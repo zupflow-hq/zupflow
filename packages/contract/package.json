@@ -1,0 +1,26 @@
+{
+  "name": "@zupflow/contract",
+  "version": "0.0.0",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./ids": "./src/ids.ts",
+    "./schemas": "./src/schemas.ts",
+    "./openapi.json": "./openapi.json"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "generate": "GENERATE_OPENAPI=1 vitest run src/openapi.test.ts"
+  },
+  "dependencies": {
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "typescript": "~6.0.2",
+    "vitest": "^5.0.3"
+  }
+}

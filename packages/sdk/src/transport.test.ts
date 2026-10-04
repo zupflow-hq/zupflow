@@ -1,6 +1,6 @@
+import type { OrganizationId } from "@zupflow/contract";
 import { describe, expect, it } from "vitest";
 import { createClient } from "./client";
-import type { OrganizationId } from "./ids";
 import { createHttpTransport, ORGANIZATION_HEADER, ZupflowApiError, ZupflowNetworkError } from "./transport";
 
 function fakeFetch(status: number, body: unknown, seen: Request[] = []): typeof fetch {

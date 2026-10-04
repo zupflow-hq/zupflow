@@ -1,6 +1,6 @@
 /**
  * The mock Zupflow API. Each handler serves the wire contract in
- * `@zupflow/sdk` and enforces the rules the backend must: membership before
+ * `@zupflow/contract` (re-exported by `@zupflow/sdk`) and enforces the rules the backend must: membership before
  * existence (404), role before action (403), explicit workspace scope on every
  * lookup, environment-matched configuration with no fallback, exact return-URL
  * allowlisting and single-use Connect sessions.
@@ -320,8 +320,8 @@ function createApp(access: OrgAccess, input: z.infer<typeof appInput>, ownerWork
       input.auth_type === "oauth2"
         ? {
             type: "oauth2",
-            authorize_url: "",
-            token_url: "",
+            authorize_url: null,
+            token_url: null,
             available_scopes: [],
             pkce: true,
             identity_url: null,
@@ -339,7 +339,7 @@ function createApp(access: OrgAccess, input: z.infer<typeof appInput>, ownerWork
               },
             ],
             placement: { location: "header", name: "Authorization", prefix: "Bearer " },
-            verify_url: "",
+            verify_url: null,
             instructions: `Paste an API token for ${input.name}.`,
             docs_url: null,
           },
@@ -505,6 +505,12 @@ function webhookSecret(env: Environment) {
   return `whsec_${env === "production" ? "live" : "test"}_${token(32)}`;
 }
 
+/** An integer query parameter clamped to 1..max; missing or not an integer means the default. */
+function clampedInt(url: URL, name: string, fallback: number, max: number): number {
+  const value = Number(url.searchParams.get(name) ?? fallback);
+  return Number.isInteger(value) ? Math.min(Math.max(value, 1), max) : fallback;
+}
+
 function paginate<T>(items: T[], cursor: string | null, limit: number) {
   const offset = cursor ? Number.parseInt(atob(cursor), 10) || 0 : 0;
   const page = items.slice(offset, offset + limit);
@@ -625,7 +631,7 @@ export function createHandlers(apiBase: string) {
             environment: "Required.",
           });
         }
-        const days = Math.min(Math.max(Number(url.searchParams.get("days") ?? 14), 1), 90);
+        const days = clampedInt(url, "days", 14, 90);
         const workspaceIds = new Set(
           db()
             .workspaces.filter((w) => w.organization_id === access.org.id && w.environment === env.data)
@@ -781,7 +787,7 @@ export function createHandlers(apiBase: string) {
         }
         const q = (url.searchParams.get("q") ?? "").trim().toLowerCase();
         const sort = url.searchParams.get("sort") === "activity" ? "activity" : "name";
-        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 25), 1), 100);
+        const limit = clampedInt(url, "limit", 25, 100);
         let rows = db().workspaces.filter(
           (w) =>
             w.organization_id === access.org.id &&
@@ -1015,7 +1021,7 @@ export function createHandlers(apiBase: string) {
         const app = findOrgApp(access, idParam(params, "app"));
         const url = new URL(request.url);
         const env = url.searchParams.get("environment");
-        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 25), 1), 100);
+        const limit = clampedInt(url, "limit", 25, 100);
         const refs: AppInstallationRef[] = db()
           .installations.filter((i) => i.organization_id === access.org.id && i.app_id === app.id)
           .sort((a, b) => b.created_at.localeCompare(a.created_at))
@@ -1648,7 +1654,7 @@ export function createHandlers(apiBase: string) {
         if (status && !(RUN_STATUSES as readonly string[]).includes(status)) {
           throw new ApiFailure(400, "validation_failed", "Unknown status.", { status: "Unknown status." });
         }
-        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 25), 1), 100);
+        const limit = clampedInt(url, "limit", 25, 100);
         const rows = db()
           .runs.filter(
             (r) =>
@@ -1685,7 +1691,7 @@ export function createHandlers(apiBase: string) {
             )
             .map((w) => [w.id, w]),
         );
-        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 25), 1), 100);
+        const limit = clampedInt(url, "limit", 25, 100);
         const rows = db()
           .runs.filter(
             (r) =>
@@ -2076,7 +2082,7 @@ export function createHandlers(apiBase: string) {
         requireRole(access, ADMINS, "read the audit log");
         const url = new URL(request.url);
         const workspaceId = url.searchParams.get("workspace_id");
-        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 50), 1), 100);
+        const limit = clampedInt(url, "limit", 50, 100);
         const rows = db().audit.filter(
           (e) => e.organization_id === access.org.id && (!workspaceId || e.workspace_id === workspaceId),
         );

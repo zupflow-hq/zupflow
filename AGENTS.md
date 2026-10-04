@@ -4,10 +4,14 @@ Read `README.md` first.
 
 ## Ground rules
 
-- **The Console is built against `@zupflow/sdk` contracts.** When a screen
-  needs data the API doesn't provide, change `packages/sdk/src/types.ts` and
-  `client.ts` first, then the mock handler (with a test), then the hook, then
-  the page, in that order.
+- **The API contract lives in `@zupflow/contract`**: one zod schema per
+  request and response (`schemas.ts`), one entry per endpoint (`routes.ts`),
+  and the generated `openapi.json`. Types everywhere are inferred from it.
+  When a screen needs data the API doesn't provide, change the contract first
+  (`pnpm --filter @zupflow/contract generate` refreshes `openapi.json`), then
+  the SDK's `client.ts`, then the mock handler (with a test), then the hook,
+  then the page, in that order. The mock's tests check every response
+  against the contract.
 - **The mock API is the backend's specification until the backend exists.**
   Rules it enforces are product rules. Don't loosen one to make a screen
   easier; add a test in `apps/console/src/mocks/handlers.test.ts` when you add

@@ -1,11 +1,14 @@
 /**
  * Every ID Zupflow shows is `{prefix}_{body}`: a prefix naming the object type
- * and a 22-character body. Treat IDs as opaque: compare and pass them, never
- * parse, build or decode them.
+ * and a 22-character base62 body. Treat IDs as opaque: compare and pass them,
+ * never parse, build or decode them.
  *
  * This is the one registry of prefixes. A prefix is never changed, reused or
  * shared; adding an object type that the API exposes means adding it here.
  */
+import { z } from "zod";
+import { registry } from "./registry";
+
 export const ID_PREFIXES = {
   organization: "org",
   workspace: "ws",
@@ -54,3 +57,26 @@ export type WebhookEndpointId = Id<"webhook_endpoint">;
 export type WebhookEventId = Id<"webhook_event">;
 export type WebhookDeliveryId = Id<"webhook_delivery">;
 export type AuditEventId = Id<"audit_event">;
+
+/** The 22-character base62 body every ID shares. */
+const BODY = /^[0-9A-Za-z]{22}$/;
+
+const schemas = new Map<IdKind, z.ZodType>();
+const componentName = (kind: IdKind) => `${kind.replace(/(^|_)([a-z])/g, (_, __, c: string) => c.toUpperCase())}Id`;
+
+/** The schema of one ID type: its prefix, then a base62 body. One shared, named schema per type. */
+export function idSchema<K extends IdKind>(kind: K): z.ZodType<Id<K>> {
+  let schema = schemas.get(kind);
+  if (!schema) {
+    schema = z
+      .templateLiteral([`${ID_PREFIXES[kind]}_`, z.string().regex(BODY)])
+      .register(registry, { id: componentName(kind) });
+    schemas.set(kind, schema);
+  }
+  return schema as unknown as z.ZodType<Id<K>>;
+}
+
+/** Any Zupflow ID: one of the registered prefixes, then a base62 body. */
+export const AnyIdSchema = z
+  .templateLiteral([z.enum(Object.values(ID_PREFIXES) as [IdPrefix, ...IdPrefix[]]), "_", z.string().regex(BODY)])
+  .register(registry, { id: "AnyId" }) as unknown as z.ZodType<AnyId>;

@@ -1,5 +1,4 @@
-import type { OrganizationId } from "./ids";
-import type { ApiErrorBody, Envelope, Meta } from "./types";
+import type { ApiErrorBody, Envelope, Meta, OrganizationId } from "@zupflow/contract";
 
 /**
  * Names the organization a Console session acts in. Workspace routes

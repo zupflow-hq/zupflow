@@ -13,7 +13,8 @@ the API. The backend comes next; it must serve the same contracts.
 apps/
   console/        Developer Console — Vite, React 19, TanStack Router + Query, shadcn/ui
 packages/
-  sdk/            @zupflow/sdk — wire types, HTTP transport, typed resource client
+  contract/       @zupflow/contract — zod schemas, route table, generated openapi.json
+  sdk/            @zupflow/sdk — HTTP transport and typed resource client over the contract
   brand/          B1 Precision brand kit (SVG/PNG/ICO) and usage notes
 ```
 
@@ -72,7 +73,8 @@ CI runs `pnpm check` on every push and pull request.
 ### The mock API
 
 `src/mocks` is a faithful stand-in for the backend, not a fixture file. It
-serves the contracts in `packages/sdk/src/types.ts` and enforces the API's
+serves the contract in `packages/contract` (zod schemas, the route table and
+the generated `openapi.json`) and enforces the API's
 rules: membership before existence, environment-matched configuration with no
 fallback, single-use Connect sessions, exact return-URL allowlists,
 workspace-coherent grants, approvals only from API keys, and no Console

@@ -1,7 +1,15 @@
 /**
  * Contract tests for the mock API. They pin the isolation and Connect rules
  * the Console relies on, so the real backend can be held to the same cases.
+ *
+ * Every response the tests receive is also checked against the contract
+ * (`@zupflow/contract`): the route's success status and response schema,
+ * with no field the contract doesn't name, pagination where the route
+ * promises it, and the error shape on failures.
  */
+
+import { isDeepStrictEqual } from "node:util";
+import { ApiErrorBody, Meta, matchRoute, Pagination, responseDataSchema, routes } from "@zupflow/contract";
 import {
   type AgentId,
   type AppId,
@@ -13,7 +21,8 @@ import {
   ZupflowApiError,
 } from "@zupflow/sdk";
 import { setupServer } from "msw/node";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 import { db, resetDb } from "./db";
 import { createHandlers } from "./handlers";
 import { setLatency } from "./http";
@@ -99,12 +108,233 @@ const app = (slug: string) => {
   return a;
 };
 
+/** Mock-only routes: stand-ins for things a provider does, never part of the API. */
+const MOCK_ONLY = ["post /v1/connect/sessions/{reference}/simulate-consent", "post /__mock/reset"];
+const mockOnly = (method: string, path: string) =>
+  MOCK_ONLY.some((entry) => {
+    const [m, p] = entry.split(" ") as [string, string];
+    return m === method.toLowerCase() && new RegExp(`^${p.replace(/\{[^}]+\}/g, "[^/]+")}$`).test(path);
+  });
+
+const violations: string[] = [];
+/** Routes whose success response has been checked against the contract. */
+const succeeded = new Set<string>();
+
+/** Check one response against the contract; record what doesn't match. */
+async function checkContract(request: Request, response: Response) {
+  const url = new URL(request.url);
+  if (!url.pathname.startsWith("/api/")) return;
+  const path = url.pathname.slice("/api".length);
+  const where = `${request.method} ${path}`;
+  if (mockOnly(request.method, path)) return;
+  const route = matchRoute(request.method, path);
+  if (!route) {
+    violations.push(`${where}: no route in the contract`);
+    return;
+  }
+  if (response.status === 204) {
+    if (route.response.status !== 204)
+      violations.push(`${where}: answered 204, contract says ${route.response.status}`);
+    else succeeded.add(route.operationId);
+    return;
+  }
+  const body = (await response.json()) as { data: unknown; meta: unknown; error: unknown };
+  if (!response.ok) {
+    const error = ApiErrorBody.safeParse(body.error);
+    if (!error.success || body.data !== null || body.meta !== null) {
+      violations.push(`${where}: error body isn't the error envelope`);
+    } else if (!isDeepStrictEqual(error.data, body.error)) {
+      violations.push(`${where}: error fields beyond the contract`);
+    }
+    return;
+  }
+  if (response.status !== route.response.status) {
+    violations.push(`${where}: answered ${response.status}, contract says ${route.response.status}`);
+  }
+  // The envelope itself: exactly data, meta and error, with meta as the contract shapes it.
+  const meta = route.response.paginated ? Meta.extend({ pagination: Pagination }) : Meta.nullable();
+  const envelope = z.strictObject({ data: z.unknown(), meta, error: z.null() }).safeParse(body);
+  if (!envelope.success || !isDeepStrictEqual(envelope.data, body)) {
+    violations.push(`${where}: envelope isn't { data, meta, error } as the contract shapes it`);
+  }
+  const schema = responseDataSchema(route);
+  if (!schema) return;
+  const parsed = schema.safeParse(body.data);
+  if (!parsed.success) {
+    violations.push(`${where}: ${z.prettifyError(parsed.error)}`);
+    return;
+  }
+  // Parsing drops fields the contract doesn't name; anything dropped is a leak.
+  if (!isDeepStrictEqual(parsed.data, body.data)) violations.push(`${where}: fields beyond the contract`);
+  succeeded.add(route.operationId);
+}
+
+const unchecked = globalThis.fetch;
+
 beforeAll(() => {
   setLatency([0, 0]);
   server.listen({ onUnhandledFrame: "error" });
+  const intercepted = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    const response = await intercepted(request.clone());
+    await checkContract(request, response.clone());
+    return response;
+  };
 });
-afterAll(() => server.close());
+afterAll(() => {
+  globalThis.fetch = unchecked;
+  server.close();
+});
+afterEach(() => {
+  const found = violations.splice(0);
+  expect(found, "responses that break the contract").toEqual([]);
+});
 beforeEach(() => resetDb());
+
+describe("the contract", () => {
+  it("serves exactly the contract's routes, and nothing else outside the mock-only ones", () => {
+    const served = createHandlers(API).map((handler) => {
+      const { method, path } = handler.info as { method: string; path: string };
+      return `${method.toLowerCase()} ${path.replace(API, "").replace(/:(\w+)/g, "{$1}")}`;
+    });
+    const contract = routes.map((route) => `${route.method} ${route.path}`);
+    expect(served.filter((entry) => !MOCK_ONLY.includes(entry)).sort()).toEqual([...contract].sort());
+  });
+
+  it("checks a success response from every route against its schema", async () => {
+    succeeded.clear();
+    const org = must(northwindId(), "Northwind");
+    const sandbox = ws("acme-sandbox");
+    const acme = ws("acme");
+
+    // Organization and workspace reads and writes.
+    await owner.me.get();
+    await owner.models.list();
+    await owner.organizations.create({ name: "Contract Co", slug: "contract-co" });
+    await owner.organizations.get(org);
+    await owner.organizations.update(org, { name: "Northwind" });
+    await owner.organizations.usage(org, "production");
+    await owner.members.list(org);
+    const invited = await owner.members.invite(org, { email: "contract@northwind.example", role: "developer" });
+    await owner.members.update(org, invited.id, { role: "admin" });
+    await owner.members.remove(org, invited.id);
+    await owner.workspaces.list(org, { environment: "production" });
+    const workspace = await owner.workspaces.create(org, {
+      name: "Contract",
+      slug: "contract",
+      environment: "sandbox",
+      external_id: null,
+    });
+    await owner.workspaces.get(workspace.id);
+    await owner.workspaces.update(workspace.id, { name: "Contract 2" });
+
+    // Apps, at both levels, including OAuth apps that have no endpoints yet.
+    const oauthApp = { kind: "mcp", description: "", auth_type: "oauth2" } as const;
+    await owner.organizationApps.list(org);
+    const orgApp = await owner.organizationApps.create(org, { ...oauthApp, name: "Org OAuth", slug: "org-oauth" });
+    await owner.organizationApps.get(org, orgApp.id);
+    await owner.organizationApps.update(org, orgApp.id, { description: "Changed" });
+    await owner.organizationApps.getConfiguration(org, orgApp.id, "sandbox");
+    await owner.organizationApps.updateConfiguration(org, orgApp.id, "sandbox", { oauth_client_id: "client" });
+    await owner.organizationApps.installations(org, orgApp.id);
+    await owner.workspaceApps.list(workspace.id);
+    const wsApp = await owner.workspaceApps.create(workspace.id, { ...oauthApp, name: "WS OAuth", slug: "ws-oauth" });
+    await owner.workspaceApps.get(workspace.id, wsApp.id);
+    await owner.workspaceApps.update(workspace.id, wsApp.id, { description: "Changed" });
+    await owner.workspaceApps.getConfiguration(workspace.id, wsApp.id);
+    await owner.workspaceApps.updateConfiguration(workspace.id, wsApp.id, { oauth_client_id: "client" });
+    await owner.workspaceApps.available(workspace.id);
+
+    // Installations and Connect, token and OAuth.
+    const installations = await owner.installations.list(sandbox.id);
+    const installation = must(installations[0], "installation");
+    await owner.installations.get(sandbox.id, installation.id);
+    await owner.installations.update(sandbox.id, installation.id, { label: installation.label });
+    await owner.connectSessions.list(sandbox.id);
+    const session = (appId: AppId, workspaceId = ws("qa-playground").id) =>
+      owner.connectSessions.create(workspaceId, {
+        app_id: appId,
+        intent: "create",
+        label: "Contract",
+        installation_id: null,
+        return_url: null,
+      });
+    const tokenSession = await session(app("echo-server").id);
+    await owner.connectSessions.get(ws("qa-playground").id, tokenSession.id);
+    await owner.connect.get(referenceOf(tokenSession));
+    const connected = await owner.connect.submitCredentials(referenceOf(tokenSession), { values: { token: "abc" } });
+    await owner.connect.authorize(referenceOf(await session(app("google-workspace").id, sandbox.id)));
+    await owner.connect.cancel(referenceOf(await session(app("echo-server").id)));
+    await owner.installations.disconnect(ws("qa-playground").id, connected.installation.id);
+    await owner.installations.delete(ws("qa-playground").id, connected.installation.id);
+
+    // Agents, grants and runs.
+    const agent = must(
+      db().agents.find((a) => a.workspace_id === acme.id && a.status === "active"),
+      "agent",
+    );
+    await owner.agents.list(acme.id);
+    const newAgent = await owner.agents.create(acme.id, {
+      name: "Contract",
+      description: "",
+      instructions: "Be brief.",
+      model: agent.model,
+    });
+    await owner.agents.get(acme.id, newAgent.id);
+    await owner.agents.update(acme.id, newAgent.id, { name: "Contract 2" });
+    const grants = await owner.grants.list(acme.id, agent.id as AgentId);
+    const grant = must(grants[0], "grant");
+    await owner.grants.update(acme.id, agent.id as AgentId, grant.id, {
+      tools: grant.tools,
+      approval_required: grant.approval_required,
+    });
+    // The new agent has no grants yet, so the existing grant's installation is free for it.
+    const newGrant = await owner.grants.create(acme.id, newAgent.id, {
+      installation_id: grant.installation_id,
+      tools: grant.tools.slice(0, 1),
+      approval_required: [],
+    });
+    await owner.grants.delete(acme.id, newAgent.id, newGrant.id);
+    await owner.agents.delete(acme.id, newAgent.id);
+    await owner.organizationRuns.list(org, { environment: "production" });
+    const runs = await owner.runs.list(acme.id);
+    await owner.runs.get(acme.id, must(runs.items[0], "run").id);
+    await owner.runs.events(acme.id, must(runs.items[0], "run").id);
+    const run = await owner.runs.create(
+      sandbox.id,
+      must(
+        db().agents.find((a) => a.workspace_id === sandbox.id && a.status === "active"),
+        "sandbox agent",
+      ).id as AgentId,
+      { input: "Hello" },
+    );
+    await owner.runs.cancel(sandbox.id, run.id);
+
+    // Organization settings.
+    await owner.connectSettings.get(org, "sandbox");
+    await owner.connectSettings.update(org, "sandbox", { return_urls: [], allowed_origins: [] });
+    await owner.apiKeys.list(org);
+    const key = await owner.apiKeys.create(org, { name: "Contract", environment: "sandbox" });
+    await owner.apiKeys.revoke(org, key.key.id);
+    await owner.webhooks.list(org);
+    const hook = await owner.webhooks.create(org, {
+      environment: "sandbox",
+      url: "https://hooks.northwind.example/zupflow",
+      description: "Contract",
+      events: ["run.completed"],
+    });
+    await owner.webhooks.update(org, hook.endpoint.id, { enabled: false });
+    await owner.webhooks.sendTest(org, hook.endpoint.id);
+    await owner.webhooks.delete(org, hook.endpoint.id);
+    await owner.audit.list(org);
+    await owner.workspaces.delete(workspace.id);
+
+    // Approvals succeed only with an API key, which the mock has none of.
+    const unreachable = new Set(["resolveApproval"]);
+    expect(routes.map((r) => r.operationId).filter((id) => !succeeded.has(id) && !unreachable.has(id))).toEqual([]);
+  });
+});
 
 describe("authentication and membership", () => {
   it("answers 401 without a credential", async () => {
