@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createClient } from "./client";
-import { createHttpTransport, ZupflowApiError, ZupflowNetworkError } from "./transport";
+import type { OrganizationId } from "./ids";
+import { createHttpTransport, ORGANIZATION_HEADER, ZupflowApiError, ZupflowNetworkError } from "./transport";
 
 function fakeFetch(status: number, body: unknown, seen: Request[] = []): typeof fetch {
   return async (input, init) => {
@@ -88,5 +89,29 @@ describe("createHttpTransport", () => {
       }),
     );
     await expect(client.me.get()).rejects.toBeInstanceOf(ZupflowNetworkError);
+  });
+
+  it("names the organization when one is given, and omits the header otherwise", async () => {
+    const seen: Request[] = [];
+    const fetch = fakeFetch(200, { data: {}, meta: null, error: null }, seen);
+    let organization: OrganizationId | null = "org_031DCoVdPC4Z4DgUS9oR60";
+    const named = createClient(
+      createHttpTransport({
+        baseUrl: "https://api.zupflow.test",
+        getToken: async () => "t",
+        getOrganization: () => organization,
+        fetch,
+      }),
+    );
+    await named.workspaces.get("ws_031DCp7XSYxLgDmAT3Dc7r");
+    organization = null;
+    await named.workspaces.get("ws_031DCp7XSYxLgDmAT3Dc7r");
+    const plain = createClient(
+      createHttpTransport({ baseUrl: "https://api.zupflow.test", getToken: async () => "t", fetch }),
+    );
+    await plain.workspaces.get("ws_031DCp7XSYxLgDmAT3Dc7r");
+    expect(seen[0]?.headers.get(ORGANIZATION_HEADER)).toBe("org_031DCoVdPC4Z4DgUS9oR60");
+    expect(seen[1]?.headers.has(ORGANIZATION_HEADER)).toBe(false);
+    expect(seen[2]?.headers.has(ORGANIZATION_HEADER)).toBe(false);
   });
 });

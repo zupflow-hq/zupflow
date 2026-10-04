@@ -4,6 +4,7 @@
  */
 import type {
   Agent,
+  AgentGrant,
   AnyId,
   ApiKey,
   AppDefinition,
@@ -20,11 +21,13 @@ import type {
   Organization,
   OrganizationId,
   Run,
+  RunEvent,
   User,
   UserId,
   Workspace,
   WorkspaceId,
 } from "@zupflow/sdk";
+import { ORGANIZATION_HEADER } from "@zupflow/sdk";
 import { delay, HttpResponse } from "msw";
 import type { z } from "zod";
 import { db, persist } from "./db";
@@ -35,12 +38,15 @@ import type {
   AppRow,
   ConfigurationRow,
   ConnectSessionRow,
+  GrantRow,
   InstallationRow,
   MembershipRow,
   OrganizationRow,
+  RunEventRow,
   RunRow,
   WorkspaceRow,
 } from "./model";
+import { appIn, configurationOf, inWorkspace, sameWorkspace } from "./scope";
 
 export const MOCK_SESSION_KEY = "zupflow.mock.session";
 export const OAUTH_CALLBACK_URL = "https://connect.zupflow.com/oauth/callback";
@@ -155,13 +161,18 @@ export interface OrgAccess {
  */
 export function orgAccess(request: Request, organizationParam: string): OrgAccess {
   const user = authenticate(request);
-  if (!isId("organization", organizationParam)) throw notFound("Organization");
+  return membershipIn(user, organizationParam, "Organization");
+}
+
+/** The caller's active membership in the named organization, or a 404 that says nothing about why. */
+function membershipIn(user: User, organizationParam: string, notFoundLabel: string): OrgAccess {
+  if (!isId("organization", organizationParam)) throw notFound(notFoundLabel);
   const organizationId: OrganizationId = organizationParam;
   const membership = db().memberships.find(
     (m) => m.organization_id === organizationId && m.user_id === user.id && m.status === "active",
   );
   const org = db().organizations.find((o) => o.id === organizationId);
-  if (!membership || !org) throw notFound("Organization");
+  if (!membership || !org) throw notFound(notFoundLabel);
   membership.last_active_at = new Date().toISOString();
   return { user, org, membership };
 }
@@ -170,18 +181,28 @@ export interface WorkspaceAccess extends OrgAccess {
   workspace: WorkspaceRow;
 }
 
-/** Like {@link orgAccess}: 401 first, then one 404 for malformed, missing and other organizations' workspaces. */
+/**
+ * Workspace routes establish the organization first, from the request, never
+ * from the workspace row: 401 for the credential, then the organization the
+ * session names (`Zupflow-Organization`) and the caller's membership in it,
+ * then the workspace within that organization. A malformed, missing or
+ * foreign workspace and a foreign organization all answer the same 404.
+ */
 export function workspaceAccess(request: Request, workspaceParam: string): WorkspaceAccess {
   const user = authenticate(request);
+  const organizationParam = request.headers.get(ORGANIZATION_HEADER);
+  if (!organizationParam) {
+    throw new ApiFailure(
+      400,
+      "organization_required",
+      `Name the organization this request acts in with the ${ORGANIZATION_HEADER} header.`,
+    );
+  }
+  const { org, membership } = membershipIn(user, organizationParam, "Workspace");
   if (!isId("workspace", workspaceParam)) throw notFound("Workspace");
   const workspaceId: WorkspaceId = workspaceParam;
-  const workspace = db().workspaces.find((w) => w.id === workspaceId);
+  const workspace = db().workspaces.find((w) => w.organization_id === org.id && w.id === workspaceId);
   if (!workspace) throw notFound("Workspace");
-  const membership = db().memberships.find(
-    (m) => m.organization_id === workspace.organization_id && m.user_id === user.id && m.status === "active",
-  );
-  const org = db().organizations.find((o) => o.id === workspace.organization_id);
-  if (!membership || !org) throw notFound("Workspace");
   return { user, org, membership, workspace };
 }
 
@@ -284,9 +305,11 @@ export function toOrganization(org: OrganizationRow, membership: MembershipRow):
       ),
       has_workspace: workspaceIds.size > 0,
       has_api_key: d.api_keys.some((k) => k.organization_id === org.id && !k.revoked_at),
-      has_installation: d.installations.some((i) => workspaceIds.has(i.workspace_id) && i.status === "connected"),
-      has_agent: d.agents.some((a) => workspaceIds.has(a.workspace_id)),
-      has_run: d.runs.some((r) => workspaceIds.has(r.workspace_id)),
+      has_installation: d.installations.some(
+        (i) => i.organization_id === org.id && workspaceIds.has(i.workspace_id) && i.status === "connected",
+      ),
+      has_agent: d.agents.some((a) => a.organization_id === org.id && workspaceIds.has(a.workspace_id)),
+      has_run: d.runs.some((r) => r.organization_id === org.id && workspaceIds.has(r.workspace_id)),
     },
   };
 }
@@ -316,9 +339,9 @@ export function toWorkspace(w: WorkspaceRow): Workspace {
     external_id: w.external_id,
     created_at: w.created_at,
     stats: {
-      agents: d.agents.filter((a) => a.workspace_id === w.id).length,
-      installations: d.installations.filter((i) => i.workspace_id === w.id).length,
-      runs_last_24h: d.runs.filter((r) => r.workspace_id === w.id && Date.parse(r.created_at) >= since).length,
+      agents: d.agents.filter((a) => inWorkspace(a, w)).length,
+      installations: d.installations.filter((i) => inWorkspace(i, w)).length,
+      runs_last_24h: d.runs.filter((r) => inWorkspace(r, w) && Date.parse(r.created_at) >= since).length,
     },
   };
 }
@@ -334,7 +357,9 @@ export function missingFields(c: ConfigurationRow, app: AppRow): string[] {
 }
 
 export function configurationStatus(c: ConfigurationRow): ConfigurationStatus {
-  const app = db().apps.find((a) => a.organization_id === c.organization_id && a.id === c.app_id);
+  const app = db().apps.find(
+    (a) => a.organization_id === c.organization_id && a.owner_workspace_id === c.workspace_id && a.id === c.app_id,
+  );
   if (!app) return "unconfigured";
   const missing = missingFields(c, app);
   const required = app.auth.type === "oauth2" ? 3 : 1;
@@ -380,8 +405,21 @@ export function toConfiguration(c: ConfigurationRow, app: AppRow): ClientConfigu
 
 export function toApp(app: AppRow): AppDefinition {
   const d = db();
+  // Installations count only where the app can be installed: its organization's workspaces, or its own workspace.
+  const appWorkspaces = new Set(
+    d.workspaces
+      .filter(
+        (w) =>
+          w.organization_id === app.organization_id &&
+          (app.owner_workspace_id === null || w.id === app.owner_workspace_id),
+      )
+      .map((w) => w.id),
+  );
   const environments: Environment[] = app.owner_workspace_id
-    ? [d.workspaces.find((w) => w.id === app.owner_workspace_id)?.environment ?? "sandbox"]
+    ? [
+        d.workspaces.find((w) => w.organization_id === app.organization_id && w.id === app.owner_workspace_id)
+          ?.environment ?? "sandbox",
+      ]
     : ["sandbox", "production"];
   return {
     id: app.id,
@@ -397,12 +435,14 @@ export function toApp(app: AppRow): AppDefinition {
     tools: app.tools,
     version: app.version,
     configurations: environments.map((environment) => {
-      const c = d.configurations.find((x) => x.app_id === app.id && x.environment === environment);
+      const c = configurationOf(d.configurations, app, environment);
       return c
         ? toConfigurationSummary(c)
         : { environment, status: "unconfigured" as const, version: 0, updated_at: null };
     }),
-    installation_count: d.installations.filter((i) => i.app_id === app.id).length,
+    installation_count: d.installations.filter(
+      (i) => i.organization_id === app.organization_id && appWorkspaces.has(i.workspace_id) && i.app_id === app.id,
+    ).length,
     created_at: app.created_at,
     updated_at: app.updated_at,
   };
@@ -424,12 +464,7 @@ export function toInstallationApp(app: AppRow): InstallationApp {
  * organization and workspace: an organization app, or the workspace's own.
  */
 export function appInScope(row: { organization_id: OrganizationId; workspace_id: WorkspaceId; app_id: AppId }) {
-  return db().apps.find(
-    (a) =>
-      a.organization_id === row.organization_id &&
-      a.id === row.app_id &&
-      (a.owner_workspace_id === null || a.owner_workspace_id === row.workspace_id),
-  );
+  return appIn(db().apps, row);
 }
 
 export function toInstallation(i: InstallationRow): Installation {
@@ -452,10 +487,15 @@ export function toInstallation(i: InstallationRow): Installation {
     status: i.status,
     configuration_version: i.configuration_version,
     connection: i.connection,
-    grant_count: d.grants.filter((g) => g.workspace_id === i.workspace_id && g.installation_id === i.id).length,
+    grant_count: d.grants.filter((g) => sameWorkspace(g, i) && g.installation_id === i.id).length,
     created_at: i.created_at,
     updated_at: i.updated_at,
   };
+}
+
+/** A stored grant as the API returns it: the organization is known from the request, not repeated. */
+export function toGrant({ organization_id: _organization, ...grant }: GrantRow): AgentGrant {
+  return grant;
 }
 
 export function toConnectSession(s: ConnectSessionRow, withAuth = false): ConnectSession {
@@ -499,7 +539,7 @@ export function toConnectSession(s: ConnectSessionRow, withAuth = false): Connec
 
 export function toAgent(a: AgentRow): Agent {
   const d = db();
-  const runs = d.runs.filter((r) => r.workspace_id === a.workspace_id && r.agent_id === a.id);
+  const runs = d.runs.filter((r) => sameWorkspace(r, a) && r.agent_id === a.id);
   const since = Date.now() - 24 * 3600_000;
   return {
     id: a.id,
@@ -509,7 +549,7 @@ export function toAgent(a: AgentRow): Agent {
     model: a.model,
     instructions: a.instructions,
     status: a.status,
-    grant_count: d.grants.filter((g) => g.workspace_id === a.workspace_id && g.agent_id === a.id).length,
+    grant_count: d.grants.filter((g) => sameWorkspace(g, a) && g.agent_id === a.id).length,
     runs_last_24h: runs.filter((r) => Date.parse(r.created_at) >= since).length,
     last_run_at: runs.reduce<string | null>(
       (latest, r) => (latest === null || r.created_at > latest ? r.created_at : latest),
@@ -520,10 +560,16 @@ export function toAgent(a: AgentRow): Agent {
   };
 }
 
+/** A stored run as the API returns it: no plan, and no organization (known from the request). */
 export function toRun(r: RunRow): Run {
-  const agent = db().agents.find((a) => a.workspace_id === r.workspace_id && a.id === r.agent_id);
-  const { plan: _plan, ...rest } = r;
+  const agent = db().agents.find((a) => sameWorkspace(a, r) && a.id === r.agent_id);
+  const { plan: _plan, organization_id: _organization, ...rest } = r;
   return { ...rest, agent_name: agent?.name ?? "Deleted agent" };
+}
+
+/** A stored run event as the API returns it. */
+export function toRunEvent({ organization_id: _organization, ...event }: RunEventRow): RunEvent {
+  return event as RunEvent;
 }
 
 export function toApiKey(k: ApiKeyRow): ApiKey {

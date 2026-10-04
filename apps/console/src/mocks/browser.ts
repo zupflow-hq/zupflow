@@ -1,5 +1,5 @@
 import { setupWorker } from "msw/browser";
-import { resumeLiveRuns } from "./db";
+import { resumeLiveRunsCrossTenant } from "./db";
 import { createHandlers } from "./handlers";
 
 /** Start the in-browser mock API. Resolves once requests are intercepted. */
@@ -10,6 +10,6 @@ export async function startMockApi(apiBase: string) {
     quiet: true,
     serviceWorker: { url: `${import.meta.env.BASE_URL}mockServiceWorker.js` },
   });
-  resumeLiveRuns();
+  resumeLiveRunsCrossTenant();
   return worker;
 }

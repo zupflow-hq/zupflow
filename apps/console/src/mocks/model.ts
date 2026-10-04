@@ -1,6 +1,7 @@
 /**
  * Storage rows for the in-browser mock API. These mirror what the backend
- * will persist: workspace-scoped rows carry `workspace_id` explicitly, and the
+ * will persist: workspace-scoped rows start with `id, organization_id,
+ * workspace_id` and carry both explicitly, and the
  * wire shapes in `@zupflow/sdk` are derived from them by the handlers.
  */
 import type {
@@ -18,6 +19,7 @@ import type {
   ConnectSessionId,
   ConnectSessionStatus,
   Environment,
+  GrantId,
   InstallationId,
   InstallationStatus,
   MemberId,
@@ -82,11 +84,15 @@ export interface AppRow {
   updated_at: string;
 }
 
+/**
+ * One app's client configuration in one environment. Natural key
+ * (organization_id, app_id, environment); `workspace_id` is set for a
+ * workspace's own app and null for an organization app.
+ */
 export interface ConfigurationRow {
-  app_id: AppId;
   organization_id: OrganizationId;
-  /** Set for workspace-owned apps only. */
   workspace_id: WorkspaceId | null;
+  app_id: AppId;
   environment: Environment;
   version: number;
   mcp_server_url: string | null;
@@ -100,8 +106,8 @@ export interface ConfigurationRow {
 
 export interface InstallationRow {
   id: InstallationId;
-  workspace_id: WorkspaceId;
   organization_id: OrganizationId;
+  workspace_id: WorkspaceId;
   app_id: AppId;
   label: string;
   status: InstallationStatus;
@@ -113,14 +119,14 @@ export interface InstallationRow {
 
 export interface ConnectSessionRow {
   id: ConnectSessionId;
+  organization_id: OrganizationId;
+  workspace_id: WorkspaceId;
   /**
    * SHA-256 of the random reference in the hosted Connect link, whose
    * possession authorizes the page. The reference itself is never stored;
    * `null` for sessions with no usable link (seeded history).
    */
   reference_hash: string | null;
-  workspace_id: WorkspaceId;
-  organization_id: OrganizationId;
   environment: Environment;
   app_id: AppId;
   configuration_version: number;
@@ -138,6 +144,7 @@ export interface ConnectSessionRow {
 
 export interface AgentRow {
   id: AgentId;
+  organization_id: OrganizationId;
   workspace_id: WorkspaceId;
   name: string;
   description: string;
@@ -179,6 +186,7 @@ export type RunStep =
 
 export interface RunRow {
   id: RunId;
+  organization_id: OrganizationId;
   workspace_id: WorkspaceId;
   agent_id: AgentId;
   session_id: SessionId;
@@ -216,6 +224,18 @@ export interface ApiKeyRow {
   revoked_at: string | null;
 }
 
+/** A grant as stored: the wire shape plus its organization, which the API doesn't repeat. */
+export type GrantRow = { id: GrantId; organization_id: OrganizationId; workspace_id: WorkspaceId } & Omit<
+  AgentGrant,
+  "id" | "workspace_id"
+>;
+
+/** A run event as stored: the wire shape plus its organization, which the API doesn't repeat. */
+export type RunEventRow = RunEvent & { organization_id: OrganizationId };
+
+/** What identifies a run's tenant: every lookup about a run carries all three. */
+export type RunScope = Pick<RunRow, "id" | "organization_id" | "workspace_id">;
+
 export interface Db {
   schema: number;
   users: User[];
@@ -227,9 +247,10 @@ export interface Db {
   installations: InstallationRow[];
   connect_sessions: ConnectSessionRow[];
   agents: AgentRow[];
-  grants: AgentGrant[];
+  grants: GrantRow[];
   runs: RunRow[];
-  run_events: Record<string, RunEvent[]>;
+  /** Each run's timeline, keyed by the run's full scope (`runEventsKey`); every event carries it too. */
+  run_events: Record<string, RunEventRow[]>;
   connect_settings: ConnectSettingsRow[];
   api_keys: ApiKeyRow[];
   webhooks: WebhookEndpoint[];

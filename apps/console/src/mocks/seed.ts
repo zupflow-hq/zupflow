@@ -6,7 +6,6 @@
  */
 import type {
   AccountConnection,
-  AgentGrant,
   ApiKeyId,
   AuditEvent,
   Environment,
@@ -25,14 +24,17 @@ import type {
   ConfigurationRow,
   ConnectSessionRow,
   Db,
+  GrantRow,
   InstallationRow,
+  OrganizationRow,
   RunRow,
   WorkspaceRow,
 } from "./model";
 import { mulberry32, type Rng, uuid } from "./random";
 import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
+import { timelineOf } from "./scope";
 
-export const DB_SCHEMA = 10;
+export const DB_SCHEMA = 11;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -162,9 +164,9 @@ export function seed(nowMs: number = Date.now()): Db {
     const has = state !== "unconfigured";
     const scopes = app.auth.type === "oauth2" ? app.auth.available_scopes.slice(0, 4).map((s) => s.name) : [];
     configurations.push({
-      app_id: app.id,
       organization_id: org.id,
       workspace_id: workspaceId,
+      app_id: app.id,
       environment,
       version: has ? 1 + Math.floor(rng() * 4) : 0,
       mcp_server_url: has ? (entry?.mcp_server_url ?? null) : null,
@@ -230,8 +232,8 @@ export function seed(nowMs: number = Date.now()): Db {
       : null;
     const row: InstallationRow = {
       id: id("installation", nowMs - createdAgo),
-      workspace_id: ws.id,
       organization_id: org.id,
+      workspace_id: ws.id,
       app_id: app.id,
       label,
       status,
@@ -288,7 +290,7 @@ export function seed(nowMs: number = Date.now()): Db {
   // --- Agents and grants ------------------------------------------------------
 
   const agents: AgentRow[] = [];
-  const grants: AgentGrant[] = [];
+  const grants: GrantRow[] = [];
   const agent = (
     ws: WorkspaceRow,
     name: string,
@@ -300,6 +302,7 @@ export function seed(nowMs: number = Date.now()): Db {
   ) => {
     const row: AgentRow = {
       id: id("agent", nowMs - createdAgo),
+      organization_id: ws.organization_id,
       workspace_id: ws.id,
       name,
       description,
@@ -315,6 +318,7 @@ export function seed(nowMs: number = Date.now()): Db {
   const grant = (a: AgentRow, installation: InstallationRow, tools: string[], approval: string[] = []) => {
     grants.push({
       id: id("grant", Date.parse(a.created_at)),
+      organization_id: a.organization_id,
       workspace_id: a.workspace_id,
       agent_id: a.id,
       installation_id: installation.id,
@@ -562,9 +566,9 @@ export function seed(nowMs: number = Date.now()): Db {
   ]);
   db.connect_sessions.push({
     id: id("connect_session", nowMs - 5 * HOUR),
-    reference_hash: null,
-    workspace_id: acme.id,
     organization_id: org.id,
+    workspace_id: acme.id,
+    reference_hash: null,
     environment: "production",
     app_id: stripe.id,
     configuration_version: 1,
@@ -597,7 +601,249 @@ export function seed(nowMs: number = Date.now()): Db {
     },
   );
 
+  seedLarkspur(db, nowMs);
   return db;
+}
+
+/**
+ * A second, unrelated organization. Nobody in Northwind belongs to it, and it
+ * has its own owner, workspace, app, installation, agent, grant, runs, key and
+ * webhook, so the contract tests can use each organization's real IDs against
+ * the other. Its own randomness, so adding it changes nothing about Northwind.
+ */
+function seedLarkspur(db: Db, nowMs: number) {
+  const rng = mulberry32(20261004);
+  const ago = (ms: number) => new Date(nowMs - ms).toISOString();
+  const id = <K extends IdKind>(kind: K, agoMs: number) => newId(kind, { rng, at: nowMs - agoMs });
+
+  const rowan: User = {
+    id: id("user", 20 * DAY),
+    name: "Rowan Ellis",
+    email: "rowan@larkspur.example",
+    avatar_url: null,
+  };
+  const org: OrganizationRow = {
+    id: id("organization", 20 * DAY),
+    name: "Larkspur Labs",
+    slug: "larkspur",
+    created_at: ago(20 * DAY),
+  };
+  db.users.push(rowan);
+  db.organizations.push(org);
+  db.memberships.push({
+    id: id("member", 20 * DAY),
+    organization_id: org.id,
+    user_id: rowan.id,
+    role: "owner",
+    status: "active",
+    invited_at: org.created_at,
+    joined_at: org.created_at,
+    last_active_at: ago(HOUR),
+  });
+
+  const harbor: WorkspaceRow = {
+    id: id("workspace", 19 * DAY),
+    organization_id: org.id,
+    name: "Harbor",
+    slug: "harbor",
+    environment: "production",
+    external_id: "acct_harbor_01",
+    created_at: ago(19 * DAY),
+  };
+  const harborSandbox: WorkspaceRow = {
+    id: id("workspace", 19 * DAY - HOUR),
+    organization_id: org.id,
+    name: "Harbor",
+    slug: "harbor-sandbox",
+    environment: "sandbox",
+    external_id: "acct_harbor_01",
+    created_at: ago(19 * DAY - HOUR),
+  };
+  db.workspaces.push(harbor, harborSandbox);
+
+  const entry = CATALOG.linear;
+  const app: AppRow = {
+    id: id("app", 18 * DAY),
+    organization_id: org.id,
+    owner_workspace_id: null,
+    kind: "mcp",
+    name: entry.name,
+    slug: entry.slug,
+    description: entry.description,
+    icon: entry.icon,
+    auth: entry.auth,
+    tools: entry.tools,
+    version: 1,
+    created_at: ago(18 * DAY),
+    updated_at: ago(18 * DAY),
+  };
+  db.apps.push(app);
+  const scopes = entry.auth.type === "oauth2" ? entry.auth.available_scopes.slice(0, 2).map((s) => s.name) : [];
+  db.configurations.push({
+    organization_id: org.id,
+    workspace_id: null,
+    app_id: app.id,
+    environment: "sandbox",
+    version: 1,
+    mcp_server_url: entry.mcp_server_url ?? null,
+    oauth_client_id: entry.auth.type === "oauth2" ? "larkspur-test.apps.example" : null,
+    oauth_client_secret_last4: entry.auth.type === "oauth2" ? "p2Wn" : null,
+    oauth_client_secret_updated_at: entry.auth.type === "oauth2" ? ago(18 * DAY) : null,
+    oauth_scopes: scopes,
+    updated_at: ago(18 * DAY),
+    updated_by_user_id: rowan.id,
+  });
+  db.configurations.push({
+    organization_id: org.id,
+    workspace_id: null,
+    app_id: app.id,
+    environment: "production",
+    version: 1,
+    mcp_server_url: entry.mcp_server_url ?? null,
+    oauth_client_id: entry.auth.type === "oauth2" ? "larkspur-prod.apps.example" : null,
+    oauth_client_secret_last4: entry.auth.type === "oauth2" ? "k9Qz" : null,
+    oauth_client_secret_updated_at: entry.auth.type === "oauth2" ? ago(18 * DAY) : null,
+    oauth_scopes: scopes,
+    updated_at: ago(18 * DAY),
+    updated_by_user_id: rowan.id,
+  });
+
+  const installation: InstallationRow = {
+    id: id("installation", 17 * DAY),
+    organization_id: org.id,
+    workspace_id: harbor.id,
+    app_id: app.id,
+    label: "Engineering",
+    status: "connected",
+    configuration_version: 1,
+    connection: {
+      account: { external_id: "553201977", display_name: "Harbor Engineering", email: "eng@harbor.example" },
+      granted_scopes: scopes,
+      credential_version: 1,
+      connected_at: ago(17 * DAY),
+      expires_at: entry.auth.type === "oauth2" ? ago(-50 * MINUTE) : null,
+    },
+    created_at: ago(17 * DAY),
+    updated_at: ago(17 * DAY),
+  };
+  db.installations.push(installation);
+
+  const agent: AgentRow = {
+    id: id("agent", 16 * DAY),
+    organization_id: org.id,
+    workspace_id: harbor.id,
+    name: "Triage assistant",
+    description: "Files and tidies issues.",
+    model: "claude-sonnet-5-5",
+    instructions: "Keep issues short and labelled.",
+    status: "active",
+    created_at: ago(16 * DAY),
+    updated_at: ago(16 * DAY),
+  };
+  db.agents.push(agent);
+  db.grants.push({
+    id: id("grant", 16 * DAY),
+    organization_id: org.id,
+    workspace_id: harbor.id,
+    agent_id: agent.id,
+    installation_id: installation.id,
+    tools: entry.tools.slice(0, 2).map((t) => t.name),
+    approval_required: [],
+    created_at: ago(16 * DAY),
+    updated_at: ago(16 * DAY),
+  });
+
+  db.api_keys.push({
+    id: id("api_key", 18 * DAY),
+    organization_id: org.id,
+    environment: "production",
+    name: "Larkspur production",
+    prefix: "zf_live_8kLm",
+    last4: "Tq3v",
+    created_by_user_id: rowan.id,
+    created_at: ago(18 * DAY),
+    last_used_at: ago(2 * HOUR),
+    revoked_at: null,
+  });
+  db.webhooks.push({
+    id: id("webhook_endpoint", 18 * DAY),
+    organization_id: org.id,
+    environment: "production",
+    url: "https://app.larkspur.example/hooks/zupflow",
+    description: "Production",
+    events: ["run.completed", "run.failed"],
+    enabled: true,
+    signing_secret_last4: "Hb7c",
+    created_at: ago(18 * DAY),
+    last_delivery: { status_code: 200, delivered_at: ago(4 * HOUR) },
+  });
+
+  const toolsEntry = CATALOG.echoServer;
+  const workspaceApp: AppRow = {
+    id: id("app", 15 * DAY),
+    organization_id: org.id,
+    owner_workspace_id: harbor.id,
+    kind: "mcp",
+    name: "Harbor tools",
+    slug: "harbor-tools",
+    description: toolsEntry.description,
+    icon: toolsEntry.icon,
+    auth: toolsEntry.auth,
+    tools: toolsEntry.tools,
+    version: 1,
+    created_at: ago(15 * DAY),
+    updated_at: ago(15 * DAY),
+  };
+  db.apps.push(workspaceApp);
+  db.configurations.push({
+    organization_id: org.id,
+    workspace_id: harbor.id,
+    app_id: workspaceApp.id,
+    environment: "production",
+    version: 1,
+    mcp_server_url: toolsEntry.mcp_server_url ?? null,
+    oauth_client_id: null,
+    oauth_client_secret_last4: null,
+    oauth_client_secret_updated_at: null,
+    oauth_scopes: [],
+    updated_at: ago(15 * DAY),
+    updated_by_user_id: rowan.id,
+  });
+
+  db.connect_sessions.push({
+    id: id("connect_session", 17 * DAY + 2 * MINUTE),
+    organization_id: org.id,
+    workspace_id: harbor.id,
+    reference_hash: null,
+    environment: "production",
+    app_id: app.id,
+    configuration_version: 1,
+    intent: "create",
+    installation_id: installation.id,
+    label: installation.label,
+    status: "completed",
+    return_url: "https://app.larkspur.example/integrations",
+    requested_scopes: scopes,
+    created_at: ago(17 * DAY + 2 * MINUTE),
+    expires_at: ago(17 * DAY - 13 * MINUTE),
+    completed_at: ago(17 * DAY),
+    failure_code: null,
+  });
+
+  db.audit.push({
+    id: id("audit_event", 19 * DAY),
+    organization_id: org.id,
+    workspace_id: harbor.id,
+    environment: "production",
+    actor: { type: "user", id: rowan.id, name: rowan.name },
+    action: "workspace.created",
+    target: { type: "workspace", id: harbor.id, name: harbor.name },
+    created_at: ago(19 * DAY),
+  });
+
+  seedRuns(db, rng, nowMs, [
+    { agent, count: 3, prompts: ["File the bug from this morning's standup", "Close duplicates in the triage queue"] },
+  ]);
 }
 
 const NAME_A = [
@@ -761,10 +1007,9 @@ interface RunSeed {
 
 /** The organization's active API key for the run's environment: approvals arrive from its backend, never the Console. */
 function approvalKey(db: Db, run: RunRow): ApiKeyId {
-  const workspace = db.workspaces.find((w) => w.id === run.workspace_id);
+  const workspace = db.workspaces.find((w) => w.organization_id === run.organization_id && w.id === run.workspace_id);
   const key = db.api_keys.find(
-    (k) =>
-      k.organization_id === workspace?.organization_id && k.environment === workspace?.environment && !k.revoked_at,
+    (k) => k.organization_id === run.organization_id && k.environment === workspace?.environment && !k.revoked_at,
   );
   if (!key) throw new Error("The seed needs an active API key in every environment that has approvals.");
   return key.id;
@@ -779,6 +1024,7 @@ function seedRuns(db: Db, rng: Rng, nowMs: number, specs: RunSeed[]) {
       const createdMs = leaveWaiting ? nowMs - 9 * MINUTE : nowMs - back;
       const run: RunRow = {
         id: newId("run", { rng, at: createdMs }),
+        organization_id: spec.agent.organization_id,
         workspace_id: spec.agent.workspace_id,
         agent_id: spec.agent.id,
         session_id: newId("session", { rng, at: createdMs }),
@@ -806,7 +1052,7 @@ function seedRuns(db: Db, rng: Rng, nowMs: number, specs: RunSeed[]) {
         if (outcome === "paused") {
           if (leaveWaiting) break;
           clock += 20_000 + Math.floor(rng() * 200_000);
-          const approval = [...(db.run_events[run.id] ?? [])].reverse().find((e) => e.type === "approval.requested");
+          const approval = [...timelineOf(db, run)].reverse().find((e) => e.type === "approval.requested");
           if (approval?.type !== "approval.requested") break;
           resolveApproval(
             db,
@@ -838,9 +1084,9 @@ function seedConnectSessions(
     const created = Date.parse(spec.installation.created_at) - 2 * MINUTE;
     const row: ConnectSessionRow = {
       id: newId("connect_session", { rng, at: created }),
-      reference_hash: null,
-      workspace_id: spec.ws.id,
       organization_id: spec.ws.organization_id,
+      workspace_id: spec.ws.id,
+      reference_hash: null,
       environment: spec.ws.environment,
       app_id: spec.app.id,
       configuration_version: spec.installation.configuration_version,

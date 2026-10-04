@@ -6,7 +6,6 @@
  * allowlisting and single-use Connect sessions.
  */
 import {
-  type AgentGrant,
   APP_KINDS,
   type AppInstallationRef,
   type AvailableApp,
@@ -16,6 +15,7 @@ import {
   type Id,
   type IdKind,
   type ModelOption,
+  type OrganizationId,
   RUN_STATUSES,
   TERMINAL_RUN_STATUSES,
   type UsageReport,
@@ -52,18 +52,21 @@ import {
   toConfiguration,
   toConfigurationSummary,
   toConnectSession,
+  toGrant,
   toInstallation,
   toMember,
   toOrganization,
   toRun,
+  toRunEvent,
   toWorkspace,
   type WorkspaceAccess,
   workspaceAccess,
 } from "./http";
 import { hashReference, isId, newId, newReference } from "./ids";
-import type { AgentRow, AppRow, ConfigurationRow, ConnectSessionRow, InstallationRow, RunRow } from "./model";
+import type { AgentRow, AppRow, ConfigurationRow, ConnectSessionRow, GrantRow, InstallationRow, RunRow } from "./model";
 import { hash, token } from "./random";
 import { cancelRun, enqueueRun, planRun } from "./runner";
+import { configurationOf, inWorkspace, runEventsKey, timelineOf } from "./scope";
 
 const MODELS: ModelOption[] = [
   {
@@ -134,14 +137,26 @@ function idParam<P extends keyof typeof ID_PARAMS>(
   return value as Id<(typeof ID_PARAMS)[P][0]>;
 }
 
-function configurationFor(app: AppRow, env: Environment): ConfigurationRow {
+/**
+ * An app's configuration in one environment, created empty on first read.
+ * Scope comes from the request: the organization, and the workspace for a
+ * workspace app (null for an organization app).
+ */
+function configurationFor(
+  scope: { organization_id: OrganizationId; workspace_id: WorkspaceId | null },
+  app: AppRow,
+  env: Environment,
+): ConfigurationRow {
+  if (app.organization_id !== scope.organization_id || app.owner_workspace_id !== scope.workspace_id) {
+    throw notFound("App");
+  }
   const d = db();
-  let row = d.configurations.find((c) => c.app_id === app.id && c.environment === env);
+  let row = configurationOf(d.configurations, app, env);
   if (!row) {
     row = {
+      organization_id: scope.organization_id,
+      workspace_id: scope.workspace_id,
       app_id: app.id,
-      organization_id: app.organization_id,
-      workspace_id: app.owner_workspace_id,
       environment: env,
       version: 0,
       mcp_server_url: null,
@@ -167,12 +182,7 @@ function availableApps(access: WorkspaceAccess): AvailableApp[] {
         (a.owner_workspace_id === null || a.owner_workspace_id === workspace.id),
     )
     .flatMap((app) => {
-      const config = db().configurations.find(
-        (c) =>
-          c.organization_id === workspace.organization_id &&
-          c.app_id === app.id &&
-          c.environment === workspace.environment,
-      );
+      const config = configurationOf(db().configurations, app, workspace.environment);
       if (!config || configurationStatus(config) !== "ready") return [];
       return [{ app: toApp(app), configuration: toConfigurationSummary(config) }];
     });
@@ -214,19 +224,19 @@ function findWorkspaceApp(access: WorkspaceAccess, appId: string): AppRow {
 }
 
 function findInstallation(access: WorkspaceAccess, installationId: string): InstallationRow {
-  const row = db().installations.find((i) => i.workspace_id === access.workspace.id && i.id === installationId);
+  const row = db().installations.find((i) => inWorkspace(i, access.workspace) && i.id === installationId);
   if (!row) throw notFound("Installation");
   return row;
 }
 
 function findAgent(access: WorkspaceAccess, agentId: string): AgentRow {
-  const row = db().agents.find((a) => a.workspace_id === access.workspace.id && a.id === agentId);
+  const row = db().agents.find((a) => inWorkspace(a, access.workspace) && a.id === agentId);
   if (!row) throw notFound("Agent");
   return row;
 }
 
 function findRun(access: WorkspaceAccess, runId: string): RunRow {
-  const row = db().runs.find((r) => r.workspace_id === access.workspace.id && r.id === runId);
+  const row = db().runs.find((r) => inWorkspace(r, access.workspace) && r.id === runId);
   if (!row) throw notFound("Run");
   return row;
 }
@@ -405,12 +415,7 @@ function assertStillEligible(session: ConnectSessionRow): AppRow {
   const scope = sessionScope(session);
   const app = scope.app();
   const workspace = scope.workspace();
-  const config = app
-    ? db().configurations.find(
-        (c) =>
-          c.organization_id === session.organization_id && c.app_id === app.id && c.environment === session.environment,
-      )
-    : undefined;
+  const config = app ? configurationOf(db().configurations, app, session.environment) : undefined;
   if (!app || !workspace || workspace.environment !== session.environment) {
     throw new ApiFailure(422, "app_not_eligible", "This app is no longer available to this workspace.");
   }
@@ -431,10 +436,7 @@ function completeSession(
 ): ConnectResult {
   const now = new Date().toISOString();
   const d = db();
-  const config = d.configurations.find(
-    (c) =>
-      c.organization_id === session.organization_id && c.app_id === app.id && c.environment === session.environment,
-  );
+  const config = configurationOf(d.configurations, app, session.environment);
   let installation: InstallationRow;
 
   if (session.intent === "reconnect") {
@@ -464,8 +466,8 @@ function completeSession(
   } else {
     installation = {
       id: newId("installation"),
-      workspace_id: session.workspace_id,
       organization_id: session.organization_id,
+      workspace_id: session.workspace_id,
       app_id: app.id,
       label: session.label,
       status: "connected",
@@ -637,7 +639,7 @@ export function createHandlers(apiBase: string) {
           buckets.set(date, { date, runs: 0, failed_runs: 0, tool_calls: 0 });
         }
         for (const run of db().runs) {
-          if (!workspaceIds.has(run.workspace_id)) continue;
+          if (run.organization_id !== access.org.id || !workspaceIds.has(run.workspace_id)) continue;
           const bucket = buckets.get(run.created_at.slice(0, 10));
           if (!bucket) continue;
           bucket.runs += 1;
@@ -730,7 +732,8 @@ export function createHandlers(apiBase: string) {
         const owners = db().memberships.filter(
           (m) => m.organization_id === access.org.id && m.role === "owner" && m.status === "active",
         );
-        if (member.role === "owner" && input.role !== "owner" && owners.length <= 1) {
+        // Only an active owner can be the last one; an invited owner can always be changed.
+        if (member.role === "owner" && member.status === "active" && input.role !== "owner" && owners.length <= 1) {
           throw new ApiFailure(422, "last_owner", "An organization needs at least one owner.");
         }
         member.role = input.role;
@@ -749,12 +752,16 @@ export function createHandlers(apiBase: string) {
           (m) => m.organization_id === access.org.id && m.id === idParam(params, "member"),
         );
         if (!member) throw notFound("Member");
-        if (member.role === "owner") {
-          const owners = d.memberships.filter((m) => m.organization_id === access.org.id && m.role === "owner");
+        // Only owners remove an owner, invited or active (403 before any 422).
+        if (member.role === "owner") requireRole(access, ["owner"], "remove an owner");
+        if (member.role === "owner" && member.status === "active") {
+          // Active owners only: an invited owner can't run the organization yet.
+          const owners = d.memberships.filter(
+            (m) => m.organization_id === access.org.id && m.role === "owner" && m.status === "active",
+          );
           if (owners.length <= 1) {
             throw new ApiFailure(422, "last_owner", "An organization needs at least one owner.");
           }
-          requireRole(access, ["owner"], "remove an owner");
         }
         d.memberships = d.memberships.filter((m) => m !== member);
         audit(access, "member.removed", { type: "member", id: member.id, name: toMember(member).user.email });
@@ -785,7 +792,9 @@ export function createHandlers(apiBase: string) {
           const since = Date.now() - 24 * 3600_000;
           const recent = new Map<string, number>();
           for (const r of db().runs) {
-            if (Date.parse(r.created_at) >= since) recent.set(r.workspace_id, (recent.get(r.workspace_id) ?? 0) + 1);
+            if (r.organization_id === access.org.id && Date.parse(r.created_at) >= since) {
+              recent.set(r.workspace_id, (recent.get(r.workspace_id) ?? 0) + 1);
+            }
           }
           rows = rows.sort((a, b) => (recent.get(b.id) ?? 0) - (recent.get(a.id) ?? 0) || a.name.localeCompare(b.name));
         } else {
@@ -878,24 +887,35 @@ export function createHandlers(apiBase: string) {
         const access = workspaceAccess(request, param(params, "ws"));
         requireRole(access, ["owner"], "delete workspaces");
         const d = db();
-        const id = access.workspace.id;
-        const appIds = new Set(d.apps.filter((a) => a.owner_workspace_id === id).map((a) => a.id));
-        for (const run of d.runs.filter((r) => r.workspace_id === id)) {
-          cancelScheduledRun(run.id);
-          delete d.run_events[run.id];
+        const workspace = access.workspace;
+        const here = (row: { organization_id: OrganizationId; workspace_id: WorkspaceId }) =>
+          inWorkspace(row, workspace);
+        for (const run of d.runs.filter(here)) {
+          cancelScheduledRun(run);
+          const key = runEventsKey(run);
+          const rest = (d.run_events[key] ?? []).filter((e) => !here(e));
+          if (rest.length > 0) d.run_events[key] = rest;
+          else delete d.run_events[key];
         }
-        d.runs = d.runs.filter((r) => r.workspace_id !== id);
-        d.grants = d.grants.filter((g) => g.workspace_id !== id);
-        d.agents = d.agents.filter((a) => a.workspace_id !== id);
-        d.installations = d.installations.filter((i) => i.workspace_id !== id);
-        d.connect_sessions = d.connect_sessions.filter((s) => s.workspace_id !== id);
-        d.configurations = d.configurations.filter((c) => !appIds.has(c.app_id));
-        d.apps = d.apps.filter((a) => !appIds.has(a.id));
-        d.workspaces = d.workspaces.filter((w) => w.id !== id);
+        d.runs = d.runs.filter((r) => !here(r));
+        d.grants = d.grants.filter((g) => !here(g));
+        d.agents = d.agents.filter((a) => !here(a));
+        d.installations = d.installations.filter((i) => !here(i));
+        d.connect_sessions = d.connect_sessions.filter((s) => !here(s));
+        // The workspace's own apps and their configurations, which carry the workspace too.
+        d.configurations = d.configurations.filter(
+          (c) => !(c.organization_id === workspace.organization_id && c.workspace_id === workspace.id),
+        );
+        d.apps = d.apps.filter(
+          (a) => !(a.organization_id === workspace.organization_id && a.owner_workspace_id === workspace.id),
+        );
+        d.workspaces = d.workspaces.filter(
+          (w) => !(w.organization_id === workspace.organization_id && w.id === workspace.id),
+        );
         audit(
           access,
           "workspace.deleted",
-          { type: "workspace", id, name: access.workspace.name },
+          { type: "workspace", id: workspace.id, name: workspace.name },
           { environment: access.workspace.environment },
         );
         return noContent();
@@ -922,7 +942,8 @@ export function createHandlers(apiBase: string) {
         const access = orgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "add apps to the catalog");
         const app = createApp(access, await body(request, appInput), null);
-        for (const env of ENVIRONMENTS) configurationFor(app, env);
+        for (const env of ENVIRONMENTS)
+          configurationFor({ organization_id: access.org.id, workspace_id: null }, app, env);
         audit(access, "app.created", { type: "app", id: app.id, name: app.name });
         return created(toApp(app));
       }),
@@ -961,7 +982,9 @@ export function createHandlers(apiBase: string) {
         const app = findOrgApp(access, idParam(params, "app"));
         const env = environment.safeParse(param(params, "env"));
         if (!env.success) throw notFound("Environment");
-        return ok(toConfiguration(configurationFor(app, env.data), app));
+        return ok(
+          toConfiguration(configurationFor({ organization_id: access.org.id, workspace_id: null }, app, env.data), app),
+        );
       }),
     ),
 
@@ -973,7 +996,7 @@ export function createHandlers(apiBase: string) {
         const app = findOrgApp(access, idParam(params, "app"));
         const env = environment.safeParse(param(params, "env"));
         if (!env.success) throw notFound("Environment");
-        const row = configurationFor(app, env.data);
+        const row = configurationFor({ organization_id: access.org.id, workspace_id: null }, app, env.data);
         applyConfiguration(access, app, row, await body(request, configurationInput));
         audit(
           access,
@@ -997,7 +1020,7 @@ export function createHandlers(apiBase: string) {
           .installations.filter((i) => i.organization_id === access.org.id && i.app_id === app.id)
           .sort((a, b) => b.created_at.localeCompare(a.created_at))
           .flatMap((i) => {
-            const w = db().workspaces.find((x) => x.id === i.workspace_id);
+            const w = db().workspaces.find((x) => x.organization_id === access.org.id && x.id === i.workspace_id);
             return w && (!env || w.environment === env)
               ? [
                   {
@@ -1019,7 +1042,7 @@ export function createHandlers(apiBase: string) {
         const access = workspaceAccess(request, param(params, "ws"));
         return ok(
           db()
-            .apps.filter((a) => a.owner_workspace_id === access.workspace.id)
+            .apps.filter((a) => a.organization_id === access.org.id && a.owner_workspace_id === access.workspace.id)
             .sort((a, b) => a.name.localeCompare(b.name))
             .map(toApp),
         );
@@ -1032,7 +1055,11 @@ export function createHandlers(apiBase: string) {
         const access = workspaceAccess(request, param(params, "ws"));
         requireRole(access, ADMINS, "create workspace apps");
         const app = createApp(access, await body(request, appInput), access.workspace.id);
-        configurationFor(app, access.workspace.environment);
+        configurationFor(
+          { organization_id: access.org.id, workspace_id: access.workspace.id },
+          app,
+          access.workspace.environment,
+        );
         audit(access, "app.created", { type: "app", id: app.id, name: app.name }, { workspace: access.workspace });
         return created(toApp(app));
       }),
@@ -1068,7 +1095,16 @@ export function createHandlers(apiBase: string) {
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
         const app = findWorkspaceApp(access, idParam(params, "app"));
-        return ok(toConfiguration(configurationFor(app, access.workspace.environment), app));
+        return ok(
+          toConfiguration(
+            configurationFor(
+              { organization_id: access.org.id, workspace_id: access.workspace.id },
+              app,
+              access.workspace.environment,
+            ),
+            app,
+          ),
+        );
       }),
     ),
 
@@ -1089,7 +1125,11 @@ export function createHandlers(apiBase: string) {
             `Workspace apps inherit the workspace's environment (${access.workspace.environment}).`,
           );
         }
-        const row = configurationFor(app, access.workspace.environment);
+        const row = configurationFor(
+          { organization_id: access.org.id, workspace_id: access.workspace.id },
+          app,
+          access.workspace.environment,
+        );
         applyConfiguration(access, app, row, await body(request, configurationInput));
         audit(
           access,
@@ -1113,7 +1153,7 @@ export function createHandlers(apiBase: string) {
         const access = workspaceAccess(request, param(params, "ws"));
         return ok(
           db()
-            .installations.filter((i) => i.workspace_id === access.workspace.id)
+            .installations.filter((i) => inWorkspace(i, access.workspace))
             .sort((a, b) => b.created_at.localeCompare(a.created_at))
             .map(toInstallation),
         );
@@ -1147,7 +1187,7 @@ export function createHandlers(apiBase: string) {
         const row = findInstallation(access, idParam(params, "inst"));
         row.status = "disconnected";
         row.updated_at = new Date().toISOString();
-        const app = db().apps.find((a) => a.id === row.app_id);
+        const app = appInScope(row);
         audit(
           access,
           "installation.disconnected",
@@ -1165,9 +1205,9 @@ export function createHandlers(apiBase: string) {
         requireRole(access, ADMINS, "remove installations");
         const row = findInstallation(access, idParam(params, "inst"));
         const d = db();
-        d.grants = d.grants.filter((g) => !(g.workspace_id === access.workspace.id && g.installation_id === row.id));
+        d.grants = d.grants.filter((g) => !(inWorkspace(g, access.workspace) && g.installation_id === row.id));
         d.installations = d.installations.filter((i) => i !== row);
-        const app = d.apps.find((a) => a.id === row.app_id);
+        const app = appInScope(row);
         audit(
           access,
           "installation.deleted",
@@ -1185,7 +1225,7 @@ export function createHandlers(apiBase: string) {
         const access = workspaceAccess(request, param(params, "ws"));
         return ok(
           db()
-            .connect_sessions.filter((s) => s.workspace_id === access.workspace.id)
+            .connect_sessions.filter((s) => inWorkspace(s, access.workspace))
             .map((s) => toConnectSession(withExpiry(s))),
         );
       }),
@@ -1196,7 +1236,7 @@ export function createHandlers(apiBase: string) {
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
         const session = db().connect_sessions.find(
-          (s) => s.workspace_id === access.workspace.id && s.id === idParam(params, "session"),
+          (s) => inWorkspace(s, access.workspace) && s.id === idParam(params, "session"),
         );
         if (!session) throw notFound("Connect session");
         return ok(toConnectSession(withExpiry(session)));
@@ -1265,19 +1305,14 @@ export function createHandlers(apiBase: string) {
           workspace_id: access.workspace.id,
           app_id: available.app.id,
         });
-        const config = db().configurations.find(
-          (c) =>
-            c.organization_id === access.org.id &&
-            c.app_id === available.app.id &&
-            c.environment === access.workspace.environment,
-        );
+        const config = app ? configurationOf(db().configurations, app, access.workspace.environment) : undefined;
         const now = Date.now();
         const reference = newReference();
         const session: ConnectSessionRow = {
           id: newId("connect_session"),
-          reference_hash: await hashReference(reference),
-          workspace_id: access.workspace.id,
           organization_id: access.org.id,
+          workspace_id: access.workspace.id,
+          reference_hash: await hashReference(reference),
           environment: access.workspace.environment,
           app_id: input.app_id,
           configuration_version: config?.version ?? 1,
@@ -1400,7 +1435,7 @@ export function createHandlers(apiBase: string) {
         const access = workspaceAccess(request, param(params, "ws"));
         return ok(
           db()
-            .agents.filter((a) => a.workspace_id === access.workspace.id)
+            .agents.filter((a) => inWorkspace(a, access.workspace))
             .sort((a, b) => a.name.localeCompare(b.name))
             .map(toAgent),
         );
@@ -1423,6 +1458,7 @@ export function createHandlers(apiBase: string) {
         const now = new Date().toISOString();
         const row: AgentRow = {
           id: newId("agent"),
+          organization_id: access.org.id,
           workspace_id: access.workspace.id,
           ...input,
           status: "active",
@@ -1479,7 +1515,7 @@ export function createHandlers(apiBase: string) {
         const access = workspaceAccess(request, param(params, "ws"));
         const row = findAgent(access, idParam(params, "agent"));
         const d = db();
-        d.grants = d.grants.filter((g) => !(g.workspace_id === access.workspace.id && g.agent_id === row.id));
+        d.grants = d.grants.filter((g) => !(inWorkspace(g, access.workspace) && g.agent_id === row.id));
         d.agents = d.agents.filter((a) => a !== row);
         audit(access, "agent.deleted", { type: "agent", id: row.id, name: row.name }, { workspace: access.workspace });
         return noContent();
@@ -1492,7 +1528,11 @@ export function createHandlers(apiBase: string) {
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
         const agent = findAgent(access, idParam(params, "agent"));
-        return ok(db().grants.filter((g) => g.workspace_id === access.workspace.id && g.agent_id === agent.id));
+        return ok(
+          db()
+            .grants.filter((g) => inWorkspace(g, access.workspace) && g.agent_id === agent.id)
+            .map(toGrant),
+        );
       }),
     ),
 
@@ -1511,13 +1551,10 @@ export function createHandlers(apiBase: string) {
         );
         // Workspace-coherent: an installation from another workspace is absent.
         const installation = findInstallation(access, input.installation_id);
-        validateTools(installation, input.tools, input.approval_required);
+        validateTools(access, installation, input.tools, input.approval_required);
         if (
           db().grants.some(
-            (g) =>
-              g.workspace_id === access.workspace.id &&
-              g.agent_id === agent.id &&
-              g.installation_id === installation.id,
+            (g) => inWorkspace(g, access.workspace) && g.agent_id === agent.id && g.installation_id === installation.id,
           )
         ) {
           throw new ApiFailure(
@@ -1527,8 +1564,9 @@ export function createHandlers(apiBase: string) {
           );
         }
         const now = new Date().toISOString();
-        const grant: AgentGrant = {
+        const grant: GrantRow = {
           id: newId("grant"),
+          organization_id: access.org.id,
           workspace_id: access.workspace.id,
           agent_id: agent.id,
           installation_id: installation.id,
@@ -1544,7 +1582,7 @@ export function createHandlers(apiBase: string) {
           { type: "agent", id: agent.id, name: agent.name },
           { workspace: access.workspace },
         );
-        return created(grant);
+        return created(toGrant(grant));
       }),
     ),
 
@@ -1554,7 +1592,7 @@ export function createHandlers(apiBase: string) {
         const access = workspaceAccess(request, param(params, "ws"));
         const agent = findAgent(access, idParam(params, "agent"));
         const grant = db().grants.find(
-          (g) => g.workspace_id === access.workspace.id && g.agent_id === agent.id && g.id === idParam(params, "grant"),
+          (g) => inWorkspace(g, access.workspace) && g.agent_id === agent.id && g.id === idParam(params, "grant"),
         );
         if (!grant) throw notFound("Grant");
         const input = await body(
@@ -1564,7 +1602,7 @@ export function createHandlers(apiBase: string) {
             approval_required: z.array(z.string()),
           }),
         );
-        validateTools(findInstallation(access, grant.installation_id), input.tools, input.approval_required);
+        validateTools(access, findInstallation(access, grant.installation_id), input.tools, input.approval_required);
         grant.tools = input.tools;
         grant.approval_required = input.approval_required;
         grant.updated_at = new Date().toISOString();
@@ -1574,7 +1612,7 @@ export function createHandlers(apiBase: string) {
           { type: "agent", id: agent.id, name: agent.name },
           { workspace: access.workspace },
         );
-        return ok(grant);
+        return ok(toGrant(grant));
       }),
     ),
 
@@ -1585,7 +1623,7 @@ export function createHandlers(apiBase: string) {
         const agent = findAgent(access, idParam(params, "agent"));
         const d = db();
         const grant = d.grants.find(
-          (g) => g.workspace_id === access.workspace.id && g.agent_id === agent.id && g.id === idParam(params, "grant"),
+          (g) => inWorkspace(g, access.workspace) && g.agent_id === agent.id && g.id === idParam(params, "grant"),
         );
         if (!grant) throw notFound("Grant");
         d.grants = d.grants.filter((g) => g !== grant);
@@ -1614,7 +1652,7 @@ export function createHandlers(apiBase: string) {
         const rows = db()
           .runs.filter(
             (r) =>
-              r.workspace_id === access.workspace.id &&
+              inWorkspace(r, access.workspace) &&
               (!agentId || r.agent_id === agentId) &&
               (!status || r.status === status),
           )
@@ -1649,7 +1687,10 @@ export function createHandlers(apiBase: string) {
         );
         const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 25), 1), 100);
         const rows = db()
-          .runs.filter((r) => workspaces.has(r.workspace_id) && (!status || r.status === status))
+          .runs.filter(
+            (r) =>
+              r.organization_id === access.org.id && workspaces.has(r.workspace_id) && (!status || r.status === status),
+          )
           .sort((a, b) => b.created_at.localeCompare(a.created_at));
         const { page, meta } = paginate(rows, url.searchParams.get("cursor"), limit);
         return ok(
@@ -1687,6 +1728,7 @@ export function createHandlers(apiBase: string) {
         );
         const run: RunRow = {
           id: newId("run"),
+          organization_id: access.org.id,
           workspace_id: access.workspace.id,
           agent_id: agent.id,
           session_id: newId("session"),
@@ -1704,7 +1746,7 @@ export function createHandlers(apiBase: string) {
         run.plan = planRun(db(), run);
         db().runs.unshift(run);
         enqueueRun(db(), run);
-        scheduleRun(run.id);
+        scheduleRun(run);
         return created(toRun(run));
       }),
     ),
@@ -1723,7 +1765,11 @@ export function createHandlers(apiBase: string) {
         const access = workspaceAccess(request, param(params, "ws"));
         const run = findRun(access, idParam(params, "run"));
         const after = Number(new URL(request.url).searchParams.get("after") ?? 0);
-        return ok((db().run_events[run.id] ?? []).filter((e) => e.sequence > after));
+        return ok(
+          timelineOf(db(), run)
+            .filter((e) => inWorkspace(e, access.workspace) && e.run_id === run.id && e.sequence > after)
+            .map(toRunEvent),
+        );
       }),
     ),
 
@@ -1735,7 +1781,7 @@ export function createHandlers(apiBase: string) {
         if (TERMINAL_RUN_STATUSES.includes(run.status)) {
           throw new ApiFailure(409, "run_finished", "This run already finished.");
         }
-        cancelScheduledRun(run.id);
+        cancelScheduledRun(run);
         cancelRun(db(), run, access.user.name, new Date().toISOString());
         return ok(toRun(run));
       }),
@@ -2037,7 +2083,9 @@ export function createHandlers(apiBase: string) {
         const { page, meta } = paginate(rows, url.searchParams.get("cursor"), limit);
         return ok(
           page.map((e) => {
-            const w = e.workspace_id ? db().workspaces.find((x) => x.id === e.workspace_id) : undefined;
+            const w = e.workspace_id
+              ? db().workspaces.find((x) => x.organization_id === access.org.id && x.id === e.workspace_id)
+              : undefined;
             return {
               ...e,
               workspace: w ? { id: w.id, name: w.name, slug: w.slug, environment: w.environment } : null,
@@ -2059,8 +2107,14 @@ export function createHandlers(apiBase: string) {
   ];
 }
 
-function validateTools(installation: InstallationRow, tools: string[], approvalRequired: string[]) {
-  const app = db().apps.find((a) => a.id === installation.app_id);
+function validateTools(
+  access: WorkspaceAccess,
+  installation: InstallationRow,
+  tools: string[],
+  approvalRequired: string[],
+) {
+  if (!inWorkspace(installation, access.workspace)) throw notFound("Installation");
+  const app = appInScope(installation);
   const known = new Set(app?.tools.map((t) => t.name));
   const unknown = tools.find((t) => !known.has(t));
   if (unknown) {

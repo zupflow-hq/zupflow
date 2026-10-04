@@ -2,12 +2,14 @@ import "./styles.css";
 import "@/lib/router-types";
 import { QueryCache, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createRouter, RouterProvider } from "@tanstack/react-router";
-import { ZupflowApiError } from "@zupflow/sdk";
+import { type Viewer, ZupflowApiError } from "@zupflow/sdk";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { session } from "@/features/auth/session";
+import { setOrganizationSource } from "@/lib/api";
 import { config } from "@/lib/env";
 import { canonicalizeEnvironmentUrl, environmentRewrite } from "@/lib/environment-url";
+import { qk } from "@/lib/query-keys";
 import { ThemeProvider } from "@/lib/theme";
 import { routeTree } from "./routeTree.gen";
 
@@ -39,6 +41,15 @@ const router = createRouter({
   defaultPreloadStaleTime: 0,
   scrollRestoration: true,
   rewrite: environmentRewrite,
+});
+
+// Workspace requests name the organization of the page the router is on (the
+// first path segment), read as each request is sent. Preloading another
+// organization's link doesn't move the router, so it can't change this.
+setOrganizationSource(() => {
+  const slug = router.latestLocation.pathname.split("/")[1];
+  const viewer = queryClient.getQueryData<Viewer>(qk.viewer);
+  return viewer?.organizations.find((o) => o.slug === slug)?.id ?? null;
 });
 
 declare module "@tanstack/react-router" {

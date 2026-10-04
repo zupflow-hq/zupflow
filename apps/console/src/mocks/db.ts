@@ -2,7 +2,7 @@
  * The mock API's storage: one in-memory database, persisted to localStorage so
  * the demo survives a reload, plus the timers that advance live runs.
  */
-import type { Db, RunRow } from "./model";
+import type { Db, RunRow, RunScope } from "./model";
 import { rngFor } from "./random";
 import { advanceRun } from "./runner";
 import { DB_SCHEMA, seed } from "./seed";
@@ -57,7 +57,9 @@ export function resetDb() {
 // ---------------------------------------------------------------------------
 // Live run scheduling
 
+/** Timers keyed by the run's full scope, so cancelling needs the run's organization and workspace too. */
 const timers = new Map<string, ReturnType<typeof setTimeout>>();
+const timerKey = (scope: RunScope) => `${scope.organization_id}/${scope.workspace_id}/${scope.id}`;
 
 function delayFor(run: RunRow): number {
   const next = run.plan[0];
@@ -77,38 +79,57 @@ function delayFor(run: RunRow): number {
   }
 }
 
-/** Advance a live run until it pauses or finishes. */
-export function scheduleRun(runId: string) {
-  const existing = timers.get(runId);
-  if (existing) clearTimeout(existing);
-  const run = db().runs.find((r) => r.id === runId);
-  if (!run || run.plan.length === 0) return;
+const findRun = (scope: RunScope) =>
+  db().runs.find(
+    (r) => r.organization_id === scope.organization_id && r.workspace_id === scope.workspace_id && r.id === scope.id,
+  );
 
-  const rng = rngFor(`${runId}:${run.plan.length}`);
+/** Advance a live run until it pauses or finishes. */
+export function scheduleRun(scope: RunScope): boolean {
+  const key = timerKey(scope);
+  const existing = timers.get(key);
+  if (existing) clearTimeout(existing);
+  timers.delete(key);
+  const run = findRun(scope);
+  if (!run || run.plan.length === 0) return false;
+
+  const rng = rngFor(`${scope.id}:${run.plan.length}`);
   timers.set(
-    runId,
+    key,
     setTimeout(() => {
-      timers.delete(runId);
-      const live = db().runs.find((r) => r.id === runId);
+      timers.delete(key);
+      const live = findRun(scope);
       if (!live || live.status === "cancelled" || live.status === "waiting_for_approval") return;
       const outcome = advanceRun(db(), live, new Date().toISOString(), rng);
       persist();
-      if (outcome === "continue") scheduleRun(runId);
+      if (outcome === "continue") scheduleRun(scope);
     }, delayFor(run)),
   );
+  return true;
 }
 
-export function cancelScheduledRun(runId: string) {
-  const timer = timers.get(runId);
+/** Whether this exact run, in this scope, has a timer: for tests and diagnostics. */
+export function isRunScheduled(scope: RunScope): boolean {
+  return timers.has(timerKey(scope));
+}
+
+export function cancelScheduledRun(scope: RunScope) {
+  const key = timerKey(scope);
+  const timer = timers.get(key);
   if (timer) clearTimeout(timer);
-  timers.delete(runId);
+  timers.delete(key);
 }
 
-/** Pick up runs that were mid-flight when the page was last closed. */
-export function resumeLiveRuns() {
+/**
+ * Cross-tenant by design, like a backend worker claiming work: picks up runs
+ * of every organization that were mid-flight when the page was last closed.
+ * It reads only each run's scope; everything after is scoped to that run's
+ * organization and workspace.
+ */
+export function resumeLiveRunsCrossTenant() {
   for (const run of db().runs) {
     if ((run.status === "queued" || run.status === "running") && run.plan.length > 0) {
-      scheduleRun(run.id);
+      scheduleRun({ id: run.id, organization_id: run.organization_id, workspace_id: run.workspace_id });
     }
   }
 }

@@ -7,8 +7,9 @@
 import type { ApiKeyId, RunError, RunEvent, RunEventType, ToolCallId } from "@zupflow/sdk";
 import { sampleToolCall } from "./catalog";
 import { newId } from "./ids";
-import type { Db, PlannedCall, RunRow, RunStep } from "./model";
+import type { Db, PlannedCall, RunEventRow, RunRow, RunStep } from "./model";
 import { type Rng, rngFor } from "./random";
+import { appIn, runEventsKey, sameWorkspace, timelineOf } from "./scope";
 
 const SUMMARY: Record<string, (label: string) => string> = {
   search_files: (l) => `found the relevant files in ${l}`,
@@ -38,20 +39,23 @@ function sentence(parts: string[]): string {
 /** Decide what the run will do, from the agent's grants at creation time. */
 export function planRun(
   db: Db,
-  run: Pick<RunRow, "id" | "workspace_id" | "agent_id" | "input" | "created_at">,
+  run: Pick<RunRow, "id" | "organization_id" | "workspace_id" | "agent_id" | "input" | "created_at">,
   rng: Rng = rngFor(run.id),
 ) {
   const at = Date.parse(run.created_at);
-  const grants = db.grants.filter((g) => g.workspace_id === run.workspace_id && g.agent_id === run.agent_id);
+  const grants = db.grants.filter((g) => sameWorkspace(g, run) && g.agent_id === run.agent_id);
 
   type Candidate = { call: PlannedCall; effect: string; approval: boolean };
   const candidates: Candidate[] = [];
   for (const grant of grants) {
-    const installation = db.installations.find(
-      (i) => i.workspace_id === run.workspace_id && i.id === grant.installation_id,
-    );
+    const installation = db.installations.find((i) => sameWorkspace(i, run) && i.id === grant.installation_id);
     if (!installation) continue;
-    const app = db.apps.find((a) => a.id === installation.app_id);
+    // The app is looked up within the run's scope, never the installation row's own label.
+    const app = appIn(db.apps, {
+      organization_id: run.organization_id,
+      workspace_id: run.workspace_id,
+      app_id: installation.app_id,
+    });
     if (!app) continue;
     for (const toolName of grant.tools) {
       const tool = app.tools.find((t) => t.name === toolName);
@@ -149,17 +153,20 @@ function pushEvent<T extends RunEventType>(
   type: T,
   data: Extract<RunEvent, { type: T }>["data"],
 ) {
-  const list = db.run_events[run.id] ?? [];
-  db.run_events[run.id] = list;
+  const key = runEventsKey(run);
+  const list = db.run_events[key] ?? [];
+  db.run_events[key] = list;
   list.push({
     id: newId("run_event", { at: Date.parse(at) }),
-    run_id: run.id,
+    organization_id: run.organization_id,
     workspace_id: run.workspace_id,
-    sequence: list.length + 1,
+    run_id: run.id,
+    // Counted within the run's own scope only.
+    sequence: timelineOf(db, run).length + 1,
     created_at: at,
     type,
     data,
-  } as RunEvent);
+  } as RunEventRow);
 }
 
 function finish(db: Db, run: RunRow, at: string, error: RunError | null) {
@@ -186,7 +193,7 @@ export type StepOutcome = "continue" | "paused" | "finished";
 export function advanceRun(db: Db, run: RunRow, at: string, rng: Rng): StepOutcome {
   const step = run.plan.shift();
   if (!step) return "finished";
-  const agent = db.agents.find((a) => a.workspace_id === run.workspace_id && a.id === run.agent_id);
+  const agent = db.agents.find((a) => sameWorkspace(a, run) && a.id === run.agent_id);
 
   switch (step.kind) {
     case "start":
@@ -223,9 +230,7 @@ export function advanceRun(db: Db, run: RunRow, at: string, rng: Rng): StepOutco
     case "tool_result": {
       const { arguments: _args, result, error: _error, ...ref } = step.call;
       // Re-check the grant's installation now, not at planning time.
-      const installation = db.installations.find(
-        (i) => i.workspace_id === run.workspace_id && i.id === step.call.installation_id,
-      );
+      const installation = db.installations.find((i) => sameWorkspace(i, run) && i.id === step.call.installation_id);
       if (installation?.status !== "connected") {
         const error: RunError = {
           code: "installation_reconnect_required",

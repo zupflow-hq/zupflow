@@ -1,4 +1,14 @@
+import type { OrganizationId } from "./ids";
 import type { ApiErrorBody, Envelope, Meta } from "./types";
+
+/**
+ * Names the organization a Console session acts in. Workspace routes
+ * (`/v1/workspaces/{ws}`) don't carry it, and a member can belong to several
+ * organizations, so the session says which one; the API checks it against the
+ * membership and the workspace. API keys don't need it: a key belongs to one
+ * organization.
+ */
+export const ORGANIZATION_HEADER = "Zupflow-Organization";
 
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
@@ -53,6 +63,8 @@ export interface HttpTransportOptions {
    * sends the request unauthenticated; the server answers 401.
    */
   getToken: () => Promise<string | null>;
+  /** For Console sessions: the organization each request acts in. */
+  getOrganization?: () => OrganizationId | null;
   fetch?: typeof fetch;
 }
 
@@ -80,6 +92,8 @@ export function createHttpTransport(options: HttpTransportOptions): Transport {
       const headers = new Headers({ Accept: "application/json" });
       const token = await options.getToken();
       if (token) headers.set("Authorization", `Bearer ${token}`);
+      const organization = options.getOrganization?.();
+      if (organization) headers.set(ORGANIZATION_HEADER, organization);
       if (body !== undefined) headers.set("Content-Type", "application/json");
 
       let response: Response;
