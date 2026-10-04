@@ -1,18 +1,23 @@
 /**
- * Contract tests for the mock API. They pin the isolation and Connect rules
- * the Console relies on, so the real backend can be held to the same cases.
+ * Tests for the mock API. The shared contract suite (`@zupflow/contract-tests`)
+ * runs here first, with the black-box cases the backend must pass too. The
+ * rest reach into the mock's database to set up and inspect what the API
+ * can't: isolation across organizations and workspaces, mislabelled rows,
+ * simulated consent and the seed. They move into the shared suite as the API
+ * grows the means to express them.
  *
- * Every response the tests receive is also checked against the contract
- * (`@zupflow/contract`): the route's success status and response schema,
- * with no field the contract doesn't name, pagination where the route
- * promises it, and the error shape on failures.
+ * Every response these tests receive is also checked against the contract.
  */
 
-import { isDeepStrictEqual } from "node:util";
-import { ApiErrorBody, Meta, matchRoute, Pagination, responseDataSchema, routes } from "@zupflow/contract";
+import { routes } from "@zupflow/contract";
 import {
-  type AgentId,
-  type AppId,
+  contractSuite,
+  createResponseChecker,
+  expectSealed,
+  loadTenant,
+  type ResponseChecker,
+} from "@zupflow/contract-tests";
+import {
   createClient,
   createHttpTransport,
   ID_PREFIXES,
@@ -22,7 +27,6 @@ import {
 } from "@zupflow/sdk";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { z } from "zod";
 import { db, resetDb } from "./db";
 import { createHandlers } from "./handlers";
 import { setLatency } from "./http";
@@ -116,81 +120,37 @@ const mockOnly = (method: string, path: string) =>
     return m === method.toLowerCase() && new RegExp(`^${p.replace(/\{[^}]+\}/g, "[^/]+")}$`).test(path);
   });
 
-const violations: string[] = [];
-/** Routes whose success response has been checked against the contract. */
-const succeeded = new Set<string>();
-
-/** Check one response against the contract; record what doesn't match. */
-async function checkContract(request: Request, response: Response) {
-  const url = new URL(request.url);
-  if (!url.pathname.startsWith("/api/")) return;
-  const path = url.pathname.slice("/api".length);
-  const where = `${request.method} ${path}`;
-  if (mockOnly(request.method, path)) return;
-  const route = matchRoute(request.method, path);
-  if (!route) {
-    violations.push(`${where}: no route in the contract`);
-    return;
-  }
-  if (response.status === 204) {
-    if (route.response.status !== 204)
-      violations.push(`${where}: answered 204, contract says ${route.response.status}`);
-    else succeeded.add(route.operationId);
-    return;
-  }
-  const body = (await response.json()) as { data: unknown; meta: unknown; error: unknown };
-  if (!response.ok) {
-    const error = ApiErrorBody.safeParse(body.error);
-    if (!error.success || body.data !== null || body.meta !== null) {
-      violations.push(`${where}: error body isn't the error envelope`);
-    } else if (!isDeepStrictEqual(error.data, body.error)) {
-      violations.push(`${where}: error fields beyond the contract`);
-    }
-    return;
-  }
-  if (response.status !== route.response.status) {
-    violations.push(`${where}: answered ${response.status}, contract says ${route.response.status}`);
-  }
-  // The envelope itself: exactly data, meta and error, with meta as the contract shapes it.
-  const meta = route.response.paginated ? Meta.extend({ pagination: Pagination }) : Meta.nullable();
-  const envelope = z.strictObject({ data: z.unknown(), meta, error: z.null() }).safeParse(body);
-  if (!envelope.success || !isDeepStrictEqual(envelope.data, body)) {
-    violations.push(`${where}: envelope isn't { data, meta, error } as the contract shapes it`);
-  }
-  const schema = responseDataSchema(route);
-  if (!schema) return;
-  const parsed = schema.safeParse(body.data);
-  if (!parsed.success) {
-    violations.push(`${where}: ${z.prettifyError(parsed.error)}`);
-    return;
-  }
-  // Parsing drops fields the contract doesn't name; anything dropped is a leak.
-  if (!isDeepStrictEqual(parsed.data, body.data)) violations.push(`${where}: fields beyond the contract`);
-  succeeded.add(route.operationId);
-}
-
+let checker: ResponseChecker;
 const unchecked = globalThis.fetch;
 
 beforeAll(() => {
   setLatency([0, 0]);
   server.listen({ onUnhandledFrame: "error" });
-  const intercepted = globalThis.fetch;
-  globalThis.fetch = async (input, init) => {
-    const request = new Request(input, init);
-    const response = await intercepted(request.clone());
-    await checkContract(request, response.clone());
-    return response;
-  };
+  // Every response these tests receive is checked against the contract.
+  checker = createResponseChecker({ baseUrl: API, ignore: mockOnly, fetch: globalThis.fetch });
+  globalThis.fetch = checker.fetch;
 });
 afterAll(() => {
   globalThis.fetch = unchecked;
   server.close();
 });
 afterEach(() => {
-  const found = violations.splice(0);
-  expect(found, "responses that break the contract").toEqual([]);
+  expect(checker.takeViolations(), "responses that break the contract").toEqual([]);
 });
 beforeEach(() => resetDb());
+
+/** The shared contract suite, against the mock: the same cases the backend must pass. */
+const userByEmail = (email: string) => must(db().users.find((u) => u.email === email)?.id, email);
+contractSuite({
+  baseUrl: API,
+  token: async (persona) =>
+    `mock_${{
+      owner: () => DEMO_USER_ID,
+      developer: () => userByEmail("sam@northwind.example"),
+      outsider: () => userByEmail("rowan@larkspur.example"),
+    }[persona]()}`,
+  reset: async () => resetDb(),
+});
 
 describe("the contract", () => {
   it("serves exactly the contract's routes, and nothing else outside the mock-only ones", () => {
@@ -201,322 +161,9 @@ describe("the contract", () => {
     const contract = routes.map((route) => `${route.method} ${route.path}`);
     expect(served.filter((entry) => !MOCK_ONLY.includes(entry)).sort()).toEqual([...contract].sort());
   });
-
-  it("checks a success response from every route against its schema", async () => {
-    succeeded.clear();
-    const org = must(northwindId(), "Northwind");
-    const sandbox = ws("acme-sandbox");
-    const acme = ws("acme");
-
-    // Organization and workspace reads and writes.
-    await owner.me.get();
-    await owner.models.list();
-    await owner.organizations.create({ name: "Contract Co", slug: "contract-co" });
-    await owner.organizations.get(org);
-    await owner.organizations.update(org, { name: "Northwind" });
-    await owner.organizations.usage(org, "production");
-    await owner.members.list(org);
-    const invited = await owner.members.invite(org, { email: "contract@northwind.example", role: "developer" });
-    await owner.members.update(org, invited.id, { role: "admin" });
-    await owner.members.remove(org, invited.id);
-    await owner.workspaces.list(org, { environment: "production" });
-    const workspace = await owner.workspaces.create(org, {
-      name: "Contract",
-      slug: "contract",
-      environment: "sandbox",
-      external_id: null,
-    });
-    await owner.workspaces.get(workspace.id);
-    await owner.workspaces.update(workspace.id, { name: "Contract 2" });
-
-    // Apps, at both levels, including OAuth apps that have no endpoints yet.
-    const oauthApp = { kind: "mcp", description: "", auth_type: "oauth2" } as const;
-    await owner.organizationApps.list(org);
-    const orgApp = await owner.organizationApps.create(org, { ...oauthApp, name: "Org OAuth", slug: "org-oauth" });
-    await owner.organizationApps.get(org, orgApp.id);
-    await owner.organizationApps.update(org, orgApp.id, { description: "Changed" });
-    await owner.organizationApps.getConfiguration(org, orgApp.id, "sandbox");
-    await owner.organizationApps.updateConfiguration(org, orgApp.id, "sandbox", { oauth_client_id: "client" });
-    await owner.organizationApps.installations(org, orgApp.id);
-    await owner.workspaceApps.list(workspace.id);
-    const wsApp = await owner.workspaceApps.create(workspace.id, { ...oauthApp, name: "WS OAuth", slug: "ws-oauth" });
-    await owner.workspaceApps.get(workspace.id, wsApp.id);
-    await owner.workspaceApps.update(workspace.id, wsApp.id, { description: "Changed" });
-    await owner.workspaceApps.getConfiguration(workspace.id, wsApp.id);
-    await owner.workspaceApps.updateConfiguration(workspace.id, wsApp.id, { oauth_client_id: "client" });
-    await owner.workspaceApps.available(workspace.id);
-
-    // Installations and Connect, token and OAuth.
-    const installations = await owner.installations.list(sandbox.id);
-    const installation = must(installations[0], "installation");
-    await owner.installations.get(sandbox.id, installation.id);
-    await owner.installations.update(sandbox.id, installation.id, { label: installation.label });
-    await owner.connectSessions.list(sandbox.id);
-    const session = (appId: AppId, workspaceId = ws("qa-playground").id) =>
-      owner.connectSessions.create(workspaceId, {
-        app_id: appId,
-        intent: "create",
-        label: "Contract",
-        installation_id: null,
-        return_url: null,
-      });
-    const tokenSession = await session(app("echo-server").id);
-    await owner.connectSessions.get(ws("qa-playground").id, tokenSession.id);
-    await owner.connect.get(referenceOf(tokenSession));
-    const connected = await owner.connect.submitCredentials(referenceOf(tokenSession), { values: { token: "abc" } });
-    await owner.connect.authorize(referenceOf(await session(app("google-workspace").id, sandbox.id)));
-    await owner.connect.cancel(referenceOf(await session(app("echo-server").id)));
-    await owner.installations.disconnect(ws("qa-playground").id, connected.installation.id);
-    await owner.installations.delete(ws("qa-playground").id, connected.installation.id);
-
-    // Agents, grants and runs.
-    const agent = must(
-      db().agents.find((a) => a.workspace_id === acme.id && a.status === "active"),
-      "agent",
-    );
-    await owner.agents.list(acme.id);
-    const newAgent = await owner.agents.create(acme.id, {
-      name: "Contract",
-      description: "",
-      instructions: "Be brief.",
-      model: agent.model,
-    });
-    await owner.agents.get(acme.id, newAgent.id);
-    await owner.agents.update(acme.id, newAgent.id, { name: "Contract 2" });
-    const grants = await owner.grants.list(acme.id, agent.id as AgentId);
-    const grant = must(grants[0], "grant");
-    await owner.grants.update(acme.id, agent.id as AgentId, grant.id, {
-      tools: grant.tools,
-      approval_required: grant.approval_required,
-    });
-    // The new agent has no grants yet, so the existing grant's installation is free for it.
-    const newGrant = await owner.grants.create(acme.id, newAgent.id, {
-      installation_id: grant.installation_id,
-      tools: grant.tools.slice(0, 1),
-      approval_required: [],
-    });
-    await owner.grants.delete(acme.id, newAgent.id, newGrant.id);
-    await owner.agents.delete(acme.id, newAgent.id);
-    await owner.organizationRuns.list(org, { environment: "production" });
-    const runs = await owner.runs.list(acme.id);
-    await owner.runs.get(acme.id, must(runs.items[0], "run").id);
-    await owner.runs.events(acme.id, must(runs.items[0], "run").id);
-    const run = await owner.runs.create(
-      sandbox.id,
-      must(
-        db().agents.find((a) => a.workspace_id === sandbox.id && a.status === "active"),
-        "sandbox agent",
-      ).id as AgentId,
-      { input: "Hello" },
-    );
-    await owner.runs.cancel(sandbox.id, run.id);
-
-    // Organization settings.
-    await owner.connectSettings.get(org, "sandbox");
-    await owner.connectSettings.update(org, "sandbox", { return_urls: [], allowed_origins: [] });
-    await owner.apiKeys.list(org);
-    const key = await owner.apiKeys.create(org, { name: "Contract", environment: "sandbox" });
-    await owner.apiKeys.revoke(org, key.key.id);
-    await owner.webhooks.list(org);
-    const hook = await owner.webhooks.create(org, {
-      environment: "sandbox",
-      url: "https://hooks.northwind.example/zupflow",
-      description: "Contract",
-      events: ["run.completed"],
-    });
-    await owner.webhooks.update(org, hook.endpoint.id, { enabled: false });
-    await owner.webhooks.sendTest(org, hook.endpoint.id);
-    await owner.webhooks.delete(org, hook.endpoint.id);
-    await owner.audit.list(org);
-    await owner.workspaces.delete(workspace.id);
-
-    // Approvals succeed only with an API key, which the mock has none of.
-    const unreachable = new Set(["resolveApproval"]);
-    expect(routes.map((r) => r.operationId).filter((id) => !succeeded.has(id) && !unreachable.has(id))).toEqual([]);
-  });
 });
 
-describe("authentication and membership", () => {
-  it("answers 401 without a credential", async () => {
-    const error = await failure(clientFor(null).me.get());
-    expect(error.status).toBe(401);
-    expect(error.code).toBe("unauthenticated");
-  });
-
-  it("checks the credential before parsing an ID, so a signed-out caller always gets 401", async () => {
-    const anonymous = clientFor(null);
-    const org = must(db().organizations[0]?.id, "organization");
-    for (const call of [
-      () => anonymous.workspaces.get("ws_short"),
-      () => anonymous.workspaces.get(ws("acme").id),
-      () => anonymous.members.list("org_short"),
-      () => anonymous.members.list(org),
-      () => anonymous.runs.get(ws("acme").id, "run_short"),
-    ]) {
-      expect((await failure(call())).status).toBe(401);
-    }
-  });
-
-  it("hides another organization's workspace as 404", async () => {
-    const outsider = newId("user");
-    db().users.push({ id: outsider, name: "Out Sider", email: "o@outsider.example", avatar_url: null });
-    const error = await failure(clientFor(outsider).workspaces.get(ws("acme").id));
-    expect(error.status).toBe(404);
-  });
-
-  it("refuses Production keys to developers but allows Sandbox keys", async () => {
-    const sam = db().users.find((u) => u.email === "sam@northwind.example");
-    const orgId = must(db().organizations[0]?.id, "organization");
-    const dev = clientFor(must(sam?.id, "Sam"));
-    const denied = await failure(dev.apiKeys.create(orgId, { name: "x", environment: "production" }));
-    expect(denied.status).toBe(403);
-    const created = await dev.apiKeys.create(orgId, { name: "x", environment: "sandbox" });
-    expect(created.secret.startsWith("zf_test_")).toBe(true);
-    expect(created.key).not.toHaveProperty("secret");
-  });
-});
-
-describe("apps and environments", () => {
-  it("rejects an unsupported app kind instead of coercing it", async () => {
-    const orgId = must(db().organizations[0]?.id, "organization");
-    const error = await failure(
-      owner.organizationApps.create(orgId, {
-        // @ts-expect-error: the contract only accepts "mcp"
-        kind: "openapi",
-        name: "Other",
-        slug: "other",
-        description: "",
-        auth_type: "token",
-      }),
-    );
-    expect(error.code).toBe("unsupported_app_kind");
-  });
-
-  it("never lets a workspace change environment", async () => {
-    const transport = createHttpTransport({
-      baseUrl: API,
-      getToken: async () => `mock_${DEMO_USER_ID}`,
-      getOrganization: () => northwindId() ?? null,
-    });
-    const error = await failure(
-      transport.request({ method: "PATCH", path: `/v1/workspaces/${ws("acme").id}`, body: { environment: "sandbox" } }),
-    );
-    expect(error.code).toBe("environment_immutable");
-  });
-
-  it("offers only apps ready in the workspace's own environment, with no fallback", async () => {
-    // Linear is ready in Sandbox and incomplete in Production.
-    const prod = await owner.workspaceApps.available(ws("acme").id);
-    const sandbox = await owner.workspaceApps.available(ws("acme-sandbox").id);
-    expect(prod.some((a) => a.app.slug === "linear")).toBe(false);
-    expect(sandbox.some((a) => a.app.slug === "linear")).toBe(true);
-
-    // Notion is in the catalog but configured in neither environment.
-    const error = await failure(
-      owner.connectSessions.create(ws("acme-sandbox").id, {
-        app_id: app("notion").id,
-        intent: "create",
-        label: "Docs",
-        installation_id: null,
-        return_url: null,
-      }),
-    );
-    expect(error.code).toBe("configuration_not_ready");
-  });
-
-  it("keeps a workspace app invisible to every other workspace", async () => {
-    // The echo server belongs to the QA playground; Acme's Sandbox can't see it.
-    const echo = app("echo-server");
-    const other = ws("acme-sandbox");
-    const available = await owner.workspaceApps.available(other.id);
-    expect(available.some((a) => a.app.id === echo.id)).toBe(false);
-    expect((await failure(owner.workspaceApps.get(other.id, echo.id))).status).toBe(404);
-    const error = await failure(
-      owner.connectSessions.create(other.id, {
-        app_id: echo.id,
-        intent: "create",
-        label: "Echo",
-        installation_id: null,
-        return_url: null,
-      }),
-    );
-    expect(error.status).toBe(404);
-  });
-
-  it("refuses private and plain-HTTP MCP endpoints", async () => {
-    const orgId = must(db().organizations[0]?.id, "organization");
-    const id = app("notion").id;
-    const local = await failure(
-      owner.organizationApps.updateConfiguration(orgId, id, "sandbox", {
-        mcp_server_url: "https://169.254.169.254/mcp",
-      }),
-    );
-    expect(local.code).toBe("destination_not_allowed");
-    const http = await failure(
-      owner.organizationApps.updateConfiguration(orgId, id, "sandbox", { mcp_server_url: "http://mcp.example.com" }),
-    );
-    expect(http.code).toBe("insecure_url");
-  });
-
-  it("never returns a stored client secret", async () => {
-    const orgId = must(db().organizations[0]?.id, "organization");
-    const config = await owner.organizationApps.updateConfiguration(orgId, app("notion").id, "production", {
-      mcp_server_url: "https://mcp.notion.com/mcp",
-      oauth_client_id: "client",
-      oauth_client_secret: "super-secret-value-1234",
-    });
-    expect(JSON.stringify(config)).not.toContain("super-secret-value");
-    expect(config.oauth?.client_secret).toEqual(expect.objectContaining({ set: true, last4: "1234" }));
-    expect(config.status).toBe("ready");
-  });
-});
-
-describe("Connect", () => {
-  const start = (
-    workspaceId: WorkspaceId,
-    appId: AppId,
-    extra: Partial<Parameters<typeof owner.connectSessions.create>[1]> = {},
-  ) =>
-    owner.connectSessions.create(workspaceId, {
-      app_id: appId,
-      intent: "create",
-      label: "Echo 2",
-      installation_id: null,
-      return_url: null,
-      ...extra,
-    });
-
-  it("only returns to allowlisted URLs", async () => {
-    const error = await failure(
-      start(ws("qa-playground").id, app("echo-server").id, { return_url: "https://evil.example/callback" }),
-    );
-    expect(error.code).toBe("return_url_not_allowed");
-    const ok = await start(ws("qa-playground").id, app("echo-server").id, {
-      return_url: "http://localhost:3000/settings/integrations",
-    });
-    expect(ok.status).toBe("pending");
-  });
-
-  it("completes once and refuses replay", async () => {
-    const session = await start(ws("qa-playground").id, app("echo-server").id);
-    const result = await owner.connect.submitCredentials(referenceOf(session), { values: { token: "abc123" } });
-    expect(result.installation.workspace_id).toBe(ws("qa-playground").id);
-    expect(result.session.status).toBe("completed");
-    const replay = await failure(
-      owner.connect.submitCredentials(referenceOf(session), { values: { token: "abc123" } }),
-    );
-    expect(replay.code).toBe("session_not_pending");
-  });
-
-  it("keeps the session open when the provider rejects a credential", async () => {
-    const session = await start(ws("qa-playground").id, app("echo-server").id);
-    const error = await failure(
-      owner.connect.submitCredentials(referenceOf(session), { values: { token: "invalid" } }),
-    );
-    expect(error.code).toBe("credential_rejected");
-    expect((await owner.connect.get(referenceOf(session))).status).toBe("pending");
-  });
-
+describe("Connect (simulated consent)", () => {
   it("refuses to reconnect a different account", async () => {
     const sandbox = ws("acme-sandbox");
     const installation = db().installations.find(
@@ -538,86 +185,6 @@ describe("Connect", () => {
       }),
     );
     expect(error.code).toBe("account_mismatch");
-  });
-});
-
-describe("grants and runs", () => {
-  it("cannot grant an installation from another workspace", async () => {
-    const acme = ws("acme");
-    const betaInstallation = db().installations.find((i) => i.workspace_id === ws("beta-labs").id);
-    const agent = db().agents.find((a) => a.workspace_id === acme.id && a.status === "active");
-    const error = await failure(
-      owner.grants.create(acme.id, must(agent?.id), {
-        installation_id: must(betaInstallation?.id),
-        tools: ["search_files"],
-        approval_required: [],
-      }),
-    );
-    expect(error.status).toBe(404);
-  });
-
-  it("rejects tools the app doesn't have and approvals outside the grant", async () => {
-    const qa = ws("qa-playground");
-    const agent = await owner.agents.create(qa.id, {
-      name: "Probe",
-      description: "",
-      model: "claude-haiku-4-5-20251001",
-      instructions: "",
-    });
-    const installation = db().installations.find((i) => i.workspace_id === qa.id && i.status === "connected");
-    const unknown = await failure(
-      owner.grants.create(qa.id, agent.id, {
-        installation_id: must(installation?.id),
-        tools: ["rm_rf"],
-        approval_required: [],
-      }),
-    );
-    expect(unknown.code).toBe("unknown_tool");
-    const outside = await failure(
-      owner.grants.create(qa.id, agent.id, {
-        installation_id: must(installation?.id),
-        tools: ["echo"],
-        approval_required: ["echo_write"],
-      }),
-    );
-    expect(outside.code).toBe("approval_outside_grant");
-  });
-
-  it("does not read another workspace's run through this workspace's path", async () => {
-    const betaRun = db().runs.find((r) => r.workspace_id === ws("beta-labs").id);
-    const error = await failure(owner.runs.get(ws("acme").id, must(betaRun?.id)));
-    expect(error.status).toBe(404);
-  });
-
-  it("refuses runs for a paused agent", async () => {
-    const qa = ws("qa-playground");
-    const agent = await owner.agents.create(qa.id, {
-      name: "Paused",
-      description: "",
-      model: "claude-haiku-4-5-20251001",
-      instructions: "",
-    });
-    await owner.agents.update(qa.id, agent.id, { status: "paused" });
-    const error = await failure(owner.runs.create(qa.id, agent.id, { input: "hi" }));
-    expect(error.code).toBe("agent_paused");
-  });
-
-  it("never lets the Console act on Production accounts", async () => {
-    const acme = ws("acme");
-    const agent = db().agents.find((a) => a.workspace_id === acme.id && a.status === "active");
-    const run = await failure(owner.runs.create(acme.id, must(agent?.id), { input: "hi" }));
-    expect(run.status).toBe(403);
-    expect(run.code).toBe("console_read_only_in_production");
-    const connect = await failure(
-      owner.connectSessions.create(acme.id, {
-        app_id: app("google-workspace").id,
-        intent: "create",
-        label: "Sales",
-        installation_id: null,
-        return_url: null,
-      }),
-    );
-    expect(connect.code).toBe("console_read_only_in_production");
   });
 });
 
@@ -667,16 +234,6 @@ describe("scale and environments", () => {
     expect(busiest.items[0]?.stats.runs_last_24h).toBeGreaterThan(0);
   });
 
-  it("lists runs across workspaces of one environment only", async () => {
-    const orgId = must(db().organizations[0]?.id, "organization");
-    const runs = await owner.organizationRuns.list(orgId, { environment: "sandbox", limit: 100 });
-    expect(runs.items.length).toBeGreaterThan(0);
-    expect(runs.items.every((r) => r.workspace.environment === "sandbox")).toBe(true);
-    const outsider = newId("user");
-    db().users.push({ id: outsider, name: "O", email: "o2@outsider.example", avatar_url: null });
-    expect((await failure(clientFor(outsider).organizationRuns.list(orgId))).status).toBe(404);
-  });
-
   it("records no end-user identity: decisions carry only the API key that sent them", async () => {
     let checked = 0;
     for (const workspace of [ws("acme"), ws("acme-sandbox")]) {
@@ -701,32 +258,6 @@ describe("scale and environments", () => {
       expect(JSON.stringify([runs, sessions, installations])).not.toMatch(/"subject"|user_[0-9a-f]{8}/);
     }
     expect(checked).toBeGreaterThan(0);
-  });
-
-  it("refuses approvals from a Console session", async () => {
-    const run = db().runs.find((r) => r.status === "waiting_for_approval");
-    const pending = run?.plan.find((s) => s.kind === "tool_call");
-    const error = await failure(
-      owner.runs.resolveApproval(must(run?.workspace_id), must(run?.id), {
-        call_id: must(pending?.kind === "tool_call" ? pending.call.call_id : null),
-        decision: "approved",
-      }),
-    );
-    expect(error.status).toBe(403);
-    expect(error.code).toBe("approval_requires_api_key");
-    expect(db().runs.find((r) => r.id === run?.id)?.status).toBe("waiting_for_approval");
-  });
-
-  it("gives every Connect session its hosted URL", async () => {
-    const session = await owner.connectSessions.create(ws("qa-playground").id, {
-      app_id: app("echo-server").id,
-      intent: "create",
-      label: "Echo 3",
-      installation_id: null,
-      return_url: null,
-    });
-    expect(session.url).toMatch(/\/connect\/[0-9A-Za-z]{32}$/);
-    expect(session.url).not.toContain(session.id);
   });
 });
 
@@ -775,35 +306,6 @@ describe("identifiers", () => {
     expect(acme.id).toMatch(/^ws_[0-9A-Za-z]{22}$/);
   });
 
-  it("answers 404 for a malformed ID, a bare UUID or another object's ID", async () => {
-    const acme = ws("acme");
-    const agent = must(db().agents.find((a) => a.workspace_id === acme.id));
-    const bare = must(uuidOf(acme.id));
-    for (const bad of [bare, `ws_${"z".repeat(22)}`, "ws_short", agent.id]) {
-      const error = await failure(owner.workspaces.get(bad as WorkspaceId));
-      expect(error.status).toBe(404);
-      expect(error.code).toBe("not_found");
-    }
-    const wrongType = await failure(owner.agents.get(acme.id, acme.id as unknown as AgentId));
-    expect(wrongType.status).toBe(404);
-  });
-
-  it("refuses an installation on a create session, including another workspace's", async () => {
-    const beta = must(db().installations.find((i) => i.workspace_id === ws("beta-labs").id));
-    for (const installation_id of [beta.id, "inst_garbage" as const]) {
-      const error = await failure(
-        owner.connectSessions.create(ws("qa-playground").id, {
-          app_id: app("echo-server").id,
-          intent: "create",
-          label: "Echo X",
-          installation_id,
-          return_url: null,
-        }),
-      );
-      expect(error.status).toBe(400);
-    }
-  });
-
   it("keeps hosted Connect inside the session's own tenant, even for a corrupted session", async () => {
     // A session whose app belongs to another organization must not show or use that app.
     const foreignApp = {
@@ -836,25 +338,6 @@ describe("identifiers", () => {
     expect(db().installations.some((i) => i.app_id === foreignApp.id)).toBe(false);
   });
 
-  it("keeps Connect sessions inside their workspace", async () => {
-    const qa = ws("qa-playground");
-    // A reconnect can't name another workspace's installation.
-    const beta = must(db().installations.find((i) => i.workspace_id === ws("beta-labs").id));
-    const reconnect = await failure(
-      owner.connectSessions.create(qa.id, {
-        app_id: app("echo-server").id,
-        intent: "reconnect",
-        label: "x",
-        installation_id: beta.id,
-        return_url: null,
-      }),
-    );
-    expect(reconnect.status).toBe(404);
-    // Another workspace's session isn't readable through this workspace's path.
-    const elsewhere = must(db().connect_sessions.find((x) => x.workspace_id !== qa.id));
-    expect((await failure(owner.connectSessions.get(qa.id, elsewhere.id))).status).toBe(404);
-  });
-
   it("refuses an expired session reached by its reference", async () => {
     const session = await owner.connectSessions.create(ws("qa-playground").id, {
       app_id: app("echo-server").id,
@@ -880,39 +363,6 @@ describe("identifiers", () => {
     });
     expect(JSON.stringify(db())).not.toContain(referenceOf(session));
   });
-
-  it("authorizes hosted Connect by the reference, never by the session ID", async () => {
-    const session = await owner.connectSessions.create(ws("qa-playground").id, {
-      app_id: app("echo-server").id,
-      intent: "create",
-      label: "Echo 4",
-      installation_id: null,
-      return_url: null,
-    });
-    expect((await owner.connect.get(referenceOf(session))).id).toBe(session.id);
-    // The workspace's own view reads the session by ID, as the Console does while it waits.
-    expect((await owner.connectSessions.get(ws("qa-playground").id, session.id)).status).toBe("pending");
-    await owner.connect.submitCredentials(referenceOf(session), { values: { token: "abc123" } });
-    expect((await owner.connectSessions.get(ws("qa-playground").id, session.id)).status).toBe("completed");
-    const listed = await owner.connectSessions.list(ws("qa-playground").id);
-    expect(listed.some((s) => s.id === session.id && s.status === "completed")).toBe(true);
-    // Only the creating response carries the link; reads never hand the reference out again.
-    expect(JSON.stringify(listed)).not.toContain(referenceOf(session));
-    expect(JSON.stringify(await owner.connectSessions.get(ws("qa-playground").id, session.id))).not.toContain(
-      referenceOf(session),
-    );
-    expect(JSON.stringify(await owner.connect.get(referenceOf(session)))).not.toMatch(/"url"/);
-    const byId = await failure(owner.connect.get(session.id));
-    expect(byId.status).toBe(404);
-    const other = await owner.connectSessions.create(ws("qa-playground").id, {
-      app_id: app("echo-server").id,
-      intent: "create",
-      label: "Echo 5",
-      installation_id: null,
-      return_url: null,
-    });
-    expect(referenceOf(other)).not.toBe(referenceOf(session));
-  });
 });
 
 describe("two organizations", () => {
@@ -921,43 +371,7 @@ describe("two organizations", () => {
 
   type Client = ReturnType<typeof clientFor>;
 
-  /** One organization's real objects, read from the seed. */
-  function tenant(orgSlug: string, workspaceSlug: string, sandboxSlug: string) {
-    const org = must(
-      db().organizations.find((o) => o.slug === orgSlug),
-      orgSlug,
-    ).id;
-    const workspace = ws(workspaceSlug);
-    // Connect is refused to Console sessions in Production, so Connect attempts start from Sandbox.
-    const sandbox = ws(sandboxSlug);
-    const here = <T extends { organization_id: string; workspace_id: string }>(rows: T[]) =>
-      must(
-        rows.find((r) => r.organization_id === org && r.workspace_id === workspace.id),
-        `${orgSlug} row`,
-      );
-    const agent = here(db().agents);
-    return {
-      org,
-      workspace,
-      sandbox,
-      agent,
-      run: here(db().runs),
-      installation: here(db().installations),
-      session: here(db().connect_sessions),
-      grant: must(
-        db().grants.find((g) => g.organization_id === org && g.agent_id === agent.id),
-        "grant",
-      ),
-      orgApp: must(db().apps.find((a) => a.organization_id === org && a.owner_workspace_id === null)),
-      workspaceApp: must(db().apps.find((a) => a.organization_id === org && a.owner_workspace_id === workspace.id)),
-      key: must(db().api_keys.find((k) => k.organization_id === org)),
-      hook: must(db().webhooks.find((h) => h.organization_id === org)),
-      member: must(db().memberships.find((m) => m.organization_id === org)),
-    };
-  }
-  type Tenant = ReturnType<typeof tenant>;
-
-  /** Everything an organization owns, to prove a refused request changed nothing. */
+  /** Every row an organization owns, to prove a refused request changed nothing the API can't show. */
   function stateOf(org: string) {
     const d = db();
     const mine = <T extends { organization_id: string }>(rows: T[]) => rows.filter((r) => r.organization_id === org);
@@ -981,223 +395,6 @@ describe("two organizations", () => {
     ]);
   }
 
-  /** Every route class, aimed at `victim`'s real IDs, directly and through the attacker's own organization. */
-  function attempts(r: Client, own: Tenant, victim: Tenant): [string, () => Promise<unknown>][] {
-    const v = victim;
-    const w = v.workspace.id;
-    const callId = "call_031DCp7XSYxLgDmAT3Dc7r" as const;
-    return [
-      // The victim's workspace.
-      ["[victim workspace] get workspace", () => r.workspaces.get(w)],
-      ["[victim workspace] rename workspace", () => r.workspaces.update(w, { name: "Owned" })],
-      ["[victim workspace] delete workspace", () => r.workspaces.delete(w)],
-      ["[victim workspace] list agents", () => r.agents.list(w)],
-      [
-        "[victim workspace] create agent",
-        () => r.agents.create(w, { name: "x", description: "", model: "claude-sonnet-5-5", instructions: "" }),
-      ],
-      ["[victim workspace] get agent", () => r.agents.get(w, v.agent.id)],
-      ["[victim workspace] pause agent", () => r.agents.update(w, v.agent.id, { status: "paused" })],
-      ["[victim workspace] delete agent", () => r.agents.delete(w, v.agent.id)],
-      ["[victim workspace] list grants", () => r.grants.list(w, v.agent.id)],
-      [
-        "[victim workspace] create grant",
-        () => r.grants.create(w, v.agent.id, { installation_id: v.installation.id, tools: [], approval_required: [] }),
-      ],
-      [
-        "[victim workspace] update grant",
-        () => r.grants.update(w, v.agent.id, v.grant.id, { tools: [], approval_required: [] }),
-      ],
-      ["[victim workspace] delete grant", () => r.grants.delete(w, v.agent.id, v.grant.id)],
-      ["[victim workspace] list runs", () => r.runs.list(w)],
-      ["[victim workspace] start run", () => r.runs.create(w, v.agent.id, { input: "hi" })],
-      ["[victim workspace] get run", () => r.runs.get(w, v.run.id)],
-      ["[victim workspace] run events", () => r.runs.events(w, v.run.id)],
-      ["[victim workspace] cancel run", () => r.runs.cancel(w, v.run.id)],
-      [
-        "[victim workspace] approve",
-        () => r.runs.resolveApproval(w, v.run.id, { call_id: callId, decision: "approved" }),
-      ],
-      ["[victim workspace] list installations", () => r.installations.list(w)],
-      ["[victim workspace] get installation", () => r.installations.get(w, v.installation.id)],
-      [
-        "[victim workspace] rename installation",
-        () => r.installations.update(w, v.installation.id, { label: "Owned" }),
-      ],
-      ["[victim workspace] disconnect", () => r.installations.disconnect(w, v.installation.id)],
-      ["[victim workspace] delete installation", () => r.installations.delete(w, v.installation.id)],
-      ["[victim workspace] list connect sessions", () => r.connectSessions.list(w)],
-      ["[victim workspace] get connect session", () => r.connectSessions.get(w, v.session.id)],
-      [
-        "[victim workspace] create connect session",
-        () =>
-          r.connectSessions.create(w, {
-            app_id: v.orgApp.id,
-            intent: "create",
-            label: "x",
-            installation_id: null,
-            return_url: null,
-          }),
-      ],
-      ["[victim workspace] list workspace apps", () => r.workspaceApps.list(w)],
-      ["[victim workspace] get workspace app", () => r.workspaceApps.get(w, v.workspaceApp.id)],
-      [
-        "[victim workspace] rename workspace app",
-        () => r.workspaceApps.update(w, v.workspaceApp.id, { name: "Owned" }),
-      ],
-      ["[victim workspace] workspace app configuration", () => r.workspaceApps.getConfiguration(w, v.workspaceApp.id)],
-      [
-        "[victim workspace] set workspace app configuration",
-        () => r.workspaceApps.updateConfiguration(w, v.workspaceApp.id, { mcp_server_url: null }),
-      ],
-      ["[victim workspace] available apps", () => r.workspaceApps.available(w)],
-      // The victim's organization.
-      ["[victim org] get organization", () => r.organizations.get(v.org)],
-      ["[victim org] rename organization", () => r.organizations.update(v.org, { name: "Owned" })],
-      ["[victim org] usage", () => r.organizations.usage(v.org, "production")],
-      ["[victim org] list members", () => r.members.list(v.org)],
-      ["[victim org] invite member", () => r.members.invite(v.org, { email: "x@attacker.example", role: "owner" })],
-      ["[victim org] change member role", () => r.members.update(v.org, v.member.id, { role: "owner" })],
-      ["[victim org] remove member", () => r.members.remove(v.org, v.member.id)],
-      ["[victim org] list workspaces", () => r.workspaces.list(v.org)],
-      [
-        "[victim org] create workspace",
-        () => r.workspaces.create(v.org, { name: "x", slug: "x-owned", environment: "sandbox", external_id: null }),
-      ],
-      ["[victim org] list org apps", () => r.organizationApps.list(v.org)],
-      ["[victim org] get org app", () => r.organizationApps.get(v.org, v.orgApp.id)],
-      ["[victim org] rename org app", () => r.organizationApps.update(v.org, v.orgApp.id, { name: "Owned" })],
-      [
-        "[victim org] org app configuration",
-        () => r.organizationApps.getConfiguration(v.org, v.orgApp.id, "production"),
-      ],
-      [
-        "[victim org] set org app configuration",
-        () => r.organizationApps.updateConfiguration(v.org, v.orgApp.id, "production", { mcp_server_url: null }),
-      ],
-      ["[victim org] org app installations", () => r.organizationApps.installations(v.org, v.orgApp.id)],
-      ["[victim org] org runs", () => r.organizationRuns.list(v.org)],
-      ["[victim org] audit", () => r.audit.list(v.org)],
-      ["[victim org] connect settings", () => r.connectSettings.get(v.org, "production")],
-      [
-        "[victim org] set connect settings",
-        () => r.connectSettings.update(v.org, "production", { return_urls: [], allowed_origins: [] }),
-      ],
-      ["[victim org] list keys", () => r.apiKeys.list(v.org)],
-      ["[victim org] create key", () => r.apiKeys.create(v.org, { name: "x", environment: "sandbox" })],
-      ["[victim org] revoke key", () => r.apiKeys.revoke(v.org, v.key.id)],
-      ["[victim org] list webhooks", () => r.webhooks.list(v.org)],
-      ["[victim org] update webhook", () => r.webhooks.update(v.org, v.hook.id, { enabled: false })],
-      ["[victim org] test webhook", () => r.webhooks.sendTest(v.org, v.hook.id)],
-      ["[victim org] delete webhook", () => r.webhooks.delete(v.org, v.hook.id)],
-      // The victim's child IDs, through the attacker's own organization and workspace.
-      ["[own org] org app via own org", () => r.organizationApps.get(own.org, v.orgApp.id)],
-      [
-        "[own org] org app config via own org",
-        () => r.organizationApps.getConfiguration(own.org, v.orgApp.id, "production"),
-      ],
-      ["[own org] key via own org", () => r.apiKeys.revoke(own.org, v.key.id)],
-      ["[own org] webhook via own org", () => r.webhooks.update(own.org, v.hook.id, { enabled: false })],
-      ["[own org] webhook test via own org", () => r.webhooks.sendTest(own.org, v.hook.id)],
-      ["[own org] delete webhook via own org", () => r.webhooks.delete(own.org, v.hook.id)],
-      ["[own org] member via own org", () => r.members.update(own.org, v.member.id, { role: "owner" })],
-      ["[own org] remove member via own org", () => r.members.remove(own.org, v.member.id)],
-      ["[own workspace] agent via own workspace", () => r.agents.get(own.workspace.id, v.agent.id)],
-      ["[own workspace] run via own workspace", () => r.runs.get(own.workspace.id, v.run.id)],
-      ["[own workspace] run events via own workspace", () => r.runs.events(own.workspace.id, v.run.id)],
-      [
-        "[own workspace] installation via own workspace",
-        () => r.installations.get(own.workspace.id, v.installation.id),
-      ],
-      ["[own workspace] session via own workspace", () => r.connectSessions.get(own.workspace.id, v.session.id)],
-      [
-        "[own workspace] workspace app via own workspace",
-        () => r.workspaceApps.get(own.workspace.id, v.workspaceApp.id),
-      ],
-      [
-        "[own workspace] grant on victim installation",
-        () =>
-          r.grants.create(own.workspace.id, own.agent.id, {
-            installation_id: v.installation.id,
-            tools: ["list_issues"],
-            approval_required: [],
-          }),
-      ],
-      [
-        "[own workspace] victim grant under own agent",
-        () => r.grants.delete(own.workspace.id, own.agent.id, v.grant.id),
-      ],
-      [
-        "[own workspace] connect with victim app",
-        () =>
-          r.connectSessions.create(own.sandbox.id, {
-            app_id: v.workspaceApp.id,
-            intent: "create",
-            label: "x",
-            installation_id: null,
-            return_url: null,
-          }),
-      ],
-      [
-        "[own workspace] reconnect victim installation",
-        () =>
-          r.connectSessions.create(own.sandbox.id, {
-            app_id: own.orgApp.id,
-            intent: "reconnect",
-            label: "x",
-            installation_id: v.installation.id,
-            return_url: null,
-          }),
-      ],
-    ];
-  }
-
-  /**
-   * Every attempt must answer 404 and change nothing. Within one organization only the
-   * attempts that use the victim's IDs through the attacker's own workspace are attacks;
-   * a member may use their organization's other workspaces directly.
-   */
-  async function expectSealed(
-    attacker: Client,
-    own: Tenant,
-    victim: Tenant,
-    { victimOrgPaths = true, sameOrganization = false } = {},
-  ) {
-    const before = stateOf(victim.org);
-    for (const [what, attempt] of attempts(attacker, own, victim)) {
-      // A member of both organizations may use the victim organization's own routes; those name it in the path.
-      if (!victimOrgPaths && what.startsWith("[victim org]")) continue;
-      if (sameOrganization && !what.startsWith("[own workspace]")) continue;
-      const error = await failure(attempt());
-      expect(error.status, what).toBe(404);
-    }
-    expect(stateOf(victim.org)).toBe(before);
-    // Filters naming the victim's workspace find nothing of it (within one organization, they rightly do).
-    if (sameOrganization) return;
-    const filtered = JSON.stringify([
-      await attacker.organizationRuns.list(own.org, { workspace_id: victim.workspace.id }),
-      await attacker.audit.list(own.org, { workspace_id: victim.workspace.id }),
-    ]);
-    expect(filtered).not.toContain(victim.org);
-    expect(filtered).not.toContain(victim.run.id);
-  }
-
-  it("answers 404 and changes nothing when Larkspur uses Northwind's real IDs", async () => {
-    await expectSealed(
-      rowan(),
-      tenant("larkspur", "harbor", "harbor-sandbox"),
-      tenant("northwind", "acme", "acme-sandbox"),
-    );
-  });
-
-  it("answers 404 and changes nothing when Northwind uses Larkspur's real IDs", async () => {
-    await expectSealed(
-      owner,
-      tenant("northwind", "acme", "acme-sandbox"),
-      tenant("larkspur", "harbor", "harbor-sandbox"),
-    );
-  });
-
   it("holds for a member of both organizations: the named organization decides", async () => {
     const larkspur = must(larkspurId());
     db().memberships.push({
@@ -1219,12 +416,16 @@ describe("two organizations", () => {
     expect((await asLarkspur.workspaces.get(harbor.id)).id).toBe(harbor.id);
     expect((await asNorthwind.workspaces.get(acme.id)).id).toBe(acme.id);
     // And acting as Northwind, Larkspur's children stay out of reach.
+    const northwind = must(northwindId());
+    const before = stateOf(larkspur);
     await expectSealed(
       asNorthwind,
-      tenant("northwind", "acme", "acme-sandbox"),
-      tenant("larkspur", "harbor", "harbor-sandbox"),
+      await loadTenant(asNorthwind, northwind, "acme", "acme-sandbox"),
+      await loadTenant(rowan(), larkspur, "harbor", "harbor-sandbox"),
+      rowan(),
       { victimOrgPaths: false },
     );
+    expect(stateOf(larkspur), "every Larkspur row").toBe(before);
   });
 
   it("ignores rows whose organization doesn't match their workspace", async () => {
@@ -1907,68 +1108,6 @@ describe("two organizations", () => {
     expect(after.workspaces.some((w) => w.id === qa.id)).toBe(false);
   });
 
-  it("keeps membership rules inside the organization", async () => {
-    const org = must(northwindId());
-    // Someone who belongs to another organization can still be invited here.
-    const invited = await owner.members.invite(org, { email: "rowan@larkspur.example", role: "developer" });
-    expect(invited.organization_id).toBe(org);
-    // Another organization's owners don't count towards this one's last owner.
-    const self = must(db().memberships.find((m) => m.organization_id === org && m.user_id === DEMO_USER_ID));
-    expect((await failure(owner.members.update(org, self.id, { role: "admin" }))).code).toBe("last_owner");
-    expect((await failure(owner.members.remove(org, self.id))).code).toBe("last_owner");
-    // Connect settings belong to their organization alone.
-    const larkspurSettings = JSON.stringify(
-      await Promise.all([
-        rowan().connectSettings.get(must(larkspurId()), "sandbox"),
-        rowan().connectSettings.get(must(larkspurId()), "production"),
-      ]),
-    );
-    expect(larkspurSettings).not.toContain("northwind");
-  });
-
-  it("keeps uniqueness, settings and Connect rules inside each organization", async () => {
-    const larkspur = must(larkspurId());
-    const r = rowan();
-    // Names another organization already uses are free here.
-    const appSlug = await r.organizationApps.create(larkspur, {
-      kind: "mcp",
-      name: "Google Workspace",
-      slug: "google-workspace",
-      description: "",
-      auth_type: "token",
-    });
-    expect(appSlug.slug).toBe("google-workspace");
-    const workspaceSlug = await r.workspaces.create(larkspur, {
-      name: "Acme",
-      slug: "acme",
-      environment: "sandbox",
-      external_id: null,
-    });
-    expect(workspaceSlug.slug).toBe("acme");
-    // Another organization's return-URL allowlist doesn't apply here.
-    const northwindSandbox = await owner.connectSettings.get(must(northwindId()), "sandbox");
-    const allowedElsewhere = must(northwindSandbox.return_urls[0]);
-    const harborSandbox = ws("harbor-sandbox");
-    const linear = must(db().apps.find((a) => a.organization_id === larkspur && a.slug === "linear"));
-    const refused = await failure(
-      r.connectSessions.create(harborSandbox.id, {
-        app_id: linear.id,
-        intent: "create",
-        label: "x",
-        installation_id: null,
-        return_url: allowedElsewhere,
-      }),
-    );
-    expect(refused.code).toBe("return_url_not_allowed");
-    // Writing this organization's settings never touches another's.
-    const before = JSON.stringify(await owner.connectSettings.get(must(northwindId()), "sandbox"));
-    await r.connectSettings.update(larkspur, "sandbox", {
-      return_urls: ["https://app.larkspur.example/back"],
-      allowed_origins: [],
-    });
-    expect(JSON.stringify(await owner.connectSettings.get(must(northwindId()), "sandbox"))).toBe(before);
-  });
-
   it("keeps grants and hosted reconnects inside their organization", async () => {
     const larkspur = must(larkspurId());
     const acme = ws("acme");
@@ -2036,21 +1175,6 @@ describe("two organizations", () => {
       }),
     );
     expect(consent.status).toBe(404);
-  });
-
-  it("keeps one workspace's IDs out of another workspace of the same organization", async () => {
-    const beta = ws("beta-labs");
-    await owner.workspaceApps.create(beta.id, {
-      kind: "mcp",
-      name: "Beta tools",
-      slug: "beta-tools",
-      description: "",
-      auth_type: "token",
-    });
-    const acmeTenant = tenant("northwind", "acme", "acme-sandbox");
-    const betaTenant = tenant("northwind", "beta-labs", "qa-playground");
-    await expectSealed(owner, acmeTenant, betaTenant, { sameOrganization: true });
-    await expectSealed(owner, betaTenant, acmeTenant, { sameOrganization: true });
   });
 
   it("deletes one workspace and leaves the rest of its organization intact", async () => {
@@ -2319,49 +1443,5 @@ describe("two organizations", () => {
     await owner.workspaces.delete(qa.id);
     expect(db().run_events[key]?.map((e) => e.id)).toEqual([stray.id]);
     expect(shown.some((e) => e.id === otherRun.id)).toBe(false);
-  });
-
-  it("checks the named organization against both the membership and the workspace", async () => {
-    const harbor = ws("harbor");
-    const acme = ws("acme");
-    // A Northwind member naming Larkspur isn't a member there.
-    const spoof = clientFor(DEMO_USER_ID, larkspurId);
-    expect((await failure(spoof.workspaces.get(harbor.id))).status).toBe(404);
-    // Naming their own organization doesn't reach another organization's workspace.
-    expect((await failure(owner.workspaces.get(harbor.id))).status).toBe(404);
-    // Larkspur's owner naming Northwind is refused, even for a workspace that exists.
-    const rowanAsNorthwind = clientFor(
-      must(db().users.find((u) => u.email === "rowan@larkspur.example")).id,
-      northwindId,
-    );
-    expect((await failure(rowanAsNorthwind.workspaces.get(acme.id))).status).toBe(404);
-    // And each organization still reaches its own.
-    expect((await rowan().workspaces.get(harbor.id)).id).toBe(harbor.id);
-    expect((await owner.workspaces.get(acme.id)).id).toBe(acme.id);
-  });
-
-  it("requires a Console session to name its organization on workspace routes", async () => {
-    const unnamed = clientFor(DEMO_USER_ID, () => undefined);
-    const error = await failure(unnamed.workspaces.get(ws("acme").id));
-    expect(error.status).toBe(400);
-    expect(error.code).toBe("organization_required");
-    // Organization routes name it in the path.
-    expect((await unnamed.members.list(must(northwindId()))).length).toBeGreaterThan(0);
-  });
-
-  it("never lists another organization's rows", async () => {
-    const larkspur = must(larkspurId());
-    const harbor = ws("harbor");
-    const me = await owner.me.get();
-    expect(me.organizations.map((o) => o.id)).not.toContain(larkspur);
-    const org = must(northwindId());
-    const [workspaces, runs, audit] = await Promise.all([
-      owner.workspaces.list(org, { limit: 100, q: "harbor" }),
-      owner.organizationRuns.list(org, { environment: "production", limit: 100 }),
-      owner.audit.list(org, { limit: 100 }),
-    ]);
-    const listed = JSON.stringify([workspaces, runs, audit]);
-    expect(listed).not.toContain(harbor.id);
-    expect(listed).not.toContain(larkspur);
   });
 });

@@ -14,6 +14,7 @@ apps/
   console/        Developer Console — Vite, React 19, TanStack Router + Query, shadcn/ui
 packages/
   contract/       @zupflow/contract — zod schemas, route table, generated openapi.json
+  contract-tests/ @zupflow/contract-tests — the black-box suite every server must pass
   sdk/            @zupflow/sdk — HTTP transport and typed resource client over the contract
   brand/          B1 Precision brand kit (SVG/PNG/ICO) and usage notes
 ```
@@ -78,8 +79,12 @@ the generated `openapi.json`) and enforces the API's
 rules: membership before existence, environment-matched configuration with no
 fallback, single-use Connect sessions, exact return-URL allowlists,
 workspace-coherent grants, approvals only from API keys, and no Console
-actions in Production. It also simulates runs. `src/mocks/handlers.test.ts`
-pins those rules; the backend should pass the same cases.
+actions in Production. It also simulates runs. Those rules are pinned by
+the shared contract suite in `packages/contract-tests`, which reaches a server
+only over HTTP and runs against the mock in `src/mocks/handlers.test.ts`; the
+backend runs the same suite by setting `ZUPFLOW_CONTRACT_URL` (see
+`packages/contract-tests/src/remote.test.ts`). Cases that need the mock's
+database stay in `handlers.test.ts`.
 
 Two pieces exist only because there is no backend yet, and are labelled as such:
 

@@ -10,7 +10,14 @@
       "dependsOn": ["^typecheck"]
     },
     "test": {
-      "dependsOn": ["^build"]
+      "dependsOn": ["^build"],
+      "env": [
+        "ZUPFLOW_CONTRACT_URL",
+        "ZUPFLOW_CONTRACT_RESET_COMMAND",
+        "ZUPFLOW_CONTRACT_TOKEN_OWNER",
+        "ZUPFLOW_CONTRACT_TOKEN_DEVELOPER",
+        "ZUPFLOW_CONTRACT_TOKEN_OUTSIDER"
+      ]
     },
     "dev": {
       "cache": false,

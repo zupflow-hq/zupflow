@@ -1,0 +1,71 @@
+/**
+ * What the suite needs from a server under test: where it is, a Console
+ * session for each persona, and a way back to the reference fixture. Nothing
+ * else: the suite reaches the server only over HTTP, so the mock and the
+ * backend are held to the same cases.
+ */
+
+/**
+ * The people the suite signs in as:
+ *
+ * - `owner`: the only active owner of the `northwind` organization, and a
+ *   member of no organization the outsider belongs to.
+ * - `developer`: an active developer of `northwind`.
+ * - `outsider`: an active owner of `larkspur`, and not a member of
+ *   `northwind`.
+ */
+export type Persona = "owner" | "developer" | "outsider";
+
+export interface Target {
+  /** Where the API is mounted; route paths are appended to it. */
+  baseUrl: string;
+  /** A Console session token for the persona. Called per request, after `reset`. */
+  token(persona: Persona): Promise<string>;
+  /** Restore the reference fixture. Called before every test. */
+  reset(): Promise<void>;
+  /** The fetch to use; defaults to the global one. */
+  fetch?: typeof fetch;
+}
+
+/**
+ * The reference fixture every target loads on `reset`. The suite finds each
+ * object by its slug, never by a fixed ID.
+ *
+ * Organization `northwind`, with:
+ * - Workspaces `acme` and `beta-labs` (Production), and `acme-sandbox` and
+ *   `qa-playground` (Sandbox).
+ * - In `acme` and `beta-labs` each: an agent with a grant and a finished run, an
+ *   installation, a Connect session and a workspace app of its own (`acme`'s
+ *   is `acme-publishing`; `beta-labs` has none at reset, and the suite makes
+ *   one). In `acme-sandbox`: an active agent and an installation. Somewhere
+ *   in the organization: a run waiting for approval.
+ * - At least one API key, webhook endpoint and catalog app.
+ * - Catalog apps `google-workspace` (OAuth, ready in Sandbox), `linear`
+ *   (ready in Sandbox, incomplete in Production) and `notion` (configured in
+ *   neither environment).
+ * - A workspace app `echo-server` owned by `qa-playground`, with token auth
+ *   through one input named `token`. Its provider accepts any token and
+ *   rejects one containing `invalid`. Its tools include `echo`, which needs
+ *   no approval, and not `echo_write`; `qa-playground` has a connected
+ *   installation of it.
+ * - At least one model in `GET /v1/models`.
+ * - Runs in Sandbox as well as Production, at least one of them in
+ *   `acme-sandbox`. At reset no run is queued or running; each is finished
+ *   or waiting for approval, so nothing changes on its own during a test.
+ * - Connect settings with at least one return URL or allowed origin.
+ * - Sandbox Connect settings that allow the return URL
+ *   `http://localhost:3000/settings/integrations`.
+ *
+ * Organization `larkspur`, owned by the outsider, with workspaces `harbor`
+ * (Production) and `harbor-sandbox` (Sandbox). In `harbor`: an agent with a
+ * grant and a finished run, an installation, a Connect session and a workspace
+ * app of its own; in the organization: a catalog app `linear`, ready in Sandbox,
+ * an API key, a webhook endpoint and Sandbox Connect settings that do not
+ * allow Northwind's return URL. Each organization's real IDs are aimed at
+ * the other.
+ *
+ * Every Sandbox workspace the suite uses as one (`acme-sandbox`,
+ * `qa-playground`, `harbor-sandbox`) offers at least one catalog app.
+ */
+export const REFERENCE_FIXTURE = "northwind";
+export const OTHER_ORGANIZATION = "larkspur";

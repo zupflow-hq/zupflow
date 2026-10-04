@@ -1,0 +1,27 @@
+{
+  "name": "@zupflow/contract-tests",
+  "version": "0.0.0",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@zupflow/contract": "workspace:*",
+    "@zupflow/sdk": "workspace:*",
+    "zod": "^4.6.5"
+  },
+  "peerDependencies": {
+    "vitest": "^5.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "typescript": "~6.0.2",
+    "vitest": "^5.0.3"
+  }
+}

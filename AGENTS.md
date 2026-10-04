@@ -14,8 +14,10 @@ Read `README.md` first.
   against the contract.
 - **The mock API is the backend's specification until the backend exists.**
   Rules it enforces are product rules. Don't loosen one to make a screen
-  easier; add a test in `apps/console/src/mocks/handlers.test.ts` when you add
-  one.
+  easier; add a test when you add one. A case that needs only the API goes in
+  the shared suite, `packages/contract-tests/src/suite.ts`, which the backend
+  must pass too; one that has to reach into the mock's database goes in
+  `apps/console/src/mocks/handlers.test.ts`.
 - **Two layers of isolation.** No organization reaches another, and no
   workspace reaches another within its organization. Both scopes are explicit
   in every function, table, query, key and test; a globally unique ID never

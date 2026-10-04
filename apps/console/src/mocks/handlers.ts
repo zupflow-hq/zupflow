@@ -138,14 +138,16 @@ function idParam<P extends keyof typeof ID_PARAMS>(
 }
 
 /**
- * An app's configuration in one environment, created empty on first read.
+ * An app's configuration in one environment, empty until first written.
  * Scope comes from the request: the organization, and the workspace for a
- * workspace app (null for an organization app).
+ * workspace app (null for an organization app). A `"read"` never stores the
+ * empty row; only a write does.
  */
 function configurationFor(
   scope: { organization_id: OrganizationId; workspace_id: WorkspaceId | null },
   app: AppRow,
   env: Environment,
+  mode: "read" | "write" = "write",
 ): ConfigurationRow {
   if (app.organization_id !== scope.organization_id || app.owner_workspace_id !== scope.workspace_id) {
     throw notFound("App");
@@ -167,7 +169,7 @@ function configurationFor(
       updated_at: null,
       updated_by_user_id: null,
     };
-    d.configurations.push(row);
+    if (mode === "write") d.configurations.push(row);
   }
   return row;
 }
@@ -989,7 +991,10 @@ export function createHandlers(apiBase: string) {
         const env = environment.safeParse(param(params, "env"));
         if (!env.success) throw notFound("Environment");
         return ok(
-          toConfiguration(configurationFor({ organization_id: access.org.id, workspace_id: null }, app, env.data), app),
+          toConfiguration(
+            configurationFor({ organization_id: access.org.id, workspace_id: null }, app, env.data, "read"),
+            app,
+          ),
         );
       }),
     ),
@@ -1107,6 +1112,7 @@ export function createHandlers(apiBase: string) {
               { organization_id: access.org.id, workspace_id: access.workspace.id },
               app,
               access.workspace.environment,
+              "read",
             ),
             app,
           ),
@@ -1817,17 +1823,16 @@ export function createHandlers(apiBase: string) {
         const access = orgAccess(request, param(params, "org"));
         const env = environment.safeParse(param(params, "env"));
         if (!env.success) throw notFound("Environment");
-        let row = db().connect_settings.find((c) => c.organization_id === access.org.id && c.environment === env.data);
-        if (!row) {
-          row = {
-            organization_id: access.org.id,
-            environment: env.data,
-            return_urls: [],
-            allowed_origins: [],
-            updated_at: null,
-          };
-          db().connect_settings.push(row);
-        }
+        // A read changes nothing: until the first write, the settings are the empty defaults.
+        const row = db().connect_settings.find(
+          (c) => c.organization_id === access.org.id && c.environment === env.data,
+        ) ?? {
+          organization_id: access.org.id,
+          environment: env.data,
+          return_urls: [],
+          allowed_origins: [],
+          updated_at: null,
+        };
         const { organization_id: _o, ...wire } = row;
         return ok(wire);
       }),
