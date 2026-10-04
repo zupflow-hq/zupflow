@@ -17,7 +17,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
-import { canAdminister, useViewerUser } from "@/features/context";
+import { canAdminister } from "@/features/context";
 import { useAvailableApps, useOrgApps } from "@/features/queries";
 import { cn } from "@/lib/utils";
 import { ConnectError, ConnectProgress, useConnectFlow } from "./connect-flow";
@@ -35,24 +35,20 @@ export function AddInstallationDialog({
   onOpenChange: (open: boolean) => void;
   initialAppId?: AppId;
 }) {
-  const user = useViewerUser();
   const navigate = useNavigate();
   const available = useAvailableApps(workspace.id);
   const catalog = useOrgApps(org.id);
   const flow = useConnectFlow(workspace.id);
   const [selected, setSelected] = useState<AvailableApp | null>(null);
   const [label, setLabel] = useState("");
-  const [subject, setSubject] = useState("");
 
   useEffect(() => {
     if (!open) {
       setSelected(null);
       setLabel("");
       flow.reset();
-    } else {
-      setSubject(`console:${user.email}`);
     }
-  }, [open, user.email, flow.reset]);
+  }, [open, flow.reset]);
 
   useEffect(() => {
     if (open && initialAppId && !selected && available.data) {
@@ -172,13 +168,12 @@ export function AddInstallationDialog({
             className="space-y-4"
             onSubmit={(e) => {
               e.preventDefault();
-              if (!label.trim() || !subject.trim()) return;
+              if (!label.trim()) return;
               flow.start({
                 app_id: selected.app.id,
                 intent: "create",
                 label: label.trim(),
                 installation_id: null,
-                subject: subject.trim(),
                 return_url: null,
               });
             }}
@@ -206,18 +201,6 @@ export function AddInstallationDialog({
                 A workspace can hold several installations of the same app — one per account.
               </p>
             </div>
-            <div className="space-y-2">
-              <Label htmlFor="installation-subject">Authorized by</Label>
-              <Input
-                id="installation-subject"
-                className="font-mono text-sm"
-                value={subject}
-                onChange={(e) => setSubject(e.target.value)}
-              />
-              <p className="text-xs text-muted-foreground">
-                Recorded on the connection. In your product this is your user's ID.
-              </p>
-            </div>
             <ConnectError error={flow.error} />
           </form>
         ) : (
@@ -242,7 +225,7 @@ export function AddInstallationDialog({
               <ChevronLeftIcon />
               Back
             </Button>
-            <Button type="submit" form="add-installation" disabled={!label.trim() || !subject.trim() || flow.starting}>
+            <Button type="submit" form="add-installation" disabled={!label.trim() || flow.starting}>
               {flow.starting ? <Spinner /> : null}
               Continue to Connect
             </Button>

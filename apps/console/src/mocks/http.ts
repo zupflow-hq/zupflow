@@ -477,7 +477,6 @@ export function toConnectSession(s: ConnectSessionRow, withAuth = false): Connec
     intent: s.intent,
     installation_id: s.installation_id,
     label: s.label,
-    subject: s.subject,
     status: s.status,
     return_url: s.return_url,
     created_at: s.created_at,

@@ -4,7 +4,7 @@
  * runs instantly against a fake clock. Every step re-checks the installation,
  * so revoking access or a broken connection shows up the way it will for real.
  */
-import type { RunError, RunEvent, RunEventType, ToolCallId } from "@zupflow/sdk";
+import type { ApiKeyId, RunError, RunEvent, RunEventType, ToolCallId } from "@zupflow/sdk";
 import { sampleToolCall } from "./catalog";
 import { newId } from "./ids";
 import type { Db, PlannedCall, RunRow, RunStep } from "./model";
@@ -271,13 +271,13 @@ export function resolveApproval(
   run: RunRow,
   callId: ToolCallId,
   decision: "approved" | "denied",
-  resolvedBy: string,
+  apiKeyId: ApiKeyId,
   at: string,
 ) {
   pushEvent(db, run, at, "approval.resolved", {
     call_id: callId,
     decision,
-    resolved_by: resolvedBy,
+    api_key_id: apiKeyId,
   });
   run.status = "running";
   if (decision === "denied") {

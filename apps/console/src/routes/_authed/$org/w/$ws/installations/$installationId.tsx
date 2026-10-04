@@ -29,7 +29,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
-import { canAdminister, useCurrentWorkspace, useDocumentTitle, useOrg, useViewerUser } from "@/features/context";
+import { canAdminister, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { ConnectError, ConnectProgress, useConnectFlow } from "@/features/installations/connect-flow";
 import {
   useAgents,
@@ -170,9 +170,6 @@ function InstallationPage() {
                     </Property>
                     <Property label="Provider account ID">
                       <MonoValue value={i.connection.account.external_id} />
-                    </Property>
-                    <Property label="Authorized by">
-                      <MonoValue value={i.connection.subject} />
                     </Property>
                     <Property label="Scopes granted">
                       {i.connection.granted_scopes.length > 0 ? (
@@ -384,7 +381,6 @@ function ReconnectDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const user = useViewerUser();
   const flow = useConnectFlow(workspace.id);
   // biome-ignore lint/correctness/useExhaustiveDependencies: reset only when the dialog closes.
   useEffect(() => {
@@ -419,7 +415,6 @@ function ReconnectDialog({
                     intent: "reconnect",
                     label: installation.label,
                     installation_id: installation.id,
-                    subject: `console:${user.email}`,
                     return_url: null,
                   })
                 }

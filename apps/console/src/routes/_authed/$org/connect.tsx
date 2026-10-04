@@ -95,7 +95,6 @@ function samples(env: Environment, returnUrl: string | undefined) {
     "intent": "create",
     "label": "Marketing",
     "installation_id": null,
-    "subject": "user_2f81c0aa",
     "return_url": "${ret}"
   }'`,
     },
@@ -115,7 +114,6 @@ const session = await zupflow.connectSessions.create(workspaceId, {
   intent: "create",
   label: "Marketing",
   installation_id: null,
-  subject: user.id,
   return_url: "${ret}",
 });
 

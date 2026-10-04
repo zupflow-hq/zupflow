@@ -368,8 +368,6 @@ export interface AccountConnection {
   credential_version: number;
   connected_at: string;
   expires_at: string | null;
-  /** The downstream subject who authorized the connection. */
-  subject: string;
 }
 
 export interface InstallationApp {
@@ -412,7 +410,6 @@ export interface ConnectSession {
   intent: ConnectIntent;
   installation_id: InstallationId | null;
   label: string;
-  subject: string;
   status: ConnectSessionStatus;
   return_url: string | null;
   created_at: string;
@@ -444,7 +441,6 @@ export interface CreateConnectSessionInput {
   intent: ConnectIntent;
   label: string;
   installation_id: InstallationId | null;
-  subject: string;
   return_url: string | null;
 }
 
@@ -546,7 +542,6 @@ export interface Run {
   agent_id: AgentId;
   agent_name: string;
   session_id: SessionId;
-  subject: string | null;
   trigger: "api" | "console";
   status: RunStatus;
   input: string;
@@ -560,7 +555,6 @@ export interface Run {
 
 export interface CreateRunInput {
   input: string;
-  subject: string | null;
 }
 
 export interface RunListQuery {
@@ -616,7 +610,8 @@ export type RunEvent = RunEventBase &
     | { type: "approval.requested"; data: ToolCallRef & { arguments: unknown } }
     | {
         type: "approval.resolved";
-        data: { call_id: ToolCallId; decision: ApprovalDecision; resolved_by: string };
+        /** The API key that sent the decision. Who decided is the organization's business, not recorded here. */
+        data: { call_id: ToolCallId; decision: ApprovalDecision; api_key_id: ApiKeyId };
       }
     | { type: "run.completed"; data: { usage: RunUsage } }
     | { type: "run.failed"; data: { error: RunError } }

@@ -252,8 +252,8 @@ export function createClient(transport: Transport) {
       cancel: (workspaceId: WorkspaceId, runId: RunId) =>
         send<Run>("POST", `${ws(workspaceId)}/runs/${enc(runId)}/cancel`),
       /**
-       * Record the downstream user's decision. Call it from your backend with an
-       * API key, after your product asked that user; Console sessions are refused.
+       * Record a decision your product made, however it decides. Call it from
+       * your backend with an API key; Console sessions are refused.
        */
       resolveApproval: (workspaceId: WorkspaceId, runId: RunId, input: ResolveApprovalInput) =>
         send<Run>("POST", `${ws(workspaceId)}/runs/${enc(runId)}/approvals`, input),

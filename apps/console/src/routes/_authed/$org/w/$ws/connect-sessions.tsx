@@ -55,7 +55,6 @@ function ConnectSessionsPage() {
                   <TableHead className="pl-4">App</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead className="hidden md:table-cell">Intent</TableHead>
-                  <TableHead className="hidden lg:table-cell">Authorized by</TableHead>
                   <TableHead className="hidden pr-4 sm:table-cell">Started</TableHead>
                 </TableRow>
               </TableHeader>
@@ -92,9 +91,6 @@ function ConnectSessionsPage() {
                       </div>
                     </TableCell>
                     <TableCell className="hidden text-muted-foreground capitalize md:table-cell">{s.intent}</TableCell>
-                    <TableCell className="hidden font-mono text-xs text-muted-foreground lg:table-cell">
-                      {s.subject}
-                    </TableCell>
                     <TableCell className="hidden pr-4 text-muted-foreground sm:table-cell">
                       <RelativeTime iso={s.created_at} />
                     </TableCell>

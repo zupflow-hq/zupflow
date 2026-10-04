@@ -7,8 +7,7 @@ import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { EnvBadge } from "@/components/app/environment";
 import { Button } from "@/components/ui/button";
-import { Form, FormControl, FormDescription, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
-import { Input } from "@/components/ui/input";
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
@@ -17,7 +16,6 @@ import { applyFieldErrors, toastError } from "@/lib/errors";
 
 const schema = z.object({
   input: z.string().trim().min(1, "Write a message for the agent.").max(8000),
-  subject: z.string().trim().max(200),
 });
 
 export function StartRunSheet({
@@ -37,7 +35,7 @@ export function StartRunSheet({
   const create = useCreateRun(workspace.id, agent.id);
   const form = useForm<z.infer<typeof schema>>({
     resolver: zodResolver(schema),
-    defaultValues: { input: "", subject: "" },
+    defaultValues: { input: "" },
   });
   useEffect(() => {
     if (!open) form.reset();
@@ -58,7 +56,7 @@ export function StartRunSheet({
             className="flex-1 space-y-5 overflow-y-auto p-4"
             onSubmit={form.handleSubmit((values) =>
               create.mutate(
-                { input: values.input, subject: values.subject || null },
+                { input: values.input },
                 {
                   onSuccess: (run) => {
                     onOpenChange(false);
@@ -100,22 +98,6 @@ export function StartRunSheet({
                       {...field}
                     />
                   </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="subject"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>
-                    On behalf of <span className="font-normal text-muted-foreground">(optional)</span>
-                  </FormLabel>
-                  <FormControl>
-                    <Input className="font-mono text-sm" placeholder="user_2f81c0aa" {...field} />
-                  </FormControl>
-                  <FormDescription>Your product's ID for the person this run acts for.</FormDescription>
                   <FormMessage />
                 </FormItem>
               )}

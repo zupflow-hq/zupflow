@@ -127,7 +127,6 @@ export interface ConnectSessionRow {
   intent: ConnectIntent;
   installation_id: InstallationId | null;
   label: string;
-  subject: string;
   status: ConnectSessionStatus;
   return_url: string | null;
   requested_scopes: string[];
@@ -183,7 +182,6 @@ export interface RunRow {
   workspace_id: WorkspaceId;
   agent_id: AgentId;
   session_id: SessionId;
-  subject: string | null;
   trigger: "api" | "console";
   status: RunStatus;
   input: string;

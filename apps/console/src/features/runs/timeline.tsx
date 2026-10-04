@@ -14,6 +14,7 @@ import { useState } from "react";
 import { CopyButton, JsonBlock } from "@/components/app/misc";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Spinner } from "@/components/ui/spinner";
+import { shortId } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 type Item =
@@ -156,8 +157,8 @@ function PendingApproval({ workspaceId, runId, callId }: { workspaceId: string; 
             <CopyButton value={request} label="Copy request" className="absolute top-1.5 right-1.5" />
           </div>
           <p className="mt-1.5 text-xs text-muted-foreground">
-            Call it with an API key after your product asked the user. Subscribe to{" "}
-            <code>run.waiting_for_approval</code> to know when to ask.
+            Call it with an API key once your product has the decision. Subscribe to{" "}
+            <code>run.waiting_for_approval</code> to know when one is needed.
           </p>
         </CollapsibleContent>
       </Collapsible>
@@ -175,7 +176,7 @@ export function RunTimeline({ run, events }: { run: Run; events: RunEvent[] }) {
     <ol aria-label="Run timeline" aria-live="polite">
       <Row at={start} start={start} icon={<CircleDotIcon />} tone="neutral">
         <div className="rounded-lg border bg-muted/40 px-3 py-2.5">
-          <p className="mb-0.5 text-xs text-muted-foreground">{run.subject ? `Input from ${run.subject}` : "Input"}</p>
+          <p className="mb-0.5 text-xs text-muted-foreground">Input</p>
           <p className="text-sm whitespace-pre-wrap">{run.input}</p>
         </div>
       </Row>
@@ -237,7 +238,7 @@ export function RunTimeline({ run, events }: { run: Run; events: RunEvent[] }) {
                   </p>
                   <p className="mb-2 text-sm text-muted-foreground">
                     {pending
-                      ? `Paused until ${run.subject ?? "your user"} decides in your product. Your backend records the decision; the Console only shows it.`
+                      ? "Paused until a decision is made in your product. Your backend sends it; the Console only shows it."
                       : "Approval was requested."}
                   </p>
                   <JsonBlock value={e.data.arguments} />
@@ -259,7 +260,14 @@ export function RunTimeline({ run, events }: { run: Run; events: RunEvent[] }) {
                 last={last}
               >
                 <p className="pt-1 text-sm">
-                  {e.data.decision === "approved" ? "Approved" : "Denied"} by {e.data.resolved_by}
+                  {e.data.decision === "approved" ? "Approved" : "Denied"} in your product
+                  <span className="text-muted-foreground">
+                    {" "}
+                    · sent with{" "}
+                    <code className="font-mono text-xs" title={e.data.api_key_id}>
+                      {shortId(e.data.api_key_id)}
+                    </code>
+                  </span>
                 </p>
               </Row>
             );

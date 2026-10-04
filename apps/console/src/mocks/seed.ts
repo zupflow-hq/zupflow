@@ -7,6 +7,7 @@
 import type {
   AccountConnection,
   AgentGrant,
+  ApiKeyId,
   AuditEvent,
   Environment,
   IdKind,
@@ -31,7 +32,7 @@ import type {
 import { mulberry32, type Rng, uuid } from "./random";
 import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 
-export const DB_SCHEMA = 9;
+export const DB_SCHEMA = 10;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -225,7 +226,6 @@ export function seed(nowMs: number = Date.now()): Db {
           credential_version: 1 + Math.floor(rng() * 3),
           connected_at: ago(createdAgo),
           expires_at: app.auth.type === "oauth2" ? ago(-50 * MINUTE) : null,
-          subject: `user_${uuid(rng).slice(0, 8)}`,
         }
       : null;
     const row: InstallationRow = {
@@ -555,10 +555,10 @@ export function seed(nowMs: number = Date.now()): Db {
   acmeBilling.updated_at = ago(6 * HOUR);
 
   seedConnectSessions(db, rng, nowMs, [
-    { ws: acme, installation: acmeMarketing, app: google, subject: "user_2f81c0aa" },
-    { ws: acme, installation: acmeEng, app: github, subject: "user_9a3e11b2" },
-    { ws: beta, installation: betaGoogle, app: google, subject: "user_77c0d4e1" },
-    { ws: acmeSandbox, installation: sandboxLinear, app: linear, subject: "user_test_01" },
+    { ws: acme, installation: acmeMarketing, app: google },
+    { ws: acme, installation: acmeEng, app: github },
+    { ws: beta, installation: betaGoogle, app: google },
+    { ws: acmeSandbox, installation: sandboxLinear, app: linear },
   ]);
   db.connect_sessions.push({
     id: id("connect_session", nowMs - 5 * HOUR),
@@ -571,7 +571,6 @@ export function seed(nowMs: number = Date.now()): Db {
     intent: "reconnect",
     installation_id: acmeBilling.id,
     label: acmeBilling.label,
-    subject: "user_2f81c0aa",
     status: "failed",
     return_url: "https://app.northwind.example/settings/integrations",
     requested_scopes: [],
@@ -760,6 +759,17 @@ interface RunSeed {
   waiting?: boolean;
 }
 
+/** The organization's active API key for the run's environment: approvals arrive from its backend, never the Console. */
+function approvalKey(db: Db, run: RunRow): ApiKeyId {
+  const workspace = db.workspaces.find((w) => w.id === run.workspace_id);
+  const key = db.api_keys.find(
+    (k) =>
+      k.organization_id === workspace?.organization_id && k.environment === workspace?.environment && !k.revoked_at,
+  );
+  if (!key) throw new Error("The seed needs an active API key in every environment that has approvals.");
+  return key.id;
+}
+
 function seedRuns(db: Db, rng: Rng, nowMs: number, specs: RunSeed[]) {
   for (const spec of specs) {
     for (let i = 0; i < spec.count; i++) {
@@ -772,7 +782,6 @@ function seedRuns(db: Db, rng: Rng, nowMs: number, specs: RunSeed[]) {
         workspace_id: spec.agent.workspace_id,
         agent_id: spec.agent.id,
         session_id: newId("session", { rng, at: createdMs }),
-        subject: rng() < 0.85 ? `user_${uuid(rng).slice(0, 8)}` : null,
         trigger: rng() < 0.9 ? "api" : "console",
         status: "queued",
         input: spec.prompts[Math.floor(rng() * spec.prompts.length)] ?? "Hello",
@@ -804,7 +813,7 @@ function seedRuns(db: Db, rng: Rng, nowMs: number, specs: RunSeed[]) {
             run,
             approval.data.call_id,
             rng() < 0.85 ? "approved" : "denied",
-            run.subject ?? "your product's user",
+            approvalKey(db, run),
             new Date(clock).toISOString(),
           );
         }
@@ -819,7 +828,7 @@ function seedConnectSessions(
   db: Db,
   rng: Rng,
   nowMs: number,
-  specs: { ws: WorkspaceRow; installation: InstallationRow; app: AppRow; subject: string }[],
+  specs: { ws: WorkspaceRow; installation: InstallationRow; app: AppRow }[],
 ) {
   const returnUrl = (env: Environment) =>
     env === "production"
@@ -838,7 +847,6 @@ function seedConnectSessions(
       intent: "create",
       installation_id: spec.installation.id,
       label: spec.installation.label,
-      subject: spec.subject,
       status: "completed",
       return_url: returnUrl(spec.ws.environment),
       requested_scopes: spec.installation.connection?.granted_scopes ?? [],

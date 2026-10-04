@@ -458,7 +458,6 @@ function completeSession(
       credential_version: (existing.connection?.credential_version ?? 0) + 1,
       connected_at: now,
       expires_at: app.auth.type === "oauth2" ? new Date(Date.now() + 60 * MINUTE).toISOString() : null,
-      subject: session.subject,
     };
     existing.updated_at = now;
     installation = existing;
@@ -477,7 +476,6 @@ function completeSession(
         credential_version: 1,
         connected_at: now,
         expires_at: app.auth.type === "oauth2" ? new Date(Date.now() + 60 * MINUTE).toISOString() : null,
-        subject: session.subject,
       },
       created_at: now,
       updated_at: now,
@@ -493,7 +491,7 @@ function completeSession(
     organization_id: session.organization_id,
     workspace_id: session.workspace_id,
     environment: session.environment,
-    actor: { type: "system", id: null, name: `Connect (${session.subject})` },
+    actor: { type: "system", id: null, name: "Connect" },
     action: session.intent === "reconnect" ? "installation.reconnected" : "installation.connected",
     target: { type: "installation", id: installation.id, name: `${app.name} · ${installation.label}` },
     created_at: now,
@@ -1217,7 +1215,6 @@ export function createHandlers(apiBase: string) {
             intent: z.enum(["create", "reconnect"]),
             label: name(40),
             installation_id: idOf("installation").nullable(),
-            subject: z.string().trim().min(1, "Required.").max(200),
             return_url: z.string().url().nullable(),
           }),
         );
@@ -1287,7 +1284,6 @@ export function createHandlers(apiBase: string) {
           intent: input.intent,
           installation_id: input.installation_id,
           label,
-          subject: input.subject,
           status: "pending",
           return_url: input.return_url,
           requested_scopes: app?.auth.type === "oauth2" ? (config?.oauth_scopes ?? []) : [],
@@ -1687,7 +1683,6 @@ export function createHandlers(apiBase: string) {
           request,
           z.object({
             input: z.string().trim().min(1, "Write a message.").max(8000),
-            subject: z.string().max(200).nullable(),
           }),
         );
         const run: RunRow = {
@@ -1695,7 +1690,6 @@ export function createHandlers(apiBase: string) {
           workspace_id: access.workspace.id,
           agent_id: agent.id,
           session_id: newId("session"),
-          subject: input.subject,
           trigger: "console",
           status: "queued",
           input: input.input,
@@ -1747,8 +1741,8 @@ export function createHandlers(apiBase: string) {
       }),
     ),
 
-    // Approvals belong to the downstream user, collected by the customer's
-    // product and recorded by its backend with an API key. A Console session
+    // Approvals are decided in the customer's product, however it wants, and
+    // recorded by its backend with an API key. A Console session
     // only observes them. The mock has no API keys, so every caller here is a
     // Console session and is refused; waiting runs stay paused until cancelled.
     http.post(
@@ -1759,7 +1753,7 @@ export function createHandlers(apiBase: string) {
         throw new ApiFailure(
           403,
           "approval_requires_api_key",
-          "Approvals are recorded by your backend with an API key, on behalf of the person who decided.",
+          "Approvals come from your backend with an API key, once your product has the decision.",
         );
       }),
     ),

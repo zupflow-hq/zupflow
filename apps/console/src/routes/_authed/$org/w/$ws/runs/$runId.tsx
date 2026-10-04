@@ -125,13 +125,6 @@ function RunPage() {
                   <Property label="Session" className="sm:grid-cols-1 sm:gap-1">
                     <MonoValue value={r.session_id} />
                   </Property>
-                  <Property label="On behalf of" className="sm:grid-cols-1 sm:gap-1">
-                    {r.subject ? (
-                      <MonoValue value={r.subject} />
-                    ) : (
-                      <span className="text-muted-foreground">Not set</span>
-                    )}
-                  </Property>
                   <Property label="Timing" className="sm:grid-cols-1 sm:gap-1">
                     <span title={fullDateTime(r.started_at)}>{duration(r.started_at, r.finished_at)}</span>
                     {r.finished_at ? (

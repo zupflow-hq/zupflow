@@ -81,7 +81,7 @@ function WorkspaceOverview() {
               key={r.id}
               tone="warning"
               icon={<HandIcon className="size-4" />}
-              title={`${r.agent_name} is waiting on ${r.subject ?? "your user"} to approve a step`}
+              title={`${r.agent_name} is waiting for a decision on a step`}
               body={`Your product collects the decision; the run resumes when your backend records it. “${r.input}”`}
               action={
                 <Button asChild size="sm" variant="outline">

@@ -51,6 +51,21 @@ function uuidToBase62(uuid: string): string {
   return out.padStart(22, "0");
 }
 
+/** An active API key of the workspace's organization and environment: where a real approval comes from. */
+function approvalKeyFor(workspaceId: string) {
+  const workspace = must(
+    db().workspaces.find((w) => w.id === workspaceId),
+    "workspace",
+  );
+  return must(
+    db().api_keys.find(
+      (k) =>
+        k.organization_id === workspace.organization_id && k.environment === workspace.environment && !k.revoked_at,
+    ),
+    "API key",
+  ).id;
+}
+
 /** The value, or a failed test: replaces `?? ""` placeholders that would hide a missing fixture. */
 function must<T>(value: T | null | undefined, what = "fixture"): T {
   if (value === null || value === undefined) throw new Error(`Missing ${what}`);
@@ -154,7 +169,6 @@ describe("apps and environments", () => {
         intent: "create",
         label: "Docs",
         installation_id: null,
-        subject: "user_1",
         return_url: null,
       }),
     );
@@ -174,7 +188,6 @@ describe("apps and environments", () => {
         intent: "create",
         label: "Echo",
         installation_id: null,
-        subject: "user_1",
         return_url: null,
       }),
     );
@@ -220,7 +233,6 @@ describe("Connect", () => {
       intent: "create",
       label: "Echo 2",
       installation_id: null,
-      subject: "user_1",
       return_url: null,
       ...extra,
     });
@@ -266,7 +278,6 @@ describe("Connect", () => {
       intent: "reconnect",
       label: "ignored",
       installation_id: installation?.id ?? null,
-      subject: "user_1",
       return_url: null,
     });
     const transport = createHttpTransport({ baseUrl: API, getToken: async () => null });
@@ -338,14 +349,14 @@ describe("grants and runs", () => {
       instructions: "",
     });
     await owner.agents.update(qa.id, agent.id, { status: "paused" });
-    const error = await failure(owner.runs.create(qa.id, agent.id, { input: "hi", subject: null }));
+    const error = await failure(owner.runs.create(qa.id, agent.id, { input: "hi" }));
     expect(error.code).toBe("agent_paused");
   });
 
   it("never lets the Console act on Production accounts", async () => {
     const acme = ws("acme");
     const agent = db().agents.find((a) => a.workspace_id === acme.id && a.status === "active");
-    const run = await failure(owner.runs.create(acme.id, must(agent?.id), { input: "hi", subject: null }));
+    const run = await failure(owner.runs.create(acme.id, must(agent?.id), { input: "hi" }));
     expect(run.status).toBe(403);
     expect(run.code).toBe("console_read_only_in_production");
     const connect = await failure(
@@ -354,7 +365,6 @@ describe("grants and runs", () => {
         intent: "create",
         label: "Sales",
         installation_id: null,
-        subject: "user_1",
         return_url: null,
       }),
     );
@@ -373,7 +383,7 @@ describe("approvals", () => {
     const callId = must(requested?.type === "approval.requested" ? requested.data.call_id : null, "pending call");
     const pending = run.plan.find((s) => s.kind === "tool_call" && s.call.call_id === callId);
     const tool = must(pending?.kind === "tool_call" ? pending.call.tool : null, "pending tool");
-    resolveApproval(db(), run, callId, "denied", "Tester", new Date().toISOString());
+    resolveApproval(db(), run, callId, "denied", approvalKeyFor(run.workspace_id), new Date().toISOString());
     for (let i = 0; i < 10 && run.status !== "completed"; i++) {
       advanceRun(db(), run, new Date().toISOString(), () => 0.5);
     }
@@ -418,6 +428,32 @@ describe("scale and environments", () => {
     expect((await failure(clientFor(outsider).organizationRuns.list(orgId))).status).toBe(404);
   });
 
+  it("records no end-user identity: decisions carry only the API key that sent them", async () => {
+    let checked = 0;
+    for (const workspace of [ws("acme"), ws("acme-sandbox")]) {
+      const runs = await owner.runs.list(workspace.id, { limit: 100 });
+      for (const run of runs.items) {
+        for (const e of await owner.runs.events(workspace.id, run.id)) {
+          if (e.type !== "approval.resolved") continue;
+          expect(e.data).not.toHaveProperty("resolved_by");
+          // The key belongs to the run's organization and environment, and existed when it sent the decision.
+          const key = must(
+            db().api_keys.find((k) => k.id === e.data.api_key_id),
+            "approval key",
+          );
+          expect(key.organization_id).toBe(workspace.organization_id);
+          expect(key.environment).toBe(workspace.environment);
+          expect(Date.parse(key.created_at)).toBeLessThanOrEqual(Date.parse(e.created_at));
+          checked++;
+        }
+      }
+      const sessions = await owner.connectSessions.list(workspace.id);
+      const installations = await owner.installations.list(workspace.id);
+      expect(JSON.stringify([runs, sessions, installations])).not.toMatch(/"subject"|user_[0-9a-f]{8}/);
+    }
+    expect(checked).toBeGreaterThan(0);
+  });
+
   it("refuses approvals from a Console session", async () => {
     const run = db().runs.find((r) => r.status === "waiting_for_approval");
     const pending = run?.plan.find((s) => s.kind === "tool_call");
@@ -438,7 +474,6 @@ describe("scale and environments", () => {
       intent: "create",
       label: "Echo 3",
       installation_id: null,
-      subject: "user_1",
       return_url: null,
     });
     expect(session.url).toMatch(/\/connect\/[0-9A-Za-z]{32}$/);
@@ -513,7 +548,6 @@ describe("identifiers", () => {
           intent: "create",
           label: "Echo X",
           installation_id,
-          subject: "user_1",
           return_url: null,
         }),
       );
@@ -563,7 +597,6 @@ describe("identifiers", () => {
         intent: "reconnect",
         label: "x",
         installation_id: beta.id,
-        subject: "user_1",
         return_url: null,
       }),
     );
@@ -579,7 +612,6 @@ describe("identifiers", () => {
       intent: "create",
       label: "Echo 7",
       installation_id: null,
-      subject: "user_1",
       return_url: null,
     });
     const row = must(db().connect_sessions.find((x) => x.id === session.id));
@@ -595,7 +627,6 @@ describe("identifiers", () => {
       intent: "create",
       label: "Echo 6",
       installation_id: null,
-      subject: "user_1",
       return_url: null,
     });
     expect(JSON.stringify(db())).not.toContain(referenceOf(session));
@@ -607,7 +638,6 @@ describe("identifiers", () => {
       intent: "create",
       label: "Echo 4",
       installation_id: null,
-      subject: "user_1",
       return_url: null,
     });
     expect((await owner.connect.get(referenceOf(session))).id).toBe(session.id);
@@ -630,7 +660,6 @@ describe("identifiers", () => {
       intent: "create",
       label: "Echo 5",
       installation_id: null,
-      subject: "user_2",
       return_url: null,
     });
     expect(referenceOf(other)).not.toBe(referenceOf(session));

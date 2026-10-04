@@ -59,7 +59,6 @@ describe("createHttpTransport", () => {
         intent: "create",
         label: "x",
         installation_id: null,
-        subject: "s",
         return_url: "https://x",
       })
       .catch((e: unknown) => e);
