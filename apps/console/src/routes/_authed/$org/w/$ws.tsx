@@ -21,11 +21,16 @@ export const Route = createFileRoute("/_authed/$org/w/$ws")({
     // out of it (back to the list, say) stays in the right environment.
     const current = (search as { env?: string }).env ?? "production";
     if (current !== environment) {
-      const next = new URLSearchParams(location.searchStr);
-      if (environment === "sandbox") next.set("env", "sandbox");
-      else next.delete("env");
-      const query = next.toString();
-      throw redirect({ href: `${location.pathname}${query ? `?${query}` : ""}`, replace: true });
+      // Set env explicitly so the organization route's retained env doesn't
+      // re-add the old value (which would redirect forever).
+      throw redirect({
+        to: location.pathname,
+        search: (prev: Record<string, unknown>) => ({
+          ...prev,
+          env: environment === "sandbox" ? "sandbox" : undefined,
+        }),
+        replace: true,
+      });
     }
   },
   component: WorkspaceLayout,

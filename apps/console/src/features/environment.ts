@@ -9,9 +9,11 @@ import { workspaceQuery } from "./queries";
  * mode. Organization pages show only that environment's workspaces, runs,
  * keys and settings.
  *
- * It lives in the URL (`?env=sandbox`; absent means Production) so links are
- * unambiguous, and the organization route retains it across navigation. A
- * workspace page always takes its workspace's environment.
+ * It lives in the URL: Sandbox pages sit under `/{org}/sandbox/…` and
+ * Production pages have no prefix, so links are unambiguous. Inside the router
+ * it is the `env` search param (see `lib/environment-url.ts`), which the
+ * organization route retains across navigation. A workspace page always takes
+ * its workspace's environment.
  */
 export function useEnvironment(): Environment {
   const { ws } = useParams({ strict: false });

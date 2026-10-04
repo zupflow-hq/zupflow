@@ -11,8 +11,9 @@ import { viewerQuery } from "@/features/queries";
 import { rememberOrg } from "@/lib/recent";
 
 export const Route = createFileRoute("/_authed/$org")({
-  // `?env=sandbox` selects Sandbox; absent means Production. It follows every
-  // navigation inside the organization.
+  // `env` is the `/sandbox/` path prefix, read in by the router's rewrite;
+  // absent means Production. It follows every navigation inside the
+  // organization.
   validateSearch: z.object({ env: z.enum(ENVIRONMENTS).optional() }),
   search: { middlewares: [retainSearchParams(["env"])] },
   beforeLoad: async ({ context, params }) => {

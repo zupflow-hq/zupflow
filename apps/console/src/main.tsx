@@ -7,6 +7,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { session } from "@/features/auth/session";
 import { config } from "@/lib/env";
+import { canonicalizeEnvironmentUrl, environmentRewrite } from "@/lib/environment-url";
 import { ThemeProvider } from "@/lib/theme";
 import { routeTree } from "./routeTree.gen";
 
@@ -29,12 +30,15 @@ const queryClient = new QueryClient({
   },
 });
 
+canonicalizeEnvironmentUrl();
+
 const router = createRouter({
   routeTree,
   context: { queryClient },
   defaultPreload: "intent",
   defaultPreloadStaleTime: 0,
   scrollRestoration: true,
+  rewrite: environmentRewrite,
 });
 
 declare module "@tanstack/react-router" {
