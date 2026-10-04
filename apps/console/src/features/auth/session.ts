@@ -1,9 +1,10 @@
 /**
  * The Console's session boundary.
  *
- * Today it is backed by the mock identity provider. Clerk replaces this module
- * when the backend lands: `getToken` will return a fresh Clerk session token
- * for every request, and nothing is ever written to browser storage.
+ * Today it is backed by the mock identity provider. When the backend lands
+ * this module delegates to the Console's auth adapter: in `oidc` mode
+ * `getToken` returns a fresh token from the provider for every request; in
+ * `local` mode there is none. Nothing is ever written to browser storage.
  */
 import { setTokenSource } from "@/lib/api";
 import { db, persist } from "@/mocks/db";

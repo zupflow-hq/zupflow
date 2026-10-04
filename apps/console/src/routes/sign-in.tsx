@@ -135,9 +135,7 @@ function SignInPage() {
             </Form>
           )}
         </div>
-        <p className="text-xs text-muted-foreground">
-          Preview build: accounts are simulated in this browser. Production sign-in uses Clerk.
-        </p>
+        <p className="text-xs text-muted-foreground">Preview build: accounts are simulated in this browser.</p>
       </section>
 
       <aside className="relative hidden overflow-hidden bg-[#10191D] text-white lg:flex lg:flex-col lg:justify-between lg:p-12">

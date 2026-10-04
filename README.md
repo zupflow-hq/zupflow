@@ -81,8 +81,9 @@ pins those rules; the backend should pass the same cases.
 
 Two pieces exist only because there is no backend yet, and are labelled as such:
 
-- **Sign-in** is simulated in `src/features/auth/session.ts`. Production uses
-  Clerk; that module is the seam.
+- **Sign-in** is simulated in `src/features/auth/session.ts`, the seam where a
+  real build will plug in an auth adapter: `local` (no sign-in; the server
+  must listen on loopback only) or `oidc` (any OpenID Connect provider).
 - **OAuth consent** sends the browser to `/connect/:reference/simulated-consent`
   instead of a real provider.
 
