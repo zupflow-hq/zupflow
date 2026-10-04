@@ -14,7 +14,7 @@ import { config } from "@/lib/env";
 import { errorMessage } from "@/lib/errors";
 import { qk } from "@/lib/query-keys";
 
-export const Route = createFileRoute("/connect/$sessionId/simulated-consent")({
+export const Route = createFileRoute("/connect/$reference/simulated-consent")({
   component: SimulatedConsentPage,
 });
 
@@ -24,10 +24,10 @@ export const Route = createFileRoute("/connect/$sessionId/simulated-consent")({
  * provider instead and this page is never reached.
  */
 function SimulatedConsentPage() {
-  const { sessionId } = Route.useParams();
+  const { reference } = Route.useParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const session = useHostedConnectSession(sessionId);
+  const session = useHostedConnectSession(reference);
   const [email, setEmail] = useState("");
 
   useEffect(() => {
@@ -38,16 +38,19 @@ function SimulatedConsentPage() {
   const decide = useMutation({
     mutationFn: async (decision: "approved" | "denied") => {
       // Mock-only endpoint, deliberately outside the SDK: a real provider redirects instead.
-      const response = await fetch(`${config.apiUrl}/v1/connect/sessions/${sessionId}/simulate-consent`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ decision, email: decision === "approved" ? email : null }),
-      });
+      const response = await fetch(
+        `${config.apiUrl}/v1/connect/sessions/${encodeURIComponent(reference)}/simulate-consent`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decision, email: decision === "approved" ? email : null }),
+        },
+      );
       return response.ok;
     },
     onSettled: async () => {
-      await queryClient.invalidateQueries({ queryKey: qk.hostedConnect(sessionId) });
-      await navigate({ to: "/connect/$sessionId", params: { sessionId } });
+      await queryClient.invalidateQueries({ queryKey: qk.hostedConnect(reference) });
+      await navigate({ to: "/connect/$reference", params: { reference } });
     },
   });
 

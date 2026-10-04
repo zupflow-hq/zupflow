@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import type { ConnectSession, CreateConnectSessionInput } from "@zupflow/sdk";
+import type { ConnectSession, ConnectSessionId, CreateConnectSessionInput, WorkspaceId } from "@zupflow/sdk";
 import { CheckCircle2Icon, ExternalLinkIcon, XCircleIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
@@ -20,10 +20,10 @@ const FAILURE_COPY: Record<string, string> = {
  * message from the popup only triggers a re-check; completion is believed
  * only when the API says the session completed.
  */
-export function useConnectFlow(workspaceId: string) {
+export function useConnectFlow(workspaceId: WorkspaceId) {
   const queryClient = useQueryClient();
   const create = useCreateConnectSession(workspaceId);
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<ConnectSessionId | null>(null);
   const [hostedUrl, setHostedUrl] = useState<string | null>(null);
   const [blocked, setBlocked] = useState(false);
   const [error, setError] = useState<unknown>(null);

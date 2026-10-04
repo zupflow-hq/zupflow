@@ -1,4 +1,4 @@
-import type { Environment } from "@zupflow/sdk";
+import type { Environment, OrganizationId, WorkspaceId } from "@zupflow/sdk";
 import { CheckIcon, ChevronsUpDownIcon } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
@@ -23,10 +23,10 @@ export function WorkspacePicker({
   allLabel = "All workspaces",
   className,
 }: {
-  orgId: string;
+  orgId: OrganizationId;
   environment?: Environment;
-  value: string | undefined;
-  onChange: (workspaceId: string | undefined) => void;
+  value: WorkspaceId | undefined;
+  onChange: (workspaceId: WorkspaceId | undefined) => void;
   allLabel?: string;
   className?: string;
 }) {
@@ -34,7 +34,7 @@ export function WorkspacePicker({
   const [query, setQuery] = useState("");
   const q = useDebounced(query.trim());
   const results = useWorkspacePage(orgId, { environment, q: q || undefined, limit: 20 }, open);
-  const selected = useWorkspace(value ?? "");
+  const selected = useWorkspace(value);
   const items = results.data?.items ?? [];
   const total = results.data?.pagination.total ?? 0;
 

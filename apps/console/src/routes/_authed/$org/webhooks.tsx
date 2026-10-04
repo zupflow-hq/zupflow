@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { createFileRoute } from "@tanstack/react-router";
-import { type Environment, WEBHOOK_EVENT_TYPES, type WebhookEndpoint } from "@zupflow/sdk";
+import { type Environment, type OrganizationId, WEBHOOK_EVENT_TYPES, type WebhookEndpoint } from "@zupflow/sdk";
 import { EllipsisIcon, PencilIcon, PlusIcon, SendIcon, Trash2Icon, WebhookIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
@@ -234,7 +234,7 @@ function EndpointDialog({
   onClose,
   onCreated,
 }: {
-  orgId: string;
+  orgId: OrganizationId;
   environment: Environment;
   endpoint: WebhookEndpoint | "new" | null;
   onClose: () => void;

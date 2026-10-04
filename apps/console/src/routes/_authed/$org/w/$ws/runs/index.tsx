@@ -11,10 +11,11 @@ import { Spinner } from "@/components/ui/spinner";
 import { useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { useAgents, useRuns } from "@/features/queries";
 import { RunTable } from "@/features/runs/run-table";
+import { idSearch } from "@/lib/route-ids";
 
 export const Route = createFileRoute("/_authed/$org/w/$ws/runs/")({
   validateSearch: z.object({
-    agent: z.string().optional(),
+    agent: idSearch("agent").optional(),
     status: z.enum(RUN_STATUSES).optional(),
   }),
   component: RunsPage,
@@ -45,7 +46,10 @@ function RunsPage() {
           <Select
             value={agent ?? ALL}
             onValueChange={(v) =>
-              navigate({ search: (s) => ({ ...s, agent: v === ALL ? undefined : v }), replace: true })
+              navigate({
+                search: (s) => ({ ...s, agent: agents.data?.find((a) => a.id === v)?.id }),
+                replace: true,
+              })
             }
           >
             <SelectTrigger aria-label="Agent" className="w-full bg-card sm:w-52">

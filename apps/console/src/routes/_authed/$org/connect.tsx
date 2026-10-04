@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { type ConnectSettings, type Environment, ZupflowApiError } from "@zupflow/sdk";
+import { type ConnectSettings, type Environment, type OrganizationId, ZupflowApiError } from "@zupflow/sdk";
 import { PlusIcon, XIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -190,7 +190,7 @@ function SettingsForm({
   settings,
   canEdit,
 }: {
-  orgId: string;
+  orgId: OrganizationId;
   environment: Environment;
   settings: ConnectSettings;
   canEdit: boolean;

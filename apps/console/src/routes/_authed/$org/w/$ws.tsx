@@ -3,8 +3,10 @@ import { NotFound } from "@/components/app/not-found";
 import { workspaceQuery } from "@/features/queries";
 import { WorkspaceLayout } from "@/features/workspaces/workspace-layout";
 import { isStatus } from "@/lib/errors";
+import { idParam } from "@/lib/route-ids";
 
 export const Route = createFileRoute("/_authed/$org/w/$ws")({
+  params: idParam("ws", "workspace"),
   staticData: { crumb: "$workspace" },
   beforeLoad: async ({ context, params, location, search }) => {
     let environment: string;

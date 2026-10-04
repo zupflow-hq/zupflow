@@ -1,5 +1,5 @@
 import { useNavigate } from "@tanstack/react-router";
-import type { AvailableApp, Organization, Workspace } from "@zupflow/sdk";
+import type { AppId, AvailableApp, Organization, Workspace } from "@zupflow/sdk";
 import { ChevronLeftIcon } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { ENVIRONMENT_LABEL, EnvBadge } from "@/components/app/environment";
@@ -33,7 +33,7 @@ export function AddInstallationDialog({
   workspace: Workspace;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  initialAppId?: string;
+  initialAppId?: AppId;
 }) {
   const user = useViewerUser();
   const navigate = useNavigate();

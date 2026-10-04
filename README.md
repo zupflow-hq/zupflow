@@ -83,7 +83,7 @@ Two pieces exist only because there is no backend yet, and are labelled as such:
 
 - **Sign-in** is simulated in `src/features/auth/session.ts`. Production uses
   Clerk; that module is the seam.
-- **OAuth consent** sends the browser to `/connect/:id/simulated-consent`
+- **OAuth consent** sends the browser to `/connect/:reference/simulated-consent`
   instead of a real provider.
 
 ## License

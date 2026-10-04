@@ -1,4 +1,3 @@
-import { useQuery } from "@tanstack/react-query";
 import { Link, useMatches } from "@tanstack/react-router";
 import { Fragment } from "react";
 import {
@@ -12,7 +11,7 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { useOptionalWorkspaceId } from "@/features/context";
-import { workspaceQuery } from "@/features/queries";
+import { useWorkspace } from "@/features/queries";
 import { useCrumbs } from "@/lib/crumbs";
 import { CommandMenu } from "./command-menu";
 
@@ -24,7 +23,7 @@ export function TopBar() {
   const matches = useMatches();
   const detail = useCrumbs();
   const ws = useOptionalWorkspaceId();
-  const workspace = useQuery({ ...workspaceQuery(ws ?? ""), enabled: Boolean(ws) });
+  const workspace = useWorkspace(ws);
   const crumbs = matches.flatMap((m) => {
     const crumb = m.staticData.crumb;
     if (!crumb) return [];

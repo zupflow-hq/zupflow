@@ -4,6 +4,7 @@ import { LinkTabs } from "@/components/app/link-tabs";
 import { MonoValue } from "@/components/app/misc";
 import { NestedPage, PageContainer } from "@/components/app/page";
 import { useCurrentWorkspace, useOrg } from "@/features/context";
+import { shortId } from "@/lib/format";
 
 /**
  * A workspace is one of thousands of customer tenants, so it's a page you
@@ -32,7 +33,7 @@ export function WorkspaceLayout() {
         </div>
         <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted-foreground">
           <span className="inline-flex items-center gap-1.5">
-            ID <MonoValue value={ws.id} display={`${ws.id.slice(0, 8)}…`} />
+            ID <MonoValue value={ws.id} display={shortId(ws.id)} />
           </span>
           {ws.external_id ? (
             <span className="inline-flex items-center gap-1.5" title="This customer's ID in your platform">

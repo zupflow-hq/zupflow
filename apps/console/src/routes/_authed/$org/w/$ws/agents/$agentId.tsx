@@ -30,10 +30,12 @@ import { useAgent, useDeleteAgent, useModels, useRuns, useUpdateAgent } from "@/
 import { RunTable } from "@/features/runs/run-table";
 import { useDetailCrumb } from "@/lib/crumbs";
 import { applyFieldErrors, toastError } from "@/lib/errors";
+import { idParam } from "@/lib/route-ids";
 
 const TABS = ["overview", "access", "configuration"] as const;
 
 export const Route = createFileRoute("/_authed/$org/w/$ws/agents/$agentId")({
+  params: idParam("agentId", "agent"),
   validateSearch: z.object({ tab: z.enum(TABS).optional(), run: z.boolean().optional() }),
   component: AgentPage,
 });

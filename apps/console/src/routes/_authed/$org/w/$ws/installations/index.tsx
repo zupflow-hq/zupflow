@@ -10,9 +10,10 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { AddInstallationDialog } from "@/features/installations/add-installation-dialog";
 import { useInstallations } from "@/features/queries";
+import { idSearch } from "@/lib/route-ids";
 
 export const Route = createFileRoute("/_authed/$org/w/$ws/installations/")({
-  validateSearch: z.object({ add: z.boolean().optional(), app: z.string().optional() }),
+  validateSearch: z.object({ add: z.boolean().optional(), app: idSearch("app").optional() }),
   component: InstallationsPage,
 });
 

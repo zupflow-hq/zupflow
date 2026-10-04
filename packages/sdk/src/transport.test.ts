@@ -20,9 +20,9 @@ describe("createHttpTransport", () => {
         fetch: fakeFetch(200, { data: [{ id: "w1" }], meta: null, error: null }, seen),
       }),
     );
-    await client.workspaces.list("org 1");
-    await client.workspaces.list("org 1");
-    expect(seen[0]?.url).toBe("https://api.zupflow.test/v1/organizations/org%201/workspaces");
+    await client.workspaces.list("org_a b");
+    await client.workspaces.list("org_a b");
+    expect(seen[0]?.url).toBe("https://api.zupflow.test/v1/organizations/org_a%20b/workspaces");
     expect(seen[0]?.headers.get("authorization")).toBe("Bearer token-1");
     expect(seen[1]?.headers.get("authorization")).toBe("Bearer token-2");
   });
@@ -54,8 +54,8 @@ describe("createHttpTransport", () => {
       }),
     );
     const error = await client.connectSessions
-      .create("ws", {
-        app_id: "a",
+      .create("ws_0000000000000000000001", {
+        app_id: "app_0000000000000000000001",
         intent: "create",
         label: "x",
         installation_id: null,

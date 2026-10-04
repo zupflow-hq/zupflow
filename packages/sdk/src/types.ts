@@ -1,8 +1,29 @@
+import type {
+  AgentId,
+  AnyId,
+  ApiKeyId,
+  AppId,
+  AuditEventId,
+  ConnectSessionId,
+  GrantId,
+  InstallationId,
+  MemberId,
+  OrganizationId,
+  RunEventId,
+  RunId,
+  SessionId,
+  ToolCallId,
+  UserId,
+  WebhookEndpointId,
+  WorkspaceId,
+} from "./ids";
+
 /**
  * Wire contracts for the Zupflow API.
  *
  * Every field is `snake_case`, every instant is an ISO 8601 UTC string and
- * every identifier is a string UUID. These shapes are the contract the
+ * every Zupflow identifier is a prefixed, opaque string (see `ids.ts`). These
+ * shapes are the contract the
  * Console is built against; the backend must serve them exactly.
  */
 
@@ -69,7 +90,7 @@ export type ConnectSessionStatus = "pending" | "completed" | "expired" | "cancel
 // Identity and organizations
 
 export interface User {
-  id: string;
+  id: UserId;
   name: string;
   email: string;
   avatar_url: string | null;
@@ -86,7 +107,7 @@ export interface OrganizationSetup {
 }
 
 export interface Organization {
-  id: string;
+  id: OrganizationId;
   name: string;
   slug: string;
   /** The caller's role in this organization. */
@@ -111,8 +132,8 @@ export interface UpdateOrganizationInput {
 }
 
 export interface Member {
-  id: string;
-  organization_id: string;
+  id: MemberId;
+  organization_id: OrganizationId;
   user: User;
   role: MemberRole;
   status: MemberStatus;
@@ -140,8 +161,8 @@ export interface WorkspaceStats {
 }
 
 export interface Workspace {
-  id: string;
-  organization_id: string;
+  id: WorkspaceId;
+  organization_id: OrganizationId;
   name: string;
   slug: string;
   /** Fixed at creation. Changing it requires a designed migration. */
@@ -249,10 +270,10 @@ export interface ConfigurationSummary {
 }
 
 export interface AppDefinition {
-  id: string;
-  organization_id: string;
+  id: AppId;
+  organization_id: OrganizationId;
   /** `null` for an organization app; the owning workspace for a workspace app. */
-  owner_workspace_id: string | null;
+  owner_workspace_id: WorkspaceId | null;
   owner_scope: AppOwnerScope;
   kind: AppKind;
   name: string;
@@ -305,7 +326,7 @@ export interface McpSettings {
 }
 
 export interface ClientConfiguration {
-  app_id: string;
+  app_id: AppId;
   environment: Environment;
   status: ConfigurationStatus;
   version: number;
@@ -352,7 +373,7 @@ export interface AccountConnection {
 }
 
 export interface InstallationApp {
-  id: string;
+  id: AppId;
   name: string;
   slug: string;
   owner_scope: AppOwnerScope;
@@ -361,8 +382,8 @@ export interface InstallationApp {
 }
 
 export interface Installation {
-  id: string;
-  workspace_id: string;
+  id: InstallationId;
+  workspace_id: WorkspaceId;
   app: InstallationApp;
   label: string;
   status: InstallationStatus;
@@ -384,17 +405,12 @@ export interface UpdateInstallationInput {
 }
 
 export interface ConnectSession {
-  id: string;
-  /**
-   * The hosted Connect page for this session. Send the user here (redirect or
-   * popup); Zupflow runs the provider flow and returns them to `return_url`.
-   */
-  url: string;
-  workspace_id: string;
+  id: ConnectSessionId;
+  workspace_id: WorkspaceId;
   environment: Environment;
   app: InstallationApp;
   intent: ConnectIntent;
-  installation_id: string | null;
+  installation_id: InstallationId | null;
   label: string;
   subject: string;
   status: ConnectSessionStatus;
@@ -410,11 +426,24 @@ export interface ConnectSession {
   expected_account: ConnectedAccount | null;
 }
 
+/**
+ * The creating response, the only one that carries the session's link. The
+ * link's reference authorizes the hosted page, so it's shown once, like a
+ * secret, and never returned by a read.
+ */
+export interface CreatedConnectSession extends ConnectSession {
+  /**
+   * The hosted Connect page for this session. Send the user here (redirect or
+   * popup); Zupflow runs the provider flow and returns them to `return_url`.
+   */
+  url: string;
+}
+
 export interface CreateConnectSessionInput {
-  app_id: string;
+  app_id: AppId;
   intent: ConnectIntent;
   label: string;
-  installation_id: string | null;
+  installation_id: InstallationId | null;
   subject: string;
   return_url: string | null;
 }
@@ -437,10 +466,10 @@ export interface AuthorizeConnectResult {
 // Agents and grants
 
 export interface AgentGrant {
-  id: string;
-  workspace_id: string;
-  agent_id: string;
-  installation_id: string;
+  id: GrantId;
+  workspace_id: WorkspaceId;
+  agent_id: AgentId;
+  installation_id: InstallationId;
   /** Tools the agent may call through this installation. */
   tools: string[];
   /** Subset of `tools` that pause the run for human approval. */
@@ -450,8 +479,8 @@ export interface AgentGrant {
 }
 
 export interface Agent {
-  id: string;
-  workspace_id: string;
+  id: AgentId;
+  workspace_id: WorkspaceId;
   name: string;
   description: string;
   model: string;
@@ -480,7 +509,7 @@ export interface UpdateAgentInput {
 }
 
 export interface CreateGrantInput {
-  installation_id: string;
+  installation_id: InstallationId;
   tools: string[];
   approval_required: string[];
 }
@@ -512,11 +541,11 @@ export interface RunError {
 }
 
 export interface Run {
-  id: string;
-  workspace_id: string;
-  agent_id: string;
+  id: RunId;
+  workspace_id: WorkspaceId;
+  agent_id: AgentId;
   agent_name: string;
-  session_id: string;
+  session_id: SessionId;
   subject: string | null;
   trigger: "api" | "console";
   status: RunStatus;
@@ -535,7 +564,7 @@ export interface CreateRunInput {
 }
 
 export interface RunListQuery {
-  agent_id?: string;
+  agent_id?: AgentId;
   status?: RunStatus;
   cursor?: string;
   limit?: number;
@@ -548,23 +577,23 @@ export interface OrganizationRun extends Run {
 
 export interface OrganizationRunListQuery {
   environment?: Environment;
-  workspace_id?: string;
+  workspace_id?: WorkspaceId;
   status?: RunStatus;
   cursor?: string;
   limit?: number;
 }
 
 interface RunEventBase {
-  id: string;
-  run_id: string;
-  workspace_id: string;
+  id: RunEventId;
+  run_id: RunId;
+  workspace_id: WorkspaceId;
   sequence: number;
   created_at: string;
 }
 
 export interface ToolCallRef {
-  call_id: string;
-  installation_id: string;
+  call_id: ToolCallId;
+  installation_id: InstallationId;
   installation_label: string;
   app_name: string;
   tool: string;
@@ -587,7 +616,7 @@ export type RunEvent = RunEventBase &
     | { type: "approval.requested"; data: ToolCallRef & { arguments: unknown } }
     | {
         type: "approval.resolved";
-        data: { call_id: string; decision: ApprovalDecision; resolved_by: string };
+        data: { call_id: ToolCallId; decision: ApprovalDecision; resolved_by: string };
       }
     | { type: "run.completed"; data: { usage: RunUsage } }
     | { type: "run.failed"; data: { error: RunError } }
@@ -599,7 +628,7 @@ export type RunEventType = RunEvent["type"];
 export type ApprovalDecision = "approved" | "denied";
 
 export interface ResolveApprovalInput {
-  call_id: string;
+  call_id: ToolCallId;
   decision: ApprovalDecision;
 }
 
@@ -621,8 +650,8 @@ export interface UpdateConnectSettingsInput {
 }
 
 export interface ApiKey {
-  id: string;
-  organization_id: string;
+  id: ApiKeyId;
+  organization_id: OrganizationId;
   environment: Environment;
   name: string;
   /** Public selector shown in lists, e.g. `zf_live_9KcB`. */
@@ -663,8 +692,8 @@ export interface WebhookDelivery {
 }
 
 export interface WebhookEndpoint {
-  id: string;
-  organization_id: string;
+  id: WebhookEndpointId;
+  organization_id: OrganizationId;
   environment: Environment;
   url: string;
   description: string;
@@ -699,20 +728,22 @@ export interface UpdateWebhookEndpointInput {
 
 export interface AuditActor {
   type: "user" | "api_key" | "system";
-  id: string;
+  /** The user or API key; `null` for Zupflow itself (`system`). */
+  id: AnyId | null;
   name: string;
 }
 
 export interface AuditTarget {
   type: string;
-  id: string;
+  /** `null` for targets that aren't objects, such as an environment's Connect settings. */
+  id: AnyId | null;
   name: string;
 }
 
 export interface AuditEvent {
-  id: string;
-  organization_id: string;
-  workspace_id: string | null;
+  id: AuditEventId;
+  organization_id: OrganizationId;
+  workspace_id: WorkspaceId | null;
   /** The workspace the event happened in, named so the log reads on its own. */
   workspace: WorkspaceRef | null;
   environment: Environment | null;
@@ -723,7 +754,7 @@ export interface AuditEvent {
 }
 
 export interface AuditListQuery {
-  workspace_id?: string;
+  workspace_id?: WorkspaceId;
   cursor?: string;
   limit?: number;
 }

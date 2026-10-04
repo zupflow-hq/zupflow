@@ -13,10 +13,12 @@ import { ConfigurationForm } from "@/features/apps/configuration-form";
 import { canAdminister, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { useUpdateWorkspaceAppConfiguration, useWorkspaceApp, useWorkspaceAppConfiguration } from "@/features/queries";
 import { useDetailCrumb } from "@/lib/crumbs";
+import { idParam } from "@/lib/route-ids";
 
 const TABS = ["overview", "configuration"] as const;
 
 export const Route = createFileRoute("/_authed/$org/w/$ws/apps/$appId")({
+  params: idParam("appId", "app"),
   validateSearch: z.object({ tab: z.enum(TABS).optional() }),
   component: WorkspaceAppPage,
 });

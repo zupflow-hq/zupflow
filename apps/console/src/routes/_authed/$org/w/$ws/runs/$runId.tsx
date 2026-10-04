@@ -14,9 +14,11 @@ import { useCancelRun, useRun, useRunEvents } from "@/features/queries";
 import { RunTimeline } from "@/features/runs/timeline";
 import { useDetailCrumb } from "@/lib/crumbs";
 import { toastError } from "@/lib/errors";
-import { duration, fullDateTime } from "@/lib/format";
+import { duration, fullDateTime, shortId } from "@/lib/format";
+import { idParam } from "@/lib/route-ids";
 
 export const Route = createFileRoute("/_authed/$org/w/$ws/runs/$runId")({
+  params: idParam("runId", "run"),
   component: RunPage,
 });
 
@@ -29,8 +31,8 @@ function RunPage() {
   const events = useRunEvents(ws.id, runId, live);
   const cancel = useCancelRun(ws.id, runId);
   const [cancelling, setCancelling] = useState(false);
-  useDetailCrumb(run.data ? `Run ${run.data.id.slice(0, 8)}` : undefined);
-  useDocumentTitle(run.data ? `Run ${run.data.id.slice(0, 8)}` : "Run", ws.name);
+  useDetailCrumb(run.data ? `Run ${shortId(run.data.id)}` : undefined);
+  useDocumentTitle(run.data ? `Run ${shortId(run.data.id)}` : "Run", ws.name);
 
   if (run.isError) {
     return (
@@ -49,7 +51,7 @@ function RunPage() {
             <>
               <div className="flex flex-wrap items-center gap-2">
                 <h2 className="text-xl leading-tight font-semibold tracking-[-0.02em]">
-                  Run <span className="font-mono text-[1.15rem] font-medium">{r.id.slice(0, 8)}</span>
+                  Run <span className="font-mono text-[1.15rem] font-medium">{shortId(r.id)}</span>
                 </h2>
                 <RunStatusPill status={r.status} />
               </div>

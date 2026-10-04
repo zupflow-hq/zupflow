@@ -13,10 +13,11 @@ import { canAdminister, useDocumentTitle, useOrg } from "@/features/context";
 import { useAuditEvents } from "@/features/queries";
 import { WorkspacePicker } from "@/features/workspaces/workspace-picker";
 import { fullDateTime } from "@/lib/format";
+import { idSearch } from "@/lib/route-ids";
 
 export const Route = createFileRoute("/_authed/$org/audit-log")({
   staticData: { crumb: "Audit log" },
-  validateSearch: z.object({ workspace: z.string().optional() }),
+  validateSearch: z.object({ workspace: idSearch("workspace").optional() }),
   component: AuditLogPage,
 });
 

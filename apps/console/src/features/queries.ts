@@ -4,6 +4,10 @@
  */
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  type AgentId,
+  type ApiKeyId,
+  type AppId,
+  type ConnectSessionId,
   type CreateAgentInput,
   type CreateApiKeyInput,
   type CreateAppInput,
@@ -14,10 +18,15 @@ import {
   type CreateWebhookEndpointInput,
   type CreateWorkspaceInput,
   type Environment,
+  type GrantId,
+  type InstallationId,
   type InviteMemberInput,
+  type MemberId,
   type MemberRole,
+  type OrganizationId,
   type OrganizationRunListQuery,
   type RunEvent,
+  type RunId,
   type RunListQuery,
   TERMINAL_RUN_STATUSES,
   type UpdateAgentInput,
@@ -28,10 +37,18 @@ import {
   type UpdateOrganizationInput,
   type UpdateWebhookEndpointInput,
   type UpdateWorkspaceInput,
+  type WebhookEndpointId,
+  type WorkspaceId,
   type WorkspaceListQuery,
 } from "@zupflow/sdk";
 import { api } from "@/lib/api";
 import { qk } from "@/lib/query-keys";
+
+/** For queries that are `enabled` only once an ID exists; reaching this without one is a bug. */
+function required<T>(id: T | undefined | null): T {
+  if (id === undefined || id === null) throw new Error("This query ran before its ID was known.");
+  return id;
+}
 
 // ---------------------------------------------------------------------------
 // Viewer and organizations
@@ -58,7 +75,7 @@ export function useCreateOrganization() {
   });
 }
 
-export function useUpdateOrganization(orgId: string) {
+export function useUpdateOrganization(orgId: OrganizationId) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: UpdateOrganizationInput) => api.organizations.update(orgId, input),
@@ -66,7 +83,7 @@ export function useUpdateOrganization(orgId: string) {
   });
 }
 
-export function useUsage(orgId: string, env: Environment) {
+export function useUsage(orgId: OrganizationId, env: Environment) {
   return useQuery({
     queryKey: qk.usage(orgId, env),
     queryFn: () => api.organizations.usage(orgId, env, 14),
@@ -76,11 +93,11 @@ export function useUsage(orgId: string, env: Environment) {
 // ---------------------------------------------------------------------------
 // Members
 
-export function useMembers(orgId: string) {
+export function useMembers(orgId: OrganizationId) {
   return useQuery({ queryKey: qk.members(orgId), queryFn: () => api.members.list(orgId) });
 }
 
-export function useInviteMember(orgId: string) {
+export function useInviteMember(orgId: OrganizationId) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: InviteMemberInput) => api.members.invite(orgId, input),
@@ -88,19 +105,19 @@ export function useInviteMember(orgId: string) {
   });
 }
 
-export function useUpdateMember(orgId: string) {
+export function useUpdateMember(orgId: OrganizationId) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ memberId, role }: { memberId: string; role: MemberRole }) =>
+    mutationFn: ({ memberId, role }: { memberId: MemberId; role: MemberRole }) =>
       api.members.update(orgId, memberId, { role }),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.members(orgId) }),
   });
 }
 
-export function useRemoveMember(orgId: string) {
+export function useRemoveMember(orgId: OrganizationId) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (memberId: string) => api.members.remove(orgId, memberId),
+    mutationFn: (memberId: MemberId) => api.members.remove(orgId, memberId),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.members(orgId) }),
   });
 }
@@ -109,7 +126,7 @@ export function useRemoveMember(orgId: string) {
 // Workspaces
 
 /** Workspaces, a page at a time. Organizations have thousands; never load them all. */
-export function useWorkspaceList(orgId: string, query: Omit<WorkspaceListQuery, "cursor">) {
+export function useWorkspaceList(orgId: OrganizationId, query: Omit<WorkspaceListQuery, "cursor">) {
   return useInfiniteQuery({
     queryKey: [...qk.workspaces(orgId), "list", query],
     queryFn: ({ pageParam }) => api.workspaces.list(orgId, { ...query, cursor: pageParam ?? undefined }),
@@ -120,7 +137,7 @@ export function useWorkspaceList(orgId: string, query: Omit<WorkspaceListQuery, 
 }
 
 /** One page of workspaces: summaries, counts and pickers. */
-export function useWorkspacePage(orgId: string, query: Omit<WorkspaceListQuery, "cursor">, enabled = true) {
+export function useWorkspacePage(orgId: OrganizationId, query: Omit<WorkspaceListQuery, "cursor">, enabled = true) {
   return useQuery({
     queryKey: [...qk.workspaces(orgId), "page", query],
     queryFn: () => api.workspaces.list(orgId, query),
@@ -129,16 +146,21 @@ export function useWorkspacePage(orgId: string, query: Omit<WorkspaceListQuery, 
   });
 }
 
-export const workspaceQuery = (wsId: string) => ({
+export const workspaceQuery = (wsId: WorkspaceId) => ({
   queryKey: qk.workspace(wsId),
   queryFn: () => api.workspaces.get(wsId),
 });
 
-export function useWorkspace(wsId: string) {
-  return useQuery({ ...workspaceQuery(wsId), enabled: Boolean(wsId) });
+/** The workspace, or nothing while there's no ID to load (outside a workspace page, say). */
+export function useWorkspace(wsId: WorkspaceId | undefined) {
+  return useQuery({
+    queryKey: qk.workspace(wsId ?? "none"),
+    queryFn: () => api.workspaces.get(required(wsId)),
+    enabled: Boolean(wsId),
+  });
 }
 
-export function useCreateWorkspace(orgId: string) {
+export function useCreateWorkspace(orgId: OrganizationId) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: CreateWorkspaceInput) => api.workspaces.create(orgId, input),
@@ -149,7 +171,7 @@ export function useCreateWorkspace(orgId: string) {
   });
 }
 
-export function useUpdateWorkspace(orgId: string, wsId: string) {
+export function useUpdateWorkspace(orgId: OrganizationId, wsId: WorkspaceId) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: UpdateWorkspaceInput) => api.workspaces.update(wsId, input),
@@ -160,10 +182,10 @@ export function useUpdateWorkspace(orgId: string, wsId: string) {
   });
 }
 
-export function useDeleteWorkspace(orgId: string) {
+export function useDeleteWorkspace(orgId: OrganizationId) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (wsId: string) => api.workspaces.delete(wsId),
+    mutationFn: (wsId: WorkspaceId) => api.workspaces.delete(wsId),
     onSuccess: (_, wsId) => {
       qc.removeQueries({ queryKey: qk.workspace(wsId) });
       qc.invalidateQueries({ queryKey: qk.org(orgId) });
@@ -175,19 +197,19 @@ export function useDeleteWorkspace(orgId: string) {
 // ---------------------------------------------------------------------------
 // Apps
 
-export function useOrgApps(orgId: string) {
+export function useOrgApps(orgId: OrganizationId) {
   return useQuery({ queryKey: qk.orgApps(orgId), queryFn: () => api.organizationApps.list(orgId) });
 }
 
-export function useOrgApp(orgId: string, appId: string) {
+export function useOrgApp(orgId: OrganizationId, appId: AppId | undefined) {
   return useQuery({
-    queryKey: qk.orgApp(orgId, appId),
-    queryFn: () => api.organizationApps.get(orgId, appId),
+    queryKey: qk.orgApp(orgId, appId ?? "none"),
+    queryFn: () => api.organizationApps.get(orgId, required(appId)),
     enabled: Boolean(appId),
   });
 }
 
-export function useCreateOrgApp(orgId: string) {
+export function useCreateOrgApp(orgId: OrganizationId) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: CreateAppInput) => api.organizationApps.create(orgId, input),
@@ -198,7 +220,7 @@ export function useCreateOrgApp(orgId: string) {
   });
 }
 
-export function useUpdateOrgApp(orgId: string, appId: string) {
+export function useUpdateOrgApp(orgId: OrganizationId, appId: AppId) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: UpdateAppInput) => api.organizationApps.update(orgId, appId, input),
@@ -209,14 +231,14 @@ export function useUpdateOrgApp(orgId: string, appId: string) {
   });
 }
 
-export function useOrgAppConfiguration(orgId: string, appId: string, env: Environment) {
+export function useOrgAppConfiguration(orgId: OrganizationId, appId: AppId, env: Environment) {
   return useQuery({
     queryKey: qk.orgAppConfig(orgId, appId, env),
     queryFn: () => api.organizationApps.getConfiguration(orgId, appId, env),
   });
 }
 
-export function useUpdateOrgAppConfiguration(orgId: string, appId: string, env: Environment) {
+export function useUpdateOrgAppConfiguration(orgId: OrganizationId, appId: AppId, env: Environment) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: UpdateConfigurationInput) => api.organizationApps.updateConfiguration(orgId, appId, env, input),
@@ -230,7 +252,7 @@ export function useUpdateOrgAppConfiguration(orgId: string, appId: string, env: 
   });
 }
 
-export function useOrgAppInstallations(orgId: string, appId: string, environment: Environment) {
+export function useOrgAppInstallations(orgId: OrganizationId, appId: AppId, environment: Environment) {
   return useInfiniteQuery({
     queryKey: [...qk.orgAppInstallations(orgId, appId), environment],
     queryFn: ({ pageParam }) =>
@@ -240,19 +262,19 @@ export function useOrgAppInstallations(orgId: string, appId: string, environment
   });
 }
 
-export function useWorkspaceApps(wsId: string) {
+export function useWorkspaceApps(wsId: WorkspaceId) {
   return useQuery({ queryKey: qk.workspaceApps(wsId), queryFn: () => api.workspaceApps.list(wsId) });
 }
 
-export function useWorkspaceApp(wsId: string, appId: string) {
+export function useWorkspaceApp(wsId: WorkspaceId, appId: AppId | undefined) {
   return useQuery({
-    queryKey: qk.workspaceApp(wsId, appId),
-    queryFn: () => api.workspaceApps.get(wsId, appId),
+    queryKey: qk.workspaceApp(wsId, appId ?? "none"),
+    queryFn: () => api.workspaceApps.get(wsId, required(appId)),
     enabled: Boolean(appId),
   });
 }
 
-export function useCreateWorkspaceApp(wsId: string) {
+export function useCreateWorkspaceApp(wsId: WorkspaceId) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: CreateAppInput) => api.workspaceApps.create(wsId, input),
@@ -260,7 +282,7 @@ export function useCreateWorkspaceApp(wsId: string) {
   });
 }
 
-export function useUpdateWorkspaceApp(wsId: string, appId: string) {
+export function useUpdateWorkspaceApp(wsId: WorkspaceId, appId: AppId) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: UpdateAppInput) => api.workspaceApps.update(wsId, appId, input),
@@ -268,14 +290,14 @@ export function useUpdateWorkspaceApp(wsId: string, appId: string) {
   });
 }
 
-export function useWorkspaceAppConfiguration(wsId: string, appId: string) {
+export function useWorkspaceAppConfiguration(wsId: WorkspaceId, appId: AppId) {
   return useQuery({
     queryKey: qk.workspaceAppConfig(wsId, appId),
     queryFn: () => api.workspaceApps.getConfiguration(wsId, appId),
   });
 }
 
-export function useUpdateWorkspaceAppConfiguration(wsId: string, appId: string) {
+export function useUpdateWorkspaceAppConfiguration(wsId: WorkspaceId, appId: AppId) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: UpdateConfigurationInput) => api.workspaceApps.updateConfiguration(wsId, appId, input),
@@ -286,7 +308,7 @@ export function useUpdateWorkspaceAppConfiguration(wsId: string, appId: string) 
   });
 }
 
-export function useAvailableApps(wsId: string) {
+export function useAvailableApps(wsId: WorkspaceId) {
   return useQuery({
     queryKey: qk.availableApps(wsId),
     queryFn: () => api.workspaceApps.available(wsId),
@@ -296,18 +318,18 @@ export function useAvailableApps(wsId: string) {
 // ---------------------------------------------------------------------------
 // Installations and Connect
 
-export function useInstallations(wsId: string) {
+export function useInstallations(wsId: WorkspaceId) {
   return useQuery({ queryKey: qk.installations(wsId), queryFn: () => api.installations.list(wsId) });
 }
 
-export function useInstallation(wsId: string, id: string) {
+export function useInstallation(wsId: WorkspaceId, id: InstallationId) {
   return useQuery({
     queryKey: qk.installation(wsId, id),
     queryFn: () => api.installations.get(wsId, id),
   });
 }
 
-export function useRenameInstallation(wsId: string, id: string) {
+export function useRenameInstallation(wsId: WorkspaceId, id: InstallationId) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (label: string) => api.installations.update(wsId, id, { label }),
@@ -315,18 +337,18 @@ export function useRenameInstallation(wsId: string, id: string) {
   });
 }
 
-export function useDisconnectInstallation(wsId: string) {
+export function useDisconnectInstallation(wsId: WorkspaceId) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => api.installations.disconnect(wsId, id),
+    mutationFn: (id: InstallationId) => api.installations.disconnect(wsId, id),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.workspace(wsId) }),
   });
 }
 
-export function useDeleteInstallation(wsId: string) {
+export function useDeleteInstallation(wsId: WorkspaceId) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => api.installations.delete(wsId, id),
+    mutationFn: (id: InstallationId) => api.installations.delete(wsId, id),
     onSuccess: (_, id) => {
       qc.removeQueries({ queryKey: qk.installation(wsId, id) });
       qc.invalidateQueries({ queryKey: qk.workspace(wsId) });
@@ -334,33 +356,34 @@ export function useDeleteInstallation(wsId: string) {
   });
 }
 
-export function useConnectSessions(wsId: string) {
+export function useConnectSessions(wsId: WorkspaceId) {
   return useQuery({
     queryKey: qk.connectSessions(wsId),
     queryFn: () => api.connectSessions.list(wsId),
   });
 }
 
-export function useCreateConnectSession(wsId: string) {
+export function useCreateConnectSession(wsId: WorkspaceId) {
   return useMutation({
     mutationFn: (input: CreateConnectSessionInput) => api.connectSessions.create(wsId, input),
   });
 }
 
 /** Polls a Connect session until it leaves `pending`. */
-export function useWatchedConnectSession(wsId: string, sessionId: string | null) {
+export function useWatchedConnectSession(wsId: WorkspaceId, sessionId: ConnectSessionId | null) {
   return useQuery({
     queryKey: qk.connectSession(wsId, sessionId ?? "none"),
-    queryFn: () => api.connectSessions.get(wsId, sessionId ?? ""),
+    queryFn: () => api.connectSessions.get(wsId, required(sessionId)),
     enabled: sessionId !== null,
     refetchInterval: (query) => (query.state.data?.status === "pending" ? 1500 : false),
   });
 }
 
-export function useHostedConnectSession(sessionId: string) {
+/** Hosted Connect, by the session's reference (the random token in its link), never its ID. */
+export function useHostedConnectSession(reference: string) {
   return useQuery({
-    queryKey: qk.hostedConnect(sessionId),
-    queryFn: () => api.connect.get(sessionId),
+    queryKey: qk.hostedConnect(reference),
+    queryFn: () => api.connect.get(reference),
     retry: false,
     // The provider round-trip changes this session outside the page.
     staleTime: 0,
@@ -370,15 +393,15 @@ export function useHostedConnectSession(sessionId: string) {
 // ---------------------------------------------------------------------------
 // Agents and grants
 
-export function useAgents(wsId: string) {
+export function useAgents(wsId: WorkspaceId) {
   return useQuery({ queryKey: qk.agents(wsId), queryFn: () => api.agents.list(wsId) });
 }
 
-export function useAgent(wsId: string, id: string) {
+export function useAgent(wsId: WorkspaceId, id: AgentId) {
   return useQuery({ queryKey: qk.agent(wsId, id), queryFn: () => api.agents.get(wsId, id) });
 }
 
-export function useCreateAgent(wsId: string) {
+export function useCreateAgent(wsId: WorkspaceId) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: CreateAgentInput) => api.agents.create(wsId, input),
@@ -389,7 +412,7 @@ export function useCreateAgent(wsId: string) {
   });
 }
 
-export function useUpdateAgent(wsId: string, id: string) {
+export function useUpdateAgent(wsId: WorkspaceId, id: AgentId) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: UpdateAgentInput) => api.agents.update(wsId, id, input),
@@ -400,10 +423,10 @@ export function useUpdateAgent(wsId: string, id: string) {
   });
 }
 
-export function useDeleteAgent(wsId: string) {
+export function useDeleteAgent(wsId: WorkspaceId) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => api.agents.delete(wsId, id),
+    mutationFn: (id: AgentId) => api.agents.delete(wsId, id),
     onSuccess: (_, id) => {
       qc.removeQueries({ queryKey: qk.agent(wsId, id) });
       qc.invalidateQueries({ queryKey: qk.workspace(wsId) });
@@ -411,14 +434,14 @@ export function useDeleteAgent(wsId: string) {
   });
 }
 
-export function useGrants(wsId: string, agentId: string) {
+export function useGrants(wsId: WorkspaceId, agentId: AgentId) {
   return useQuery({
     queryKey: qk.grants(wsId, agentId),
     queryFn: () => api.grants.list(wsId, agentId),
   });
 }
 
-function useInvalidateGrants(wsId: string, agentId: string) {
+function useInvalidateGrants(wsId: WorkspaceId, agentId: AgentId) {
   const qc = useQueryClient();
   return () => {
     qc.invalidateQueries({ queryKey: qk.grants(wsId, agentId) });
@@ -428,7 +451,7 @@ function useInvalidateGrants(wsId: string, agentId: string) {
   };
 }
 
-export function useCreateGrant(wsId: string, agentId: string) {
+export function useCreateGrant(wsId: WorkspaceId, agentId: AgentId) {
   const invalidate = useInvalidateGrants(wsId, agentId);
   return useMutation({
     mutationFn: (input: CreateGrantInput) => api.grants.create(wsId, agentId, input),
@@ -436,19 +459,19 @@ export function useCreateGrant(wsId: string, agentId: string) {
   });
 }
 
-export function useUpdateGrant(wsId: string, agentId: string) {
+export function useUpdateGrant(wsId: WorkspaceId, agentId: AgentId) {
   const invalidate = useInvalidateGrants(wsId, agentId);
   return useMutation({
-    mutationFn: ({ grantId, ...input }: UpdateGrantInput & { grantId: string }) =>
+    mutationFn: ({ grantId, ...input }: UpdateGrantInput & { grantId: GrantId }) =>
       api.grants.update(wsId, agentId, grantId, input),
     onSuccess: invalidate,
   });
 }
 
-export function useDeleteGrant(wsId: string, agentId: string) {
+export function useDeleteGrant(wsId: WorkspaceId, agentId: AgentId) {
   const invalidate = useInvalidateGrants(wsId, agentId);
   return useMutation({
-    mutationFn: (grantId: string) => api.grants.delete(wsId, agentId, grantId),
+    mutationFn: (grantId: GrantId) => api.grants.delete(wsId, agentId, grantId),
     onSuccess: invalidate,
   });
 }
@@ -456,7 +479,7 @@ export function useDeleteGrant(wsId: string, agentId: string) {
 // ---------------------------------------------------------------------------
 // Runs
 
-export function useRuns(wsId: string, query: Omit<RunListQuery, "cursor"> = {}) {
+export function useRuns(wsId: WorkspaceId, query: Omit<RunListQuery, "cursor"> = {}) {
   return useInfiniteQuery({
     queryKey: qk.runs(wsId, query),
     queryFn: ({ pageParam }) => api.runs.list(wsId, { ...query, cursor: pageParam ?? undefined }),
@@ -467,7 +490,7 @@ export function useRuns(wsId: string, query: Omit<RunListQuery, "cursor"> = {}) 
   });
 }
 
-export function useRun(wsId: string, id: string) {
+export function useRun(wsId: WorkspaceId, id: RunId) {
   return useQuery({
     queryKey: qk.run(wsId, id),
     queryFn: () => api.runs.get(wsId, id),
@@ -476,7 +499,7 @@ export function useRun(wsId: string, id: string) {
 }
 
 /** Events for a run, polled while it is live. Realtime replaces polling later. */
-export function useRunEvents(wsId: string, id: string, live: boolean) {
+export function useRunEvents(wsId: WorkspaceId, id: RunId, live: boolean) {
   return useQuery<RunEvent[]>({
     queryKey: qk.runEvents(wsId, id),
     queryFn: () => api.runs.events(wsId, id),
@@ -484,7 +507,7 @@ export function useRunEvents(wsId: string, id: string, live: boolean) {
   });
 }
 
-export function useCreateRun(wsId: string, agentId: string) {
+export function useCreateRun(wsId: WorkspaceId, agentId: AgentId) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: CreateRunInput) => api.runs.create(wsId, agentId, input),
@@ -495,7 +518,7 @@ export function useCreateRun(wsId: string, agentId: string) {
   });
 }
 
-export function useCancelRun(wsId: string, id: string) {
+export function useCancelRun(wsId: WorkspaceId, id: RunId) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => api.runs.cancel(wsId, id),
@@ -506,7 +529,7 @@ export function useCancelRun(wsId: string, id: string) {
   });
 }
 
-export function useOrganizationRuns(orgId: string, query: Omit<OrganizationRunListQuery, "cursor">) {
+export function useOrganizationRuns(orgId: OrganizationId, query: Omit<OrganizationRunListQuery, "cursor">) {
   return useInfiniteQuery({
     queryKey: ["org", orgId, "runs", query],
     queryFn: ({ pageParam }) => api.organizationRuns.list(orgId, { ...query, cursor: pageParam ?? undefined }),
@@ -520,14 +543,14 @@ export function useOrganizationRuns(orgId: string, query: Omit<OrganizationRunLi
 // ---------------------------------------------------------------------------
 // Developer settings
 
-export function useConnectSettings(orgId: string, env: Environment) {
+export function useConnectSettings(orgId: OrganizationId, env: Environment) {
   return useQuery({
     queryKey: qk.connectSettings(orgId, env),
     queryFn: () => api.connectSettings.get(orgId, env),
   });
 }
 
-export function useUpdateConnectSettings(orgId: string, env: Environment) {
+export function useUpdateConnectSettings(orgId: OrganizationId, env: Environment) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: UpdateConnectSettingsInput) => api.connectSettings.update(orgId, env, input),
@@ -535,11 +558,11 @@ export function useUpdateConnectSettings(orgId: string, env: Environment) {
   });
 }
 
-export function useApiKeys(orgId: string) {
+export function useApiKeys(orgId: OrganizationId) {
   return useQuery({ queryKey: qk.apiKeys(orgId), queryFn: () => api.apiKeys.list(orgId) });
 }
 
-export function useCreateApiKey(orgId: string) {
+export function useCreateApiKey(orgId: OrganizationId) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: CreateApiKeyInput) => api.apiKeys.create(orgId, input),
@@ -550,19 +573,19 @@ export function useCreateApiKey(orgId: string) {
   });
 }
 
-export function useRevokeApiKey(orgId: string) {
+export function useRevokeApiKey(orgId: OrganizationId) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (keyId: string) => api.apiKeys.revoke(orgId, keyId),
+    mutationFn: (keyId: ApiKeyId) => api.apiKeys.revoke(orgId, keyId),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.apiKeys(orgId) }),
   });
 }
 
-export function useWebhooks(orgId: string) {
+export function useWebhooks(orgId: OrganizationId) {
   return useQuery({ queryKey: qk.webhooks(orgId), queryFn: () => api.webhooks.list(orgId) });
 }
 
-export function useCreateWebhook(orgId: string) {
+export function useCreateWebhook(orgId: OrganizationId) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: CreateWebhookEndpointInput) => api.webhooks.create(orgId, input),
@@ -570,27 +593,27 @@ export function useCreateWebhook(orgId: string) {
   });
 }
 
-export function useUpdateWebhook(orgId: string) {
+export function useUpdateWebhook(orgId: OrganizationId) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, ...input }: UpdateWebhookEndpointInput & { id: string }) =>
+    mutationFn: ({ id, ...input }: UpdateWebhookEndpointInput & { id: WebhookEndpointId }) =>
       api.webhooks.update(orgId, id, input),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.webhooks(orgId) }),
   });
 }
 
-export function useDeleteWebhook(orgId: string) {
+export function useDeleteWebhook(orgId: OrganizationId) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => api.webhooks.delete(orgId, id),
+    mutationFn: (id: WebhookEndpointId) => api.webhooks.delete(orgId, id),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.webhooks(orgId) }),
   });
 }
 
-export function useTestWebhook(orgId: string) {
+export function useTestWebhook(orgId: OrganizationId) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => api.webhooks.sendTest(orgId, id),
+    mutationFn: (id: WebhookEndpointId) => api.webhooks.sendTest(orgId, id),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.webhooks(orgId) }),
   });
 }
@@ -598,7 +621,7 @@ export function useTestWebhook(orgId: string) {
 // ---------------------------------------------------------------------------
 // Audit
 
-export function useAuditEvents(orgId: string, workspaceId?: string) {
+export function useAuditEvents(orgId: OrganizationId, workspaceId?: WorkspaceId) {
   return useInfiniteQuery({
     queryKey: qk.audit(orgId, workspaceId),
     queryFn: ({ pageParam }) =>

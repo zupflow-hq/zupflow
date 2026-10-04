@@ -24,8 +24,8 @@ import { Route as AuthedOrgRunsRouteImport } from "./routes/_authed/$org/runs"
 import { Route as AuthedOrgSettingsRouteImport } from "./routes/_authed/$org/settings"
 import { Route as AuthedOrgWebhooksRouteImport } from "./routes/_authed/$org/webhooks"
 import { Route as AuthedOrgWorkspacesRouteImport } from "./routes/_authed/$org/workspaces"
-import { Route as ConnectSessionIdIndexRouteImport } from "./routes/connect/$sessionId/index"
-import { Route as ConnectSessionIdSimulatedConsentRouteImport } from "./routes/connect/$sessionId/simulated-consent"
+import { Route as ConnectReferenceIndexRouteImport } from "./routes/connect/$reference/index"
+import { Route as ConnectReferenceSimulatedConsentRouteImport } from "./routes/connect/$reference/simulated-consent"
 import { Route as AuthedOrgAppsIndexRouteImport } from "./routes/_authed/$org/apps/index"
 import { Route as AuthedOrgAppsAppIdRouteImport } from "./routes/_authed/$org/apps/$appId"
 import { Route as AuthedOrgWWsRouteImport } from "./routes/_authed/$org/w/$ws"
@@ -119,15 +119,15 @@ const AuthedOrgWorkspacesRoute = AuthedOrgWorkspacesRouteImport.update({
   path: "/workspaces",
   getParentRoute: () => AuthedOrgRoute,
 } as any)
-const ConnectSessionIdIndexRoute = ConnectSessionIdIndexRouteImport.update({
-  id: "/connect/$sessionId/",
-  path: "/connect/$sessionId/",
+const ConnectReferenceIndexRoute = ConnectReferenceIndexRouteImport.update({
+  id: "/connect/$reference/",
+  path: "/connect/$reference/",
   getParentRoute: () => rootRouteImport,
 } as any)
-const ConnectSessionIdSimulatedConsentRoute =
-  ConnectSessionIdSimulatedConsentRouteImport.update({
-    id: "/connect/$sessionId/simulated-consent",
-    path: "/connect/$sessionId/simulated-consent",
+const ConnectReferenceSimulatedConsentRoute =
+  ConnectReferenceSimulatedConsentRouteImport.update({
+    id: "/connect/$reference/simulated-consent",
+    path: "/connect/$reference/simulated-consent",
     getParentRoute: () => rootRouteImport,
   } as any)
 const AuthedOrgAppsIndexRoute = AuthedOrgAppsIndexRouteImport.update({
@@ -240,9 +240,9 @@ export interface FileRoutesByFullPath {
   "/$org/settings": typeof AuthedOrgSettingsRoute
   "/$org/webhooks": typeof AuthedOrgWebhooksRoute
   "/$org/workspaces": typeof AuthedOrgWorkspacesRoute
-  "/connect/$sessionId/simulated-consent": typeof ConnectSessionIdSimulatedConsentRoute
+  "/connect/$reference/simulated-consent": typeof ConnectReferenceSimulatedConsentRoute
   "/$org/": typeof AuthedOrgIndexRoute
-  "/connect/$sessionId/": typeof ConnectSessionIdIndexRoute
+  "/connect/$reference/": typeof ConnectReferenceIndexRoute
   "/$org/apps/$appId": typeof AuthedOrgAppsAppIdRoute
   "/$org/w/$ws": typeof AuthedOrgWWsRouteWithChildren
   "/$org/apps/": typeof AuthedOrgAppsIndexRoute
@@ -274,9 +274,9 @@ export interface FileRoutesByTo {
   "/$org/settings": typeof AuthedOrgSettingsRoute
   "/$org/webhooks": typeof AuthedOrgWebhooksRoute
   "/$org/workspaces": typeof AuthedOrgWorkspacesRoute
-  "/connect/$sessionId/simulated-consent": typeof ConnectSessionIdSimulatedConsentRoute
+  "/connect/$reference/simulated-consent": typeof ConnectReferenceSimulatedConsentRoute
   "/$org": typeof AuthedOrgIndexRoute
-  "/connect/$sessionId": typeof ConnectSessionIdIndexRoute
+  "/connect/$reference": typeof ConnectReferenceIndexRoute
   "/$org/apps/$appId": typeof AuthedOrgAppsAppIdRoute
   "/$org/apps": typeof AuthedOrgAppsIndexRoute
   "/$org/w/$ws/connect-sessions": typeof AuthedOrgWWsConnectSessionsRoute
@@ -307,9 +307,9 @@ export interface FileRoutesById {
   "/_authed/$org/settings": typeof AuthedOrgSettingsRoute
   "/_authed/$org/webhooks": typeof AuthedOrgWebhooksRoute
   "/_authed/$org/workspaces": typeof AuthedOrgWorkspacesRoute
-  "/connect/$sessionId/simulated-consent": typeof ConnectSessionIdSimulatedConsentRoute
+  "/connect/$reference/simulated-consent": typeof ConnectReferenceSimulatedConsentRoute
   "/_authed/$org/": typeof AuthedOrgIndexRoute
-  "/connect/$sessionId/": typeof ConnectSessionIdIndexRoute
+  "/connect/$reference/": typeof ConnectReferenceIndexRoute
   "/_authed/$org/apps/$appId": typeof AuthedOrgAppsAppIdRoute
   "/_authed/$org/w/$ws": typeof AuthedOrgWWsRouteWithChildren
   "/_authed/$org/apps/": typeof AuthedOrgAppsIndexRoute
@@ -345,9 +345,9 @@ export interface FileRouteTypes {
     | "/$org/settings"
     | "/$org/webhooks"
     | "/$org/workspaces"
-    | "/connect/$sessionId/simulated-consent"
+    | "/connect/$reference/simulated-consent"
     | "/$org/"
-    | "/connect/$sessionId/"
+    | "/connect/$reference/"
     | "/$org/apps/$appId"
     | "/$org/w/$ws"
     | "/$org/apps/"
@@ -379,9 +379,9 @@ export interface FileRouteTypes {
     | "/$org/settings"
     | "/$org/webhooks"
     | "/$org/workspaces"
-    | "/connect/$sessionId/simulated-consent"
+    | "/connect/$reference/simulated-consent"
     | "/$org"
-    | "/connect/$sessionId"
+    | "/connect/$reference"
     | "/$org/apps/$appId"
     | "/$org/apps"
     | "/$org/w/$ws/connect-sessions"
@@ -411,9 +411,9 @@ export interface FileRouteTypes {
     | "/_authed/$org/settings"
     | "/_authed/$org/webhooks"
     | "/_authed/$org/workspaces"
-    | "/connect/$sessionId/simulated-consent"
+    | "/connect/$reference/simulated-consent"
     | "/_authed/$org/"
-    | "/connect/$sessionId/"
+    | "/connect/$reference/"
     | "/_authed/$org/apps/$appId"
     | "/_authed/$org/w/$ws"
     | "/_authed/$org/apps/"
@@ -438,8 +438,8 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AuthedRoute: typeof AuthedRouteWithChildren
   SignInRoute: typeof SignInRoute
-  ConnectSessionIdSimulatedConsentRoute: typeof ConnectSessionIdSimulatedConsentRoute
-  ConnectSessionIdIndexRoute: typeof ConnectSessionIdIndexRoute
+  ConnectReferenceSimulatedConsentRoute: typeof ConnectReferenceSimulatedConsentRoute
+  ConnectReferenceIndexRoute: typeof ConnectReferenceIndexRoute
 }
 
 declare module "@tanstack/react-router" {
@@ -549,18 +549,18 @@ declare module "@tanstack/react-router" {
       preLoaderRoute: typeof AuthedOrgWorkspacesRouteImport
       parentRoute: typeof AuthedOrgRoute
     }
-    "/connect/$sessionId/": {
-      id: "/connect/$sessionId/"
-      path: "/connect/$sessionId"
-      fullPath: "/connect/$sessionId/"
-      preLoaderRoute: typeof ConnectSessionIdIndexRouteImport
+    "/connect/$reference/": {
+      id: "/connect/$reference/"
+      path: "/connect/$reference"
+      fullPath: "/connect/$reference/"
+      preLoaderRoute: typeof ConnectReferenceIndexRouteImport
       parentRoute: typeof rootRouteImport
     }
-    "/connect/$sessionId/simulated-consent": {
-      id: "/connect/$sessionId/simulated-consent"
-      path: "/connect/$sessionId/simulated-consent"
-      fullPath: "/connect/$sessionId/simulated-consent"
-      preLoaderRoute: typeof ConnectSessionIdSimulatedConsentRouteImport
+    "/connect/$reference/simulated-consent": {
+      id: "/connect/$reference/simulated-consent"
+      path: "/connect/$reference/simulated-consent"
+      fullPath: "/connect/$reference/simulated-consent"
+      preLoaderRoute: typeof ConnectReferenceSimulatedConsentRouteImport
       parentRoute: typeof rootRouteImport
     }
     "/_authed/$org/apps/": {
@@ -835,8 +835,8 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AuthedRoute: AuthedRouteWithChildren,
   SignInRoute: SignInRoute,
-  ConnectSessionIdSimulatedConsentRoute: ConnectSessionIdSimulatedConsentRoute,
-  ConnectSessionIdIndexRoute: ConnectSessionIdIndexRoute,
+  ConnectReferenceSimulatedConsentRoute: ConnectReferenceSimulatedConsentRoute,
+  ConnectReferenceIndexRoute: ConnectReferenceIndexRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

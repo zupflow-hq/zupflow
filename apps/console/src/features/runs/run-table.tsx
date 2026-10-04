@@ -3,7 +3,7 @@ import type { Run, WorkspaceRef } from "@zupflow/sdk";
 import { RelativeTime, rowLinkProps } from "@/components/app/misc";
 import { RunStatusPill } from "@/components/app/status";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { duration } from "@/lib/format";
+import { duration, shortId } from "@/lib/format";
 
 /** Runs, newest first. Rows from several workspaces carry `workspace` and show it. */
 export function RunTable({
@@ -54,7 +54,7 @@ export function RunTable({
                 <TableCell className="py-3 pl-4">
                   <p className="truncate font-medium">{run.input}</p>
                   <p className="truncate font-mono text-xs text-muted-foreground">
-                    {run.id.slice(0, 8)}
+                    {shortId(run.id)}
                     {run.workspace ? <span className="@2xl:hidden"> · {run.workspace.name}</span> : null}
                     {showAgent ? <span className="@2xl:hidden"> · {run.agent_name}</span> : null}
                     {run.subject ? ` · ${run.subject}` : ""}

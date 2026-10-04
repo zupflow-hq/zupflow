@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { createFileRoute } from "@tanstack/react-router";
-import type { ApiKey, Environment } from "@zupflow/sdk";
+import type { ApiKey, Environment, OrganizationId } from "@zupflow/sdk";
 import { KeyRoundIcon, PlusIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
@@ -212,7 +212,7 @@ function CreateKeyDialog({
   onOpenChange,
   onCreated,
 }: {
-  orgId: string;
+  orgId: OrganizationId;
   environment: Environment;
   open: boolean;
   onOpenChange: (open: boolean) => void;

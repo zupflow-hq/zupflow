@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import type { Environment, Organization, OrganizationSetup } from "@zupflow/sdk";
+import type { Environment, Organization, OrganizationId, OrganizationSetup } from "@zupflow/sdk";
 import { ArrowRightIcon, CheckIcon } from "lucide-react";
 import { ENVIRONMENT_LABEL } from "@/components/app/environment";
 import { AppIcon, QueryError, RowsSkeleton } from "@/components/app/misc";
@@ -176,7 +176,7 @@ function Metric({ label, value, tone }: { label: string; value: string; tone?: "
   );
 }
 
-function EnvironmentActivity({ orgId, environment }: { orgId: string; environment: Environment }) {
+function EnvironmentActivity({ orgId, environment }: { orgId: OrganizationId; environment: Environment }) {
   const usage = useUsage(orgId, environment);
   const workspaces = useWorkspacePage(orgId, { environment, limit: 1 });
   const count = workspaces.data?.pagination.total;

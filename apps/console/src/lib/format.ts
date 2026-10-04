@@ -44,8 +44,16 @@ export function count(n: number, singular: string, plural = `${singular}s`): str
   return `${n.toLocaleString("en")} ${n === 1 ? singular : plural}`;
 }
 
+/**
+ * A compact label for an ID: its prefix and the last six characters. IDs start
+ * with their creation time, so the head of IDs made close together is the
+ * same; the tail is random and tells them apart. Display only: the full ID is
+ * what's copied and sent.
+ */
 export function shortId(id: string): string {
-  return id.length > 12 ? `${id.slice(0, 8)}…` : id;
+  const separator = id.indexOf("_");
+  if (separator < 1 || id.length - separator < 10) return id;
+  return `${id.slice(0, separator + 1)}…${id.slice(-6)}`;
 }
 
 export function slugify(value: string): string {

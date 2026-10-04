@@ -4,8 +4,10 @@
  */
 import type {
   Agent,
+  AnyId,
   ApiKey,
   AppDefinition,
+  AppId,
   ClientConfiguration,
   ConfigurationStatus,
   ConfigurationSummary,
@@ -16,13 +18,17 @@ import type {
   Member,
   MemberRole,
   Organization,
+  OrganizationId,
   Run,
   User,
+  UserId,
   Workspace,
+  WorkspaceId,
 } from "@zupflow/sdk";
 import { delay, HttpResponse } from "msw";
 import type { z } from "zod";
 import { db, persist } from "./db";
+import { isId, newId } from "./ids";
 import type {
   AgentRow,
   ApiKeyRow,
@@ -142,9 +148,15 @@ export interface OrgAccess {
   membership: MembershipRow;
 }
 
-/** Membership is checked before anything else; non-members see a 404. */
-export function orgAccess(request: Request, organizationId: string): OrgAccess {
+/**
+ * The credential is checked first (401), then the organization: a malformed
+ * ID, a missing organization and one the caller isn't a member of all answer
+ * the same 404.
+ */
+export function orgAccess(request: Request, organizationParam: string): OrgAccess {
   const user = authenticate(request);
+  if (!isId("organization", organizationParam)) throw notFound("Organization");
+  const organizationId: OrganizationId = organizationParam;
   const membership = db().memberships.find(
     (m) => m.organization_id === organizationId && m.user_id === user.id && m.status === "active",
   );
@@ -158,8 +170,11 @@ export interface WorkspaceAccess extends OrgAccess {
   workspace: WorkspaceRow;
 }
 
-export function workspaceAccess(request: Request, workspaceId: string): WorkspaceAccess {
+/** Like {@link orgAccess}: 401 first, then one 404 for malformed, missing and other organizations' workspaces. */
+export function workspaceAccess(request: Request, workspaceParam: string): WorkspaceAccess {
   const user = authenticate(request);
+  if (!isId("workspace", workspaceParam)) throw notFound("Workspace");
+  const workspaceId: WorkspaceId = workspaceParam;
   const workspace = db().workspaces.find((w) => w.id === workspaceId);
   if (!workspace) throw notFound("Workspace");
   const membership = db().memberships.find(
@@ -185,11 +200,11 @@ export const ADMINS: MemberRole[] = ["owner", "admin"];
 export function audit(
   access: OrgAccess,
   action: string,
-  target: { type: string; id: string; name: string },
+  target: { type: string; id: AnyId | null; name: string },
   scope: { workspace?: WorkspaceRow; environment?: Environment } = {},
 ) {
   db().audit.unshift({
-    id: crypto.randomUUID(),
+    id: newId("audit_event"),
     organization_id: access.org.id,
     workspace_id: scope.workspace?.id ?? null,
     environment: scope.environment ?? scope.workspace?.environment ?? null,
@@ -242,7 +257,7 @@ export function assertPublicHttps(value: string, field: string) {
 // ---------------------------------------------------------------------------
 // Row → wire mappers
 
-export function toUser(id: string): User {
+export function toUser(id: UserId): User {
   return (
     db().users.find((u) => u.id === id) ?? {
       id,
@@ -319,7 +334,7 @@ export function missingFields(c: ConfigurationRow, app: AppRow): string[] {
 }
 
 export function configurationStatus(c: ConfigurationRow): ConfigurationStatus {
-  const app = db().apps.find((a) => a.id === c.app_id);
+  const app = db().apps.find((a) => a.organization_id === c.organization_id && a.id === c.app_id);
   if (!app) return "unconfigured";
   const missing = missingFields(c, app);
   const required = app.auth.type === "oauth2" ? 3 : 1;
@@ -404,9 +419,22 @@ export function toInstallationApp(app: AppRow): InstallationApp {
   };
 }
 
+/**
+ * The app a workspace-scoped row refers to, looked up within that row's own
+ * organization and workspace: an organization app, or the workspace's own.
+ */
+export function appInScope(row: { organization_id: OrganizationId; workspace_id: WorkspaceId; app_id: AppId }) {
+  return db().apps.find(
+    (a) =>
+      a.organization_id === row.organization_id &&
+      a.id === row.app_id &&
+      (a.owner_workspace_id === null || a.owner_workspace_id === row.workspace_id),
+  );
+}
+
 export function toInstallation(i: InstallationRow): Installation {
   const d = db();
-  const app = d.apps.find((a) => a.id === i.app_id);
+  const app = appInScope(i);
   return {
     id: i.id,
     workspace_id: i.workspace_id,
@@ -431,10 +459,9 @@ export function toInstallation(i: InstallationRow): Installation {
 }
 
 export function toConnectSession(s: ConnectSessionRow, withAuth = false): ConnectSession {
-  const app = db().apps.find((a) => a.id === s.app_id);
+  const app = appInScope(s);
   return {
     id: s.id,
-    url: `${window.location.origin}/connect/${s.id}`,
     workspace_id: s.workspace_id,
     environment: s.environment,
     app: app
@@ -461,8 +488,12 @@ export function toConnectSession(s: ConnectSessionRow, withAuth = false): Connec
     requested_scopes: s.requested_scopes,
     expected_account:
       s.intent === "reconnect"
-        ? (db().installations.find((i) => i.workspace_id === s.workspace_id && i.id === s.installation_id)?.connection
-            ?.account ?? null)
+        ? (db().installations.find(
+            (i) =>
+              i.organization_id === s.organization_id &&
+              i.workspace_id === s.workspace_id &&
+              i.id === s.installation_id,
+          )?.connection?.account ?? null)
         : null,
   };
 }

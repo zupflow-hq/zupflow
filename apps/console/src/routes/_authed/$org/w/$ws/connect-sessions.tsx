@@ -7,6 +7,7 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { useConnectSessions } from "@/features/queries";
+import { shortId } from "@/lib/format";
 
 export const Route = createFileRoute("/_authed/$org/w/$ws/connect-sessions")({
   staticData: { crumb: "Connect sessions" },
@@ -78,7 +79,7 @@ function ConnectSessionsPage() {
                               `${s.app.name} · ${s.label}`
                             )}
                           </p>
-                          <p className="font-mono text-xs text-muted-foreground">{s.id.slice(0, 8)}</p>
+                          <p className="font-mono text-xs text-muted-foreground">{shortId(s.id)}</p>
                         </div>
                       </div>
                     </TableCell>

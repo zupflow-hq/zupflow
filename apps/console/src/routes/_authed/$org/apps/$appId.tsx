@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import type { AppDefinition, Environment, Organization } from "@zupflow/sdk";
+import type { AppDefinition, AppId, Environment, Organization } from "@zupflow/sdk";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
 import { z } from "zod";
@@ -31,12 +31,14 @@ import {
 } from "@/features/queries";
 import { useDetailCrumb } from "@/lib/crumbs";
 import { applyFieldErrors, toastError } from "@/lib/errors";
+import { idParam } from "@/lib/route-ids";
 import { cn } from "@/lib/utils";
 
 const TABS = ["overview", "configuration", "installations"] as const;
 type Tab = (typeof TABS)[number];
 
 export const Route = createFileRoute("/_authed/$org/apps/$appId")({
+  params: idParam("appId", "app"),
   validateSearch: z.object({ tab: z.enum(TABS).optional() }),
   component: AppPage,
 });
@@ -266,7 +268,7 @@ function EnvironmentTab({
   );
 }
 
-function InstallationsTab({ org, appId, environment }: { org: Organization; appId: string; environment: Environment }) {
+function InstallationsTab({ org, appId, environment }: { org: Organization; appId: AppId; environment: Environment }) {
   const installations = useOrgAppInstallations(org.id, appId, environment);
   if (installations.isError) {
     return <QueryError error={installations.error} onRetry={() => installations.refetch()} what="installations" />;

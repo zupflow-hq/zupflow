@@ -38,5 +38,5 @@ export const qk = {
   run: (wsId: string, id: string) => ["ws", wsId, "runs", id] as const,
   runEvents: (wsId: string, id: string) => ["ws", wsId, "runs", id, "events"] as const,
 
-  hostedConnect: (sessionId: string) => ["connect", sessionId] as const,
+  hostedConnect: (reference: string) => ["connect", reference] as const,
 };

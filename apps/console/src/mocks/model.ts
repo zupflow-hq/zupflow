@@ -6,37 +6,49 @@
 import type {
   AccountConnection,
   AgentGrant,
+  AgentId,
   AgentStatus,
+  ApiKeyId,
   AppIcon,
+  AppId,
   AppKind,
   AuditEvent,
   AuthTemplate,
   ConnectIntent,
+  ConnectSessionId,
   ConnectSessionStatus,
   Environment,
+  InstallationId,
   InstallationStatus,
+  MemberId,
   MemberRole,
   MemberStatus,
+  OrganizationId,
   RunError,
   RunEvent,
+  RunId,
   RunStatus,
   RunUsage,
+  SessionId,
+  ToolCallId,
   ToolDefinition,
   User,
+  UserId,
   WebhookEndpoint,
+  WorkspaceId,
 } from "@zupflow/sdk";
 
 export interface OrganizationRow {
-  id: string;
+  id: OrganizationId;
   name: string;
   slug: string;
   created_at: string;
 }
 
 export interface MembershipRow {
-  id: string;
-  organization_id: string;
-  user_id: string;
+  id: MemberId;
+  organization_id: OrganizationId;
+  user_id: UserId;
   role: MemberRole;
   status: MemberStatus;
   invited_at: string;
@@ -45,8 +57,8 @@ export interface MembershipRow {
 }
 
 export interface WorkspaceRow {
-  id: string;
-  organization_id: string;
+  id: WorkspaceId;
+  organization_id: OrganizationId;
   name: string;
   slug: string;
   environment: Environment;
@@ -55,9 +67,9 @@ export interface WorkspaceRow {
 }
 
 export interface AppRow {
-  id: string;
-  organization_id: string;
-  owner_workspace_id: string | null;
+  id: AppId;
+  organization_id: OrganizationId;
+  owner_workspace_id: WorkspaceId | null;
   kind: AppKind;
   name: string;
   slug: string;
@@ -71,10 +83,10 @@ export interface AppRow {
 }
 
 export interface ConfigurationRow {
-  app_id: string;
-  organization_id: string;
+  app_id: AppId;
+  organization_id: OrganizationId;
   /** Set for workspace-owned apps only. */
-  workspace_id: string | null;
+  workspace_id: WorkspaceId | null;
   environment: Environment;
   version: number;
   mcp_server_url: string | null;
@@ -83,14 +95,14 @@ export interface ConfigurationRow {
   oauth_client_secret_updated_at: string | null;
   oauth_scopes: string[];
   updated_at: string | null;
-  updated_by_user_id: string | null;
+  updated_by_user_id: UserId | null;
 }
 
 export interface InstallationRow {
-  id: string;
-  workspace_id: string;
-  organization_id: string;
-  app_id: string;
+  id: InstallationId;
+  workspace_id: WorkspaceId;
+  organization_id: OrganizationId;
+  app_id: AppId;
   label: string;
   status: InstallationStatus;
   configuration_version: number;
@@ -100,14 +112,20 @@ export interface InstallationRow {
 }
 
 export interface ConnectSessionRow {
-  id: string;
-  workspace_id: string;
-  organization_id: string;
+  id: ConnectSessionId;
+  /**
+   * SHA-256 of the random reference in the hosted Connect link, whose
+   * possession authorizes the page. The reference itself is never stored;
+   * `null` for sessions with no usable link (seeded history).
+   */
+  reference_hash: string | null;
+  workspace_id: WorkspaceId;
+  organization_id: OrganizationId;
   environment: Environment;
-  app_id: string;
+  app_id: AppId;
   configuration_version: number;
   intent: ConnectIntent;
-  installation_id: string | null;
+  installation_id: InstallationId | null;
   label: string;
   subject: string;
   status: ConnectSessionStatus;
@@ -120,8 +138,8 @@ export interface ConnectSessionRow {
 }
 
 export interface AgentRow {
-  id: string;
-  workspace_id: string;
+  id: AgentId;
+  workspace_id: WorkspaceId;
   name: string;
   description: string;
   model: string;
@@ -133,8 +151,8 @@ export interface AgentRow {
 
 /** A tool call decided when the run was planned. */
 export interface PlannedCall {
-  call_id: string;
-  installation_id: string;
+  call_id: ToolCallId;
+  installation_id: InstallationId;
   installation_label: string;
   app_name: string;
   tool: string;
@@ -153,7 +171,7 @@ export type RunStep =
   | {
       kind: "complete";
       /** What each planned call achieved; denied calls are removed before completion. */
-      parts: { call_id: string; text: string }[];
+      parts: { call_id: ToolCallId; text: string }[];
       /** Used when no tool call contributes, e.g. the agent had no access. */
       fallback: string;
       closing: string;
@@ -161,10 +179,10 @@ export type RunStep =
   | { kind: "fail"; error: RunError };
 
 export interface RunRow {
-  id: string;
-  workspace_id: string;
-  agent_id: string;
-  session_id: string;
+  id: RunId;
+  workspace_id: WorkspaceId;
+  agent_id: AgentId;
+  session_id: SessionId;
   subject: string | null;
   trigger: "api" | "console";
   status: RunStatus;
@@ -180,7 +198,7 @@ export interface RunRow {
 }
 
 export interface ConnectSettingsRow {
-  organization_id: string;
+  organization_id: OrganizationId;
   environment: Environment;
   return_urls: string[];
   allowed_origins: string[];
@@ -188,13 +206,13 @@ export interface ConnectSettingsRow {
 }
 
 export interface ApiKeyRow {
-  id: string;
-  organization_id: string;
+  id: ApiKeyId;
+  organization_id: OrganizationId;
   environment: Environment;
   name: string;
   prefix: string;
   last4: string;
-  created_by_user_id: string;
+  created_by_user_id: UserId;
   created_at: string;
   last_used_at: string | null;
   revoked_at: string | null;

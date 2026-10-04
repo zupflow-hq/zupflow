@@ -29,8 +29,8 @@ import { cn } from "@/lib/utils";
 /** Tools of an installation's app, from whichever scope owns the app. */
 function useInstallationTools(org: Organization, workspace: Workspace, installation: Installation) {
   const isOrgApp = installation.app.owner_scope === "organization";
-  const orgApp = useOrgApp(org.id, isOrgApp ? installation.app.id : "");
-  const wsApp = useWorkspaceApp(workspace.id, isOrgApp ? "" : installation.app.id);
+  const orgApp = useOrgApp(org.id, isOrgApp ? installation.app.id : undefined);
+  const wsApp = useWorkspaceApp(workspace.id, isOrgApp ? undefined : installation.app.id);
   const query = isOrgApp ? orgApp : wsApp;
   return { tools: query.data?.tools, error: query.error, isPending: query.isPending, refetch: query.refetch };
 }

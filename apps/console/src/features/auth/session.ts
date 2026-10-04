@@ -8,6 +8,7 @@
 import { setTokenSource } from "@/lib/api";
 import { db, persist } from "@/mocks/db";
 import { MOCK_SESSION_KEY } from "@/mocks/http";
+import { newId } from "@/mocks/ids";
 import { DEMO_USER_ID } from "@/mocks/seed";
 
 type Listener = () => void;
@@ -63,7 +64,7 @@ export const session = {
       return;
     }
     const user = {
-      id: crypto.randomUUID(),
+      id: newId("user"),
       name: input.name.trim(),
       email: input.email.trim().toLowerCase(),
       avatar_url: null,

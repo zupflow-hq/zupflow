@@ -13,12 +13,15 @@ import {
   type ConnectResult,
   ENVIRONMENTS,
   type Environment,
+  type Id,
+  type IdKind,
   type ModelOption,
   RUN_STATUSES,
   TERMINAL_RUN_STATUSES,
   type UsageReport,
   WEBHOOK_EVENT_TYPES,
   type WebhookEndpoint,
+  type WorkspaceId,
 } from "@zupflow/sdk";
 import { HttpResponse, http } from "msw";
 import { z } from "zod";
@@ -27,6 +30,7 @@ import { cancelScheduledRun, db, resetDb, scheduleRun } from "./db";
 import {
   ADMINS,
   ApiFailure,
+  appInScope,
   assertPublicHttps,
   audit,
   authenticate,
@@ -56,6 +60,7 @@ import {
   type WorkspaceAccess,
   workspaceAccess,
 } from "./http";
+import { hashReference, isId, newId, newReference } from "./ids";
 import type { AgentRow, AppRow, ConfigurationRow, ConnectSessionRow, InstallationRow, RunRow } from "./model";
 import { hash, token } from "./random";
 import { cancelRun, enqueueRun, planRun } from "./runner";
@@ -91,6 +96,44 @@ function param(params: Record<string, string | readonly string[] | undefined>, k
   return typeof value === "string" ? value : "";
 }
 
+/**
+ * An ID in a request body. A malformed one is accepted here and simply matches
+ * nothing, so it answers 404 like any ID that doesn't exist.
+ */
+const idOf = <K extends IdKind>(_kind: K) =>
+  // Unchecked on purpose: the lookup that follows is the check.
+  z.string().transform((value) => value as Id<K>);
+
+/** Path parameters that carry an ID, with the object type each must be. */
+const ID_PARAMS = {
+  member: ["member", "Member"],
+  app: ["app", "App"],
+  inst: ["installation", "Installation"],
+  session: ["connect_session", "Connect session"],
+  agent: ["agent", "Agent"],
+  grant: ["grant", "Grant"],
+  run: ["run", "Run"],
+  key: ["api_key", "API key"],
+  hook: ["webhook_endpoint", "Webhook endpoint"],
+} as const satisfies Record<string, readonly [IdKind, string]>;
+
+/**
+ * A path ID of the right type. Anything else (a wrong prefix, a bad length, a
+ * bare UUID) can't exist, so it answers 404 exactly like a missing object.
+ * Only for child IDs read after access is established, so a missing
+ * credential still answers 401 first; `orgAccess` and `workspaceAccess` parse
+ * their own IDs after authenticating.
+ */
+function idParam<P extends keyof typeof ID_PARAMS>(
+  params: Record<string, string | readonly string[] | undefined>,
+  key: P,
+): Id<(typeof ID_PARAMS)[P][0]> {
+  const [kind, label] = ID_PARAMS[key];
+  const value = param(params, key);
+  if (!isId(kind, value)) throw notFound(label);
+  return value as Id<(typeof ID_PARAMS)[P][0]>;
+}
+
 function configurationFor(app: AppRow, env: Environment): ConfigurationRow {
   const d = db();
   let row = d.configurations.find((c) => c.app_id === app.id && c.environment === env);
@@ -124,7 +167,12 @@ function availableApps(access: WorkspaceAccess): AvailableApp[] {
         (a.owner_workspace_id === null || a.owner_workspace_id === workspace.id),
     )
     .flatMap((app) => {
-      const config = db().configurations.find((c) => c.app_id === app.id && c.environment === workspace.environment);
+      const config = db().configurations.find(
+        (c) =>
+          c.organization_id === workspace.organization_id &&
+          c.app_id === app.id &&
+          c.environment === workspace.environment,
+      );
       if (!config || configurationStatus(config) !== "ready") return [];
       return [{ app: toApp(app), configuration: toConfigurationSummary(config) }];
     });
@@ -231,7 +279,7 @@ const appInput = z.object({
   auth_type: z.enum(["oauth2", "token"], "Choose OAuth or token."),
 });
 
-function createApp(access: OrgAccess, input: z.infer<typeof appInput>, ownerWorkspaceId: string | null) {
+function createApp(access: OrgAccess, input: z.infer<typeof appInput>, ownerWorkspaceId: WorkspaceId | null) {
   if (!(APP_KINDS as readonly string[]).includes(input.kind)) {
     throw new ApiFailure(400, "unsupported_app_kind", `App kind "${input.kind}" is not supported.`, {
       kind: 'Only "mcp" is supported.',
@@ -247,7 +295,7 @@ function createApp(access: OrgAccess, input: z.infer<typeof appInput>, ownerWork
   }
   const now = new Date().toISOString();
   const app: AppRow = {
-    id: crypto.randomUUID(),
+    id: newId("app"),
     organization_id: access.org.id,
     owner_workspace_id: ownerWorkspaceId,
     kind: "mcp",
@@ -303,9 +351,23 @@ function accountFor(app: AppRow, seed: string, displayName: string, email: strin
   };
 }
 
-function loadPendingSession(sessionId: string): ConnectSessionRow {
-  const session = db().connect_sessions.find((s) => s.id === sessionId);
+/**
+ * Cross-tenant by design: hosted Connect starts with no organization or
+ * workspace, only the link's reference (a random token, never the session's
+ * ID). It reads exactly one session and nothing else. Everything after it is
+ * scoped to that session's organization and workspace (see `sessionScope`).
+ */
+async function findSessionByReferenceCrossTenant(reference: string): Promise<ConnectSessionRow> {
+  const referenceHash = reference ? await hashReference(reference) : null;
+  const session = referenceHash
+    ? db().connect_sessions.find((s) => s.reference_hash !== null && s.reference_hash === referenceHash)
+    : undefined;
   if (!session) throw notFound("Connect session");
+  return withExpiry(session);
+}
+
+/** A pending session past its expiry is expired, whoever reads it. */
+function withExpiry(session: ConnectSessionRow): ConnectSessionRow {
   if (session.status === "pending" && Date.parse(session.expires_at) < Date.now()) {
     session.status = "expired";
   }
@@ -324,12 +386,30 @@ function assertSessionPending(session: ConnectSessionRow) {
   }
 }
 
+/** The session's own tenant: every statement after hosted Connect attributes a session goes through these. */
+function sessionScope(session: ConnectSessionRow) {
+  const { organization_id, workspace_id } = session;
+  return {
+    app: () => appInScope(session),
+    workspace: () => db().workspaces.find((w) => w.organization_id === organization_id && w.id === workspace_id),
+    installation: () =>
+      db().installations.find(
+        (i) =>
+          i.organization_id === organization_id && i.workspace_id === workspace_id && i.id === session.installation_id,
+      ),
+  };
+}
+
 /** Revalidate eligibility at completion, not only at session creation. */
 function assertStillEligible(session: ConnectSessionRow): AppRow {
-  const app = db().apps.find((a) => a.id === session.app_id);
-  const workspace = db().workspaces.find((w) => w.id === session.workspace_id);
+  const scope = sessionScope(session);
+  const app = scope.app();
+  const workspace = scope.workspace();
   const config = app
-    ? db().configurations.find((c) => c.app_id === app.id && c.environment === session.environment)
+    ? db().configurations.find(
+        (c) =>
+          c.organization_id === session.organization_id && c.app_id === app.id && c.environment === session.environment,
+      )
     : undefined;
   if (!app || !workspace || workspace.environment !== session.environment) {
     throw new ApiFailure(422, "app_not_eligible", "This app is no longer available to this workspace.");
@@ -351,13 +431,14 @@ function completeSession(
 ): ConnectResult {
   const now = new Date().toISOString();
   const d = db();
-  const config = d.configurations.find((c) => c.app_id === app.id && c.environment === session.environment);
+  const config = d.configurations.find(
+    (c) =>
+      c.organization_id === session.organization_id && c.app_id === app.id && c.environment === session.environment,
+  );
   let installation: InstallationRow;
 
   if (session.intent === "reconnect") {
-    const existing = d.installations.find(
-      (i) => i.workspace_id === session.workspace_id && i.id === session.installation_id,
-    );
+    const existing = sessionScope(session).installation();
     if (!existing) throw notFound("Installation");
     const previous = existing.connection?.account.external_id;
     if (previous && previous !== account.external_id) {
@@ -383,7 +464,7 @@ function completeSession(
     installation = existing;
   } else {
     installation = {
-      id: crypto.randomUUID(),
+      id: newId("installation"),
       workspace_id: session.workspace_id,
       organization_id: session.organization_id,
       app_id: app.id,
@@ -408,11 +489,11 @@ function completeSession(
   session.status = "completed";
   session.completed_at = now;
   d.audit.unshift({
-    id: crypto.randomUUID(),
+    id: newId("audit_event"),
     organization_id: session.organization_id,
     workspace_id: session.workspace_id,
     environment: session.environment,
-    actor: { type: "system", id: "connect", name: `Connect (${session.subject})` },
+    actor: { type: "system", id: null, name: `Connect (${session.subject})` },
     action: session.intent === "reconnect" ? "installation.reconnected" : "installation.connected",
     target: { type: "installation", id: installation.id, name: `${app.name} · ${installation.label}` },
     created_at: now,
@@ -473,9 +554,9 @@ export function createHandlers(apiBase: string) {
           throw new ApiFailure(409, "slug_taken", "That URL is taken.", { slug: "Already taken." });
         }
         const now = new Date().toISOString();
-        const org = { id: crypto.randomUUID(), name: input.name, slug: input.slug, created_at: now };
+        const org = { id: newId("organization"), name: input.name, slug: input.slug, created_at: now };
         const membership = {
-          id: crypto.randomUUID(),
+          id: newId("member"),
           organization_id: org.id,
           user_id: user.id,
           role: "owner" as const,
@@ -615,7 +696,7 @@ export function createHandlers(apiBase: string) {
         }
         if (!user) {
           user = {
-            id: crypto.randomUUID(),
+            id: newId("user"),
             name: input.email.split("@")[0] ?? input.email,
             email: input.email,
             avatar_url: null,
@@ -623,7 +704,7 @@ export function createHandlers(apiBase: string) {
           db().users.push(user);
         }
         const membership = {
-          id: crypto.randomUUID(),
+          id: newId("member"),
           organization_id: access.org.id,
           user_id: user.id,
           role: input.role,
@@ -645,7 +726,7 @@ export function createHandlers(apiBase: string) {
         requireRole(access, ["owner"], "change roles");
         const input = await body(request, z.object({ role: z.enum(["owner", "admin", "developer"]) }));
         const member = db().memberships.find(
-          (m) => m.organization_id === access.org.id && m.id === param(params, "member"),
+          (m) => m.organization_id === access.org.id && m.id === idParam(params, "member"),
         );
         if (!member) throw notFound("Member");
         const owners = db().memberships.filter(
@@ -667,7 +748,7 @@ export function createHandlers(apiBase: string) {
         requireRole(access, ADMINS, "remove members");
         const d = db();
         const member = d.memberships.find(
-          (m) => m.organization_id === access.org.id && m.id === param(params, "member"),
+          (m) => m.organization_id === access.org.id && m.id === idParam(params, "member"),
         );
         if (!member) throw notFound("Member");
         if (member.role === "owner") {
@@ -737,7 +818,7 @@ export function createHandlers(apiBase: string) {
           });
         }
         const workspace = {
-          id: crypto.randomUUID(),
+          id: newId("workspace"),
           organization_id: access.org.id,
           name: input.name,
           slug: input.slug,
@@ -853,7 +934,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/organizations/:org/apps/:app"),
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
-        return ok(toApp(findOrgApp(access, param(params, "app"))));
+        return ok(toApp(findOrgApp(access, idParam(params, "app"))));
       }),
     ),
 
@@ -862,7 +943,7 @@ export function createHandlers(apiBase: string) {
       route(async ({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "edit apps");
-        const app = findOrgApp(access, param(params, "app"));
+        const app = findOrgApp(access, idParam(params, "app"));
         const input = await body(
           request,
           z.object({ name: name().optional(), description: z.string().trim().max(280).optional() }),
@@ -879,7 +960,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/organizations/:org/apps/:app/environments/:env/configuration"),
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
-        const app = findOrgApp(access, param(params, "app"));
+        const app = findOrgApp(access, idParam(params, "app"));
         const env = environment.safeParse(param(params, "env"));
         if (!env.success) throw notFound("Environment");
         return ok(toConfiguration(configurationFor(app, env.data), app));
@@ -891,7 +972,7 @@ export function createHandlers(apiBase: string) {
       route(async ({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "configure apps");
-        const app = findOrgApp(access, param(params, "app"));
+        const app = findOrgApp(access, idParam(params, "app"));
         const env = environment.safeParse(param(params, "env"));
         if (!env.success) throw notFound("Environment");
         const row = configurationFor(app, env.data);
@@ -910,7 +991,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/organizations/:org/apps/:app/installations"),
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
-        const app = findOrgApp(access, param(params, "app"));
+        const app = findOrgApp(access, idParam(params, "app"));
         const url = new URL(request.url);
         const env = url.searchParams.get("environment");
         const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 25), 1), 100);
@@ -963,7 +1044,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/apps/:app"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        return ok(toApp(findWorkspaceApp(access, param(params, "app"))));
+        return ok(toApp(findWorkspaceApp(access, idParam(params, "app"))));
       }),
     ),
 
@@ -972,7 +1053,7 @@ export function createHandlers(apiBase: string) {
       route(async ({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
         requireRole(access, ADMINS, "edit apps");
-        const app = findWorkspaceApp(access, param(params, "app"));
+        const app = findWorkspaceApp(access, idParam(params, "app"));
         const input = await body(
           request,
           z.object({ name: name().optional(), description: z.string().trim().max(280).optional() }),
@@ -988,7 +1069,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/apps/:app/configuration"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        const app = findWorkspaceApp(access, param(params, "app"));
+        const app = findWorkspaceApp(access, idParam(params, "app"));
         return ok(toConfiguration(configurationFor(app, access.workspace.environment), app));
       }),
     ),
@@ -998,7 +1079,7 @@ export function createHandlers(apiBase: string) {
       route(async ({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
         requireRole(access, ADMINS, "configure apps");
-        const app = findWorkspaceApp(access, param(params, "app"));
+        const app = findWorkspaceApp(access, idParam(params, "app"));
         const raw = (await request
           .clone()
           .json()
@@ -1045,7 +1126,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/installations/:inst"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        return ok(toInstallation(findInstallation(access, param(params, "inst"))));
+        return ok(toInstallation(findInstallation(access, idParam(params, "inst"))));
       }),
     ),
 
@@ -1053,7 +1134,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/installations/:inst"),
       route(async ({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        const row = findInstallation(access, param(params, "inst"));
+        const row = findInstallation(access, idParam(params, "inst"));
         const input = await body(request, z.object({ label: name(40) }));
         row.label = input.label;
         row.updated_at = new Date().toISOString();
@@ -1065,7 +1146,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/installations/:inst/disconnect"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        const row = findInstallation(access, param(params, "inst"));
+        const row = findInstallation(access, idParam(params, "inst"));
         row.status = "disconnected";
         row.updated_at = new Date().toISOString();
         const app = db().apps.find((a) => a.id === row.app_id);
@@ -1084,7 +1165,7 @@ export function createHandlers(apiBase: string) {
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
         requireRole(access, ADMINS, "remove installations");
-        const row = findInstallation(access, param(params, "inst"));
+        const row = findInstallation(access, idParam(params, "inst"));
         const d = db();
         d.grants = d.grants.filter((g) => !(g.workspace_id === access.workspace.id && g.installation_id === row.id));
         d.installations = d.installations.filter((i) => i !== row);
@@ -1107,7 +1188,7 @@ export function createHandlers(apiBase: string) {
         return ok(
           db()
             .connect_sessions.filter((s) => s.workspace_id === access.workspace.id)
-            .map((s) => toConnectSession(loadPendingSession(s.id))),
+            .map((s) => toConnectSession(withExpiry(s))),
         );
       }),
     ),
@@ -1117,10 +1198,10 @@ export function createHandlers(apiBase: string) {
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
         const session = db().connect_sessions.find(
-          (s) => s.workspace_id === access.workspace.id && s.id === param(params, "session"),
+          (s) => s.workspace_id === access.workspace.id && s.id === idParam(params, "session"),
         );
         if (!session) throw notFound("Connect session");
-        return ok(toConnectSession(loadPendingSession(session.id)));
+        return ok(toConnectSession(withExpiry(session)));
       }),
     ),
 
@@ -1132,10 +1213,10 @@ export function createHandlers(apiBase: string) {
         const input = await body(
           request,
           z.object({
-            app_id: z.string().uuid(),
+            app_id: idOf("app"),
             intent: z.enum(["create", "reconnect"]),
             label: name(40),
-            installation_id: z.string().uuid().nullable(),
+            installation_id: idOf("installation").nullable(),
             subject: z.string().trim().min(1, "Required.").max(200),
             return_url: z.string().url().nullable(),
           }),
@@ -1153,6 +1234,12 @@ export function createHandlers(apiBase: string) {
           );
         }
         let label = input.label;
+        if (input.intent === "create" && input.installation_id !== null) {
+          // A new installation has no existing one to point at; never store an unchecked reference.
+          throw new ApiFailure(400, "validation_failed", "A new installation can't name an existing one.", {
+            installation_id: "Leave empty unless you're reconnecting.",
+          });
+        }
         if (input.intent === "reconnect") {
           if (!input.installation_id) {
             throw new ApiFailure(400, "validation_failed", "Choose the installation to reconnect.", {
@@ -1175,13 +1262,23 @@ export function createHandlers(apiBase: string) {
             });
           }
         }
-        const app = db().apps.find((a) => a.id === input.app_id);
+        // Both already resolved within this organization and workspace by `availableApps`.
+        const app = appInScope({
+          organization_id: access.org.id,
+          workspace_id: access.workspace.id,
+          app_id: available.app.id,
+        });
         const config = db().configurations.find(
-          (c) => c.app_id === input.app_id && c.environment === access.workspace.environment,
+          (c) =>
+            c.organization_id === access.org.id &&
+            c.app_id === available.app.id &&
+            c.environment === access.workspace.environment,
         );
         const now = Date.now();
+        const reference = newReference();
         const session: ConnectSessionRow = {
-          id: crypto.randomUUID(),
+          id: newId("connect_session"),
+          reference_hash: await hashReference(reference),
           workspace_id: access.workspace.id,
           organization_id: access.org.id,
           environment: access.workspace.environment,
@@ -1200,20 +1297,23 @@ export function createHandlers(apiBase: string) {
           failure_code: null,
         };
         db().connect_sessions.unshift(session);
-        return created(toConnectSession(session));
+        // The link is shown once, here: it carries the reference that authorizes the hosted page.
+        return created({ ...toConnectSession(session), url: `${window.location.origin}/connect/${reference}` });
       }),
     ),
 
     // Hosted Connect: authorized by the session reference alone.
     http.get(
-      u("/v1/connect/sessions/:session"),
-      route(({ params }) => ok(toConnectSession(loadPendingSession(param(params, "session")), true))),
+      u("/v1/connect/sessions/:reference"),
+      route(async ({ params }) =>
+        ok(toConnectSession(await findSessionByReferenceCrossTenant(param(params, "reference")), true)),
+      ),
     ),
 
     http.post(
-      u("/v1/connect/sessions/:session/cancel"),
-      route(({ params }) => {
-        const session = loadPendingSession(param(params, "session"));
+      u("/v1/connect/sessions/:reference/cancel"),
+      route(async ({ params }) => {
+        const session = await findSessionByReferenceCrossTenant(param(params, "reference"));
         assertSessionPending(session);
         session.status = "cancelled";
         return ok(toConnectSession(session));
@@ -1221,9 +1321,9 @@ export function createHandlers(apiBase: string) {
     ),
 
     http.post(
-      u("/v1/connect/sessions/:session/credentials"),
+      u("/v1/connect/sessions/:reference/credentials"),
       route(async ({ request, params }) => {
-        const session = loadPendingSession(param(params, "session"));
+        const session = await findSessionByReferenceCrossTenant(param(params, "reference"));
         assertSessionPending(session);
         const app = assertStillEligible(session);
         if (app.auth.type !== "token") {
@@ -1252,40 +1352,35 @@ export function createHandlers(apiBase: string) {
             },
           );
         }
-        const seedValue =
-          session.intent === "reconnect"
-            ? (db().installations.find((i) => i.id === session.installation_id)?.connection?.account.external_id ??
-              first)
-            : first;
+        const previous = session.intent === "reconnect" ? sessionScope(session).installation() : undefined;
+        const seedValue = previous?.connection?.account.external_id ?? first;
         const account =
-          session.intent === "reconnect"
-            ? (db().installations.find((i) => i.id === session.installation_id)?.connection?.account ??
-              accountFor(app, seedValue, `${app.name} account ••${first.slice(-4)}`, null))
-            : accountFor(app, seedValue, `${app.name} account ••${first.slice(-4)}`, null);
+          previous?.connection?.account ?? accountFor(app, seedValue, `${app.name} account ••${first.slice(-4)}`, null);
         return ok(completeSession(session, app, account));
       }),
     ),
 
     http.post(
-      u("/v1/connect/sessions/:session/authorize"),
-      route(({ params }) => {
-        const session = loadPendingSession(param(params, "session"));
+      u("/v1/connect/sessions/:reference/authorize"),
+      route(async ({ params }) => {
+        const session = await findSessionByReferenceCrossTenant(param(params, "reference"));
         assertSessionPending(session);
         const app = assertStillEligible(session);
         if (app.auth.type !== "oauth2") {
           throw new ApiFailure(422, "wrong_auth_type", `${app.name} connects with a token.`);
         }
         return ok({
-          authorization_url: `${window.location.origin}/connect/${session.id}/simulated-consent`,
+          // The caller's own reference: the stored hash can't be turned back into a link.
+          authorization_url: `${window.location.origin}/connect/${encodeURIComponent(param(params, "reference"))}/simulated-consent`,
         });
       }),
     ),
 
     // Mock-only stand-in for the provider redirecting to the OAuth callback.
     http.post(
-      u("/v1/connect/sessions/:session/simulate-consent"),
+      u("/v1/connect/sessions/:reference/simulate-consent"),
       route(async ({ params, request }) => {
-        const session = loadPendingSession(param(params, "session"));
+        const session = await findSessionByReferenceCrossTenant(param(params, "reference"));
         assertSessionPending(session);
         const app = assertStillEligible(session);
         const input = await body(
@@ -1331,7 +1426,7 @@ export function createHandlers(apiBase: string) {
         );
         const now = new Date().toISOString();
         const row: AgentRow = {
-          id: crypto.randomUUID(),
+          id: newId("agent"),
           workspace_id: access.workspace.id,
           ...input,
           status: "active",
@@ -1348,7 +1443,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/agents/:agent"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        return ok(toAgent(findAgent(access, param(params, "agent"))));
+        return ok(toAgent(findAgent(access, idParam(params, "agent"))));
       }),
     ),
 
@@ -1356,7 +1451,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/agents/:agent"),
       route(async ({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        const row = findAgent(access, param(params, "agent"));
+        const row = findAgent(access, idParam(params, "agent"));
         const input = await body(
           request,
           z.object({
@@ -1386,7 +1481,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/agents/:agent"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        const row = findAgent(access, param(params, "agent"));
+        const row = findAgent(access, idParam(params, "agent"));
         const d = db();
         d.grants = d.grants.filter((g) => !(g.workspace_id === access.workspace.id && g.agent_id === row.id));
         d.agents = d.agents.filter((a) => a !== row);
@@ -1400,7 +1495,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/agents/:agent/grants"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        const agent = findAgent(access, param(params, "agent"));
+        const agent = findAgent(access, idParam(params, "agent"));
         return ok(db().grants.filter((g) => g.workspace_id === access.workspace.id && g.agent_id === agent.id));
       }),
     ),
@@ -1409,11 +1504,11 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/agents/:agent/grants"),
       route(async ({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        const agent = findAgent(access, param(params, "agent"));
+        const agent = findAgent(access, idParam(params, "agent"));
         const input = await body(
           request,
           z.object({
-            installation_id: z.string().uuid(),
+            installation_id: idOf("installation"),
             tools: z.array(z.string()).min(1, "Choose at least one tool."),
             approval_required: z.array(z.string()),
           }),
@@ -1437,7 +1532,7 @@ export function createHandlers(apiBase: string) {
         }
         const now = new Date().toISOString();
         const grant: AgentGrant = {
-          id: crypto.randomUUID(),
+          id: newId("grant"),
           workspace_id: access.workspace.id,
           agent_id: agent.id,
           installation_id: installation.id,
@@ -1461,9 +1556,9 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/agents/:agent/grants/:grant"),
       route(async ({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        const agent = findAgent(access, param(params, "agent"));
+        const agent = findAgent(access, idParam(params, "agent"));
         const grant = db().grants.find(
-          (g) => g.workspace_id === access.workspace.id && g.agent_id === agent.id && g.id === param(params, "grant"),
+          (g) => g.workspace_id === access.workspace.id && g.agent_id === agent.id && g.id === idParam(params, "grant"),
         );
         if (!grant) throw notFound("Grant");
         const input = await body(
@@ -1491,10 +1586,10 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/agents/:agent/grants/:grant"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        const agent = findAgent(access, param(params, "agent"));
+        const agent = findAgent(access, idParam(params, "agent"));
         const d = db();
         const grant = d.grants.find(
-          (g) => g.workspace_id === access.workspace.id && g.agent_id === agent.id && g.id === param(params, "grant"),
+          (g) => g.workspace_id === access.workspace.id && g.agent_id === agent.id && g.id === idParam(params, "grant"),
         );
         if (!grant) throw notFound("Grant");
         d.grants = d.grants.filter((g) => g !== grant);
@@ -1584,7 +1679,7 @@ export function createHandlers(apiBase: string) {
       route(async ({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
         assertConsoleMayAct(access, "start runs");
-        const agent = findAgent(access, param(params, "agent"));
+        const agent = findAgent(access, idParam(params, "agent"));
         if (agent.status === "paused") {
           throw new ApiFailure(422, "agent_paused", `${agent.name} is paused. Resume it to start runs.`);
         }
@@ -1596,10 +1691,10 @@ export function createHandlers(apiBase: string) {
           }),
         );
         const run: RunRow = {
-          id: crypto.randomUUID(),
+          id: newId("run"),
           workspace_id: access.workspace.id,
           agent_id: agent.id,
-          session_id: `ses_${crypto.randomUUID().slice(0, 12)}`,
+          session_id: newId("session"),
           subject: input.subject,
           trigger: "console",
           status: "queued",
@@ -1624,7 +1719,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/runs/:run"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        return ok(toRun(findRun(access, param(params, "run"))));
+        return ok(toRun(findRun(access, idParam(params, "run"))));
       }),
     ),
 
@@ -1632,7 +1727,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/runs/:run/events"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        const run = findRun(access, param(params, "run"));
+        const run = findRun(access, idParam(params, "run"));
         const after = Number(new URL(request.url).searchParams.get("after") ?? 0);
         return ok((db().run_events[run.id] ?? []).filter((e) => e.sequence > after));
       }),
@@ -1642,7 +1737,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/runs/:run/cancel"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        const run = findRun(access, param(params, "run"));
+        const run = findRun(access, idParam(params, "run"));
         if (TERMINAL_RUN_STATUSES.includes(run.status)) {
           throw new ApiFailure(409, "run_finished", "This run already finished.");
         }
@@ -1660,7 +1755,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/runs/:run/approvals"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        findRun(access, param(params, "run"));
+        findRun(access, idParam(params, "run"));
         throw new ApiFailure(
           403,
           "approval_requires_api_key",
@@ -1749,7 +1844,7 @@ export function createHandlers(apiBase: string) {
         audit(
           access,
           "connect_settings.updated",
-          { type: "connect_settings", id: env.data, name: `Connect (${env.data})` },
+          { type: "connect_settings", id: null, name: `Connect (${env.data})` },
           { environment: env.data },
         );
         const { organization_id: _o, ...wire } = row;
@@ -1782,7 +1877,7 @@ export function createHandlers(apiBase: string) {
         const secretPart = token(40);
         const secret = `zf_${live ? "live" : "test"}_${selector}${secretPart}`;
         const row = {
-          id: crypto.randomUUID(),
+          id: newId("api_key"),
           organization_id: access.org.id,
           environment: input.environment,
           name: input.name,
@@ -1808,7 +1903,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/organizations/:org/api-keys/:key/revoke"),
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
-        const row = db().api_keys.find((k) => k.organization_id === access.org.id && k.id === param(params, "key"));
+        const row = db().api_keys.find((k) => k.organization_id === access.org.id && k.id === idParam(params, "key"));
         if (!row) throw notFound("API key");
         if (row.environment === "production") requireRole(access, ADMINS, "revoke Production keys");
         if (row.revoked_at) throw new ApiFailure(409, "already_revoked", "This key is already revoked.");
@@ -1849,7 +1944,7 @@ export function createHandlers(apiBase: string) {
         assertPublicHttps(input.url, "url");
         const secret = webhookSecret(input.environment);
         const endpoint: WebhookEndpoint = {
-          id: crypto.randomUUID(),
+          id: newId("webhook_endpoint"),
           organization_id: access.org.id,
           environment: input.environment,
           url: input.url,
@@ -1877,7 +1972,7 @@ export function createHandlers(apiBase: string) {
         const access = orgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "edit webhook endpoints");
         const endpoint = db().webhooks.find(
-          (w) => w.organization_id === access.org.id && w.id === param(params, "hook"),
+          (w) => w.organization_id === access.org.id && w.id === idParam(params, "hook"),
         );
         if (!endpoint) throw notFound("Webhook endpoint");
         const input = await body(
@@ -1901,7 +1996,9 @@ export function createHandlers(apiBase: string) {
         const access = orgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "delete webhook endpoints");
         const d = db();
-        const endpoint = d.webhooks.find((w) => w.organization_id === access.org.id && w.id === param(params, "hook"));
+        const endpoint = d.webhooks.find(
+          (w) => w.organization_id === access.org.id && w.id === idParam(params, "hook"),
+        );
         if (!endpoint) throw notFound("Webhook endpoint");
         d.webhooks = d.webhooks.filter((w) => w !== endpoint);
         audit(
@@ -1919,7 +2016,7 @@ export function createHandlers(apiBase: string) {
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
         const endpoint = db().webhooks.find(
-          (w) => w.organization_id === access.org.id && w.id === param(params, "hook"),
+          (w) => w.organization_id === access.org.id && w.id === idParam(params, "hook"),
         );
         if (!endpoint) throw notFound("Webhook endpoint");
         const delivery = {

@@ -1,6 +1,6 @@
 import { useSuspenseQuery } from "@tanstack/react-query";
 import { notFound, useParams } from "@tanstack/react-router";
-import type { Organization, Workspace } from "@zupflow/sdk";
+import type { Organization, Workspace, WorkspaceId } from "@zupflow/sdk";
 import { useEffect } from "react";
 import { viewerQuery, workspaceQuery } from "./queries";
 
@@ -24,7 +24,7 @@ export function useCurrentWorkspace(): Workspace {
 }
 
 /** The workspace in the URL, if any. Safe anywhere under `/$org`. */
-export function useOptionalWorkspaceId(): string | undefined {
+export function useOptionalWorkspaceId(): WorkspaceId | undefined {
   return useParams({ strict: false }).ws;
 }
 

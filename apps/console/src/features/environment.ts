@@ -1,8 +1,7 @@
-import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import type { Environment } from "@zupflow/sdk";
 import { useCallback } from "react";
-import { workspaceQuery } from "./queries";
+import { useWorkspace } from "./queries";
 
 /**
  * The Console works in one environment at a time, like a dashboard's test
@@ -18,7 +17,7 @@ import { workspaceQuery } from "./queries";
 export function useEnvironment(): Environment {
   const { ws } = useParams({ strict: false });
   const { env } = useSearch({ strict: false }) as { env?: Environment };
-  const workspace = useQuery({ ...workspaceQuery(ws ?? ""), enabled: Boolean(ws) });
+  const workspace = useWorkspace(ws);
   if (ws && workspace.data) return workspace.data.environment;
   return env === "sandbox" ? "sandbox" : "production";
 }

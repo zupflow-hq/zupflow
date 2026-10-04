@@ -43,8 +43,10 @@ import { useDetailCrumb } from "@/lib/crumbs";
 import { toastError } from "@/lib/errors";
 import { fullDateTime } from "@/lib/format";
 import { qk } from "@/lib/query-keys";
+import { idParam } from "@/lib/route-ids";
 
 export const Route = createFileRoute("/_authed/$org/w/$ws/installations/$installationId")({
+  params: idParam("installationId", "installation"),
   component: InstallationPage,
 });
 

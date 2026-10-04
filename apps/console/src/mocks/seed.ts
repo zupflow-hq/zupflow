@@ -4,8 +4,20 @@
  * publishing app; Beta Labs connects its own Google account; each has Sandbox
  * counterparts. Everything is relative to the moment the seed runs.
  */
-import type { AccountConnection, AgentGrant, AuditEvent, Environment, User, WebhookEndpoint } from "@zupflow/sdk";
+import type {
+  AccountConnection,
+  AgentGrant,
+  AuditEvent,
+  Environment,
+  IdKind,
+  OrganizationId,
+  User,
+  UserId,
+  WebhookEndpoint,
+  WorkspaceId,
+} from "@zupflow/sdk";
 import { CATALOG, type CatalogEntry } from "./catalog";
+import { newId } from "./ids";
 import type {
   AgentRow,
   AppRow,
@@ -19,8 +31,8 @@ import type {
 import { mulberry32, type Rng, uuid } from "./random";
 import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 
-export const DB_SCHEMA = 8;
-export const DEMO_USER_ID = "7b0d6a52-2f0e-4b63-9a1c-5d2f4c8e9a01";
+export const DB_SCHEMA = 9;
+export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -28,22 +40,27 @@ const DAY = 24 * HOUR;
 
 export function seed(nowMs: number = Date.now()): Db {
   const rng = mulberry32(20261003);
-  const id = () => uuid(rng);
+  const id = <K extends IdKind>(kind: K, at = nowMs) => newId(kind, { rng, at });
   const ago = (ms: number) => new Date(nowMs - ms).toISOString();
 
   const users: User[] = [
     { id: DEMO_USER_ID, name: "Jordan Lee", email: "jordan@northwind.example", avatar_url: null },
-    { id: id(), name: "Priya Natarajan", email: "priya@northwind.example", avatar_url: null },
-    { id: id(), name: "Sam Okafor", email: "sam@northwind.example", avatar_url: null },
-    { id: id(), name: "Mei Tanaka", email: "mei@northwind.example", avatar_url: null },
+    { id: id("user", nowMs - 39 * DAY), name: "Priya Natarajan", email: "priya@northwind.example", avatar_url: null },
+    { id: id("user", nowMs - 20 * DAY), name: "Sam Okafor", email: "sam@northwind.example", avatar_url: null },
+    { id: id("user", nowMs - 2 * DAY), name: "Mei Tanaka", email: "mei@northwind.example", avatar_url: null },
   ];
   const [jordan, priya, sam, mei] = users as [User, User, User, User];
 
-  const org = { id: id(), name: "Northwind", slug: "northwind", created_at: ago(41 * DAY) };
+  const org = {
+    id: id("organization", nowMs - 41 * DAY),
+    name: "Northwind",
+    slug: "northwind",
+    created_at: ago(41 * DAY),
+  };
 
   const memberships = [
     {
-      id: id(),
+      id: id("member", nowMs - 41 * DAY),
       organization_id: org.id,
       user_id: jordan.id,
       role: "owner" as const,
@@ -53,7 +70,7 @@ export function seed(nowMs: number = Date.now()): Db {
       last_active_at: ago(4 * MINUTE),
     },
     {
-      id: id(),
+      id: id("member", nowMs - 39 * DAY),
       organization_id: org.id,
       user_id: priya.id,
       role: "admin" as const,
@@ -63,7 +80,7 @@ export function seed(nowMs: number = Date.now()): Db {
       last_active_at: ago(3 * HOUR),
     },
     {
-      id: id(),
+      id: id("member", nowMs - 20 * DAY),
       organization_id: org.id,
       user_id: sam.id,
       role: "developer" as const,
@@ -73,7 +90,7 @@ export function seed(nowMs: number = Date.now()): Db {
       last_active_at: ago(2 * DAY),
     },
     {
-      id: id(),
+      id: id("member", nowMs - 2 * DAY),
       organization_id: org.id,
       user_id: mei.id,
       role: "developer" as const,
@@ -91,7 +108,7 @@ export function seed(nowMs: number = Date.now()): Db {
     externalRef: string | null,
     createdAgo: number,
   ): WorkspaceRow => ({
-    id: id(),
+    id: id("workspace", nowMs - createdAgo),
     organization_id: org.id,
     name,
     slug,
@@ -112,7 +129,7 @@ export function seed(nowMs: number = Date.now()): Db {
 
   const addApp = (entry: CatalogEntry, owner: WorkspaceRow | null, createdAgo: number) => {
     const app: AppRow = {
-      id: id(),
+      id: id("app", nowMs - createdAgo),
       organization_id: org.id,
       owner_workspace_id: owner?.id ?? null,
       kind: "mcp",
@@ -135,7 +152,7 @@ export function seed(nowMs: number = Date.now()): Db {
     app: AppRow,
     environment: Environment,
     state: ConfigState,
-    workspaceId: string | null,
+    workspaceId: WorkspaceId | null,
     updatedBy: User,
     updatedAgo: number,
   ) => {
@@ -212,7 +229,7 @@ export function seed(nowMs: number = Date.now()): Db {
         }
       : null;
     const row: InstallationRow = {
-      id: id(),
+      id: id("installation", nowMs - createdAgo),
       workspace_id: ws.id,
       organization_id: org.id,
       app_id: app.id,
@@ -282,7 +299,7 @@ export function seed(nowMs: number = Date.now()): Db {
     status: AgentRow["status"] = "active",
   ) => {
     const row: AgentRow = {
-      id: id(),
+      id: id("agent", nowMs - createdAgo),
       workspace_id: ws.id,
       name,
       description,
@@ -297,7 +314,7 @@ export function seed(nowMs: number = Date.now()): Db {
   };
   const grant = (a: AgentRow, installation: InstallationRow, tools: string[], approval: string[] = []) => {
     grants.push({
-      id: id(),
+      id: id("grant", Date.parse(a.created_at)),
       workspace_id: a.workspace_id,
       agent_id: a.id,
       installation_id: installation.id,
@@ -437,7 +454,7 @@ export function seed(nowMs: number = Date.now()): Db {
     ],
     api_keys: [
       {
-        id: id(),
+        id: id("api_key", nowMs - 37 * DAY),
         organization_id: org.id,
         environment: "sandbox",
         name: "Local development",
@@ -449,7 +466,7 @@ export function seed(nowMs: number = Date.now()): Db {
         revoked_at: null,
       },
       {
-        id: id(),
+        id: id("api_key", nowMs - 15 * DAY),
         organization_id: org.id,
         environment: "sandbox",
         name: "CI",
@@ -461,7 +478,7 @@ export function seed(nowMs: number = Date.now()): Db {
         revoked_at: null,
       },
       {
-        id: id(),
+        id: id("api_key", nowMs - 34 * DAY),
         organization_id: org.id,
         environment: "production",
         name: "Northwind API",
@@ -473,7 +490,7 @@ export function seed(nowMs: number = Date.now()): Db {
         revoked_at: null,
       },
       {
-        id: id(),
+        id: id("api_key", nowMs - 33 * DAY),
         organization_id: org.id,
         environment: "production",
         name: "Old worker key",
@@ -491,7 +508,7 @@ export function seed(nowMs: number = Date.now()): Db {
 
   db.webhooks.push(
     {
-      id: id(),
+      id: id("webhook_endpoint", nowMs - 30 * DAY),
       organization_id: org.id,
       environment: "production",
       url: "https://hooks.northwind.example/zupflow",
@@ -510,7 +527,7 @@ export function seed(nowMs: number = Date.now()): Db {
       last_delivery: { status_code: 200, delivered_at: ago(3 * MINUTE) },
     },
     {
-      id: id(),
+      id: id("webhook_endpoint", nowMs - 29 * DAY),
       organization_id: org.id,
       environment: "sandbox",
       url: "https://staging.northwind.example/hooks/zupflow",
@@ -544,7 +561,8 @@ export function seed(nowMs: number = Date.now()): Db {
     { ws: acmeSandbox, installation: sandboxLinear, app: linear, subject: "user_test_01" },
   ]);
   db.connect_sessions.push({
-    id: id(),
+    id: id("connect_session", nowMs - 5 * HOUR),
+    reference_hash: null,
     workspace_id: acme.id,
     organization_id: org.id,
     environment: "production",
@@ -669,7 +687,7 @@ const NAME_B = [
  * Many quiet tenant workspaces, the shape of a real customer base: most
  * Production, some with a Sandbox twin. They make search and paging honest.
  */
-function tenantWorkspaces(rng: Rng, organizationId: string, nowMs: number): WorkspaceRow[] {
+function tenantWorkspaces(rng: Rng, organizationId: OrganizationId, nowMs: number): WorkspaceRow[] {
   const rows: WorkspaceRow[] = [];
   const used = new Set<string>();
   for (let i = 0; i < 1180; i++) {
@@ -680,7 +698,7 @@ function tenantWorkspaces(rng: Rng, organizationId: string, nowMs: number): Work
     const ref = `tenant_${uuid(rng).slice(0, 6)}`;
     const createdMs = nowMs - Math.floor(rng() * 300 * DAY) - DAY;
     const production: WorkspaceRow = {
-      id: uuid(rng),
+      id: newId("workspace", { rng, at: createdMs }),
       organization_id: organizationId,
       name,
       slug,
@@ -692,7 +710,7 @@ function tenantWorkspaces(rng: Rng, organizationId: string, nowMs: number): Work
     if (rng() < 0.18) {
       rows.push({
         ...production,
-        id: uuid(rng),
+        id: newId("workspace", { rng, at: createdMs - 2 * DAY }),
         slug: `${slug}-sandbox`,
         environment: "sandbox",
         created_at: new Date(createdMs - 2 * DAY).toISOString(),
@@ -747,13 +765,13 @@ function seedRuns(db: Db, rng: Rng, nowMs: number, specs: RunSeed[]) {
     for (let i = 0; i < spec.count; i++) {
       // Skew toward recent days so the activity chart has a shape.
       const back = Math.floor(rng() ** 1.6 * 13.5 * DAY) + 6 * MINUTE + i * 1000;
-      const createdMs = nowMs - back;
       const leaveWaiting = spec.waiting === true && i === 0;
+      const createdMs = leaveWaiting ? nowMs - 9 * MINUTE : nowMs - back;
       const run: RunRow = {
-        id: uuid(rng),
+        id: newId("run", { rng, at: createdMs }),
         workspace_id: spec.agent.workspace_id,
         agent_id: spec.agent.id,
-        session_id: `ses_${uuid(rng).slice(0, 12)}`,
+        session_id: newId("session", { rng, at: createdMs }),
         subject: rng() < 0.85 ? `user_${uuid(rng).slice(0, 8)}` : null,
         trigger: rng() < 0.9 ? "api" : "console",
         status: "queued",
@@ -761,13 +779,14 @@ function seedRuns(db: Db, rng: Rng, nowMs: number, specs: RunSeed[]) {
         output: null,
         usage: { input_tokens: 0, output_tokens: 0, tool_calls: 0 },
         error: null,
-        created_at: new Date(leaveWaiting ? nowMs - 9 * MINUTE : createdMs).toISOString(),
+        created_at: new Date(createdMs).toISOString(),
         started_at: null,
         finished_at: null,
         plan: [],
       };
       if (leaveWaiting) run.input = "Publish the autumn release notes";
-      run.plan = planRun(db, run);
+      // Plan from the seed's randomness, not the run's ID: IDs carry the clock, and the demo must not change with it.
+      run.plan = planRun(db, run, rng);
       db.runs.push(run);
       enqueueRun(db, run);
 
@@ -779,11 +798,11 @@ function seedRuns(db: Db, rng: Rng, nowMs: number, specs: RunSeed[]) {
           if (leaveWaiting) break;
           clock += 20_000 + Math.floor(rng() * 200_000);
           const approval = [...(db.run_events[run.id] ?? [])].reverse().find((e) => e.type === "approval.requested");
-          const callId = approval?.type === "approval.requested" ? approval.data.call_id : "";
+          if (approval?.type !== "approval.requested") break;
           resolveApproval(
             db,
             run,
-            callId,
+            approval.data.call_id,
             rng() < 0.85 ? "approved" : "denied",
             run.subject ?? "your product's user",
             new Date(clock).toISOString(),
@@ -809,7 +828,8 @@ function seedConnectSessions(
   for (const spec of specs) {
     const created = Date.parse(spec.installation.created_at) - 2 * MINUTE;
     const row: ConnectSessionRow = {
-      id: uuid(rng),
+      id: newId("connect_session", { rng, at: created }),
+      reference_hash: null,
       workspace_id: spec.ws.id,
       organization_id: spec.ws.organization_id,
       environment: spec.ws.environment,
@@ -832,7 +852,8 @@ function seedConnectSessions(
       const abandoned = nowMs - Math.floor(rng() * 9 * DAY) - HOUR;
       db.connect_sessions.push({
         ...row,
-        id: uuid(rng),
+        id: newId("connect_session", { rng, at: abandoned }),
+        reference_hash: null,
         installation_id: null,
         status: rng() < 0.5 ? "expired" : "cancelled",
         created_at: new Date(abandoned).toISOString(),
@@ -863,6 +884,11 @@ function seedAudit(
   const org = db.organizations[0];
   if (!org) return;
   const user = (u: User) => ({ type: "user" as const, id: u.id, name: u.name });
+  const keyId = (name: string) => db.api_keys.find((k) => k.organization_id === org.id && k.name === name)?.id ?? null;
+  const memberId = (email: string) =>
+    db.memberships.find(
+      (m) => m.organization_id === org.id && db.users.find((u) => u.id === m.user_id)?.email === email,
+    )?.id ?? null;
   const add = (
     agoMs: number,
     actor: AuditEvent["actor"],
@@ -872,7 +898,7 @@ function seedAudit(
     environment: Environment | null = w?.environment ?? null,
   ) =>
     db.audit.push({
-      id: uuid(rng),
+      id: newId("audit_event", { rng, at: nowMs - agoMs }),
       organization_id: org.id,
       workspace_id: w?.id ?? null,
       environment,
@@ -894,7 +920,7 @@ function seedAudit(
     34 * DAY,
     user(people.jordan),
     "api_key.created",
-    { type: "api_key", id: "k", name: "Northwind API" },
+    { type: "api_key", id: keyId("Northwind API"), name: "Northwind API" },
     null,
     "production",
   );
@@ -906,7 +932,7 @@ function seedAudit(
     14 * DAY,
     user(people.priya),
     "api_key.revoked",
-    { type: "api_key", id: "k2", name: "Old worker key" },
+    { type: "api_key", id: keyId("Old worker key"), name: "Old worker key" },
     null,
     "production",
   );
@@ -920,17 +946,21 @@ function seedAudit(
     ws.acme,
   );
   add(3 * DAY, user(people.jordan), "app.created", app(refs.notion));
-  add(2 * DAY, user(people.jordan), "member.invited", { type: "member", id: "m", name: "mei@northwind.example" });
+  add(2 * DAY, user(people.jordan), "member.invited", {
+    type: "member",
+    id: memberId("mei@northwind.example"),
+    name: "mei@northwind.example",
+  });
   add(
     6 * HOUR,
-    { type: "system", id: "credential-service", name: "Credential service" },
+    { type: "system", id: null, name: "Credential service" },
     "installation.reconnect_required",
     { type: "installation", id: refs.acmeBilling.id, name: `${refs.stripe.name} · ${refs.acmeBilling.label}` },
     ws.acme,
   );
   add(
     5 * HOUR,
-    { type: "api_key", id: "k", name: "Northwind API" },
+    { type: "api_key", id: keyId("Northwind API"), name: "Northwind API" },
     "connect_session.failed",
     { type: "installation", id: refs.acmeBilling.id, name: `${refs.stripe.name} · ${refs.acmeBilling.label}` },
     ws.acme,

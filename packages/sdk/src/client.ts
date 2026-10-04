@@ -1,3 +1,16 @@
+import type {
+  AgentId,
+  ApiKeyId,
+  AppId,
+  ConnectSessionId,
+  GrantId,
+  InstallationId,
+  MemberId,
+  OrganizationId,
+  RunId,
+  WebhookEndpointId,
+  WorkspaceId,
+} from "./ids";
 import type { QueryValue, Transport } from "./transport";
 import type {
   Agent,
@@ -18,6 +31,7 @@ import type {
   CreateAppInput,
   CreateConnectSessionInput,
   CreatedApiKey,
+  CreatedConnectSession,
   CreatedWebhookEndpoint,
   CreateGrantInput,
   CreateOrganizationInput,
@@ -78,8 +92,8 @@ export function createClient(transport: Transport) {
   const send = async <T>(method: "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown) =>
     (await transport.request<T>({ method, path, body })).data;
 
-  const org = (organizationId: string) => `/v1/organizations/${enc(organizationId)}`;
-  const ws = (workspaceId: string) => `/v1/workspaces/${enc(workspaceId)}`;
+  const org = (organizationId: OrganizationId) => `/v1/organizations/${enc(organizationId)}`;
+  const ws = (workspaceId: WorkspaceId) => `/v1/workspaces/${enc(workspaceId)}`;
 
   return {
     me: {
@@ -92,45 +106,47 @@ export function createClient(transport: Transport) {
 
     organizations: {
       create: (input: CreateOrganizationInput) => send<Organization>("POST", "/v1/organizations", input),
-      get: (organizationId: string) => get<Organization>(org(organizationId)),
-      update: (organizationId: string, input: UpdateOrganizationInput) =>
+      get: (organizationId: OrganizationId) => get<Organization>(org(organizationId)),
+      update: (organizationId: OrganizationId, input: UpdateOrganizationInput) =>
         send<Organization>("PATCH", org(organizationId), input),
-      usage: (organizationId: string, environment: Environment, days = 14) =>
+      usage: (organizationId: OrganizationId, environment: Environment, days = 14) =>
         get<UsageReport>(`${org(organizationId)}/usage`, { environment, days }),
     },
 
     members: {
-      list: (organizationId: string) => get<Member[]>(`${org(organizationId)}/members`),
-      invite: (organizationId: string, input: InviteMemberInput) =>
+      list: (organizationId: OrganizationId) => get<Member[]>(`${org(organizationId)}/members`),
+      invite: (organizationId: OrganizationId, input: InviteMemberInput) =>
         send<Member>("POST", `${org(organizationId)}/members`, input),
-      update: (organizationId: string, memberId: string, input: UpdateMemberInput) =>
+      update: (organizationId: OrganizationId, memberId: MemberId, input: UpdateMemberInput) =>
         send<Member>("PATCH", `${org(organizationId)}/members/${enc(memberId)}`, input),
-      remove: (organizationId: string, memberId: string) =>
+      remove: (organizationId: OrganizationId, memberId: MemberId) =>
         send<void>("DELETE", `${org(organizationId)}/members/${enc(memberId)}`),
     },
 
     workspaces: {
-      list: (organizationId: string, query: WorkspaceListQuery = {}) =>
+      list: (organizationId: OrganizationId, query: WorkspaceListQuery = {}) =>
         getPage<Workspace>(`${org(organizationId)}/workspaces`, { ...query }),
-      create: (organizationId: string, input: CreateWorkspaceInput) =>
+      create: (organizationId: OrganizationId, input: CreateWorkspaceInput) =>
         send<Workspace>("POST", `${org(organizationId)}/workspaces`, input),
-      get: (workspaceId: string) => get<Workspace>(ws(workspaceId)),
-      update: (workspaceId: string, input: UpdateWorkspaceInput) => send<Workspace>("PATCH", ws(workspaceId), input),
-      delete: (workspaceId: string) => send<void>("DELETE", ws(workspaceId)),
+      get: (workspaceId: WorkspaceId) => get<Workspace>(ws(workspaceId)),
+      update: (workspaceId: WorkspaceId, input: UpdateWorkspaceInput) =>
+        send<Workspace>("PATCH", ws(workspaceId), input),
+      delete: (workspaceId: WorkspaceId) => send<void>("DELETE", ws(workspaceId)),
     },
 
     organizationApps: {
-      list: (organizationId: string) => get<AppDefinition[]>(`${org(organizationId)}/apps`),
-      create: (organizationId: string, input: CreateAppInput) =>
+      list: (organizationId: OrganizationId) => get<AppDefinition[]>(`${org(organizationId)}/apps`),
+      create: (organizationId: OrganizationId, input: CreateAppInput) =>
         send<AppDefinition>("POST", `${org(organizationId)}/apps`, input),
-      get: (organizationId: string, appId: string) => get<AppDefinition>(`${org(organizationId)}/apps/${enc(appId)}`),
-      update: (organizationId: string, appId: string, input: UpdateAppInput) =>
+      get: (organizationId: OrganizationId, appId: AppId) =>
+        get<AppDefinition>(`${org(organizationId)}/apps/${enc(appId)}`),
+      update: (organizationId: OrganizationId, appId: AppId, input: UpdateAppInput) =>
         send<AppDefinition>("PATCH", `${org(organizationId)}/apps/${enc(appId)}`, input),
-      getConfiguration: (organizationId: string, appId: string, environment: Environment) =>
+      getConfiguration: (organizationId: OrganizationId, appId: AppId, environment: Environment) =>
         get<ClientConfiguration>(`${org(organizationId)}/apps/${enc(appId)}/environments/${environment}/configuration`),
       updateConfiguration: (
-        organizationId: string,
-        appId: string,
+        organizationId: OrganizationId,
+        appId: AppId,
         environment: Environment,
         input: UpdateConfigurationInput,
       ) =>
@@ -141,133 +157,137 @@ export function createClient(transport: Transport) {
         ),
       /** Installations of this app across workspaces, newest first. */
       installations: (
-        organizationId: string,
-        appId: string,
+        organizationId: OrganizationId,
+        appId: AppId,
         query: { environment?: Environment; cursor?: string; limit?: number } = {},
       ) => getPage<AppInstallationRef>(`${org(organizationId)}/apps/${enc(appId)}/installations`, { ...query }),
     },
 
     workspaceApps: {
-      list: (workspaceId: string) => get<AppDefinition[]>(`${ws(workspaceId)}/apps`),
-      create: (workspaceId: string, input: CreateAppInput) =>
+      list: (workspaceId: WorkspaceId) => get<AppDefinition[]>(`${ws(workspaceId)}/apps`),
+      create: (workspaceId: WorkspaceId, input: CreateAppInput) =>
         send<AppDefinition>("POST", `${ws(workspaceId)}/apps`, input),
-      get: (workspaceId: string, appId: string) => get<AppDefinition>(`${ws(workspaceId)}/apps/${enc(appId)}`),
-      update: (workspaceId: string, appId: string, input: UpdateAppInput) =>
+      get: (workspaceId: WorkspaceId, appId: AppId) => get<AppDefinition>(`${ws(workspaceId)}/apps/${enc(appId)}`),
+      update: (workspaceId: WorkspaceId, appId: AppId, input: UpdateAppInput) =>
         send<AppDefinition>("PATCH", `${ws(workspaceId)}/apps/${enc(appId)}`, input),
-      getConfiguration: (workspaceId: string, appId: string) =>
+      getConfiguration: (workspaceId: WorkspaceId, appId: AppId) =>
         get<ClientConfiguration>(`${ws(workspaceId)}/apps/${enc(appId)}/configuration`),
-      updateConfiguration: (workspaceId: string, appId: string, input: UpdateConfigurationInput) =>
+      updateConfiguration: (workspaceId: WorkspaceId, appId: AppId, input: UpdateConfigurationInput) =>
         send<ClientConfiguration>("PUT", `${ws(workspaceId)}/apps/${enc(appId)}/configuration`, input),
-      available: (workspaceId: string) => get<AvailableApp[]>(`${ws(workspaceId)}/available-apps`),
+      available: (workspaceId: WorkspaceId) => get<AvailableApp[]>(`${ws(workspaceId)}/available-apps`),
     },
 
     installations: {
-      list: (workspaceId: string) => get<Installation[]>(`${ws(workspaceId)}/installations`),
-      get: (workspaceId: string, installationId: string) =>
+      list: (workspaceId: WorkspaceId) => get<Installation[]>(`${ws(workspaceId)}/installations`),
+      get: (workspaceId: WorkspaceId, installationId: InstallationId) =>
         get<Installation>(`${ws(workspaceId)}/installations/${enc(installationId)}`),
-      update: (workspaceId: string, installationId: string, input: UpdateInstallationInput) =>
+      update: (workspaceId: WorkspaceId, installationId: InstallationId, input: UpdateInstallationInput) =>
         send<Installation>("PATCH", `${ws(workspaceId)}/installations/${enc(installationId)}`, input),
-      disconnect: (workspaceId: string, installationId: string) =>
+      disconnect: (workspaceId: WorkspaceId, installationId: InstallationId) =>
         send<Installation>("POST", `${ws(workspaceId)}/installations/${enc(installationId)}/disconnect`),
-      delete: (workspaceId: string, installationId: string) =>
+      delete: (workspaceId: WorkspaceId, installationId: InstallationId) =>
         send<void>("DELETE", `${ws(workspaceId)}/installations/${enc(installationId)}`),
     },
 
     connectSessions: {
-      list: (workspaceId: string) => get<ConnectSession[]>(`${ws(workspaceId)}/connect-sessions`),
-      create: (workspaceId: string, input: CreateConnectSessionInput) =>
-        send<ConnectSession>("POST", `${ws(workspaceId)}/connect-sessions`, input),
-      get: (workspaceId: string, sessionId: string) =>
+      list: (workspaceId: WorkspaceId) => get<ConnectSession[]>(`${ws(workspaceId)}/connect-sessions`),
+      create: (workspaceId: WorkspaceId, input: CreateConnectSessionInput) =>
+        send<CreatedConnectSession>("POST", `${ws(workspaceId)}/connect-sessions`, input),
+      get: (workspaceId: WorkspaceId, sessionId: ConnectSessionId) =>
         get<ConnectSession>(`${ws(workspaceId)}/connect-sessions/${enc(sessionId)}`),
     },
 
     /**
-     * Hosted Connect. Authorized by the session reference alone, so the page
-     * can only act on the organization, workspace and app bound to it.
+     * Hosted Connect. Authorized by the session's reference alone: the random
+     * token at the end of the session's `url`, never its ID. The page can only
+     * act on the organization, workspace and app bound to it.
      */
     connect: {
-      get: (sessionId: string) => get<ConnectSession>(`/v1/connect/sessions/${enc(sessionId)}`),
-      submitCredentials: (sessionId: string, input: SubmitConnectCredentialsInput) =>
-        send<ConnectResult>("POST", `/v1/connect/sessions/${enc(sessionId)}/credentials`, input),
-      authorize: (sessionId: string) =>
-        send<AuthorizeConnectResult>("POST", `/v1/connect/sessions/${enc(sessionId)}/authorize`),
-      cancel: (sessionId: string) => send<ConnectSession>("POST", `/v1/connect/sessions/${enc(sessionId)}/cancel`),
+      get: (reference: string) => get<ConnectSession>(`/v1/connect/sessions/${enc(reference)}`),
+      submitCredentials: (reference: string, input: SubmitConnectCredentialsInput) =>
+        send<ConnectResult>("POST", `/v1/connect/sessions/${enc(reference)}/credentials`, input),
+      authorize: (reference: string) =>
+        send<AuthorizeConnectResult>("POST", `/v1/connect/sessions/${enc(reference)}/authorize`),
+      cancel: (reference: string) => send<ConnectSession>("POST", `/v1/connect/sessions/${enc(reference)}/cancel`),
     },
 
     agents: {
-      list: (workspaceId: string) => get<Agent[]>(`${ws(workspaceId)}/agents`),
-      create: (workspaceId: string, input: CreateAgentInput) => send<Agent>("POST", `${ws(workspaceId)}/agents`, input),
-      get: (workspaceId: string, agentId: string) => get<Agent>(`${ws(workspaceId)}/agents/${enc(agentId)}`),
-      update: (workspaceId: string, agentId: string, input: UpdateAgentInput) =>
+      list: (workspaceId: WorkspaceId) => get<Agent[]>(`${ws(workspaceId)}/agents`),
+      create: (workspaceId: WorkspaceId, input: CreateAgentInput) =>
+        send<Agent>("POST", `${ws(workspaceId)}/agents`, input),
+      get: (workspaceId: WorkspaceId, agentId: AgentId) => get<Agent>(`${ws(workspaceId)}/agents/${enc(agentId)}`),
+      update: (workspaceId: WorkspaceId, agentId: AgentId, input: UpdateAgentInput) =>
         send<Agent>("PATCH", `${ws(workspaceId)}/agents/${enc(agentId)}`, input),
-      delete: (workspaceId: string, agentId: string) =>
+      delete: (workspaceId: WorkspaceId, agentId: AgentId) =>
         send<void>("DELETE", `${ws(workspaceId)}/agents/${enc(agentId)}`),
     },
 
     grants: {
-      list: (workspaceId: string, agentId: string) =>
+      list: (workspaceId: WorkspaceId, agentId: AgentId) =>
         get<AgentGrant[]>(`${ws(workspaceId)}/agents/${enc(agentId)}/grants`),
-      create: (workspaceId: string, agentId: string, input: CreateGrantInput) =>
+      create: (workspaceId: WorkspaceId, agentId: AgentId, input: CreateGrantInput) =>
         send<AgentGrant>("POST", `${ws(workspaceId)}/agents/${enc(agentId)}/grants`, input),
-      update: (workspaceId: string, agentId: string, grantId: string, input: UpdateGrantInput) =>
+      update: (workspaceId: WorkspaceId, agentId: AgentId, grantId: GrantId, input: UpdateGrantInput) =>
         send<AgentGrant>("PATCH", `${ws(workspaceId)}/agents/${enc(agentId)}/grants/${enc(grantId)}`, input),
-      delete: (workspaceId: string, agentId: string, grantId: string) =>
+      delete: (workspaceId: WorkspaceId, agentId: AgentId, grantId: GrantId) =>
         send<void>("DELETE", `${ws(workspaceId)}/agents/${enc(agentId)}/grants/${enc(grantId)}`),
     },
 
     organizationRuns: {
       /** Runs across every workspace of the organization the caller can see. */
-      list: (organizationId: string, query: OrganizationRunListQuery = {}) =>
+      list: (organizationId: OrganizationId, query: OrganizationRunListQuery = {}) =>
         getPage<OrganizationRun>(`${org(organizationId)}/runs`, { ...query }),
     },
 
     runs: {
-      list: (workspaceId: string, query: RunListQuery = {}) => getPage<Run>(`${ws(workspaceId)}/runs`, { ...query }),
-      create: (workspaceId: string, agentId: string, input: CreateRunInput) =>
+      list: (workspaceId: WorkspaceId, query: RunListQuery = {}) =>
+        getPage<Run>(`${ws(workspaceId)}/runs`, { ...query }),
+      create: (workspaceId: WorkspaceId, agentId: AgentId, input: CreateRunInput) =>
         send<Run>("POST", `${ws(workspaceId)}/agents/${enc(agentId)}/runs`, input),
-      get: (workspaceId: string, runId: string) => get<Run>(`${ws(workspaceId)}/runs/${enc(runId)}`),
-      events: (workspaceId: string, runId: string, afterSequence?: number) =>
+      get: (workspaceId: WorkspaceId, runId: RunId) => get<Run>(`${ws(workspaceId)}/runs/${enc(runId)}`),
+      events: (workspaceId: WorkspaceId, runId: RunId, afterSequence?: number) =>
         get<RunEvent[]>(`${ws(workspaceId)}/runs/${enc(runId)}/events`, {
           after: afterSequence,
         }),
-      cancel: (workspaceId: string, runId: string) => send<Run>("POST", `${ws(workspaceId)}/runs/${enc(runId)}/cancel`),
+      cancel: (workspaceId: WorkspaceId, runId: RunId) =>
+        send<Run>("POST", `${ws(workspaceId)}/runs/${enc(runId)}/cancel`),
       /**
        * Record the downstream user's decision. Call it from your backend with an
        * API key, after your product asked that user; Console sessions are refused.
        */
-      resolveApproval: (workspaceId: string, runId: string, input: ResolveApprovalInput) =>
+      resolveApproval: (workspaceId: WorkspaceId, runId: RunId, input: ResolveApprovalInput) =>
         send<Run>("POST", `${ws(workspaceId)}/runs/${enc(runId)}/approvals`, input),
     },
 
     connectSettings: {
-      get: (organizationId: string, environment: Environment) =>
+      get: (organizationId: OrganizationId, environment: Environment) =>
         get<ConnectSettings>(`${org(organizationId)}/connect-settings/${environment}`),
-      update: (organizationId: string, environment: Environment, input: UpdateConnectSettingsInput) =>
+      update: (organizationId: OrganizationId, environment: Environment, input: UpdateConnectSettingsInput) =>
         send<ConnectSettings>("PUT", `${org(organizationId)}/connect-settings/${environment}`, input),
     },
 
     apiKeys: {
-      list: (organizationId: string) => get<ApiKey[]>(`${org(organizationId)}/api-keys`),
-      create: (organizationId: string, input: CreateApiKeyInput) =>
+      list: (organizationId: OrganizationId) => get<ApiKey[]>(`${org(organizationId)}/api-keys`),
+      create: (organizationId: OrganizationId, input: CreateApiKeyInput) =>
         send<CreatedApiKey>("POST", `${org(organizationId)}/api-keys`, input),
-      revoke: (organizationId: string, keyId: string) =>
+      revoke: (organizationId: OrganizationId, keyId: ApiKeyId) =>
         send<ApiKey>("POST", `${org(organizationId)}/api-keys/${enc(keyId)}/revoke`),
     },
 
     webhooks: {
-      list: (organizationId: string) => get<WebhookEndpoint[]>(`${org(organizationId)}/webhooks`),
-      create: (organizationId: string, input: CreateWebhookEndpointInput) =>
+      list: (organizationId: OrganizationId) => get<WebhookEndpoint[]>(`${org(organizationId)}/webhooks`),
+      create: (organizationId: OrganizationId, input: CreateWebhookEndpointInput) =>
         send<CreatedWebhookEndpoint>("POST", `${org(organizationId)}/webhooks`, input),
-      update: (organizationId: string, endpointId: string, input: UpdateWebhookEndpointInput) =>
+      update: (organizationId: OrganizationId, endpointId: WebhookEndpointId, input: UpdateWebhookEndpointInput) =>
         send<WebhookEndpoint>("PATCH", `${org(organizationId)}/webhooks/${enc(endpointId)}`, input),
-      delete: (organizationId: string, endpointId: string) =>
+      delete: (organizationId: OrganizationId, endpointId: WebhookEndpointId) =>
         send<void>("DELETE", `${org(organizationId)}/webhooks/${enc(endpointId)}`),
-      sendTest: (organizationId: string, endpointId: string) =>
+      sendTest: (organizationId: OrganizationId, endpointId: WebhookEndpointId) =>
         send<WebhookDelivery>("POST", `${org(organizationId)}/webhooks/${enc(endpointId)}/test`),
     },
 
     audit: {
-      list: (organizationId: string, query: AuditListQuery = {}) =>
+      list: (organizationId: OrganizationId, query: AuditListQuery = {}) =>
         getPage<AuditEvent>(`${org(organizationId)}/audit-events`, { ...query }),
     },
   };

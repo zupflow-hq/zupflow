@@ -4,10 +4,11 @@
  * runs instantly against a fake clock. Every step re-checks the installation,
  * so revoking access or a broken connection shows up the way it will for real.
  */
-import type { RunError, RunEvent, RunEventType } from "@zupflow/sdk";
+import type { RunError, RunEvent, RunEventType, ToolCallId } from "@zupflow/sdk";
 import { sampleToolCall } from "./catalog";
+import { newId } from "./ids";
 import type { Db, PlannedCall, RunRow, RunStep } from "./model";
-import { type Rng, rngFor, uuid } from "./random";
+import { type Rng, rngFor } from "./random";
 
 const SUMMARY: Record<string, (label: string) => string> = {
   search_files: (l) => `found the relevant files in ${l}`,
@@ -35,8 +36,12 @@ function sentence(parts: string[]): string {
 }
 
 /** Decide what the run will do, from the agent's grants at creation time. */
-export function planRun(db: Db, run: Pick<RunRow, "id" | "workspace_id" | "agent_id" | "input">) {
-  const rng = rngFor(run.id);
+export function planRun(
+  db: Db,
+  run: Pick<RunRow, "id" | "workspace_id" | "agent_id" | "input" | "created_at">,
+  rng: Rng = rngFor(run.id),
+) {
+  const at = Date.parse(run.created_at);
   const grants = db.grants.filter((g) => g.workspace_id === run.workspace_id && g.agent_id === run.agent_id);
 
   type Candidate = { call: PlannedCall; effect: string; approval: boolean };
@@ -56,7 +61,7 @@ export function planRun(db: Db, run: Pick<RunRow, "id" | "workspace_id" | "agent
         effect: tool.effect,
         approval: grant.approval_required.includes(tool.name),
         call: {
-          call_id: `call_${uuid(rng).slice(0, 12)}`,
+          call_id: newId("tool_call", { rng, at }),
           installation_id: installation.id,
           installation_label: installation.label,
           app_name: app.name,
@@ -121,7 +126,7 @@ export function planRun(db: Db, run: Pick<RunRow, "id" | "workspace_id" | "agent
     text: `I'll start with ${chosen[0]?.call.app_name ?? "the connected apps"} and work from there.`,
   });
 
-  const parts: { call_id: string; text: string }[] = [];
+  const parts: { call_id: ToolCallId; text: string }[] = [];
   for (const { call, approval } of chosen) {
     if (approval) steps.push({ kind: "approval", call });
     steps.push({ kind: "tool_call", call });
@@ -147,7 +152,7 @@ function pushEvent<T extends RunEventType>(
   const list = db.run_events[run.id] ?? [];
   db.run_events[run.id] = list;
   list.push({
-    id: crypto.randomUUID(),
+    id: newId("run_event", { at: Date.parse(at) }),
     run_id: run.id,
     workspace_id: run.workspace_id,
     sequence: list.length + 1,
@@ -264,7 +269,7 @@ export function advanceRun(db: Db, run: RunRow, at: string, rng: Rng): StepOutco
 export function resolveApproval(
   db: Db,
   run: RunRow,
-  callId: string,
+  callId: ToolCallId,
   decision: "approved" | "denied",
   resolvedBy: string,
   at: string,

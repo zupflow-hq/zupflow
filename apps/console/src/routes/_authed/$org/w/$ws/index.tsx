@@ -1,4 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
+import type { WorkspaceId } from "@zupflow/sdk";
 import { AlertTriangleIcon, ArrowRightIcon, CheckIcon, HandIcon } from "lucide-react";
 import { AppIcon, QueryError, RowsSkeleton } from "@/components/app/misc";
 import { PageContainer, Panel, SectionHeader } from "@/components/app/page";
@@ -280,7 +281,7 @@ function QuickStart({
   production,
 }: {
   orgSlug: string;
-  wsId: string;
+  wsId: WorkspaceId;
   hasInstallation: boolean;
   hasAgent: boolean;
   production: boolean;

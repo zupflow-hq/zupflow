@@ -14,11 +14,12 @@ import { useEnvironment } from "@/features/environment";
 import { useOrganizationRuns } from "@/features/queries";
 import { RunTable } from "@/features/runs/run-table";
 import { WorkspacePicker } from "@/features/workspaces/workspace-picker";
+import { idSearch } from "@/lib/route-ids";
 
 export const Route = createFileRoute("/_authed/$org/runs")({
   staticData: { crumb: "Runs" },
   validateSearch: z.object({
-    workspace: z.string().optional(),
+    workspace: idSearch("workspace").optional(),
     status: z.enum(RUN_STATUSES).optional(),
   }),
   component: OrganizationRunsPage,

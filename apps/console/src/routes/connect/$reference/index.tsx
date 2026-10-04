@@ -18,7 +18,7 @@ import { api } from "@/lib/api";
 import { errorMessage } from "@/lib/errors";
 import { qk } from "@/lib/query-keys";
 
-export const Route = createFileRoute("/connect/$sessionId/")({
+export const Route = createFileRoute("/connect/$reference/")({
   component: HostedConnectPage,
 });
 
@@ -31,8 +31,9 @@ function notifyOpener(sessionId: string) {
 }
 
 function HostedConnectPage() {
-  const { sessionId } = Route.useParams();
-  const session = useHostedConnectSession(sessionId);
+  // The link's last segment is the session's reference: possession authorizes this page.
+  const { reference } = Route.useParams();
+  const session = useHostedConnectSession(reference);
   useDocumentTitle(session.data ? `Connect ${session.data.app.name}` : "Connect");
 
   if (session.isError) {
@@ -64,7 +65,7 @@ function HostedConnectPage() {
   }
   return (
     <ConnectFrame>
-      <ConnectBody session={session.data} />
+      <ConnectBody session={session.data} reference={reference} />
     </ConnectFrame>
   );
 }
@@ -90,10 +91,10 @@ function Final({
   );
 }
 
-function ConnectBody({ session }: { session: ConnectSession }) {
+function ConnectBody({ session, reference }: { session: ConnectSession; reference: string }) {
   const queryClient = useQueryClient();
-  const refresh = () => queryClient.invalidateQueries({ queryKey: qk.hostedConnect(session.id) });
-  const cancel = useMutation({ mutationFn: () => api.connect.cancel(session.id), onSettled: refresh });
+  const refresh = () => queryClient.invalidateQueries({ queryKey: qk.hostedConnect(reference) });
+  const cancel = useMutation({ mutationFn: () => api.connect.cancel(reference), onSettled: refresh });
 
   useEffect(() => {
     if (session.status === "pending") return;
@@ -166,9 +167,9 @@ function ConnectBody({ session }: { session: ConnectSession }) {
       </div>
       <div className="mt-7">
         {session.auth?.type === "token" ? (
-          <TokenForm session={session} auth={session.auth} onDone={refresh} />
+          <TokenForm session={session} reference={reference} auth={session.auth} onDone={refresh} />
         ) : (
-          <OAuthStart session={session} />
+          <OAuthStart session={session} reference={reference} />
         )}
       </div>
       <Button
@@ -183,9 +184,9 @@ function ConnectBody({ session }: { session: ConnectSession }) {
   );
 }
 
-function OAuthStart({ session }: { session: ConnectSession }) {
+function OAuthStart({ session, reference }: { session: ConnectSession; reference: string }) {
   const authorize = useMutation({
-    mutationFn: () => api.connect.authorize(session.id),
+    mutationFn: () => api.connect.authorize(reference),
     onSuccess: ({ authorization_url }) => window.location.assign(authorization_url),
   });
   return (
@@ -216,16 +217,18 @@ function OAuthStart({ session }: { session: ConnectSession }) {
 
 function TokenForm({
   session,
+  reference,
   auth,
   onDone,
 }: {
   session: ConnectSession;
+  reference: string;
   auth: TokenAuthTemplate;
   onDone: () => void;
 }) {
   const [values, setValues] = useState<Record<string, string>>({});
   const submit = useMutation({
-    mutationFn: () => api.connect.submitCredentials(session.id, { values }),
+    mutationFn: () => api.connect.submitCredentials(reference, { values }),
     onSuccess: () => {
       setValues({});
       onDone();
