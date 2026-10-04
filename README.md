@@ -62,9 +62,12 @@ CI runs `pnpm check` on every push and pull request.
   hand-edit). Console-specific building blocks live in `src/components/app`.
 - Every page handles loading (layout-stable skeletons), empty, error,
   permission-denied and destructive-confirmation states, and works at 375 px.
-- The Console shows one environment at a time (`?env=sandbox`, retained on
-  every navigation; `src/features/environment.ts`). Workspaces are listed and
-  searched on the server, never loaded in full.
+- The Console shows one environment at a time. Sandbox pages live under
+  `/{org}/sandbox/…` and Production pages have no prefix; a router rewrite
+  (`src/lib/environment-url.ts`) maps the prefix to the environment, and
+  `src/features/environment.ts` reads it; older `?env=` links are rewritten to
+  the path form on load. Workspaces are listed and searched
+  on the server, never loaded in full.
 
 ### The mock API
 
