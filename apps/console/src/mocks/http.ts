@@ -31,7 +31,8 @@ import { ORGANIZATION_HEADER } from "@zupflow/sdk";
 import { delay, HttpResponse } from "msw";
 import type { z } from "zod";
 import { db, persist } from "./db";
-import { isId, newId } from "./ids";
+import { idempotently } from "./idempotency";
+import { hashReference, isId, newId } from "./ids";
 import type {
   AgentRow,
   ApiKeyRow,
@@ -76,6 +77,12 @@ export function noContent() {
   return new HttpResponse(null, { status: 204 });
 }
 
+function failureFor(error: unknown) {
+  if (error instanceof ApiFailure) return failure(error);
+  console.error("[mock api]", error);
+  return failure(new ApiFailure(500, "internal_error", "Something went wrong on our side."));
+}
+
 function failure(error: ApiFailure) {
   return HttpResponse.json(
     {
@@ -94,8 +101,9 @@ export function setLatency(range: [number, number]) {
 }
 
 /**
- * Wrap a resolver: add latency, turn {@link ApiFailure} into an error
- * envelope and persist after successful mutations.
+ * Wrap a resolver: add latency, apply `Idempotency-Key` to every `POST`, turn
+ * {@link ApiFailure} into an error envelope and persist after successful
+ * mutations.
  */
 type ResolverArgs = {
   request: Request;
@@ -106,14 +114,19 @@ export function route<A extends ResolverArgs>(fn: (args: A) => Promise<Response>
   return async (args: A) => {
     const [min, max] = latency;
     if (max > 0) await delay(min + Math.floor(Math.random() * (max - min)));
+    const handle = async () => {
+      try {
+        const response = await fn(args);
+        if (args.request.method !== "GET" && response.ok) persist();
+        return response;
+      } catch (error) {
+        return failureFor(error);
+      }
+    };
     try {
-      const response = await fn(args);
-      if (args.request.method !== "GET" && response.ok) persist();
-      return response;
+      return await idempotently(args.request, args.params, handle);
     } catch (error) {
-      if (error instanceof ApiFailure) return failure(error);
-      console.error("[mock api]", error);
-      return failure(new ApiFailure(500, "internal_error", "Something went wrong on our side."));
+      return failureFor(error);
     }
   };
 }
@@ -204,6 +217,29 @@ export function workspaceAccess(request: Request, workspaceParam: string): Works
   const workspace = db().workspaces.find((w) => w.organization_id === org.id && w.id === workspaceId);
   if (!workspace) throw notFound("Workspace");
   return { user, org, membership, workspace };
+}
+
+/**
+ * Cross-tenant by design: hosted Connect starts with no organization or
+ * workspace, only the link's reference (a random token, never the session's
+ * ID). It reads exactly one session and nothing else. Everything after it is
+ * scoped to that session's organization and workspace (see `sessionScope`).
+ */
+export async function findSessionByReferenceCrossTenant(reference: string): Promise<ConnectSessionRow> {
+  const referenceHash = reference ? await hashReference(reference) : null;
+  const session = referenceHash
+    ? db().connect_sessions.find((s) => s.reference_hash !== null && s.reference_hash === referenceHash)
+    : undefined;
+  if (!session) throw notFound("Connect session");
+  return withExpiry(session);
+}
+
+/** A pending session past its expiry is expired, whoever reads it. */
+export function withExpiry(session: ConnectSessionRow): ConnectSessionRow {
+  if (session.status === "pending" && Date.parse(session.expires_at) < Date.now()) {
+    session.status = "expired";
+  }
+  return session;
 }
 
 export function requireRole(access: OrgAccess, roles: MemberRole[], action: string) {

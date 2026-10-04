@@ -1,4 +1,5 @@
 import type { ApiErrorBody, Envelope, Meta, OrganizationId } from "@zupflow/contract";
+import { IDEMPOTENCY_HEADER } from "@zupflow/contract/idempotency";
 
 /**
  * Names the organization a Console session acts in. Workspace routes
@@ -19,6 +20,8 @@ export interface RequestOptions {
   query?: Record<string, QueryValue>;
   body?: unknown;
   signal?: AbortSignal;
+  /** For `POST`: the `Idempotency-Key`. Omitted, the transport makes a fresh one per call. */
+  idempotencyKey?: string;
 }
 
 export interface TransportResponse<T> {
@@ -65,6 +68,12 @@ export interface HttpTransportOptions {
   /** For Console sessions: the organization each request acts in. */
   getOrganization?: () => OrganizationId | null;
   fetch?: typeof fetch;
+  /**
+   * Times to retry a request that got no response at all (default 2). A
+   * `POST` is retried with the same `Idempotency-Key`, so the server runs it
+   * at most once; an answer of any status is never retried.
+   */
+  retries?: number;
 }
 
 function buildUrl(baseUrl: string, path: string, query?: Record<string, QueryValue>): string {
@@ -82,30 +91,42 @@ function isEnvelope(value: unknown): value is Envelope<unknown> {
   return typeof value === "object" && value !== null && "data" in value && "meta" in value && "error" in value;
 }
 
+/**
+ * A fresh key: 128 random bits as hex. `crypto.getRandomValues`, unlike
+ * `crypto.randomUUID`, works outside secure contexts too.
+ */
+function newIdempotencyKey(): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export function createHttpTransport(options: HttpTransportOptions): Transport {
   // Resolve fetch per request so later instrumentation or polyfills apply.
   const doFetch: typeof fetch = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
 
   return {
-    async request<T>({ method, path, query, body, signal }: RequestOptions) {
+    async request<T>({ method, path, query, body, signal, idempotencyKey }: RequestOptions) {
       const headers = new Headers({ Accept: "application/json" });
       const token = await options.getToken();
       if (token) headers.set("Authorization", `Bearer ${token}`);
       const organization = options.getOrganization?.();
       if (organization) headers.set(ORGANIZATION_HEADER, organization);
       if (body !== undefined) headers.set("Content-Type", "application/json");
+      if (method === "POST") headers.set(IDEMPOTENCY_HEADER, idempotencyKey ?? newIdempotencyKey());
 
-      let response: Response;
-      try {
-        response = await doFetch(buildUrl(options.baseUrl, path, query), {
-          method,
-          headers,
-          body: body === undefined ? undefined : JSON.stringify(body),
-          signal,
-        });
-      } catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") throw error;
-        throw new ZupflowNetworkError(error);
+      const url = buildUrl(options.baseUrl, path, query);
+      const init = { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal };
+      const retries = options.retries ?? 2;
+      let response: Response | undefined;
+      for (let attempt = 0; !response; attempt++) {
+        try {
+          response = await doFetch(url, init);
+        } catch (error) {
+          // A cancelled request is the caller's decision: never retried, never wrapped.
+          if (signal?.aborted) throw signal.reason;
+          if (error instanceof DOMException && error.name === "AbortError") throw error;
+          if (attempt >= retries) throw new ZupflowNetworkError(error);
+          await new Promise((resolve) => setTimeout(resolve, 200 * 2 ** attempt));
+        }
       }
 
       if (response.status === 204) {

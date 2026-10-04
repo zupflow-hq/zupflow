@@ -33,6 +33,20 @@
         "description": "An environment-bound API key (`zf_live_…`, `zf_test_…`)."
       }
     },
+    "parameters": {
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[\\x20-\\x7E]+$"
+        },
+        "description": "Makes a retry safe: 1–255 printable ASCII characters, scoped to the caller that sent it, kept for 24 hours. The same key and request replays the saved response; the same key with a different request answers `422 idempotency_key_reused`; a key still in flight answers `409 idempotency_request_in_progress`; a malformed key answers `400 invalid_idempotency_key`. Routes marked `x-zupflow-shows-secret-once` never save their body: a retry answers `409 idempotency_key_completed`."
+      }
+    },
     "responses": {
       "Error": {
         "description": "An error: branch on `error.code`, never on `error.message`.",
@@ -2992,7 +3006,11 @@
         "x-zupflow-callers": [
           "console"
         ],
-        "parameters": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
         "responses": {
           "201": {
             "description": "OK",
@@ -3368,6 +3386,9 @@
               "$ref": "#/components/schemas/OrganizationId"
             },
             "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -3907,6 +3928,9 @@
               "$ref": "#/components/schemas/OrganizationId"
             },
             "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -4266,6 +4290,9 @@
               "$ref": "#/components/schemas/OrganizationId"
             },
             "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -4910,6 +4937,9 @@
               "$ref": "#/components/schemas/WorkspaceId"
             },
             "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -5740,6 +5770,9 @@
               "$ref": "#/components/schemas/InstallationId"
             },
             "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -5877,6 +5910,9 @@
               "$ref": "#/components/schemas/WorkspaceId"
             },
             "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -5917,6 +5953,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
+        "x-zupflow-shows-secret-once": true,
         "requestBody": {
           "required": true,
           "content": {
@@ -6124,6 +6161,9 @@
               "type": "string",
               "description": "The session's reference: the random token at the end of its `url`. Possession authorizes the page."
             }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -6209,6 +6249,9 @@
               "type": "string",
               "description": "The session's reference: the random token at the end of its `url`. Possession authorizes the page."
             }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -6248,7 +6291,8 @@
           "default": {
             "$ref": "#/components/responses/Error"
           }
-        }
+        },
+        "x-zupflow-shows-secret-once": true
       }
     },
     "/v1/connect/sessions/{reference}/cancel": {
@@ -6270,6 +6314,9 @@
               "type": "string",
               "description": "The session's reference: the random token at the end of its `url`. Possession authorizes the page."
             }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -6407,6 +6454,9 @@
               "$ref": "#/components/schemas/WorkspaceId"
             },
             "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -6820,6 +6870,9 @@
               "$ref": "#/components/schemas/AgentId"
             },
             "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -7097,6 +7150,9 @@
               "$ref": "#/components/schemas/AgentId"
             },
             "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -7467,6 +7523,9 @@
               "$ref": "#/components/schemas/RunId"
             },
             "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -7539,6 +7598,9 @@
               "$ref": "#/components/schemas/RunId"
             },
             "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -7868,6 +7930,9 @@
               "$ref": "#/components/schemas/OrganizationId"
             },
             "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -7908,6 +7973,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
+        "x-zupflow-shows-secret-once": true,
         "requestBody": {
           "required": true,
           "content": {
@@ -7962,6 +8028,9 @@
               "$ref": "#/components/schemas/ApiKeyId"
             },
             "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -8097,6 +8166,9 @@
               "$ref": "#/components/schemas/OrganizationId"
             },
             "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {
@@ -8137,6 +8209,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
+        "x-zupflow-shows-secret-once": true,
         "requestBody": {
           "required": true,
           "content": {
@@ -8373,6 +8446,9 @@
               "$ref": "#/components/schemas/WebhookEndpointId"
             },
             "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
           }
         ],
         "responses": {

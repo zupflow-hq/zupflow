@@ -68,6 +68,16 @@ import type {
 import type { Page } from "./page";
 import type { QueryValue, Transport } from "./transport";
 
+/** Options every `POST` takes. */
+export interface PostOptions {
+  /**
+   * Your own `Idempotency-Key`, to make a retry safe across process restarts:
+   * store it with the work before sending, and send the same key again. By
+   * default the SDK makes a fresh key per call and reuses it on its own retries.
+   */
+  idempotencyKey?: string;
+}
+
 const enc = encodeURIComponent;
 
 /**
@@ -87,8 +97,10 @@ export function createClient(transport: Transport) {
       pagination: meta?.pagination ?? { next_cursor: null, total: data.length },
     };
   };
-  const send = async <T>(method: "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown) =>
+  const send = async <T>(method: "PUT" | "PATCH" | "DELETE", path: string, body?: unknown) =>
     (await transport.request<T>({ method, path, body })).data;
+  const post = async <T>(path: string, body: unknown, options?: PostOptions) =>
+    (await transport.request<T>({ method: "POST", path, body, idempotencyKey: options?.idempotencyKey })).data;
 
   const org = (organizationId: OrganizationId) => `/v1/organizations/${enc(organizationId)}`;
   const ws = (workspaceId: WorkspaceId) => `/v1/workspaces/${enc(workspaceId)}`;
@@ -103,7 +115,8 @@ export function createClient(transport: Transport) {
     },
 
     organizations: {
-      create: (input: CreateOrganizationInput) => send<Organization>("POST", "/v1/organizations", input),
+      create: (input: CreateOrganizationInput, options?: PostOptions) =>
+        post<Organization>("/v1/organizations", input, options),
       get: (organizationId: OrganizationId) => get<Organization>(org(organizationId)),
       update: (organizationId: OrganizationId, input: UpdateOrganizationInput) =>
         send<Organization>("PATCH", org(organizationId), input),
@@ -113,8 +126,8 @@ export function createClient(transport: Transport) {
 
     members: {
       list: (organizationId: OrganizationId) => get<Member[]>(`${org(organizationId)}/members`),
-      invite: (organizationId: OrganizationId, input: InviteMemberInput) =>
-        send<Member>("POST", `${org(organizationId)}/members`, input),
+      invite: (organizationId: OrganizationId, input: InviteMemberInput, options?: PostOptions) =>
+        post<Member>(`${org(organizationId)}/members`, input, options),
       update: (organizationId: OrganizationId, memberId: MemberId, input: UpdateMemberInput) =>
         send<Member>("PATCH", `${org(organizationId)}/members/${enc(memberId)}`, input),
       remove: (organizationId: OrganizationId, memberId: MemberId) =>
@@ -124,8 +137,8 @@ export function createClient(transport: Transport) {
     workspaces: {
       list: (organizationId: OrganizationId, query: WorkspaceListQuery = {}) =>
         getPage<Workspace>(`${org(organizationId)}/workspaces`, { ...query }),
-      create: (organizationId: OrganizationId, input: CreateWorkspaceInput) =>
-        send<Workspace>("POST", `${org(organizationId)}/workspaces`, input),
+      create: (organizationId: OrganizationId, input: CreateWorkspaceInput, options?: PostOptions) =>
+        post<Workspace>(`${org(organizationId)}/workspaces`, input, options),
       get: (workspaceId: WorkspaceId) => get<Workspace>(ws(workspaceId)),
       update: (workspaceId: WorkspaceId, input: UpdateWorkspaceInput) =>
         send<Workspace>("PATCH", ws(workspaceId), input),
@@ -134,8 +147,8 @@ export function createClient(transport: Transport) {
 
     organizationApps: {
       list: (organizationId: OrganizationId) => get<AppDefinition[]>(`${org(organizationId)}/apps`),
-      create: (organizationId: OrganizationId, input: CreateAppInput) =>
-        send<AppDefinition>("POST", `${org(organizationId)}/apps`, input),
+      create: (organizationId: OrganizationId, input: CreateAppInput, options?: PostOptions) =>
+        post<AppDefinition>(`${org(organizationId)}/apps`, input, options),
       get: (organizationId: OrganizationId, appId: AppId) =>
         get<AppDefinition>(`${org(organizationId)}/apps/${enc(appId)}`),
       update: (organizationId: OrganizationId, appId: AppId, input: UpdateAppInput) =>
@@ -163,8 +176,8 @@ export function createClient(transport: Transport) {
 
     workspaceApps: {
       list: (workspaceId: WorkspaceId) => get<AppDefinition[]>(`${ws(workspaceId)}/apps`),
-      create: (workspaceId: WorkspaceId, input: CreateAppInput) =>
-        send<AppDefinition>("POST", `${ws(workspaceId)}/apps`, input),
+      create: (workspaceId: WorkspaceId, input: CreateAppInput, options?: PostOptions) =>
+        post<AppDefinition>(`${ws(workspaceId)}/apps`, input, options),
       get: (workspaceId: WorkspaceId, appId: AppId) => get<AppDefinition>(`${ws(workspaceId)}/apps/${enc(appId)}`),
       update: (workspaceId: WorkspaceId, appId: AppId, input: UpdateAppInput) =>
         send<AppDefinition>("PATCH", `${ws(workspaceId)}/apps/${enc(appId)}`, input),
@@ -181,16 +194,16 @@ export function createClient(transport: Transport) {
         get<Installation>(`${ws(workspaceId)}/installations/${enc(installationId)}`),
       update: (workspaceId: WorkspaceId, installationId: InstallationId, input: UpdateInstallationInput) =>
         send<Installation>("PATCH", `${ws(workspaceId)}/installations/${enc(installationId)}`, input),
-      disconnect: (workspaceId: WorkspaceId, installationId: InstallationId) =>
-        send<Installation>("POST", `${ws(workspaceId)}/installations/${enc(installationId)}/disconnect`),
+      disconnect: (workspaceId: WorkspaceId, installationId: InstallationId, options?: PostOptions) =>
+        post<Installation>(`${ws(workspaceId)}/installations/${enc(installationId)}/disconnect`, undefined, options),
       delete: (workspaceId: WorkspaceId, installationId: InstallationId) =>
         send<void>("DELETE", `${ws(workspaceId)}/installations/${enc(installationId)}`),
     },
 
     connectSessions: {
       list: (workspaceId: WorkspaceId) => get<ConnectSession[]>(`${ws(workspaceId)}/connect-sessions`),
-      create: (workspaceId: WorkspaceId, input: CreateConnectSessionInput) =>
-        send<CreatedConnectSession>("POST", `${ws(workspaceId)}/connect-sessions`, input),
+      create: (workspaceId: WorkspaceId, input: CreateConnectSessionInput, options?: PostOptions) =>
+        post<CreatedConnectSession>(`${ws(workspaceId)}/connect-sessions`, input, options),
       get: (workspaceId: WorkspaceId, sessionId: ConnectSessionId) =>
         get<ConnectSession>(`${ws(workspaceId)}/connect-sessions/${enc(sessionId)}`),
     },
@@ -202,17 +215,18 @@ export function createClient(transport: Transport) {
      */
     connect: {
       get: (reference: string) => get<ConnectSession>(`/v1/connect/sessions/${enc(reference)}`),
-      submitCredentials: (reference: string, input: SubmitConnectCredentialsInput) =>
-        send<ConnectResult>("POST", `/v1/connect/sessions/${enc(reference)}/credentials`, input),
-      authorize: (reference: string) =>
-        send<AuthorizeConnectResult>("POST", `/v1/connect/sessions/${enc(reference)}/authorize`),
-      cancel: (reference: string) => send<ConnectSession>("POST", `/v1/connect/sessions/${enc(reference)}/cancel`),
+      submitCredentials: (reference: string, input: SubmitConnectCredentialsInput, options?: PostOptions) =>
+        post<ConnectResult>(`/v1/connect/sessions/${enc(reference)}/credentials`, input, options),
+      authorize: (reference: string, options?: PostOptions) =>
+        post<AuthorizeConnectResult>(`/v1/connect/sessions/${enc(reference)}/authorize`, undefined, options),
+      cancel: (reference: string, options?: PostOptions) =>
+        post<ConnectSession>(`/v1/connect/sessions/${enc(reference)}/cancel`, undefined, options),
     },
 
     agents: {
       list: (workspaceId: WorkspaceId) => get<Agent[]>(`${ws(workspaceId)}/agents`),
-      create: (workspaceId: WorkspaceId, input: CreateAgentInput) =>
-        send<Agent>("POST", `${ws(workspaceId)}/agents`, input),
+      create: (workspaceId: WorkspaceId, input: CreateAgentInput, options?: PostOptions) =>
+        post<Agent>(`${ws(workspaceId)}/agents`, input, options),
       get: (workspaceId: WorkspaceId, agentId: AgentId) => get<Agent>(`${ws(workspaceId)}/agents/${enc(agentId)}`),
       update: (workspaceId: WorkspaceId, agentId: AgentId, input: UpdateAgentInput) =>
         send<Agent>("PATCH", `${ws(workspaceId)}/agents/${enc(agentId)}`, input),
@@ -223,8 +237,8 @@ export function createClient(transport: Transport) {
     grants: {
       list: (workspaceId: WorkspaceId, agentId: AgentId) =>
         get<AgentGrant[]>(`${ws(workspaceId)}/agents/${enc(agentId)}/grants`),
-      create: (workspaceId: WorkspaceId, agentId: AgentId, input: CreateGrantInput) =>
-        send<AgentGrant>("POST", `${ws(workspaceId)}/agents/${enc(agentId)}/grants`, input),
+      create: (workspaceId: WorkspaceId, agentId: AgentId, input: CreateGrantInput, options?: PostOptions) =>
+        post<AgentGrant>(`${ws(workspaceId)}/agents/${enc(agentId)}/grants`, input, options),
       update: (workspaceId: WorkspaceId, agentId: AgentId, grantId: GrantId, input: UpdateGrantInput) =>
         send<AgentGrant>("PATCH", `${ws(workspaceId)}/agents/${enc(agentId)}/grants/${enc(grantId)}`, input),
       delete: (workspaceId: WorkspaceId, agentId: AgentId, grantId: GrantId) =>
@@ -240,21 +254,21 @@ export function createClient(transport: Transport) {
     runs: {
       list: (workspaceId: WorkspaceId, query: RunListQuery = {}) =>
         getPage<Run>(`${ws(workspaceId)}/runs`, { ...query }),
-      create: (workspaceId: WorkspaceId, agentId: AgentId, input: CreateRunInput) =>
-        send<Run>("POST", `${ws(workspaceId)}/agents/${enc(agentId)}/runs`, input),
+      create: (workspaceId: WorkspaceId, agentId: AgentId, input: CreateRunInput, options?: PostOptions) =>
+        post<Run>(`${ws(workspaceId)}/agents/${enc(agentId)}/runs`, input, options),
       get: (workspaceId: WorkspaceId, runId: RunId) => get<Run>(`${ws(workspaceId)}/runs/${enc(runId)}`),
       events: (workspaceId: WorkspaceId, runId: RunId, afterSequence?: number) =>
         get<RunEvent[]>(`${ws(workspaceId)}/runs/${enc(runId)}/events`, {
           after: afterSequence,
         }),
-      cancel: (workspaceId: WorkspaceId, runId: RunId) =>
-        send<Run>("POST", `${ws(workspaceId)}/runs/${enc(runId)}/cancel`),
+      cancel: (workspaceId: WorkspaceId, runId: RunId, options?: PostOptions) =>
+        post<Run>(`${ws(workspaceId)}/runs/${enc(runId)}/cancel`, undefined, options),
       /**
        * Record a decision your product made, however it decides. Call it from
        * your backend with an API key; Console sessions are refused.
        */
-      resolveApproval: (workspaceId: WorkspaceId, runId: RunId, input: ResolveApprovalInput) =>
-        send<Run>("POST", `${ws(workspaceId)}/runs/${enc(runId)}/approvals`, input),
+      resolveApproval: (workspaceId: WorkspaceId, runId: RunId, input: ResolveApprovalInput, options?: PostOptions) =>
+        post<Run>(`${ws(workspaceId)}/runs/${enc(runId)}/approvals`, input, options),
     },
 
     connectSettings: {
@@ -266,22 +280,22 @@ export function createClient(transport: Transport) {
 
     apiKeys: {
       list: (organizationId: OrganizationId) => get<ApiKey[]>(`${org(organizationId)}/api-keys`),
-      create: (organizationId: OrganizationId, input: CreateApiKeyInput) =>
-        send<CreatedApiKey>("POST", `${org(organizationId)}/api-keys`, input),
-      revoke: (organizationId: OrganizationId, keyId: ApiKeyId) =>
-        send<ApiKey>("POST", `${org(organizationId)}/api-keys/${enc(keyId)}/revoke`),
+      create: (organizationId: OrganizationId, input: CreateApiKeyInput, options?: PostOptions) =>
+        post<CreatedApiKey>(`${org(organizationId)}/api-keys`, input, options),
+      revoke: (organizationId: OrganizationId, keyId: ApiKeyId, options?: PostOptions) =>
+        post<ApiKey>(`${org(organizationId)}/api-keys/${enc(keyId)}/revoke`, undefined, options),
     },
 
     webhooks: {
       list: (organizationId: OrganizationId) => get<WebhookEndpoint[]>(`${org(organizationId)}/webhooks`),
-      create: (organizationId: OrganizationId, input: CreateWebhookEndpointInput) =>
-        send<CreatedWebhookEndpoint>("POST", `${org(organizationId)}/webhooks`, input),
+      create: (organizationId: OrganizationId, input: CreateWebhookEndpointInput, options?: PostOptions) =>
+        post<CreatedWebhookEndpoint>(`${org(organizationId)}/webhooks`, input, options),
       update: (organizationId: OrganizationId, endpointId: WebhookEndpointId, input: UpdateWebhookEndpointInput) =>
         send<WebhookEndpoint>("PATCH", `${org(organizationId)}/webhooks/${enc(endpointId)}`, input),
       delete: (organizationId: OrganizationId, endpointId: WebhookEndpointId) =>
         send<void>("DELETE", `${org(organizationId)}/webhooks/${enc(endpointId)}`),
-      sendTest: (organizationId: OrganizationId, endpointId: WebhookEndpointId) =>
-        send<WebhookDelivery>("POST", `${org(organizationId)}/webhooks/${enc(endpointId)}/test`),
+      sendTest: (organizationId: OrganizationId, endpointId: WebhookEndpointId, options?: PostOptions) =>
+        post<WebhookDelivery>(`${org(organizationId)}/webhooks/${enc(endpointId)}/test`, undefined, options),
     },
 
     audit: {

@@ -817,5 +817,139 @@ export function contractSuite(target: Target) {
         expect(referenceOf(await create())).not.toBe(reference);
       });
     });
+
+    describe("idempotency", () => {
+      const agentInput = async (name: string) => ({
+        name,
+        description: "",
+        instructions: "Be brief.",
+        model: await anyModel(),
+      });
+
+      it("replays a repeated POST instead of running it twice", async () => {
+        const qa = fx.workspaces.qaPlayground.id;
+        const input = await agentInput("Once");
+        const first = await owner.agents.create(qa, input, { idempotencyKey: "suite-replay-1" });
+        const again = await owner.agents.create(qa, input, { idempotencyKey: "suite-replay-1" });
+        expect(again).toEqual(first);
+        expect((await owner.agents.list(qa)).filter((a) => a.name === "Once")).toHaveLength(1);
+        // A new key is a new request.
+        const other = await owner.agents.create(qa, input, { idempotencyKey: "suite-replay-2" });
+        expect(other.id).not.toBe(first.id);
+      });
+
+      it("replays a saved error too", async () => {
+        const qa = fx.workspaces.qaPlayground.id;
+        const bad = { ...(await agentInput("")), name: "" };
+        const first = await failure(owner.agents.create(qa, bad, { idempotencyKey: "suite-error-1" }));
+        const again = await failure(owner.agents.create(qa, bad, { idempotencyKey: "suite-error-1" }));
+        expect(again.status).toBe(first.status);
+        expect([again.code, again.fields]).toEqual([first.code, first.fields]);
+      });
+
+      it("refuses a key reused for a different request", async () => {
+        const qa = fx.workspaces.qaPlayground.id;
+        await owner.agents.create(qa, await agentInput("First"), { idempotencyKey: "suite-reused" });
+        const error = await failure(
+          owner.agents.create(qa, await agentInput("Second"), { idempotencyKey: "suite-reused" }),
+        );
+        expect([error.status, error.code]).toEqual([422, "idempotency_key_reused"]);
+        expect((await owner.agents.list(qa)).some((a) => a.name === "Second")).toBe(false);
+      });
+
+      it("refuses a malformed key, after the credential", async () => {
+        const qa = fx.workspaces.qaPlayground.id;
+        const long = "k".repeat(256);
+        const error = await failure(owner.agents.create(qa, await agentInput("Long"), { idempotencyKey: long }));
+        expect([error.status, error.code]).toEqual([400, "invalid_idempotency_key"]);
+        const anonymous = await failure(as(null).agents.create(qa, await agentInput("Long"), { idempotencyKey: long }));
+        expect(anonymous.status).toBe(401);
+      });
+
+      it("never shows a secret twice: a retry answers 409 and the resource is created once", async () => {
+        const name = "Suite once";
+        const input = { name, environment: "sandbox" } as const;
+        const created = await owner.apiKeys.create(fx.organization, input, { idempotencyKey: "suite-secret" });
+        const error = await failure(owner.apiKeys.create(fx.organization, input, { idempotencyKey: "suite-secret" }));
+        expect([error.status, error.code]).toEqual([409, "idempotency_key_completed"]);
+        expect(JSON.stringify(error)).not.toContain(created.secret);
+        expect((await owner.apiKeys.list(fx.organization)).filter((k) => k.name === name)).toHaveLength(1);
+      });
+
+      it("replays an error from a secret-once route, rather than calling it completed", async () => {
+        const developer = as("developer");
+        const input = { name: "Not allowed", environment: "production" } as const;
+        const first = await failure(
+          developer.apiKeys.create(fx.organization, input, { idempotencyKey: "suite-secret-error" }),
+        );
+        const again = await failure(
+          developer.apiKeys.create(fx.organization, input, { idempotencyKey: "suite-secret-error" }),
+        );
+        expect(first.status).toBe(403);
+        expect([again.status, again.code]).toEqual([first.status, first.code]);
+      });
+
+      it("keeps a key to the caller that sent it", async () => {
+        const qa = fx.workspaces.qaPlayground.id;
+        const input = await agentInput("Shared key");
+        const mine = await owner.agents.create(qa, input, { idempotencyKey: "suite-shared" });
+        // Another member sending the same key and request gets their own answer, never the owner's.
+        const theirs = await as("developer").agents.create(qa, input, { idempotencyKey: "suite-shared" });
+        expect(theirs.id).not.toBe(mine.id);
+        // And a key someone used elsewhere replays nothing to an outsider: their request is refused on its own merits.
+        const outsider = await failure(as("outsider").agents.create(qa, input, { idempotencyKey: "suite-shared" }));
+        expect([outsider.status, outsider.code]).toEqual([404, "not_found"]);
+      });
+
+      it("keeps a key to its workspace: the same key elsewhere is a new request", async () => {
+        const [a, b] = [fx.workspaces.qaPlayground.id, fx.workspaces.acmeSandbox.id];
+        const input = await agentInput("Per workspace");
+        const inA = await owner.agents.create(a, input, { idempotencyKey: "suite-per-workspace" });
+        const inB = await owner.agents.create(b, input, { idempotencyKey: "suite-per-workspace" });
+        // Never workspace A's answer replayed into workspace B.
+        expect(inB.workspace_id).toBe(b);
+        expect(inB.id).not.toBe(inA.id);
+        expect((await owner.agents.list(b)).filter((x) => x.name === "Per workspace")).toHaveLength(1);
+        expect((await owner.agents.list(a)).filter((x) => x.name === "Per workspace")).toHaveLength(1);
+      });
+
+      it("never shows a Connect authorization twice", async () => {
+        const session = await owner.connectSessions.create(fx.workspaces.acmeSandbox.id, {
+          app_id: fx.apps.googleWorkspace,
+          intent: "create",
+          label: "OAuth retry",
+          installation_id: null,
+          return_url: null,
+        });
+        await owner.connect.authorize(referenceOf(session), { idempotencyKey: "suite-authorize" });
+        const again = await failure(
+          owner.connect.authorize(referenceOf(session), { idempotencyKey: "suite-authorize" }),
+        );
+        expect([again.status, again.code]).toEqual([409, "idempotency_key_completed"]);
+        // A fresh key asks again, as a retry should.
+        expect((await owner.connect.authorize(referenceOf(session))).authorization_url).toBeTruthy();
+      });
+
+      it("replays hosted Connect to the same session", async () => {
+        const session = await owner.connectSessions.create(fx.workspaces.qaPlayground.id, {
+          app_id: fx.apps.echoServer,
+          intent: "create",
+          label: "Echo retry",
+          installation_id: null,
+          return_url: null,
+        });
+        const values = { values: { token: "abc123" } };
+        const first = await owner.connect.submitCredentials(referenceOf(session), values, {
+          idempotencyKey: "suite-c",
+        });
+        // Without the key this would be session_not_pending; with it, the retry sees the same result.
+        const again = await owner.connect.submitCredentials(referenceOf(session), values, {
+          idempotencyKey: "suite-c",
+        });
+        expect(again).toEqual(first);
+        const installs = await owner.installations.list(fx.workspaces.qaPlayground.id);
+        expect(installs.filter((i) => i.id === first.installation.id)).toHaveLength(1);
+      });
+    });
   });
 }

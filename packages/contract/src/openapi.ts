@@ -4,6 +4,7 @@
  * anyone else can check themselves against it without running TypeScript.
  */
 import { z } from "zod";
+import { IDEMPOTENCY_HEADER } from "./idempotency";
 import { registry } from "./registry";
 import { routes } from "./routes";
 import "./schemas";
@@ -90,7 +91,9 @@ function parameters(route: (typeof routes)[number]) {
         schema: schemaOf(schema as z.ZodType),
       }))
     : [];
-  return [...path, ...query];
+  // Every POST takes an idempotency key (decision 0016); PUT, PATCH and DELETE are safe to repeat as they are.
+  const idempotency = route.method === "post" ? [{ $ref: "#/components/parameters/IdempotencyKey" }] : [];
+  return [...path, ...query, ...idempotency];
 }
 
 const SECURITY: Record<string, Record<string, string[]>> = {
@@ -131,6 +134,7 @@ export function buildOpenApi() {
         default: { $ref: "#/components/responses/Error" },
       },
     };
+    if (route.showsSecretOnce) operation["x-zupflow-shows-secret-once"] = true;
     if (route.body) {
       operation.requestBody = { required: true, content: { "application/json": { schema: schemaOf(route.body) } } };
     }
@@ -166,6 +170,21 @@ export function buildOpenApi() {
           type: "http",
           scheme: "bearer",
           description: "An environment-bound API key (`zf_live_…`, `zf_test_…`).",
+        },
+      },
+      parameters: {
+        IdempotencyKey: {
+          name: IDEMPOTENCY_HEADER,
+          in: "header",
+          required: false,
+          schema: { type: "string", minLength: 1, maxLength: 255, pattern: "^[\\x20-\\x7E]+$" },
+          description: [
+            "Makes a retry safe: 1–255 printable ASCII characters, scoped to the caller that sent it, kept for 24 hours.",
+            "The same key and request replays the saved response; the same key with a different request answers",
+            "`422 idempotency_key_reused`; a key still in flight answers `409 idempotency_request_in_progress`;",
+            "a malformed key answers `400 invalid_idempotency_key`. Routes marked `x-zupflow-shows-secret-once`",
+            "never save their body: a retry answers `409 idempotency_key_completed`.",
+          ].join(" "),
         },
       },
       responses: {

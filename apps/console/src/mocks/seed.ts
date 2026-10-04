@@ -34,7 +34,7 @@ import { mulberry32, type Rng, uuid } from "./random";
 import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 import { timelineOf } from "./scope";
 
-export const DB_SCHEMA = 11;
+export const DB_SCHEMA = 13;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -508,6 +508,11 @@ export function seed(nowMs: number = Date.now()): Db {
     ],
     webhooks: [] as WebhookEndpoint[],
     audit: [] as Db["audit"],
+    idempotency_keys: [],
+    // Secure randomness, not the seed's: this key is a secret.
+    idempotency_fingerprint_key: Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) =>
+      b.toString(16).padStart(2, "0"),
+    ).join(""),
   };
 
   db.webhooks.push(

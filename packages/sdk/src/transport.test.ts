@@ -1,4 +1,5 @@
 import type { OrganizationId } from "@zupflow/contract";
+import { IDEMPOTENCY_HEADER } from "@zupflow/contract/idempotency";
 import { describe, expect, it } from "vitest";
 import { createClient } from "./client";
 import { createHttpTransport, ORGANIZATION_HEADER, ZupflowApiError, ZupflowNetworkError } from "./transport";
@@ -113,5 +114,123 @@ describe("createHttpTransport", () => {
     expect(seen[0]?.headers.get(ORGANIZATION_HEADER)).toBe("org_031DCoVdPC4Z4DgUS9oR60");
     expect(seen[1]?.headers.has(ORGANIZATION_HEADER)).toBe(false);
     expect(seen[2]?.headers.has(ORGANIZATION_HEADER)).toBe(false);
+  });
+
+  describe("idempotency", () => {
+    const created = { data: { id: "org_1" }, meta: null, error: null };
+    const input = { name: "Acme", slug: "acme" };
+
+    it("sends a fresh key on every POST, and none on other methods", async () => {
+      const seen: Request[] = [];
+      const client = createClient(
+        createHttpTransport({
+          baseUrl: "https://api.zupflow.test",
+          getToken: async () => "t",
+          fetch: fakeFetch(201, created, seen),
+        }),
+      );
+      await client.organizations.create(input);
+      await client.organizations.create(input);
+      await client.organizations.update("org_031DCoVdPC4Z4DgUS9oR60", { name: "B" });
+      const [first, second, patch] = seen.map((r) => r.headers.get(IDEMPOTENCY_HEADER));
+      expect(first).toMatch(/^[\x20-\x7E]{1,255}$/);
+      expect(second).toMatch(/^[\x20-\x7E]{1,255}$/);
+      expect(first).not.toBe(second);
+      expect(patch).toBeNull();
+    });
+
+    it("sends the caller's own key when given one", async () => {
+      const seen: Request[] = [];
+      const client = createClient(
+        createHttpTransport({
+          baseUrl: "https://api.zupflow.test",
+          getToken: async () => "t",
+          fetch: fakeFetch(201, created, seen),
+        }),
+      );
+      await client.organizations.create(input, { idempotencyKey: "signup-42" });
+      expect(seen[0]?.headers.get(IDEMPOTENCY_HEADER)).toBe("signup-42");
+    });
+
+    it("retries a request that got no response with the same key, and gives up after its retries", async () => {
+      const keys: (string | null)[] = [];
+      let failures = 2;
+      const flaky: typeof fetch = async (input, init) => {
+        keys.push(new Request(input as string, init).headers.get(IDEMPOTENCY_HEADER));
+        if (failures-- > 0) throw new TypeError("connection reset");
+        return new Response(JSON.stringify(created), { status: 201 });
+      };
+      const client = createClient(
+        createHttpTransport({ baseUrl: "https://api.zupflow.test", getToken: async () => "t", fetch: flaky }),
+      );
+      await client.organizations.create(input);
+      expect(keys).toHaveLength(3);
+      expect(new Set(keys).size).toBe(1);
+
+      let calls = 0;
+      const down: typeof fetch = async () => {
+        calls++;
+        throw new TypeError("offline");
+      };
+      const offline = createClient(
+        createHttpTransport({
+          baseUrl: "https://api.zupflow.test",
+          getToken: async () => "t",
+          fetch: down,
+          retries: 1,
+        }),
+      );
+      await expect(offline.organizations.create(input)).rejects.toBeInstanceOf(ZupflowNetworkError);
+      expect(calls).toBe(2);
+    });
+
+    it("retries twice by default", async () => {
+      let calls = 0;
+      const client = createClient(
+        createHttpTransport({
+          baseUrl: "https://api.zupflow.test",
+          getToken: async () => "t",
+          fetch: async () => {
+            calls++;
+            throw new TypeError("offline");
+          },
+        }),
+      );
+      await expect(client.organizations.create(input)).rejects.toBeInstanceOf(ZupflowNetworkError);
+      expect(calls).toBe(3);
+    });
+
+    it("never retries a cancelled request, and rethrows the caller's reason", async () => {
+      let calls = 0;
+      const controller = new AbortController();
+      const reason = new Error("navigated away");
+      const transport = createHttpTransport({
+        baseUrl: "https://api.zupflow.test",
+        getToken: async () => "t",
+        fetch: async () => {
+          calls++;
+          controller.abort(reason);
+          throw reason;
+        },
+      });
+      await expect(
+        transport.request({ method: "POST", path: "/v1/organizations", body: input, signal: controller.signal }),
+      ).rejects.toBe(reason);
+      expect(calls).toBe(1);
+    });
+
+    it("never retries a request the server answered", async () => {
+      const seen: Request[] = [];
+      const error = { data: null, meta: null, error: { code: "internal_error", message: "x", fields: null } };
+      const client = createClient(
+        createHttpTransport({
+          baseUrl: "https://api.zupflow.test",
+          getToken: async () => "t",
+          fetch: fakeFetch(500, error, seen),
+        }),
+      );
+      await expect(client.organizations.create(input)).rejects.toBeInstanceOf(ZupflowApiError);
+      expect(seen).toHaveLength(1);
+    });
   });
 });

@@ -31,6 +31,7 @@ import { db, resetDb } from "./db";
 import { createHandlers } from "./handlers";
 import { setLatency } from "./http";
 import { hashReference, isId, newId, newReference, uuidOf } from "./ids";
+import type { IdempotencyRow } from "./model";
 import { mulberry32 } from "./random";
 import { runEventsKey, timelineOf } from "./scope";
 import { DEMO_USER_ID, seed } from "./seed";
@@ -160,6 +161,137 @@ describe("the contract", () => {
     });
     const contract = routes.map((route) => `${route.method} ${route.path}`);
     expect(served.filter((entry) => !MOCK_ONLY.includes(entry)).sort()).toEqual([...contract].sort());
+  });
+});
+
+describe("idempotency store", () => {
+  // Black-box idempotency is in the shared suite. These plant the states a request can't reach on its own.
+  const qa = () => ws("qa-playground").id;
+  const input = { name: "Stored", description: "", instructions: "", model: "claude-haiku-4-5-20251001" };
+  const rowFor = (key: string) =>
+    must(
+      db().idempotency_keys.find((r) => r.key === key),
+      "idempotency row",
+    );
+
+  it("answers 409 while the same key is in flight, and takes over a key whose lock lapsed", async () => {
+    await owner.agents.create(qa(), input, { idempotencyKey: "store-lock" });
+    const row = rowFor("store-lock");
+    Object.assign(row, { state: "running", status: null, body: null });
+    row.locked_until = new Date(Date.now() + 30_000).toISOString();
+    const busy = await failure(owner.agents.create(qa(), input, { idempotencyKey: "store-lock" }));
+    expect([busy.status, busy.code]).toEqual([409, "idempotency_request_in_progress"]);
+    // A crashed request's lock lapses after a minute; the next one runs and completes the key.
+    row.locked_until = new Date(Date.now() - 1).toISOString();
+    await owner.agents.create(qa(), input, { idempotencyKey: "store-lock" });
+    expect(rowFor("store-lock").state).toBe("completed");
+    expect(db().agents.filter((a) => a.workspace_id === qa() && a.name === "Stored")).toHaveLength(2);
+  });
+
+  it("forgets a key after 24 hours", async () => {
+    await owner.agents.create(qa(), input, { idempotencyKey: "store-ttl" });
+    rowFor("store-ttl").created_at = new Date(Date.now() - 24 * 3600_000 - 1).toISOString();
+    await owner.agents.create(qa(), input, { idempotencyKey: "store-ttl" });
+    expect(db().agents.filter((a) => a.workspace_id === qa() && a.name === "Stored")).toHaveLength(2);
+  });
+
+  it("saves nothing for a server error, so the retry runs again", async () => {
+    const agents = db().agents;
+    // A store that refuses writes makes the handler fail with a 500.
+    db().agents = Object.freeze([...agents]) as typeof agents;
+    const broken = await failure(owner.agents.create(qa(), input, { idempotencyKey: "store-5xx" }));
+    expect(broken.status).toBe(500);
+    expect(db().idempotency_keys.some((r) => r.key === "store-5xx")).toBe(false);
+    db().agents = [...agents];
+    const agent = await owner.agents.create(qa(), input, { idempotencyKey: "store-5xx" });
+    expect(agent.workspace_id).toBe(qa());
+    expect(rowFor("store-5xx").state).toBe("completed");
+  });
+
+  it("stores no Connect reference and no plain body digest", async () => {
+    const session = await owner.connectSessions.create(ws("acme-sandbox").id, {
+      app_id: app("google-workspace").id,
+      intent: "create",
+      label: "Stored OAuth",
+      installation_id: null,
+      return_url: null,
+    });
+    const reference = referenceOf(session);
+    await owner.connect.authorize(reference);
+    await owner.connect.cancel(reference);
+    const stored = JSON.stringify(db().idempotency_keys);
+    expect(stored).not.toContain(reference);
+    // The fingerprint is keyed: the body's plain SHA-256 appears nowhere.
+    const digest = Array.from(
+      new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(input)))),
+      (b) => b.toString(16).padStart(2, "0"),
+    ).join("");
+    await owner.agents.create(qa(), input, { idempotencyKey: "store-digest" });
+    expect(JSON.stringify(db().idempotency_keys)).not.toContain(digest);
+  });
+
+  const larkspur = () => must(db().organizations.find((o) => o.slug === "larkspur")?.id, "Larkspur");
+  /** A row of another organization, otherwise like `template`, as a corrupted or colliding store might hold. */
+  const foreign = (template: IdempotencyRow, key: string): IdempotencyRow => ({
+    ...structuredClone(template),
+    organization_id: larkspur(),
+    key,
+  });
+
+  it("deletes a workspace's saved responses with the workspace, and no other organization's", async () => {
+    await owner.agents.create(qa(), input, { idempotencyKey: "store-purge" });
+    expect(rowFor("store-purge").workspace_id).toBe(qa());
+    // Another organization's row naming the same workspace ID must survive.
+    db().idempotency_keys.push(foreign(rowFor("store-purge"), "store-purge-foreign"));
+    await owner.workspaces.delete(qa());
+    expect(db().idempotency_keys.some((r) => r.key === "store-purge")).toBe(false);
+    expect(db().idempotency_keys.some((r) => r.key === "store-purge-foreign")).toBe(true);
+  });
+
+  it("sheds only its own organization's expired keys", async () => {
+    await owner.agents.create(qa(), input, { idempotencyKey: "store-sweep" });
+    const old = foreign(rowFor("store-sweep"), "store-sweep-foreign");
+    old.created_at = new Date(Date.now() - 25 * 3600_000).toISOString();
+    db().idempotency_keys.push(old);
+    await owner.agents.create(qa(), input, { idempotencyKey: "store-sweep-2" });
+    expect(db().idempotency_keys.some((r) => r.key === "store-sweep-foreign")).toBe(true);
+  });
+
+  it("keeps a member's key to the organization it was used in", async () => {
+    // Jordan joins Larkspur too, and sends the same key and request to each organization's own route.
+    db().memberships.push({
+      id: newId("member"),
+      organization_id: larkspur(),
+      user_id: DEMO_USER_ID,
+      role: "owner",
+      status: "active",
+      invited_at: new Date().toISOString(),
+      joined_at: new Date().toISOString(),
+      last_active_at: null,
+    });
+    const app = { kind: "mcp", name: "Both", slug: "both-orgs", description: "", auth_type: "token" } as const;
+    const inNorthwind = await owner.organizationApps.create(must(northwindId()), app, { idempotencyKey: "store-orgs" });
+    const asLarkspur = clientFor(DEMO_USER_ID, larkspur);
+    const inLarkspur = await asLarkspur.organizationApps.create(larkspur(), app, { idempotencyKey: "store-orgs" });
+    expect(inLarkspur.organization_id).toBe(larkspur());
+    expect(inLarkspur.id).not.toBe(inNorthwind.id);
+  });
+
+  it("keeps each key in its organization's scope and saves no secret", async () => {
+    const created = await owner.apiKeys.create(
+      must(northwindId()),
+      { name: "Stored key", environment: "sandbox" },
+      {
+        idempotencyKey: "store-secret",
+      },
+    );
+    const row = rowFor("store-secret");
+    expect(row.organization_id).toBe(northwindId());
+    expect(row.caller).toBe(`member:${DEMO_USER_ID}|-`);
+    expect(row.body).toBeNull();
+    expect(JSON.stringify(db().idempotency_keys)).not.toContain(created.secret);
+    await owner.agents.create(qa(), input, { idempotencyKey: "store-env" });
+    expect(rowFor("store-env").caller).toBe(`member:${DEMO_USER_ID}|sandbox`);
   });
 });
 
@@ -392,6 +524,7 @@ describe("two organizations", () => {
       mine(d.webhooks),
       mine(d.audit),
       mine(d.memberships).map(({ last_active_at: _seen, ...m }) => m),
+      d.idempotency_keys.filter((r) => r.organization_id === org),
     ]);
   }
 

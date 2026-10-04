@@ -27,6 +27,12 @@ export interface Route {
   body?: z.ZodType;
   /** `data` is the response's `data`; `list` wraps it in an array; `paginated` adds `meta.pagination`. */
   response: { status: 200 | 201 | 204; data?: z.ZodType; list?: boolean; paginated?: boolean };
+  /**
+   * The response shows a secret once. Idempotency records that its key
+   * completed but never saves the body, so a retry answers
+   * `409 idempotency_key_completed` instead of showing the secret again.
+   */
+  showsSecretOnce?: true;
 }
 
 const org = { org: idSchema("organization") };
@@ -432,6 +438,7 @@ export const routes: readonly Route[] = [
     params: ws,
     body: s.CreateConnectSessionInput,
     response: created(s.CreatedConnectSession),
+    showsSecretOnce: true,
   },
   {
     operationId: "getConnectSession",
@@ -471,6 +478,8 @@ export const routes: readonly Route[] = [
     callers: connect,
     params: { reference },
     response: ok(s.AuthorizeConnectResult),
+    // The authorization URL carries the reference, and on the backend the session-bound OAuth state.
+    showsSecretOnce: true,
   },
   {
     operationId: "cancelConnect",
@@ -667,6 +676,7 @@ export const routes: readonly Route[] = [
     params: org,
     body: s.CreateApiKeyInput,
     response: created(s.CreatedApiKey),
+    showsSecretOnce: true,
   },
   {
     operationId: "revokeApiKey",
@@ -695,6 +705,7 @@ export const routes: readonly Route[] = [
     params: org,
     body: s.CreateWebhookEndpointInput,
     response: created(s.CreatedWebhookEndpoint),
+    showsSecretOnce: true,
   },
   {
     operationId: "updateWebhook",

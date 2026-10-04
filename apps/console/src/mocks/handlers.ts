@@ -37,6 +37,7 @@ import {
   body,
   configurationStatus,
   created,
+  findSessionByReferenceCrossTenant,
   noContent,
   notFound,
   type OrgAccess,
@@ -60,6 +61,7 @@ import {
   toRunEvent,
   toWorkspace,
   type WorkspaceAccess,
+  withExpiry,
   workspaceAccess,
 } from "./http";
 import { hashReference, isId, newId, newReference } from "./ids";
@@ -361,29 +363,6 @@ function accountFor(app: AppRow, seed: string, displayName: string, email: strin
     display_name: displayName,
     email,
   };
-}
-
-/**
- * Cross-tenant by design: hosted Connect starts with no organization or
- * workspace, only the link's reference (a random token, never the session's
- * ID). It reads exactly one session and nothing else. Everything after it is
- * scoped to that session's organization and workspace (see `sessionScope`).
- */
-async function findSessionByReferenceCrossTenant(reference: string): Promise<ConnectSessionRow> {
-  const referenceHash = reference ? await hashReference(reference) : null;
-  const session = referenceHash
-    ? db().connect_sessions.find((s) => s.reference_hash !== null && s.reference_hash === referenceHash)
-    : undefined;
-  if (!session) throw notFound("Connect session");
-  return withExpiry(session);
-}
-
-/** A pending session past its expiry is expired, whoever reads it. */
-function withExpiry(session: ConnectSessionRow): ConnectSessionRow {
-  if (session.status === "pending" && Date.parse(session.expires_at) < Date.now()) {
-    session.status = "expired";
-  }
-  return session;
 }
 
 function assertSessionPending(session: ConnectSessionRow) {
@@ -910,6 +889,10 @@ export function createHandlers(apiBase: string) {
         d.agents = d.agents.filter((a) => !here(a));
         d.installations = d.installations.filter((i) => !here(i));
         d.connect_sessions = d.connect_sessions.filter((s) => !here(s));
+        // Saved responses describe the workspace's rows, so they go with them.
+        d.idempotency_keys = d.idempotency_keys.filter(
+          (r) => !(r.organization_id === workspace.organization_id && r.workspace_id === workspace.id),
+        );
         // The workspace's own apps and their configurations, which carry the workspace too.
         d.configurations = d.configurations.filter(
           (c) => !(c.organization_id === workspace.organization_id && c.workspace_id === workspace.id),

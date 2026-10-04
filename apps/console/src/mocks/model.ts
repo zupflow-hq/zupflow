@@ -255,4 +255,29 @@ export interface Db {
   api_keys: ApiKeyRow[];
   webhooks: WebhookEndpoint[];
   audit: Omit<AuditEvent, "workspace">[];
+  /** Idempotency keys (decision 0016), each scoped to its organization, workspace and the caller that sent it. */
+  idempotency_keys: IdempotencyRow[];
+  /** The server key the idempotency fingerprint is keyed with, so a stored fingerprint can't be guessed back. */
+  idempotency_fingerprint_key: string;
+}
+
+/**
+ * One `Idempotency-Key` as the caller used it. `organization_id` is null only
+ * for creating an organization, whose keys belong to the user alone;
+ * `workspace_id` is set on workspace routes and null on organization routes.
+ */
+export interface IdempotencyRow {
+  organization_id: OrganizationId | null;
+  workspace_id: WorkspaceId | null;
+  /** The credential and environment that sent the key, e.g. `member:usr_…|sandbox` or `connect:cs_…|sandbox`. */
+  caller: string;
+  key: string;
+  /** Method, path and an HMAC-SHA-256 of the body under the server key. */
+  fingerprint: string;
+  state: "running" | "completed";
+  /** The saved answer; `body` is null for a route that shows a secret once. */
+  status: number | null;
+  body: string | null;
+  created_at: string;
+  locked_until: string;
 }

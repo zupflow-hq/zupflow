@@ -18,6 +18,10 @@ Read `README.md` first.
   the shared suite, `packages/contract-tests/src/suite.ts`, which the backend
   must pass too; one that has to reach into the mock's database goes in
   `apps/console/src/mocks/handlers.test.ts`.
+- **Idempotency is one wrapper.** Every `POST` goes through it
+  (`apps/console/src/mocks/idempotency.ts`, from `route`); never read
+  `Idempotency-Key` in a handler. A route whose response shows a secret once
+  is marked `showsSecretOnce` in the contract, so its body is never saved.
 - **Two layers of isolation.** No organization reaches another, and no
   workspace reaches another within its organization. Both scopes are explicit
   in every function, table, query, key and test; a globally unique ID never
