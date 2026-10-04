@@ -1,0 +1,58 @@
+ZUPFLOW / B1 PRECISION — BRAND ASSET KIT
+
+START HERE
+• Websites and documents: 02-horizontal/zupflow-horizontal-cyan-ink.svg
+• Dark headers: 02-horizontal/zupflow-horizontal-cyan-white.svg
+• Compact placements: 01-icon/zupflow-icon-cyan.svg
+• Social profiles and app artwork: 05-tiles; full square, no baked corner radius
+• Favicon: 06-favicons; adaptive SVG plus ink/cyan/white ICO and PNG options
+
+WHAT IS INCLUDED
+01-icon: three transparent colors, SVG and 32/64/128/256/512/1024px PNG
+02-horizontal: five color combinations, SVG and 860/1720/3440px-wide PNG
+03-stacked: five color combinations, SVG and 660/1320/2640px-wide PNG
+04-wordmark: three transparent colors, SVG and 600/1200/2400px-wide PNG
+05-tiles: three opaque square backgrounds, SVG and 256/512/1024px PNG
+06-favicons: 16/32/48px PNG, multi-size ICO, SVG and theme-adaptive SVG
+Overview: visual guide only, not an individual logo export
+
+COLORS (sRGB)
+Ink / near-black: #10191D — RGB 16, 25, 29
+Cyan: #35C8F5 — RGB 53, 200, 245
+White: #FFFFFF — RGB 255, 255, 255
+Off-white presentation background: #F5F8FA — RGB 245, 248, 250
+Use ink or cyan+ink on light surfaces. Use white or cyan+white on dark
+surfaces. All-cyan is best on dark backgrounds; avoid it for small wordmarks
+on white. White transparent files need a dark background to be visible.
+
+USAGE
+SVG is preferred for websites, design tools and print: it scales cleanly.
+All logo letters are outlined vector paths, so no font install is required.
+PNG files are transparent except the deliberately opaque square tile files.
+Use a PNG at least twice its displayed width for high-density screens.
+ICO files embed 16, 32 and 48px images. Browser/OS masking should be applied
+to the square tiles by the platform; do not bake your own rounded corners.
+
+SPACING AND SIZE (recommended starting points)
+Keep outside clear space of at least 16 units per 100-unit icon canvas
+(about one loop-stroke thickness). The exported artboards include padding,
+but do not always include the full recommended external clear space.
+For wordmark-only use, clear space should be at least half the x-height.
+Recommended minimum displayed widths: icon 24px, horizontal 160px,
+stacked 120px, wordmark 120px. 16px icons are supplied specifically for
+favicons; at that size fine separation is naturally less distinct.
+For print, start at icon 8mm, horizontal 40mm, stacked/wordmark 30mm and
+proof at final size. Colors are RGB; ask your printer for CMYK conversion
+using the actual press/paper profile rather than assuming a universal CMYK.
+
+PRESERVE THE DESIGN
+The exact chosen B1 angular loop, separate play triangle and original
+lowercase outlined wordmark are retained. The horizontal lockup preserves
+the original placement. Stacked and wordmark-only are new arrangements of
+the same paths. Do not stretch, rotate individual elements, round corners,
+change the play triangle, add effects, or retype the wordmark.
+
+FONT AND RIGHTS
+Wordmark source: DejaVu Sans Bold; supplied as paths. Its original license
+is included in FONT-LICENSE.txt. This kit is not a trademark clearance or
+registration. Check rights in your intended market before registering it.

@@ -1,0 +1,244 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "@fontsource-variable/instrument-sans";
+@import "@fontsource-variable/jetbrains-mono";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * Zupflow B1 Precision.
+ * Ink #10191D and cyan #35C8F5 come from the brand kit. Sandbox and
+ * Production are first-class colors because the environment must always be
+ * visible before anyone connects an account or runs an agent.
+ */
+:root {
+  --radius: 0.5rem;
+
+  --background: #f7f9fb;
+  --foreground: #10191d;
+  --card: #ffffff;
+  --card-foreground: #10191d;
+  --popover: #ffffff;
+  --popover-foreground: #10191d;
+  --primary: #10191d;
+  --primary-foreground: #ffffff;
+  --secondary: #eaf0f3;
+  --secondary-foreground: #10191d;
+  --muted: #eef3f6;
+  --muted-foreground: #5a6a72;
+  --accent: #e9f0f4;
+  --accent-foreground: #10191d;
+  --destructive: #d63a3a;
+  --destructive-foreground: #ffffff;
+  --border: #dbe3e8;
+  --input: #d3dce2;
+  --ring: #35c8f5;
+
+  --brand: #35c8f5;
+  --brand-ink: #0b6f93;
+  --brand-soft: #e3f6fd;
+
+  --sandbox: #d99a2b;
+  --sandbox-ink: #8a5800;
+  --sandbox-soft: #fdf3df;
+  --production: #35c8f5;
+  --production-ink: #0b6f93;
+  --production-soft: #e3f6fd;
+
+  --success: #1f9d6b;
+  --success-soft: #e2f5ec;
+  --warning: #c98a1b;
+  --warning-soft: #fdf3df;
+  --danger-soft: #fdeaea;
+
+  /* Validated with the dataviz palette checker against #FFFFFF and #10191D. */
+  --chart-1: #1a9fcb;
+  --chart-2: #10191d;
+  --chart-3: #d63a3a;
+  --chart-4: #d99a2b;
+  --chart-5: #7b8a91;
+
+  --sidebar: #edf1f4;
+  --sidebar-foreground: #33434a;
+  --sidebar-primary: #10191d;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e1e8ed;
+  --sidebar-accent-foreground: #10191d;
+  --sidebar-border: #dbe3e8;
+  --sidebar-ring: #35c8f5;
+}
+
+.dark {
+  /* Three surfaces, each a visible step: sidebar < page < card. */
+  --background: #0d1417;
+  --foreground: #e4ecef;
+  --card: #141f24;
+  --card-foreground: #e4ecef;
+  --popover: #172328;
+  --popover-foreground: #e4ecef;
+  --primary: #35c8f5;
+  --primary-foreground: #10191d;
+  --secondary: #1c2a30;
+  --secondary-foreground: #e4ecef;
+  --muted: #1a262c;
+  --muted-foreground: #8fa0a8;
+  --accent: #1d2b32;
+  --accent-foreground: #e4ecef;
+  --destructive: #e5534b;
+  --destructive-foreground: #ffffff;
+  --border: #26363d;
+  --input: #2d4048;
+  --ring: #35c8f5;
+
+  --brand: #35c8f5;
+  --brand-ink: #6fd8f8;
+  --brand-soft: #0f2a35;
+
+  --sandbox: #e8aa3c;
+  --sandbox-ink: #f0c26e;
+  --sandbox-soft: #2b2112;
+  --production: #35c8f5;
+  --production-ink: #6fd8f8;
+  --production-soft: #0f2a35;
+
+  --success: #3cc28c;
+  --success-soft: #11291f;
+  --warning: #e8aa3c;
+  --warning-soft: #2b2112;
+  --danger-soft: #2e1617;
+
+  --chart-1: #1a9fcb;
+  --chart-2: #c5d3d9;
+  --chart-3: #e5534b;
+  --chart-4: #e8aa3c;
+  --chart-5: #5f7179;
+
+  --sidebar: #080d0f;
+  --sidebar-foreground: #b4c2c8;
+  --sidebar-primary: #35c8f5;
+  --sidebar-primary-foreground: #10191d;
+  --sidebar-accent: #152126;
+  --sidebar-accent-foreground: #e4ecef;
+  --sidebar-border: #1c2a30;
+  --sidebar-ring: #35c8f5;
+}
+
+@theme inline {
+  --font-sans: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", monospace;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-brand: var(--brand);
+  --color-brand-ink: var(--brand-ink);
+  --color-brand-soft: var(--brand-soft);
+  --color-sandbox: var(--sandbox);
+  --color-sandbox-ink: var(--sandbox-ink);
+  --color-sandbox-soft: var(--sandbox-soft);
+  --color-production: var(--production);
+  --color-production-ink: var(--production-ink);
+  --color-production-soft: var(--production-soft);
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-danger-soft: var(--danger-soft);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+  code,
+  kbd,
+  samp,
+  pre {
+    @apply font-mono;
+    font-feature-settings: "zero";
+  }
+  ::selection {
+    background: color-mix(in oklab, var(--brand) 35%, transparent);
+  }
+}
+
+@layer components {
+  /*
+   * The brand mark's 45° chamfer, reused for the environment tag so the one
+   * label that matters most has a shape nothing else on screen shares.
+   */
+  .chamfer {
+    clip-path: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
+  }
+
+  /* Environment rail along the top of every workspace page. */
+  .env-rail-sandbox {
+    background-image: repeating-linear-gradient(
+      -45deg,
+      var(--sandbox) 0 6px,
+      color-mix(in oklab, var(--sandbox) 25%, transparent) 6px 12px
+    );
+  }
+  .env-rail-production {
+    background: var(--production);
+  }
+
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* biome-ignore-start lint/complexity/noImportantStyles: reduced motion must win over every component animation. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+/* biome-ignore-end lint/complexity/noImportantStyles: end of reduced-motion overrides. */

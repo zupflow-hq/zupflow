@@ -1,0 +1,23 @@
+{
+  "name": "zupflow",
+  "private": true,
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@10.20.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @zupflow/console dev",
+    "build": "turbo run build",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "check": "pnpm lint && turbo run typecheck test build"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "turbo": "^2.11.7",
+    "typescript": "~6.0.2"
+  }
+}
