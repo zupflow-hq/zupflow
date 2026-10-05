@@ -20,8 +20,9 @@ packages/
   brand/          B1 Precision brand kit (SVG/PNG/ICO) and usage notes
 server/           The Rust backend — a Cargo workspace
   crates/zupflow-core/        Shared types and the external-resource traits: typed IDs, API errors, scopes,
-                              KeyService, Cache, ObjectStore
-  crates/zupflow-basic/       The basic implementations: local keys, an in-memory cache, local files
+                              KeyService, Cache, ObjectStore, EventBus
+  crates/zupflow-basic/       The basic implementations: local keys, an in-memory cache, local files,
+                              an in-process event bus
   crates/zupflow-conformance/ The suites every implementation of a trait must pass
   crates/zupflow-server/      The API server (`zupflow` binary), on axum
 ```

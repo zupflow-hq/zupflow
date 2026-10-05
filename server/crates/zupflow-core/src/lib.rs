@@ -6,9 +6,11 @@
 //! - [`keys`]: envelope encryption and the [`keys::KeyService`] trait.
 //! - [`scope`]: the scope stored values belong to, and the names inside it.
 //! - [`storage`]: the [`storage::Cache`] and [`storage::ObjectStore`] traits.
+//! - [`events`]: the [`events::EventBus`] trait.
 
 pub mod environment;
 pub mod error;
+pub mod events;
 pub mod ids;
 pub mod keys;
 pub mod scope;

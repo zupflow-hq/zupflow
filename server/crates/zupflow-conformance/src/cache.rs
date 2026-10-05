@@ -18,6 +18,7 @@ fn name(value: &str) -> Name {
 pub async fn run(cache: &dyn Cache) {
     round_trips(cache).await;
     keeps_scopes_apart(cache).await;
+    resists_keys_that_spell_another_keyspace(cache).await;
     deletes_only_inside_a_scope(cache).await;
     expires(cache).await;
 }
@@ -76,6 +77,37 @@ async fn keeps_scopes_apart(cache: &dyn Cache) {
             expected,
             "a delete stays in its scope"
         );
+    }
+}
+
+/// From an organization's own scope and from its Sandbox, keys spelled like a
+/// workspace's or an environment's entries, in the common flat layouts, reach
+/// nothing of them.
+async fn resists_keys_that_spell_another_keyspace(cache: &dyn Cache) {
+    let org = OrganizationId::generate();
+    let ws = WorkspaceId::generate();
+    cache
+        .put(&Scope::Workspace(org, ws), &name("shared"), b"workspace".to_vec(), HOUR)
+        .await
+        .unwrap();
+    cache
+        .put(
+            &Scope::Environment(org, Environment::Production),
+            &name("shared"),
+            b"production".to_vec(),
+            HOUR,
+        )
+        .await
+        .unwrap();
+    let imitations = crate::imitations::imitations(org, ws, "shared");
+    for listener in [Scope::Organization(org), Scope::Environment(org, Environment::Sandbox)] {
+        for imitation in &imitations {
+            assert_eq!(
+                cache.get(&listener, &name(imitation)).await.unwrap(),
+                None,
+                "{listener:?} through {imitation}"
+            );
+        }
     }
 }
 
