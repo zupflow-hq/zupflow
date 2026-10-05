@@ -2713,6 +2713,7 @@ dependencies = [
  "jsonwebtoken",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sqlx",
  "thiserror",
  "tokio",
@@ -2731,6 +2732,7 @@ name = "zupflow-sqlite"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "getrandom 0.4.3",
  "sqlx",
  "thiserror",

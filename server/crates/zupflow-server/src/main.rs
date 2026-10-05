@@ -10,7 +10,7 @@ use zupflow_core::identity::Identity;
 use zupflow_oidc::{OidcConfig, OidcIdentity};
 use zupflow_server::config::{Config, IdentityMode};
 use zupflow_server::{AppState, RequestGuard};
-use zupflow_sqlite::{Database, SqliteOrganizationStore};
+use zupflow_sqlite::{Database, SqliteOrganizationStore, SqliteWorkspaceStore};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -68,7 +68,8 @@ async fn main() -> ExitCode {
     };
     let state = AppState {
         identity,
-        organizations: Arc::new(SqliteOrganizationStore::new(database)),
+        organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
+        workspaces: Arc::new(SqliteWorkspaceStore::new(database)),
     };
 
     let listener = match TcpListener::bind(config.listen).await {

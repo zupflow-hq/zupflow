@@ -10,6 +10,7 @@ pub mod guard;
 pub mod http;
 pub mod input;
 pub mod organizations;
+pub mod workspaces;
 
 use axum::Router;
 use axum::routing::get;
@@ -25,6 +26,7 @@ pub fn app(state: AppState, guard: RequestGuard) -> Router {
         .route("/health", get(http::health))
         .route("/ready", get(http::ready))
         .merge(organizations::routes())
+        .merge(workspaces::routes())
         .fallback(http::route_not_found)
         .method_not_allowed_fallback(http::method_not_allowed)
         .with_state(state)

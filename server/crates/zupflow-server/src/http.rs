@@ -12,6 +12,11 @@ pub fn envelope<T: Serialize>(status: StatusCode, data: T) -> Response {
     (status, Json(json!({ "data": data, "meta": null, "error": null }))).into_response()
 }
 
+/// A success with `meta`, for paginated lists: `{ data, meta, error: null }`.
+pub fn envelope_with_meta<T: Serialize, M: Serialize>(status: StatusCode, data: T, meta: M) -> Response {
+    (status, Json(json!({ "data": data, "meta": meta, "error": null }))).into_response()
+}
+
 /// An [`ApiError`] as an HTTP response: the envelope with `data` and `meta`
 /// null. A newtype, because the error type lives in the core crate.
 #[derive(Debug)]

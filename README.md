@@ -21,7 +21,7 @@ packages/
 server/           The Rust backend — a Cargo workspace
   crates/zupflow-core/        Shared types and the external-resource traits: typed IDs, API errors, scopes,
                               KeyService, Cache, ObjectStore, EventBus, JobQueue, Identity,
-                              the organizations store
+                              the organizations and workspaces stores
   crates/zupflow-basic/       The basic implementations: local keys, an in-memory cache, local files,
                               an in-process event bus, local sign-in
   crates/zupflow-sqlite/      The basic database: SQLite, its migrations, the stores, the job queue
@@ -79,7 +79,8 @@ provider's ID token as the bearer and may listen on any address. The
 open-source Console doesn't sign in with OIDC yet, and the server has no CORS
 yet: both arrive when the Console switches from the mock to the backend.
 
-So far it serves `/health`, `/ready`, `/v1/me`, organizations and members;
+So far it serves `/health`, `/ready`, `/v1/me`, organizations, members and
+workspaces;
 every other path answers the API's `404` envelope, and an unsupported method
 on a served path the `405` one.
 

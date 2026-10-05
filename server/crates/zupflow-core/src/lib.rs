@@ -11,6 +11,7 @@
 //! - [`identity`]: Console sign-in, the [`identity::Identity`] trait.
 //! - [`organizations`]: organizations, members and users, and their store.
 //! - [`time`]: instants as stored and as the API writes them.
+//! - [`workspaces`]: workspaces and their store.
 
 pub mod environment;
 pub mod error;
@@ -23,6 +24,7 @@ pub mod organizations;
 pub mod scope;
 pub mod storage;
 pub mod time;
+pub mod workspaces;
 
 /// Typed IDs make scope mistakes fail to compile. Swapping the organization
 /// and the workspace doesn't compile:

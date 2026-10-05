@@ -3,6 +3,7 @@
 //! - [`Database`]: opens the file, sets it up and applies the migrations.
 //! - [`SqliteJobQueue`]: the job queue, in the same database.
 //! - [`SqliteOrganizationStore`]: organizations, members and users.
+//! - [`SqliteWorkspaceStore`]: workspaces, listed by keyset.
 //!
 //! Migrations are in `migrations/`, applied in order at open and never edited
 //! once merged: a change is a new migration. The schema test in `schema.rs`
@@ -13,7 +14,9 @@ mod job_queue;
 mod organizations;
 #[cfg(test)]
 mod schema;
+mod workspaces;
 
 pub use database::{Database, DatabaseError};
 pub use job_queue::SqliteJobQueue;
 pub use organizations::SqliteOrganizationStore;
+pub use workspaces::SqliteWorkspaceStore;

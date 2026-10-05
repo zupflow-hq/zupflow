@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use zupflow_core::identity::{Identity, IdentityError, Profile, VerifiedIdentity};
 use zupflow_server::{AppState, RequestGuard};
-use zupflow_sqlite::{Database, SqliteOrganizationStore};
+use zupflow_sqlite::{Database, SqliteOrganizationStore, SqliteWorkspaceStore};
 
 /// Signs in whoever a `Bearer test:{name}` token names, as `{name}@people.example`.
 struct TestIdentity;
@@ -61,7 +61,8 @@ impl Server {
         let database = Database::open(&directory.join("zupflow.sqlite")).await.unwrap();
         let state = AppState {
             identity: Arc::new(TestIdentity),
-            organizations: Arc::new(SqliteOrganizationStore::new(database)),
+            organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
+            workspaces: Arc::new(SqliteWorkspaceStore::new(database)),
         };
         Self {
             app: zupflow_server::app(state, guard),
@@ -184,7 +185,11 @@ async fn reports_health_and_readiness() {
 #[tokio::test]
 async fn answers_unknown_paths_and_methods_with_the_error_envelope() {
     let server = Server::new().await;
-    for uri in ["/v1/nothing", "/", "/v1/workspaces/ws_031DCp7XMZ9AHIB2uF6QgS"] {
+    for uri in [
+        "/v1/nothing",
+        "/",
+        "/v1/workspaces/ws_031DCp7XMZ9AHIB2uF6QgS/not-a-route",
+    ] {
         let (status, body) = server.call(None, Method::GET, uri, None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
         assert_eq!(

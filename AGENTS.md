@@ -94,6 +94,13 @@ Read `README.md` first.
   are checked inside the store's transaction, not only before it: the acting
   member's current role (passed as their member ID and read again), owners
   removed only by owners, and the last active owner.
+- Workspace routes resolve with `WorkspaceAccess::resolve`: the organization
+  comes from the `Zupflow-Organization` header (400 without it) and the
+  membership, then the workspace is found within it. Never read the
+  organization off a workspace row.
+- A handler takes `input::Body` as an argument but calls `body.object()` only
+  after the caller's access and role are checked, so a refused caller gets
+  403 before any complaint about the body.
 - Request bodies go through `input::Body` (JSON only, 64 KiB), and every
   request through `guard`, which refuses foreign origins and, with `local`
   sign-in, non-loopback hosts. Don't add a route that reads a body another way.

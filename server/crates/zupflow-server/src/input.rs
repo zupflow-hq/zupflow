@@ -14,29 +14,37 @@ use crate::http::Failure;
 /// The largest body any route here reads.
 const MAX_BODY_BYTES: usize = 64 << 10;
 
-/// A JSON object body.
-pub struct Body(pub Map<String, Value>);
+/// A request body, read but not yet interpreted: routes check the caller and
+/// the role first, then ask for the JSON object, so a refused caller gets
+/// `403` before any complaint about what they sent.
+pub struct Body {
+    json: bool,
+    bytes: Bytes,
+}
 
 impl<S: Send + Sync> FromRequest<S> for Body {
     type Rejection = Failure;
 
-    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let invalid = || {
-            Failure(ApiError::new(
-                400,
-                "invalid_json",
-                "The request body is not valid JSON.",
-            ))
-        };
-        // JSON only, so a cross-site form or `text/plain` post can't carry a
-        // body without the browser asking first (a CORS preflight).
+    async fn from_request(request: Request, _state: &S) -> Result<Self, Self::Rejection> {
         let json = request
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
             .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"));
-        if !json {
+        let bytes = axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES)
+            .await
+            .map_err(|_| ApiError::new(413, "body_too_large", "The request body is too large."))?;
+        Ok(Self { json, bytes })
+    }
+}
+
+impl Body {
+    /// The body as a JSON object. JSON only, so a cross-site form or
+    /// `text/plain` post can't carry a body without the browser asking first
+    /// (a CORS preflight).
+    pub fn object(&self) -> Result<Object, Failure> {
+        if !self.json {
             return Err(ApiError::new(
                 415,
                 "unsupported_media_type",
@@ -44,19 +52,18 @@ impl<S: Send + Sync> FromRequest<S> for Body {
             )
             .into());
         }
-        let bytes = Bytes::from_request(request, state).await.map_err(|_| invalid())?;
-        if bytes.len() > MAX_BODY_BYTES {
-            return Err(ApiError::new(413, "body_too_large", "The request body is too large.").into());
-        }
-        match serde_json::from_slice(&bytes) {
-            Ok(Value::Object(object)) => Ok(Self(object)),
+        match serde_json::from_slice(&self.bytes) {
+            Ok(Value::Object(object)) => Ok(Object(object)),
             Ok(_) => Err(
                 ApiError::validation(BTreeMap::from([("body".to_owned(), "Send a JSON object.".to_owned())])).into(),
             ),
-            Err(_) => Err(invalid()),
+            Err(_) => Err(ApiError::new(400, "invalid_json", "The request body is not valid JSON.").into()),
         }
     }
 }
+
+/// A JSON object body.
+pub struct Object(pub Map<String, Value>);
 
 /// Collects per-field problems while a body is checked.
 #[derive(Default)]
@@ -77,7 +84,12 @@ impl Fields {
     }
 }
 
-impl Body {
+impl Object {
+    /// Whether the body names `field` at all.
+    pub fn has(&self, field: &str) -> bool {
+        self.0.contains_key(field)
+    }
+
     /// A string field, `None` if absent. Present but not a string is invalid.
     pub fn optional_string(&self, field: &str, fields: &mut Fields) -> Option<String> {
         match self.0.get(field) {

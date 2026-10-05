@@ -79,7 +79,7 @@ async fn view(state: &AppState, organization: Organization, role: MemberRole) ->
 }
 
 /// A name: trimmed, 1–60 characters.
-fn checked_name(value: Option<String>, fields: &mut Fields) -> Option<String> {
+pub(crate) fn checked_name(value: Option<String>, fields: &mut Fields) -> Option<String> {
     let name = value?.trim().to_owned();
     if name.is_empty() {
         fields.invalid("name", "Required.");
@@ -93,7 +93,7 @@ fn checked_name(value: Option<String>, fields: &mut Fields) -> Option<String> {
 }
 
 /// A slug: 1–40 lowercase letters, numbers and hyphens, not starting or ending with a hyphen.
-fn checked_slug(value: Option<String>, fields: &mut Fields) -> Option<String> {
+pub(crate) fn checked_slug(value: Option<String>, fields: &mut Fields) -> Option<String> {
     let slug = value?;
     let valid = (1..=40).contains(&slug.len())
         && slug
@@ -192,6 +192,7 @@ async fn create_organization(
     ConsoleUser(user): ConsoleUser,
     body: Body,
 ) -> Result<Response, Failure> {
+    let body = body.object()?;
     let mut fields = Fields::default();
     let name = checked_name(body.string("name", &mut fields), &mut fields);
     let slug = checked_slug(body.string("slug", &mut fields), &mut fields);
@@ -234,6 +235,7 @@ async fn update_organization(
 ) -> Result<Response, Failure> {
     let access = OrganizationAccess::resolve(&state, user, &org).await?;
     access.require(MemberRole::is_admin, "change organization settings")?;
+    let body = body.object()?;
     let mut fields = Fields::default();
     let name = checked_name(body.optional_string("name", &mut fields), &mut fields);
     let slug = checked_slug(body.optional_string("slug", &mut fields), &mut fields);
@@ -278,6 +280,7 @@ async fn invite_member(
 ) -> Result<Response, Failure> {
     let access = OrganizationAccess::resolve(&state, user, &org).await?;
     access.require(MemberRole::is_admin, "invite members")?;
+    let body = body.object()?;
     let mut fields = Fields::default();
     let email = checked_email(body.string("email", &mut fields), &mut fields);
     let role = checked_role(body.string("role", &mut fields), &mut fields);
@@ -319,6 +322,7 @@ async fn update_member(
 ) -> Result<Response, Failure> {
     let access = OrganizationAccess::resolve(&state, user, &org).await?;
     access.require(|role| role == MemberRole::Owner, "change roles")?;
+    let body = body.object()?;
     let mut fields = Fields::default();
     let role = checked_role(body.string("role", &mut fields), &mut fields);
     fields.finish()?;

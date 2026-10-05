@@ -12,6 +12,14 @@ pub enum Environment {
 }
 
 impl Environment {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "sandbox" => Some(Self::Sandbox),
+            "production" => Some(Self::Production),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Sandbox => "sandbox",
