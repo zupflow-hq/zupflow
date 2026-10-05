@@ -1,0 +1,23 @@
+[package]
+name = "zupflow-basic"
+description = "The basic implementations of Zupflow's external-resource traits: they run anywhere, with no account or extra service."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+zupflow-core.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+zupflow-conformance.workspace = true

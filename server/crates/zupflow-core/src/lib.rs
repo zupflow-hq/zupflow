@@ -2,9 +2,13 @@
 //!
 //! - [`ids`]: typed, prefixed identifiers (`run_…`) over UUIDv7.
 //! - [`error`]: the API's error codes and the envelope's `error` field.
+//! - [`environment`]: Sandbox and Production.
+//! - [`keys`]: envelope encryption and the [`keys::KeyService`] trait.
 
+pub mod environment;
 pub mod error;
 pub mod ids;
+pub mod keys;
 
 /// Typed IDs make scope mistakes fail to compile. Swapping the organization
 /// and the workspace doesn't compile:

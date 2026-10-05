@@ -1,0 +1,14 @@
+[package]
+name = "zupflow-conformance"
+description = "The suites every implementation of a Zupflow external-resource trait must pass."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zupflow-core.workspace = true

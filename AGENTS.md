@@ -66,6 +66,15 @@ Read `README.md` first.
   the envelope. Production code returns errors instead of panicking; no
   `unwrap`, and `expect` only for true invariants with a reason.
 - Configuration is `ZUPFLOW_*`; an invalid value stops startup.
+- External resources are traits in `zupflow-core`; the basic implementations
+  live in `zupflow-basic` and run their trait's suite from
+  `zupflow-conformance`. A new implementation isn't done until it passes; a
+  new rule for a trait goes into its suite, not only into one implementation.
+- Secrets are sealed with `keys::seal` under an `EncryptionContext` built from
+  the trust context with the constructor for that kind of secret
+  (`installation_credential`, `oauth_client_secret`, `webhook_signing_secret`),
+  and opened only by the code that uses them. An installation's credential is
+  sealed as one value per version, all its fields together.
 
 ## Console conventions
 
