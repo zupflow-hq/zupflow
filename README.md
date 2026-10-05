@@ -15,7 +15,7 @@ apps/
 packages/
   contract/       @zupflow/contract — zod schemas, route table, generated openapi.json
   contract-tests/ @zupflow/contract-tests — the black-box suite every server must pass
-  sdk/            @zupflow/sdk — HTTP transport and typed resource client over the contract
+  sdk/            @zupflow/sdk — HTTP transport, typed resource client, verifyWebhook
   brand/          B1 Precision brand kit (SVG/PNG/ICO) and usage notes
 ```
 

@@ -7,7 +7,15 @@ import { z } from "zod";
 import { IDEMPOTENCY_HEADER } from "./idempotency";
 import { registry } from "./registry";
 import { routes } from "./routes";
-import "./schemas";
+import { WebhookEvent } from "./schemas";
+import {
+  WEBHOOK_ATTEMPT_HEADER,
+  WEBHOOK_EVENT_ID_HEADER,
+  WEBHOOK_EVENT_TYPE_HEADER,
+  WEBHOOK_SIGNATURE_HEADER,
+  WEBHOOK_TOLERANCE_SECONDS,
+  WEBHOOK_USER_AGENT,
+} from "./webhooks";
 
 type JsonSchema = Record<string, unknown>;
 
@@ -112,6 +120,59 @@ function security(route: (typeof routes)[number]) {
 
 const ID_PARAM = "A malformed ID, or an ID of another type, answers 404 like a missing one.";
 
+const WEBHOOK_HEADERS = [
+  {
+    name: WEBHOOK_SIGNATURE_HEADER,
+    in: "header",
+    required: true,
+    schema: { type: "string" },
+    description: `\`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>\` over \`"<t>.<raw body>"\` with the endpoint's signing secret; two \`v1\` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than ${WEBHOOK_TOLERANCE_SECONDS} seconds from your clock. The SDK's \`verifyWebhook\` does all of it.`,
+  },
+  {
+    name: WEBHOOK_EVENT_ID_HEADER,
+    in: "header",
+    required: true,
+    schema: { type: "string" },
+    description: "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled.",
+  },
+  { name: WEBHOOK_ATTEMPT_HEADER, in: "header", required: true, schema: { type: "integer", minimum: 1 } },
+  { name: "User-Agent", in: "header", required: true, schema: { type: "string", const: WEBHOOK_USER_AGENT } },
+];
+
+/** Each event type as an OpenAPI 3.1 webhook: what Zupflow POSTs to a subscribed endpoint. */
+function webhooks() {
+  return Object.fromEntries(
+    WebhookEvent.options.map((variant) => {
+      const type = variant.shape.type.value;
+      return [
+        type,
+        {
+          post: {
+            operationId: `webhook_${type.replace(/\./g, "_")}`,
+            summary: type === "webhook.test" ? "Sent by the test button; can't be subscribed to" : `\`${type}\``,
+            parameters: [
+              ...WEBHOOK_HEADERS,
+              {
+                name: WEBHOOK_EVENT_TYPE_HEADER,
+                in: "header",
+                required: true,
+                schema: { type: "string", const: type },
+              },
+            ],
+            requestBody: { required: true, content: { "application/json": { schema: schemaOf(variant) } } },
+            responses: {
+              "2XX": {
+                description:
+                  "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried.",
+              },
+            },
+          },
+        },
+      ];
+    }),
+  );
+}
+
 export function buildOpenApi() {
   const paths: Record<string, Record<string, unknown>> = {};
   for (const route of routes) {
@@ -196,5 +257,6 @@ export function buildOpenApi() {
       schemas: components(),
     },
     paths,
+    webhooks: webhooks(),
   };
 }

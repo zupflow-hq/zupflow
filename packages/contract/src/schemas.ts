@@ -765,9 +765,120 @@ export const WEBHOOK_EVENT_TYPES = [
   "run.completed",
   "run.failed",
   "run.waiting_for_approval",
+  "run.cancelled",
 ] as const;
+/** The event types an endpoint can subscribe to. `webhook.test` is sent only by the test button. */
 export const WebhookEventType = z.enum(WEBHOOK_EVENT_TYPES);
 export type WebhookEventType = z.infer<typeof WebhookEventType>;
+
+// ---------------------------------------------------------------------------
+// Webhook events: the body of each delivery (decision 0017). Lean on purpose:
+// what changed and where, never content; the consumer reads current state.
+
+/** The workspace an event happened in, with your own ID for it so you can route without a lookup. */
+export const WebhookEventWorkspace = named(
+  "WebhookEventWorkspace",
+  z.object({ id: idSchema("workspace"), external_id: z.string().nullable() }),
+);
+
+// Each event's `data`, with `status` narrowed to what that event means: a
+// `run.completed` is always `completed`, so a server can't send otherwise.
+const installationData = <S extends z.ZodType>(status: S) =>
+  z.object({ object: z.literal("installation"), id: idSchema("installation"), app_id: idSchema("app"), status });
+const connectSessionData = <S extends z.ZodType>(status: S) =>
+  z.object({
+    object: z.literal("connect_session"),
+    id: idSchema("connect_session"),
+    status,
+    /** The installation it created or reconnected; null when it didn't finish. */
+    installation_id: idSchema("installation").nullable(),
+    /** Why it didn't finish, e.g. `consent_denied`; null when it completed. */
+    failure_code: z.string().nullable(),
+  });
+const runData = <S extends z.ZodType>(status: S) =>
+  z.object({ object: z.literal("run"), id: idSchema("run"), agent_id: idSchema("agent"), status });
+
+const webhookEventName = (type: string) =>
+  `${type.replace(/(^|[._])([a-z])/g, (_, __, c: string) => c.toUpperCase())}WebhookEvent`;
+
+const envelopeFields = {
+  /** Stable across every attempt and resend: deduplicate on it. */
+  id: idSchema("webhook_event"),
+  created_at: instant,
+  environment: Environment,
+  organization_id: idSchema("organization"),
+};
+
+function webhookEvent<T extends string, D extends z.ZodType, W extends z.ZodType>(type: T, data: D, workspace: W) {
+  return named(webhookEventName(type), z.object({ ...envelopeFields, type: z.literal(type), workspace, data }));
+}
+
+/** Every delivery body, by `type`. */
+export const WebhookEvent = named(
+  "WebhookEvent",
+  z.discriminatedUnion("type", [
+    webhookEvent(
+      "installation.connected",
+      installationData(InstallationStatus.extract(["connected"])),
+      WebhookEventWorkspace,
+    ),
+    webhookEvent(
+      "installation.reconnect_required",
+      installationData(InstallationStatus.extract(["reconnect_required"])),
+      WebhookEventWorkspace,
+    ),
+    webhookEvent(
+      "installation.disconnected",
+      installationData(InstallationStatus.extract(["disconnected"])),
+      WebhookEventWorkspace,
+    ),
+    webhookEvent(
+      "connect_session.completed",
+      connectSessionData(ConnectSessionStatus.extract(["completed"])),
+      WebhookEventWorkspace,
+    ),
+    webhookEvent(
+      "connect_session.failed",
+      connectSessionData(ConnectSessionStatus.extract(["failed", "expired", "cancelled"])),
+      WebhookEventWorkspace,
+    ),
+    webhookEvent("run.completed", runData(RunStatus.extract(["completed"])), WebhookEventWorkspace),
+    webhookEvent("run.failed", runData(RunStatus.extract(["failed"])), WebhookEventWorkspace),
+    webhookEvent(
+      "run.waiting_for_approval",
+      runData(RunStatus.extract(["waiting_for_approval"])),
+      WebhookEventWorkspace,
+    ),
+    webhookEvent("run.cancelled", runData(RunStatus.extract(["cancelled"])), WebhookEventWorkspace),
+    // The test button's event belongs to no workspace.
+    webhookEvent(
+      "webhook.test",
+      z.object({ object: z.literal("webhook_endpoint"), id: idSchema("webhook_endpoint") }),
+      z.null(),
+    ),
+  ]),
+);
+export type WebhookEvent = z.infer<typeof WebhookEvent>;
+/** Every type a delivery can carry: the subscribable ones and `webhook.test`. */
+export type WebhookDeliveryType = WebhookEvent["type"];
+export const WEBHOOK_DELIVERY_TYPES = WebhookEvent.options.map((variant) => variant.shape.type.value);
+
+/**
+ * What every delivery has, whatever its type, including types added after a
+ * client was built. Open, like every contract object: fields added later pass
+ * through.
+ */
+export const WebhookEventEnvelope = named(
+  "WebhookEventEnvelope",
+  z.looseObject({
+    ...envelopeFields,
+    type: z.string(),
+    workspace: WebhookEventWorkspace.nullable(),
+    // Any object's ID, including kinds added after this client: checked as a string, not by prefix.
+    data: z.looseObject({ object: z.string(), id: z.string() }),
+  }),
+);
+export type WebhookEventEnvelope = z.infer<typeof WebhookEventEnvelope>;
 
 export const WebhookDelivery = named(
   "WebhookDelivery",

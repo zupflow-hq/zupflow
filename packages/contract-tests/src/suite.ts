@@ -6,7 +6,7 @@
  * Call `contractSuite(target)` from a test file; see `Target` for what a
  * server provides and the reference fixture it loads.
  */
-import { routes } from "@zupflow/contract";
+import { routes, WEBHOOK_EVENT_TYPES } from "@zupflow/contract";
 import {
   type AgentId,
   type ApiKeyId,
@@ -1161,6 +1161,33 @@ export function contractSuite(target: Target) {
           as("developer").agents.create(qa, { name: "x", description: "", instructions: "", model: await anyModel() }),
         );
         expect(`${error.status} ${error.code}`).toBe("403 forbidden");
+      });
+    });
+
+    describe("webhooks", () => {
+      it("subscribes to every event type, and never to the test button's", async () => {
+        const input = {
+          environment: "sandbox" as const,
+          url: "https://hooks.northwind.example/all",
+          description: "Everything",
+          events: [...WEBHOOK_EVENT_TYPES],
+        };
+        const created = await owner.webhooks.create(fx.organization, input);
+        expect([...created.endpoint.events].sort()).toEqual([...WEBHOOK_EVENT_TYPES].sort());
+        expect(created.signing_secret.length).toBeGreaterThan(0);
+        const test = await failure(
+          owner.webhooks.create(fx.organization, {
+            ...input,
+            // @ts-expect-error: webhook.test is sent by the test button only
+            events: ["webhook.test"],
+          }),
+        );
+        expect([test.status, test.code]).toEqual([400, "validation_failed"]);
+        const update = await failure(
+          // @ts-expect-error: nor can an update add it
+          owner.webhooks.update(fx.organization, created.endpoint.id, { events: ["webhook.test"] }),
+        );
+        expect([update.status, update.code]).toEqual([400, "validation_failed"]);
       });
     });
   });

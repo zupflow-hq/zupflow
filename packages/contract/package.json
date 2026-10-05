@@ -9,6 +9,7 @@
     "./idempotency": "./src/idempotency.ts",
     "./ids": "./src/ids.ts",
     "./schemas": "./src/schemas.ts",
+    "./webhooks": "./src/webhooks.ts",
     "./openapi.json": "./openapi.json"
   },
   "scripts": {

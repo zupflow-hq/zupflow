@@ -869,6 +869,156 @@
           "expected_account"
         ]
       },
+      "ConnectSessionCompletedWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "connect_session.completed"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "connect_session"
+              },
+              "id": {
+                "$ref": "#/components/schemas/ConnectSessionId"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "completed"
+                ]
+              },
+              "installation_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/InstallationId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "failure_code": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "status",
+              "installation_id",
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
+      },
+      "ConnectSessionFailedWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "connect_session.failed"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "connect_session"
+              },
+              "id": {
+                "$ref": "#/components/schemas/ConnectSessionId"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "failed",
+                  "expired",
+                  "cancelled"
+                ]
+              },
+              "installation_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/InstallationId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "failure_code": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "status",
+              "installation_id",
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
+      },
       "ConnectSessionId": {
         "type": "string",
         "pattern": "^cs_[0-9A-Za-z]{22}$"
@@ -1259,9 +1409,189 @@
           "auth_type"
         ]
       },
+      "InstallationConnectedWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "installation.connected"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "installation"
+              },
+              "id": {
+                "$ref": "#/components/schemas/InstallationId"
+              },
+              "app_id": {
+                "$ref": "#/components/schemas/AppId"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "connected"
+                ]
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "app_id",
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
+      },
+      "InstallationDisconnectedWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "installation.disconnected"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "installation"
+              },
+              "id": {
+                "$ref": "#/components/schemas/InstallationId"
+              },
+              "app_id": {
+                "$ref": "#/components/schemas/AppId"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "disconnected"
+                ]
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "app_id",
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
+      },
       "InstallationId": {
         "type": "string",
         "pattern": "^inst_[0-9A-Za-z]{22}$"
+      },
+      "InstallationReconnectRequiredWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "installation.reconnect_required"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "installation"
+              },
+              "id": {
+                "$ref": "#/components/schemas/InstallationId"
+              },
+              "app_id": {
+                "$ref": "#/components/schemas/AppId"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "reconnect_required"
+                ]
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "app_id",
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
       },
       "Instant": {
         "type": "string",
@@ -1750,6 +2080,126 @@
           "created_at",
           "started_at",
           "finished_at"
+        ]
+      },
+      "RunCancelledWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "run.cancelled"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "run"
+              },
+              "id": {
+                "$ref": "#/components/schemas/RunId"
+              },
+              "agent_id": {
+                "$ref": "#/components/schemas/AgentId"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "cancelled"
+                ]
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "agent_id",
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
+      },
+      "RunCompletedWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "run.completed"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "run"
+              },
+              "id": {
+                "$ref": "#/components/schemas/RunId"
+              },
+              "agent_id": {
+                "$ref": "#/components/schemas/AgentId"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "completed"
+                ]
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "agent_id",
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
         ]
       },
       "RunError": {
@@ -2368,6 +2818,66 @@
         "type": "string",
         "pattern": "^rev_[0-9A-Za-z]{22}$"
       },
+      "RunFailedWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "run.failed"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "run"
+              },
+              "id": {
+                "$ref": "#/components/schemas/RunId"
+              },
+              "agent_id": {
+                "$ref": "#/components/schemas/AgentId"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "failed"
+                ]
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "agent_id",
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
+      },
       "RunId": {
         "type": "string",
         "pattern": "^run_[0-9A-Za-z]{22}$"
@@ -2395,6 +2905,66 @@
           "input_tokens",
           "output_tokens",
           "tool_calls"
+        ]
+      },
+      "RunWaitingForApprovalWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "run.waiting_for_approval"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "run"
+              },
+              "id": {
+                "$ref": "#/components/schemas/RunId"
+              },
+              "agent_id": {
+                "$ref": "#/components/schemas/AgentId"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "waiting_for_approval"
+                ]
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "agent_id",
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
         ]
       },
       "SecretState": {
@@ -2745,7 +3315,8 @@
                 "connect_session.failed",
                 "run.completed",
                 "run.failed",
-                "run.waiting_for_approval"
+                "run.waiting_for_approval",
+                "run.cancelled"
               ]
             }
           },
@@ -2785,6 +3356,167 @@
       "WebhookEndpointId": {
         "type": "string",
         "pattern": "^we_[0-9A-Za-z]{22}$"
+      },
+      "WebhookEvent": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/InstallationConnectedWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/InstallationReconnectRequiredWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/InstallationDisconnectedWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ConnectSessionCompletedWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ConnectSessionFailedWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/RunCompletedWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/RunFailedWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/RunWaitingForApprovalWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/RunCancelledWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/WebhookTestWebhookEvent"
+          }
+        ]
+      },
+      "WebhookEventEnvelope": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WebhookEventWorkspace"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "object",
+              "id"
+            ],
+            "additionalProperties": {}
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ],
+        "additionalProperties": {}
+      },
+      "WebhookEventId": {
+        "type": "string",
+        "pattern": "^evt_[0-9A-Za-z]{22}$"
+      },
+      "WebhookEventWorkspace": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WorkspaceId"
+          },
+          "external_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "external_id"
+        ]
+      },
+      "WebhookTestWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "webhook.test"
+          },
+          "workspace": {
+            "type": "null"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "webhook_endpoint"
+              },
+              "id": {
+                "$ref": "#/components/schemas/WebhookEndpointId"
+              }
+            },
+            "required": [
+              "object",
+              "id"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
       },
       "Workspace": {
         "type": "object",
@@ -8242,7 +8974,8 @@
                         "connect_session.failed",
                         "run.completed",
                         "run.failed",
-                        "run.waiting_for_approval"
+                        "run.waiting_for_approval",
+                        "run.cancelled"
                       ]
                     }
                   }
@@ -8358,7 +9091,8 @@
                         "connect_session.failed",
                         "run.completed",
                         "run.failed",
-                        "run.waiting_for_approval"
+                        "run.waiting_for_approval",
+                        "run.cancelled"
                       ]
                     }
                   },
@@ -8491,6 +9225,688 @@
           },
           "default": {
             "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "webhooks": {
+    "installation.connected": {
+      "post": {
+        "operationId": "webhook_installation_connected",
+        "summary": "`installation.connected`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "installation.connected"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstallationConnectedWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "installation.reconnect_required": {
+      "post": {
+        "operationId": "webhook_installation_reconnect_required",
+        "summary": "`installation.reconnect_required`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "installation.reconnect_required"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstallationReconnectRequiredWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "installation.disconnected": {
+      "post": {
+        "operationId": "webhook_installation_disconnected",
+        "summary": "`installation.disconnected`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "installation.disconnected"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstallationDisconnectedWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "connect_session.completed": {
+      "post": {
+        "operationId": "webhook_connect_session_completed",
+        "summary": "`connect_session.completed`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "connect_session.completed"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectSessionCompletedWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "connect_session.failed": {
+      "post": {
+        "operationId": "webhook_connect_session_failed",
+        "summary": "`connect_session.failed`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "connect_session.failed"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectSessionFailedWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "run.completed": {
+      "post": {
+        "operationId": "webhook_run_completed",
+        "summary": "`run.completed`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "run.completed"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunCompletedWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "run.failed": {
+      "post": {
+        "operationId": "webhook_run_failed",
+        "summary": "`run.failed`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "run.failed"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunFailedWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "run.waiting_for_approval": {
+      "post": {
+        "operationId": "webhook_run_waiting_for_approval",
+        "summary": "`run.waiting_for_approval`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "run.waiting_for_approval"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunWaitingForApprovalWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "run.cancelled": {
+      "post": {
+        "operationId": "webhook_run_cancelled",
+        "summary": "`run.cancelled`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "run.cancelled"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunCancelledWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "webhook.test": {
+      "post": {
+        "operationId": "webhook_webhook_test",
+        "summary": "Sent by the test button; can't be subscribed to",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "webhook.test"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebhookTestWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
           }
         }
       }
