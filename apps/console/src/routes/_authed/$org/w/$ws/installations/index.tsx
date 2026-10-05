@@ -7,7 +7,7 @@ import { InstallationStatusPill } from "@/components/app/status";
 import { Button } from "@/components/ui/button";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
+import { canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { AddInstallationDialog } from "@/features/installations/add-installation-dialog";
 import { useInstallations } from "@/features/queries";
 import { idSearch } from "@/lib/route-ids";
@@ -25,6 +25,8 @@ function InstallationsPage() {
   const { add, app } = Route.useSearch();
   const installations = useInstallations(ws.id);
   const production = ws.environment === "production";
+  // Production accounts come from customers through Connect; viewers add nothing anywhere.
+  const mayAdd = !production && canChange(org);
   const setAdd = (open: boolean) => navigate({ search: open ? { add: true } : {}, replace: true });
 
   return (
@@ -37,7 +39,7 @@ function InstallationsPage() {
             : "Each installation is one connected account, usable only in this workspace. Agents reach it through grants."
         }
         actions={
-          production ? null : (
+          !mayAdd ? null : (
             <Button onClick={() => setAdd(true)}>
               <PlusIcon />
               Add installation
@@ -54,27 +56,31 @@ function InstallationsPage() {
               <EmptyMedia variant="icon">
                 <PlugIcon />
               </EmptyMedia>
-              <EmptyTitle>{production ? "No accounts connected yet" : "Connect the first account"}</EmptyTitle>
+              <EmptyTitle>{mayAdd ? "Connect the first account" : "No accounts connected yet"}</EmptyTitle>
               <EmptyDescription>
                 {production
                   ? "This customer connects accounts from your product, through Connect."
-                  : "Pick an app that's ready for this environment and run Connect, the same flow your users will see."}
+                  : mayAdd
+                    ? "Pick an app that's ready for this environment and run Connect, the same flow your users will see."
+                    : "Accounts appear here once one is connected."}
               </EmptyDescription>
             </EmptyHeader>
-            <EmptyContent>
-              {production ? (
-                <Button asChild variant="outline">
-                  <Link to="/$org/connect" params={{ org: org.slug }}>
-                    Set up Connect
-                  </Link>
-                </Button>
-              ) : (
-                <Button onClick={() => setAdd(true)}>
-                  <PlusIcon />
-                  Add installation
-                </Button>
-              )}
-            </EmptyContent>
+            {production || mayAdd ? (
+              <EmptyContent>
+                {production ? (
+                  <Button asChild variant="outline">
+                    <Link to="/$org/connect" params={{ org: org.slug }}>
+                      Set up Connect
+                    </Link>
+                  </Button>
+                ) : (
+                  <Button onClick={() => setAdd(true)}>
+                    <PlusIcon />
+                    Add installation
+                  </Button>
+                )}
+              </EmptyContent>
+            ) : null}
           </Empty>
         </Panel>
       ) : (
@@ -132,7 +138,7 @@ function InstallationsPage() {
           )}
         </Panel>
       )}
-      {production ? null : (
+      {!mayAdd ? null : (
         <AddInstallationDialog org={org} workspace={ws} open={Boolean(add)} onOpenChange={setAdd} initialAppId={app} />
       )}
     </PageContainer>

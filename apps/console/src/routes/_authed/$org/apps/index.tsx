@@ -149,7 +149,7 @@ function CatalogPage() {
       )}
 
       <CreateAppDialog
-        open={Boolean(create)}
+        open={Boolean(create) && admin}
         onOpenChange={setCreate}
         scope={{ type: "organization" }}
         pending={createApp.isPending}

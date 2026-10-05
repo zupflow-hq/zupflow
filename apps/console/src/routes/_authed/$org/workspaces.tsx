@@ -177,7 +177,12 @@ function WorkspacesPage() {
           ) : null}
         </>
       )}
-      <CreateWorkspaceDialog org={org} environment={environment} open={Boolean(create)} onOpenChange={setCreate} />
+      <CreateWorkspaceDialog
+        org={org}
+        environment={environment}
+        open={Boolean(create) && admin}
+        onOpenChange={setCreate}
+      />
     </PageContainer>
   );
 }

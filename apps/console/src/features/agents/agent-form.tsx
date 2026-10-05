@@ -43,7 +43,19 @@ export function useAgentForm(agent?: Agent) {
   });
 }
 
-export function AgentFields({ form, disabled }: { form: UseFormReturn<AgentValues>; disabled?: boolean }) {
+/**
+ * `disabled` locks the fields while a save is pending. `readOnly` shows them to someone who can't change
+ * them: still focusable, selectable and scrollable, which disabled fields are not.
+ */
+export function AgentFields({
+  form,
+  disabled,
+  readOnly,
+}: {
+  form: UseFormReturn<AgentValues>;
+  disabled?: boolean;
+  readOnly?: boolean;
+}) {
   const models = useModels();
   return (
     <fieldset disabled={disabled} className="space-y-5">
@@ -55,7 +67,7 @@ export function AgentFields({ form, disabled }: { form: UseFormReturn<AgentValue
             <FormItem>
               <FormLabel>Name</FormLabel>
               <FormControl>
-                <Input placeholder="Publishing assistant" autoComplete="off" {...field} />
+                <Input placeholder="Publishing assistant" autoComplete="off" readOnly={readOnly} {...field} />
               </FormControl>
               <FormMessage />
             </FormItem>
@@ -67,7 +79,7 @@ export function AgentFields({ form, disabled }: { form: UseFormReturn<AgentValue
           render={({ field }) => (
             <FormItem>
               <FormLabel>Model</FormLabel>
-              <Select value={field.value} onValueChange={field.onChange} disabled={disabled}>
+              <Select value={field.value} onValueChange={field.onChange} disabled={disabled || readOnly}>
                 <FormControl>
                   <SelectTrigger className="w-full">
                     <SelectValue placeholder={models.isPending ? "Loading models…" : "Choose a model"} />
@@ -96,7 +108,7 @@ export function AgentFields({ form, disabled }: { form: UseFormReturn<AgentValue
               Description <span className="font-normal text-muted-foreground">(optional)</span>
             </FormLabel>
             <FormControl>
-              <Input placeholder="What it's for, in one line" {...field} />
+              <Input placeholder="What it's for, in one line" readOnly={readOnly} {...field} />
             </FormControl>
             <FormMessage />
           </FormItem>
@@ -112,6 +124,7 @@ export function AgentFields({ form, disabled }: { form: UseFormReturn<AgentValue
               <Textarea
                 rows={9}
                 className="font-mono text-[13px] leading-relaxed"
+                readOnly={readOnly}
                 placeholder={
                   "You help the marketing team…\n\n- Read source material before drafting.\n- Never publish without an explicit request."
                 }

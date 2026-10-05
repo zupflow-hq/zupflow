@@ -29,7 +29,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
-import { canAdminister, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
+import { canAdminister, canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { ConnectError, ConnectProgress, useConnectFlow } from "@/features/installations/connect-flow";
 import {
   useAgents,
@@ -95,7 +95,7 @@ function InstallationPage() {
             </>
           )}
         </div>
-        {i ? (
+        {i && canChange(org) ? (
           <div className="flex items-center gap-2">
             {ws.environment === "sandbox" ? (
               <Button variant={needsReconnect ? "default" : "outline"} onClick={() => setDialog("reconnect")}>

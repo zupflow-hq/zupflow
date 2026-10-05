@@ -68,7 +68,8 @@ export const AuthType = z.enum(["oauth2", "token"]);
 export type AuthType = z.infer<typeof AuthType>;
 export const ConfigurationStatus = z.enum(["unconfigured", "incomplete", "ready"]);
 export type ConfigurationStatus = z.infer<typeof ConfigurationStatus>;
-export const MemberRole = z.enum(["owner", "admin", "developer"]);
+/** `viewer` is read-only: it sees what a developer sees and changes nothing. */
+export const MemberRole = z.enum(["owner", "admin", "developer", "viewer"]);
 export type MemberRole = z.infer<typeof MemberRole>;
 export const MemberStatus = z.enum(["active", "invited"]);
 export type MemberStatus = z.infer<typeof MemberStatus>;

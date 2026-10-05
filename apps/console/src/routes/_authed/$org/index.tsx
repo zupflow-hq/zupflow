@@ -9,7 +9,7 @@ import { ConfigStatus } from "@/components/app/status";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
-import { useDocumentTitle, useOrg } from "@/features/context";
+import { canAdminister, canChange, useDocumentTitle, useOrg } from "@/features/context";
 import { useEnvironment } from "@/features/environment";
 import { useOrgApps, useUsage, useWorkspacePage } from "@/features/queries";
 import { compact } from "@/lib/format";
@@ -30,7 +30,7 @@ function OverviewPage() {
         title={org.name}
         description={`${ENVIRONMENT_LABEL[environment]} activity across every workspace in this organization.`}
       />
-      <SetupChecklist org={org} />
+      {canChange(org) ? <SetupChecklist org={org} /> : null}
       <EnvironmentActivity orgId={org.id} environment={environment} />
       <div className="mt-8 grid gap-8 lg:grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)]">
         <WorkspaceSummary org={org} environment={environment} />
@@ -90,7 +90,11 @@ const STEPS: {
   },
 ];
 
+/** Steps only owners and admins can take: the catalog, its configuration and workspaces. */
+const ADMIN_STEPS = new Set<keyof OrganizationSetup>(["has_app", "has_ready_configuration", "has_workspace"]);
+
 function SetupChecklist({ org }: { org: Organization }) {
+  const admin = canAdminister(org);
   const done = STEPS.filter((s) => org.setup[s.key]).length;
   if (done === STEPS.length) return null;
   const next = STEPS.find((s) => !org.setup[s.key]);
@@ -149,13 +153,15 @@ function SetupChecklist({ org }: { org: Organization }) {
                 </p>
                 {!complete ? <p className="text-sm text-muted-foreground">{step.body}</p> : null}
               </div>
-              {isNext ? (
+              {isNext && (admin || !ADMIN_STEPS.has(step.key)) ? (
                 <Button asChild size="sm">
                   <Link {...link(step.key)}>
                     {step.cta}
                     <ArrowRightIcon />
                   </Link>
                 </Button>
+              ) : isNext ? (
+                <span className="shrink-0 text-xs text-muted-foreground">An owner or admin does this</span>
               ) : null}
             </li>
           );
@@ -300,11 +306,13 @@ function CatalogReadiness({ org, environment }: { org: Organization; environment
         ) : apps.data.length === 0 ? (
           <div className="flex flex-col items-center gap-3 p-6 text-center">
             <p className="text-sm text-muted-foreground">Your catalog is empty.</p>
-            <Button asChild size="sm" variant="outline">
-              <Link to="/$org/apps" params={{ org: org.slug }} search={{ create: true }}>
-                Add an app
-              </Link>
-            </Button>
+            {canAdminister(org) ? (
+              <Button asChild size="sm" variant="outline">
+                <Link to="/$org/apps" params={{ org: org.slug }} search={{ create: true }}>
+                  Add an app
+                </Link>
+              </Button>
+            ) : null}
           </div>
         ) : (
           <ul className="divide-y">

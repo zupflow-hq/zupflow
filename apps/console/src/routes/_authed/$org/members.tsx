@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { createFileRoute } from "@tanstack/react-router";
-import type { Member, MemberRole, Organization } from "@zupflow/sdk";
+import { type Member, MemberRole, type Organization } from "@zupflow/sdk";
 import { Trash2Icon, UserPlusIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
@@ -41,6 +41,7 @@ const ROLES: { value: MemberRole; label: string; body: string }[] = [
   { value: "owner", label: "Owner", body: "Everything, including roles and deleting workspaces." },
   { value: "admin", label: "Admin", body: "Apps, configurations, workspaces, keys and members." },
   { value: "developer", label: "Developer", body: "Agents, installations, runs and Sandbox keys." },
+  { value: "viewer", label: "Viewer", body: "Sees what developers see. Changes nothing." },
 ];
 
 function MembersPage() {
@@ -205,7 +206,7 @@ function RoleSelect({ value, onChange }: { value: MemberRole; onChange: (role: M
 
 const inviteSchema = z.object({
   email: z.string().trim().email("Enter a valid email address."),
-  role: z.enum(["owner", "admin", "developer"]),
+  role: MemberRole,
 });
 
 function InviteDialog({

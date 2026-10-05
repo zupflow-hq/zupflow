@@ -9,6 +9,7 @@
 import { routes } from "@zupflow/contract";
 import {
   type AgentId,
+  type ApiKeyId,
   type AppId,
   type CreateConnectSessionInput,
   createClient,
@@ -21,7 +22,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createResponseChecker } from "./checker";
 import { type Fixture, loadFixture, must } from "./fixture";
-import { expectSealed, loadTenant } from "./isolation";
+import { expectSealed, loadTenant, snapshotOf, type Tenant } from "./isolation";
 import type { Persona, Target } from "./target";
 
 async function failure(promise: Promise<unknown>) {
@@ -949,6 +950,217 @@ export function contractSuite(target: Target) {
         expect(again).toEqual(first);
         const installs = await owner.installations.list(fx.workspaces.qaPlayground.id);
         expect(installs.filter((i) => i.id === first.installation.id)).toHaveLength(1);
+      });
+    });
+
+    describe("the viewer role", () => {
+      it("reads what a developer reads", async () => {
+        const reads = (c: ZupflowClient) => async () => {
+          const acme = fx.workspaces.acme.id;
+          const agents = await c.agents.list(acme);
+          const settled = async (p: Promise<unknown>) =>
+            p.then(
+              (v) => v,
+              (e: unknown) => (e instanceof ZupflowApiError ? e.code : e),
+            );
+          return JSON.stringify(
+            await Promise.all([
+              settled(c.workspaces.list(fx.organization, { limit: 100 })),
+              settled(c.workspaces.get(acme)),
+              agents,
+              settled(Promise.all(agents.map((a) => c.grants.list(acme, a.id)))),
+              settled(c.runs.list(acme, { limit: 100 })),
+              settled(c.installations.list(acme)),
+              settled(c.connectSessions.list(acme)),
+              settled(c.organizationApps.list(fx.organization)),
+              settled(c.workspaceApps.list(acme)),
+              settled(c.workspaceApps.available(fx.workspaces.acmeSandbox.id)),
+              settled(c.apiKeys.list(fx.organization)),
+              settled(c.webhooks.list(fx.organization)),
+              settled(c.connectSettings.get(fx.organization, "sandbox")),
+              settled(c.organizations.usage(fx.organization, "production")),
+              settled(c.organizationRuns.list(fx.organization, { environment: "production", limit: 100 })),
+              settled(c.audit.list(fx.organization)),
+            ]),
+          );
+        };
+        expect(await reads(as("viewer"))()).toBe(await reads(as("developer"))());
+        expect((await as("viewer").members.list(fx.organization)).length).toBeGreaterThan(0);
+        const me = await as("viewer").me.get();
+        expect(me.organizations.find((o) => o.id === fx.organization)?.role).toBe("viewer");
+      });
+
+      /** Every change a Console member can make, by operation, aimed at real objects of the tenant. */
+      const changesBy = (c: ZupflowClient, t: Tenant, sandboxKey: ApiKeyId): [string, () => Promise<unknown>][] => {
+        const w = t.workspace.id;
+        const sandbox = t.sandbox.id;
+        const agentInput = { name: "x", description: "", instructions: "", model: t.agent.model };
+        const app = { kind: "mcp", name: "x", slug: "viewer-x", description: "", auth_type: "token" } as const;
+        return [
+          ["updateOrganization", () => c.organizations.update(t.org, { name: "Viewed" })],
+          ["inviteMember", () => c.members.invite(t.org, { email: "v@northwind.example", role: "developer" })],
+          ["updateMember", () => c.members.update(t.org, t.member.id, { role: "viewer" })],
+          ["removeMember", () => c.members.remove(t.org, t.member.id)],
+          [
+            "createWorkspace",
+            () =>
+              c.workspaces.create(t.org, {
+                name: "x",
+                slug: "viewer-x",
+                environment: "sandbox",
+                external_id: null,
+              }),
+          ],
+          ["updateWorkspace", () => c.workspaces.update(w, { name: "Viewed" })],
+          ["deleteWorkspace", () => c.workspaces.delete(sandbox)],
+          ["createOrganizationApp", () => c.organizationApps.create(t.org, app)],
+          ["updateOrganizationApp", () => c.organizationApps.update(t.org, t.orgApp.id, { name: "Viewed" })],
+          [
+            "updateOrganizationAppConfiguration",
+            () => c.organizationApps.updateConfiguration(t.org, t.orgApp.id, "sandbox", { oauth_client_id: "x" }),
+          ],
+          ["createWorkspaceApp", () => c.workspaceApps.create(w, app)],
+          ["updateWorkspaceApp", () => c.workspaceApps.update(w, t.workspaceApp.id, { name: "Viewed" })],
+          [
+            "updateWorkspaceAppConfiguration",
+            () => c.workspaceApps.updateConfiguration(w, t.workspaceApp.id, { mcp_server_url: null }),
+          ],
+          ["updateInstallation", () => c.installations.update(w, t.installation.id, { label: "Viewed" })],
+          ["disconnectInstallation", () => c.installations.disconnect(w, t.installation.id)],
+          ["deleteInstallation", () => c.installations.delete(w, t.installation.id)],
+          [
+            "createConnectSession",
+            () =>
+              c.connectSessions.create(sandbox, {
+                app_id: t.orgApp.id,
+                intent: "create",
+                label: "x",
+                installation_id: null,
+                return_url: null,
+              }),
+          ],
+          // Changes first and removals last, so each change still finds what it changes.
+          ["createAgent", () => c.agents.create(w, agentInput)],
+          ["updateAgent", () => c.agents.update(w, t.agent.id, { name: "Changed" })],
+          [
+            "createGrant",
+            () =>
+              c.grants.create(w, t.agent.id, {
+                installation_id: t.installation.id,
+                tools: t.grant.tools.slice(0, 1),
+                approval_required: [],
+              }),
+          ],
+          [
+            "updateGrant",
+            () => c.grants.update(w, t.agent.id, t.grant.id, { tools: t.grant.tools, approval_required: [] }),
+          ],
+          ["startRun", () => c.runs.create(w, t.agent.id, { input: "hi" })],
+          ["cancelRun", () => c.runs.cancel(w, t.run.id)],
+          ["deleteGrant", () => c.grants.delete(w, t.agent.id, t.grant.id)],
+          ["deleteAgent", () => c.agents.delete(w, t.agent.id)],
+          [
+            "updateConnectSettings",
+            () => c.connectSettings.update(t.org, "sandbox", { return_urls: [], allowed_origins: [] }),
+          ],
+          ["createApiKey", () => c.apiKeys.create(t.org, { name: "x", environment: "sandbox" })],
+          ["revokeApiKey", () => c.apiKeys.revoke(t.org, sandboxKey)],
+          [
+            "createWebhook",
+            () =>
+              c.webhooks.create(t.org, {
+                environment: "sandbox",
+                url: "https://hooks.northwind.example/viewer",
+                description: "x",
+                events: ["run.completed"],
+              }),
+          ],
+          ["updateWebhook", () => c.webhooks.update(t.org, t.hook.id, { enabled: false })],
+          ["deleteWebhook", () => c.webhooks.delete(t.org, t.hook.id)],
+          ["testWebhook", () => c.webhooks.sendTest(t.org, t.hook.id)],
+        ];
+      };
+
+      /** Every change a Console member could make: the route table's, minus creating one's own organization. */
+      const MUTATING = routes
+        .filter((r) => r.method !== "get" && r.callers.includes("console") && r.operationId !== "createOrganization")
+        .map((r) => r.operationId);
+      /** A Sandbox key, so a developer's revoke isn't refused for being Production's. */
+      const sandboxKey = async () =>
+        (await owner.apiKeys.create(fx.organization, { name: "Revocable", environment: "sandbox" })).key.id;
+
+      it("changes nothing: every change answers 403 and leaves the organization as it was", async () => {
+        const t = await northwind();
+        const changes = changesBy(as("viewer"), t, await sandboxKey());
+        // Every change a Console member could make is tried; only creating one's own organization is open to all.
+        expect(changes.map(([id]) => id).sort()).toEqual([...MUTATING].sort());
+
+        const before = await snapshotOf(owner, t);
+        for (const [what, change] of changes) {
+          const error = await failure(change());
+          expect(`${error.status} ${error.code}`, what).toBe("403 forbidden");
+        }
+        expect(await snapshotOf(owner, t), "the organization after the viewer's attempts").toBe(before);
+      });
+
+      it("leaves developers every change but the admins' and owners'", async () => {
+        // The admins' and owners' operations, named so a check made stricter than the role allows fails here.
+        const ADMIN_ONLY = new Set([
+          "updateOrganization",
+          "inviteMember",
+          "updateMember",
+          "removeMember",
+          "createWorkspace",
+          "updateWorkspace",
+          "deleteWorkspace",
+          "createOrganizationApp",
+          "updateOrganizationApp",
+          "updateOrganizationAppConfiguration",
+          "createWorkspaceApp",
+          "updateWorkspaceApp",
+          "updateWorkspaceAppConfiguration",
+          "deleteInstallation",
+          "updateConnectSettings",
+          "createWebhook",
+          "updateWebhook",
+          "deleteWebhook",
+          "testWebhook",
+        ]);
+        const t = await northwind();
+        const changes = changesBy(as("developer"), t, await sandboxKey());
+        expect(changes.map(([id]) => id).sort()).toEqual([...MUTATING].sort());
+        for (const [what, change] of changes) {
+          let code = "succeeded";
+          try {
+            await change();
+          } catch (error) {
+            if (!(error instanceof ZupflowApiError)) throw error;
+            code = error.code;
+          }
+          // A developer's own change may be refused by a product rule (Production's read-only one, a grant that
+          // already exists), never by the role, and never by failing to find what the fixture holds.
+          if (ADMIN_ONLY.has(what)) expect(code, what).toBe("forbidden");
+          else expect(["forbidden", "not_found"], what).not.toContain(code);
+        }
+      });
+
+      it("can be given: an owner invites a viewer and makes a developer one", async () => {
+        const invited = await owner.members.invite(fx.organization, {
+          email: "viewer@northwind.example",
+          role: "viewer",
+        });
+        expect([invited.role, invited.status]).toEqual(["viewer", "invited"]);
+        const developerId = (await as("developer").me.get()).user.id;
+        const developer = must(
+          (await owner.members.list(fx.organization)).find((m) => m.user.id === developerId),
+          "the developer's membership",
+        );
+        expect((await owner.members.update(fx.organization, developer.id, { role: "viewer" })).role).toBe("viewer");
+        const qa = fx.workspaces.qaPlayground.id;
+        const error = await failure(
+          as("developer").agents.create(qa, { name: "x", description: "", instructions: "", model: await anyModel() }),
+        );
+        expect(`${error.status} ${error.code}`).toBe("403 forbidden");
       });
     });
   });

@@ -253,6 +253,8 @@ export function requireRole(access: OrgAccess, roles: MemberRole[], action: stri
 }
 
 export const ADMINS: MemberRole[] = ["owner", "admin"];
+/** Everyone who may change anything: every role but the read-only viewer. */
+export const DEVELOPERS: MemberRole[] = ["owner", "admin", "developer"];
 
 export function audit(
   access: OrgAccess,

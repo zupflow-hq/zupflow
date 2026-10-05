@@ -11,7 +11,7 @@ import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTi
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { AuthTypeLabel } from "@/features/apps/app-definition";
 import { CreateAppDialog } from "@/features/apps/create-app-dialog";
-import { canAdminister, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
+import { canAdminister, canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { useAvailableApps, useCreateWorkspaceApp, useWorkspaceApps } from "@/features/queries";
 
 export const Route = createFileRoute("/_authed/$org/w/$ws/apps/")({
@@ -159,7 +159,7 @@ function WorkspaceAppsPage() {
                 <li key={app.id} className="flex items-center gap-3 px-4 py-3">
                   <AppIcon icon={app.icon} size="sm" />
                   <span className="flex-1 text-sm font-medium">{app.name}</span>
-                  {ws.environment === "sandbox" ? (
+                  {ws.environment === "sandbox" && canChange(org) ? (
                     <Button asChild variant="outline" size="sm">
                       <Link
                         to="/$org/w/$ws/installations"
@@ -169,9 +169,9 @@ function WorkspaceAppsPage() {
                         Install
                       </Link>
                     </Button>
-                  ) : (
+                  ) : ws.environment === "production" ? (
                     <span className="text-xs text-muted-foreground">Installed by customers through Connect</span>
-                  )}
+                  ) : null}
                 </li>
               ))}
             </ul>
@@ -180,7 +180,7 @@ function WorkspaceAppsPage() {
       </section>
 
       <CreateAppDialog
-        open={Boolean(create)}
+        open={Boolean(create) && admin}
         onOpenChange={setCreate}
         scope={{ type: "workspace", name: ws.name, environment: ws.environment }}
         pending={createApp.isPending}

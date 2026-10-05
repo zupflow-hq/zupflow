@@ -136,44 +136,43 @@ function WebhooksPage() {
                         )
                       }
                     />
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="icon-sm" aria-label="Endpoint actions">
-                          <EllipsisIcon />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        <DropdownMenuItem
-                          onSelect={() =>
-                            test.mutate(h.id, {
-                              onSuccess: (d) =>
-                                d.status_code < 300
-                                  ? toast.success(`Test event delivered (${d.status_code})`)
-                                  : toast.error(`Your endpoint answered ${d.status_code}`, {
-                                      description: "Zupflow retries failed deliveries with backoff.",
-                                    }),
-                              onError: (e) => toastError(e),
-                            })
-                          }
-                        >
-                          <SendIcon />
-                          Send test event
-                        </DropdownMenuItem>
-                        {admin ? (
-                          <>
-                            <DropdownMenuItem onSelect={() => setEditing(h)}>
-                              <PencilIcon />
-                              Edit
-                            </DropdownMenuItem>
-                            <DropdownMenuSeparator />
-                            <DropdownMenuItem variant="destructive" onSelect={() => setDeleting(h)}>
-                              <Trash2Icon />
-                              Delete
-                            </DropdownMenuItem>
-                          </>
-                        ) : null}
-                      </DropdownMenuContent>
-                    </DropdownMenu>
+                    {/* Sending a test delivery is part of managing endpoints, like editing them: admins only. */}
+                    {admin ? (
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button variant="ghost" size="icon-sm" aria-label="Endpoint actions">
+                            <EllipsisIcon />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem
+                            onSelect={() =>
+                              test.mutate(h.id, {
+                                onSuccess: (d) =>
+                                  d.status_code < 300
+                                    ? toast.success(`Test event delivered (${d.status_code})`)
+                                    : toast.error(`Your endpoint answered ${d.status_code}`, {
+                                        description: "Zupflow retries failed deliveries with backoff.",
+                                      }),
+                                onError: (e) => toastError(e),
+                              })
+                            }
+                          >
+                            <SendIcon />
+                            Send test event
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onSelect={() => setEditing(h)}>
+                            <PencilIcon />
+                            Edit
+                          </DropdownMenuItem>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem variant="destructive" onSelect={() => setDeleting(h)}>
+                            <Trash2Icon />
+                            Delete
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    ) : null}
                   </div>
                 </li>
               ))}

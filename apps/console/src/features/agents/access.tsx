@@ -14,6 +14,7 @@ import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
+import { canChange } from "@/features/context";
 import {
   useCreateGrant,
   useDeleteGrant,
@@ -68,7 +69,9 @@ export function AgentAccess({ org, workspace, agent }: { org: Organization; work
             </EmptyMedia>
             <EmptyTitle>Nothing to grant yet</EmptyTitle>
             <EmptyDescription>
-              This workspace has no installations. Connect an account first, then come back to grant tools.
+              {canChange(org)
+                ? "This workspace has no installations. Connect an account first, then come back to grant tools."
+                : "This workspace has no installations, so no agent has access to any tools yet."}
             </EmptyDescription>
           </EmptyHeader>
           <EmptyContent>
@@ -93,8 +96,11 @@ export function AgentAccess({ org, workspace, agent }: { org: Organization; work
     <div className="space-y-4">
       <p className="flex items-start gap-2 text-sm text-muted-foreground">
         <ShieldIcon className="mt-0.5 size-4 shrink-0" />
-        Access is granted per installation. Granting one Google Workspace installation never grants another, and an
-        agent never sees credentials — only tool results.
+        <span>
+          Access is granted per installation. Granting one Google Workspace installation never grants another, and an
+          agent never sees credentials — only tool results.
+          {canChange(org) ? null : " You can view access; owners, admins and developers can change it."}
+        </span>
       </p>
       {sorted.map((installation) => (
         <GrantCard
@@ -164,6 +170,7 @@ function GrantCard({
   };
 
   const pending = create.isPending || update.isPending;
+  const mayChange = canChange(org);
 
   return (
     <Panel className={cn(!open && "bg-card/60")}>
@@ -186,16 +193,18 @@ function GrantCard({
             <span className="tabular text-sm text-muted-foreground">
               {grant.tools.length} of {tools?.length ?? "…"} tools
             </span>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="text-destructive hover:text-destructive"
-              onClick={() => setRevoking(true)}
-            >
-              Revoke
-            </Button>
+            {mayChange ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-destructive hover:text-destructive"
+                onClick={() => setRevoking(true)}
+              >
+                Revoke
+              </Button>
+            ) : null}
           </>
-        ) : !editing ? (
+        ) : !editing && mayChange ? (
           <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
             Grant access
           </Button>
@@ -224,10 +233,18 @@ function GrantCard({
                 const id = `${installation.id}-${tool.name}`;
                 return (
                   <li key={tool.name} className="flex items-center gap-3 px-4 py-2.5">
-                    <Checkbox id={id} checked={checked} onCheckedChange={(v) => toggleTool(tool, v === true)} />
+                    <Checkbox
+                      id={id}
+                      checked={checked}
+                      disabled={!mayChange}
+                      onCheckedChange={(v) => toggleTool(tool, v === true)}
+                    />
                     <Label
                       htmlFor={id}
-                      className="min-w-0 flex-1 cursor-pointer flex-col items-start gap-0.5 font-normal"
+                      className={cn(
+                        "min-w-0 flex-1 flex-col items-start gap-0.5 font-normal",
+                        mayChange && "cursor-pointer",
+                      )}
                     >
                       <span className="flex flex-wrap items-center gap-2">
                         <span className="font-medium">{tool.title}</span>
@@ -245,7 +262,7 @@ function GrantCard({
                       <Switch
                         id={`${id}-approval`}
                         aria-label={`Require approval for ${tool.title}`}
-                        disabled={!checked}
+                        disabled={!checked || !mayChange}
                         checked={approval.includes(tool.name)}
                         onCheckedChange={(on) =>
                           setApproval((a) => (on ? [...a, tool.name] : a.filter((t) => t !== tool.name)))

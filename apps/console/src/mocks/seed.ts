@@ -34,7 +34,7 @@ import { mulberry32, type Rng, uuid } from "./random";
 import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 import { timelineOf } from "./scope";
 
-export const DB_SCHEMA = 13;
+export const DB_SCHEMA = 14;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -51,8 +51,9 @@ export function seed(nowMs: number = Date.now()): Db {
     { id: id("user", nowMs - 39 * DAY), name: "Priya Natarajan", email: "priya@northwind.example", avatar_url: null },
     { id: id("user", nowMs - 20 * DAY), name: "Sam Okafor", email: "sam@northwind.example", avatar_url: null },
     { id: id("user", nowMs - 2 * DAY), name: "Mei Tanaka", email: "mei@northwind.example", avatar_url: null },
+    { id: id("user", nowMs - 15 * DAY), name: "Alex Rivera", email: "alex@northwind.example", avatar_url: null },
   ];
-  const [jordan, priya, sam, mei] = users as [User, User, User, User];
+  const [jordan, priya, sam, mei, alex] = users as [User, User, User, User, User];
 
   const org = {
     id: id("organization", nowMs - 41 * DAY),
@@ -101,6 +102,17 @@ export function seed(nowMs: number = Date.now()): Db {
       invited_at: ago(2 * DAY),
       joined_at: null,
       last_active_at: null,
+    },
+    {
+      // Read-only: support sees what developers see, and changes nothing.
+      id: id("member", nowMs - 15 * DAY),
+      organization_id: org.id,
+      user_id: alex.id,
+      role: "viewer" as const,
+      status: "active" as const,
+      invited_at: ago(15 * DAY),
+      joined_at: ago(15 * DAY),
+      last_active_at: ago(1 * DAY),
     },
   ];
 

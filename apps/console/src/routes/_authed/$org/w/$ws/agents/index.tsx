@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { CreateAgentDialog } from "@/features/agents/agent-form";
-import { useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
+import { canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { useAgents, useCreateAgent, useModels } from "@/features/queries";
 import { applyFieldErrors, toastError } from "@/lib/errors";
 
@@ -29,6 +29,7 @@ function AgentsPage() {
   const createAgent = useCreateAgent(ws.id);
   const setCreate = (open: boolean) => navigate({ search: open ? { create: true } : {}, replace: true });
   const modelName = (id: string) => models.data?.find((m) => m.id === id)?.name ?? id;
+  const mayChange = canChange(org);
 
   return (
     <PageContainer>
@@ -36,10 +37,12 @@ function AgentsPage() {
         title="Agents"
         description="Each agent keeps its configuration and grants across runs. It can only use the installations and tools you grant it here."
         actions={
-          <Button onClick={() => setCreate(true)}>
-            <PlusIcon />
-            Create agent
-          </Button>
+          mayChange ? (
+            <Button onClick={() => setCreate(true)}>
+              <PlusIcon />
+              Create agent
+            </Button>
+          ) : null
         }
       />
       {agents.isError ? (
@@ -52,14 +55,20 @@ function AgentsPage() {
                 <BotIcon />
               </EmptyMedia>
               <EmptyTitle>No agents in {ws.name} yet</EmptyTitle>
-              <EmptyDescription>Create one, grant it tools on an installation, then start a run.</EmptyDescription>
+              <EmptyDescription>
+                {mayChange
+                  ? "Create one, grant it tools on an installation, then start a run."
+                  : "Agents appear here once one is created."}
+              </EmptyDescription>
             </EmptyHeader>
-            <EmptyContent>
-              <Button onClick={() => setCreate(true)}>
-                <PlusIcon />
-                Create agent
-              </Button>
-            </EmptyContent>
+            {mayChange ? (
+              <EmptyContent>
+                <Button onClick={() => setCreate(true)}>
+                  <PlusIcon />
+                  Create agent
+                </Button>
+              </EmptyContent>
+            ) : null}
           </Empty>
         </Panel>
       ) : (
@@ -115,7 +124,7 @@ function AgentsPage() {
       )}
       <CreateAgentDialog
         workspace={ws}
-        open={Boolean(create)}
+        open={Boolean(create) && mayChange}
         onOpenChange={setCreate}
         pending={createAgent.isPending}
         onCreate={(values, form) =>

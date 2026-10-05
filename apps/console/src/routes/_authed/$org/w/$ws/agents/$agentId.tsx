@@ -25,7 +25,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { AgentAccess } from "@/features/agents/access";
 import { AgentFields, useAgentForm } from "@/features/agents/agent-form";
 import { StartRunSheet } from "@/features/agents/start-run-sheet";
-import { useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
+import { canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { useAgent, useDeleteAgent, useModels, useRuns, useUpdateAgent } from "@/features/queries";
 import { RunTable } from "@/features/runs/run-table";
 import { useDetailCrumb } from "@/lib/crumbs";
@@ -63,8 +63,10 @@ function AgentPage() {
   }
 
   const a = agent.data;
-  const runBlocked =
-    ws.environment === "production"
+  const mayChange = canChange(org);
+  const runBlocked = !mayChange
+    ? "Viewers can't start runs. Ask a developer or an admin."
+    : ws.environment === "production"
       ? "In Production, runs start from your product through the API. Test here in a Sandbox workspace."
       : a?.status === "paused"
         ? "Resume the agent to start runs."
@@ -113,35 +115,37 @@ function AgentPage() {
                 Start run
               </Button>
             )}
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="outline" size="icon" aria-label="More actions">
-                  {update.isPending ? <Spinner /> : <EllipsisIcon />}
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuItem
-                  onSelect={() =>
-                    update.mutate(
-                      { status: a.status === "active" ? "paused" : "active" },
-                      {
-                        onSuccess: (next) =>
-                          toast.success(next.status === "paused" ? `Paused ${next.name}` : `Resumed ${next.name}`),
-                        onError: (e) => toastError(e),
-                      },
-                    )
-                  }
-                >
-                  {a.status === "active" ? <PauseIcon /> : <PlayIcon />}
-                  {a.status === "active" ? "Pause agent" : "Resume agent"}
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem variant="destructive" onSelect={() => setDeleting(true)}>
-                  <Trash2Icon />
-                  Delete agent
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+            {mayChange ? (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="outline" size="icon" aria-label="More actions">
+                    {update.isPending ? <Spinner /> : <EllipsisIcon />}
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem
+                    onSelect={() =>
+                      update.mutate(
+                        { status: a.status === "active" ? "paused" : "active" },
+                        {
+                          onSuccess: (next) =>
+                            toast.success(next.status === "paused" ? `Paused ${next.name}` : `Resumed ${next.name}`),
+                          onError: (e) => toastError(e),
+                        },
+                      )
+                    }
+                  >
+                    {a.status === "active" ? <PauseIcon /> : <PlayIcon />}
+                    {a.status === "active" ? "Pause agent" : "Resume agent"}
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem variant="destructive" onSelect={() => setDeleting(true)}>
+                    <Trash2Icon />
+                    Delete agent
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : null}
           </div>
         ) : null}
       </header>
@@ -167,7 +171,9 @@ function AgentPage() {
           {a ? <OverviewTab org={org} workspace={ws} agent={a} /> : <RowsSkeleton />}
         </TabsContent>
         <TabsContent value="access">{a ? <AgentAccess org={org} workspace={ws} agent={a} /> : null}</TabsContent>
-        <TabsContent value="configuration">{a ? <ConfigurationTab workspace={ws} agent={a} /> : null}</TabsContent>
+        <TabsContent value="configuration">
+          {a ? <ConfigurationTab workspace={ws} agent={a} readOnly={!mayChange} /> : null}
+        </TabsContent>
       </Tabs>
 
       {a ? (
@@ -176,7 +182,7 @@ function AgentPage() {
             orgSlug={org.slug}
             workspace={ws}
             agent={a}
-            open={Boolean(runOpen)}
+            open={Boolean(runOpen) && !runBlocked}
             onOpenChange={setRunOpen}
           />
           <ConfirmDialog
@@ -230,7 +236,7 @@ function OverviewTab({ org, workspace, agent }: { org: Organization; workspace: 
               runs={runs.data.pages[0]?.items ?? []}
               orgSlug={org.slug}
               showAgent={false}
-              empty="No runs yet. Start one to see the agent work."
+              empty={canChange(org) ? "No runs yet. Start one to see the agent work." : "No runs yet."}
             />
           )}
         </Panel>
@@ -263,7 +269,7 @@ function OverviewTab({ org, workspace, agent }: { org: Organization; workspace: 
   );
 }
 
-function ConfigurationTab({ workspace, agent }: { workspace: Workspace; agent: Agent }) {
+function ConfigurationTab({ workspace, agent, readOnly }: { workspace: Workspace; agent: Agent; readOnly: boolean }) {
   const update = useUpdateAgent(workspace.id, agent.id);
   const form = useAgentForm(agent);
   return (
@@ -280,19 +286,25 @@ function ConfigurationTab({ workspace, agent }: { workspace: Workspace; agent: A
             }),
           )}
         >
-          <AgentFields form={form} />
-          <div className="flex items-center gap-2 border-t pt-5">
-            <Button type="submit" disabled={!form.formState.isDirty || update.isPending}>
-              {update.isPending ? <Spinner /> : null}
-              Save configuration
-            </Button>
-            {form.formState.isDirty ? (
-              <Button type="button" variant="ghost" onClick={() => form.reset()}>
-                Discard
+          <AgentFields form={form} readOnly={readOnly} />
+          {readOnly ? (
+            <p className="border-t pt-5 text-xs text-muted-foreground">
+              You can view this configuration. Owners, admins and developers can change it.
+            </p>
+          ) : (
+            <div className="flex items-center gap-2 border-t pt-5">
+              <Button type="submit" disabled={!form.formState.isDirty || update.isPending}>
+                {update.isPending ? <Spinner /> : null}
+                Save configuration
               </Button>
-            ) : null}
-            <span className="ml-auto text-xs text-muted-foreground">Applies to runs started after you save.</span>
-          </div>
+              {form.formState.isDirty ? (
+                <Button type="button" variant="ghost" onClick={() => form.reset()}>
+                  Discard
+                </Button>
+              ) : null}
+              <span className="ml-auto text-xs text-muted-foreground">Applies to runs started after you save.</span>
+            </div>
+          )}
         </form>
       </Form>
     </Panel>

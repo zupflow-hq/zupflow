@@ -25,7 +25,7 @@ import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { canAdminister, useDocumentTitle, useOrg } from "@/features/context";
+import { canAdminister, canChange, useDocumentTitle, useOrg } from "@/features/context";
 import { useEnvironment } from "@/features/environment";
 import { useApiKeys, useCreateApiKey, useRevokeApiKey } from "@/features/queries";
 import { applyFieldErrors, toastError } from "@/lib/errors";
@@ -45,7 +45,8 @@ function ApiKeysPage() {
   const [secret, setSecret] = useState<{ value: string; key: ApiKey } | null>(null);
   const [revoking, setRevoking] = useState<ApiKey | null>(null);
   const environment = useEnvironment();
-  const mayManage = environment === "sandbox" || canAdminister(org);
+  // Sandbox keys are for developers too; Production keys are admins'. Viewers manage none.
+  const mayManage = canChange(org) && (environment === "sandbox" || canAdminister(org));
 
   return (
     <PageContainer>
@@ -133,7 +134,7 @@ function KeySection({
       <p className="mb-3 text-sm text-muted-foreground">
         {environment === "production"
           ? "Production keys start with zf_live_. Owners and admins create and revoke them."
-          : "Sandbox keys start with zf_test_. Any member can create them."}
+          : "Sandbox keys start with zf_test_. Owners, admins and developers create and revoke them."}
       </p>
       <Panel className="overflow-hidden">
         {!keys ? (

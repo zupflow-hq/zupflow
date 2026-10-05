@@ -4,7 +4,7 @@
  *   ZUPFLOW_CONTRACT_URL=http://localhost:8080 \
  *   ZUPFLOW_CONTRACT_RESET_COMMAND="…restores the reference fixture…" \
  *   ZUPFLOW_CONTRACT_TOKEN_OWNER=… ZUPFLOW_CONTRACT_TOKEN_DEVELOPER=… \
- *   ZUPFLOW_CONTRACT_TOKEN_OUTSIDER=… pnpm test --filter @zupflow/contract-tests
+ *   ZUPFLOW_CONTRACT_TOKEN_VIEWER=… ZUPFLOW_CONTRACT_TOKEN_OUTSIDER=… pnpm test --filter @zupflow/contract-tests
  *
  * The reset is a shell command run before every test, not an HTTP route: the
  * server under test never exposes a way to wipe its data. Turbo passes these
@@ -30,6 +30,7 @@ if (url) {
   const tokens: Record<Persona, string> = {
     owner: env("ZUPFLOW_CONTRACT_TOKEN_OWNER"),
     developer: env("ZUPFLOW_CONTRACT_TOKEN_DEVELOPER"),
+    viewer: env("ZUPFLOW_CONTRACT_TOKEN_VIEWER"),
     outsider: env("ZUPFLOW_CONTRACT_TOKEN_OUTSIDER"),
   };
   const reset = env("ZUPFLOW_CONTRACT_RESET_COMMAND");

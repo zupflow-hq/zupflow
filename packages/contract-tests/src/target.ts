@@ -11,10 +11,11 @@
  * - `owner`: the only active owner of the `northwind` organization, and a
  *   member of no organization the outsider belongs to.
  * - `developer`: an active developer of `northwind`.
+ * - `viewer`: an active viewer of `northwind`: read-only.
  * - `outsider`: an active owner of `larkspur`, and not a member of
  *   `northwind`.
  */
-export type Persona = "owner" | "developer" | "outsider";
+export type Persona = "owner" | "developer" | "viewer" | "outsider";
 
 export interface Target {
   /** Where the API is mounted; route paths are appended to it. */

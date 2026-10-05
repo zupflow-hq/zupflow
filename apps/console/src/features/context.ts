@@ -32,6 +32,11 @@ export function canAdminister(org: Organization) {
   return org.role === "owner" || org.role === "admin";
 }
 
+/** Whether the member may change anything at all: every role but the read-only viewer. */
+export function canChange(org: Organization) {
+  return org.role !== "viewer";
+}
+
 export function useDocumentTitle(...parts: (string | undefined | null)[]) {
   const title = [...parts.filter(Boolean), "Zupflow Console"].join(" · ");
   useEffect(() => {

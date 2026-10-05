@@ -5,7 +5,7 @@ import { AppIcon, QueryError, RowsSkeleton } from "@/components/app/misc";
 import { PageContainer, Panel, SectionHeader } from "@/components/app/page";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
+import { canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { useAgents, useInstallations, useRuns } from "@/features/queries";
 import { RunTable } from "@/features/runs/run-table";
 import { cn } from "@/lib/utils";
@@ -70,7 +70,7 @@ function WorkspaceOverview() {
               action={
                 <Button asChild size="sm" variant="outline">
                   <Link to="/$org/w/$ws/installations/$installationId" params={{ ...params, installationId: i.id }}>
-                    {ws.environment === "production" ? "View" : "Reconnect"}
+                    {ws.environment === "production" || !canChange(org) ? "View" : "Reconnect"}
                   </Link>
                 </Button>
               }
@@ -95,7 +95,7 @@ function WorkspaceOverview() {
         </div>
       )}
 
-      {isEmpty ? (
+      {isEmpty && canChange(org) ? (
         <QuickStart
           orgSlug={org.slug}
           wsId={ws.id}

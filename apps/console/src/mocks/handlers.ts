@@ -14,6 +14,7 @@ import {
   type Environment,
   type Id,
   type IdKind,
+  MemberRole,
   type ModelOption,
   type OrganizationId,
   RUN_STATUSES,
@@ -37,6 +38,7 @@ import {
   body,
   configurationStatus,
   created,
+  DEVELOPERS,
   findSessionByReferenceCrossTenant,
   noContent,
   notFound,
@@ -669,7 +671,7 @@ export function createHandlers(apiBase: string) {
           request,
           z.object({
             email: z.string().trim().toLowerCase().email("Enter a valid email address."),
-            role: z.enum(["owner", "admin", "developer"]),
+            role: MemberRole,
           }),
         );
         if (input.role === "owner" && access.membership.role !== "owner") {
@@ -711,7 +713,7 @@ export function createHandlers(apiBase: string) {
       route(async ({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
         requireRole(access, ["owner"], "change roles");
-        const input = await body(request, z.object({ role: z.enum(["owner", "admin", "developer"]) }));
+        const input = await body(request, z.object({ role: MemberRole }));
         const member = db().memberships.find(
           (m) => m.organization_id === access.org.id && m.id === idParam(params, "member"),
         );
@@ -1167,6 +1169,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/installations/:inst"),
       route(async ({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
+        requireRole(access, DEVELOPERS, "rename installations");
         const row = findInstallation(access, idParam(params, "inst"));
         const input = await body(request, z.object({ label: name(40) }));
         row.label = input.label;
@@ -1179,6 +1182,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/installations/:inst/disconnect"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
+        requireRole(access, DEVELOPERS, "disconnect installations");
         const row = findInstallation(access, idParam(params, "inst"));
         row.status = "disconnected";
         row.updated_at = new Date().toISOString();
@@ -1242,6 +1246,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/connect-sessions"),
       route(async ({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
+        requireRole(access, DEVELOPERS, "start Connect sessions");
         assertConsoleMayAct(access, "connect accounts");
         const input = await body(
           request,
@@ -1441,6 +1446,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/agents"),
       route(async ({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
+        requireRole(access, DEVELOPERS, "create agents");
         const input = await body(
           request,
           z.object({
@@ -1478,6 +1484,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/agents/:agent"),
       route(async ({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
+        requireRole(access, DEVELOPERS, "change agents");
         const row = findAgent(access, idParam(params, "agent"));
         const input = await body(
           request,
@@ -1508,6 +1515,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/agents/:agent"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
+        requireRole(access, DEVELOPERS, "delete agents");
         const row = findAgent(access, idParam(params, "agent"));
         const d = db();
         d.grants = d.grants.filter((g) => !(inWorkspace(g, access.workspace) && g.agent_id === row.id));
@@ -1535,6 +1543,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/agents/:agent/grants"),
       route(async ({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
+        requireRole(access, DEVELOPERS, "grant access");
         const agent = findAgent(access, idParam(params, "agent"));
         const input = await body(
           request,
@@ -1585,6 +1594,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/agents/:agent/grants/:grant"),
       route(async ({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
+        requireRole(access, DEVELOPERS, "change access");
         const agent = findAgent(access, idParam(params, "agent"));
         const grant = db().grants.find(
           (g) => inWorkspace(g, access.workspace) && g.agent_id === agent.id && g.id === idParam(params, "grant"),
@@ -1615,6 +1625,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/agents/:agent/grants/:grant"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
+        requireRole(access, DEVELOPERS, "remove access");
         const agent = findAgent(access, idParam(params, "agent"));
         const d = db();
         const grant = d.grants.find(
@@ -1710,6 +1721,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/agents/:agent/runs"),
       route(async ({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
+        requireRole(access, DEVELOPERS, "start runs");
         assertConsoleMayAct(access, "start runs");
         const agent = findAgent(access, idParam(params, "agent"));
         if (agent.status === "paused") {
@@ -1772,6 +1784,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/runs/:run/cancel"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
+        requireRole(access, DEVELOPERS, "cancel runs");
         const run = findRun(access, idParam(params, "run"));
         if (TERMINAL_RUN_STATUSES.includes(run.status)) {
           throw new ApiFailure(409, "run_finished", "This run already finished.");
@@ -1904,6 +1917,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/organizations/:org/api-keys"),
       route(async ({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
+        requireRole(access, DEVELOPERS, "create API keys");
         const input = await body(request, z.object({ name: name(), environment }));
         if (input.environment === "production") requireRole(access, ADMINS, "create Production keys");
         const live = input.environment === "production";
@@ -1937,6 +1951,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/organizations/:org/api-keys/:key/revoke"),
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
+        requireRole(access, DEVELOPERS, "revoke API keys");
         const row = db().api_keys.find((k) => k.organization_id === access.org.id && k.id === idParam(params, "key"));
         if (!row) throw notFound("API key");
         if (row.environment === "production") requireRole(access, ADMINS, "revoke Production keys");
@@ -2049,6 +2064,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/organizations/:org/webhooks/:hook/test"),
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
+        requireRole(access, ADMINS, "send test events");
         const endpoint = db().webhooks.find(
           (w) => w.organization_id === access.org.id && w.id === idParam(params, "hook"),
         );

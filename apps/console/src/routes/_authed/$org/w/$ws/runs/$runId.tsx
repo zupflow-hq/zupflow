@@ -9,7 +9,7 @@ import { PageContainer, Panel, Properties, Property, SectionHeader } from "@/com
 import { RunStatusPill } from "@/components/app/status";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
+import { canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { useCancelRun, useRun, useRunEvents } from "@/features/queries";
 import { RunTimeline } from "@/features/runs/timeline";
 import { useDetailCrumb } from "@/lib/crumbs";
@@ -74,7 +74,7 @@ function RunPage() {
             </>
           )}
         </div>
-        {r && !TERMINAL_RUN_STATUSES.includes(r.status) ? (
+        {r && !TERMINAL_RUN_STATUSES.includes(r.status) && canChange(org) ? (
           <Button variant="outline" onClick={() => setCancelling(true)}>
             <BanIcon />
             Cancel run

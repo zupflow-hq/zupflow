@@ -148,6 +148,7 @@ contractSuite({
     `mock_${{
       owner: () => DEMO_USER_ID,
       developer: () => userByEmail("sam@northwind.example"),
+      viewer: () => userByEmail("alex@northwind.example"),
       outsider: () => userByEmail("rowan@larkspur.example"),
     }[persona]()}`,
   reset: async () => resetDb(),
