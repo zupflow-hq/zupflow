@@ -20,10 +20,11 @@ packages/
   brand/          B1 Precision brand kit (SVG/PNG/ICO) and usage notes
 server/           The Rust backend — a Cargo workspace
   crates/zupflow-core/        Shared types and the external-resource traits: typed IDs, API errors, scopes,
-                              KeyService, Cache, ObjectStore, EventBus, JobQueue
+                              KeyService, Cache, ObjectStore, EventBus, JobQueue, Identity,
+                              the organizations store
   crates/zupflow-basic/       The basic implementations: local keys, an in-memory cache, local files,
-                              an in-process event bus
-  crates/zupflow-sqlite/      The basic database: SQLite, its migrations, the database-backed job queue
+                              an in-process event bus, local sign-in
+  crates/zupflow-sqlite/      The basic database: SQLite, its migrations, the stores, the job queue
   crates/zupflow-conformance/ The suites every implementation of a trait must pass
   crates/zupflow-server/      The API server (`zupflow` binary), on axum
 ```
@@ -55,11 +56,24 @@ picks it up).
 pnpm --filter @zupflow/server dev   # or: cd server && cargo run --bin zupflow
 ```
 
-It listens on `127.0.0.1:8080` (`ZUPFLOW_LISTEN`) and logs JSON
-(`ZUPFLOW_LOG`, a tracing filter). An invalid, empty or non-UTF-8 value stops
-startup rather than falling back. So far it serves `/health` and `/ready`; every
-other path answers the API's `404` envelope, and an unsupported method on a
-served path the `405` one.
+It listens on `127.0.0.1:8080` (`ZUPFLOW_LISTEN`), keeps its data in one
+SQLite file (`ZUPFLOW_DATABASE`, default `zupflow.db`, created readable by its
+owner only) and logs JSON (`ZUPFLOW_LOG`, a tracing filter). An invalid, empty
+or non-UTF-8 value stops startup rather than falling back.
+
+Console sign-in is `ZUPFLOW_IDENTITY=local` for now: no sign-in, every Console
+request is one built-in owner (`owner@local.invalid`). Because that trusts
+anyone who can reach the port, the server refuses to start with it on
+anything but a loopback address, and answers only requests addressed to
+`localhost`, `127.0.0.1` or `[::1]` and its port, so a web page can't reach it
+through DNS rebinding. Browser requests must come from an allowed origin: the
+server's own, or one listed in `ZUPFLOW_ALLOWED_ORIGINS` (comma-separated,
+like `http://localhost:5173`). Request bodies must be `application/json`.
+`oidc` comes next.
+
+So far it serves `/health`, `/ready`, `/v1/me`, organizations and members;
+every other path answers the API's `404` envelope, and an unsupported method
+on a served path the `405` one.
 
 ## Checks
 

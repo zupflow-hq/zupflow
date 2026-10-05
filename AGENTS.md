@@ -87,6 +87,16 @@ Read `README.md` first.
   Every statement after the trust context repeats the full scope, even next to
   a unique ID; the few that can't (a worker's claim) are named and documented
   as cross-tenant.
+- Console routes take `ConsoleUser` first (401 before anything is parsed),
+  then resolve their organization with `OrganizationAccess::resolve` (a
+  malformed ID, a missing organization and a non-member all answer the same
+  404), then check the role. Rules that must hold across concurrent changes
+  are checked inside the store's transaction, not only before it: the acting
+  member's current role (passed as their member ID and read again), owners
+  removed only by owners, and the last active owner.
+- Request bodies go through `input::Body` (JSON only, 64 KiB), and every
+  request through `guard`, which refuses foreign origins and, with `local`
+  sign-in, non-loopback hosts. Don't add a route that reads a body another way.
 - Background work goes through `JobQueue`: claim with a lease, then finish,
   retry or bury naming the job's scope and lease. Delivery is at least once,
   so handlers are idempotent; payloads carry references, never secrets.

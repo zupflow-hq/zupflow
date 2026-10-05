@@ -3,6 +3,7 @@
 //! silently.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -10,6 +11,20 @@ pub struct Config {
     pub listen: SocketAddr,
     /// `ZUPFLOW_LOG`: a tracing filter, e.g. `info` or `zupflow_server=debug`.
     pub log: String,
+    /// `ZUPFLOW_DATABASE`: the SQLite file. Defaults to `zupflow.db` in the
+    /// working directory; created if missing.
+    pub database: PathBuf,
+    /// `ZUPFLOW_IDENTITY`: how the Console signs in. Only `local` so far.
+    pub identity: IdentityMode,
+    /// `ZUPFLOW_ALLOWED_ORIGINS`: comma-separated origins a browser may call
+    /// the API from, like `http://localhost:5173`. Empty by default.
+    pub allowed_origins: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityMode {
+    /// No sign-in: every Console request is the built-in owner. Loopback only.
+    Local,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -20,6 +35,16 @@ pub enum ConfigError {
     Empty { name: &'static str },
     #[error("{name} isn't valid UTF-8")]
     NotUnicode { name: &'static str },
+    #[error("ZUPFLOW_ALLOWED_ORIGINS must be comma-separated origins like http://localhost:5173, with no path")]
+    InvalidOrigins,
+    #[error("ZUPFLOW_IDENTITY must be `local`; `oidc` isn't available yet")]
+    UnknownIdentity,
+    /// `local` lets anyone who reaches the server in as the owner.
+    #[error(
+        "ZUPFLOW_IDENTITY=local signs every Console request in as the owner, so it only runs on a loopback \
+         address (127.0.0.1 or ::1); set ZUPFLOW_LISTEN to one"
+    )]
+    LocalNeedsLoopback,
 }
 
 /// A variable's value: `None` when unset, an error when set to something unreadable.
@@ -41,7 +66,33 @@ impl Config {
             None => SocketAddr::from(([127, 0, 0, 1], 8080)),
         };
         let log = set("ZUPFLOW_LOG")?.unwrap_or_else(|| "info".to_owned());
-        Ok(Self { listen, log })
+        let database = set("ZUPFLOW_DATABASE")?.map_or_else(|| PathBuf::from("zupflow.db"), PathBuf::from);
+        let identity = match set("ZUPFLOW_IDENTITY")?.as_deref() {
+            None | Some("local") => IdentityMode::Local,
+            Some(_) => return Err(ConfigError::UnknownIdentity),
+        };
+        if identity == IdentityMode::Local && !listen.ip().is_loopback() {
+            return Err(ConfigError::LocalNeedsLoopback);
+        }
+        let allowed_origins = match set("ZUPFLOW_ALLOWED_ORIGINS")? {
+            None => Vec::new(),
+            Some(value) => value
+                .split(',')
+                .map(str::trim)
+                .map(|origin| {
+                    valid_origin(origin)
+                        .then(|| origin.to_owned())
+                        .ok_or(ConfigError::InvalidOrigins)
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        Ok(Self {
+            listen,
+            log,
+            database,
+            identity,
+            allowed_origins,
+        })
     }
 
     pub fn from_env() -> Result<Self, ConfigError> {
@@ -53,6 +104,20 @@ impl Config {
     }
 }
 
+/// `http(s)://host[:port]`: a scheme, a host, and nothing after it.
+fn valid_origin(origin: &str) -> bool {
+    let rest = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"));
+    rest.is_some_and(|rest| {
+        !rest.is_empty()
+            && !rest.contains('/')
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,6 +127,34 @@ mod tests {
         let config = Config::from_vars(|_| Ok(None)).expect("defaults are valid");
         assert_eq!(config.listen, SocketAddr::from(([127, 0, 0, 1], 8080)));
         assert_eq!(config.log, "info");
+        assert_eq!(config.database, PathBuf::from("zupflow.db"));
+        assert_eq!(config.identity, IdentityMode::Local);
+    }
+
+    #[test]
+    fn refuses_local_sign_in_beyond_loopback() {
+        for address in ["0.0.0.0:8080", "[::]:8080", "192.168.1.5:8080"] {
+            let config = Config::from_vars(|name| Ok((name == "ZUPFLOW_LISTEN").then(|| address.to_owned())));
+            assert!(matches!(config, Err(ConfigError::LocalNeedsLoopback)), "{address}");
+        }
+        for address in ["127.0.0.1:9000", "[::1]:9000"] {
+            let config = Config::from_vars(|name| Ok((name == "ZUPFLOW_LISTEN").then(|| address.to_owned())));
+            assert!(config.is_ok(), "{address}");
+        }
+        let origins = |value: &'static str| {
+            Config::from_vars(move |name| Ok((name == "ZUPFLOW_ALLOWED_ORIGINS").then(|| value.to_owned())))
+        };
+        assert_eq!(
+            origins("http://localhost:5173, https://console.example")
+                .expect("valid origins")
+                .allowed_origins,
+            ["http://localhost:5173", "https://console.example"]
+        );
+        for bad in ["localhost:5173", "http://x/path", "*", "http://"] {
+            assert!(matches!(origins(bad), Err(ConfigError::InvalidOrigins)), "{bad}");
+        }
+        let unknown = Config::from_vars(|name| Ok((name == "ZUPFLOW_IDENTITY").then(|| "none".to_owned())));
+        assert!(matches!(unknown, Err(ConfigError::UnknownIdentity)));
     }
 
     #[test]

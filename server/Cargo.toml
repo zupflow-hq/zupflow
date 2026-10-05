@@ -36,6 +36,7 @@ uuid = { version = "1", features = ["v7"] }
 zupflow-basic = { path = "crates/zupflow-basic" }
 zupflow-conformance = { path = "crates/zupflow-conformance" }
 zupflow-core = { path = "crates/zupflow-core" }
+zupflow-sqlite = { path = "crates/zupflow-sqlite" }
 
 # Test-only
 http-body-util = "0.1"

@@ -1,10 +1,15 @@
 //! `zupflow`: runs the API server.
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
-use zupflow_server::config::Config;
+use zupflow_basic::local_identity::LocalIdentity;
+use zupflow_core::identity::Identity;
+use zupflow_server::config::{Config, IdentityMode};
+use zupflow_server::{AppState, RequestGuard};
+use zupflow_sqlite::{Database, SqliteOrganizationStore};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -22,6 +27,30 @@ async fn main() -> ExitCode {
     };
     tracing_subscriber::fmt().json().with_env_filter(filter).init();
 
+    let database = match Database::open(&config.database).await {
+        Ok(database) => database,
+        Err(error) => {
+            tracing::error!(event = "server.database_failed", path = %config.database.display(), error = %error, cause = ?std::error::Error::source(&error));
+            return ExitCode::FAILURE;
+        }
+    };
+    let identity: Arc<dyn Identity> = match config.identity {
+        IdentityMode::Local => {
+            tracing::warn!(
+                event = "server.local_identity",
+                "Console sign-in is off: every Console request is the built-in owner"
+            );
+            Arc::new(LocalIdentity)
+        }
+    };
+    let guard = match config.identity {
+        IdentityMode::Local => RequestGuard::local(config.listen.port(), &config.allowed_origins),
+    };
+    let state = AppState {
+        identity,
+        organizations: Arc::new(SqliteOrganizationStore::new(database)),
+    };
+
     let listener = match TcpListener::bind(config.listen).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -30,7 +59,7 @@ async fn main() -> ExitCode {
         }
     };
     tracing::info!(event = "server.listening", address = %config.listen);
-    if let Err(error) = axum::serve(listener, zupflow_server::app())
+    if let Err(error) = axum::serve(listener, zupflow_server::app(state, guard))
         .with_graceful_shutdown(shutdown())
         .await
     {

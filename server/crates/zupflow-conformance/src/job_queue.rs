@@ -262,7 +262,12 @@ async fn reclaims_after_a_lost_lease_and_refuses_the_old_holder(queue: &dyn JobQ
         .unwrap();
     let first = claim(queue, &kind).await.unwrap();
     tokio::time::sleep(PAST_LEASE).await;
-    let second = claim(queue, &kind).await.expect("claimed again once the lease ran out");
+    // A long lease, so the calls below can't outlast it on a slow adapter.
+    let second = queue
+        .claim_next(std::slice::from_ref(&kind), LONG)
+        .await
+        .unwrap()
+        .expect("claimed again once the lease ran out");
     assert_eq!(second.id, first.id);
     assert_eq!(second.attempt, 2, "as its next attempt");
     assert_ne!(second.lease, first.lease, "with a new lease");

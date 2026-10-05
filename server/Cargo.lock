@@ -1990,16 +1990,21 @@ dependencies = [
 name = "zupflow-server"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "axum",
  "http-body-util",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror",
  "tokio",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+ "zupflow-basic",
  "zupflow-core",
+ "zupflow-sqlite",
 ]
 
 [[package]]

@@ -14,3 +14,4 @@ mod imitations;
 pub mod job_queue;
 pub mod key_service;
 pub mod object_store;
+pub mod organization_store;

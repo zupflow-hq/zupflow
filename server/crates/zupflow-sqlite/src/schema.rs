@@ -19,12 +19,19 @@ enum Scoping {
     /// Starts `id UUID NOT NULL PRIMARY KEY, organization_id UUID NOT NULL, workspace_id UUID NOT NULL`.
     #[allow(dead_code)]
     Workspace,
+    /// Not tenant data, declared by name: users, who belong to many
+    /// organizations, and the identities they sign in with. Holds no
+    /// organization or workspace column and references no scoped table.
+    Global,
 }
 
 const TABLES: &[(&str, Scoping)] = &[
     ("organizations", Scoping::Root),
     ("workspaces", Scoping::Organization),
     ("jobs", Scoping::Organization),
+    ("users", Scoping::Global),
+    ("user_identities", Scoping::Global),
+    ("members", Scoping::Organization),
 ];
 
 struct Column {
@@ -165,6 +172,11 @@ async fn holds_every_table_to_the_isolation_rules() {
     }
     assert_eq!(actual.len(), TABLES.len(), "every declared table exists");
 
+    let global: HashSet<&str> = TABLES
+        .iter()
+        .filter(|(_, scoping)| matches!(scoping, Scoping::Global))
+        .map(|(name, _)| *name)
+        .collect();
     let workspace_scoped: HashSet<&str> = TABLES
         .iter()
         .filter(|(_, scoping)| matches!(scoping, Scoping::Workspace))
@@ -176,6 +188,22 @@ async fn holds_every_table_to_the_isolation_rules() {
         let keys = foreign_keys(&database, table).await;
         match scoping {
             Scoping::Root => starts_with(table, &columns, &["id"]),
+            Scoping::Global => {
+                for column in &columns {
+                    assert!(
+                        column.name != "organization_id" && column.name != "workspace_id",
+                        "{table} is global, so it holds no {}",
+                        column.name
+                    );
+                }
+                for key in &keys {
+                    assert!(
+                        global.contains(key.parent.as_str()),
+                        "{table} is global, so it references only global tables, not {}",
+                        key.parent
+                    );
+                }
+            }
             Scoping::Organization => {
                 starts_with(table, &columns, &["id", "organization_id"]);
                 assert!(
@@ -203,7 +231,7 @@ async fn holds_every_table_to_the_isolation_rules() {
         // than the root carries the organization, and the workspace too when
         // the parent is workspace-scoped.
         for key in &keys {
-            if key.parent == "organizations" {
+            if key.parent == "organizations" || global.contains(key.parent.as_str()) {
                 continue;
             }
             assert!(

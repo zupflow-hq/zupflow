@@ -8,15 +8,21 @@
 //! - [`storage`]: the [`storage::Cache`] and [`storage::ObjectStore`] traits.
 //! - [`events`]: the [`events::EventBus`] trait.
 //! - [`jobs`]: the [`jobs::JobQueue`] trait.
+//! - [`identity`]: Console sign-in, the [`identity::Identity`] trait.
+//! - [`organizations`]: organizations, members and users, and their store.
+//! - [`time`]: instants as stored and as the API writes them.
 
 pub mod environment;
 pub mod error;
 pub mod events;
+pub mod identity;
 pub mod ids;
 pub mod jobs;
 pub mod keys;
+pub mod organizations;
 pub mod scope;
 pub mod storage;
+pub mod time;
 
 /// Typed IDs make scope mistakes fail to compile. Swapping the organization
 /// and the workspace doesn't compile:
