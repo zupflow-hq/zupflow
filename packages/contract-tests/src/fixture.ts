@@ -7,6 +7,7 @@ export interface Fixture {
   /** The outsider's own organization. */
   otherOrganization: OrganizationId;
   workspaces: { acme: Workspace; acmeSandbox: Workspace; qaPlayground: Workspace };
+  /** Throws, when read, whatever kept the apps from loading (a server that doesn't serve apps yet). */
   apps: { googleWorkspace: AppId; linear: AppId; notion: AppId; echoServer: AppId };
 }
 
@@ -50,22 +51,33 @@ export async function loadFixture(
     workspace("acme-sandbox"),
     workspace("qa-playground"),
   ]);
-  const catalog = await client.organizationApps.list(organization);
-  const own = await client.workspaceApps.list(qaPlayground.id);
-  const app = (apps: typeof catalog, slug: string) =>
-    must(
-      apps.find((a) => a.slug === slug),
-      `app ${slug}`,
-    ).id;
-  return {
-    organization,
-    otherOrganization,
-    workspaces: { acme, acmeSandbox, qaPlayground },
-    apps: {
+  const loadApps = async (): Promise<Fixture["apps"]> => {
+    const catalog = await client.organizationApps.list(organization);
+    const own = await client.workspaceApps.list(qaPlayground.id);
+    const app = (apps: typeof catalog, slug: string) =>
+      must(
+        apps.find((a) => a.slug === slug),
+        `app ${slug}`,
+      ).id;
+    return {
       googleWorkspace: app(catalog, "google-workspace"),
       linear: app(catalog, "linear"),
       notion: app(catalog, "notion"),
       echoServer: app(own, "echo-server"),
+    };
+  };
+  // Kept as a promise's outcome, so a case that never touches apps runs on a server without them.
+  const apps = await loadApps().then(
+    (loaded) => ({ loaded }),
+    (error: unknown) => ({ error }),
+  );
+  return {
+    organization,
+    otherOrganization,
+    workspaces: { acme, acmeSandbox, qaPlayground },
+    get apps() {
+      if ("error" in apps) throw apps.error;
+      return apps.loaded;
     },
   };
 }

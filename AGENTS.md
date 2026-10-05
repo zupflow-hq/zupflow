@@ -117,6 +117,10 @@ Read `README.md` first.
   shows a secret once goes in `SHOWS_SECRET_ONCE`, and a `POST` route API keys
   can't call goes in `NOT_FOR_API_KEYS`; tests hold both equal to the
   contract.
+- A new route adds its `operationId` to `SERVED_OPERATIONS` (a test holds the
+  list equal to what the router answers), and what it needs to the reference
+  fixture in `zupflow-contract`'s `reset`. Then `pnpm contract:backend` runs
+  the shared suite's cases for it instead of skipping them.
 - Background work goes through `JobQueue`: claim with a lease, then finish,
   retry or bury naming the job's scope and lease. Delivery is at least once,
   so handlers are idempotent; payloads carry references, never secrets.

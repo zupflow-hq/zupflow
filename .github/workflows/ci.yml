@@ -28,3 +28,5 @@ jobs:
           workspaces: server
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
+      # The shared contract suite against the backend, on a fixture of its own.
+      - run: pnpm contract:backend

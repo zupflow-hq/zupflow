@@ -10,9 +10,13 @@
  * server under test never exposes a way to wipe its data. Turbo passes these
  * variables through (`turbo.json`) and keys its cache on them.
  *
+ * `ZUPFLOW_CONTRACT_OPERATIONS`, optional, lists the operations the server
+ * serves (comma-separated `operationId`s); a case that needs another is
+ * skipped and names it.
+ *
  * Without `ZUPFLOW_CONTRACT_URL` the suite is skipped; the mock runs it
- * in-process from the Console's tests. With it, every other variable is
- * required.
+ * in-process from the Console's tests. With it, every other variable but
+ * `ZUPFLOW_CONTRACT_OPERATIONS` is required.
  */
 import { execSync } from "node:child_process";
 import { describe, it } from "vitest";
@@ -34,8 +38,12 @@ if (url) {
     outsider: env("ZUPFLOW_CONTRACT_TOKEN_OUTSIDER"),
   };
   const reset = env("ZUPFLOW_CONTRACT_RESET_COMMAND");
+  const operations = process.env.ZUPFLOW_CONTRACT_OPERATIONS?.split(",")
+    .map((id) => id.trim())
+    .filter((id) => id !== "");
   contractSuite({
     baseUrl: url,
+    operations,
     token: async (persona) => tokens[persona],
     reset: async () => {
       execSync(reset, { stdio: "inherit" });

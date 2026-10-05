@@ -26,6 +26,12 @@ export interface Target {
   reset(): Promise<void>;
   /** The fetch to use; defaults to the global one. */
   fetch?: typeof fetch;
+  /**
+   * The operations the server serves, by `operationId`; all of them when
+   * omitted. A case that needs another is skipped and names it, and the suite
+   * never sends that request.
+   */
+  operations?: readonly string[];
 }
 
 /**

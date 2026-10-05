@@ -2675,6 +2675,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "zupflow-contract"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "sqlx",
+ "tokio",
+ "zupflow-core",
+ "zupflow-server",
+ "zupflow-sqlite",
+]
+
+[[package]]
 name = "zupflow-core"
 version = "0.0.0"
 dependencies = [

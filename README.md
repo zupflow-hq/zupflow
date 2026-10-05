@@ -26,6 +26,7 @@ server/           The Rust backend — a Cargo workspace
                               an in-process event bus, local sign-in
   crates/zupflow-sqlite/      The basic database: SQLite, its migrations, the stores, the job queue
   crates/zupflow-oidc/        Console sign-in through any OpenID Connect provider
+  crates/zupflow-contract/    Development only: the server and fixture the contract suite runs against
   crates/zupflow-conformance/ The suites every implementation of a trait must pass
   crates/zupflow-server/      The API server (`zupflow` binary), on axum
 ```
@@ -90,6 +91,18 @@ So far it serves `/health`, `/ready`, `/v1/me`, organizations, members,
 workspaces and API keys;
 every other path answers the API's `404` envelope, and an unsupported method
 on a served path the `405` one.
+
+### The contract suite against the backend
+
+```bash
+pnpm contract:backend
+```
+
+Runs the shared contract suite (the same cases the mock passes) against the
+backend: it builds the development-only `zupflow-contract-server`, restores
+the reference fixture into a throwaway database, serves it on loopback and
+points the suite at it. Cases that need an operation the backend doesn't serve
+yet are skipped, each naming the operation. CI runs it after `pnpm check`.
 
 ## Checks
 

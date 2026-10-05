@@ -3,6 +3,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -48,4 +50,49 @@ fn knows_every_post_route_an_api_key_cannot_call() {
         .map(|path| (*path).to_owned())
         .collect();
     assert_eq!(known, not_for_keys);
+}
+
+/// `SERVED_OPERATIONS` is exactly what the router answers: asked without a
+/// credential, a served route answers 401 and any other contract route the
+/// API's 404 or 405, so the list can't claim a route that isn't there or miss
+/// one that is.
+#[tokio::test]
+async fn serves_exactly_the_operations_it_lists() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packages/contract/openapi.json");
+    let document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let server = common::Server::new().await;
+    let listed: BTreeSet<&str> = zupflow_server::SERVED_OPERATIONS.into_iter().collect();
+    let mut answered = BTreeSet::new();
+    let mut every = BTreeSet::new();
+    for (template, operations) in document["paths"].as_object().unwrap() {
+        for (method, operation) in operations.as_object().unwrap() {
+            let id = operation["operationId"].as_str().unwrap().to_owned();
+            every.insert(id.clone());
+            // Any value fills a parameter: the credential is checked before IDs are read.
+            let uri: String = template
+                .split('/')
+                .map(|segment| if segment.starts_with('{') { "x" } else { segment })
+                .collect::<Vec<_>>()
+                .join("/");
+            let request = axum::http::Request::builder()
+                .method(method.to_uppercase().as_str())
+                .uri(&uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = tower::ServiceExt::oneshot(server.app.clone(), request).await.unwrap();
+            match response.status().as_u16() {
+                401 => {
+                    answered.insert(id);
+                }
+                404 | 405 => {}
+                other => panic!("{method} {uri} answered {other}"),
+            }
+        }
+    }
+    let answered: BTreeSet<&str> = answered.iter().map(String::as_str).collect();
+    assert_eq!(listed, answered);
+    assert!(
+        listed.iter().all(|id| every.contains(*id)),
+        "every listed operation is in the contract"
+    );
 }

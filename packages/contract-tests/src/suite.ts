@@ -6,7 +6,7 @@
  * Call `contractSuite(target)` from a test file; see `Target` for what a
  * server provides and the reference fixture it loads.
  */
-import { routes, WEBHOOK_EVENT_TYPES } from "@zupflow/contract";
+import { matchRoute, routes, WEBHOOK_EVENT_TYPES } from "@zupflow/contract";
 import {
   type AgentId,
   type ApiKeyId,
@@ -19,10 +19,11 @@ import {
   ZupflowApiError,
   type ZupflowClient,
 } from "@zupflow/sdk";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it as vitestIt } from "vitest";
 import { createResponseChecker } from "./checker";
 import { type Fixture, loadFixture, must } from "./fixture";
 import { expectSealed, loadTenant, snapshotOf, type Tenant } from "./isolation";
+import { NotServed, notServedIn } from "./served";
 import type { Persona, Target } from "./target";
 
 async function failure(promise: Promise<unknown>) {
@@ -55,9 +56,35 @@ export const NOT_YET_COVERED: Record<string, string> = {
   resolveApproval: "Approvals come only from an API key, and the suite has no API-key credential yet.",
 };
 
+/**
+ * A case of the suite. One that needs an operation the target doesn't serve
+ * is skipped, naming the operation; it never fails or passes for it.
+ */
+function it(name: string, test: () => Promise<void>) {
+  vitestIt(name, async (context) => {
+    try {
+      await test();
+    } catch (error) {
+      const notServed = notServedIn(error);
+      if (notServed) context.skip(`needs ${notServed.operationId}, which this server doesn't serve yet`);
+      throw error;
+    }
+  });
+}
+
 export function contractSuite(target: Target) {
   describe("the contract suite", () => {
     const checker = createResponseChecker({ baseUrl: target.baseUrl, fetch: target.fetch });
+    const served = target.operations ? new Set(target.operations) : null;
+    const serves = (operationId: string) => served === null || served.has(operationId);
+    const base = new URL(target.baseUrl).pathname.replace(/\/$/, "");
+    /** The checked fetch, refusing to send a request for an operation the target doesn't serve. */
+    const servedFetch: typeof fetch = async (input, init) => {
+      const request = new Request(input, init);
+      const route = matchRoute(request.method, new URL(request.url).pathname.slice(base.length));
+      if (route && !serves(route.operationId)) throw new NotServed(route.operationId);
+      return checker.fetch(input, init);
+    };
     let fx: Fixture;
 
     const transportFor = (persona: Persona | null, organization: () => OrganizationId | null) =>
@@ -65,7 +92,9 @@ export function contractSuite(target: Target) {
         baseUrl: target.baseUrl,
         getToken: async () => (persona ? target.token(persona) : null),
         getOrganization: organization,
-        fetch: checker.fetch,
+        fetch: servedFetch,
+        // An operation the target doesn't serve is refused at once, not retried as a network error.
+        retries: 0,
       });
     /** A Console session acting in the persona's own organization: the outsider's is `larkspur`. */
     const as = (persona: Persona | null): ZupflowClient =>
@@ -117,132 +146,150 @@ export function contractSuite(target: Target) {
       const org = fx.organization;
       const { acme, acmeSandbox: sandbox, qaPlayground: qa } = fx.workspaces;
 
-      // Organization and workspace reads and writes.
-      await owner.me.get();
-      await owner.models.list();
-      await owner.organizations.create({ name: "Contract Co", slug: "contract-co" });
-      await owner.organizations.get(org);
-      await owner.organizations.update(org, { name: "Northwind" });
-      await owner.organizations.usage(org, "production");
-      await owner.members.list(org);
-      const invited = await owner.members.invite(org, { email: "contract@northwind.example", role: "developer" });
-      await owner.members.update(org, invited.id, { role: "admin" });
-      await owner.members.remove(org, invited.id);
-      await owner.workspaces.list(org, { environment: "production" });
-      const workspace = await owner.workspaces.create(org, {
-        name: "Contract",
-        slug: "contract",
-        environment: "sandbox",
-        external_id: null,
-      });
-      await owner.workspaces.get(workspace.id);
-      await owner.workspaces.update(workspace.id, { name: "Contract 2" });
-
-      // Apps, at both levels, including OAuth apps that have no endpoints yet.
-      const oauthApp = { kind: "mcp", description: "", auth_type: "oauth2" } as const;
-      await owner.organizationApps.list(org);
-      const orgApp = await owner.organizationApps.create(org, { ...oauthApp, name: "Org OAuth", slug: "org-oauth" });
-      await owner.organizationApps.get(org, orgApp.id);
-      await owner.organizationApps.update(org, orgApp.id, { description: "Changed" });
-      await owner.organizationApps.getConfiguration(org, orgApp.id, "sandbox");
-      await owner.organizationApps.updateConfiguration(org, orgApp.id, "sandbox", { oauth_client_id: "client" });
-      await owner.organizationApps.installations(org, orgApp.id);
-      await owner.workspaceApps.list(workspace.id);
-      const wsApp = await owner.workspaceApps.create(workspace.id, {
-        ...oauthApp,
-        name: "WS OAuth",
-        slug: "ws-oauth",
-      });
-      await owner.workspaceApps.get(workspace.id, wsApp.id);
-      await owner.workspaceApps.update(workspace.id, wsApp.id, { description: "Changed" });
-      await owner.workspaceApps.getConfiguration(workspace.id, wsApp.id);
-      await owner.workspaceApps.updateConfiguration(workspace.id, wsApp.id, { oauth_client_id: "client" });
-      await owner.workspaceApps.available(workspace.id);
-
-      // Installations and Connect, token and OAuth.
-      const installation = must((await owner.installations.list(sandbox.id))[0], "installation in acme-sandbox");
-      await owner.installations.get(sandbox.id, installation.id);
-      await owner.installations.update(sandbox.id, installation.id, { label: installation.label });
-      await owner.connectSessions.list(sandbox.id);
-      const session = (appId: AppId, workspaceId: WorkspaceId = qa.id) =>
-        owner.connectSessions.create(workspaceId, {
-          app_id: appId,
-          intent: "create",
-          label: "Contract",
-          installation_id: null,
-          return_url: null,
-        });
-      const tokenSession = await session(fx.apps.echoServer);
-      await owner.connectSessions.get(qa.id, tokenSession.id);
-      await owner.connect.get(referenceOf(tokenSession));
-      const connected = await owner.connect.submitCredentials(referenceOf(tokenSession), {
-        values: { token: "abc" },
-      });
-      await owner.connect.authorize(referenceOf(await session(fx.apps.googleWorkspace, sandbox.id)));
-      await owner.connect.cancel(referenceOf(await session(fx.apps.echoServer)));
-      await owner.installations.disconnect(qa.id, connected.installation.id);
-      await owner.installations.delete(qa.id, connected.installation.id);
-
-      // Agents, grants and runs.
-      const agent = must(
-        (await owner.agents.list(acme.id)).find((a) => a.status === "active"),
-        "active agent in acme",
-      );
-      const newAgent = await owner.agents.create(acme.id, {
-        name: "Contract",
-        description: "",
-        instructions: "Be brief.",
-        model: agent.model,
-      });
-      await owner.agents.get(acme.id, newAgent.id);
-      await owner.agents.update(acme.id, newAgent.id, { name: "Contract 2" });
-      const grant = must((await owner.grants.list(acme.id, agent.id))[0], "grant in acme");
-      await owner.grants.update(acme.id, agent.id, grant.id, {
-        tools: grant.tools,
-        approval_required: grant.approval_required,
-      });
-      // The new agent has no grants yet, so the existing grant's installation is free for it.
-      const newGrant = await owner.grants.create(acme.id, newAgent.id, {
-        installation_id: grant.installation_id,
-        tools: grant.tools.slice(0, 1),
-        approval_required: [],
-      });
-      await owner.grants.delete(acme.id, newAgent.id, newGrant.id);
-      await owner.agents.delete(acme.id, newAgent.id);
-      await owner.organizationRuns.list(org, { environment: "production" });
-      const run = must((await owner.runs.list(acme.id)).items[0], "run in acme");
-      await owner.runs.get(acme.id, run.id);
-      await owner.runs.events(acme.id, run.id);
-      const sandboxAgent = must(
-        (await owner.agents.list(sandbox.id)).find((a) => a.status === "active"),
-        "active agent in acme-sandbox",
-      );
-      const started = await owner.runs.create(sandbox.id, sandboxAgent.id, { input: "Hello" });
-      await owner.runs.cancel(sandbox.id, started.id);
-
-      // Organization settings.
-      await owner.connectSettings.get(org, "sandbox");
-      await owner.connectSettings.update(org, "sandbox", { return_urls: [], allowed_origins: [] });
-      await owner.apiKeys.list(org);
-      const key = await owner.apiKeys.create(org, { name: "Contract", environment: "sandbox" });
-      await owner.apiKeys.revoke(org, key.key.id);
-      await owner.webhooks.list(org);
-      const hook = await owner.webhooks.create(org, {
-        environment: "sandbox",
-        url: "https://hooks.northwind.example/zupflow",
-        description: "Contract",
-        events: ["run.completed"],
-      });
-      await owner.webhooks.update(org, hook.endpoint.id, { enabled: false });
-      await owner.webhooks.sendTest(org, hook.endpoint.id);
-      await owner.webhooks.delete(org, hook.endpoint.id);
-      await owner.audit.list(org);
-      await owner.workspaces.delete(workspace.id);
-
+      // A server that serves part of the API stops at the first operation it
+      // doesn't, so what every server has comes first: organizations,
+      // members, workspaces and API keys.
+      try {
+        await everyOperation();
+      } catch (error) {
+        if (!notServedIn(error)) throw error;
+      }
       const missed = routes
         .map((r) => r.operationId)
-        .filter((id) => !checker.succeeded.has(id) && !(id in NOT_YET_COVERED));
-      expect(missed, "operations with no checked success").toEqual([]);
+        .filter((id) => serves(id) && !checker.succeeded.has(id) && !(id in NOT_YET_COVERED));
+      expect(missed, "served operations with no checked success, or served after one that isn't").toEqual([]);
+
+      async function everyOperation() {
+        await owner.me.get();
+        await owner.organizations.create({ name: "Contract Co", slug: "contract-co" });
+        await owner.organizations.get(org);
+        await owner.organizations.update(org, { name: "Northwind" });
+        await owner.members.list(org);
+        const invited = await owner.members.invite(org, { email: "contract@northwind.example", role: "developer" });
+        await owner.members.update(org, invited.id, { role: "admin" });
+        await owner.members.remove(org, invited.id);
+        await owner.workspaces.list(org, { environment: "production" });
+        const workspace = await owner.workspaces.create(org, {
+          name: "Contract",
+          slug: "contract",
+          environment: "sandbox",
+          external_id: null,
+        });
+        await owner.workspaces.get(workspace.id);
+        await owner.workspaces.update(workspace.id, { name: "Contract 2" });
+        const spare = await owner.workspaces.create(org, {
+          name: "Spare",
+          slug: "spare",
+          environment: "sandbox",
+          external_id: null,
+        });
+        await owner.workspaces.delete(spare.id);
+        await owner.apiKeys.list(org);
+        const key = await owner.apiKeys.create(org, { name: "Contract", environment: "sandbox" });
+        await owner.apiKeys.revoke(org, key.key.id);
+
+        // The rest of the API.
+        await owner.models.list();
+        await owner.organizations.usage(org, "production");
+
+        // Apps, at both levels, including OAuth apps that have no endpoints yet.
+        const oauthApp = { kind: "mcp", description: "", auth_type: "oauth2" } as const;
+        await owner.organizationApps.list(org);
+        const orgApp = await owner.organizationApps.create(org, { ...oauthApp, name: "Org OAuth", slug: "org-oauth" });
+        await owner.organizationApps.get(org, orgApp.id);
+        await owner.organizationApps.update(org, orgApp.id, { description: "Changed" });
+        await owner.organizationApps.getConfiguration(org, orgApp.id, "sandbox");
+        await owner.organizationApps.updateConfiguration(org, orgApp.id, "sandbox", { oauth_client_id: "client" });
+        await owner.organizationApps.installations(org, orgApp.id);
+        await owner.workspaceApps.list(workspace.id);
+        const wsApp = await owner.workspaceApps.create(workspace.id, {
+          ...oauthApp,
+          name: "WS OAuth",
+          slug: "ws-oauth",
+        });
+        await owner.workspaceApps.get(workspace.id, wsApp.id);
+        await owner.workspaceApps.update(workspace.id, wsApp.id, { description: "Changed" });
+        await owner.workspaceApps.getConfiguration(workspace.id, wsApp.id);
+        await owner.workspaceApps.updateConfiguration(workspace.id, wsApp.id, { oauth_client_id: "client" });
+        await owner.workspaceApps.available(workspace.id);
+
+        // Installations and Connect, token and OAuth.
+        const installation = must((await owner.installations.list(sandbox.id))[0], "installation in acme-sandbox");
+        await owner.installations.get(sandbox.id, installation.id);
+        await owner.installations.update(sandbox.id, installation.id, { label: installation.label });
+        await owner.connectSessions.list(sandbox.id);
+        const session = (appId: AppId, workspaceId: WorkspaceId = qa.id) =>
+          owner.connectSessions.create(workspaceId, {
+            app_id: appId,
+            intent: "create",
+            label: "Contract",
+            installation_id: null,
+            return_url: null,
+          });
+        const tokenSession = await session(fx.apps.echoServer);
+        await owner.connectSessions.get(qa.id, tokenSession.id);
+        await owner.connect.get(referenceOf(tokenSession));
+        const connected = await owner.connect.submitCredentials(referenceOf(tokenSession), {
+          values: { token: "abc" },
+        });
+        await owner.connect.authorize(referenceOf(await session(fx.apps.googleWorkspace, sandbox.id)));
+        await owner.connect.cancel(referenceOf(await session(fx.apps.echoServer)));
+        await owner.installations.disconnect(qa.id, connected.installation.id);
+        await owner.installations.delete(qa.id, connected.installation.id);
+
+        // Agents, grants and runs.
+        const agent = must(
+          (await owner.agents.list(acme.id)).find((a) => a.status === "active"),
+          "active agent in acme",
+        );
+        const newAgent = await owner.agents.create(acme.id, {
+          name: "Contract",
+          description: "",
+          instructions: "Be brief.",
+          model: agent.model,
+        });
+        await owner.agents.get(acme.id, newAgent.id);
+        await owner.agents.update(acme.id, newAgent.id, { name: "Contract 2" });
+        const grant = must((await owner.grants.list(acme.id, agent.id))[0], "grant in acme");
+        await owner.grants.update(acme.id, agent.id, grant.id, {
+          tools: grant.tools,
+          approval_required: grant.approval_required,
+        });
+        // The new agent has no grants yet, so the existing grant's installation is free for it.
+        const newGrant = await owner.grants.create(acme.id, newAgent.id, {
+          installation_id: grant.installation_id,
+          tools: grant.tools.slice(0, 1),
+          approval_required: [],
+        });
+        await owner.grants.delete(acme.id, newAgent.id, newGrant.id);
+        await owner.agents.delete(acme.id, newAgent.id);
+        await owner.organizationRuns.list(org, { environment: "production" });
+        const run = must((await owner.runs.list(acme.id)).items[0], "run in acme");
+        await owner.runs.get(acme.id, run.id);
+        await owner.runs.events(acme.id, run.id);
+        const sandboxAgent = must(
+          (await owner.agents.list(sandbox.id)).find((a) => a.status === "active"),
+          "active agent in acme-sandbox",
+        );
+        const started = await owner.runs.create(sandbox.id, sandboxAgent.id, { input: "Hello" });
+        await owner.runs.cancel(sandbox.id, started.id);
+
+        // Organization settings.
+        await owner.connectSettings.get(org, "sandbox");
+        await owner.connectSettings.update(org, "sandbox", { return_urls: [], allowed_origins: [] });
+        await owner.webhooks.list(org);
+        const hook = await owner.webhooks.create(org, {
+          environment: "sandbox",
+          url: "https://hooks.northwind.example/zupflow",
+          description: "Contract",
+          events: ["run.completed"],
+        });
+        await owner.webhooks.update(org, hook.endpoint.id, { enabled: false });
+        await owner.webhooks.sendTest(org, hook.endpoint.id);
+        await owner.webhooks.delete(org, hook.endpoint.id);
+        await owner.audit.list(org);
+        await owner.workspaces.delete(workspace.id);
+      }
     });
 
     describe("authentication and membership", () => {
@@ -258,7 +305,8 @@ export function contractSuite(target: Target) {
             baseUrl: target.baseUrl,
             getToken: async () => "not-a-token-this-server-issued",
             getOrganization: () => fx.organization,
-            fetch: checker.fetch,
+            fetch: servedFetch,
+            retries: 0,
           }),
         );
         for (const call of [() => forged.me.get(), () => forged.workspaces.get(fx.workspaces.acme.id)]) {
@@ -958,10 +1006,15 @@ export function contractSuite(target: Target) {
         const reads = (c: ZupflowClient) => async () => {
           const acme = fx.workspaces.acme.id;
           const agents = await c.agents.list(acme);
+          // An API error is an answer to compare; anything else (an operation the
+          // server doesn't serve, a network failure) ends the case instead.
           const settled = async (p: Promise<unknown>) =>
             p.then(
               (v) => v,
-              (e: unknown) => (e instanceof ZupflowApiError ? e.code : e),
+              (e: unknown) => {
+                if (e instanceof ZupflowApiError) return e.code;
+                throw e;
+              },
             );
           return JSON.stringify(
             await Promise.all([
