@@ -14,17 +14,25 @@ pub struct Config {
     /// `ZUPFLOW_DATABASE`: the SQLite file. Defaults to `zupflow.db` in the
     /// working directory; created if missing.
     pub database: PathBuf,
-    /// `ZUPFLOW_IDENTITY`: how the Console signs in. Only `local` so far.
+    /// `ZUPFLOW_IDENTITY`: how the Console signs in, `local` (the default) or `oidc`.
     pub identity: IdentityMode,
     /// `ZUPFLOW_ALLOWED_ORIGINS`: comma-separated origins a browser may call
     /// the API from, like `http://localhost:5173`. Empty by default.
     pub allowed_origins: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentityMode {
     /// No sign-in: every Console request is the built-in owner. Loopback only.
     Local,
+    /// Any OpenID Connect provider: `ZUPFLOW_OIDC_ISSUER` and
+    /// `ZUPFLOW_OIDC_AUDIENCE` (the Console's client ID), and optionally
+    /// `ZUPFLOW_OIDC_JWKS_URL` instead of discovery.
+    Oidc {
+        issuer: String,
+        audience: String,
+        jwks_url: Option<String>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -37,8 +45,10 @@ pub enum ConfigError {
     NotUnicode { name: &'static str },
     #[error("ZUPFLOW_ALLOWED_ORIGINS must be comma-separated origins like http://localhost:5173, with no path")]
     InvalidOrigins,
-    #[error("ZUPFLOW_IDENTITY must be `local`; `oidc` isn't available yet")]
+    #[error("ZUPFLOW_IDENTITY must be `local` or `oidc`")]
     UnknownIdentity,
+    #[error("ZUPFLOW_IDENTITY=oidc needs {name}")]
+    Missing { name: &'static str },
     /// `local` lets anyone who reaches the server in as the owner.
     #[error(
         "ZUPFLOW_IDENTITY=local signs every Console request in as the owner, so it only runs on a loopback \
@@ -67,8 +77,14 @@ impl Config {
         };
         let log = set("ZUPFLOW_LOG")?.unwrap_or_else(|| "info".to_owned());
         let database = set("ZUPFLOW_DATABASE")?.map_or_else(|| PathBuf::from("zupflow.db"), PathBuf::from);
+        let required = |name: &'static str| set(name)?.ok_or(ConfigError::Missing { name });
         let identity = match set("ZUPFLOW_IDENTITY")?.as_deref() {
             None | Some("local") => IdentityMode::Local,
+            Some("oidc") => IdentityMode::Oidc {
+                issuer: required("ZUPFLOW_OIDC_ISSUER")?,
+                audience: required("ZUPFLOW_OIDC_AUDIENCE")?,
+                jwks_url: set("ZUPFLOW_OIDC_JWKS_URL")?,
+            },
             Some(_) => return Err(ConfigError::UnknownIdentity),
         };
         if identity == IdentityMode::Local && !listen.ip().is_loopback() {
@@ -153,6 +169,38 @@ mod tests {
         for bad in ["localhost:5173", "http://x/path", "*", "http://"] {
             assert!(matches!(origins(bad), Err(ConfigError::InvalidOrigins)), "{bad}");
         }
+        let oidc = |vars: &'static [(&'static str, &'static str)]| {
+            Config::from_vars(move |name| {
+                Ok(vars
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned()))
+            })
+        };
+        let configured = oidc(&[
+            ("ZUPFLOW_IDENTITY", "oidc"),
+            ("ZUPFLOW_LISTEN", "0.0.0.0:8080"),
+            ("ZUPFLOW_OIDC_ISSUER", "https://idp.example"),
+            ("ZUPFLOW_OIDC_AUDIENCE", "console"),
+        ])
+        .expect("oidc may listen beyond loopback");
+        assert_eq!(
+            configured.identity,
+            IdentityMode::Oidc {
+                issuer: "https://idp.example".to_owned(),
+                audience: "console".to_owned(),
+                jwks_url: None,
+            }
+        );
+        assert!(matches!(
+            oidc(&[
+                ("ZUPFLOW_IDENTITY", "oidc"),
+                ("ZUPFLOW_OIDC_ISSUER", "https://idp.example")
+            ]),
+            Err(ConfigError::Missing {
+                name: "ZUPFLOW_OIDC_AUDIENCE"
+            })
+        ));
         let unknown = Config::from_vars(|name| Ok((name == "ZUPFLOW_IDENTITY").then(|| "none".to_owned())));
         assert!(matches!(unknown, Err(ConfigError::UnknownIdentity)));
     }

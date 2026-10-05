@@ -25,6 +25,7 @@ server/           The Rust backend — a Cargo workspace
   crates/zupflow-basic/       The basic implementations: local keys, an in-memory cache, local files,
                               an in-process event bus, local sign-in
   crates/zupflow-sqlite/      The basic database: SQLite, its migrations, the stores, the job queue
+  crates/zupflow-oidc/        Console sign-in through any OpenID Connect provider
   crates/zupflow-conformance/ The suites every implementation of a trait must pass
   crates/zupflow-server/      The API server (`zupflow` binary), on axum
 ```
@@ -61,7 +62,7 @@ SQLite file (`ZUPFLOW_DATABASE`, default `zupflow.db`, created readable by its
 owner only) and logs JSON (`ZUPFLOW_LOG`, a tracing filter). An invalid, empty
 or non-UTF-8 value stops startup rather than falling back.
 
-Console sign-in is `ZUPFLOW_IDENTITY=local` for now: no sign-in, every Console
+Console sign-in defaults to `ZUPFLOW_IDENTITY=local`: no sign-in, every Console
 request is one built-in owner (`owner@local.invalid`). Because that trusts
 anyone who can reach the port, the server refuses to start with it on
 anything but a loopback address, and answers only requests addressed to
@@ -69,7 +70,14 @@ anything but a loopback address, and answers only requests addressed to
 through DNS rebinding. Browser requests must come from an allowed origin: the
 server's own, or one listed in `ZUPFLOW_ALLOWED_ORIGINS` (comma-separated,
 like `http://localhost:5173`). Request bodies must be `application/json`.
-`oidc` comes next.
+
+For a team, `ZUPFLOW_IDENTITY=oidc` signs the Console in through any OpenID
+Connect provider: set `ZUPFLOW_OIDC_ISSUER` (the `iss` of its tokens) and
+`ZUPFLOW_OIDC_AUDIENCE` (the Console's client ID), and optionally
+`ZUPFLOW_OIDC_JWKS_URL` to skip discovery. The server then verifies the
+provider's ID token as the bearer and may listen on any address. The
+open-source Console doesn't sign in with OIDC yet, and the server has no CORS
+yet: both arrive when the Console switches from the mock to the backend.
 
 So far it serves `/health`, `/ready`, `/v1/me`, organizations and members;
 every other path answers the API's `404` envelope, and an unsupported method

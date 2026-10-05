@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 use zupflow_basic::local_identity::LocalIdentity;
 use zupflow_core::identity::Identity;
+use zupflow_oidc::{OidcConfig, OidcIdentity};
 use zupflow_server::config::{Config, IdentityMode};
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{Database, SqliteOrganizationStore};
@@ -34,7 +35,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let identity: Arc<dyn Identity> = match config.identity {
+    let identity: Arc<dyn Identity> = match &config.identity {
         IdentityMode::Local => {
             tracing::warn!(
                 event = "server.local_identity",
@@ -42,9 +43,28 @@ async fn main() -> ExitCode {
             );
             Arc::new(LocalIdentity)
         }
+        IdentityMode::Oidc {
+            issuer,
+            audience,
+            jwks_url,
+        } => {
+            let config = OidcConfig {
+                issuer: issuer.clone(),
+                audience: audience.clone(),
+                jwks_url: jwks_url.clone(),
+            };
+            match OidcIdentity::new(config) {
+                Ok(oidc) => Arc::new(oidc),
+                Err(error) => {
+                    tracing::error!(event = "server.identity_failed", %error);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
     };
     let guard = match config.identity {
         IdentityMode::Local => RequestGuard::local(config.listen.port(), &config.allowed_origins),
+        IdentityMode::Oidc { .. } => RequestGuard::with_origins(&config.allowed_origins),
     };
     let state = AppState {
         identity,

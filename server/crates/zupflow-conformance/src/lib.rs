@@ -10,6 +10,7 @@
 
 pub mod cache;
 pub mod event_bus;
+pub mod identity;
 mod imitations;
 pub mod job_queue;
 pub mod key_service;

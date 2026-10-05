@@ -3,7 +3,7 @@
 //! user, and owns memberships and roles; no provider decides access.
 //!
 //! The open-source build ships `local` (no sign-in: one built-in owner, only
-//! on a loopback listener) and, later, `oidc`. API keys and Connect sessions
+//! on a loopback listener) and `oidc` (`zupflow-oidc`). API keys and Connect sessions
 //! never go through this trait.
 
 use async_trait::async_trait;
