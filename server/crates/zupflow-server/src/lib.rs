@@ -5,6 +5,7 @@
 //! directly.
 
 pub mod api_keys;
+pub mod apps;
 pub mod auth;
 pub mod config;
 pub mod guard;
@@ -24,7 +25,7 @@ pub use guard::RequestGuard;
 /// The contract's operations this server serves so far, by `operationId`. The
 /// shared contract suite skips, by name, any case that needs another one; a
 /// test holds this list equal to the routes the router actually answers.
-pub const SERVED_OPERATIONS: [&str; 16] = [
+pub const SERVED_OPERATIONS: [&str; 24] = [
     "getViewer",
     "createOrganization",
     "getOrganization",
@@ -41,6 +42,14 @@ pub const SERVED_OPERATIONS: [&str; 16] = [
     "listApiKeys",
     "createApiKey",
     "revokeApiKey",
+    "listOrganizationApps",
+    "createOrganizationApp",
+    "getOrganizationApp",
+    "updateOrganizationApp",
+    "listWorkspaceApps",
+    "createWorkspaceApp",
+    "getWorkspaceApp",
+    "updateWorkspaceApp",
 ];
 
 /// The whole HTTP surface. Every response under `/v1` is the envelope; the
@@ -53,6 +62,7 @@ pub fn app(state: AppState, guard: RequestGuard) -> Router {
         .merge(organizations::routes())
         .merge(api_keys::routes())
         .merge(workspaces::routes())
+        .merge(apps::routes())
         // Matched routes only, after routing, so the middleware knows the route's template.
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

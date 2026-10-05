@@ -147,8 +147,8 @@ export function contractSuite(target: Target) {
       const { acme, acmeSandbox: sandbox, qaPlayground: qa } = fx.workspaces;
 
       // A server that serves part of the API stops at the first operation it
-      // doesn't, so what every server has comes first: organizations,
-      // members, workspaces and API keys.
+      // doesn't, so what every server has comes first, in the order the
+      // backend builds it: organizations, members, workspaces, API keys, apps.
       try {
         await everyOperation();
       } catch (error) {
@@ -188,19 +188,12 @@ export function contractSuite(target: Target) {
         const key = await owner.apiKeys.create(org, { name: "Contract", environment: "sandbox" });
         await owner.apiKeys.revoke(org, key.key.id);
 
-        // The rest of the API.
-        await owner.models.list();
-        await owner.organizations.usage(org, "production");
-
         // Apps, at both levels, including OAuth apps that have no endpoints yet.
         const oauthApp = { kind: "mcp", description: "", auth_type: "oauth2" } as const;
         await owner.organizationApps.list(org);
         const orgApp = await owner.organizationApps.create(org, { ...oauthApp, name: "Org OAuth", slug: "org-oauth" });
         await owner.organizationApps.get(org, orgApp.id);
         await owner.organizationApps.update(org, orgApp.id, { description: "Changed" });
-        await owner.organizationApps.getConfiguration(org, orgApp.id, "sandbox");
-        await owner.organizationApps.updateConfiguration(org, orgApp.id, "sandbox", { oauth_client_id: "client" });
-        await owner.organizationApps.installations(org, orgApp.id);
         await owner.workspaceApps.list(workspace.id);
         const wsApp = await owner.workspaceApps.create(workspace.id, {
           ...oauthApp,
@@ -209,9 +202,18 @@ export function contractSuite(target: Target) {
         });
         await owner.workspaceApps.get(workspace.id, wsApp.id);
         await owner.workspaceApps.update(workspace.id, wsApp.id, { description: "Changed" });
+
+        // Their client configurations, then where they're offered and installed.
+        await owner.organizationApps.getConfiguration(org, orgApp.id, "sandbox");
+        await owner.organizationApps.updateConfiguration(org, orgApp.id, "sandbox", { oauth_client_id: "client" });
         await owner.workspaceApps.getConfiguration(workspace.id, wsApp.id);
         await owner.workspaceApps.updateConfiguration(workspace.id, wsApp.id, { oauth_client_id: "client" });
         await owner.workspaceApps.available(workspace.id);
+        await owner.organizationApps.installations(org, orgApp.id);
+
+        // The rest of the API.
+        await owner.models.list();
+        await owner.organizations.usage(org, "production");
 
         // Installations and Connect, token and OAuth.
         const installation = must((await owner.installations.list(sandbox.id))[0], "installation in acme-sandbox");

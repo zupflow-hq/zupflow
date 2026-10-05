@@ -2,6 +2,7 @@
 //!
 //! - [`Database`]: opens the file, sets it up and applies the migrations.
 //! - [`SqliteApiKeyStore`]: API keys, by keyed hash.
+//! - [`SqliteAppStore`]: catalog apps and workspace apps.
 //! - [`SqliteIdempotencyStore`]: idempotency keys for `POST`.
 //! - [`SqliteJobQueue`]: the job queue, in the same database.
 //! - [`SqliteOrganizationStore`]: organizations, members and users.
@@ -12,6 +13,7 @@
 //! holds every table to the tenant-isolation rules.
 
 mod api_keys;
+mod apps;
 mod database;
 mod idempotency;
 mod job_queue;
@@ -21,6 +23,7 @@ mod schema;
 mod workspaces;
 
 pub use api_keys::SqliteApiKeyStore;
+pub use apps::SqliteAppStore;
 pub use database::{Database, DatabaseError};
 pub use idempotency::SqliteIdempotencyStore;
 pub use job_queue::SqliteJobQueue;

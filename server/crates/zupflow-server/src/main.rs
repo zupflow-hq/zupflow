@@ -85,6 +85,7 @@ async fn main() -> ExitCode {
         identity,
         organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
         workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
+        apps: Arc::new(zupflow_sqlite::SqliteAppStore::new(database.clone())),
         api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
         api_key_hasher: Arc::new(ApiKeyHasher::new(secret_key)),
         idempotency: Arc::new(SqliteIdempotencyStore::new(database.clone())),

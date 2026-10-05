@@ -12,6 +12,8 @@
 //! `viewer` belong to `northwind`, `outsider` owns `larkspur`. `reset` runs
 //! beside a serving process, against the same database file.
 
+mod fixture_apps;
+
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -23,15 +25,16 @@ compile_error!("zupflow-contract is for development only and is never built for 
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use zupflow_core::api_keys::{ApiKeyHasher, ApiKeyStore, NewApiKey, NewSecret};
+use zupflow_core::apps::AppStore;
 use zupflow_core::environment::Environment;
 use zupflow_core::idempotency::Fingerprinter;
 use zupflow_core::identity::{Identity, IdentityError, Profile, VerifiedIdentity};
-use zupflow_core::ids::{ApiKeyId, OrganizationId, WorkspaceId};
+use zupflow_core::ids::{ApiKeyId, AppId, OrganizationId, WorkspaceId};
 use zupflow_core::organizations::{MemberRole, OrganizationStore, User};
 use zupflow_core::workspaces::{NewWorkspace, WorkspaceStore};
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{
-    Database, SqliteApiKeyStore, SqliteIdempotencyStore, SqliteOrganizationStore, SqliteWorkspaceStore,
+    Database, SqliteApiKeyStore, SqliteAppStore, SqliteIdempotencyStore, SqliteOrganizationStore, SqliteWorkspaceStore,
 };
 
 /// The personas, with the address each signs in with: people's names, as in
@@ -91,6 +94,7 @@ async fn serve(path: &str) -> Result<(), String> {
         identity: Arc::new(PersonaIdentity),
         organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
         workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
+        apps: Arc::new(SqliteAppStore::new(database.clone())),
         api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
         api_key_hasher: Arc::new(ApiKeyHasher::new(secret)),
         idempotency: Arc::new(SqliteIdempotencyStore::new(database)),
@@ -180,6 +184,7 @@ async fn reset(path: &str) -> Result<(), String> {
     pool.close().await;
 
     let workspaces = SqliteWorkspaceStore::new(database.clone());
+    let mut workspace_ids = Vec::new();
     for (organization, name, slug, environment) in [
         (northwind.id, "Acme", "acme", Environment::Production),
         (northwind.id, "Beta Labs", "beta-labs", Environment::Production),
@@ -194,10 +199,47 @@ async fn reset(path: &str) -> Result<(), String> {
             environment,
             external_id: None,
         };
-        workspaces
+        let created = workspaces
             .create_workspace(organization, WorkspaceId::generate(), &workspace)
             .await
             .map_err(|error| fail(slug)(&error))?;
+        workspace_ids.push((slug, created.id));
+    }
+    let workspace_id = |slug: &str| {
+        workspace_ids
+            .iter()
+            .find(|(each, _)| *each == slug)
+            .map(|(_, id)| *id)
+            .ok_or_else(|| format!("workspace {slug}"))
+    };
+
+    let apps = SqliteAppStore::new(database.clone());
+    for (organization, app) in [
+        (northwind.id, fixture_apps::google_workspace()?),
+        (northwind.id, fixture_apps::linear()?),
+        (northwind.id, fixture_apps::notion()?),
+        (larkspur.id, fixture_apps::linear()?),
+    ] {
+        apps.create_organization_app(organization, AppId::generate(), &app)
+            .await
+            .map_err(|error| fail(&app.slug)(&error))?;
+    }
+    for (organization, workspace, app) in [
+        (
+            northwind.id,
+            "acme",
+            fixture_apps::publishing("Acme Publishing", "AP", "acme-publishing", "cms.acme.example")?,
+        ),
+        (northwind.id, "qa-playground", fixture_apps::echo_server()?),
+        (
+            larkspur.id,
+            "harbor",
+            fixture_apps::publishing("Harbor Publishing", "HP", "harbor-publishing", "cms.harbor.example")?,
+        ),
+    ] {
+        apps.create_workspace_app(organization, workspace_id(workspace)?, AppId::generate(), &app)
+            .await
+            .map_err(|error| fail(&app.slug)(&error))?;
     }
 
     let secret = database

@@ -38,6 +38,8 @@ const TABLES: &[(&str, Scoping)] = &[
     ("idempotency_keys", Scoping::Organization),
     // A user's own keys for creating an organization, before there is one.
     ("user_idempotency_keys", Scoping::Global),
+    ("apps", Scoping::Organization),
+    ("workspace_apps", Scoping::Workspace),
 ];
 
 struct Column {

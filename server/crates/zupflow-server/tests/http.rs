@@ -63,6 +63,7 @@ impl Server {
             identity: Arc::new(TestIdentity),
             organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
             workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
+            apps: Arc::new(zupflow_sqlite::SqliteAppStore::new(database.clone())),
             api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
             idempotency: Arc::new(zupflow_sqlite::SqliteIdempotencyStore::new(database)),
             fingerprinter: Arc::new(zupflow_core::idempotency::Fingerprinter::new([7; 32])),

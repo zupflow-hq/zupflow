@@ -9,6 +9,7 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 
 pub mod api_key_store;
+pub mod app_store;
 pub mod cache;
 pub mod event_bus;
 pub mod idempotency_store;

@@ -2692,6 +2692,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "axum",
+ "serde_json",
  "sqlx",
  "tokio",
  "zupflow-core",
@@ -2783,6 +2784,7 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "getrandom 0.4.3",
+ "serde_json",
  "sqlx",
  "thiserror",
  "tokio",

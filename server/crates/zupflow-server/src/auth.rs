@@ -15,6 +15,7 @@ use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use zupflow_core::api_keys::{ApiKey, ApiKeyHasher, ApiKeyStore, SECRET_PREFIX};
+use zupflow_core::apps::AppStore;
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::idempotency::{Fingerprinter, IdempotencyStore};
@@ -32,6 +33,7 @@ pub struct AppState {
     pub identity: Arc<dyn Identity>,
     pub organizations: Arc<dyn OrganizationStore>,
     pub workspaces: Arc<dyn WorkspaceStore>,
+    pub apps: Arc<dyn AppStore>,
     pub api_keys: Arc<dyn ApiKeyStore>,
     pub api_key_hasher: Arc<ApiKeyHasher>,
     pub idempotency: Arc<dyn IdempotencyStore>,
