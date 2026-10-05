@@ -53,6 +53,20 @@ Read `README.md` first.
   A newly created API key or signing secret is shown once from the creating
   response and never stored by the Console.
 
+## Backend conventions (`server/`)
+
+- One Cargo workspace; `pnpm check` runs `cargo fmt --check`, `clippy` with
+  warnings denied, `cargo test` and `cargo build` through `@zupflow/server`.
+- IDs are `Id<K>` from `zupflow_core::ids` (`WorkspaceId`, `RunId`, …). Never
+  format, parse or store a prefixed ID by hand; storage holds the UUID. The
+  registry must equal the contract's (a test reads `openapi.json`).
+- Scope comes first: organization-scoped functions take the organization ID
+  first, workspace-scoped ones the organization then the workspace.
+- Errors are `ApiError` (status, stable code, message, fields); responses are
+  the envelope. Production code returns errors instead of panicking; no
+  `unwrap`, and `expect` only for true invariants with a reason.
+- Configuration is `ZUPFLOW_*`; an invalid value stops startup.
+
 ## Console conventions
 
 - Data flows SDK → `src/features/queries.ts` → pages. No `fetch` in features.

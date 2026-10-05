@@ -1,0 +1,13 @@
+{
+  "name": "@zupflow/server",
+  "version": "0.0.0",
+  "license": "Apache-2.0",
+  "private": true,
+  "description": "Runs the Rust backend's checks from the monorepo's pnpm check.",
+  "scripts": {
+    "typecheck": "cargo fmt --check && cargo clippy --workspace --all-targets --locked -- -D warnings",
+    "test": "cargo test --workspace --locked",
+    "build": "cargo build --workspace --locked",
+    "dev": "cargo run --bin zupflow"
+  }
+}

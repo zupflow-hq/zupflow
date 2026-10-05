@@ -11,5 +11,8 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.test.{ts,tsx}"],
+    // The shared contract suite's sweeps make hundreds of requests per case. The timeout is there to catch a
+    // hang, not a slow machine: CI runs these beside the Rust build on two cores.
+    testTimeout: 30_000,
   },
 });

@@ -5,9 +5,10 @@ product. Create an isolated workspace for each of your customers, connect their
 accounts, give an agent access to selected tools, and run it inside your own
 experience.
 
-This repository is the monorepo for the platform. Today it holds the developer
-**Console** and the TypeScript **SDK**, running against an in-browser mock of
-the API. The backend comes next; it must serve the same contracts.
+This repository is the monorepo for the platform: the developer **Console**,
+the TypeScript **SDK**, the API **contract**, and the Rust **backend**, which
+is being built against that contract. Until it serves the API, the Console runs
+against an in-browser mock of it.
 
 ```
 apps/
@@ -17,6 +18,9 @@ packages/
   contract-tests/ @zupflow/contract-tests — the black-box suite every server must pass
   sdk/            @zupflow/sdk — HTTP transport, typed resource client, verifyWebhook
   brand/          B1 Precision brand kit (SVG/PNG/ICO) and usage notes
+server/           The Rust backend — a Cargo workspace
+  crates/zupflow-core/    Shared types: typed prefixed IDs, API errors
+  crates/zupflow-server/  The API server (`zupflow` binary), on axum
 ```
 
 ## Getting started
@@ -37,11 +41,26 @@ With no `VITE_ZUPFLOW_API_URL` set, every request is served by the mock API in
 `apps/console/src/mocks` through a service worker. Data is kept in this
 browser's localStorage; **Reset demo data** in the user menu reseeds it.
 
+### The backend
+
+Requires Rust (the version is pinned in `server/rust-toolchain.toml`; rustup
+picks it up).
+
+```bash
+pnpm --filter @zupflow/server dev   # or: cd server && cargo run --bin zupflow
+```
+
+It listens on `127.0.0.1:8080` (`ZUPFLOW_LISTEN`) and logs JSON
+(`ZUPFLOW_LOG`, a tracing filter). An invalid, empty or non-UTF-8 value stops
+startup rather than falling back. So far it serves `/health` and `/ready`; every
+other path answers the API's `404` envelope, and an unsupported method on a
+served path the `405` one.
+
 ## Checks
 
 ```bash
-pnpm check        # Biome lint + format, typecheck, tests and build for every package
-pnpm test         # Vitest only
+pnpm check        # Biome lint + format, typecheck, tests and build for every package, Rust included
+pnpm test         # Vitest and cargo test
 pnpm format       # Apply Biome fixes
 ```
 

@@ -1,0 +1,19 @@
+[package]
+name = "zupflow-core"
+description = "Types every part of the Zupflow backend shares: typed IDs and API errors."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
