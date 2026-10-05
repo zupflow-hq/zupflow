@@ -20,7 +20,8 @@ enum Scoping {
     #[allow(dead_code)]
     Workspace,
     /// Not tenant data, declared by name: users, who belong to many
-    /// organizations, and the identities they sign in with. Holds no
+    /// organizations, the identities they sign in with, and the installation's
+    /// own settings. Holds no
     /// organization or workspace column and references no scoped table.
     Global,
 }
@@ -32,6 +33,8 @@ const TABLES: &[(&str, Scoping)] = &[
     ("users", Scoping::Global),
     ("user_identities", Scoping::Global),
     ("members", Scoping::Organization),
+    ("api_keys", Scoping::Organization),
+    ("instance_settings", Scoping::Global),
 ];
 
 struct Column {

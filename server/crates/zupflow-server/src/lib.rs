@@ -4,6 +4,7 @@
 //! configuration, logging, the adapters and the listener. Tests drive [`app`]
 //! directly.
 
+pub mod api_keys;
 pub mod auth;
 pub mod config;
 pub mod guard;
@@ -26,6 +27,7 @@ pub fn app(state: AppState, guard: RequestGuard) -> Router {
         .route("/health", get(http::health))
         .route("/ready", get(http::ready))
         .merge(organizations::routes())
+        .merge(api_keys::routes())
         .merge(workspaces::routes())
         .fallback(http::route_not_found)
         .method_not_allowed_fallback(http::method_not_allowed)

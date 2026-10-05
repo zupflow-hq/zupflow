@@ -17,7 +17,7 @@ use zupflow_core::workspaces::{
     NewWorkspace, Workspace, WorkspaceError, WorkspaceFilter, WorkspaceSort, WorkspaceStats,
 };
 
-use crate::auth::{AppState, ConsoleUser, OrganizationAccess, WorkspaceAccess, workspace_unavailable};
+use crate::auth::{Access, AppState, Caller, WorkspaceAccess, workspace_unavailable};
 use crate::http::{Failure, envelope, envelope_with_meta};
 use crate::input::{Body, Fields, Object};
 use crate::organizations::{checked_name, checked_slug};
@@ -134,6 +134,16 @@ impl ListQuery {
     }
 }
 
+/// A key asked for its other environment.
+fn environment_mismatch() -> Failure {
+    ApiError::new(
+        422,
+        "environment_mismatch",
+        "This API key works in one environment only; use a key for the other one.",
+    )
+    .into()
+}
+
 fn invalid_cursor() -> Failure {
     let mut error = ApiError::new(400, "validation_failed", "Some fields are invalid.");
     error.fields = Some([("cursor".to_owned(), "Not a cursor from this list.".to_owned())].into());
@@ -142,11 +152,11 @@ fn invalid_cursor() -> Failure {
 
 async fn list_workspaces(
     State(state): State<AppState>,
-    ConsoleUser(user): ConsoleUser,
+    caller: Caller,
     Path(org): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Result<Response, Failure> {
-    let access = OrganizationAccess::resolve(&state, user, &org).await?;
+    let access = Access::organization(&state, caller, &org).await?;
     let query = ListQuery::parse(raw.as_deref())?;
     let environment = match query.environment.as_deref().filter(|value| !value.is_empty()) {
         None => None,
@@ -155,6 +165,12 @@ async fn list_workspaces(
             error.fields = Some([("environment".to_owned(), "Unknown.".to_owned())].into());
             Failure(error)
         })?),
+    };
+    // A key sees its own environment only.
+    let environment = match (access.environment(), environment) {
+        (Some(own), Some(asked)) if own != asked => return Err(environment_mismatch()),
+        (Some(own), _) => Some(own),
+        (None, asked) => asked,
     };
     let filter = WorkspaceFilter {
         environment,
@@ -180,7 +196,7 @@ async fn list_workspaces(
     let page = state
         .workspaces
         .list_workspaces(
-            access.organization.id,
+            access.organization_id,
             &filter,
             query.cursor.as_deref().filter(|cursor| !cursor.is_empty()),
             u32::try_from(limit).unwrap_or(25),
@@ -192,7 +208,7 @@ async fn list_workspaces(
         })?;
     let mut items = Vec::with_capacity(page.items.len());
     for workspace in page.items {
-        items.push(view(&state, access.organization.id, workspace).await?);
+        items.push(view(&state, access.organization_id, workspace).await?);
     }
     let meta = json!({ "pagination": { "next_cursor": page.next_cursor, "total": page.total } });
     Ok(envelope_with_meta(StatusCode::OK, items, meta))
@@ -200,11 +216,11 @@ async fn list_workspaces(
 
 async fn create_workspace(
     State(state): State<AppState>,
-    ConsoleUser(user): ConsoleUser,
+    caller: Caller,
     Path(org): Path<String>,
     body: Body,
 ) -> Result<Response, Failure> {
-    let access = OrganizationAccess::resolve(&state, user, &org).await?;
+    let access = Access::organization(&state, caller, &org).await?;
     access.require(MemberRole::is_admin, "create workspaces")?;
     let body = body.object()?;
     let mut fields = Fields::default();
@@ -228,10 +244,13 @@ async fn create_workspace(
     let (Some(name), Some(slug), Some(environment), Some(external_id)) = (name, slug, environment, external_id) else {
         return Err(ApiError::internal().into());
     };
+    if access.environment().is_some_and(|own| own != environment) {
+        return Err(environment_mismatch());
+    }
     let workspace = state
         .workspaces
         .create_workspace(
-            access.organization.id,
+            access.organization_id,
             WorkspaceId::generate(),
             &NewWorkspace {
                 name,
@@ -251,18 +270,18 @@ async fn create_workspace(
         })?;
     Ok(envelope(
         StatusCode::CREATED,
-        view(&state, access.organization.id, workspace).await?,
+        view(&state, access.organization_id, workspace).await?,
     ))
 }
 
 async fn get_workspace(
     State(state): State<AppState>,
-    ConsoleUser(user): ConsoleUser,
+    caller: Caller,
     headers: HeaderMap,
     Path(ws): Path<String>,
 ) -> Result<Response, Failure> {
-    let access = WorkspaceAccess::resolve(&state, user, &headers, &ws).await?;
-    let organization_id = access.organization.organization.id;
+    let access = WorkspaceAccess::resolve(&state, caller, &headers, &ws).await?;
+    let organization_id = access.access.organization_id;
     Ok(envelope(
         StatusCode::OK,
         view(&state, organization_id, access.workspace).await?,
@@ -271,14 +290,14 @@ async fn get_workspace(
 
 async fn update_workspace(
     State(state): State<AppState>,
-    ConsoleUser(user): ConsoleUser,
+    caller: Caller,
     headers: HeaderMap,
     Path(ws): Path<String>,
     body: Body,
 ) -> Result<Response, Failure> {
-    let access = WorkspaceAccess::resolve(&state, user, &headers, &ws).await?;
+    let access = WorkspaceAccess::resolve(&state, caller, &headers, &ws).await?;
     access
-        .organization
+        .access
         .require(MemberRole::is_admin, "change workspace settings")?;
     let body = body.object()?;
     if body.has("environment") {
@@ -296,7 +315,7 @@ async fn update_workspace(
     let workspace = state
         .workspaces
         .update_workspace(
-            access.organization.organization.id,
+            access.access.organization_id,
             access.workspace.id,
             name.as_deref(),
             external_id.as_ref().map(|external_id| external_id.as_deref()),
@@ -308,23 +327,23 @@ async fn update_workspace(
         })?;
     Ok(envelope(
         StatusCode::OK,
-        view(&state, access.organization.organization.id, workspace).await?,
+        view(&state, access.access.organization_id, workspace).await?,
     ))
 }
 
 async fn delete_workspace(
     State(state): State<AppState>,
-    ConsoleUser(user): ConsoleUser,
+    caller: Caller,
     headers: HeaderMap,
     Path(ws): Path<String>,
 ) -> Result<Response, Failure> {
-    let access = WorkspaceAccess::resolve(&state, user, &headers, &ws).await?;
+    let access = WorkspaceAccess::resolve(&state, caller, &headers, &ws).await?;
     access
-        .organization
+        .access
         .require(|role| role == MemberRole::Owner, "delete workspaces")?;
     state
         .workspaces
-        .delete_workspace(access.organization.organization.id, access.workspace.id)
+        .delete_workspace(access.access.organization_id, access.workspace.id)
         .await
         .map_err(|error| match error {
             WorkspaceError::NotFound => ApiError::not_found("Workspace").into(),

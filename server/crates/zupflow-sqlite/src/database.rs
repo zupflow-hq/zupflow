@@ -19,6 +19,10 @@ pub enum DatabaseError {
     Create(#[source] std::io::Error),
     #[error("can't open the database")]
     Open(#[source] sqlx::Error),
+    #[error("can't read random bytes from the operating system")]
+    Random,
+    #[error("an installation setting isn't what this version wrote")]
+    Corrupt,
     /// Includes a migration already applied whose file has since changed.
     #[error("can't apply the database migrations")]
     Migrate(#[source] sqlx::migrate::MigrateError),
@@ -46,6 +50,27 @@ impl Database {
             .map_err(DatabaseError::Open)?;
         MIGRATOR.run(&pool).await.map_err(DatabaseError::Migrate)?;
         Ok(Self { pool })
+    }
+
+    /// A 32-byte secret belonging to this Zupflow instance, generated on first
+    /// use and the same ever after. For `local` deployments only, where the
+    /// database and the server are one person's laptop; elsewhere such secrets
+    /// come from configuration, so a database leak doesn't carry them.
+    pub async fn instance_secret(&self, name: &str) -> Result<[u8; 32], DatabaseError> {
+        let mut fresh = [0u8; 32];
+        getrandom::fill(&mut fresh).map_err(|_| DatabaseError::Random)?;
+        sqlx::query("INSERT OR IGNORE INTO instance_settings (name, value) VALUES (?, ?)")
+            .bind(name)
+            .bind(fresh.to_vec())
+            .execute(&self.pool)
+            .await
+            .map_err(DatabaseError::Open)?;
+        let stored: Vec<u8> = sqlx::query_scalar("SELECT value FROM instance_settings WHERE name = ?")
+            .bind(name)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(DatabaseError::Open)?;
+        stored.try_into().map_err(|_| DatabaseError::Corrupt)
     }
 
     pub(crate) fn pool(&self) -> &SqlitePool {

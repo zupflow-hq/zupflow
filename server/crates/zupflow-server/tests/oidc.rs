@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use zupflow_oidc::{OidcConfig, OidcIdentity};
 use zupflow_server::{AppState, RequestGuard};
-use zupflow_sqlite::{Database, SqliteOrganizationStore, SqliteWorkspaceStore};
+use zupflow_sqlite::{Database, SqliteApiKeyStore, SqliteOrganizationStore, SqliteWorkspaceStore};
 
 struct Setup {
     app: axum::Router,
@@ -67,7 +67,9 @@ async fn setup() -> Setup {
     let state = AppState {
         identity: Arc::new(identity),
         organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
-        workspaces: Arc::new(SqliteWorkspaceStore::new(database)),
+        workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
+        api_keys: Arc::new(SqliteApiKeyStore::new(database)),
+        api_key_hasher: Arc::new(zupflow_core::api_keys::ApiKeyHasher::new([7; 32])),
     };
     Setup {
         app: zupflow_server::app(

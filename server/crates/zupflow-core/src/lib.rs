@@ -1,5 +1,6 @@
 //! Types every part of the Zupflow backend shares.
 //!
+//! - [`api_keys`]: API keys, their hashing and their store.
 //! - [`ids`]: typed, prefixed identifiers (`run_…`) over UUIDv7.
 //! - [`error`]: the API's error codes and the envelope's `error` field.
 //! - [`environment`]: Sandbox and Production.
@@ -13,6 +14,7 @@
 //! - [`time`]: instants as stored and as the API writes them.
 //! - [`workspaces`]: workspaces and their store.
 
+pub mod api_keys;
 pub mod environment;
 pub mod error;
 pub mod events;

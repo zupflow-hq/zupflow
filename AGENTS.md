@@ -94,6 +94,12 @@ Read `README.md` first.
   are checked inside the store's transaction, not only before it: the acting
   member's current role (passed as their member ID and read again), owners
   removed only by owners, and the last active owner.
+- Routes open to both callers take `Caller` and resolve with
+  `Access::organization` or `WorkspaceAccess::resolve`: an API key acts with
+  every permission but only in its organization and environment (other
+  organization: 404; other environment's workspace: 404; listing or creating
+  in it: 422 `environment_mismatch`). Console-only routes take `ConsoleUser`,
+  which answers a valid key with 403 `console_only`.
 - Workspace routes resolve with `WorkspaceAccess::resolve`: the organization
   comes from the `Zupflow-Organization` header (400 without it) and the
   membership, then the workspace is found within it. Never read the

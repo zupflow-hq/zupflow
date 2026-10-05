@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use zupflow_core::identity::{Identity, IdentityError, Profile, VerifiedIdentity};
 use zupflow_server::{AppState, RequestGuard};
-use zupflow_sqlite::{Database, SqliteOrganizationStore, SqliteWorkspaceStore};
+use zupflow_sqlite::{Database, SqliteApiKeyStore, SqliteOrganizationStore, SqliteWorkspaceStore};
 
 struct TestIdentity;
 
@@ -87,7 +87,9 @@ impl Server {
         let state = AppState {
             identity: Arc::new(TestIdentity),
             organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
-            workspaces: Arc::new(SqliteWorkspaceStore::new(database)),
+            workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
+            api_keys: Arc::new(SqliteApiKeyStore::new(database)),
+            api_key_hasher: Arc::new(zupflow_core::api_keys::ApiKeyHasher::new([7; 32])),
         };
         Self {
             app: zupflow_server::app(state, RequestGuard::default()),
