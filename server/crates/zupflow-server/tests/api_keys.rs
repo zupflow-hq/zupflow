@@ -378,7 +378,29 @@ async fn keeps_a_production_key_out_of_sandbox_and_other_organizations() {
         .send(call("bob", Method::GET, format!("/v1/workspaces/{}", id(&harbor))).naming(&larkspur))
         .await;
     assert_eq!((status, &theirs["data"]["name"]), (StatusCode::OK, &harbor["name"]));
-    // A header with the key's own organization is fine; a blank one isn't.
+    // A blank or unreadable header names nothing, even with the key's own workspace.
+    let blank = call(secret, Method::GET, format!("/v1/workspaces/{}", id(&production_ws))).naming(" ");
+    assert_eq!(server.send(blank).await.0, StatusCode::NOT_FOUND);
+    let malformed = call(secret, Method::GET, format!("/v1/workspaces/{}", id(&production_ws))).naming("org_nope");
+    assert_eq!(server.send(malformed).await.0, StatusCode::NOT_FOUND);
+    let unreadable = axum::http::Request::builder()
+        .uri(format!("/v1/workspaces/{}", id(&production_ws)))
+        .header("Authorization", format!("Bearer {secret}"))
+        .header(
+            "Zupflow-Organization",
+            axum::http::HeaderValue::from_bytes(b"\xff\xfe").unwrap(),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(server.app.clone(), unreadable)
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "an unreadable header names nothing"
+    );
+    // A header with the key's own organization is fine.
     let own = call(secret, Method::GET, format!("/v1/workspaces/{}", id(&production_ws))).naming(&northwind);
     assert_eq!(server.send(own).await.0, StatusCode::OK);
 }

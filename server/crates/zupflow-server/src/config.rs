@@ -16,10 +16,11 @@ pub struct Config {
     pub database: PathBuf,
     /// `ZUPFLOW_IDENTITY`: how the Console signs in, `local` (the default) or `oidc`.
     pub identity: IdentityMode,
-    /// `ZUPFLOW_API_KEY_HASH_KEY`: 32 bytes, base64, the key API keys are
-    /// hashed under. Required with `oidc`; with `local`, generated and kept in
-    /// the database when unset. Changing it orphans every API key.
-    pub api_key_hash_key: Option<[u8; 32]>,
+    /// `ZUPFLOW_SECRET_KEY`: 32 bytes, base64, the server's own key: API keys
+    /// are hashed and idempotency fingerprints keyed under it, each use
+    /// domain-separated. Required with `oidc`; with `local`, generated and kept
+    /// in the database when unset. Changing it orphans every API key.
+    pub secret_key: Option<[u8; 32]>,
     /// `ZUPFLOW_ALLOWED_ORIGINS`: comma-separated origins a browser may call
     /// the API from, like `http://localhost:5173`. Empty by default.
     pub allowed_origins: Vec<String>,
@@ -47,13 +48,17 @@ pub enum ConfigError {
     Empty { name: &'static str },
     #[error("{name} isn't valid UTF-8")]
     NotUnicode { name: &'static str },
-    #[error("ZUPFLOW_API_KEY_HASH_KEY must be 32 bytes, base64-encoded: generate one with `openssl rand -base64 32`")]
-    InvalidHashKey,
+    /// A variable an earlier version read, renamed: silently ignoring it would
+    /// orphan every API key.
+    #[error("{old} is now {new}; rename it")]
+    Renamed { old: &'static str, new: &'static str },
+    #[error("ZUPFLOW_SECRET_KEY must be 32 bytes, base64-encoded: generate one with `openssl rand -base64 32`")]
+    InvalidSecretKey,
     #[error(
-        "ZUPFLOW_IDENTITY=oidc needs ZUPFLOW_API_KEY_HASH_KEY, kept outside the database: \
+        "ZUPFLOW_IDENTITY=oidc needs ZUPFLOW_SECRET_KEY, kept outside the database: \
          generate one with `openssl rand -base64 32`"
     )]
-    HashKeyRequired,
+    SecretKeyRequired,
     #[error("ZUPFLOW_ALLOWED_ORIGINS must be comma-separated origins like http://localhost:5173, with no path")]
     InvalidOrigins,
     #[error("ZUPFLOW_IDENTITY must be `local` or `oidc`")]
@@ -113,15 +118,21 @@ impl Config {
                 })
                 .collect::<Result<_, _>>()?,
         };
-        let api_key_hash_key = match set("ZUPFLOW_API_KEY_HASH_KEY")? {
+        if set("ZUPFLOW_API_KEY_HASH_KEY")?.is_some() {
+            return Err(ConfigError::Renamed {
+                old: "ZUPFLOW_API_KEY_HASH_KEY",
+                new: "ZUPFLOW_SECRET_KEY",
+            });
+        }
+        let secret_key = match set("ZUPFLOW_SECRET_KEY")? {
             Some(value) => {
                 use base64::Engine;
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(value.trim())
-                    .map_err(|_| ConfigError::InvalidHashKey)?;
-                Some(<[u8; 32]>::try_from(bytes).map_err(|_| ConfigError::InvalidHashKey)?)
+                    .map_err(|_| ConfigError::InvalidSecretKey)?;
+                Some(<[u8; 32]>::try_from(bytes).map_err(|_| ConfigError::InvalidSecretKey)?)
             }
-            None if matches!(identity, IdentityMode::Oidc { .. }) => return Err(ConfigError::HashKeyRequired),
+            None if matches!(identity, IdentityMode::Oidc { .. }) => return Err(ConfigError::SecretKeyRequired),
             None => None,
         };
         Ok(Self {
@@ -129,7 +140,7 @@ impl Config {
             log,
             database,
             identity,
-            api_key_hash_key,
+            secret_key,
             allowed_origins,
         })
     }
@@ -205,10 +216,7 @@ mod tests {
             ("ZUPFLOW_LISTEN", "0.0.0.0:8080"),
             ("ZUPFLOW_OIDC_ISSUER", "https://idp.example"),
             ("ZUPFLOW_OIDC_AUDIENCE", "console"),
-            (
-                "ZUPFLOW_API_KEY_HASH_KEY",
-                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-            ),
+            ("ZUPFLOW_SECRET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
         ])
         .expect("oidc may listen beyond loopback");
         assert_eq!(
@@ -235,21 +243,28 @@ mod tests {
                     ("ZUPFLOW_OIDC_ISSUER", "https://idp.example"),
                     ("ZUPFLOW_OIDC_AUDIENCE", "console"),
                 ]),
-                Err(ConfigError::HashKeyRequired)
+                Err(ConfigError::SecretKeyRequired)
             ),
-            "oidc keeps the hashing key outside the database"
+            "oidc keeps the secret key outside the database"
         );
         for bad in [
-            oidc(&[("ZUPFLOW_API_KEY_HASH_KEY", "not base64!")]),
-            oidc(&[("ZUPFLOW_API_KEY_HASH_KEY", "AAAA")]),
+            oidc(&[("ZUPFLOW_SECRET_KEY", "not base64!")]),
+            oidc(&[("ZUPFLOW_SECRET_KEY", "AAAA")]),
         ] {
-            assert!(matches!(bad, Err(ConfigError::InvalidHashKey)));
+            assert!(matches!(bad, Err(ConfigError::InvalidSecretKey)));
         }
         assert_eq!(
-            Config::from_vars(|_| Ok(None)).expect("defaults").api_key_hash_key,
+            Config::from_vars(|_| Ok(None)).expect("defaults").secret_key,
             None,
             "local generates one when unset"
         );
+        assert!(matches!(
+            oidc(&[(
+                "ZUPFLOW_API_KEY_HASH_KEY",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            )]),
+            Err(ConfigError::Renamed { .. })
+        ));
         let unknown = Config::from_vars(|name| Ok((name == "ZUPFLOW_IDENTITY").then(|| "none".to_owned())));
         assert!(matches!(unknown, Err(ConfigError::UnknownIdentity)));
     }

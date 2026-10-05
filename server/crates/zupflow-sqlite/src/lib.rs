@@ -2,6 +2,7 @@
 //!
 //! - [`Database`]: opens the file, sets it up and applies the migrations.
 //! - [`SqliteApiKeyStore`]: API keys, by keyed hash.
+//! - [`SqliteIdempotencyStore`]: idempotency keys for `POST`.
 //! - [`SqliteJobQueue`]: the job queue, in the same database.
 //! - [`SqliteOrganizationStore`]: organizations, members and users.
 //! - [`SqliteWorkspaceStore`]: workspaces, listed by keyset.
@@ -12,6 +13,7 @@
 
 mod api_keys;
 mod database;
+mod idempotency;
 mod job_queue;
 mod organizations;
 #[cfg(test)]
@@ -20,6 +22,7 @@ mod workspaces;
 
 pub use api_keys::SqliteApiKeyStore;
 pub use database::{Database, DatabaseError};
+pub use idempotency::SqliteIdempotencyStore;
 pub use job_queue::SqliteJobQueue;
 pub use organizations::SqliteOrganizationStore;
 pub use workspaces::SqliteWorkspaceStore;

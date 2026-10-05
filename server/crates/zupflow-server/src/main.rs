@@ -7,11 +7,14 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 use zupflow_basic::local_identity::LocalIdentity;
 use zupflow_core::api_keys::ApiKeyHasher;
+use zupflow_core::idempotency::Fingerprinter;
 use zupflow_core::identity::Identity;
 use zupflow_oidc::{OidcConfig, OidcIdentity};
 use zupflow_server::config::{Config, IdentityMode};
 use zupflow_server::{AppState, RequestGuard};
-use zupflow_sqlite::{Database, SqliteApiKeyStore, SqliteOrganizationStore, SqliteWorkspaceStore};
+use zupflow_sqlite::{
+    Database, SqliteApiKeyStore, SqliteIdempotencyStore, SqliteOrganizationStore, SqliteWorkspaceStore,
+};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -67,10 +70,10 @@ async fn main() -> ExitCode {
         IdentityMode::Local => RequestGuard::local(config.listen.port(), &config.allowed_origins),
         IdentityMode::Oidc { .. } => RequestGuard::with_origins(&config.allowed_origins),
     };
-    let hash_key = match config.api_key_hash_key {
+    let secret_key = match config.secret_key {
         Some(key) => key,
         // Only `local` gets here: the config refuses `oidc` without a key.
-        None => match database.instance_secret("api_key_hash_key").await {
+        None => match database.instance_secret("secret_key").await {
             Ok(key) => key,
             Err(error) => {
                 tracing::error!(event = "server.database_failed", error = %error);
@@ -82,8 +85,10 @@ async fn main() -> ExitCode {
         identity,
         organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
         workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
-        api_keys: Arc::new(SqliteApiKeyStore::new(database)),
-        api_key_hasher: Arc::new(ApiKeyHasher::new(hash_key)),
+        api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
+        api_key_hasher: Arc::new(ApiKeyHasher::new(secret_key)),
+        idempotency: Arc::new(SqliteIdempotencyStore::new(database.clone())),
+        fingerprinter: Arc::new(Fingerprinter::new(secret_key)),
     };
 
     let listener = match TcpListener::bind(config.listen).await {

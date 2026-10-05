@@ -35,6 +35,9 @@ const TABLES: &[(&str, Scoping)] = &[
     ("members", Scoping::Organization),
     ("api_keys", Scoping::Organization),
     ("instance_settings", Scoping::Global),
+    ("idempotency_keys", Scoping::Organization),
+    // A user's own keys for creating an organization, before there is one.
+    ("user_idempotency_keys", Scoping::Global),
 ];
 
 struct Column {

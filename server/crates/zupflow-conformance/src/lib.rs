@@ -11,6 +11,7 @@
 pub mod api_key_store;
 pub mod cache;
 pub mod event_bus;
+pub mod idempotency_store;
 pub mod identity;
 mod imitations;
 pub mod job_queue;

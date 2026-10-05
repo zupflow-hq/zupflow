@@ -55,6 +55,7 @@ pub struct Call<'a> {
     pub uri: String,
     pub organization: Option<&'a str>,
     pub body: Option<Value>,
+    pub idempotency_key: Option<&'a str>,
 }
 
 pub fn call<'a>(user: &'a str, method: Method, uri: impl Into<String>) -> Call<'a> {
@@ -64,12 +65,18 @@ pub fn call<'a>(user: &'a str, method: Method, uri: impl Into<String>) -> Call<'
         uri: uri.into(),
         organization: None,
         body: None,
+        idempotency_key: None,
     }
 }
 
 impl<'a> Call<'a> {
     pub fn naming(mut self, organization: &'a str) -> Self {
         self.organization = Some(organization);
+        self
+    }
+
+    pub fn idempotent(mut self, key: &'a str) -> Self {
+        self.idempotency_key = Some(key);
         self
     }
 
@@ -93,7 +100,9 @@ impl Server {
             identity,
             organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
             workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
-            api_keys: Arc::new(SqliteApiKeyStore::new(database)),
+            api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
+            idempotency: Arc::new(zupflow_sqlite::SqliteIdempotencyStore::new(database)),
+            fingerprinter: Arc::new(zupflow_core::idempotency::Fingerprinter::new([7; 32])),
             api_key_hasher: Arc::new(zupflow_core::api_keys::ApiKeyHasher::new([7; 32])),
         };
         Self {
@@ -109,6 +118,9 @@ impl Server {
             .header("Authorization", bearer(call.user));
         if let Some(organization) = call.organization {
             request = request.header("Zupflow-Organization", organization);
+        }
+        if let Some(key) = call.idempotency_key {
+            request = request.header("Idempotency-Key", key);
         }
         let request = match call.body {
             Some(body) => request

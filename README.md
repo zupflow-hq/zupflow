@@ -79,11 +79,12 @@ provider's ID token as the bearer and may listen on any address. The
 open-source Console doesn't sign in with OIDC yet, and the server has no CORS
 yet: both arrive when the Console switches from the mock to the backend.
 
-API keys (`zf_test_…`, `zf_live_…`) are stored as an HMAC under
-`ZUPFLOW_API_KEY_HASH_KEY` (32 bytes, base64: `openssl rand -base64 32`). With
-`local` it's optional: the server generates one on first start and keeps it in
-the database. With `oidc` it's required, so the key lives outside the
-database. Changing it invalidates every API key.
+The server's own secret, `ZUPFLOW_SECRET_KEY` (32 bytes, base64:
+`openssl rand -base64 32`), keys what must not be guessable from the database:
+API keys (`zf_test_…`, `zf_live_…`) are stored as an HMAC under it, and so are
+idempotency fingerprints. With `local` it's optional: the server generates one
+on first start and keeps it in the database. With `oidc` it's required, so it
+lives outside the database. Changing it invalidates every API key.
 
 So far it serves `/health`, `/ready`, `/v1/me`, organizations, members,
 workspaces and API keys;

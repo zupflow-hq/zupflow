@@ -9,6 +9,7 @@
 //! - [`storage`]: the [`storage::Cache`] and [`storage::ObjectStore`] traits.
 //! - [`events`]: the [`events::EventBus`] trait.
 //! - [`jobs`]: the [`jobs::JobQueue`] trait.
+//! - [`idempotency`]: idempotency keys for `POST`, and their store.
 //! - [`identity`]: Console sign-in, the [`identity::Identity`] trait.
 //! - [`organizations`]: organizations, members and users, and their store.
 //! - [`time`]: instants as stored and as the API writes them.
@@ -18,6 +19,7 @@ pub mod api_keys;
 pub mod environment;
 pub mod error;
 pub mod events;
+pub mod idempotency;
 pub mod identity;
 pub mod ids;
 pub mod jobs;

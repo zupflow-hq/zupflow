@@ -234,13 +234,13 @@ mod tests {
     #[tokio::test]
     async fn keeps_one_instance_secret() {
         let Temporary { database, directory } = temporary().await;
-        let first = database.instance_secret("api_key_hash_key").await.unwrap();
-        assert_eq!(database.instance_secret("api_key_hash_key").await.unwrap(), first);
+        let first = database.instance_secret("secret_key").await.unwrap();
+        assert_eq!(database.instance_secret("secret_key").await.unwrap(), first);
         assert_ne!(database.instance_secret("another").await.unwrap(), first);
         database.pool().close().await;
         let reopened = Database::open(&directory.file()).await.unwrap();
         assert_eq!(
-            reopened.instance_secret("api_key_hash_key").await.unwrap(),
+            reopened.instance_secret("secret_key").await.unwrap(),
             first,
             "across restarts"
         );

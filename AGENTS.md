@@ -110,6 +110,13 @@ Read `README.md` first.
 - Request bodies go through `input::Body` (JSON only, 64 KiB), and every
   request through `guard`, which refuses foreign origins and, with `local`
   sign-in, non-loopback hosts. Don't add a route that reads a body another way.
+- Every `POST` passes through the idempotency middleware, which resolves the
+  caller and scope itself (`idempotency::scope_of`). A `POST` route outside
+  `/v1/organizations…` and `/v1/workspaces/{ws}…` must be taught its scope
+  there first, or every request with a key answers 500. A route whose answer
+  shows a secret once goes in `SHOWS_SECRET_ONCE`, and a `POST` route API keys
+  can't call goes in `NOT_FOR_API_KEYS`; tests hold both equal to the
+  contract.
 - Background work goes through `JobQueue`: claim with a lease, then finish,
   retry or bury naming the job's scope and lease. Delivery is at least once,
   so handlers are idempotent; payloads carry references, never secrets.

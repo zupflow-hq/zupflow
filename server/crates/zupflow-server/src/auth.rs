@@ -17,6 +17,7 @@ use axum::http::request::Parts;
 use zupflow_core::api_keys::{ApiKey, ApiKeyHasher, ApiKeyStore, SECRET_PREFIX};
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
+use zupflow_core::idempotency::{Fingerprinter, IdempotencyStore};
 use zupflow_core::identity::{Identity, IdentityError};
 use zupflow_core::ids::OrganizationId;
 use zupflow_core::ids::WorkspaceId;
@@ -33,6 +34,8 @@ pub struct AppState {
     pub workspaces: Arc<dyn WorkspaceStore>,
     pub api_keys: Arc<dyn ApiKeyStore>,
     pub api_key_hasher: Arc<ApiKeyHasher>,
+    pub idempotency: Arc<dyn IdempotencyStore>,
+    pub fingerprinter: Arc<Fingerprinter>,
 }
 
 /// A store failure the caller can do nothing about: the database is a

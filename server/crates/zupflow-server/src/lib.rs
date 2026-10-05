@@ -9,6 +9,7 @@ pub mod auth;
 pub mod config;
 pub mod guard;
 pub mod http;
+pub mod idempotency;
 pub mod input;
 pub mod organizations;
 pub mod workspaces;
@@ -29,6 +30,11 @@ pub fn app(state: AppState, guard: RequestGuard) -> Router {
         .merge(organizations::routes())
         .merge(api_keys::routes())
         .merge(workspaces::routes())
+        // Matched routes only, after routing, so the middleware knows the route's template.
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            idempotency::idempotency,
+        ))
         .fallback(http::route_not_found)
         .method_not_allowed_fallback(http::method_not_allowed)
         .with_state(state)
