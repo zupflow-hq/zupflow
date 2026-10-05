@@ -43,6 +43,7 @@ zupflow-basic = { path = "crates/zupflow-basic" }
 zupflow-conformance = { path = "crates/zupflow-conformance" }
 zupflow-core = { path = "crates/zupflow-core" }
 zupflow-oidc = { path = "crates/zupflow-oidc" }
+zupflow-outbound = { path = "crates/zupflow-outbound" }
 zupflow-sqlite = { path = "crates/zupflow-sqlite" }
 
 # Test-only

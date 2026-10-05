@@ -121,6 +121,12 @@ Read `README.md` first.
   list equal to what the router answers), and what it needs to the reference
   fixture in `zupflow-contract`'s `reset`. Then `pnpm contract:backend` runs
   the shared suite's cases for it instead of skipping them.
+- Every call to a provider, an MCP server or a webhook endpoint goes through
+  `OutboundHttp` (`SafeHttpClient`), never a client of its own: it refuses
+  non-public and non-HTTPS destinations after DNS resolution, follows no
+  redirects, bounds time and size, injects the credential last and scrubs it
+  from what comes back. Statuses are the caller's to classify; never pass the
+  other side's text on. The one exception is fetching an `oidc` issuer's keys.
 - Background work goes through `JobQueue`: claim with a lease, then finish,
   retry or bury naming the job's scope and lease. Delivery is at least once,
   so handlers are idempotent; payloads carry references, never secrets.

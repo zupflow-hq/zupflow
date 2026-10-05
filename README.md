@@ -26,6 +26,7 @@ server/           The Rust backend — a Cargo workspace
                               an in-process event bus, local sign-in
   crates/zupflow-sqlite/      The basic database: SQLite, its migrations, the stores, the job queue
   crates/zupflow-oidc/        Console sign-in through any OpenID Connect provider
+  crates/zupflow-outbound/    The safe outbound HTTP path: public HTTPS only, no redirects, bounded
   crates/zupflow-contract/    Development only: the server and fixture the contract suite runs against
   crates/zupflow-conformance/ The suites every implementation of a trait must pass
   crates/zupflow-server/      The API server (`zupflow` binary), on axum
