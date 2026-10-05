@@ -70,6 +70,11 @@ Read `README.md` first.
   live in `zupflow-basic` and run their trait's suite from
   `zupflow-conformance`. A new implementation isn't done until it passes; a
   new rule for a trait goes into its suite, not only into one implementation.
+- Stored values take a `Scope` first (an organization, an organization's
+  environment, or a workspace with its organization), built only from the
+  trust context; names and paths are the validated `Name` and `ObjectPath`,
+  never raw strings from a request. An adapter with a flat keyspace uses
+  `Scope::storage_key`; never build a storage key by hand.
 - Secrets are sealed with `keys::seal` under an `EncryptionContext` built from
   the trust context with the constructor for that kind of secret
   (`installation_credential`, `oauth_client_secret`, `webhook_signing_secret`),

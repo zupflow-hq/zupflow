@@ -13,11 +13,12 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
+getrandom.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
 zupflow-core.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
 zupflow-conformance.workspace = true

@@ -8,4 +8,6 @@
 // A suite reports a broken rule by panicking, like any assertion.
 #![allow(clippy::unwrap_used, clippy::panic)]
 
+pub mod cache;
 pub mod key_service;
+pub mod object_store;

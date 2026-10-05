@@ -19,8 +19,9 @@ packages/
   sdk/            @zupflow/sdk — HTTP transport, typed resource client, verifyWebhook
   brand/          B1 Precision brand kit (SVG/PNG/ICO) and usage notes
 server/           The Rust backend — a Cargo workspace
-  crates/zupflow-core/        Shared types and the external-resource traits: typed IDs, API errors, KeyService
-  crates/zupflow-basic/       The basic implementations (the local key service, …)
+  crates/zupflow-core/        Shared types and the external-resource traits: typed IDs, API errors, scopes,
+                              KeyService, Cache, ObjectStore
+  crates/zupflow-basic/       The basic implementations: local keys, an in-memory cache, local files
   crates/zupflow-conformance/ The suites every implementation of a trait must pass
   crates/zupflow-server/      The API server (`zupflow` binary), on axum
 ```

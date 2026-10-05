@@ -4,11 +4,15 @@
 //! - [`error`]: the API's error codes and the envelope's `error` field.
 //! - [`environment`]: Sandbox and Production.
 //! - [`keys`]: envelope encryption and the [`keys::KeyService`] trait.
+//! - [`scope`]: the scope stored values belong to, and the names inside it.
+//! - [`storage`]: the [`storage::Cache`] and [`storage::ObjectStore`] traits.
 
 pub mod environment;
 pub mod error;
 pub mod ids;
 pub mod keys;
+pub mod scope;
+pub mod storage;
 
 /// Typed IDs make scope mistakes fail to compile. Swapping the organization
 /// and the workspace doesn't compile:
