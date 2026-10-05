@@ -7,11 +7,13 @@
 //! - [`scope`]: the scope stored values belong to, and the names inside it.
 //! - [`storage`]: the [`storage::Cache`] and [`storage::ObjectStore`] traits.
 //! - [`events`]: the [`events::EventBus`] trait.
+//! - [`jobs`]: the [`jobs::JobQueue`] trait.
 
 pub mod environment;
 pub mod error;
 pub mod events;
 pub mod ids;
+pub mod jobs;
 pub mod keys;
 pub mod scope;
 pub mod storage;

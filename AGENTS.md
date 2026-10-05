@@ -75,6 +75,21 @@ Read `README.md` first.
   trust context; names and paths are the validated `Name` and `ObjectPath`,
   never raw strings from a request. An adapter with a flat keyspace uses
   `Scope::storage_key`; never build a storage key by hand.
+- Database (`zupflow-sqlite`): a schema change is a new file in
+  `migrations/`, never an edit to a merged one (the migrator checks their
+  checksums). Every table is declared in `src/schema.rs` with its scoping, and
+  the schema test holds it to the rules: organization-scoped tables start
+  `id, organization_id`, workspace-scoped ones `id, organization_id,
+  workspace_id`, all `UUID` and declared NOT NULL (`id UUID NOT NULL PRIMARY
+  KEY`: SQLite lets a primary key hold NULL); a `workspace_id` references
+  `workspaces (organization_id, id)`; every reference carries the
+  organization. UUIDs are 16-byte blobs, instants INTEGER milliseconds UTC.
+  Every statement after the trust context repeats the full scope, even next to
+  a unique ID; the few that can't (a worker's claim) are named and documented
+  as cross-tenant.
+- Background work goes through `JobQueue`: claim with a lease, then finish,
+  retry or bury naming the job's scope and lease. Delivery is at least once,
+  so handlers are idempotent; payloads carry references, never secrets.
 - Secrets are sealed with `keys::seal` under an `EncryptionContext` built from
   the trust context with the constructor for that kind of secret
   (`installation_credential`, `oauth_client_secret`, `webhook_signing_secret`),
