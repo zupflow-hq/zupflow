@@ -24,6 +24,10 @@ pub struct Config {
     /// `ZUPFLOW_ALLOWED_ORIGINS`: comma-separated origins a browser may call
     /// the API from, like `http://localhost:5173`. Empty by default.
     pub allowed_origins: Vec<String>,
+    /// `ZUPFLOW_PUBLIC_URL`: the origin providers and browsers reach this
+    /// server at, like `https://zupflow.example`; OAuth redirect URIs are
+    /// built on it (decision 0033). Defaults to `http://localhost:{port}`.
+    pub public_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +65,8 @@ pub enum ConfigError {
     SecretKeyRequired,
     #[error("ZUPFLOW_ALLOWED_ORIGINS must be comma-separated origins like http://localhost:5173, with no path")]
     InvalidOrigins,
+    #[error("ZUPFLOW_PUBLIC_URL must be an origin like https://zupflow.example, with no path")]
+    InvalidPublicUrl,
     #[error("ZUPFLOW_IDENTITY must be `local` or `oidc`")]
     UnknownIdentity,
     #[error("ZUPFLOW_IDENTITY=oidc needs {name}")]
@@ -135,6 +141,10 @@ impl Config {
             None if matches!(identity, IdentityMode::Oidc { .. }) => return Err(ConfigError::SecretKeyRequired),
             None => None,
         };
+        let public_url = match set("ZUPFLOW_PUBLIC_URL")? {
+            Some(value) => public_origin(value.trim()).ok_or(ConfigError::InvalidPublicUrl)?,
+            None => format!("http://localhost:{}", listen.port()),
+        };
         Ok(Self {
             listen,
             log,
@@ -142,6 +152,7 @@ impl Config {
             identity,
             secret_key,
             allowed_origins,
+            public_url,
         })
     }
 
@@ -152,6 +163,20 @@ impl Config {
             Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::NotUnicode { name }),
         })
     }
+}
+
+/// `ZUPFLOW_PUBLIC_URL` as an origin: `http` or `https`, a host, an optional
+/// port, and nothing else (a trailing `/` is allowed and dropped).
+fn public_origin(value: &str) -> Option<String> {
+    let url = url::Url::parse(value).ok()?;
+    let plain = matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some_and(|host| !host.is_empty())
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none();
+    plain.then(|| url.origin().ascii_serialization())
 }
 
 /// `http(s)://host[:port]`: a scheme, a host, and nothing after it.
@@ -179,6 +204,35 @@ mod tests {
         assert_eq!(config.log, "info");
         assert_eq!(config.database, PathBuf::from("zupflow.db"));
         assert_eq!(config.identity, IdentityMode::Local);
+        assert_eq!(config.public_url, "http://localhost:8080");
+    }
+
+    #[test]
+    fn takes_a_public_url_that_is_an_origin() {
+        let public = |value: &'static str| {
+            Config::from_vars(move |name| Ok((name == "ZUPFLOW_PUBLIC_URL").then(|| value.to_owned())))
+        };
+        assert_eq!(
+            public("https://zupflow.example/").expect("an origin").public_url,
+            "https://zupflow.example"
+        );
+        assert_eq!(
+            public("http://localhost:3000").expect("an origin").public_url,
+            "http://localhost:3000"
+        );
+        for invalid in [
+            "zupflow.example",
+            "https://zupflow.example/api",
+            "ftp://zupflow.example",
+            "https://:443",
+            "https://user@zupflow.example",
+            "https://zupflow.example/?q=1",
+        ] {
+            assert!(
+                matches!(public(invalid), Err(ConfigError::InvalidPublicUrl)),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

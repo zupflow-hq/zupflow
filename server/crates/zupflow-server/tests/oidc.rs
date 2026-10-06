@@ -69,6 +69,8 @@ async fn setup() -> Setup {
         organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
         workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
         apps: Arc::new(zupflow_sqlite::SqliteAppStore::new(database.clone())),
+        keys: Arc::new(zupflow_basic::local_keys::LocalKeyService::from_server_secret(&[7; 32])),
+        public_url: "http://localhost:8080".to_owned(),
         api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
         idempotency: Arc::new(zupflow_sqlite::SqliteIdempotencyStore::new(database)),
         fingerprinter: Arc::new(zupflow_core::idempotency::Fingerprinter::new([7; 32])),

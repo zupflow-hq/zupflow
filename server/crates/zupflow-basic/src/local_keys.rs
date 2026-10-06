@@ -9,6 +9,8 @@
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 use zeroize::Zeroizing;
 use zupflow_core::keys::{self, DataKey, EncryptionContext, KeyError, KeyService, WrappedKey};
 
@@ -71,6 +73,29 @@ impl LocalKeyService {
             },
             previous: Vec::new(),
         })
+    }
+
+    /// The service with a key derived from the server's own secret
+    /// (`ZUPFLOW_SECRET_KEY`, decision 0033), under its own domain label so it
+    /// is never the key anything else uses. Its ID is derived too, so keys
+    /// from two secrets never share one.
+    pub fn from_server_secret(secret: &[u8; 32]) -> Self {
+        let derive = |label: &[u8]| -> [u8; 32] {
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC takes a key of any length");
+            mac.update(label);
+            mac.finalize().into_bytes().into()
+        };
+        let id: String = derive(b"zupflow.keys.id.v1")[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Self {
+            current: LocalKey {
+                id: format!("server-{id}"),
+                material: Zeroizing::new(derive(b"zupflow.keys.wrap.v1")),
+            },
+            previous: Vec::new(),
+        }
     }
 
     /// A key this service was rotated from: still unwraps what it wrapped, never wraps again.

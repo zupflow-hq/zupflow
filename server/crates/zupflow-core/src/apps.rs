@@ -7,7 +7,10 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AppId, OrganizationId, WorkspaceId};
+use crate::environment::Environment;
+use crate::ids::{AppId, OrganizationId, UserId, WorkspaceId};
+use crate::keys::Sealed;
+use crate::organizations::User;
 use crate::time::Timestamp;
 
 /// Only `mcp` exists.
@@ -227,6 +230,124 @@ pub enum AppError {
     SlugTaken,
     #[error("not found")]
     NotFound,
+    /// A secret was written under a version another write already took.
+    #[error("the client secret changed meanwhile")]
+    SecretVersionTaken,
+}
+
+/// What the API may show of a stored client secret: never the secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretState {
+    pub last4: String,
+    pub updated_at: Timestamp,
+    /// Raised each time the secret changes; bound into its encryption context.
+    pub version: u32,
+}
+
+/// An app's client configuration in one environment (a workspace app's is
+/// its workspace's). A configuration never written reads as
+/// [`Configuration::empty`], version 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Configuration {
+    pub app_id: AppId,
+    pub environment: Environment,
+    /// Raised by every write.
+    pub version: u32,
+    pub mcp_server_url: Option<String>,
+    pub oauth_client_id: Option<String>,
+    pub client_secret: Option<SecretState>,
+    /// The last secret version written here, whether or not a secret is set
+    /// now: the next secret takes this plus one.
+    pub secret_version: u32,
+    pub oauth_scopes: Vec<String>,
+    pub updated_at: Option<Timestamp>,
+    /// The member who last wrote it; `None` when an API key did, or the user is gone.
+    pub updated_by: Option<User>,
+}
+
+impl Configuration {
+    pub fn empty(app_id: AppId, environment: Environment) -> Self {
+        Self {
+            app_id,
+            environment,
+            version: 0,
+            mcp_server_url: None,
+            oauth_client_id: None,
+            client_secret: None,
+            secret_version: 0,
+            oauth_scopes: Vec::new(),
+            updated_at: None,
+            updated_by: None,
+        }
+    }
+
+    /// The fields still required before the app can be connected: the MCP
+    /// server, and an OAuth app's client ID and secret.
+    pub fn missing(&self, auth: &AuthTemplate) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.mcp_server_url.is_none() {
+            missing.push("mcp_server_url");
+        }
+        if matches!(auth, AuthTemplate::OAuth2 { .. }) {
+            if self.oauth_client_id.is_none() {
+                missing.push("oauth_client_id");
+            }
+            if self.client_secret.is_none() {
+                missing.push("oauth_client_secret");
+            }
+        }
+        missing
+    }
+
+    /// `unconfigured` with every required field missing, `ready` with none,
+    /// `incomplete` between.
+    pub fn status(&self, auth: &AuthTemplate) -> ConfigurationStatus {
+        let required = if matches!(auth, AuthTemplate::OAuth2 { .. }) {
+            3
+        } else {
+            1
+        };
+        match self.missing(auth).len() {
+            0 => ConfigurationStatus::Ready,
+            missing if missing == required => ConfigurationStatus::Unconfigured,
+            _ => ConfigurationStatus::Incomplete,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigurationStatus {
+    Unconfigured,
+    Incomplete,
+    Ready,
+}
+
+/// A new client secret, already sealed under the context of `version`, which
+/// must be the stored secret's version plus one (1 for the first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewClientSecret {
+    pub sealed: Sealed,
+    pub last4: String,
+    pub version: u32,
+}
+
+/// What a write changes; `None` keeps the value, `Some(None)` clears it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigurationChanges {
+    pub mcp_server_url: Option<Option<String>>,
+    pub oauth_client_id: Option<Option<String>>,
+    pub client_secret: Option<NewClientSecret>,
+    pub oauth_scopes: Option<Vec<String>>,
+    /// The member writing; `None` for an API key.
+    pub updated_by: Option<UserId>,
+}
+
+/// A stored client secret, sealed, with the version it was sealed under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredClientSecret {
+    pub sealed: Sealed,
+    pub version: u32,
 }
 
 #[async_trait]
@@ -286,6 +407,69 @@ pub trait AppStore: Send + Sync {
         app_id: AppId,
         changes: AppChanges<'_>,
     ) -> Result<App, AppError>;
+
+    /// Every written configuration of the organization's catalog apps.
+    async fn list_organization_configurations(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<Vec<Configuration>, AppError>;
+
+    /// A catalog app's configuration in one environment, if ever written.
+    async fn find_organization_configuration(
+        &self,
+        organization_id: OrganizationId,
+        app_id: AppId,
+        environment: Environment,
+    ) -> Result<Option<Configuration>, AppError>;
+
+    /// Writes a catalog app's configuration, creating it on first write, and
+    /// raises its version. `NotFound` unless the app is in the organization's
+    /// catalog; `SecretVersionTaken` if another write changed the secret first.
+    async fn save_organization_configuration(
+        &self,
+        organization_id: OrganizationId,
+        app_id: AppId,
+        environment: Environment,
+        changes: &ConfigurationChanges,
+    ) -> Result<Configuration, AppError>;
+
+    async fn find_organization_client_secret(
+        &self,
+        organization_id: OrganizationId,
+        app_id: AppId,
+        environment: Environment,
+    ) -> Result<Option<StoredClientSecret>, AppError>;
+
+    /// Every written configuration of the workspace's own apps.
+    async fn list_workspace_configurations(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<Configuration>, AppError>;
+
+    /// A workspace app's configuration, in its workspace's environment.
+    async fn find_workspace_configuration(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        app_id: AppId,
+    ) -> Result<Option<Configuration>, AppError>;
+
+    /// As [`AppStore::save_organization_configuration`], for a workspace app.
+    async fn save_workspace_configuration(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        app_id: AppId,
+        changes: &ConfigurationChanges,
+    ) -> Result<Configuration, AppError>;
+
+    async fn find_workspace_client_secret(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        app_id: AppId,
+    ) -> Result<Option<StoredClientSecret>, AppError>;
 }
 
 #[cfg(test)]

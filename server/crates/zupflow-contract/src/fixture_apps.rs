@@ -2,7 +2,50 @@
 //! them: the same definitions the Console's mock seeds.
 
 use serde_json::{Value, json};
-use zupflow_core::apps::{AppIcon, AppKind, NewApp};
+use zupflow_core::apps::{AppIcon, AppKind, ConfigurationChanges, NewApp, NewClientSecret};
+use zupflow_core::environment::Environment;
+use zupflow_core::ids::{AppId, OrganizationId, WorkspaceId};
+use zupflow_core::keys::{self, EncryptionContext, KeyService};
+
+/// A configuration to seed: a server, and for an OAuth app a client.
+pub struct Ready {
+    pub mcp_server_url: String,
+    /// With a client ID and a sealed client secret, so an OAuth app is ready.
+    pub oauth: bool,
+}
+
+impl Ready {
+    /// The write, sealing the client secret under its owner's context as the API does.
+    pub async fn changes(
+        &self,
+        keys: &dyn KeyService,
+        organization_id: OrganizationId,
+        workspace_id: Option<WorkspaceId>,
+        environment: Environment,
+        app_id: AppId,
+    ) -> Result<ConfigurationChanges, String> {
+        let client_secret = if self.oauth {
+            let context = EncryptionContext::oauth_client_secret(organization_id, workspace_id, environment, app_id, 1);
+            let sealed = keys::seal(keys, &context, b"fixture-client-secret")
+                .await
+                .map_err(|error| error.to_string())?;
+            Some(NewClientSecret {
+                sealed,
+                last4: "cret".to_owned(),
+                version: 1,
+            })
+        } else {
+            None
+        };
+        Ok(ConfigurationChanges {
+            mcp_server_url: Some(Some(self.mcp_server_url.clone())),
+            oauth_client_id: self.oauth.then(|| Some("fixture-client".to_owned())),
+            client_secret,
+            oauth_scopes: None,
+            updated_by: None,
+        })
+    }
+}
 
 /// An app from its contract-shaped JSON.
 fn app(definition: Value) -> Result<NewApp, String> {

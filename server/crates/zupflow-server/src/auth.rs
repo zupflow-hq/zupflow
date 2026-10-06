@@ -22,6 +22,7 @@ use zupflow_core::idempotency::{Fingerprinter, IdempotencyStore};
 use zupflow_core::identity::{Identity, IdentityError};
 use zupflow_core::ids::OrganizationId;
 use zupflow_core::ids::WorkspaceId;
+use zupflow_core::keys::KeyService;
 use zupflow_core::organizations::{Member, MemberRole, Organization, OrganizationStore, StoreError, User};
 use zupflow_core::workspaces::{Workspace, WorkspaceError, WorkspaceStore};
 
@@ -34,6 +35,11 @@ pub struct AppState {
     pub organizations: Arc<dyn OrganizationStore>,
     pub workspaces: Arc<dyn WorkspaceStore>,
     pub apps: Arc<dyn AppStore>,
+    /// Seals the secrets Zupflow holds (decision 0033).
+    pub keys: Arc<dyn KeyService>,
+    /// The origin providers and browsers reach this server at, with no
+    /// trailing slash: OAuth redirect URIs are built on it.
+    pub public_url: String,
     pub api_keys: Arc<dyn ApiKeyStore>,
     pub api_key_hasher: Arc<ApiKeyHasher>,
     pub idempotency: Arc<dyn IdempotencyStore>,

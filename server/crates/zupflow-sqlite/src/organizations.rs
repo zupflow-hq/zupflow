@@ -459,15 +459,37 @@ impl OrganizationStore for SqliteOrganizationStore {
     }
 
     async fn load_setup(&self, organization_id: OrganizationId) -> Result<OrganizationSetup, StoreError> {
-        let has_workspace: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM workspaces WHERE organization_id = ?)")
-                .bind(organization_id.uuid())
-                .fetch_one(self.database.pool())
-                .await
-                .map_err(failed("load_setup"))?;
-        // The rest arrive with their tables: apps, API keys, installations, agents and runs.
+        // A configuration is ready with a server, and for an OAuth app a client
+        // ID and secret, as `Configuration::status` says.
+        let row = sqlx::query(
+            "SELECT \
+             EXISTS (SELECT 1 FROM workspaces WHERE organization_id = ?1) AS has_workspace, \
+             EXISTS (SELECT 1 FROM api_keys WHERE organization_id = ?1 AND revoked_at IS NULL) AS has_api_key, \
+             (EXISTS (SELECT 1 FROM apps WHERE organization_id = ?1) \
+              OR EXISTS (SELECT 1 FROM workspace_apps WHERE organization_id = ?1)) AS has_app, \
+             (EXISTS (SELECT 1 FROM app_configurations c \
+                JOIN apps a ON a.organization_id = c.organization_id AND a.id = c.app_id \
+                WHERE c.organization_id = ?1 AND c.mcp_server_url IS NOT NULL \
+                AND (json_extract(a.auth, '$.type') = 'token' \
+                     OR (c.oauth_client_id IS NOT NULL AND c.secret_ciphertext IS NOT NULL))) \
+              OR EXISTS (SELECT 1 FROM workspace_app_configurations c \
+                JOIN workspace_apps a ON a.organization_id = c.organization_id \
+                  AND a.workspace_id = c.workspace_id AND a.id = c.app_id \
+                WHERE c.organization_id = ?1 AND c.mcp_server_url IS NOT NULL \
+                AND (json_extract(a.auth, '$.type') = 'token' \
+                     OR (c.oauth_client_id IS NOT NULL AND c.secret_ciphertext IS NOT NULL)))) \
+             AS has_ready_configuration",
+        )
+        .bind(organization_id.uuid())
+        .fetch_one(self.database.pool())
+        .await
+        .map_err(failed("load_setup"))?;
+        // The rest arrive with their tables: installations, agents and runs.
         Ok(OrganizationSetup {
-            has_workspace,
+            has_workspace: row.try_get("has_workspace").map_err(read)?,
+            has_api_key: row.try_get("has_api_key").map_err(read)?,
+            has_app: row.try_get("has_app").map_err(read)?,
+            has_ready_configuration: row.try_get("has_ready_configuration").map_err(read)?,
             ..OrganizationSetup::default()
         })
     }

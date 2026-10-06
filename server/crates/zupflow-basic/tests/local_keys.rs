@@ -86,3 +86,36 @@ fn refuses_unusable_configuration() {
         LocalKeyService::new("local:1", &random_key()).and_then(|keys| keys.with_previous("local:1", &random_key()));
     assert!(matches!(duplicate, Err(LocalKeyError::DuplicateKeyId)));
 }
+
+/// Derived from the server secret: the same secret gives the same key and ID,
+/// another secret another key, and the result passes the suite.
+#[tokio::test]
+async fn derives_its_key_from_the_server_secret() {
+    zupflow_conformance::key_service::run(
+        &LocalKeyService::from_server_secret(&[1; 32]),
+        &LocalKeyService::from_server_secret(&[2; 32]),
+    )
+    .await;
+    let context = EncryptionContext::webhook_signing_secret(
+        OrganizationId::generate(),
+        Environment::Sandbox,
+        WebhookEndpointId::generate(),
+        1,
+    );
+    let one = LocalKeyService::from_server_secret(&[1; 32]);
+    let sealed = keys::seal(&one, &context, b"client secret").await.expect("sealed");
+    assert!(sealed.wrapped_key.key_id.starts_with("server-"));
+    assert_eq!(sealed.wrapped_key.key_id.len(), "server-".len() + 16);
+    let again = LocalKeyService::from_server_secret(&[1; 32]);
+    assert_eq!(
+        keys::open(&again, &context, &sealed).await.expect("opened").expose(),
+        b"client secret"
+    );
+    let other = LocalKeyService::from_server_secret(&[2; 32]);
+    assert_eq!(
+        keys::open(&other, &context, &sealed).await.expect_err("refused"),
+        KeyError::Refused
+    );
+    let resealed = keys::seal(&other, &context, b"x").await.expect("sealed");
+    assert_ne!(resealed.wrapped_key.key_id, sealed.wrapped_key.key_id);
+}

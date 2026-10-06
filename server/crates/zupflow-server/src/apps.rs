@@ -4,8 +4,8 @@
 //! workspace app is never found in the catalog, nor a catalog app, or another
 //! workspace's app, under a workspace.
 //!
-//! Client configurations come with their own routes; until then every app
-//! reports its environments `unconfigured`, and nothing is installed.
+//! An app's client configurations are in `app_configurations`; nothing is
+//! installed yet, so every app's `installation_count` is 0.
 
 use axum::Router;
 use axum::extract::{Path, State};
@@ -13,7 +13,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use serde::Serialize;
-use zupflow_core::apps::{App, AppChanges, AppError, AppIcon, AppKind, AuthTemplate, AuthType, NewApp, ToolDefinition};
+use zupflow_core::apps::{
+    App, AppChanges, AppError, AppIcon, AppKind, AuthTemplate, AuthType, Configuration, ConfigurationStatus, NewApp,
+    ToolDefinition,
+};
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{AppId, OrganizationId, WorkspaceId};
@@ -56,16 +59,27 @@ enum OwnerScope {
 
 /// The contract's `ConfigurationSummary`.
 #[derive(Serialize)]
-struct ConfigurationSummary {
+pub(crate) struct ConfigurationSummary {
     environment: Environment,
-    status: &'static str,
+    status: ConfigurationStatus,
     version: u32,
     updated_at: Option<Timestamp>,
 }
 
+impl ConfigurationSummary {
+    pub(crate) fn of(configuration: &Configuration, auth: &AuthTemplate) -> Self {
+        Self {
+            environment: configuration.environment,
+            status: configuration.status(auth),
+            version: configuration.version,
+            updated_at: configuration.updated_at,
+        }
+    }
+}
+
 /// The contract's `App`.
 #[derive(Serialize)]
-struct AppView {
+pub(crate) struct AppView {
     id: AppId,
     organization_id: OrganizationId,
     owner_workspace_id: Option<WorkspaceId>,
@@ -84,9 +98,22 @@ struct AppView {
     updated_at: Timestamp,
 }
 
-/// The app as the contract shows it, configured in `environments`: both for a
-/// catalog app, the workspace's own for a workspace app.
-fn view(app: App, environments: &[Environment]) -> AppView {
+/// The app as the contract shows it, in `environments`: both for a catalog
+/// app, the workspace's own for a workspace app. `configurations` may hold
+/// any app's; this app's are picked out, and an environment never written
+/// reads as empty.
+pub(crate) fn view(app: App, configurations: &[Configuration], environments: &[Environment]) -> AppView {
+    let summaries = environments
+        .iter()
+        .map(|&environment| {
+            let empty = Configuration::empty(app.id, environment);
+            let configuration = configurations
+                .iter()
+                .find(|configuration| configuration.app_id == app.id && configuration.environment == environment)
+                .unwrap_or(&empty);
+            ConfigurationSummary::of(configuration, &app.auth)
+        })
+        .collect();
     AppView {
         id: app.id,
         organization_id: app.organization_id,
@@ -104,26 +131,32 @@ fn view(app: App, environments: &[Environment]) -> AppView {
         auth: app.auth,
         tools: app.tools,
         version: app.version,
-        configurations: environments
-            .iter()
-            .map(|&environment| ConfigurationSummary {
-                environment,
-                status: "unconfigured",
-                version: 0,
-                updated_at: None,
-            })
-            .collect(),
+        configurations: summaries,
         installation_count: 0,
         created_at: app.created_at,
         updated_at: app.updated_at,
     }
 }
 
-const BOTH: [Environment; 2] = [Environment::Sandbox, Environment::Production];
+/// The environments a catalog app is shown in: both for a member, only its
+/// own for an API key, which sees nothing of the other (decision 0029).
+pub(crate) fn catalog_environments(access: &Access) -> Vec<Environment> {
+    match access.environment() {
+        Some(own) => vec![own],
+        None => vec![Environment::Sandbox, Environment::Production],
+    }
+}
 
-fn app_failure(error: AppError) -> Failure {
+pub(crate) fn app_failure(error: AppError) -> Failure {
     match error {
         AppError::NotFound => ApiError::not_found("App").into(),
+        // Only a configuration write meets this, and only after retrying.
+        AppError::SecretVersionTaken => ApiError::new(
+            409,
+            "configuration_conflict",
+            "The client secret changed while this request ran. Try again.",
+        )
+        .into(),
         AppError::SlugTaken => {
             let mut error = ApiError::new(409, "slug_taken", "That slug is already used by another app.");
             error.fields = Some([("slug".to_owned(), "Already used by another app here.".to_owned())].into());
@@ -141,7 +174,7 @@ fn app_failure(error: AppError) -> Failure {
 
 /// An app ID from the path; anything else is the same `404` as an app that
 /// isn't there.
-fn app_id(app: &str) -> Result<AppId, Failure> {
+pub(crate) fn app_id(app: &str) -> Result<AppId, Failure> {
     AppId::parse(app).map_err(|_| ApiError::not_found("App").into())
 }
 
@@ -212,7 +245,15 @@ async fn list_organization_apps(
         .list_organization_apps(access.organization_id)
         .await
         .map_err(app_failure)?;
-    let views: Vec<AppView> = apps.into_iter().map(|app| view(app, &BOTH)).collect();
+    let configurations = state
+        .apps
+        .list_organization_configurations(access.organization_id)
+        .await
+        .map_err(app_failure)?;
+    let views: Vec<AppView> = apps
+        .into_iter()
+        .map(|app| view(app, &configurations, &catalog_environments(&access)))
+        .collect();
     Ok(envelope(StatusCode::OK, views))
 }
 
@@ -230,7 +271,10 @@ async fn create_organization_app(
         .create_organization_app(access.organization_id, AppId::generate(), &app)
         .await
         .map_err(app_failure)?;
-    Ok(envelope(StatusCode::CREATED, view(app, &BOTH)))
+    Ok(envelope(
+        StatusCode::CREATED,
+        view(app, &[], &catalog_environments(&access)),
+    ))
 }
 
 async fn get_organization_app(
@@ -246,7 +290,15 @@ async fn get_organization_app(
         .map_err(app_failure)?
         .ok_or(AppError::NotFound)
         .map_err(app_failure)?;
-    Ok(envelope(StatusCode::OK, view(app, &BOTH)))
+    let configurations = state
+        .apps
+        .list_organization_configurations(access.organization_id)
+        .await
+        .map_err(app_failure)?;
+    Ok(envelope(
+        StatusCode::OK,
+        view(app, &configurations, &catalog_environments(&access)),
+    ))
 }
 
 async fn update_organization_app(
@@ -279,7 +331,15 @@ async fn update_organization_app(
         )
         .await
         .map_err(app_failure)?;
-    Ok(envelope(StatusCode::OK, view(app, &BOTH)))
+    let configurations = state
+        .apps
+        .list_organization_configurations(access.organization_id)
+        .await
+        .map_err(app_failure)?;
+    Ok(envelope(
+        StatusCode::OK,
+        view(app, &configurations, &catalog_environments(&access)),
+    ))
 }
 
 async fn list_workspace_apps(
@@ -294,8 +354,16 @@ async fn list_workspace_apps(
         .list_workspace_apps(access.access.organization_id, access.workspace.id)
         .await
         .map_err(app_failure)?;
+    let configurations = state
+        .apps
+        .list_workspace_configurations(access.access.organization_id, access.workspace.id)
+        .await
+        .map_err(app_failure)?;
     let environment = [access.workspace.environment];
-    let views: Vec<AppView> = apps.into_iter().map(|app| view(app, &environment)).collect();
+    let views: Vec<AppView> = apps
+        .into_iter()
+        .map(|app| view(app, &configurations, &environment))
+        .collect();
     Ok(envelope(StatusCode::OK, views))
 }
 
@@ -321,7 +389,7 @@ async fn create_workspace_app(
         .map_err(app_failure)?;
     Ok(envelope(
         StatusCode::CREATED,
-        view(app, &[access.workspace.environment]),
+        view(app, &[], &[access.workspace.environment]),
     ))
 }
 
@@ -339,7 +407,15 @@ async fn get_workspace_app(
         .map_err(app_failure)?
         .ok_or(AppError::NotFound)
         .map_err(app_failure)?;
-    Ok(envelope(StatusCode::OK, view(app, &[access.workspace.environment])))
+    let configurations = state
+        .apps
+        .list_workspace_configurations(access.access.organization_id, access.workspace.id)
+        .await
+        .map_err(app_failure)?;
+    Ok(envelope(
+        StatusCode::OK,
+        view(app, &configurations, &[access.workspace.environment]),
+    ))
 }
 
 async fn update_workspace_app(
@@ -374,5 +450,13 @@ async fn update_workspace_app(
         )
         .await
         .map_err(app_failure)?;
-    Ok(envelope(StatusCode::OK, view(app, &[access.workspace.environment])))
+    let configurations = state
+        .apps
+        .list_workspace_configurations(access.access.organization_id, access.workspace.id)
+        .await
+        .map_err(app_failure)?;
+    Ok(envelope(
+        StatusCode::OK,
+        view(app, &configurations, &[access.workspace.environment]),
+    ))
 }

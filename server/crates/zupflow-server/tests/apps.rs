@@ -422,7 +422,11 @@ async fn lets_a_key_reach_apps_in_its_environment_only() {
         .send(call(key, Method::POST, format!("/v1/organizations/{org}/apps")).body(app("linear", "oauth2")))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    assert_eq!(created["data"]["configurations"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        created["data"]["configurations"],
+        json!([{ "environment": "sandbox", "status": "unconfigured", "version": 0, "updated_at": null }]),
+        "a key sees its own environment only"
+    );
     // Its own environment's workspaces, yes; the other's, never.
     let (status, _) = server
         .send(call(key, Method::POST, format!("/v1/workspaces/{sandbox}/apps")).body(app("mine", "token")))

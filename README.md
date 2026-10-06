@@ -84,12 +84,20 @@ yet: both arrive when the Console switches from the mock to the backend.
 The server's own secret, `ZUPFLOW_SECRET_KEY` (32 bytes, base64:
 `openssl rand -base64 32`), keys what must not be guessable from the database:
 API keys (`zf_test_…`, `zf_live_…`) are stored as an HMAC under it, and so are
-idempotency fingerprints. With `local` it's optional: the server generates one
-on first start and keeps it in the database. With `oidc` it's required, so it
-lives outside the database. Changing it invalidates every API key.
+idempotency fingerprints, and the key that seals apps' OAuth client secrets is
+derived from it. With `local` it's optional: the server generates one on first
+start and keeps it in the database. With `oidc` it's required, so it lives
+outside the database. Changing it invalidates every API key and every stored
+client secret.
+
+`ZUPFLOW_PUBLIC_URL` is the origin providers and browsers reach the server at
+(default `http://localhost:{port}`). An app's OAuth redirect URI is built on it:
+`{ZUPFLOW_PUBLIC_URL}/connect/oauth/callback`, one per deployment, registered
+once per OAuth client.
 
 So far it serves `/health`, `/ready`, `/v1/me`, organizations, members,
-workspaces, API keys, and catalog and workspace apps;
+workspaces, API keys, catalog and workspace apps with their client
+configurations, and the apps available to a workspace;
 every other path answers the API's `404` envelope, and an unsupported method
 on a served path the `405` one.
 

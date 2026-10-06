@@ -40,6 +40,8 @@ const TABLES: &[(&str, Scoping)] = &[
     ("user_idempotency_keys", Scoping::Global),
     ("apps", Scoping::Organization),
     ("workspace_apps", Scoping::Workspace),
+    ("app_configurations", Scoping::Organization),
+    ("workspace_app_configurations", Scoping::Workspace),
 ];
 
 struct Column {

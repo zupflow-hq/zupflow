@@ -24,6 +24,7 @@ compile_error!("zupflow-contract is for development only and is never built for 
 
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
+use zupflow_basic::local_keys::LocalKeyService;
 use zupflow_core::api_keys::{ApiKeyHasher, ApiKeyStore, NewApiKey, NewSecret};
 use zupflow_core::apps::AppStore;
 use zupflow_core::environment::Environment;
@@ -90,20 +91,22 @@ async fn serve(path: &str) -> Result<(), String> {
         .instance_secret("secret_key")
         .await
         .map_err(|error| error.to_string())?;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|error| format!("can't listen on loopback: {error}"))?;
+    let port = listener.local_addr().map_err(|error| error.to_string())?.port();
     let state = AppState {
         identity: Arc::new(PersonaIdentity),
         organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
         workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
         apps: Arc::new(SqliteAppStore::new(database.clone())),
+        keys: Arc::new(LocalKeyService::from_server_secret(&secret)),
+        public_url: format!("http://localhost:{port}"),
         api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
         api_key_hasher: Arc::new(ApiKeyHasher::new(secret)),
         idempotency: Arc::new(SqliteIdempotencyStore::new(database)),
         fingerprinter: Arc::new(Fingerprinter::new(secret)),
     };
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .map_err(|error| format!("can't listen on loopback: {error}"))?;
-    let port = listener.local_addr().map_err(|error| error.to_string())?.port();
     #[allow(clippy::print_stdout)]
     {
         println!("listening {port}");
@@ -203,26 +206,65 @@ async fn reset(path: &str) -> Result<(), String> {
             .create_workspace(organization, WorkspaceId::generate(), &workspace)
             .await
             .map_err(|error| fail(slug)(&error))?;
-        workspace_ids.push((slug, created.id));
+        workspace_ids.push((slug, created.id, environment));
     }
     let workspace_id = |slug: &str| {
         workspace_ids
             .iter()
-            .find(|(each, _)| *each == slug)
-            .map(|(_, id)| *id)
+            .find(|(each, _, _)| *each == slug)
+            .map(|(_, id, environment)| (*id, *environment))
             .ok_or_else(|| format!("workspace {slug}"))
     };
 
     let apps = SqliteAppStore::new(database.clone());
-    for (organization, app) in [
-        (northwind.id, fixture_apps::google_workspace()?),
-        (northwind.id, fixture_apps::linear()?),
-        (northwind.id, fixture_apps::notion()?),
-        (larkspur.id, fixture_apps::linear()?),
+    // Who is ready where, as the suite's `Target` describes it.
+    let secret_key = database
+        .instance_secret("secret_key")
+        .await
+        .map_err(|error| error.to_string())?;
+    let sealing = LocalKeyService::from_server_secret(&secret_key);
+    let ready = |url: &str, oauth: bool| fixture_apps::Ready {
+        mcp_server_url: url.to_owned(),
+        oauth,
+    };
+    for (organization, app, sandbox, production) in [
+        (
+            northwind.id,
+            fixture_apps::google_workspace()?,
+            Some(ready("https://mcp.northwind.example/google-workspace", true)),
+            None,
+        ),
+        (
+            northwind.id,
+            fixture_apps::linear()?,
+            Some(ready("https://mcp.linear.example/mcp", true)),
+            // Incomplete in Production: a server, no client.
+            Some(fixture_apps::Ready {
+                mcp_server_url: "https://mcp.linear.example/mcp".to_owned(),
+                oauth: false,
+            }),
+        ),
+        (northwind.id, fixture_apps::notion()?, None, None),
+        (
+            larkspur.id,
+            fixture_apps::linear()?,
+            Some(ready("https://mcp.linear.example/mcp", true)),
+            None,
+        ),
     ] {
-        apps.create_organization_app(organization, AppId::generate(), &app)
+        let created = apps
+            .create_organization_app(organization, AppId::generate(), &app)
             .await
             .map_err(|error| fail(&app.slug)(&error))?;
+        for (environment, configuration) in [(Environment::Sandbox, sandbox), (Environment::Production, production)] {
+            let Some(configuration) = configuration else { continue };
+            let changes = configuration
+                .changes(&sealing, organization, None, environment, created.id)
+                .await?;
+            apps.save_organization_configuration(organization, created.id, environment, &changes)
+                .await
+                .map_err(|error| fail(&app.slug)(&error))?;
+        }
     }
     for (organization, workspace, app) in [
         (
@@ -237,7 +279,16 @@ async fn reset(path: &str) -> Result<(), String> {
             fixture_apps::publishing("Harbor Publishing", "HP", "harbor-publishing", "cms.harbor.example")?,
         ),
     ] {
-        apps.create_workspace_app(organization, workspace_id(workspace)?, AppId::generate(), &app)
+        let (workspace, environment) = workspace_id(workspace)?;
+        let created = apps
+            .create_workspace_app(organization, workspace, AppId::generate(), &app)
+            .await
+            .map_err(|error| fail(&app.slug)(&error))?;
+        // Token apps: ready with a server alone.
+        let changes = ready(&format!("https://{}.example/mcp", app.slug), false)
+            .changes(&sealing, organization, Some(workspace), environment, created.id)
+            .await?;
+        apps.save_workspace_configuration(organization, workspace, created.id, &changes)
             .await
             .map_err(|error| fail(&app.slug)(&error))?;
     }
