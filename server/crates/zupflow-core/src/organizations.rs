@@ -42,6 +42,11 @@ impl MemberRole {
     pub fn is_admin(self) -> bool {
         matches!(self, Self::Owner | Self::Admin)
     }
+
+    /// Everyone but viewers: building with apps, installations and agents.
+    pub fn is_developer(self) -> bool {
+        !matches!(self, Self::Viewer)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

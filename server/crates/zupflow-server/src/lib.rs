@@ -13,6 +13,7 @@ pub mod guard;
 pub mod http;
 pub mod idempotency;
 pub mod input;
+pub mod installations;
 pub mod organizations;
 pub mod workspaces;
 
@@ -26,7 +27,7 @@ pub use guard::RequestGuard;
 /// The contract's operations this server serves so far, by `operationId`. The
 /// shared contract suite skips, by name, any case that needs another one; a
 /// test holds this list equal to the routes the router actually answers.
-pub const SERVED_OPERATIONS: [&str; 29] = [
+pub const SERVED_OPERATIONS: [&str; 35] = [
     "getViewer",
     "createOrganization",
     "getOrganization",
@@ -56,6 +57,12 @@ pub const SERVED_OPERATIONS: [&str; 29] = [
     "getWorkspaceAppConfiguration",
     "updateWorkspaceAppConfiguration",
     "listAvailableApps",
+    "listOrganizationAppInstallations",
+    "listInstallations",
+    "getInstallation",
+    "updateInstallation",
+    "disconnectInstallation",
+    "deleteInstallation",
 ];
 
 /// The whole HTTP surface. Every response under `/v1` is the envelope; the
@@ -70,6 +77,7 @@ pub fn app(state: AppState, guard: RequestGuard) -> Router {
         .merge(workspaces::routes())
         .merge(apps::routes())
         .merge(app_configurations::routes())
+        .merge(installations::routes())
         // Matched routes only, after routing, so the middleware knows the route's template.
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

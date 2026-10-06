@@ -4,7 +4,8 @@
 use serde_json::{Value, json};
 use zupflow_core::apps::{AppIcon, AppKind, ConfigurationChanges, NewApp, NewClientSecret};
 use zupflow_core::environment::Environment;
-use zupflow_core::ids::{AppId, OrganizationId, WorkspaceId};
+use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
+use zupflow_core::installations::{ConnectedAccount, InstalledApp, NewCredential, NewInstallation};
 use zupflow_core::keys::{self, EncryptionContext, KeyService};
 
 /// A configuration to seed: a server, and for an OAuth app a client.
@@ -210,4 +211,47 @@ pub fn echo_server() -> Result<NewApp, String> {
             tool("echo_write", "Echo as write", "Return the input, marked as a write.", "write"),
         ],
     }))
+}
+
+/// Where an installation is, for the context its credential is sealed under.
+pub struct Owner {
+    pub organization_id: OrganizationId,
+    pub workspace_id: WorkspaceId,
+    pub environment: Environment,
+    pub installation_id: InstallationId,
+}
+
+/// A connected installation whose credential is sealed under its own
+/// `installation_credential` context, version 1.
+pub async fn installation(
+    keys: &dyn KeyService,
+    owner: Owner,
+    app: InstalledApp,
+    label: &str,
+) -> Result<NewInstallation, String> {
+    let context = EncryptionContext::installation_credential(
+        owner.organization_id,
+        owner.workspace_id,
+        owner.environment,
+        app.id(),
+        owner.installation_id,
+        1,
+    );
+    let sealed = keys::seal(keys, &context, br#"{"token":"fixture-token"}"#)
+        .await
+        .map_err(|error| error.to_string())?;
+    let handle = label.to_ascii_lowercase();
+    Ok(NewInstallation {
+        app,
+        label: label.to_owned(),
+        configuration_version: 1,
+        account: ConnectedAccount {
+            external_id: format!("acct-{handle}"),
+            display_name: format!("{label} account"),
+            email: Some(format!("{handle}@accounts.example")),
+        },
+        granted_scopes: Vec::new(),
+        expires_at: None,
+        credential: NewCredential { sealed, version: 1 },
+    })
 }

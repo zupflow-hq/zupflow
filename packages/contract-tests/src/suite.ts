@@ -148,7 +148,8 @@ export function contractSuite(target: Target) {
 
       // A server that serves part of the API stops at the first operation it
       // doesn't, so what every server has comes first, in the order the
-      // backend builds it: organizations, members, workspaces, API keys, apps.
+      // backend builds it: organizations, members, workspaces, API keys, apps,
+      // installations, Connect.
       try {
         await everyOperation();
       } catch (error) {
@@ -211,14 +212,15 @@ export function contractSuite(target: Target) {
         await owner.workspaceApps.available(workspace.id);
         await owner.organizationApps.installations(org, orgApp.id);
 
-        // The rest of the API.
-        await owner.models.list();
-        await owner.organizations.usage(org, "production");
-
-        // Installations and Connect, token and OAuth.
+        // Installations: read, renamed, and one disconnected and deleted.
         const installation = must((await owner.installations.list(sandbox.id))[0], "installation in acme-sandbox");
         await owner.installations.get(sandbox.id, installation.id);
         await owner.installations.update(sandbox.id, installation.id, { label: installation.label });
+        const echo = must((await owner.installations.list(qa.id))[0], "installation in qa-playground");
+        await owner.installations.disconnect(qa.id, echo.id);
+        await owner.installations.delete(qa.id, echo.id);
+
+        // Connect, token and OAuth.
         await owner.connectSessions.list(sandbox.id);
         const session = (appId: AppId, workspaceId: WorkspaceId = qa.id) =>
           owner.connectSessions.create(workspaceId, {
@@ -231,13 +233,13 @@ export function contractSuite(target: Target) {
         const tokenSession = await session(fx.apps.echoServer);
         await owner.connectSessions.get(qa.id, tokenSession.id);
         await owner.connect.get(referenceOf(tokenSession));
-        const connected = await owner.connect.submitCredentials(referenceOf(tokenSession), {
-          values: { token: "abc" },
-        });
+        await owner.connect.submitCredentials(referenceOf(tokenSession), { values: { token: "abc" } });
         await owner.connect.authorize(referenceOf(await session(fx.apps.googleWorkspace, sandbox.id)));
         await owner.connect.cancel(referenceOf(await session(fx.apps.echoServer)));
-        await owner.installations.disconnect(qa.id, connected.installation.id);
-        await owner.installations.delete(qa.id, connected.installation.id);
+
+        // The rest of the API.
+        await owner.models.list();
+        await owner.organizations.usage(org, "production");
 
         // Agents, grants and runs.
         const agent = must(
@@ -413,6 +415,16 @@ export function contractSuite(target: Target) {
           }),
         );
         expect(error.code).toBe("unsupported_app_kind");
+      });
+
+      it("refuses an unknown environment filter on an app's installations", async () => {
+        const error = await failure(
+          owner.organizationApps.installations(fx.organization, fx.apps.linear, {
+            // @ts-expect-error: the contract only accepts sandbox or production
+            environment: "staging",
+          }),
+        );
+        expect([error.status, error.code]).toEqual([400, "validation_failed"]);
       });
 
       it("never lets a workspace change environment", async () => {

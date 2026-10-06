@@ -99,16 +99,16 @@ fn checked_external_id(body: &Object, fields: &mut Fields) -> Option<Option<Stri
 /// takes its first value, as the mock does, and an unreadable query string
 /// answers the envelope's `400`.
 #[derive(Default)]
-struct ListQuery {
-    environment: Option<String>,
-    q: Option<String>,
-    sort: Option<String>,
-    cursor: Option<String>,
-    limit: Option<String>,
+pub(crate) struct ListQuery {
+    pub(crate) environment: Option<String>,
+    pub(crate) q: Option<String>,
+    pub(crate) sort: Option<String>,
+    pub(crate) cursor: Option<String>,
+    pub(crate) limit: Option<String>,
 }
 
 impl ListQuery {
-    fn parse(raw: Option<&str>) -> Result<Self, Failure> {
+    pub(crate) fn parse(raw: Option<&str>) -> Result<Self, Failure> {
         let pairs: Vec<(String, String)> = serde_urlencoded::from_str(raw.unwrap_or_default()).map_err(|_| {
             Failure(ApiError::new(
                 400,
@@ -134,8 +134,43 @@ impl ListQuery {
     }
 }
 
+/// A list's `environment` filter. A key sees its own environment only:
+/// asking for the other is `422`, asking for none means its own.
+pub(crate) fn listed_environment(access: &Access, query: &ListQuery) -> Result<Option<Environment>, Failure> {
+    let asked = match query.environment.as_deref().filter(|value| !value.is_empty()) {
+        None => None,
+        Some(value) => Some(Environment::parse(value).ok_or_else(|| {
+            let mut error = ApiError::new(400, "validation_failed", "Unknown environment.");
+            error.fields = Some([("environment".to_owned(), "Unknown.".to_owned())].into());
+            Failure(error)
+        })?),
+    };
+    match (access.environment(), asked) {
+        (Some(own), Some(asked)) if own != asked => Err(environment_mismatch()),
+        (Some(own), _) => Ok(Some(own)),
+        (None, asked) => Ok(asked),
+    }
+}
+
+/// A list's page size: 1 to 100, default 25; out of range is clamped, not an
+/// integer is the default.
+pub(crate) fn page_limit(query: &ListQuery) -> u32 {
+    let limit = query
+        .limit
+        .as_deref()
+        .and_then(|value| {
+            if value.trim().is_empty() {
+                Some(0)
+            } else {
+                value.trim().parse::<i64>().ok()
+            }
+        })
+        .map_or(25, |limit| limit.clamp(1, 100));
+    u32::try_from(limit).unwrap_or(25)
+}
+
 /// A key asked for its other environment.
-fn environment_mismatch() -> Failure {
+pub(crate) fn environment_mismatch() -> Failure {
     ApiError::new(
         422,
         "environment_mismatch",
@@ -144,7 +179,7 @@ fn environment_mismatch() -> Failure {
     .into()
 }
 
-fn invalid_cursor() -> Failure {
+pub(crate) fn invalid_cursor() -> Failure {
     let mut error = ApiError::new(400, "validation_failed", "Some fields are invalid.");
     error.fields = Some([("cursor".to_owned(), "Not a cursor from this list.".to_owned())].into());
     error.into()
@@ -158,20 +193,8 @@ async fn list_workspaces(
 ) -> Result<Response, Failure> {
     let access = Access::organization(&state, caller, &org).await?;
     let query = ListQuery::parse(raw.as_deref())?;
-    let environment = match query.environment.as_deref().filter(|value| !value.is_empty()) {
-        None => None,
-        Some(value) => Some(Environment::parse(value).ok_or_else(|| {
-            let mut error = ApiError::new(400, "validation_failed", "Unknown environment.");
-            error.fields = Some([("environment".to_owned(), "Unknown.".to_owned())].into());
-            Failure(error)
-        })?),
-    };
-    // A key sees its own environment only.
-    let environment = match (access.environment(), environment) {
-        (Some(own), Some(asked)) if own != asked => return Err(environment_mismatch()),
-        (Some(own), _) => Some(own),
-        (None, asked) => asked,
-    };
+    let environment = listed_environment(&access, &query)?;
+    let limit = page_limit(&query);
     let filter = WorkspaceFilter {
         environment,
         query: query.q,
@@ -181,25 +204,13 @@ async fn list_workspaces(
             WorkspaceSort::Name
         },
     };
-    // 1 to 100, default 25; out of range is clamped, not an integer is the default.
-    let limit = query
-        .limit
-        .as_deref()
-        .and_then(|value| {
-            if value.trim().is_empty() {
-                Some(0)
-            } else {
-                value.trim().parse::<i64>().ok()
-            }
-        })
-        .map_or(25, |limit| limit.clamp(1, 100));
     let page = state
         .workspaces
         .list_workspaces(
             access.organization_id,
             &filter,
             query.cursor.as_deref().filter(|cursor| !cursor.is_empty()),
-            u32::try_from(limit).unwrap_or(25),
+            limit,
         )
         .await
         .map_err(|error| match error {

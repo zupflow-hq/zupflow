@@ -4,8 +4,8 @@
 //! workspace app is never found in the catalog, nor a catalog app, or another
 //! workspace's app, under a workspace.
 //!
-//! An app's client configurations are in `app_configurations`; nothing is
-//! installed yet, so every app's `installation_count` is 0.
+//! An app's client configurations are in `app_configurations`, its
+//! installations in `installations`.
 
 use axum::Router;
 use axum::extract::{Path, State};
@@ -102,7 +102,16 @@ pub(crate) struct AppView {
 /// app, the workspace's own for a workspace app. `configurations` may hold
 /// any app's; this app's are picked out, and an environment never written
 /// reads as empty.
-pub(crate) fn view(app: App, configurations: &[Configuration], environments: &[Environment]) -> AppView {
+pub(crate) fn view(
+    app: App,
+    configurations: &[Configuration],
+    environments: &[Environment],
+    installations: &[(AppId, u64)],
+) -> AppView {
+    let installation_count = installations
+        .iter()
+        .find(|(id, _)| *id == app.id)
+        .map_or(0, |(_, count)| *count);
     let summaries = environments
         .iter()
         .map(|&environment| {
@@ -132,7 +141,7 @@ pub(crate) fn view(app: App, configurations: &[Configuration], environments: &[E
         tools: app.tools,
         version: app.version,
         configurations: summaries,
-        installation_count: 0,
+        installation_count,
         created_at: app.created_at,
         updated_at: app.updated_at,
     }
@@ -145,6 +154,24 @@ pub(crate) fn catalog_environments(access: &Access) -> Vec<Environment> {
         Some(own) => vec![own],
         None => vec![Environment::Sandbox, Environment::Production],
     }
+}
+
+/// How many installations each of the organization's apps has: in a key's
+/// own environment only, which is all it may see of them.
+pub(crate) async fn installation_counts(state: &AppState, access: &Access) -> Result<Vec<(AppId, u64)>, Failure> {
+    let environment = access.environment();
+    state
+        .installations
+        .count_by_app(access.organization_id, environment)
+        .await
+        .map_err(|_| {
+            // The store has logged the cause.
+            Failure(ApiError::new(
+                503,
+                "unavailable",
+                "The service is unavailable right now. Try again shortly.",
+            ))
+        })
 }
 
 pub(crate) fn app_failure(error: AppError) -> Failure {
@@ -250,9 +277,10 @@ async fn list_organization_apps(
         .list_organization_configurations(access.organization_id)
         .await
         .map_err(app_failure)?;
+    let installations = installation_counts(&state, &access).await?;
     let views: Vec<AppView> = apps
         .into_iter()
-        .map(|app| view(app, &configurations, &catalog_environments(&access)))
+        .map(|app| view(app, &configurations, &catalog_environments(&access), &installations))
         .collect();
     Ok(envelope(StatusCode::OK, views))
 }
@@ -273,7 +301,7 @@ async fn create_organization_app(
         .map_err(app_failure)?;
     Ok(envelope(
         StatusCode::CREATED,
-        view(app, &[], &catalog_environments(&access)),
+        view(app, &[], &catalog_environments(&access), &[]),
     ))
 }
 
@@ -295,9 +323,10 @@ async fn get_organization_app(
         .list_organization_configurations(access.organization_id)
         .await
         .map_err(app_failure)?;
+    let installations = installation_counts(&state, &access).await?;
     Ok(envelope(
         StatusCode::OK,
-        view(app, &configurations, &catalog_environments(&access)),
+        view(app, &configurations, &catalog_environments(&access), &installations),
     ))
 }
 
@@ -336,9 +365,10 @@ async fn update_organization_app(
         .list_organization_configurations(access.organization_id)
         .await
         .map_err(app_failure)?;
+    let installations = installation_counts(&state, &access).await?;
     Ok(envelope(
         StatusCode::OK,
-        view(app, &configurations, &catalog_environments(&access)),
+        view(app, &configurations, &catalog_environments(&access), &installations),
     ))
 }
 
@@ -359,10 +389,11 @@ async fn list_workspace_apps(
         .list_workspace_configurations(access.access.organization_id, access.workspace.id)
         .await
         .map_err(app_failure)?;
+    let installations = installation_counts(&state, &access.access).await?;
     let environment = [access.workspace.environment];
     let views: Vec<AppView> = apps
         .into_iter()
-        .map(|app| view(app, &configurations, &environment))
+        .map(|app| view(app, &configurations, &environment, &installations))
         .collect();
     Ok(envelope(StatusCode::OK, views))
 }
@@ -389,7 +420,7 @@ async fn create_workspace_app(
         .map_err(app_failure)?;
     Ok(envelope(
         StatusCode::CREATED,
-        view(app, &[], &[access.workspace.environment]),
+        view(app, &[], &[access.workspace.environment], &[]),
     ))
 }
 
@@ -412,9 +443,10 @@ async fn get_workspace_app(
         .list_workspace_configurations(access.access.organization_id, access.workspace.id)
         .await
         .map_err(app_failure)?;
+    let installations = installation_counts(&state, &access.access).await?;
     Ok(envelope(
         StatusCode::OK,
-        view(app, &configurations, &[access.workspace.environment]),
+        view(app, &configurations, &[access.workspace.environment], &installations),
     ))
 }
 
@@ -455,8 +487,9 @@ async fn update_workspace_app(
         .list_workspace_configurations(access.access.organization_id, access.workspace.id)
         .await
         .map_err(app_failure)?;
+    let installations = installation_counts(&state, &access.access).await?;
     Ok(envelope(
         StatusCode::OK,
-        view(app, &configurations, &[access.workspace.environment]),
+        view(app, &configurations, &[access.workspace.environment], &installations),
     ))
 }

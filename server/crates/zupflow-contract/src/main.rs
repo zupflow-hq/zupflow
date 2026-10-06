@@ -30,12 +30,14 @@ use zupflow_core::apps::AppStore;
 use zupflow_core::environment::Environment;
 use zupflow_core::idempotency::Fingerprinter;
 use zupflow_core::identity::{Identity, IdentityError, Profile, VerifiedIdentity};
-use zupflow_core::ids::{ApiKeyId, AppId, OrganizationId, WorkspaceId};
+use zupflow_core::ids::{ApiKeyId, AppId, InstallationId, OrganizationId, WorkspaceId};
+use zupflow_core::installations::{InstallationStore, InstalledApp};
 use zupflow_core::organizations::{MemberRole, OrganizationStore, User};
 use zupflow_core::workspaces::{NewWorkspace, WorkspaceStore};
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{
-    Database, SqliteApiKeyStore, SqliteAppStore, SqliteIdempotencyStore, SqliteOrganizationStore, SqliteWorkspaceStore,
+    Database, SqliteApiKeyStore, SqliteAppStore, SqliteIdempotencyStore, SqliteInstallationStore,
+    SqliteOrganizationStore, SqliteWorkspaceStore,
 };
 
 /// The personas, with the address each signs in with: people's names, as in
@@ -100,6 +102,7 @@ async fn serve(path: &str) -> Result<(), String> {
         organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
         workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
         apps: Arc::new(SqliteAppStore::new(database.clone())),
+        installations: Arc::new(SqliteInstallationStore::new(database.clone())),
         keys: Arc::new(LocalKeyService::from_server_secret(&secret)),
         public_url: format!("http://localhost:{port}"),
         api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
@@ -227,6 +230,8 @@ async fn reset(path: &str) -> Result<(), String> {
         mcp_server_url: url.to_owned(),
         oauth,
     };
+    // Each app as it was made, to install it below.
+    let mut seeded: Vec<(OrganizationId, String, InstalledApp)> = Vec::new();
     for (organization, app, sandbox, production) in [
         (
             northwind.id,
@@ -256,6 +261,7 @@ async fn reset(path: &str) -> Result<(), String> {
             .create_organization_app(organization, AppId::generate(), &app)
             .await
             .map_err(|error| fail(&app.slug)(&error))?;
+        seeded.push((organization, app.slug.clone(), InstalledApp::Catalog(created.id)));
         for (environment, configuration) in [(Environment::Sandbox, sandbox), (Environment::Production, production)] {
             let Some(configuration) = configuration else { continue };
             let changes = configuration
@@ -284,6 +290,7 @@ async fn reset(path: &str) -> Result<(), String> {
             .create_workspace_app(organization, workspace, AppId::generate(), &app)
             .await
             .map_err(|error| fail(&app.slug)(&error))?;
+        seeded.push((organization, app.slug.clone(), InstalledApp::Workspace(created.id)));
         // Token apps: ready with a server alone.
         let changes = ready(&format!("https://{}.example/mcp", app.slug), false)
             .changes(&sealing, organization, Some(workspace), environment, created.id)
@@ -291,6 +298,40 @@ async fn reset(path: &str) -> Result<(), String> {
         apps.save_workspace_configuration(organization, workspace, created.id, &changes)
             .await
             .map_err(|error| fail(&app.slug)(&error))?;
+    }
+
+    // Connected installations, each with its credential sealed as Connect seals it.
+    let installations = SqliteInstallationStore::new(database.clone());
+    for (organization, workspace, slug, label) in [
+        (northwind.id, "acme", "google-workspace", "Marketing"),
+        (northwind.id, "beta-labs", "google-workspace", "Google"),
+        (northwind.id, "acme-sandbox", "linear", "Engineering"),
+        (northwind.id, "qa-playground", "echo-server", "Echo"),
+        (larkspur.id, "harbor", "linear", "Harbor"),
+    ] {
+        let (workspace, environment) = workspace_id(workspace)?;
+        let app = seeded
+            .iter()
+            .find(|(owner, seeded, _)| *owner == organization && seeded == slug)
+            .map(|(_, _, app)| *app)
+            .ok_or_else(|| format!("app {slug}"))?;
+        let installation_id = InstallationId::generate();
+        let installation = fixture_apps::installation(
+            &sealing,
+            fixture_apps::Owner {
+                organization_id: organization,
+                workspace_id: workspace,
+                environment,
+                installation_id,
+            },
+            app,
+            label,
+        )
+        .await?;
+        installations
+            .create_installation(organization, workspace, installation_id, &installation)
+            .await
+            .map_err(|error| fail(label)(&error))?;
     }
 
     let secret = database

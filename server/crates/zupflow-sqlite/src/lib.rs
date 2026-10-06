@@ -4,6 +4,7 @@
 //! - [`SqliteApiKeyStore`]: API keys, by keyed hash.
 //! - [`SqliteAppStore`]: catalog apps and workspace apps.
 //! - [`SqliteIdempotencyStore`]: idempotency keys for `POST`.
+//! - [`SqliteInstallationStore`]: installations and their sealed credentials.
 //! - [`SqliteJobQueue`]: the job queue, in the same database.
 //! - [`SqliteOrganizationStore`]: organizations, members and users.
 //! - [`SqliteWorkspaceStore`]: workspaces, listed by keyset.
@@ -16,6 +17,7 @@ mod api_keys;
 mod apps;
 mod database;
 mod idempotency;
+mod installations;
 mod job_queue;
 mod organizations;
 #[cfg(test)]
@@ -26,6 +28,7 @@ pub use api_keys::SqliteApiKeyStore;
 pub use apps::SqliteAppStore;
 pub use database::{Database, DatabaseError};
 pub use idempotency::SqliteIdempotencyStore;
+pub use installations::SqliteInstallationStore;
 pub use job_queue::SqliteJobQueue;
 pub use organizations::SqliteOrganizationStore;
 pub use workspaces::SqliteWorkspaceStore;

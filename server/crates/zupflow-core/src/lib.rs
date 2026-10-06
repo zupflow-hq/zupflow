@@ -12,6 +12,7 @@
 //! - [`jobs`]: the [`jobs::JobQueue`] trait.
 //! - [`idempotency`]: idempotency keys for `POST`, and their store.
 //! - [`identity`]: Console sign-in, the [`identity::Identity`] trait.
+//! - [`installations`]: connected accounts, their sealed credentials and their store.
 //! - [`outbound`]: the one path every outbound call takes, and which addresses are public.
 //! - [`organizations`]: organizations, members and users, and their store.
 //! - [`time`]: instants as stored and as the API writes them.
@@ -25,6 +26,7 @@ pub mod events;
 pub mod idempotency;
 pub mod identity;
 pub mod ids;
+pub mod installations;
 pub mod jobs;
 pub mod keys;
 pub mod organizations;

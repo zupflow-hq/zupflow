@@ -478,18 +478,21 @@ impl OrganizationStore for SqliteOrganizationStore {
                 WHERE c.organization_id = ?1 AND c.mcp_server_url IS NOT NULL \
                 AND (json_extract(a.auth, '$.type') = 'token' \
                      OR (c.oauth_client_id IS NOT NULL AND c.secret_ciphertext IS NOT NULL)))) \
-             AS has_ready_configuration",
+             AS has_ready_configuration, \
+             EXISTS (SELECT 1 FROM installations WHERE organization_id = ?1 AND status = 'connected') \
+             AS has_installation",
         )
         .bind(organization_id.uuid())
         .fetch_one(self.database.pool())
         .await
         .map_err(failed("load_setup"))?;
-        // The rest arrive with their tables: installations, agents and runs.
+        // The rest arrive with their tables: agents and runs.
         Ok(OrganizationSetup {
             has_workspace: row.try_get("has_workspace").map_err(read)?,
             has_api_key: row.try_get("has_api_key").map_err(read)?,
             has_app: row.try_get("has_app").map_err(read)?,
             has_ready_configuration: row.try_get("has_ready_configuration").map_err(read)?,
+            has_installation: row.try_get("has_installation").map_err(read)?,
             ..OrganizationSetup::default()
         })
     }

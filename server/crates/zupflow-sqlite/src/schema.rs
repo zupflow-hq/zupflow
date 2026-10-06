@@ -42,6 +42,8 @@ const TABLES: &[(&str, Scoping)] = &[
     ("workspace_apps", Scoping::Workspace),
     ("app_configurations", Scoping::Organization),
     ("workspace_app_configurations", Scoping::Workspace),
+    ("installations", Scoping::Workspace),
+    ("installation_credentials", Scoping::Workspace),
 ];
 
 struct Column {

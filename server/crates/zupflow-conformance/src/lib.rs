@@ -15,6 +15,7 @@ pub mod event_bus;
 pub mod idempotency_store;
 pub mod identity;
 mod imitations;
+pub mod installation_store;
 pub mod job_queue;
 pub mod key_service;
 pub mod object_store;

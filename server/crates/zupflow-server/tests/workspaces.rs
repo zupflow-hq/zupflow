@@ -89,6 +89,7 @@ impl Server {
             organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
             workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
             apps: Arc::new(zupflow_sqlite::SqliteAppStore::new(database.clone())),
+            installations: Arc::new(zupflow_sqlite::SqliteInstallationStore::new(database.clone())),
             keys: Arc::new(zupflow_basic::local_keys::LocalKeyService::from_server_secret(&[7; 32])),
             public_url: "http://localhost:8080".to_owned(),
             api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),

@@ -27,7 +27,9 @@ use zupflow_core::organizations::{MemberRole, User};
 use zupflow_core::outbound::is_public;
 use zupflow_core::time::Timestamp;
 
-use crate::apps::{AppView, ConfigurationSummary, app_failure, app_id, catalog_environments, view};
+use crate::apps::{
+    AppView, ConfigurationSummary, app_failure, app_id, catalog_environments, installation_counts, view,
+};
 use crate::auth::{Access, Actor, AppState, Caller, WorkspaceAccess};
 use crate::http::{Failure, envelope};
 use crate::input::{Body, Fields, Object};
@@ -553,6 +555,7 @@ async fn list_available_apps(
         .list_workspace_configurations(organization_id, workspace.id)
         .await
         .map_err(app_failure)?;
+    let installations = installation_counts(&state, &access.access).await?;
     let ready = |app: &App, configurations: &[Configuration]| {
         configurations
             .iter()
@@ -564,14 +567,19 @@ async fn list_available_apps(
     for app in catalog {
         if let Some(configuration) = ready(&app, &catalog_configurations) {
             let name = app.name.to_ascii_lowercase();
-            let app = view(app, &catalog_configurations, &catalog_environments(&access.access));
+            let app = view(
+                app,
+                &catalog_configurations,
+                &catalog_environments(&access.access),
+                &installations,
+            );
             available.push((name, AvailableView { app, configuration }));
         }
     }
     for app in own {
         if let Some(configuration) = ready(&app, &own_configurations) {
             let name = app.name.to_ascii_lowercase();
-            let app = view(app, &own_configurations, &[workspace.environment]);
+            let app = view(app, &own_configurations, &[workspace.environment], &installations);
             available.push((name, AvailableView { app, configuration }));
         }
     }

@@ -1011,6 +1011,9 @@ export function createHandlers(apiBase: string) {
         const app = findOrgApp(access, idParam(params, "app"));
         const url = new URL(request.url);
         const env = url.searchParams.get("environment");
+        if (env && !environment.safeParse(env).success) {
+          throw new ApiFailure(400, "validation_failed", "Unknown environment.", { environment: "Unknown." });
+        }
         const limit = clampedInt(url, "limit", 25, 100);
         const refs: AppInstallationRef[] = db()
           .installations.filter((i) => i.organization_id === access.org.id && i.app_id === app.id)
