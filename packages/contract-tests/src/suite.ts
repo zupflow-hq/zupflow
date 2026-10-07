@@ -11,6 +11,7 @@ import {
   type AgentId,
   type ApiKeyId,
   type AppId,
+  type AuthTemplate,
   type CreateConnectSessionInput,
   createClient,
   createHttpTransport,
@@ -487,6 +488,182 @@ export function contractSuite(target: Target) {
           }),
         );
         expect(http.code).toBe("insecure_url");
+      });
+
+      describe("authentication templates", () => {
+        const oauthTemplate: Extract<AuthTemplate, { type: "oauth2" }> = {
+          type: "oauth2",
+          authorize_url: " https://auth.provider.example/authorize ",
+          token_url: "https://auth.provider.example/token",
+          identity_url: null,
+          available_scopes: [{ name: "read", description: "Read everything" }],
+          pkce: true,
+        };
+        const newOAuthApp = (slug: string) =>
+          owner.organizationApps.create(fx.organization, {
+            kind: "mcp",
+            name: "Provider",
+            slug,
+            description: "",
+            auth_type: "oauth2",
+          });
+
+        it("sets an OAuth app's endpoints and raises its version", async () => {
+          const app = await newOAuthApp("templated");
+          const updated = await owner.organizationApps.update(fx.organization, app.id, { auth: oauthTemplate });
+          expect(updated.auth).toEqual({ ...oauthTemplate, authorize_url: "https://auth.provider.example/authorize" });
+          expect(updated.version).toBe(app.version + 1);
+          expect((await owner.organizationApps.get(fx.organization, app.id)).auth).toEqual(updated.auth);
+          // Renaming alone leaves the template and the version as they are.
+          const renamed = await owner.organizationApps.update(fx.organization, app.id, { name: "Renamed" });
+          expect([renamed.auth, renamed.version]).toEqual([updated.auth, updated.version]);
+        });
+
+        it("sets a workspace app's token template", async () => {
+          const ws = fx.workspaces.qaPlayground.id;
+          const app = await owner.workspaceApps.create(ws, {
+            kind: "mcp",
+            name: "Tools",
+            slug: "templated-tools",
+            description: "",
+            auth_type: "token",
+          });
+          const auth: AuthTemplate = {
+            type: "token",
+            inputs: [
+              { key: "api_key", label: "API key", secret: true, help: null, placeholder: "tk_…", pattern: null },
+            ],
+            placement: { location: "header", name: "X-Api-Key", prefix: "" },
+            verify_url: "https://tools.provider.example/me",
+            instructions: "Paste a key from Settings.",
+            docs_url: null,
+          };
+          const updated = await owner.workspaceApps.update(ws, app.id, { auth });
+          expect(updated.auth).toEqual(auth);
+          expect(updated.version).toBe(app.version + 1);
+        });
+
+        it("keeps an app's authentication type", async () => {
+          const app = await newOAuthApp("typed");
+          const error = await failure(
+            owner.organizationApps.update(fx.organization, app.id, {
+              auth: {
+                type: "token",
+                inputs: [{ key: "token", label: "Token", secret: true, help: null, placeholder: null, pattern: null }],
+                placement: { location: "header", name: "Authorization", prefix: "Bearer " },
+                verify_url: null,
+                instructions: "",
+                docs_url: null,
+              },
+            }),
+          );
+          expect([error.status, error.code]).toEqual([422, "auth_type_immutable"]);
+        });
+
+        it("refuses private and plain-HTTP provider endpoints, and changes nothing", async () => {
+          const app = await newOAuthApp("endpoints");
+          const insecure = await failure(
+            owner.organizationApps.update(fx.organization, app.id, {
+              auth: { ...oauthTemplate, authorize_url: "http://auth.provider.example/authorize" },
+            }),
+          );
+          expect([insecure.code, Object.keys(insecure.fields ?? {})]).toEqual(["insecure_url", ["auth.authorize_url"]]);
+          const local = await failure(
+            owner.organizationApps.update(fx.organization, app.id, {
+              name: "Changed",
+              auth: { ...oauthTemplate, token_url: "https://169.254.169.254/token" },
+            }),
+          );
+          expect([local.code, Object.keys(local.fields ?? {})]).toEqual([
+            "destination_not_allowed",
+            ["auth.token_url"],
+          ]);
+          const after = await owner.organizationApps.get(fx.organization, app.id);
+          expect([after.name, after.version, after.auth]).toEqual([app.name, app.version, app.auth]);
+        });
+
+        it("refuses a token placement in a header Zupflow sets itself", async () => {
+          const ws = fx.workspaces.qaPlayground.id;
+          const app = await owner.workspaceApps.create(ws, {
+            kind: "mcp",
+            name: "Hosty",
+            slug: "hosty",
+            description: "",
+            auth_type: "token",
+          });
+          const error = await failure(
+            owner.workspaceApps.update(ws, app.id, {
+              auth: {
+                type: "token",
+                inputs: [{ key: "token", label: "Token", secret: true, help: null, placeholder: null, pattern: null }],
+                placement: { location: "header", name: "Host", prefix: "" },
+                verify_url: null,
+                instructions: "",
+                docs_url: null,
+              },
+            }),
+          );
+          expect([error.status, error.code, Object.keys(error.fields ?? {})]).toEqual([
+            400,
+            "validation_failed",
+            ["auth.placement.name"],
+          ]);
+        });
+
+        it("accepts only input patterns both the browser and the server understand", async () => {
+          const ws = fx.workspaces.qaPlayground.id;
+          const app = await owner.workspaceApps.create(ws, {
+            kind: "mcp",
+            name: "Patterned",
+            slug: "patterned",
+            description: "",
+            auth_type: "token",
+          });
+          const withPattern = (pattern: string): AuthTemplate => ({
+            type: "token",
+            inputs: [{ key: "token", label: "Token", secret: true, help: null, placeholder: null, pattern }],
+            placement: { location: "header", name: "Authorization", prefix: "Bearer " },
+            verify_url: null,
+            instructions: "",
+            docs_url: null,
+          });
+          for (const pattern of [
+            "(",
+            "(?=tk)tk",
+            "(?i)tk",
+            "(?<name>tk)",
+            "(tk)\\1",
+            "a**",
+            "a{,3}",
+            "[]a]",
+            "\\x{41}",
+          ]) {
+            const error = await failure(owner.workspaceApps.update(ws, app.id, { auth: withPattern(pattern) }));
+            expect([error.status, Object.keys(error.fields ?? {})], pattern).toEqual([400, ["auth.inputs"]]);
+          }
+          const ok = await owner.workspaceApps.update(ws, app.id, { auth: withPattern("^(?:sk|rk)_[a-z0-9]{8,}$") });
+          expect(ok.auth.type === "token" && ok.auth.inputs[0]?.pattern).toBe("^(?:sk|rk)_[a-z0-9]{8,}$");
+        });
+
+        it("won't remove a scope a configuration still requests", async () => {
+          const app = await newOAuthApp("scoped");
+          await owner.organizationApps.update(fx.organization, app.id, { auth: oauthTemplate });
+          await owner.organizationApps.updateConfiguration(fx.organization, app.id, "sandbox", {
+            oauth_scopes: ["read"],
+          });
+          const error = await failure(
+            owner.organizationApps.update(fx.organization, app.id, {
+              auth: { ...oauthTemplate, available_scopes: [] },
+            }),
+          );
+          expect([error.status, error.code]).toEqual([409, "scope_in_use"]);
+          // Once the configuration stops asking for it, it can go.
+          await owner.organizationApps.updateConfiguration(fx.organization, app.id, "sandbox", { oauth_scopes: [] });
+          const updated = await owner.organizationApps.update(fx.organization, app.id, {
+            auth: { ...oauthTemplate, available_scopes: [] },
+          });
+          expect(updated.auth.type === "oauth2" && updated.auth.available_scopes).toEqual([]);
+        });
       });
 
       it("never returns a stored client secret", async () => {

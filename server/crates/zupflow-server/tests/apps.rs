@@ -499,3 +499,323 @@ async fn keeps_an_idempotency_key_to_its_workspace() {
     let again = server.send(post(one)).await;
     assert_eq!(again, first, "a replay in the first workspace");
 }
+
+/// What a template is checked for beyond the shared suite: each shape error
+/// on its own field, and a workspace app's configuration keeping its scopes.
+#[tokio::test]
+async fn checks_a_new_template_field_by_field() {
+    let server = Server::new().await;
+    let org = server.organization("alice", "northwind").await;
+    let ws = server.workspace("alice", &org, "acme-sandbox", "sandbox").await;
+    let ws = ws["id"].as_str().unwrap();
+    let oauth = workspace_app(&server, "alice", &org, ws, "crm").await;
+    let path = format!("/v1/workspaces/{ws}/apps/{}", id(&oauth));
+    let patch = |auth: Value| {
+        call("alice", Method::PATCH, &path)
+            .naming(&org)
+            .body(json!({ "auth": auth }))
+    };
+
+    let (status, body) = server.send(patch(json!({ "type": "basic" }))).await;
+    assert_eq!(
+        (status, &body["error"]["fields"]),
+        (
+            StatusCode::BAD_REQUEST,
+            &json!({ "auth.type": "Choose oauth2 or token." })
+        )
+    );
+
+    // A token app (the helper makes token apps): every field of the template is checked.
+    let (status, body) = server
+        .send(patch(json!({
+            "type": "token",
+            "inputs": [{ "key": "Bad Key", "label": "Token", "secret": true }],
+            "placement": { "location": "query", "name": "Authorization", "prefix": "Bearer\n" },
+            "verify_url": 7,
+            "instructions": "x".repeat(1001),
+        })))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let fields: Vec<&str> = body["error"]["fields"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            "auth.docs_url",
+            "auth.inputs",
+            "auth.instructions",
+            "auth.placement.location",
+            "auth.placement.prefix",
+            "auth.verify_url",
+        ]
+    );
+    let token = |verify_url: &str| {
+        json!({
+            "type": "token",
+            "inputs": [{ "key": "api_key", "label": "Key", "secret": true, "help": null, "placeholder": null, "pattern": null }],
+            "placement": { "location": "header", "name": "X-Api-Key", "prefix": "" },
+            "verify_url": verify_url,
+            "instructions": "",
+            "docs_url": null,
+        })
+    };
+    for (url, expected) in [
+        ("https://user:pass@api.example/me", "destination_not_allowed"),
+        ("https://localhost/me", "destination_not_allowed"),
+        ("http://api.example/me", "insecure_url"),
+    ] {
+        let (_, body) = server.send(patch(token(url))).await;
+        assert_eq!(
+            (code(&body), &body["error"]["fields"]["auth.verify_url"].is_string()),
+            (expected, &true),
+            "{url}"
+        );
+    }
+    let (status, body) = server.send(patch(token("https://api.example/me"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["version"], 2);
+
+    // A workspace OAuth app keeps the scopes its configuration requests.
+    let (_, created) = server
+        .send(
+            call("alice", Method::POST, format!("/v1/workspaces/{ws}/apps"))
+                .naming(&org)
+                .body(app("tickets", "oauth2")),
+        )
+        .await;
+    let tickets = format!("/v1/workspaces/{ws}/apps/{}", id(&created["data"]));
+    let template = |scopes: Value| json!({ "type": "oauth2", "authorize_url": null, "token_url": null, "identity_url": null, "available_scopes": scopes, "pkce": true });
+    let (status, _) = server
+        .send(
+            call("alice", Method::PATCH, &tickets)
+                .naming(&org)
+                .body(json!({ "auth": template(json!([{ "name": "read", "description": "" }])) })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    server
+        .send(
+            call("alice", Method::PUT, format!("{tickets}/configuration"))
+                .naming(&org)
+                .body(json!({ "oauth_scopes": ["read"] })),
+        )
+        .await;
+    let (status, body) = server
+        .send(
+            call("alice", Method::PATCH, &tickets)
+                .naming(&org)
+                .body(json!({ "auth": template(json!([])) })),
+        )
+        .await;
+    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "scope_in_use"));
+    assert_eq!(
+        body["error"]["fields"]["auth.available_scopes"],
+        "read is still requested by the Sandbox configuration."
+    );
+    let duplicate =
+        template(json!([{ "name": "read", "description": "" }, { "name": "read", "description": "again" }]));
+    let (status, body) = server
+        .send(
+            call("alice", Method::PATCH, &tickets)
+                .naming(&org)
+                .body(json!({ "auth": duplicate })),
+        )
+        .await;
+    assert_eq!(
+        (status, body["error"]["fields"]["auth.available_scopes"].is_string()),
+        (StatusCode::BAD_REQUEST, true)
+    );
+}
+
+/// A catalog app's template is shared by both environments, so no API key,
+/// acting in one of them, may change it, and its refusal names nothing of
+/// the other environment. A workspace app lives in one environment: its
+/// key may.
+#[tokio::test]
+async fn keeps_api_keys_off_a_shared_template() {
+    let server = Server::new().await;
+    let org = server.organization("alice", "northwind").await;
+    let sandbox = server.workspace("alice", &org, "acme-sandbox", "sandbox").await;
+    let sandbox = sandbox["id"].as_str().unwrap();
+    let (_, created) = server
+        .send(call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(app("tracker", "oauth2")))
+        .await;
+    let path = format!("/v1/organizations/{org}/apps/{}", id(&created["data"]));
+    let template = |token_url: &str, scopes: Value| json!({ "type": "oauth2", "authorize_url": null, "token_url": token_url, "identity_url": null, "available_scopes": scopes, "pkce": true });
+    let owned = template(
+        "https://auth.tracker.example/token",
+        json!([{ "name": "secret:admin", "description": "" }]),
+    );
+    let (status, _) = server
+        .send(call("alice", Method::PATCH, &path).body(json!({ "auth": owned })))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = server
+        .send(
+            call(
+                "alice",
+                Method::PUT,
+                format!("{path}/environments/production/configuration"),
+            )
+            .body(json!({ "oauth_scopes": ["secret:admin"] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    for environment in ["sandbox", "production"] {
+        let (_, key) = server
+            .send(
+                call("alice", Method::POST, format!("/v1/organizations/{org}/api-keys"))
+                    .body(json!({ "name": "Server", "environment": environment })),
+            )
+            .await;
+        let key = key["data"]["secret"].as_str().unwrap();
+        for auth in [
+            template(
+                "https://attacker.example/t",
+                json!([{ "name": "secret:admin", "description": "" }]),
+            ),
+            template("https://auth.tracker.example/token", json!([])),
+        ] {
+            let (status, body) = server
+                .send(call(key, Method::PATCH, &path).body(json!({ "auth": auth })))
+                .await;
+            assert_eq!(
+                (status, code(&body)),
+                (StatusCode::FORBIDDEN, "console_only"),
+                "{environment}"
+            );
+            assert!(
+                !body.to_string().contains("secret:admin"),
+                "nothing of a configuration is named"
+            );
+        }
+        // Renaming stays open to keys.
+        let (status, _) = server
+            .send(call(key, Method::PATCH, &path).body(json!({ "name": format!("Tracker {environment}") })))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (_, after) = server.send(call("alice", Method::GET, &path)).await;
+    assert_eq!(
+        after["data"]["auth"]["token_url"], "https://auth.tracker.example/token",
+        "unchanged"
+    );
+
+    // A workspace app's key may change its workspace app's template.
+    let (_, key) = server
+        .send(
+            call("alice", Method::POST, format!("/v1/organizations/{org}/api-keys"))
+                .body(json!({ "name": "Server", "environment": "sandbox" })),
+        )
+        .await;
+    let key = key["data"]["secret"].as_str().unwrap();
+    let (_, own) = server
+        .send(call(key, Method::POST, format!("/v1/workspaces/{sandbox}/apps")).body(app("crm", "oauth2")))
+        .await;
+    let (status, body) = server
+        .send(
+            call(
+                key,
+                Method::PATCH,
+                format!("/v1/workspaces/{sandbox}/apps/{}", id(&own["data"])),
+            )
+            .body(json!({ "auth": template("https://auth.crm.example/token", json!([])) })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Patterns Connect checks in the browser must mean the same here; trailing
+/// dots don't hide a local name; and a dropped scope (409) is reported before
+/// a bad URL (422).
+#[tokio::test]
+async fn checks_patterns_hosts_and_the_order_of_refusals() {
+    let server = Server::new().await;
+    let org = server.organization("alice", "northwind").await;
+    let ws = server.workspace("alice", &org, "acme-sandbox", "sandbox").await;
+    let ws = ws["id"].as_str().unwrap();
+    let token = workspace_app(&server, "alice", &org, ws, "tools").await;
+    let path = format!("/v1/workspaces/{ws}/apps/{}", id(&token));
+    let with_pattern = |pattern: &str| {
+        json!({ "auth": {
+            "type": "token",
+            "inputs": [{ "key": "token", "label": "Token", "secret": true, "help": null, "placeholder": null, "pattern": pattern }],
+            "placement": { "location": "header", "name": "Authorization", "prefix": "Bearer " },
+            "verify_url": null, "instructions": "", "docs_url": null,
+        }})
+    };
+    for pattern in ["(", "(?=tk)tk", "(?i)tk", "(?<name>tk)", r"(tk)\1", r"(?P<n>tk)"] {
+        let (status, body) = server
+            .send(
+                call("alice", Method::PATCH, &path)
+                    .naming(&org)
+                    .body(with_pattern(pattern)),
+            )
+            .await;
+        assert_eq!(
+            (status, &body["error"]["fields"]["auth.inputs"]),
+            (
+                StatusCode::BAD_REQUEST,
+                &json!(
+                    "Use a simple regular expression: characters, [classes] with ranges, (groups), \\d \\w \\s, and one quantifier (* + ? {m,n}) each."
+                )
+            ),
+            "{pattern}"
+        );
+    }
+    for pattern in [r"^tk_[a-z0-9]{8,}$", r"^(?:sk|rk)_(test|live)_\w+$", r"\d{4}"] {
+        let (status, body) = server
+            .send(
+                call("alice", Method::PATCH, &path)
+                    .naming(&org)
+                    .body(with_pattern(pattern)),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{pattern}: {body}");
+    }
+    let mut dotted = with_pattern("^x$");
+    dotted["auth"]["verify_url"] = json!("https://localhost../me");
+    let (status, body) = server
+        .send(call("alice", Method::PATCH, &path).naming(&org).body(dotted))
+        .await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::UNPROCESSABLE_ENTITY, "destination_not_allowed")
+    );
+
+    let (_, created) = server
+        .send(
+            call("alice", Method::POST, format!("/v1/workspaces/{ws}/apps"))
+                .naming(&org)
+                .body(app("tickets", "oauth2")),
+        )
+        .await;
+    let tickets = format!("/v1/workspaces/{ws}/apps/{}", id(&created["data"]));
+    let template = |token_url: &str, scopes: Value| json!({ "auth": { "type": "oauth2", "authorize_url": null, "token_url": token_url, "identity_url": null, "available_scopes": scopes, "pkce": true } });
+    server
+        .send(call("alice", Method::PATCH, &tickets).naming(&org).body(template(
+            "https://auth.example/t",
+            json!([{ "name": "read", "description": "" }]),
+        )))
+        .await;
+    server
+        .send(
+            call("alice", Method::PUT, format!("{tickets}/configuration"))
+                .naming(&org)
+                .body(json!({ "oauth_scopes": ["read"] })),
+        )
+        .await;
+    let (status, body) = server
+        .send(
+            call("alice", Method::PATCH, &tickets)
+                .naming(&org)
+                .body(template("http://insecure.example/t", json!([]))),
+        )
+        .await;
+    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "scope_in_use"));
+}

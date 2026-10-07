@@ -26,6 +26,7 @@ import {
 } from "@zupflow/sdk";
 import { HttpResponse, http } from "msw";
 import { z } from "zod";
+import { checkedAuthTemplate } from "./auth-templates";
 import { defaultToolsFor } from "./catalog";
 import { cancelScheduledRun, db, resetDb, scheduleRun } from "./db";
 import {
@@ -285,6 +286,42 @@ function applyConfiguration(
   row.updated_at = now;
   row.updated_by_user_id = access.user.id;
   app.updated_at = now;
+}
+
+const appUpdateInput = z.object({
+  name: name().optional(),
+  description: z.string().trim().max(280).optional(),
+  auth: z.unknown().optional(),
+});
+
+/**
+ * Renames, describes and re-templates an app, all or nothing: the template is
+ * checked against the scopes the app's own configurations request before
+ * anything changes. A new template raises the app's version.
+ */
+function applyAppUpdate(app: AppRow, input: z.infer<typeof appUpdateInput>) {
+  const auth =
+    input.auth === undefined
+      ? undefined
+      : checkedAuthTemplate(
+          app.auth,
+          input.auth,
+          db()
+            .configurations.filter(
+              (c) =>
+                c.organization_id === app.organization_id &&
+                c.workspace_id === app.owner_workspace_id &&
+                c.app_id === app.id,
+            )
+            .map((c) => ({ environment: c.environment, scopes: c.oauth_scopes })),
+        );
+  if (input.name) app.name = input.name;
+  if (input.description !== undefined) app.description = input.description;
+  if (auth) {
+    app.auth = auth;
+    app.version += 1;
+  }
+  app.updated_at = new Date().toISOString();
 }
 
 const appInput = z.object({
@@ -956,13 +993,7 @@ export function createHandlers(apiBase: string) {
         const access = orgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "edit apps");
         const app = findOrgApp(access, idParam(params, "app"));
-        const input = await body(
-          request,
-          z.object({ name: name().optional(), description: z.string().trim().max(280).optional() }),
-        );
-        if (input.name) app.name = input.name;
-        if (input.description !== undefined) app.description = input.description;
-        app.updated_at = new Date().toISOString();
+        applyAppUpdate(app, await body(request, appUpdateInput));
         audit(access, "app.updated", { type: "app", id: app.id, name: app.name });
         return ok(toApp(app));
       }),
@@ -1078,13 +1109,7 @@ export function createHandlers(apiBase: string) {
         const access = workspaceAccess(request, param(params, "ws"));
         requireRole(access, ADMINS, "edit apps");
         const app = findWorkspaceApp(access, idParam(params, "app"));
-        const input = await body(
-          request,
-          z.object({ name: name().optional(), description: z.string().trim().max(280).optional() }),
-        );
-        if (input.name) app.name = input.name;
-        if (input.description !== undefined) app.description = input.description;
-        app.updated_at = new Date().toISOString();
+        applyAppUpdate(app, await body(request, appUpdateInput));
         return ok(toApp(app));
       }),
     ),

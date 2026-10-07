@@ -2,6 +2,7 @@
  * Shared plumbing for mock route handlers: the response envelope, errors,
  * authentication, authorization and the row → wire mappers.
  */
+
 import type {
   Agent,
   AgentGrant,
@@ -31,6 +32,7 @@ import { ORGANIZATION_HEADER } from "@zupflow/sdk";
 import { delay, HttpResponse } from "msw";
 import type { z } from "zod";
 import { db, persist } from "./db";
+import { isPublicHost } from "./destinations";
 import { idempotently } from "./idempotency";
 import { hashReference, isId, newId } from "./ids";
 import type {
@@ -289,8 +291,6 @@ export const RESERVED_ORG_SLUGS = new Set([
   "help",
 ]);
 
-const PRIVATE_HOST = /^(localhost|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.|\[::1\]|metadata\.)/i;
-
 /** Provider destinations must be public HTTPS hosts. */
 export function assertPublicHttps(value: string, field: string) {
   let url: URL;
@@ -306,7 +306,7 @@ export function assertPublicHttps(value: string, field: string) {
       [field]: "Use an https:// URL.",
     });
   }
-  if (PRIVATE_HOST.test(url.hostname)) {
+  if (!isPublicHost(url.hostname) || url.username !== "" || url.password !== "") {
     throw new ApiFailure(422, "destination_not_allowed", "Private and link-local hosts are blocked.", {
       [field]: "Use a public host. Private, loopback and link-local addresses are blocked.",
     });

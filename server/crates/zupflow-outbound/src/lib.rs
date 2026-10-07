@@ -24,8 +24,8 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{Client, Url};
 use zupflow_core::outbound::{
-    Limits, MAX_CREDENTIAL_BYTES, Method, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse, Refusal,
-    is_public, scrub,
+    Limits, MAX_CREDENTIAL_BYTES, Method, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse,
+    RESERVED_HEADERS, Refusal, is_public, scrub,
 };
 
 /// Raised by the resolver; found again in the error chain to say why.
@@ -71,25 +71,9 @@ fn all_allowed(policy: Policy, addresses: &[SocketAddr]) -> bool {
     addresses.iter().all(|address| policy.allows(address.ip()))
 }
 
-/// Headers a caller can't set: the connection's own, and `Accept-Encoding`,
-/// because nothing here decodes, and a compressed echo of the credential
-/// couldn't be scrubbed.
-const RESERVED_HEADERS: [&str; 10] = [
-    "host",
-    "accept-encoding",
-    "connection",
-    "keep-alive",
-    "proxy-authorization",
-    "proxy-connection",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-];
-
 /// Whether a header is one only the client sets. `HeaderName` is lowercase.
 fn reserved(name: &HeaderName) -> bool {
-    RESERVED_HEADERS.contains(&name.as_str()) || name.as_str() == "content-length"
+    RESERVED_HEADERS.contains(&name.as_str())
 }
 
 /// Resolves a name and refuses it unless every address it resolves to is allowed.

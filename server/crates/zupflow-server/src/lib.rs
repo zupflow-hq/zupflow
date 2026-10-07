@@ -8,6 +8,7 @@ pub mod api_keys;
 pub mod app_configurations;
 pub mod apps;
 pub mod auth;
+pub mod auth_templates;
 pub mod config;
 pub mod guard;
 pub mod http;

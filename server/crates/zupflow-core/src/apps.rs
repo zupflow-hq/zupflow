@@ -219,9 +219,11 @@ impl NewApp {
 pub struct AppChanges<'a> {
     pub name: Option<&'a str>,
     pub description: Option<&'a str>,
+    /// A whole new template, already checked; it raises the app's version.
+    pub auth: Option<&'a AuthTemplate>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AppError {
     #[error("the store is unavailable")]
     Unavailable,
@@ -233,6 +235,28 @@ pub enum AppError {
     /// A secret was written under a version another write already took.
     #[error("the client secret changed meanwhile")]
     SecretVersionTaken,
+    /// A new template drops a scope this configuration still requests.
+    /// Checked in the same transaction as the write.
+    #[error("{scope} is still requested by the {environment:?} configuration")]
+    ScopeInUse { environment: Environment, scope: String },
+    /// A configuration requests a scope its app's template doesn't offer.
+    /// Checked in the same transaction as the write.
+    #[error("{0} is not offered by this app")]
+    UnknownScope(String),
+}
+
+impl AuthTemplate {
+    /// For an OAuth app, the first of `requested` it doesn't offer; a token
+    /// app offers no scopes and refuses none (its configuration's scopes are
+    /// unused).
+    pub fn first_unoffered<'a>(&self, requested: &'a [String]) -> Option<&'a String> {
+        match self {
+            Self::OAuth2 { available_scopes, .. } => requested
+                .iter()
+                .find(|scope| !available_scopes.iter().any(|offered| &offered.name == *scope)),
+            Self::Token { .. } => None,
+        }
+    }
 }
 
 /// What the API may show of a stored client secret: never the secret.

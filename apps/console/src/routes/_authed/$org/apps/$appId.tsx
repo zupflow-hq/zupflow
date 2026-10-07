@@ -1,6 +1,7 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import type { AppDefinition, AppId, Environment, Organization } from "@zupflow/sdk";
+import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
 import { z } from "zod";
@@ -20,6 +21,7 @@ import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { AuthTemplatePanel, AuthTypeLabel, ToolsPanel } from "@/features/apps/app-definition";
 import { ConfigurationForm } from "@/features/apps/configuration-form";
+import { EditAuthSheet } from "@/features/apps/edit-auth-sheet";
 import { canAdminister, useDocumentTitle, useOrg } from "@/features/context";
 import { useEnvironment } from "@/features/environment";
 import {
@@ -138,6 +140,7 @@ const detailsSchema = z.object({
 function OverviewTab({ org, app }: { org: Organization; app: AppDefinition }) {
   const update = useUpdateOrgApp(org.id, app.id);
   const admin = canAdminister(org);
+  const [editingAuth, setEditingAuth] = useState(false);
   const form = useForm<z.infer<typeof detailsSchema>>({
     resolver: zodResolver(detailsSchema),
     values: { name: app.name, description: app.description },
@@ -147,7 +150,25 @@ function OverviewTab({ org, app }: { org: Organization; app: AppDefinition }) {
     <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_20rem]">
       <div className="space-y-8">
         <ToolsPanel app={app} />
-        <AuthTemplatePanel app={app} />
+        <AuthTemplatePanel app={app} onEdit={admin ? () => setEditingAuth(true) : undefined} />
+        <EditAuthSheet
+          app={app}
+          open={editingAuth}
+          onOpenChange={setEditingAuth}
+          pending={update.isPending}
+          onSave={(auth, callbacks) =>
+            update.mutate(
+              { auth },
+              {
+                onSuccess: () => {
+                  toast.success("Saved authentication");
+                  callbacks.onSuccess();
+                },
+                onError: callbacks.onError,
+              },
+            )
+          }
+        />
       </div>
       <div className="space-y-8">
         <section>

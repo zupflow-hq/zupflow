@@ -1,4 +1,6 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { useState } from "react";
+import { toast } from "sonner";
 import { z } from "zod";
 import { EnvBadge } from "@/components/app/environment";
 import { LineTabsList, LineTabsTrigger } from "@/components/app/line-tabs";
@@ -10,8 +12,14 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { AuthTemplatePanel, AuthTypeLabel, ToolsPanel } from "@/features/apps/app-definition";
 import { ConfigurationForm } from "@/features/apps/configuration-form";
+import { EditAuthSheet } from "@/features/apps/edit-auth-sheet";
 import { canAdminister, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
-import { useUpdateWorkspaceAppConfiguration, useWorkspaceApp, useWorkspaceAppConfiguration } from "@/features/queries";
+import {
+  useUpdateWorkspaceApp,
+  useUpdateWorkspaceAppConfiguration,
+  useWorkspaceApp,
+  useWorkspaceAppConfiguration,
+} from "@/features/queries";
 import { useDetailCrumb } from "@/lib/crumbs";
 import { idParam } from "@/lib/route-ids";
 
@@ -32,6 +40,9 @@ function WorkspaceAppPage() {
   const app = useWorkspaceApp(ws.id, appId);
   const configuration = useWorkspaceAppConfiguration(ws.id, appId);
   const update = useUpdateWorkspaceAppConfiguration(ws.id, appId);
+  const updateApp = useUpdateWorkspaceApp(ws.id, appId);
+  const [editingAuth, setEditingAuth] = useState(false);
+  const admin = canAdminister(org);
   useDetailCrumb(app.data?.name);
   useDocumentTitle(app.data?.name, ws.name);
 
@@ -85,7 +96,25 @@ function WorkspaceAppPage() {
           {app.data ? (
             <div className="space-y-8">
               <ToolsPanel app={app.data} />
-              <AuthTemplatePanel app={app.data} />
+              <AuthTemplatePanel app={app.data} onEdit={admin ? () => setEditingAuth(true) : undefined} />
+              <EditAuthSheet
+                app={app.data}
+                open={editingAuth}
+                onOpenChange={setEditingAuth}
+                pending={updateApp.isPending}
+                onSave={(auth, callbacks) =>
+                  updateApp.mutate(
+                    { auth },
+                    {
+                      onSuccess: () => {
+                        toast.success("Saved authentication");
+                        callbacks.onSuccess();
+                      },
+                      onError: callbacks.onError,
+                    },
+                  )
+                }
+              />
             </div>
           ) : (
             <RowsSkeleton />

@@ -179,6 +179,22 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     !special
 }
 
+/// Headers the outbound path sets itself: a caller's are dropped, and a
+/// credential or an app's token placement may never name one.
+pub const RESERVED_HEADERS: [&str; 11] = [
+    "host",
+    "accept-encoding",
+    "connection",
+    "keep-alive",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+];
+
 /// The longest credential the path sends: scrubbing stays cheap, and a
 /// tenant can't make every call slow by choosing an enormous one.
 pub const MAX_CREDENTIAL_BYTES: usize = 8 << 10;

@@ -10,7 +10,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use zupflow_core::apps::{
-    App, AppChanges, AppError, AppStore, AuthType, ConfigurationChanges, NewApp, NewClientSecret, StoredClientSecret,
+    App, AppChanges, AppError, AppStore, AuthTemplate, AuthType, ConfigurationChanges, NewApp, NewClientSecret,
+    StoredClientSecret,
 };
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, OrganizationId, WorkspaceId};
@@ -63,6 +64,117 @@ pub async fn run(store: &dyn AppStore, prepare: Prepare) {
     saves_configurations_field_by_field(store, &prepare).await;
     keeps_configurations_to_their_app_and_environment(store, &prepare).await;
     takes_each_secret_version_once(store, &prepare).await;
+    keeps_requested_scopes_offered(store, &prepare).await;
+}
+
+fn oauth_template(scopes: &[&str]) -> AuthTemplate {
+    AuthTemplate::OAuth2 {
+        authorize_url: None,
+        token_url: None,
+        available_scopes: scopes
+            .iter()
+            .map(|name| zupflow_core::apps::OAuthScope {
+                name: (*name).to_owned(),
+                description: String::new(),
+            })
+            .collect(),
+        pkce: true,
+        identity_url: None,
+    }
+}
+
+fn with(template: &AuthTemplate) -> AppChanges<'_> {
+    AppChanges {
+        auth: Some(template),
+        ..AppChanges::default()
+    }
+}
+
+fn requesting(scopes: &[&str]) -> ConfigurationChanges {
+    ConfigurationChanges {
+        oauth_scopes: Some(scopes.iter().map(|scope| (*scope).to_owned()).collect()),
+        ..ConfigurationChanges::default()
+    }
+}
+
+/// A configuration never requests a scope its app doesn't offer, whichever
+/// write comes first; and only the app's own configurations count.
+async fn keeps_requested_scopes_offered(store: &dyn AppStore, prepare: &Prepare) {
+    let (a, one, two) = organization(prepare).await;
+    let oauth =
+        |name: &str, slug: &str| NewApp::blank(name.to_owned(), slug.to_owned(), String::new(), AuthType::OAuth2);
+    let catalog = catalog_app(store, a, oauth("Tracker", "tracker")).await;
+    let sibling = catalog_app(store, a, oauth("Other", "other")).await;
+    let own = workspace_app(store, a, one, oauth("Crm", "crm")).await;
+    let neighbour = workspace_app(store, a, two, oauth("Crm", "crm")).await;
+    let beside = workspace_app(store, a, one, oauth("Desk", "desk")).await;
+    let read = oauth_template(&["read"]);
+    for app in [catalog.id, sibling.id] {
+        store.update_organization_app(a, app, with(&read)).await.unwrap();
+    }
+    for (workspace, app) in [(one, own.id), (two, neighbour.id), (one, beside.id)] {
+        store
+            .update_workspace_app(a, workspace, app, with(&read))
+            .await
+            .unwrap();
+    }
+
+    // A scope the template doesn't offer can't be requested.
+    assert_eq!(
+        store
+            .save_organization_configuration(a, catalog.id, Environment::Production, &requesting(&["write"]))
+            .await,
+        Err(AppError::UnknownScope("write".to_owned()))
+    );
+    assert_eq!(
+        store
+            .save_workspace_configuration(a, one, own.id, &requesting(&["write"]))
+            .await,
+        Err(AppError::UnknownScope("write".to_owned()))
+    );
+
+    // Others requesting `read` don't hold this app's template back...
+    store
+        .save_organization_configuration(a, sibling.id, Environment::Sandbox, &requesting(&["read"]))
+        .await
+        .unwrap();
+    store
+        .save_workspace_configuration(a, two, neighbour.id, &requesting(&["read"]))
+        .await
+        .unwrap();
+    // An app beside it in the same workspace doesn't either.
+    store
+        .save_workspace_configuration(a, one, beside.id, &requesting(&["read"]))
+        .await
+        .unwrap();
+    let none = oauth_template(&[]);
+    store.update_organization_app(a, catalog.id, with(&none)).await.unwrap();
+    store.update_workspace_app(a, one, own.id, with(&none)).await.unwrap();
+
+    // ...but its own configuration requesting it does.
+    assert_eq!(
+        store.update_organization_app(a, sibling.id, with(&none)).await,
+        Err(AppError::ScopeInUse {
+            environment: Environment::Sandbox,
+            scope: "read".to_owned(),
+        })
+    );
+    assert_eq!(
+        store.update_workspace_app(a, two, neighbour.id, with(&none)).await,
+        Err(AppError::ScopeInUse {
+            environment: Environment::Sandbox,
+            scope: "read".to_owned(),
+        })
+    );
+    assert_eq!(
+        store
+            .find_organization_app(a, sibling.id)
+            .await
+            .unwrap()
+            .map(|app| app.auth),
+        Some(read),
+        "a refused template writes nothing"
+    );
 }
 
 /// Opaque to the store: it keeps and returns these bytes exactly.
@@ -443,7 +555,7 @@ async fn updates_only_within_the_owner(store: &dyn AppStore, prepare: &Prepare) 
     let own = workspace_app(store, a, one, new("Echo", "echo")).await;
     let rename = AppChanges {
         name: Some("Renamed"),
-        description: None,
+        ..AppChanges::default()
     };
 
     // Through the wrong owner, nothing changes.
@@ -482,14 +594,60 @@ async fn updates_only_within_the_owner(store: &dyn AppStore, prepare: &Prepare) 
             one,
             own.id,
             AppChanges {
-                name: None,
                 description: Some(""),
+                ..AppChanges::default()
             },
         )
         .await
         .unwrap();
     assert_eq!((described.name.as_str(), described.description.as_str()), ("Echo", ""));
-    assert_eq!(store.find_workspace_app(a, one, own.id).await.unwrap(), Some(described));
+    assert_eq!(
+        store.find_workspace_app(a, one, own.id).await.unwrap(),
+        Some(described.clone())
+    );
+    assert_eq!(described.version, own.version, "a rename keeps the version");
+
+    // A new template replaces the old and raises the version, at either level.
+    let template = AuthTemplate::OAuth2 {
+        authorize_url: Some("https://auth.example/authorize".to_owned()),
+        token_url: Some("https://auth.example/token".to_owned()),
+        available_scopes: Vec::new(),
+        pkce: false,
+        identity_url: None,
+    };
+    let templated = store
+        .update_organization_app(
+            a,
+            catalog.id,
+            AppChanges {
+                auth: Some(&template),
+                ..AppChanges::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!((&templated.auth, templated.version), (&template, updated.version + 1));
+    assert_eq!(templated.name, "Renamed", "the rest is kept");
+    let own_templated = store
+        .update_workspace_app(
+            a,
+            one,
+            own.id,
+            AppChanges {
+                auth: Some(&template),
+                ..AppChanges::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (&own_templated.auth, own_templated.version),
+        (&template, own.version + 1)
+    );
+    assert_eq!(
+        store.find_workspace_app(a, one, own.id).await.unwrap(),
+        Some(own_templated)
+    );
 }
 
 async fn refuses_a_workspace_of_another_organization(store: &dyn AppStore, prepare: &Prepare) {

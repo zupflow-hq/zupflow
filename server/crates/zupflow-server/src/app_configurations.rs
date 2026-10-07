@@ -206,7 +206,7 @@ fn field_error(status: u16, code: &'static str, message: &str, field: &str, deta
 /// credentials in the URL are refused. That is a courtesy, not the guard: a
 /// name can resolve anywhere, so the outbound path checks every resolved
 /// address on every call (decision 0032).
-fn check_public_https(value: &str, field: &str) -> Result<(), Failure> {
+pub(crate) fn check_public_https(value: &str, field: &str) -> Result<(), Failure> {
     let Ok(url) = url::Url::parse(value) else {
         return Err(field_error(
             400,

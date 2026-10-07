@@ -1,8 +1,9 @@
 import type { AppDefinition } from "@zupflow/sdk";
-import { CheckIcon, ExternalLinkIcon, LockIcon } from "lucide-react";
+import { CheckIcon, ExternalLinkIcon, LockIcon, PencilIcon } from "lucide-react";
 import { MonoValue } from "@/components/app/misc";
 import { Panel, Properties, Property, SectionHeader } from "@/components/app/page";
 import { ToolEffectTag } from "@/components/app/status";
+import { Button } from "@/components/ui/button";
 
 export function AuthTypeLabel({ app }: { app: Pick<AppDefinition, "auth"> }) {
   return <>{app.auth.type === "oauth2" ? "OAuth" : "API token"}</>;
@@ -37,12 +38,19 @@ export function ToolsPanel({ app }: { app: AppDefinition }) {
 }
 
 /** The declarative authentication template. Never contains secrets. */
-export function AuthTemplatePanel({ app }: { app: AppDefinition }) {
+export function AuthTemplatePanel({ app, onEdit }: { app: AppDefinition; onEdit?: () => void }) {
   const auth = app.auth;
   return (
     <section>
       <SectionHeader
         title="Authentication"
+        actions={
+          onEdit ? (
+            <Button variant="outline" size="sm" onClick={onEdit}>
+              <PencilIcon /> Edit
+            </Button>
+          ) : null
+        }
         description={
           auth.type === "oauth2"
             ? "Defined once. Each environment brings its own OAuth client."

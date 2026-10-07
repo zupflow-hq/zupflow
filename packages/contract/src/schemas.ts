@@ -340,7 +340,21 @@ export const CreateAppInput = z.object({
   auth_type: AuthType,
 });
 export type CreateAppInput = z.infer<typeof CreateAppInput>;
-export const UpdateAppInput = z.object({ name: z.string().optional(), description: z.string().optional() });
+export const UpdateAppInput = z.object({
+  name: z.string().optional(),
+  description: z.string().optional(),
+  /**
+   * Replaces the app's authentication template, whole. Its `type` must be
+   * the app's own (`422 auth_type_immutable`). URLs must be public HTTPS
+   * (`422 insecure_url`, `422 destination_not_allowed`); a scope a
+   * configuration still requests can't be removed (`409 scope_in_use`).
+   * Input patterns use a small grammar both the browser and the server read
+   * alike. A catalog app's template is shared by both environments, so an API
+   * key can't send this field there (`403 console_only`). Raises the app's
+   * `version`.
+   */
+  auth: AuthTemplate.optional(),
+});
 export type UpdateAppInput = z.infer<typeof UpdateAppInput>;
 
 export const SecretState = named(

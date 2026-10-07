@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, Sqlite, Transaction};
 use zupflow_core::apps::{
-    App, AppChanges, AppError, AppKind, AppStore, Configuration, ConfigurationChanges, NewApp, NewClientSecret,
-    SecretState, StoredClientSecret,
+    App, AppChanges, AppError, AppKind, AppStore, AuthTemplate, Configuration, ConfigurationChanges, NewApp,
+    NewClientSecret, SecretState, StoredClientSecret,
 };
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, OrganizationId, UserId, WorkspaceId};
@@ -288,6 +288,34 @@ macro_rules! upsert_update {
     };
 }
 
+/// `ScopeInUse` if `auth` drops a scope one of `requested` (each
+/// configuration's environment and stored scopes, as JSON) still asks for.
+fn check_scopes_kept(auth: &AuthTemplate, requested: &[(String, String)]) -> Result<(), AppError> {
+    for (environment, scopes) in requested {
+        let scopes: Vec<String> = serde_json::from_str(scopes).map_err(read)?;
+        if let Some(scope) = auth.first_unoffered(&scopes) {
+            return Err(AppError::ScopeInUse {
+                environment: Environment::parse(environment).ok_or(AppError::Unavailable)?,
+                scope: scope.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `UnknownScope` if a configuration write requests a scope the app's
+/// stored template (`auth`, as JSON) doesn't offer.
+fn check_scopes_offered(auth: &str, changes: &ConfigurationChanges) -> Result<(), AppError> {
+    let Some(requested) = &changes.oauth_scopes else {
+        return Ok(());
+    };
+    let auth: AuthTemplate = serde_json::from_str(auth).map_err(read)?;
+    match auth.first_unoffered(requested) {
+        Some(scope) => Err(AppError::UnknownScope(scope.clone())),
+        None => Ok(()),
+    }
+}
+
 /// `SecretVersionTaken` unless a new secret's version follows the stored one.
 fn check_secret_version(stored: i64, secret: Option<&NewClientSecret>) -> Result<(), AppError> {
     match secret {
@@ -365,20 +393,40 @@ impl AppStore for SqliteAppStore {
         app_id: AppId,
         changes: AppChanges<'_>,
     ) -> Result<App, AppError> {
+        let auth = changes.auth.map(serde_json::to_string).transpose().map_err(read)?;
+        // A new template and a configuration write are serialised, so neither
+        // can leave a configuration requesting a scope the app no longer offers.
+        let mut transaction = self.immediate().await?;
+        if let Some(template) = changes.auth {
+            let requested: Vec<(String, String)> = sqlx::query_as(
+                "SELECT environment, oauth_scopes FROM app_configurations WHERE organization_id = ? AND app_id = ?",
+            )
+            .bind(organization_id.uuid())
+            .bind(app_id.uuid())
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(failed("update_organization_app"))?;
+            check_scopes_kept(template, &requested)?;
+        }
         let row = sqlx::query(concat!(
-            "UPDATE apps SET name = coalesce(?, name), description = coalesce(?, description), updated_at = ? \
+            "UPDATE apps SET name = coalesce(?, name), description = coalesce(?, description), \
+             auth = coalesce(?, auth), version = version + (? IS NOT NULL), updated_at = ? \
              WHERE organization_id = ? AND id = ? RETURNING ",
             columns!()
         ))
         .bind(changes.name)
         .bind(changes.description)
+        .bind(auth.as_deref())
+        .bind(auth.as_deref())
         .bind(Timestamp::now().millis())
         .bind(organization_id.uuid())
         .bind(app_id.uuid())
-        .fetch_optional(self.database.pool())
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(failed("update_organization_app"))?;
-        app_from(&row.ok_or(AppError::NotFound)?, None)
+        let app = app_from(&row.ok_or(AppError::NotFound)?, None)?;
+        transaction.commit().await.map_err(failed("update_organization_app"))?;
+        Ok(app)
     }
 
     async fn list_workspace_apps(
@@ -467,21 +515,42 @@ impl AppStore for SqliteAppStore {
         app_id: AppId,
         changes: AppChanges<'_>,
     ) -> Result<App, AppError> {
+        let auth = changes.auth.map(serde_json::to_string).transpose().map_err(read)?;
+        let mut transaction = self.immediate().await?;
+        if let Some(template) = changes.auth {
+            let requested: Vec<(String, String)> = sqlx::query_as(
+                "SELECT w.environment, c.oauth_scopes FROM workspace_app_configurations c \
+                 JOIN workspaces w ON w.organization_id = c.organization_id AND w.id = c.workspace_id \
+                 WHERE c.organization_id = ? AND c.workspace_id = ? AND c.app_id = ?",
+            )
+            .bind(organization_id.uuid())
+            .bind(workspace_id.uuid())
+            .bind(app_id.uuid())
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(failed("update_workspace_app"))?;
+            check_scopes_kept(template, &requested)?;
+        }
         let row = sqlx::query(concat!(
             "UPDATE workspace_apps SET name = coalesce(?, name), description = coalesce(?, description), \
+             auth = coalesce(?, auth), version = version + (? IS NOT NULL), \
              updated_at = ? WHERE organization_id = ? AND workspace_id = ? AND id = ? RETURNING ",
             workspace_columns!()
         ))
         .bind(changes.name)
         .bind(changes.description)
+        .bind(auth.as_deref())
+        .bind(auth.as_deref())
         .bind(Timestamp::now().millis())
         .bind(organization_id.uuid())
         .bind(workspace_id.uuid())
         .bind(app_id.uuid())
-        .fetch_optional(self.database.pool())
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(failed("update_workspace_app"))?;
-        workspace_app_from(&row.ok_or(AppError::NotFound)?)
+        let app = workspace_app_from(&row.ok_or(AppError::NotFound)?)?;
+        transaction.commit().await.map_err(failed("update_workspace_app"))?;
+        Ok(app)
     }
 
     async fn list_organization_configurations(
@@ -491,7 +560,8 @@ impl AppStore for SqliteAppStore {
         let rows = sqlx::query(concat!(
             "SELECT c.environment, ",
             configuration_columns!(),
-            " FROM app_configurations c LEFT JOIN users u ON u.id = c.updated_by_user_id              WHERE c.organization_id = ?"
+            " FROM app_configurations c LEFT JOIN users u ON u.id = c.updated_by_user_id \
+             WHERE c.organization_id = ?"
         ))
         .bind(organization_id.uuid())
         .fetch_all(self.database.pool())
@@ -511,7 +581,8 @@ impl AppStore for SqliteAppStore {
         let row = sqlx::query(concat!(
             "SELECT ",
             configuration_columns!(),
-            " FROM app_configurations c LEFT JOIN users u ON u.id = c.updated_by_user_id              WHERE c.organization_id = ? AND c.app_id = ? AND c.environment = ?"
+            " FROM app_configurations c LEFT JOIN users u ON u.id = c.updated_by_user_id \
+             WHERE c.organization_id = ? AND c.app_id = ? AND c.environment = ?"
         ))
         .bind(organization_id.uuid())
         .bind(app_id.uuid())
@@ -531,17 +602,16 @@ impl AppStore for SqliteAppStore {
     ) -> Result<Configuration, AppError> {
         let write = Write::of(changes)?;
         let mut transaction = self.immediate().await?;
-        let app = sqlx::query("SELECT 1 FROM apps WHERE organization_id = ? AND id = ?")
+        let auth: Option<String> = sqlx::query_scalar("SELECT auth FROM apps WHERE organization_id = ? AND id = ?")
             .bind(organization_id.uuid())
             .bind(app_id.uuid())
             .fetch_optional(&mut *transaction)
             .await
             .map_err(failed("save_organization_configuration"))?;
-        if app.is_none() {
-            return Err(AppError::NotFound);
-        }
+        check_scopes_offered(&auth.ok_or(AppError::NotFound)?, changes)?;
         let stored: Option<i64> = sqlx::query_scalar(
-            "SELECT secret_version FROM app_configurations              WHERE organization_id = ? AND app_id = ? AND environment = ?",
+            "SELECT secret_version FROM app_configurations \
+             WHERE organization_id = ? AND app_id = ? AND environment = ?",
         )
         .bind(organization_id.uuid())
         .bind(app_id.uuid())
@@ -551,7 +621,11 @@ impl AppStore for SqliteAppStore {
         .map_err(failed("save_organization_configuration"))?;
         check_secret_version(stored.unwrap_or(0), write.secret.as_ref())?;
         let query = sqlx::query(concat!(
-            "INSERT INTO app_configurations (id, organization_id, app_id, environment, version, mcp_server_url,              oauth_client_id, oauth_scopes, secret_key_id, secret_wrapped_key, secret_nonce, secret_ciphertext,              secret_last4, secret_updated_at, secret_version, updated_at, updated_by_user_id)              VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)              ON CONFLICT (organization_id, app_id, environment)",
+            "INSERT INTO app_configurations (id, organization_id, app_id, environment, version, mcp_server_url, \
+             oauth_client_id, oauth_scopes, secret_key_id, secret_wrapped_key, secret_nonce, secret_ciphertext, \
+             secret_last4, secret_updated_at, secret_version, updated_at, updated_by_user_id) \
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+             ON CONFLICT (organization_id, app_id, environment)",
             upsert_update!()
         ))
         .bind(uuid::Uuid::now_v7())
@@ -574,7 +648,8 @@ impl AppStore for SqliteAppStore {
         let row = sqlx::query(concat!(
             "SELECT ",
             configuration_columns!(),
-            " FROM app_configurations c LEFT JOIN users u ON u.id = c.updated_by_user_id              WHERE c.organization_id = ? AND c.app_id = ? AND c.environment = ?"
+            " FROM app_configurations c LEFT JOIN users u ON u.id = c.updated_by_user_id \
+             WHERE c.organization_id = ? AND c.app_id = ? AND c.environment = ?"
         ))
         .bind(organization_id.uuid())
         .bind(app_id.uuid())
@@ -597,7 +672,8 @@ impl AppStore for SqliteAppStore {
         environment: Environment,
     ) -> Result<Option<StoredClientSecret>, AppError> {
         let row = sqlx::query(
-            "SELECT secret_key_id, secret_wrapped_key, secret_nonce, secret_ciphertext, secret_version              FROM app_configurations WHERE organization_id = ? AND app_id = ? AND environment = ?",
+            "SELECT secret_key_id, secret_wrapped_key, secret_nonce, secret_ciphertext, secret_version \
+             FROM app_configurations WHERE organization_id = ? AND app_id = ? AND environment = ?",
         )
         .bind(organization_id.uuid())
         .bind(app_id.uuid())
@@ -616,7 +692,10 @@ impl AppStore for SqliteAppStore {
         let rows = sqlx::query(concat!(
             "SELECT w.environment, ",
             configuration_columns!(),
-            " FROM workspace_app_configurations c              JOIN workspaces w ON w.organization_id = c.organization_id AND w.id = c.workspace_id              LEFT JOIN users u ON u.id = c.updated_by_user_id              WHERE c.organization_id = ? AND c.workspace_id = ?"
+            " FROM workspace_app_configurations c \
+             JOIN workspaces w ON w.organization_id = c.organization_id AND w.id = c.workspace_id \
+             LEFT JOIN users u ON u.id = c.updated_by_user_id \
+             WHERE c.organization_id = ? AND c.workspace_id = ?"
         ))
         .bind(organization_id.uuid())
         .bind(workspace_id.uuid())
@@ -637,7 +716,10 @@ impl AppStore for SqliteAppStore {
         let row = sqlx::query(concat!(
             "SELECT w.environment, ",
             configuration_columns!(),
-            " FROM workspace_app_configurations c              JOIN workspaces w ON w.organization_id = c.organization_id AND w.id = c.workspace_id              LEFT JOIN users u ON u.id = c.updated_by_user_id              WHERE c.organization_id = ? AND c.workspace_id = ? AND c.app_id = ?"
+            " FROM workspace_app_configurations c \
+             JOIN workspaces w ON w.organization_id = c.organization_id AND w.id = c.workspace_id \
+             LEFT JOIN users u ON u.id = c.updated_by_user_id \
+             WHERE c.organization_id = ? AND c.workspace_id = ? AND c.app_id = ?"
         ))
         .bind(organization_id.uuid())
         .bind(workspace_id.uuid())
@@ -658,18 +740,19 @@ impl AppStore for SqliteAppStore {
     ) -> Result<Configuration, AppError> {
         let write = Write::of(changes)?;
         let mut transaction = self.immediate().await?;
-        let app = sqlx::query("SELECT 1 FROM workspace_apps WHERE organization_id = ? AND workspace_id = ? AND id = ?")
-            .bind(organization_id.uuid())
-            .bind(workspace_id.uuid())
-            .bind(app_id.uuid())
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(failed("save_workspace_configuration"))?;
-        if app.is_none() {
-            return Err(AppError::NotFound);
-        }
+        let auth: Option<String> = sqlx::query_scalar(
+            "SELECT auth FROM workspace_apps WHERE organization_id = ? AND workspace_id = ? AND id = ?",
+        )
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(app_id.uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(failed("save_workspace_configuration"))?;
+        check_scopes_offered(&auth.ok_or(AppError::NotFound)?, changes)?;
         let stored: Option<i64> = sqlx::query_scalar(
-            "SELECT secret_version FROM workspace_app_configurations              WHERE organization_id = ? AND workspace_id = ? AND app_id = ?",
+            "SELECT secret_version FROM workspace_app_configurations \
+             WHERE organization_id = ? AND workspace_id = ? AND app_id = ?",
         )
         .bind(organization_id.uuid())
         .bind(workspace_id.uuid())
@@ -679,7 +762,11 @@ impl AppStore for SqliteAppStore {
         .map_err(failed("save_workspace_configuration"))?;
         check_secret_version(stored.unwrap_or(0), write.secret.as_ref())?;
         let query = sqlx::query(concat!(
-            "INSERT INTO workspace_app_configurations (id, organization_id, workspace_id, app_id, version,              mcp_server_url, oauth_client_id, oauth_scopes, secret_key_id, secret_wrapped_key, secret_nonce,              secret_ciphertext, secret_last4, secret_updated_at, secret_version, updated_at, updated_by_user_id)              VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)              ON CONFLICT (organization_id, workspace_id, app_id)",
+            "INSERT INTO workspace_app_configurations (id, organization_id, workspace_id, app_id, version, \
+             mcp_server_url, oauth_client_id, oauth_scopes, secret_key_id, secret_wrapped_key, secret_nonce, \
+             secret_ciphertext, secret_last4, secret_updated_at, secret_version, updated_at, updated_by_user_id) \
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+             ON CONFLICT (organization_id, workspace_id, app_id)",
             upsert_update!()
         ))
         .bind(uuid::Uuid::now_v7())
@@ -704,7 +791,10 @@ impl AppStore for SqliteAppStore {
         let row = sqlx::query(concat!(
             "SELECT w.environment, ",
             configuration_columns!(),
-            " FROM workspace_app_configurations c              JOIN workspaces w ON w.organization_id = c.organization_id AND w.id = c.workspace_id              LEFT JOIN users u ON u.id = c.updated_by_user_id              WHERE c.organization_id = ? AND c.workspace_id = ? AND c.app_id = ?"
+            " FROM workspace_app_configurations c \
+             JOIN workspaces w ON w.organization_id = c.organization_id AND w.id = c.workspace_id \
+             LEFT JOIN users u ON u.id = c.updated_by_user_id \
+             WHERE c.organization_id = ? AND c.workspace_id = ? AND c.app_id = ?"
         ))
         .bind(organization_id.uuid())
         .bind(workspace_id.uuid())
@@ -727,7 +817,8 @@ impl AppStore for SqliteAppStore {
         app_id: AppId,
     ) -> Result<Option<StoredClientSecret>, AppError> {
         let row = sqlx::query(
-            "SELECT secret_key_id, secret_wrapped_key, secret_nonce, secret_ciphertext, secret_version              FROM workspace_app_configurations WHERE organization_id = ? AND workspace_id = ? AND app_id = ?",
+            "SELECT secret_key_id, secret_wrapped_key, secret_nonce, secret_ciphertext, secret_version \
+             FROM workspace_app_configurations WHERE organization_id = ? AND workspace_id = ? AND app_id = ?",
         )
         .bind(organization_id.uuid())
         .bind(workspace_id.uuid())

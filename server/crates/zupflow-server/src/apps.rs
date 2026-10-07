@@ -24,6 +24,7 @@ use zupflow_core::organizations::MemberRole;
 use zupflow_core::time::Timestamp;
 
 use crate::auth::{Access, AppState, Caller, WorkspaceAccess};
+use crate::auth_templates::checked_auth_template;
 use crate::http::{Failure, envelope};
 use crate::input::{Body, Fields, Object};
 use crate::organizations::{checked_name, checked_slug};
@@ -177,6 +178,31 @@ pub(crate) async fn installation_counts(state: &AppState, access: &Access) -> Re
 pub(crate) fn app_failure(error: AppError) -> Failure {
     match error {
         AppError::NotFound => ApiError::not_found("App").into(),
+        AppError::ScopeInUse { environment, scope } => {
+            let environment = match environment {
+                Environment::Sandbox => "Sandbox",
+                Environment::Production => "Production",
+            };
+            let mut error = ApiError::new(
+                409,
+                "scope_in_use",
+                format!("{scope} is requested by the {environment} configuration. Remove it there first."),
+            );
+            error.fields = Some(
+                [(
+                    "auth.available_scopes".to_owned(),
+                    format!("{scope} is still requested by the {environment} configuration."),
+                )]
+                .into(),
+            );
+            error.into()
+        }
+        AppError::UnknownScope(scope) => {
+            let message = format!("{scope} is not offered by this app.");
+            let mut error = ApiError::new(422, "unknown_scope", message.clone());
+            error.fields = Some([("oauth_scopes".to_owned(), message)].into());
+            error.into()
+        }
         // Only a configuration write meets this, and only after retrying.
         AppError::SecretVersionTaken => ApiError::new(
             409,
@@ -252,13 +278,46 @@ fn new_app(body: &Object) -> Result<NewApp, Failure> {
     Ok(NewApp::blank(name, slug, description, auth_type))
 }
 
-/// `UpdateAppInput`: a name and a description, each optional.
-fn changes(body: &Object) -> Result<(Option<String>, Option<String>), Failure> {
+/// `UpdateAppInput`, checked against the app as it is: a name and a
+/// description, each optional, then a whole new template if `auth` is sent.
+/// `configurations` are the app's own, whose requested scopes the template
+/// must keep offering.
+struct Update {
+    name: Option<String>,
+    description: Option<String>,
+    auth: Option<AuthTemplate>,
+}
+
+fn update_of(body: &Object, app: &App, configurations: &[Configuration]) -> Result<Update, Failure> {
     let mut fields = Fields::default();
     let name = checked_name(body.optional_string("name", &mut fields), &mut fields);
     let description = checked_description(body.optional_string("description", &mut fields), &mut fields);
     fields.finish()?;
-    Ok((name, description))
+    let used: Vec<(Environment, Vec<String>)> = configurations
+        .iter()
+        .filter(|configuration| configuration.app_id == app.id && !configuration.oauth_scopes.is_empty())
+        .map(|configuration| (configuration.environment, configuration.oauth_scopes.clone()))
+        .collect();
+    let auth = body
+        .0
+        .get("auth")
+        .map(|raw| checked_auth_template(&app.auth, raw, &used))
+        .transpose()?;
+    Ok(Update {
+        name,
+        description,
+        auth,
+    })
+}
+
+impl Update {
+    fn changes(&self) -> AppChanges<'_> {
+        AppChanges {
+            name: self.name.as_deref(),
+            description: self.description.as_deref(),
+            auth: self.auth.as_ref(),
+        }
+    }
 }
 
 async fn list_organization_apps(
@@ -340,29 +399,33 @@ async fn update_organization_app(
     access.require(MemberRole::is_admin, "edit apps")?;
     let app_id = app_id(&app)?;
     // A missing app is 404 before anything about the body.
-    state
+    let current = state
         .apps
         .find_organization_app(access.organization_id, app_id)
         .await
         .map_err(app_failure)?
         .ok_or(AppError::NotFound)
         .map_err(app_failure)?;
-    let (name, description) = changes(&body.object()?)?;
-    let app = state
-        .apps
-        .update_organization_app(
-            access.organization_id,
-            app_id,
-            AppChanges {
-                name: name.as_deref(),
-                description: description.as_deref(),
-            },
+    let body = body.object()?;
+    // A catalog app's template is shared by both environments, so a key,
+    // which acts in one, never changes it (decision 0035).
+    if body.has("auth") && access.environment().is_some() {
+        return Err(ApiError::new(
+            403,
+            "console_only",
+            "A catalog app's authentication is shared by both environments; change it in the Console.",
         )
-        .await
-        .map_err(app_failure)?;
+        .into());
+    }
     let configurations = state
         .apps
         .list_organization_configurations(access.organization_id)
+        .await
+        .map_err(app_failure)?;
+    let update = update_of(&body, &current, &configurations)?;
+    let app = state
+        .apps
+        .update_organization_app(access.organization_id, app_id, update.changes())
         .await
         .map_err(app_failure)?;
     let installations = installation_counts(&state, &access).await?;
@@ -461,30 +524,22 @@ async fn update_workspace_app(
     access.access.require(MemberRole::is_admin, "edit apps")?;
     let (organization_id, workspace_id) = (access.access.organization_id, access.workspace.id);
     let app_id = app_id(&app)?;
-    state
+    let current = state
         .apps
         .find_workspace_app(organization_id, workspace_id, app_id)
         .await
         .map_err(app_failure)?
         .ok_or(AppError::NotFound)
         .map_err(app_failure)?;
-    let (name, description) = changes(&body.object()?)?;
-    let app = state
-        .apps
-        .update_workspace_app(
-            organization_id,
-            workspace_id,
-            app_id,
-            AppChanges {
-                name: name.as_deref(),
-                description: description.as_deref(),
-            },
-        )
-        .await
-        .map_err(app_failure)?;
     let configurations = state
         .apps
-        .list_workspace_configurations(access.access.organization_id, access.workspace.id)
+        .list_workspace_configurations(organization_id, workspace_id)
+        .await
+        .map_err(app_failure)?;
+    let update = update_of(&body.object()?, &current, &configurations)?;
+    let app = state
+        .apps
+        .update_workspace_app(organization_id, workspace_id, app_id, update.changes())
         .await
         .map_err(app_failure)?;
     let installations = installation_counts(&state, &access.access).await?;

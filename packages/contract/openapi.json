@@ -5189,7 +5189,7 @@
       },
       "patch": {
         "operationId": "updateOrganizationApp",
-        "summary": "Rename or describe a catalog app",
+        "summary": "Rename or describe a catalog app, or set how it authenticates",
         "security": [
           {
             "consoleSession": []
@@ -5272,6 +5272,9 @@
                   },
                   "description": {
                     "type": "string"
+                  },
+                  "auth": {
+                    "$ref": "#/components/schemas/AuthTemplate"
                   }
                 }
               }
@@ -5837,7 +5840,7 @@
       },
       "patch": {
         "operationId": "updateWorkspaceApp",
-        "summary": "Rename or describe a workspace app",
+        "summary": "Rename or describe a workspace app, or set how it authenticates",
         "security": [
           {
             "consoleSession": [],
@@ -5921,6 +5924,9 @@
                   },
                   "description": {
                     "type": "string"
+                  },
+                  "auth": {
+                    "$ref": "#/components/schemas/AuthTemplate"
                   }
                 }
               }
