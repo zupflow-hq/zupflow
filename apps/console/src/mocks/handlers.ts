@@ -1874,6 +1874,18 @@ export function createHandlers(apiBase: string) {
           z.object({ return_urls: z.array(z.string()).max(20), allowed_origins: z.array(z.string()).max(20) }),
         );
         const fields: Record<string, string> = {};
+        // The longest a session can carry; checked before anything else, as the backend does.
+        for (const [list, values] of [
+          ["return_urls", input.return_urls],
+          ["allowed_origins", input.allowed_origins],
+        ] as const) {
+          values.forEach((value, i) => {
+            if ([...value].length > 2000) fields[`${list}.${i}`] = "Use 2,000 characters or fewer.";
+          });
+        }
+        if (Object.keys(fields).length > 0) {
+          throw new ApiFailure(400, "validation_failed", "Some entries are invalid.", fields);
+        }
         const allowHttp = (url: URL) => env.data === "sandbox" && url.hostname === "localhost";
         input.return_urls.forEach((value, i) => {
           if (value.includes("*")) fields[`return_urls.${i}`] = "Wildcards aren't allowed. List each URL exactly.";

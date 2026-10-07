@@ -27,16 +27,18 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use zupflow_basic::local_keys::LocalKeyService;
 use zupflow_core::api_keys::{ApiKeyHasher, ApiKeyStore, NewApiKey, NewSecret};
 use zupflow_core::apps::AppStore;
+use zupflow_core::connect::{ConnectIntent, ConnectStore, NewConnectSession, Reference};
 use zupflow_core::environment::Environment;
 use zupflow_core::idempotency::Fingerprinter;
 use zupflow_core::identity::{Identity, IdentityError, Profile, VerifiedIdentity};
-use zupflow_core::ids::{ApiKeyId, AppId, InstallationId, OrganizationId, WorkspaceId};
+use zupflow_core::ids::{ApiKeyId, AppId, ConnectSessionId, InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::{InstallationStore, InstalledApp};
 use zupflow_core::organizations::{MemberRole, OrganizationStore, User};
+use zupflow_core::time::Timestamp;
 use zupflow_core::workspaces::{NewWorkspace, WorkspaceStore};
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{
-    Database, SqliteApiKeyStore, SqliteAppStore, SqliteIdempotencyStore, SqliteInstallationStore,
+    Database, SqliteApiKeyStore, SqliteAppStore, SqliteConnectStore, SqliteIdempotencyStore, SqliteInstallationStore,
     SqliteOrganizationStore, SqliteWorkspaceStore,
 };
 
@@ -103,6 +105,7 @@ async fn serve(path: &str) -> Result<(), String> {
         workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
         apps: Arc::new(SqliteAppStore::new(database.clone())),
         installations: Arc::new(SqliteInstallationStore::new(database.clone())),
+        connect: Arc::new(SqliteConnectStore::new(database.clone())),
         keys: Arc::new(LocalKeyService::from_server_secret(&secret)),
         public_url: format!("http://localhost:{port}"),
         api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
@@ -332,6 +335,60 @@ async fn reset(path: &str) -> Result<(), String> {
             .create_installation(organization, workspace, installation_id, &installation)
             .await
             .map_err(|error| fail(label)(&error))?;
+    }
+
+    // Connect settings: Northwind's Sandbox allows the suite's return URL,
+    // Larkspur's doesn't. And a session in each workspace the suite expects one.
+    let connect = SqliteConnectStore::new(database.clone());
+    for (organization, return_urls, origins) in [
+        (
+            northwind.id,
+            vec!["http://localhost:3000/settings/integrations".to_owned()],
+            vec!["http://localhost:3000".to_owned()],
+        ),
+        (
+            larkspur.id,
+            vec!["https://harbor.example/settings/integrations".to_owned()],
+            vec!["https://harbor.example".to_owned()],
+        ),
+    ] {
+        connect
+            .save_settings(organization, Environment::Sandbox, &return_urls, &origins)
+            .await
+            .map_err(|error| fail("connect settings")(&error))?;
+    }
+    for (organization, workspace, slug) in [
+        (northwind.id, "acme", "google-workspace"),
+        (northwind.id, "beta-labs", "google-workspace"),
+        (larkspur.id, "harbor", "linear"),
+    ] {
+        let (workspace, environment) = workspace_id(workspace)?;
+        let app = seeded
+            .iter()
+            .find(|(owner, seeded, _)| *owner == organization && seeded == slug)
+            .map(|(_, _, app)| *app)
+            .ok_or_else(|| format!("app {slug}"))?;
+        let reference = Reference::generate().map_err(|error| fail("reference")(&error))?;
+        connect
+            .create_session(
+                organization,
+                workspace,
+                ConnectSessionId::generate(),
+                &NewConnectSession {
+                    environment,
+                    app,
+                    configuration_version: 1,
+                    intent: ConnectIntent::Create,
+                    installation_id: None,
+                    label: "Team".to_owned(),
+                    return_url: None,
+                    requested_scopes: Vec::new(),
+                    reference_hash: reference.hash(),
+                },
+                Timestamp::now(),
+            )
+            .await
+            .map_err(|error| fail("session")(&error))?;
     }
 
     let secret = database

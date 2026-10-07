@@ -53,8 +53,8 @@ fn knows_every_post_route_an_api_key_cannot_call() {
 }
 
 /// `SERVED_OPERATIONS` is exactly what the router answers: asked without a
-/// credential, a served route answers 401 and any other contract route the
-/// API's 404 or 405, so the list can't claim a route that isn't there or miss
+/// credential, a served route answers 401 (or, for hosted Connect, its own
+/// 404) and any other contract route the API's 404 or 405, so the list can't claim a route that isn't there or miss
 /// one that is.
 #[tokio::test]
 async fn serves_exactly_the_operations_it_lists() {
@@ -80,8 +80,22 @@ async fn serves_exactly_the_operations_it_lists() {
                 .body(axum::body::Body::empty())
                 .unwrap();
             let response = tower::ServiceExt::oneshot(server.app.clone(), request).await.unwrap();
-            match response.status().as_u16() {
+            let status = response.status().as_u16();
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            let message = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default()["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            match status {
                 401 => {
+                    answered.insert(id);
+                }
+                // Hosted Connect needs no credential: its route answers that
+                // the reference names no session, not the router's 404.
+                404 if message != "There's nothing at this path." => {
                     answered.insert(id);
                 }
                 404 | 405 => {}

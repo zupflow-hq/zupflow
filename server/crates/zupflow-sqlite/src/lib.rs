@@ -3,6 +3,7 @@
 //! - [`Database`]: opens the file, sets it up and applies the migrations.
 //! - [`SqliteApiKeyStore`]: API keys, by keyed hash.
 //! - [`SqliteAppStore`]: catalog apps and workspace apps.
+//! - [`SqliteConnectStore`]: Connect settings and sessions.
 //! - [`SqliteIdempotencyStore`]: idempotency keys for `POST`.
 //! - [`SqliteInstallationStore`]: installations and their sealed credentials.
 //! - [`SqliteJobQueue`]: the job queue, in the same database.
@@ -15,6 +16,7 @@
 
 mod api_keys;
 mod apps;
+mod connect;
 mod database;
 mod idempotency;
 mod installations;
@@ -26,6 +28,7 @@ mod workspaces;
 
 pub use api_keys::SqliteApiKeyStore;
 pub use apps::SqliteAppStore;
+pub use connect::SqliteConnectStore;
 pub use database::{Database, DatabaseError};
 pub use idempotency::SqliteIdempotencyStore;
 pub use installations::SqliteInstallationStore;

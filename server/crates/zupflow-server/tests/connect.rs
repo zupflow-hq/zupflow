@@ -1,0 +1,601 @@
+//! Connect end to end (decision 0005): settings per organization and
+//! environment; sessions started only for ready apps of this workspace, with a
+//! link shown once; the hosted page reached by the link's reference alone.
+
+#![allow(clippy::unwrap_used)]
+
+mod common;
+
+use axum::http::{Method, StatusCode};
+use common::{Server, call, code};
+use serde_json::{Value, json};
+
+fn id(value: &Value) -> &str {
+    value["id"].as_str().unwrap()
+}
+
+struct Tenant {
+    org: String,
+    sandbox: String,
+    production: String,
+    /// A ready token app in the catalog.
+    ready: String,
+    /// A catalog app with no configuration.
+    unready: String,
+}
+
+async fn tenant(server: &Server, user: &str, slug: &str) -> Tenant {
+    let org = server.organization(user, slug).await;
+    let sandbox = server
+        .workspace(user, &org, &format!("{slug}-sandbox"), "sandbox")
+        .await;
+    let production = server.workspace(user, &org, slug, "production").await;
+    let mut apps = Vec::new();
+    for app_slug in ["tools", "notes"] {
+        let (status, body) = server
+            .send(
+                call(user, Method::POST, format!("/v1/organizations/{org}/apps")).body(json!({
+                    "kind": "mcp", "name": app_slug, "slug": app_slug, "description": "", "auth_type": "token",
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        apps.push(id(&body["data"]).to_owned());
+    }
+    for environment in ["sandbox", "production"] {
+        let (status, _) = server
+            .send(
+                call(
+                    user,
+                    Method::PUT,
+                    format!(
+                        "/v1/organizations/{org}/apps/{}/environments/{environment}/configuration",
+                        apps[0]
+                    ),
+                )
+                .body(json!({ "mcp_server_url": "https://tools.example/mcp" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    Tenant {
+        org,
+        sandbox: id(&sandbox).to_owned(),
+        production: id(&production).to_owned(),
+        ready: apps[0].clone(),
+        unready: apps[1].clone(),
+    }
+}
+
+fn session(app: &str, return_url: Value) -> Value {
+    json!({ "app_id": app, "intent": "create", "label": "Main", "installation_id": null, "return_url": return_url })
+}
+
+fn start<'a>(user: &'a str, org: &'a str, ws: &str, body: Value) -> common::Call<'a> {
+    call(user, Method::POST, format!("/v1/workspaces/{ws}/connect-sessions"))
+        .naming(org)
+        .body(body)
+}
+
+/// The reference at the end of a created session's link.
+fn reference_of(created: &Value) -> String {
+    created["url"].as_str().unwrap().rsplit('/').next().unwrap().to_owned()
+}
+
+async fn key(server: &Server, user: &str, org: &str, environment: &str) -> String {
+    let (_, body) = server
+        .send(
+            call(user, Method::POST, format!("/v1/organizations/{org}/api-keys"))
+                .body(json!({ "name": "Server", "environment": environment })),
+        )
+        .await;
+    body["data"]["secret"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn keeps_settings_per_organization_and_environment() {
+    let server = Server::new().await;
+    let t = tenant(&server, "alice", "northwind").await;
+    let path = |env: &str| format!("/v1/organizations/{}/connect-settings/{env}", t.org);
+
+    let (status, empty) = server.send(call("alice", Method::GET, path("sandbox"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        empty["data"],
+        json!({ "environment": "sandbox", "return_urls": [], "allowed_origins": [], "updated_at": null })
+    );
+
+    let (status, body) = server
+        .send(call("alice", Method::PUT, path("production")).body(json!({
+            "return_urls": ["https://app.example/*", "http://localhost:3000/cb", "https://app.example/cb#x", "nope"],
+            "allowed_origins": ["https://app.example/path", "http://localhost:3000"],
+        })))
+        .await;
+    assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "validation_failed"));
+    assert_eq!(
+        body["error"]["fields"],
+        json!({
+            "return_urls.0": "Wildcards aren't allowed. List each URL exactly.",
+            "return_urls.1": "Use https:// (http://localhost is allowed in Sandbox).",
+            "return_urls.2": "Remove the #fragment.",
+            "return_urls.3": "Enter a full URL.",
+            "allowed_origins.0": "Use an origin only: scheme, host and port.",
+            "allowed_origins.1": "Use https:// (http://localhost is allowed in Sandbox).",
+        })
+    );
+
+    let (status, saved) = server
+        .send(call("alice", Method::PUT, path("sandbox")).body(json!({
+            "return_urls": ["http://localhost:3000/cb", "http://localhost:3000/cb", "https://app.example/cb"],
+            "allowed_origins": ["https://app.example/", "http://localhost:3000"],
+        })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(
+        (&saved["data"]["return_urls"], &saved["data"]["allowed_origins"]),
+        (
+            &json!(["http://localhost:3000/cb", "https://app.example/cb"]),
+            &json!(["https://app.example", "http://localhost:3000"])
+        ),
+        "duplicates go, a trailing slash goes"
+    );
+    let (_, production) = server.send(call("alice", Method::GET, path("production"))).await;
+    assert_eq!(production["data"]["return_urls"], json!([]), "Production is its own");
+
+    // Roles, keys and other organizations.
+    server.member("alice", &t.org, "devin", "developer").await;
+    let (status, _) = server
+        .send(call("devin", Method::PUT, path("sandbox")).body(json!({ "return_urls": [], "allowed_origins": [] })))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let sandbox_key = key(&server, "alice", &t.org, "sandbox").await;
+    let (status, body) = server.send(call(&sandbox_key, Method::GET, path("production"))).await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::UNPROCESSABLE_ENTITY, "environment_mismatch")
+    );
+    server.organization("riley", "larkspur").await;
+    let (status, _) = server.send(call("riley", Method::GET, path("sandbox"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn starts_a_session_only_for_a_ready_app_of_this_workspace() {
+    let server = Server::new().await;
+    let t = tenant(&server, "alice", "northwind").await;
+    let sessions = |ws: &str| format!("/v1/workspaces/{ws}/connect-sessions");
+    let (status, created) = server
+        .send(start("alice", &t.org, &t.sandbox, session(&t.ready, Value::Null)))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let created = &created["data"];
+    let url = created["url"].as_str().unwrap();
+    assert!(url.starts_with("http://localhost:8080/connect/"), "{url}");
+    let reference = reference_of(created);
+    assert_eq!(reference.len(), 32);
+    assert!(reference.bytes().all(|b| b.is_ascii_alphanumeric()));
+    assert_eq!(
+        (
+            &created["status"],
+            &created["intent"],
+            &created["environment"],
+            &created["auth"]
+        ),
+        (&json!("pending"), &json!("create"), &json!("sandbox"), &Value::Null)
+    );
+    assert_eq!(created["app"]["id"], t.ready.as_str());
+
+    // The link is shown once: no read returns it, nor its reference.
+    let (_, listed) = server
+        .send(call("alice", Method::GET, sessions(&t.sandbox)).naming(&t.org))
+        .await;
+    let (_, got) = server
+        .send(
+            call(
+                "alice",
+                Method::GET,
+                format!("{}/{}", sessions(&t.sandbox), id(created)),
+            )
+            .naming(&t.org),
+        )
+        .await;
+    for body in [&listed, &got] {
+        assert!(!body.to_string().contains(&reference));
+        assert!(!body.to_string().contains("\"url\""));
+    }
+    assert_eq!(listed["data"].as_array().unwrap().len(), 1);
+    // Nor does the database hold it.
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", server.directory.join("zupflow.sqlite").display()))
+        .await
+        .unwrap();
+    let rows: Vec<(Vec<u8>,)> = sqlx::query_as("SELECT reference_hash FROM connect_sessions")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert!(
+        rows.iter()
+            .all(|(hash,)| hash.len() == 32 && !hash.windows(8).any(|w| w == &reference.as_bytes()[..8]))
+    );
+
+    // Refusals, in the order the mock gives them.
+    for (body, status, expected) in [
+        (
+            session(&t.unready, Value::Null),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "configuration_not_ready",
+        ),
+        (session("app_nothere", Value::Null), StatusCode::NOT_FOUND, "not_found"),
+        (
+            session(&t.ready, json!("https://evil.example/cb")),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "return_url_not_allowed",
+        ),
+        (
+            json!({ "app_id": t.ready, "intent": "create", "label": "Main", "installation_id": "inst_x", "return_url": null }),
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+        ),
+        (
+            json!({ "app_id": t.ready, "intent": "reconnect", "label": "Main", "installation_id": null, "return_url": null }),
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+        ),
+        (
+            json!({ "app_id": t.ready, "intent": "reconnect", "label": "Main", "installation_id": "inst_nothere", "return_url": null }),
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+    ] {
+        let (got, error) = server.send(start("alice", &t.org, &t.sandbox, body.clone())).await;
+        assert_eq!((got, code(&error)), (status, expected), "{body}");
+    }
+
+    // The Console only observes Production; a key there starts sessions.
+    let (status, body) = server
+        .send(start("alice", &t.org, &t.production, session(&t.ready, Value::Null)))
+        .await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::FORBIDDEN, "console_read_only_in_production")
+    );
+    let production_key = key(&server, "alice", &t.org, "production").await;
+    let (status, _) = server
+        .send(call(&production_key, Method::POST, sessions(&t.production)).body(session(&t.ready, Value::Null)))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Viewers don't start sessions; another organization doesn't see them.
+    server.member("alice", &t.org, "vic", "viewer").await;
+    let (status, _) = server
+        .send(start("vic", &t.org, &t.sandbox, session(&t.ready, Value::Null)))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let other = tenant(&server, "riley", "larkspur").await;
+    let (status, _) = server
+        .send(
+            call(
+                "riley",
+                Method::GET,
+                format!("{}/{}", sessions(&t.sandbox), id(created)),
+            )
+            .naming(&other.org),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = server
+        .send(
+            call(
+                "riley",
+                Method::GET,
+                format!("{}/{}", sessions(&other.sandbox), id(created)),
+            )
+            .naming(&other.org),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // Another organization's ready app isn't this workspace's to connect.
+    let (status, _) = server
+        .send(start(
+            "riley",
+            &other.org,
+            &other.sandbox,
+            session(&t.ready, Value::Null),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn serves_the_hosted_page_by_its_reference_alone() {
+    let server = Server::new().await;
+    let t = tenant(&server, "alice", "northwind").await;
+    let start = || {
+        call(
+            "alice",
+            Method::POST,
+            format!("/v1/workspaces/{}/connect-sessions", t.sandbox),
+        )
+        .naming(&t.org)
+        .body(session(&t.ready, Value::Null))
+    };
+    let (_, created) = server.send(start()).await;
+    let reference = reference_of(&created["data"]);
+
+    // Whoever calls: the reference is the authority, not a credential.
+    let (status, hosted) = server
+        .send(call("nobody", Method::GET, format!("/v1/connect/sessions/{reference}")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{hosted}");
+    assert_eq!(hosted["data"]["id"], created["data"]["id"]);
+    assert_eq!(
+        hosted["data"]["auth"]["type"], "token",
+        "the page gets the template to render"
+    );
+    assert!(!hosted.to_string().contains("\"url\""));
+    for unknown in ["nope", &reference[1..], &"x".repeat(200)] {
+        let (status, body) = server
+            .send(call("nobody", Method::GET, format!("/v1/connect/sessions/{unknown}")))
+            .await;
+        assert_eq!(
+            (status, &body["error"]["message"]),
+            (StatusCode::NOT_FOUND, &json!("Connect session was not found."))
+        );
+    }
+
+    // Cancel once. A retry with the same key replays that answer (the key is
+    // the session's); a fresh attempt is 409.
+    let cancel = |key: &'static str| {
+        call(
+            "nobody",
+            Method::POST,
+            format!("/v1/connect/sessions/{reference}/cancel"),
+        )
+        .idempotent(key)
+    };
+    let (status, cancelled) = server.send(cancel("k-1")).await;
+    assert_eq!(
+        (status, &cancelled["data"]["status"]),
+        (StatusCode::OK, &json!("cancelled"))
+    );
+    assert_eq!(
+        server.send(cancel("k-1")).await,
+        (status, cancelled.clone()),
+        "replayed"
+    );
+    let (status, again) = server.send(cancel("k-2")).await;
+    assert_eq!((status, code(&again)), (StatusCode::CONFLICT, "session_not_pending"));
+    assert_eq!(
+        again["error"]["message"],
+        "This Connect session was already used. Start again from the app."
+    );
+    // The same key on another session is that session's own.
+    let (_, other) = server.send(start()).await;
+    let other_reference = reference_of(&other["data"]);
+    let (status, body) = server
+        .send(
+            call(
+                "nobody",
+                Method::POST,
+                format!("/v1/connect/sessions/{other_reference}/cancel"),
+            )
+            .idempotent("k-1"),
+        )
+        .await;
+    assert_eq!((status, &body["data"]["id"]), (StatusCode::OK, &other["data"]["id"]));
+    // An unknown reference is the same 404, key or not.
+    let (status, _) = server
+        .send(call("nobody", Method::POST, "/v1/connect/sessions/nope/cancel").idempotent("k-1"))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, seen) = server
+        .send(
+            call(
+                "alice",
+                Method::GET,
+                format!("/v1/workspaces/{}/connect-sessions/{}", t.sandbox, id(&created["data"])),
+            )
+            .naming(&t.org),
+        )
+        .await;
+    assert_eq!(seen["data"]["status"], "cancelled");
+}
+
+/// An installation of `app` in `ws`, made through the store: Connect is what
+/// makes them, and the credential submit arrives next.
+async fn installation(server: &Server, org: &str, ws: &str, app: &str, label: &str) -> String {
+    use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
+    use zupflow_core::installations::{
+        ConnectedAccount, InstallationStore, InstalledApp, NewCredential, NewInstallation,
+    };
+    use zupflow_core::keys::{Sealed, WrappedKey};
+    let store = zupflow_sqlite::SqliteInstallationStore::new(
+        zupflow_sqlite::Database::open(&server.directory.join("zupflow.sqlite"))
+            .await
+            .unwrap(),
+    );
+    let installation = NewInstallation {
+        app: InstalledApp::Catalog(AppId::parse(app).unwrap()),
+        label: label.to_owned(),
+        configuration_version: 1,
+        account: ConnectedAccount {
+            external_id: "4242".to_owned(),
+            display_name: "Jordan".to_owned(),
+            email: None,
+        },
+        granted_scopes: Vec::new(),
+        expires_at: None,
+        credential: NewCredential {
+            sealed: Sealed {
+                wrapped_key: WrappedKey {
+                    key_id: "k".to_owned(),
+                    bytes: vec![1; 40],
+                },
+                nonce: [1; 12],
+                ciphertext: vec![1; 16],
+            },
+            version: 1,
+        },
+    };
+    store
+        .create_installation(
+            OrganizationId::parse(org).unwrap(),
+            WorkspaceId::parse(ws).unwrap(),
+            InstallationId::generate(),
+            &installation,
+        )
+        .await
+        .unwrap()
+        .id
+        .to_string()
+}
+
+/// A session uses its workspace's own environment, and only its own
+/// workspace's installations; it expires on every read.
+#[tokio::test]
+async fn keeps_sessions_to_their_own_environment_and_workspace() {
+    let server = Server::new().await;
+    let t = tenant(&server, "alice", "northwind").await;
+    let sessions = |ws: &str| format!("/v1/workspaces/{ws}/connect-sessions");
+    let production_key = key(&server, "alice", &t.org, "production").await;
+    let from_production = |body: Value| call(&production_key, Method::POST, sessions(&t.production)).body(body);
+
+    // An app ready only in Sandbox isn't ready for a Production workspace.
+    let (status, _) = server
+        .send(
+            call(
+                "alice",
+                Method::PUT,
+                format!(
+                    "/v1/organizations/{}/apps/{}/environments/sandbox/configuration",
+                    t.org, t.unready
+                ),
+            )
+            .body(json!({ "mcp_server_url": "https://notes.example/mcp" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = server.send(from_production(session(&t.unready, Value::Null))).await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::UNPROCESSABLE_ENTITY, "configuration_not_ready")
+    );
+    let (status, _) = server
+        .send(start("alice", &t.org, &t.sandbox, session(&t.unready, Value::Null)))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "ready in Sandbox");
+
+    // A return URL allowed only in Sandbox isn't allowed from Production.
+    let settings = |env: &str, url: &str| {
+        call(
+            "alice",
+            Method::PUT,
+            format!("/v1/organizations/{}/connect-settings/{env}", t.org),
+        )
+        .body(json!({ "return_urls": [url], "allowed_origins": [] }))
+    };
+    server.send(settings("sandbox", "http://localhost:3000/cb")).await;
+    server.send(settings("production", "https://app.example/cb")).await;
+    let (status, body) = server
+        .send(from_production(session(&t.ready, json!("http://localhost:3000/cb"))))
+        .await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::UNPROCESSABLE_ENTITY, "return_url_not_allowed")
+    );
+    let (status, _) = server
+        .send(from_production(session(&t.ready, json!("https://app.example/cb"))))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let long = format!("https://app.example/{}", "a".repeat(2000));
+    let (status, body) = server.send(settings("production", &long)).await;
+    assert_eq!(
+        (status, &body["error"]["fields"]["return_urls.0"]),
+        (StatusCode::BAD_REQUEST, &json!("Use 2,000 characters or fewer."))
+    );
+
+    // A reconnect renews this workspace's installation of this app, and nothing else.
+    let other = server.workspace("alice", &t.org, "qa", "sandbox").await;
+    let other = id(&other).to_owned();
+    let installed = installation(&server, &t.org, &t.sandbox, &t.ready, "Engineering").await;
+    let reconnect = |app: &str, installation: &str| json!({ "app_id": app, "intent": "reconnect", "label": "ignored", "installation_id": installation, "return_url": null });
+    let (status, body) = server
+        .send(start("alice", &t.org, &t.sandbox, reconnect(&t.unready, &installed)))
+        .await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::UNPROCESSABLE_ENTITY, "app_mismatch")
+    );
+    let (status, body) = server
+        .send(start("alice", &t.org, &other, reconnect(&t.ready, &installed)))
+        .await;
+    assert_eq!(
+        (status, &body["error"]["message"]),
+        (StatusCode::NOT_FOUND, &json!("Installation was not found.")),
+        "another workspace's installation"
+    );
+    let (status, renewed) = server
+        .send(start("alice", &t.org, &t.sandbox, reconnect(&t.ready, &installed)))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{renewed}");
+    assert_eq!(
+        (
+            &renewed["data"]["label"],
+            &renewed["data"]["installation_id"],
+            &renewed["data"]["expected_account"]["external_id"]
+        ),
+        (&json!("Engineering"), &json!(installed), &json!("4242")),
+        "the installation's own label and account"
+    );
+    let (status, _) = server
+        .send(
+            call(
+                "alice",
+                Method::GET,
+                format!("{}/{}", sessions(&other), id(&renewed["data"])),
+            )
+            .naming(&t.org),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "read through another workspace");
+
+    // Past its expiry a session reads as expired everywhere, and can't be cancelled.
+    let reference = reference_of(&renewed["data"]);
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", server.directory.join("zupflow.sqlite").display()))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE connect_sessions SET expires_at = 0")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let (_, read) = server
+        .send(
+            call(
+                "alice",
+                Method::GET,
+                format!("{}/{}", sessions(&t.sandbox), id(&renewed["data"])),
+            )
+            .naming(&t.org),
+        )
+        .await;
+    assert_eq!(read["data"]["status"], "expired");
+    let (_, hosted) = server
+        .send(call("nobody", Method::GET, format!("/v1/connect/sessions/{reference}")))
+        .await;
+    assert_eq!(hosted["data"]["status"], "expired");
+    let (status, body) = server
+        .send(call(
+            "nobody",
+            Method::POST,
+            format!("/v1/connect/sessions/{reference}/cancel"),
+        ))
+        .await;
+    assert_eq!(
+        (status, &body["error"]["message"]),
+        (
+            StatusCode::CONFLICT,
+            &json!("This Connect link has expired. Start again from the app.")
+        )
+    );
+}

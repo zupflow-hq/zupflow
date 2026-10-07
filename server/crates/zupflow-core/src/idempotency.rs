@@ -15,7 +15,7 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::environment::Environment;
-use crate::ids::{ApiKeyId, OrganizationId, UserId, WorkspaceId};
+use crate::ids::{ApiKeyId, ConnectSessionId, OrganizationId, UserId, WorkspaceId};
 use crate::time::Timestamp;
 
 pub const HEADER: &str = "Idempotency-Key";
@@ -32,8 +32,8 @@ pub fn valid_key(key: &str) -> bool {
 }
 
 /// Who sent a key, and in which environment: a member (in a workspace's
-/// environment on workspace routes, in none on organization routes) or an API
-/// key (always in its own).
+/// environment on workspace routes, in none on organization routes), an API
+/// key (always in its own), or a Connect session (in its own).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdempotencyCaller {
     Member {
@@ -42,6 +42,12 @@ pub enum IdempotencyCaller {
     },
     ApiKey {
         api_key_id: ApiKeyId,
+        environment: Environment,
+    },
+    /// The hosted Connect page, which holds no credential: its key belongs to
+    /// the session its link names, in the session's environment.
+    ConnectSession {
+        session_id: ConnectSessionId,
         environment: Environment,
     },
 }

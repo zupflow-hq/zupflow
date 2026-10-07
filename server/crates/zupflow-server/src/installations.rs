@@ -59,7 +59,7 @@ enum OwnerScope {
 
 /// The contract's `InstallationApp`.
 #[derive(Serialize)]
-struct InstallationAppView {
+pub(crate) struct InstallationAppView {
     id: AppId,
     name: String,
     slug: String,
@@ -81,6 +81,25 @@ struct InstallationView {
     grant_count: u64,
     created_at: Timestamp,
     updated_at: Timestamp,
+}
+
+/// An installed app as the contract shows it beside an installation or a
+/// Connect session.
+pub(crate) fn installation_app_view(app: &App, installed: InstalledApp) -> InstallationAppView {
+    InstallationAppView {
+        id: app.id,
+        name: app.name.clone(),
+        slug: app.slug.clone(),
+        owner_scope: match installed {
+            InstalledApp::Catalog(_) => OwnerScope::Organization,
+            InstalledApp::Workspace(_) => OwnerScope::Workspace,
+        },
+        icon: app.icon.clone(),
+        auth_type: match app.auth {
+            AuthTemplate::OAuth2 { .. } => "oauth2",
+            AuthTemplate::Token { .. } => "token",
+        },
+    }
 }
 
 /// The apps an installation may be of: the organization's catalog and the
@@ -124,20 +143,7 @@ impl Apps {
         Ok(InstallationView {
             id: installation.id,
             workspace_id: installation.workspace_id,
-            app: InstallationAppView {
-                id: app.id,
-                name: app.name.clone(),
-                slug: app.slug.clone(),
-                owner_scope: match installation.app {
-                    InstalledApp::Catalog(_) => OwnerScope::Organization,
-                    InstalledApp::Workspace(_) => OwnerScope::Workspace,
-                },
-                icon: app.icon.clone(),
-                auth_type: match app.auth {
-                    AuthTemplate::OAuth2 { .. } => "oauth2",
-                    AuthTemplate::Token { .. } => "token",
-                },
-            },
+            app: installation_app_view(app, installation.app),
             label: installation.label,
             status: installation.status,
             configuration_version: installation.configuration_version,

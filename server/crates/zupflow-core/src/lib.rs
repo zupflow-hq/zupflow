@@ -2,6 +2,7 @@
 //!
 //! - [`api_keys`]: API keys, their hashing and their store.
 //! - [`apps`]: catalog apps and workspace apps, and their store.
+//! - [`connect`]: Connect settings and sessions, and their store.
 //! - [`ids`]: typed, prefixed identifiers (`run_…`) over UUIDv7.
 //! - [`error`]: the API's error codes and the envelope's `error` field.
 //! - [`environment`]: Sandbox and Production.
@@ -20,6 +21,7 @@
 
 pub mod api_keys;
 pub mod apps;
+pub mod connect;
 pub mod environment;
 pub mod error;
 pub mod events;

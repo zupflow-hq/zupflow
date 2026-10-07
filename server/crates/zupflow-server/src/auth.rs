@@ -16,6 +16,7 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use zupflow_core::api_keys::{ApiKey, ApiKeyHasher, ApiKeyStore, SECRET_PREFIX};
 use zupflow_core::apps::AppStore;
+use zupflow_core::connect::ConnectStore;
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::idempotency::{Fingerprinter, IdempotencyStore};
@@ -37,6 +38,7 @@ pub struct AppState {
     pub workspaces: Arc<dyn WorkspaceStore>,
     pub apps: Arc<dyn AppStore>,
     pub installations: Arc<dyn InstallationStore>,
+    pub connect: Arc<dyn ConnectStore>,
     /// Seals the secrets Zupflow holds (decision 0033).
     pub keys: Arc<dyn KeyService>,
     /// The origin providers and browsers reach this server at, with no

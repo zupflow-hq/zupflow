@@ -87,6 +87,7 @@ async fn main() -> ExitCode {
         workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
         apps: Arc::new(zupflow_sqlite::SqliteAppStore::new(database.clone())),
         installations: Arc::new(zupflow_sqlite::SqliteInstallationStore::new(database.clone())),
+        connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
         keys: Arc::new(zupflow_basic::local_keys::LocalKeyService::from_server_secret(
             &secret_key,
         )),

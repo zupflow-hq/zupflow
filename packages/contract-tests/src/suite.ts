@@ -221,7 +221,12 @@ export function contractSuite(target: Target) {
         await owner.installations.disconnect(qa.id, echo.id);
         await owner.installations.delete(qa.id, echo.id);
 
-        // Connect, token and OAuth.
+        // Connect: settings, then sessions, then the hosted page, token and OAuth.
+        await owner.connectSettings.get(org, "sandbox");
+        await owner.connectSettings.update(org, "sandbox", {
+          return_urls: ["http://localhost:3000/settings/integrations"],
+          allowed_origins: [],
+        });
         await owner.connectSessions.list(sandbox.id);
         const session = (appId: AppId, workspaceId: WorkspaceId = qa.id) =>
           owner.connectSessions.create(workspaceId, {
@@ -234,9 +239,9 @@ export function contractSuite(target: Target) {
         const tokenSession = await session(fx.apps.echoServer);
         await owner.connectSessions.get(qa.id, tokenSession.id);
         await owner.connect.get(referenceOf(tokenSession));
+        await owner.connect.cancel(referenceOf(await session(fx.apps.echoServer)));
         await owner.connect.submitCredentials(referenceOf(tokenSession), { values: { token: "abc" } });
         await owner.connect.authorize(referenceOf(await session(fx.apps.googleWorkspace, sandbox.id)));
-        await owner.connect.cancel(referenceOf(await session(fx.apps.echoServer)));
 
         // The rest of the API.
         await owner.models.list();
@@ -280,8 +285,6 @@ export function contractSuite(target: Target) {
         await owner.runs.cancel(sandbox.id, started.id);
 
         // Organization settings.
-        await owner.connectSettings.get(org, "sandbox");
-        await owner.connectSettings.update(org, "sandbox", { return_urls: [], allowed_origins: [] });
         await owner.webhooks.list(org);
         const hook = await owner.webhooks.create(org, {
           environment: "sandbox",

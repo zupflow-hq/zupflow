@@ -6,7 +6,8 @@
 //!   key answers `400 invalid_idempotency_key`, before the route's own checks.
 //! - A key belongs to that caller: the organization, the workspace on
 //!   workspace routes, the environment and the credential. Creating an
-//!   organization is the user's own key space.
+//!   organization is the user's own key space. Hosted Connect holds no
+//!   credential: its key belongs to the session its link names.
 //! - The same key and request replays the saved status and body; another
 //!   request answers `422`, one still in flight `409`.
 //! - `5xx` saves nothing. A route that shows a secret once saves that it
@@ -93,6 +94,23 @@ async fn scope_of(state: &AppState, parts: &mut Parts, template: &str) -> Result
             .find(|(key, _)| *key == name)
             .map(|(_, value)| value.to_owned())
     };
+    // Hosted Connect holds no credential: its link's reference names a
+    // session, and the key is that session's, in its workspace. An unknown
+    // reference is the route's own 404, before anything is kept.
+    if let (true, Some(reference)) = (
+        template.starts_with("/v1/connect/sessions/{reference}"),
+        param("reference"),
+    ) {
+        let session = crate::connect::attributed(state, &reference).await?;
+        return Ok(Some(IdempotencyScope::Organization {
+            organization_id: session.organization_id,
+            workspace_id: Some(session.workspace_id),
+            caller: IdempotencyCaller::ConnectSession {
+                session_id: session.id,
+                environment: session.environment,
+            },
+        }));
+    }
     let caller = Caller::from_request_parts(parts, state).await?;
     if matches!(caller, Caller::ApiKey(_)) && NOT_FOR_API_KEYS.contains(&template) {
         return Ok(None);

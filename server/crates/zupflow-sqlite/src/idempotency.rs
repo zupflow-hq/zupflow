@@ -134,6 +134,10 @@ fn caller_columns(caller: &IdempotencyCaller) -> (&'static str, Uuid, Option<&'s
             api_key_id,
             environment,
         } => ("api_key", api_key_id.uuid(), Some(environment.as_str())),
+        IdempotencyCaller::ConnectSession {
+            session_id,
+            environment,
+        } => ("connect_session", session_id.uuid(), Some(environment.as_str())),
     }
 }
 
