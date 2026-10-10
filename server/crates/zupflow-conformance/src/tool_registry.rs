@@ -1,7 +1,8 @@
 //! The `ToolRegistry` suite: tools kept per installation, reached only
 //! through their own organization and workspace; the first definition
 //! pinned, a changed one held beside it unreviewed, a missing one gone; a
-//! listing that breaks the limits recorded not at all.
+//! listing that breaks the limits recorded not at all; read a page at a
+//! time, by name; gone tools kept up to a bound.
 //!
 //! `prepare` makes a [`Tenant`] exist: its organization, two workspaces, and
 //! an installation of one app in each.
@@ -14,7 +15,8 @@ use zupflow_core::apps::ToolEffect;
 use zupflow_core::ids::{InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{
-    ListedTool, ListingChanges, MAX_TOOLS, RegisteredTool, ToolError, ToolRegistry, ToolRevision, ToolStatus,
+    ListedTool, ListingChanges, MAX_GONE, MAX_PAGE, MAX_TOOLS, RegisteredTool, ToolError, ToolRegistry, ToolRevision,
+    ToolStatus,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -63,8 +65,26 @@ async fn record(
     registry.record_listing(at.0, at.1, at.2, listed, now).await
 }
 
+/// Every tool of the installation, read two at a time, so every case pages.
 async fn list(registry: &dyn ToolRegistry, at: At) -> Result<Vec<RegisteredTool>, ToolError> {
-    registry.list_tools(at.0, at.1, at.2).await
+    let mut tools = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = registry.list_tools(at.0, at.1, at.2, after.as_deref(), 2).await?;
+        assert!(page.items.len() <= 2, "a page holds at most its limit");
+        tools.extend(page.items);
+        match page.next_after {
+            Some(next) => after = Some(next),
+            None => {
+                assert_eq!(
+                    usize::try_from(page.total).ok(),
+                    Some(tools.len()),
+                    "the total counts every tool"
+                );
+                return Ok(tools);
+            }
+        }
+    }
 }
 
 /// A definition the registry treats as opaque: kept and returned exactly.
@@ -96,6 +116,94 @@ pub async fn run(registry: &dyn ToolRegistry, prepare: Prepare) {
     pins_the_first_definition_and_holds_changes(registry, &prepare).await;
     marks_missing_tools_gone_until_listed_again(registry, &prepare).await;
     records_an_invalid_listing_not_at_all(registry, &prepare).await;
+    pages_by_name(registry, &prepare).await;
+    keeps_a_bounded_number_of_gone_tools(registry, &prepare).await;
+}
+
+async fn pages_by_name(registry: &dyn ToolRegistry, prepare: &Prepare) {
+    let a = tenant(prepare).await;
+    let at = a.at();
+    let now = Timestamp::now();
+    // Byte order: upper case before lower case, and "b" before "b_".
+    record(
+        registry,
+        at,
+        &["c", "a", "b_", "B", "b"].map(|name| listed(name, 1, ToolEffect::Read)),
+        now,
+    )
+    .await
+    .unwrap();
+    let page = |after: Option<&'static str>, limit: u32| async move {
+        let page = registry.list_tools(at.0, at.1, at.2, after, limit).await.unwrap();
+        let names: Vec<String> = page.items.iter().map(|tool| tool.name.clone()).collect();
+        (names, page.next_after, page.total)
+    };
+    assert_eq!(page(None, 2).await, (strings(&["B", "a"]), Some("a".to_owned()), 5));
+    assert_eq!(
+        page(Some("a"), 2).await,
+        (strings(&["b", "b_"]), Some("b_".to_owned()), 5)
+    );
+    assert_eq!(page(Some("b_"), 2).await, (strings(&["c"]), None, 5));
+    // A name that isn't there still marks a place; the last page has no next.
+    assert_eq!(page(Some("b0"), 10).await, (strings(&["b_", "c"]), None, 5));
+    assert_eq!(page(Some("z"), 10).await, (Vec::new(), None, 5));
+    // A limit is clamped: 0 reads one, a huge one at most the largest page.
+    assert_eq!(page(None, 0).await.0, strings(&["B"]));
+    assert_eq!(page(None, u32::MAX).await.0.len(), 5);
+    let many: Vec<ListedTool> = (0..150)
+        .map(|index| listed(&format!("t{index:03}"), 1, ToolEffect::Read))
+        .collect();
+    record(registry, at, &many, now).await.unwrap();
+    let full = registry.list_tools(at.0, at.1, at.2, None, u32::MAX).await.unwrap();
+    assert_eq!(full.items.len(), MAX_PAGE as usize);
+    assert_eq!(full.total, 155, "gone tools count too");
+    // Another scope's page is not found.
+    assert_eq!(
+        registry
+            .list_tools(a.organization_id, a.sibling, a.installation, None, 10)
+            .await,
+        Err(ToolError::NotFound)
+    );
+}
+
+async fn keeps_a_bounded_number_of_gone_tools(registry: &dyn ToolRegistry, prepare: &Prepare) {
+    let a = tenant(prepare).await;
+    let at = a.at();
+    let batch = |prefix: &str| -> Vec<ListedTool> {
+        (0..MAX_TOOLS)
+            .map(|index| listed(&format!("{prefix}{index:04}"), 1, ToolEffect::Read))
+            .collect()
+    };
+    let (first, second, third) = (
+        Timestamp::from_millis(1_000_000),
+        Timestamp::from_millis(2_000_000),
+        Timestamp::from_millis(3_000_000),
+    );
+    record(registry, at, &batch("a"), first).await.unwrap();
+    // Every `a` gone at `second`: exactly the most kept.
+    record(registry, at, &batch("b"), second).await.unwrap();
+    let tools = list(registry, at).await.unwrap();
+    assert_eq!(tools.len(), 2 * MAX_TOOLS);
+    // Every `b` gone at `third` too: the `a`s, gone longest, are deleted.
+    record(registry, at, &[listed("c", 1, ToolEffect::Read)], third)
+        .await
+        .unwrap();
+    let tools = list(registry, at).await.unwrap();
+    let gone: Vec<&RegisteredTool> = tools.iter().filter(|tool| tool.gone_at.is_some()).collect();
+    assert_eq!(gone.len(), MAX_GONE);
+    assert!(
+        gone.iter()
+            .all(|tool| tool.name.starts_with('b') && tool.gone_at == Some(third)),
+        "the most recently gone are kept"
+    );
+    assert_eq!(tools.len(), MAX_GONE + 1, "the listed tool stays");
+    // A tool deleted while gone is new when it's listed again.
+    let changes = record(registry, at, &[listed("a0000", 2, ToolEffect::Write)], third)
+        .await
+        .unwrap();
+    assert_eq!(changes.added, ["a0000"]);
+    // The sibling's tools are untouched by another installation's bound.
+    assert_eq!(list(registry, a.sibling_at()).await.unwrap(), []);
 }
 
 async fn keeps_tools_per_installation(registry: &dyn ToolRegistry, prepare: &Prepare) {

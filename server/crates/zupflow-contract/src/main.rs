@@ -23,6 +23,8 @@ use std::sync::Arc;
 compile_error!("zupflow-contract is for development only and is never built for release");
 
 use async_trait::async_trait;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use zupflow_basic::local_keys::LocalKeyService;
 use zupflow_core::api_keys::{ApiKeyHasher, ApiKeyStore, NewApiKey, NewSecret};
@@ -36,11 +38,12 @@ use zupflow_core::installations::{InstallationStore, InstalledApp, TemplateSnaps
 use zupflow_core::organizations::{MemberRole, OrganizationStore, User};
 use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse, Refusal};
 use zupflow_core::time::Timestamp;
+use zupflow_core::tools::{ListedTool, ToolRegistry, ToolRevision};
 use zupflow_core::workspaces::{NewWorkspace, WorkspaceStore};
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{
     Database, SqliteApiKeyStore, SqliteAppStore, SqliteConnectStore, SqliteIdempotencyStore, SqliteInstallationStore,
-    SqliteOrganizationStore, SqliteWorkspaceStore,
+    SqliteOrganizationStore, SqliteToolRegistry, SqliteWorkspaceStore,
 };
 
 /// The personas, with the address each signs in with: people's names, as in
@@ -132,6 +135,7 @@ async fn serve(path: &str) -> Result<(), String> {
         connect: Arc::new(SqliteConnectStore::new(database.clone())),
         jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
         tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),
+        cache: Arc::new(zupflow_basic::memory_cache::MemoryCache::default()),
         keys: Arc::new(LocalKeyService::from_server_secret(&secret)),
         outbound: Arc::new(FixtureProviders),
         public_url: format!("http://localhost:{port}"),
@@ -332,6 +336,7 @@ async fn reset(path: &str) -> Result<(), String> {
 
     // Connected installations, each with its credential sealed as Connect seals it.
     let installations = SqliteInstallationStore::new(database.clone());
+    let mut installed: Vec<(OrganizationId, WorkspaceId, InstallationId, &str)> = Vec::new();
     for (organization, workspace, slug, label) in [
         (northwind.id, "acme", "google-workspace", "Marketing"),
         (northwind.id, "beta-labs", "google-workspace", "Google"),
@@ -372,6 +377,43 @@ async fn reset(path: &str) -> Result<(), String> {
             .create_installation(organization, workspace, installation_id, &installation)
             .await
             .map_err(|error| fail(label)(&error))?;
+        installed.push((organization, workspace, installation_id, label));
+    }
+
+    // Tools discovered for the Sandbox's installation, as two listings left
+    // them: one tool as first listed, one changed since, one gone.
+    let (organization, workspace, installation_id, _) = installed
+        .iter()
+        .find(|(_, _, _, label)| *label == "Engineering")
+        .copied()
+        .ok_or("installation Engineering")?;
+    let tools = SqliteToolRegistry::new(database.clone());
+    for (listing, at) in [
+        (
+            vec![
+                fixture_tool("search_issues", "Search issues", "Find issues by text.", true),
+                fixture_tool("create_issue", "Create an issue", "Open an issue in a team.", false),
+                fixture_tool("archive_issue", "Archive an issue", "Archive one issue.", false),
+            ],
+            Timestamp::from_millis(Timestamp::now().millis() - 86_400_000),
+        ),
+        (
+            vec![
+                fixture_tool("search_issues", "Search issues", "Find issues by text.", true),
+                fixture_tool(
+                    "create_issue",
+                    "Create an issue",
+                    "Open an issue in a team, assigned to anyone.",
+                    false,
+                ),
+            ],
+            Timestamp::now(),
+        ),
+    ] {
+        tools
+            .record_listing(organization, workspace, installation_id, &listing, at)
+            .await
+            .map_err(|error| fail("tools")(&error))?;
     }
 
     // Connect settings: Northwind's Sandbox allows the suite's return URL,
@@ -449,6 +491,28 @@ async fn reset(path: &str) -> Result<(), String> {
             .map_err(|error| fail("key")(&error))?;
     }
     Ok(())
+}
+
+/// A tool as the MCP client records it: canonical JSON and its SHA-256.
+fn fixture_tool(name: &str, title: &str, description: &str, read_only: bool) -> ListedTool {
+    let definition: Value = json!({
+        "name": name,
+        "title": title,
+        "description": description,
+        "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } } },
+        "annotations": { "readOnlyHint": read_only, "destructiveHint": false },
+    });
+    let definition = zupflow_mcp::canonical(&definition);
+    let hash = Sha256::digest(definition.as_bytes()).into();
+    ListedTool {
+        name: name.to_owned(),
+        revision: ToolRevision { definition, hash },
+        effect: if read_only {
+            zupflow_core::apps::ToolEffect::Read
+        } else {
+            zupflow_core::apps::ToolEffect::Write
+        },
+    }
 }
 
 #[tokio::main]

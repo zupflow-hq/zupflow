@@ -13,9 +13,9 @@ fn name(value: &str) -> Name {
     Name::new(value).expect("a valid name")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn memory_cache_conforms() {
-    zupflow_conformance::cache::run(&MemoryCache::default()).await;
+    zupflow_conformance::cache::run(std::sync::Arc::new(MemoryCache::default())).await;
 }
 
 #[tokio::test]

@@ -34,6 +34,8 @@ import type {
   SessionId,
   ToolCallId,
   ToolDefinition,
+  ToolEffect,
+  ToolText,
   User,
   UserId,
   WebhookEndpoint,
@@ -115,6 +117,35 @@ export interface InstallationRow {
   connection: AccountConnection | null;
   created_at: string;
   updated_at: string;
+}
+
+/**
+ * A tool an installation's MCP server listed, kept as that installation's
+ * own (decision 0038). Natural key (organization_id, workspace_id,
+ * installation_id, name). The first definition seen is `pinned`; a later one
+ * that differs is `latest`, unreviewed.
+ */
+export interface InstallationToolRow {
+  organization_id: OrganizationId;
+  workspace_id: WorkspaceId;
+  installation_id: InstallationId;
+  name: string;
+  /** Seeded from the definition when the tool is first listed; a listing never changes it. */
+  effect: ToolEffect;
+  pinned: ToolText;
+  latest: ToolText | null;
+  first_seen_at: string;
+  seen_at: string;
+  changed_at: string | null;
+  gone_at: string | null;
+}
+
+/** An accepted refresh of an installation's tools: another is refused until `until`. */
+export interface ToolRefreshRow {
+  organization_id: OrganizationId;
+  workspace_id: WorkspaceId;
+  installation_id: InstallationId;
+  until: string;
 }
 
 export interface ConnectSessionRow {
@@ -245,6 +276,10 @@ export interface Db {
   apps: AppRow[];
   configurations: ConfigurationRow[];
   installations: InstallationRow[];
+  /** Each installation's discovered tools, under the installation's full scope. */
+  installation_tools: InstallationToolRow[];
+  /** When each installation's tools may next be refreshed, under the installation's full scope. */
+  tool_refreshes: ToolRefreshRow[];
   connect_sessions: ConnectSessionRow[];
   agents: AgentRow[];
   grants: GrantRow[];

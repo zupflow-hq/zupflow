@@ -2707,10 +2707,12 @@ dependencies = [
  "async-trait",
  "axum",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "zupflow-basic",
  "zupflow-core",
+ "zupflow-mcp",
  "zupflow-server",
  "zupflow-sqlite",
 ]

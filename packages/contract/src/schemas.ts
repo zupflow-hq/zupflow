@@ -460,6 +460,58 @@ export const Installation = named(
 );
 export type Installation = z.infer<typeof Installation>;
 
+/** A page of a list: where to start and how many. */
+export const PageQuery = z.object({
+  cursor: z.string().optional(),
+  limit: z
+    .number()
+    .int()
+    .optional()
+    .describe("Page size, 1 to 100 (default 25); values outside are clamped, and a non-integer means the default."),
+});
+export type PageQuery = z.infer<typeof PageQuery>;
+
+export const InstallationToolStatus = z.enum(["current", "changed", "gone"]);
+export type InstallationToolStatus = z.infer<typeof InstallationToolStatus>;
+
+/** What a tool's definition says, as its app's MCP server listed it. */
+export const ToolText = named(
+  "ToolText",
+  z.object({
+    title: z.string().nullable(),
+    description: z.string().nullable(),
+    /** The JSON Schema of the tool's arguments. */
+    input_schema: z.record(z.string(), z.unknown()).nullable(),
+    /** The JSON Schema of the tool's structured result. */
+    output_schema: z.record(z.string(), z.unknown()).nullable(),
+    /** The server's hints about the tool, such as `readOnlyHint`. Hints only: never trusted. */
+    annotations: z.record(z.string(), z.unknown()).nullable(),
+  }),
+);
+export type ToolText = z.infer<typeof ToolText>;
+
+/**
+ * A tool an installation's MCP server listed. The first definition seen is
+ * `pinned`; a later one that differs is `latest`, unreviewed, and the tool is
+ * `changed`. A tool the server stopped listing is `gone`; an installation keeps
+ * at most 500 gone tools, dropping those gone longest.
+ */
+export const InstallationTool = named(
+  "InstallationTool",
+  z.object({
+    name: z.string(),
+    effect: ToolEffect,
+    status: InstallationToolStatus,
+    pinned: ToolText,
+    latest: ToolText.nullable(),
+    first_seen_at: instant,
+    seen_at: instant,
+    changed_at: instant.nullable(),
+    gone_at: instant.nullable(),
+  }),
+);
+export type InstallationTool = z.infer<typeof InstallationTool>;
+
 /** An installation seen from its app's organization-level page. */
 export const AppInstallationRef = named(
   "AppInstallationRef",

@@ -26,6 +26,18 @@ pub enum StorageError {
 pub trait Cache: Send + Sync {
     async fn get(&self, scope: &Scope, key: &Name) -> Result<Option<Vec<u8>>, StorageError>;
     async fn put(&self, scope: &Scope, key: &Name, value: Vec<u8>, ttl: Duration) -> Result<(), StorageError>;
+    /// Stores `value` only if no live entry holds the key: `true` when it
+    /// stored, `false` when a live entry was already there (which is kept as
+    /// it was). An expired entry counts as absent. Atomic: of concurrent
+    /// callers on one key, exactly one gets `true`. As with every entry, the
+    /// cache may still lose it early, so it suits pacing, never a guarantee.
+    async fn add_if_absent(
+        &self,
+        scope: &Scope,
+        key: &Name,
+        value: Vec<u8>,
+        ttl: Duration,
+    ) -> Result<bool, StorageError>;
     async fn delete(&self, scope: &Scope, key: &Name) -> Result<(), StorageError>;
     /// Drops every entry of a scope. An organization scope drops only its own
     /// entries, never its environments' or workspaces'.

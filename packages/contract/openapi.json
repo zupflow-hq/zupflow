@@ -1593,6 +1593,80 @@
           "data"
         ]
       },
+      "InstallationTool": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "effect": {
+            "type": "string",
+            "enum": [
+              "read",
+              "write",
+              "destructive"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "current",
+              "changed",
+              "gone"
+            ]
+          },
+          "pinned": {
+            "$ref": "#/components/schemas/ToolText"
+          },
+          "latest": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolText"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "first_seen_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "seen_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "changed_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "gone_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "effect",
+          "status",
+          "pinned",
+          "latest",
+          "first_seen_at",
+          "seen_at",
+          "changed_at",
+          "gone_at"
+        ]
+      },
       "Instant": {
         "type": "string",
         "format": "date-time",
@@ -3135,6 +3209,72 @@
           "title",
           "description",
           "effect"
+        ]
+      },
+      "ToolText": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "input_schema": {
+            "anyOf": [
+              {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {}
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "output_schema": {
+            "anyOf": [
+              {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {}
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "annotations": {
+            "anyOf": [
+              {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {}
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "title",
+          "description",
+          "input_schema",
+          "output_schema",
+          "annotations"
         ]
       },
       "UsageDay": {
@@ -6481,6 +6621,178 @@
       "post": {
         "operationId": "disconnectInstallation",
         "summary": "Stop using an installation; its grants are kept",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "inst",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/InstallationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Installation"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{ws}/installations/{inst}/tools": {
+      "get": {
+        "operationId": "listInstallationTools",
+        "summary": "Tools an installation's app listed, a page at a time by name",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "inst",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/InstallationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Page size, 1 to 100 (default 25); values outside are clamped, and a non-integer means the default.",
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/InstallationTool"
+                      }
+                    },
+                    "meta": {
+                      "$ref": "#/components/schemas/Meta"
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{ws}/installations/{inst}/refresh-tools": {
+      "post": {
+        "operationId": "refreshInstallationTools",
+        "summary": "List a connected installation's tools again",
         "security": [
           {
             "consoleSession": [],

@@ -32,6 +32,7 @@ import type {
   GrantId,
   Installation,
   InstallationId,
+  InstallationTool,
   InviteMemberInput,
   Member,
   MemberId,
@@ -40,6 +41,7 @@ import type {
   OrganizationId,
   OrganizationRun,
   OrganizationRunListQuery,
+  PageQuery,
   ResolveApprovalInput,
   Run,
   RunEvent,
@@ -198,6 +200,12 @@ export function createClient(transport: Transport) {
         post<Installation>(`${ws(workspaceId)}/installations/${enc(installationId)}/disconnect`, undefined, options),
       delete: (workspaceId: WorkspaceId, installationId: InstallationId) =>
         send<void>("DELETE", `${ws(workspaceId)}/installations/${enc(installationId)}`),
+      /** A page of the tools its app's MCP server listed, by name; a changed definition stays unreviewed beside the pinned one. */
+      tools: (workspaceId: WorkspaceId, installationId: InstallationId, query: PageQuery = {}) =>
+        getPage<InstallationTool>(`${ws(workspaceId)}/installations/${enc(installationId)}/tools`, { ...query }),
+      /** Ask the app's MCP server for the installation's tools again; the listing arrives in the background. */
+      refreshTools: (workspaceId: WorkspaceId, installationId: InstallationId, options?: PostOptions) =>
+        post<Installation>(`${ws(workspaceId)}/installations/${enc(installationId)}/refresh-tools`, undefined, options),
     },
 
     connectSessions: {

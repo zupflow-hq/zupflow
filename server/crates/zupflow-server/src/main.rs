@@ -97,6 +97,7 @@ async fn main() -> ExitCode {
         connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
         jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
         tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),
+        cache: Arc::new(zupflow_basic::memory_cache::MemoryCache::default()),
         keys: Arc::new(zupflow_basic::local_keys::LocalKeyService::from_server_secret(
             &secret_key,
         )),

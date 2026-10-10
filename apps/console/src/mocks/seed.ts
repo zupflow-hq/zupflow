@@ -32,9 +32,10 @@ import type {
 } from "./model";
 import { mulberry32, type Rng, uuid } from "./random";
 import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
-import { timelineOf } from "./scope";
+import { appIn, timelineOf } from "./scope";
+import { listedFrom, recordListing } from "./tools";
 
-export const DB_SCHEMA = 14;
+export const DB_SCHEMA = 16;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -444,6 +445,8 @@ export function seed(nowMs: number = Date.now()): Db {
     apps,
     configurations,
     installations,
+    installation_tools: [],
+    tool_refreshes: [],
     connect_sessions: [],
     agents,
     grants,
@@ -619,7 +622,48 @@ export function seed(nowMs: number = Date.now()): Db {
   );
 
   seedLarkspur(db, nowMs);
+  seedTools(db, nowMs, sandboxLinear);
   return db;
+}
+
+/**
+ * Each installation's tools, as discovery recorded them when it connected.
+ * `reviewed` shows the registry's other states: listed first with older
+ * definitions of two tools (one's text, one's hints only) and a tool its
+ * server has since dropped, then again two days ago, so two tools are changed
+ * and unreviewed and one is gone.
+ */
+function seedTools(db: Db, nowMs: number, reviewed: InstallationRow) {
+  for (const installation of db.installations) {
+    const app = appIn(db.apps, installation);
+    if (!installation.connection || !app) continue;
+    const listed = app.tools.map(listedFrom);
+    if (installation === reviewed) {
+      // `create_issue` said less then; `add_comment` changed only its hints since.
+      const older = listed.map((tool) =>
+        tool.name === "create_issue"
+          ? { ...tool, text: { ...tool.text, description: "Open an issue." } }
+          : tool.name === "add_comment"
+            ? { ...tool, text: { ...tool.text, annotations: { readOnlyHint: false } } }
+            : tool,
+      );
+      older.push({
+        name: "export_roadmap",
+        effect: "read",
+        text: {
+          title: "Export roadmap",
+          description: "Download a team's roadmap as a CSV file.",
+          input_schema: { type: "object" },
+          output_schema: null,
+          annotations: { readOnlyHint: true },
+        },
+      });
+      recordListing(db, installation, older, installation.connection.connected_at);
+      recordListing(db, installation, listed, new Date(nowMs - 2 * DAY).toISOString());
+    } else {
+      recordListing(db, installation, listed, installation.connection.connected_at);
+    }
+  }
 }
 
 /**

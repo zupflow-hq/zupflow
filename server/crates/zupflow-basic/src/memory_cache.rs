@@ -88,6 +88,26 @@ impl MemoryCache {
     }
 }
 
+/// When an entry written `now` with `ttl` expires. A TTL too large to
+/// represent means "as long as anything lives here".
+fn expiry(now: Instant, ttl: Duration) -> Instant {
+    now.checked_add(ttl)
+        .or_else(|| now.checked_add(Duration::from_secs(10 * 365 * 24 * 3600)))
+        .unwrap_or(now)
+}
+
+impl MemoryCache {
+    /// Writes an entry under the held lock, then evicts down to the bounds.
+    fn store(&self, entries: &mut Entries, slot: Slot, value: Vec<u8>, expires_at: Instant) {
+        entries.insert(slot, value, expires_at);
+        while entries.by_slot.len() > self.max_entries || entries.bytes > self.max_bytes {
+            if !entries.evict_soonest() {
+                break;
+            }
+        }
+    }
+}
+
 impl Default for MemoryCache {
     /// 10,000 entries and 64 MiB in all, at most 1 MiB per value.
     fn default() -> Self {
@@ -114,20 +134,31 @@ impl Cache for MemoryCache {
         if value.len() > self.max_value_bytes {
             return Err(StorageError::TooLarge);
         }
-        let now = Instant::now();
-        // A TTL too large to represent means "as long as anything lives here".
-        let expires_at = now
-            .checked_add(ttl)
-            .or_else(|| now.checked_add(Duration::from_secs(10 * 365 * 24 * 3600)))
-            .unwrap_or(now);
+        let expires_at = expiry(Instant::now(), ttl);
         let mut entries = self.entries();
-        entries.insert((*scope, key.clone()), value, expires_at);
-        while entries.by_slot.len() > self.max_entries || entries.bytes > self.max_bytes {
-            if !entries.evict_soonest() {
-                break;
-            }
-        }
+        self.store(&mut entries, (*scope, key.clone()), value, expires_at);
         Ok(())
+    }
+
+    async fn add_if_absent(
+        &self,
+        scope: &Scope,
+        key: &Name,
+        value: Vec<u8>,
+        ttl: Duration,
+    ) -> Result<bool, StorageError> {
+        if value.len() > self.max_value_bytes {
+            return Err(StorageError::TooLarge);
+        }
+        let now = Instant::now();
+        let slot = (*scope, key.clone());
+        // One lock for the check and the write: that is what makes it atomic.
+        let mut entries = self.entries();
+        if entries.by_slot.get(&slot).is_some_and(|entry| entry.expiry.0 > now) {
+            return Ok(false);
+        }
+        self.store(&mut entries, slot, value, expiry(now, ttl));
+        Ok(true)
     }
 
     async fn delete(&self, scope: &Scope, key: &Name) -> Result<(), StorageError> {

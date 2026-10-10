@@ -41,7 +41,13 @@ impl Installed {
 
     async fn tools(&self, server: &Server) -> Vec<RegisteredTool> {
         let (org, ws, installation) = self.ids();
-        server.state.tools.list_tools(org, ws, installation).await.unwrap()
+        server
+            .state
+            .tools
+            .list_tools(org, ws, installation, None, 100)
+            .await
+            .unwrap()
+            .items
     }
 
     async fn discover(&self, server: &Server) -> Outcome {

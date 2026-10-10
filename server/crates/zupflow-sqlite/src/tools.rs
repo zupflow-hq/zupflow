@@ -11,7 +11,8 @@ use zupflow_core::apps::ToolEffect;
 use zupflow_core::ids::{InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{
-    ListedTool, ListingChanges, RegisteredTool, ToolError, ToolRegistry, ToolRevision, validate_listing,
+    ListedTool, ListingChanges, MAX_GONE, MAX_PAGE, RegisteredTool, ToolError, ToolPage, ToolRegistry, ToolRevision,
+    validate_listing,
 };
 
 use crate::Database;
@@ -54,6 +55,22 @@ const SELECT: &str = concat!(
     columns!(),
     " FROM installation_tools WHERE organization_id = ? AND workspace_id = ? AND installation_id = ? ORDER BY name"
 );
+/// One page, by name: the scope, then the name to start after (or NULL for the first page), then the limit.
+const PAGE: &str = concat!(
+    "SELECT ",
+    columns!(),
+    " FROM installation_tools WHERE organization_id = ? AND workspace_id = ? AND installation_id = ? \
+     AND (?4 IS NULL OR name > ?4) ORDER BY name LIMIT ?5"
+);
+const COUNT: &str =
+    "SELECT count(*) FROM installation_tools WHERE organization_id = ? AND workspace_id = ? AND installation_id = ?";
+/// Gone tools beyond the most kept, those gone longest first: the scope, then
+/// the scope again for the inner query, then how many to keep.
+const PRUNE_GONE: &str = "DELETE FROM installation_tools \
+     WHERE organization_id = ? AND workspace_id = ? AND installation_id = ? AND gone_at IS NOT NULL AND name IN ( \
+     SELECT name FROM installation_tools \
+     WHERE organization_id = ? AND workspace_id = ? AND installation_id = ? AND gone_at IS NOT NULL \
+     ORDER BY gone_at DESC, name ASC LIMIT -1 OFFSET ?)";
 const INSERT: &str = "INSERT INTO installation_tools (organization_id, workspace_id, installation_id, id, name, effect, \
                       pinned_definition, pinned_hash, first_seen_at, seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 /// Listed as pinned: no latest, not gone.
@@ -225,6 +242,12 @@ impl ToolRegistry for SqliteToolRegistry {
                 changes.gone.push(existing.name.clone());
             }
         }
+        let keep = i64::try_from(MAX_GONE).map_err(|_| ToolError::Unavailable)?;
+        bind_scope(bind_scope(sqlx::query(PRUNE_GONE), owner), owner)
+            .bind(keep)
+            .execute(&mut *transaction)
+            .await
+            .map_err(failed("record_listing"))?;
         transaction.commit().await.map_err(failed("record_listing"))?;
         for names in [
             &mut changes.added,
@@ -242,21 +265,43 @@ impl ToolRegistry for SqliteToolRegistry {
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         installation_id: InstallationId,
-    ) -> Result<Vec<RegisteredTool>, ToolError> {
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<ToolPage, ToolError> {
         let owner = Owner {
             organization_id,
             workspace_id,
             installation_id,
         };
+        let limit = limit.clamp(1, MAX_PAGE);
         let mut transaction = self.database.pool().begin().await.map_err(failed("list_tools"))?;
         if !installation_exists(&mut transaction, owner).await? {
             return Err(ToolError::NotFound);
         }
-        let rows = bind_scope(sqlx::query(SELECT), owner)
+        let total: i64 = bind_scope(sqlx::query(COUNT), owner)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(failed("list_tools"))?
+            .try_get(0)
+            .map_err(read)?;
+        let rows = bind_scope(sqlx::query(PAGE), owner)
+            .bind(after)
+            .bind(i64::from(limit) + 1)
             .fetch_all(&mut *transaction)
             .await
             .map_err(failed("list_tools"))?;
-        rows.iter().map(tool_from).collect()
+        let mut items = rows.iter().map(tool_from).collect::<Result<Vec<_>, _>>()?;
+        let next_after = if items.len() > limit as usize {
+            items.truncate(limit as usize);
+            items.last().map(|last| last.name.clone())
+        } else {
+            None
+        };
+        Ok(ToolPage {
+            items,
+            next_after,
+            total: u64::try_from(total).map_err(read)?,
+        })
     }
 }
 

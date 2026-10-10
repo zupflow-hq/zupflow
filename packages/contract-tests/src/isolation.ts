@@ -88,6 +88,7 @@ export async function snapshotOf(client: ZupflowClient, t: Tenant): Promise<stri
     runs,
     await client.runs.events(w, t.run.id),
     await client.installations.list(w),
+    await Promise.all((await client.installations.list(w)).map((i) => client.installations.tools(w, i.id))),
     await client.connectSessions.list(w),
     orgApps,
     await Promise.all(
@@ -144,6 +145,8 @@ export function attempts(r: ZupflowClient, own: Tenant, victim: Tenant): [string
     ["[victim workspace] rename installation", () => r.installations.update(w, v.installation.id, { label: "Owned" })],
     ["[victim workspace] disconnect", () => r.installations.disconnect(w, v.installation.id)],
     ["[victim workspace] delete installation", () => r.installations.delete(w, v.installation.id)],
+    ["[victim workspace] list installation tools", () => r.installations.tools(w, v.installation.id)],
+    ["[victim workspace] refresh installation tools", () => r.installations.refreshTools(w, v.installation.id)],
     ["[victim workspace] list connect sessions", () => r.connectSessions.list(w)],
     ["[victim workspace] get connect session", () => r.connectSessions.get(w, v.session.id)],
     [
@@ -256,6 +259,12 @@ export function attempts(r: ZupflowClient, own: Tenant, victim: Tenant): [string
       () => r.installations.disconnect(own.workspace.id, v.installation.id),
     ],
     ["[own workspace] delete victim installation", () => r.installations.delete(own.workspace.id, v.installation.id)],
+    ["[own workspace] victim installation tools", () => r.installations.tools(own.workspace.id, v.installation.id)],
+    // Through the attacker's Sandbox, so Production's read-only refusal can't answer first.
+    [
+      "[own workspace] refresh victim installation tools",
+      () => r.installations.refreshTools(own.sandbox.id, v.installation.id),
+    ],
     ["[own workspace] session via own workspace", () => r.connectSessions.get(own.workspace.id, v.session.id)],
     ["[own workspace] workspace app via own workspace", () => r.workspaceApps.get(own.workspace.id, v.workspaceApp.id)],
     [

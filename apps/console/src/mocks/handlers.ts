@@ -72,6 +72,7 @@ import type { AgentRow, AppRow, ConfigurationRow, ConnectSessionRow, GrantRow, I
 import { hash, token } from "./random";
 import { cancelRun, enqueueRun, planRun } from "./runner";
 import { configurationOf, inWorkspace, runEventsKey, timelineOf } from "./scope";
+import { claimRefresh, compareNames, discoverTools, forgetTools, toInstallationTool, toolsOf } from "./tools";
 
 const MODELS: ModelOption[] = [
   {
@@ -508,6 +509,8 @@ function completeSession(
 
   session.status = "completed";
   session.completed_at = now;
+  // The backend queues discovery; the mock lists the app's tools at once.
+  discoverTools(d, installation, now);
   d.audit.unshift({
     id: newId("audit_event"),
     organization_id: session.organization_id,
@@ -529,6 +532,25 @@ function webhookSecret(env: Environment) {
 function clampedInt(url: URL, name: string, fallback: number, max: number): number {
   const value = Number(url.searchParams.get(name) ?? fallback);
   return Number.isInteger(value) ? Math.min(Math.max(value, 1), max) : fallback;
+}
+
+/** A tool list's cursor: the page's last name, base64url-encoded. */
+function encodeToolCursor(name: string): string {
+  const binary = Array.from(new TextEncoder().encode(name), (b) => String.fromCharCode(b)).join("");
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+function toolCursorName(cursor: string): string {
+  try {
+    const binary = atob(cursor.replaceAll("-", "+").replaceAll("_", "/"));
+    const name = new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(binary, (c) => c.charCodeAt(0)));
+    if (name) return name;
+  } catch {
+    // Falls through to the refusal.
+  }
+  throw new ApiFailure(400, "validation_failed", "Some fields are invalid.", {
+    cursor: "Not a cursor from this list.",
+  });
 }
 
 function paginate<T>(items: T[], cursor: string | null, limit: number) {
@@ -927,6 +949,8 @@ export function createHandlers(apiBase: string) {
         d.grants = d.grants.filter((g) => !here(g));
         d.agents = d.agents.filter((a) => !here(a));
         d.installations = d.installations.filter((i) => !here(i));
+        d.installation_tools = d.installation_tools.filter((t) => !here(t));
+        d.tool_refreshes = d.tool_refreshes.filter((r) => !here(r));
         d.connect_sessions = d.connect_sessions.filter((s) => !here(s));
         // Saved responses describe the workspace's rows, so they go with them.
         d.idempotency_keys = d.idempotency_keys.filter(
@@ -1225,6 +1249,52 @@ export function createHandlers(apiBase: string) {
       }),
     ),
 
+    http.get(
+      u("/v1/workspaces/:ws/installations/:inst/tools"),
+      route(({ request, params }) => {
+        const access = workspaceAccess(request, param(params, "ws"));
+        const row = findInstallation(access, idParam(params, "inst"));
+        const url = new URL(request.url);
+        const limit = clampedInt(url, "limit", 25, 100);
+        const cursor = url.searchParams.get("cursor");
+        const after = cursor ? toolCursorName(cursor) : null;
+        const all = toolsOf(db(), row);
+        // Keyset by name: the tools after the last one of the page before.
+        const rest = after === null ? all : all.filter((t) => compareNames(t.name, after) > 0);
+        const page = rest.slice(0, limit);
+        const last = page.at(-1);
+        const next = rest.length > limit && last ? encodeToolCursor(last.name) : null;
+        return ok(page.map(toInstallationTool), { meta: { pagination: { next_cursor: next, total: all.length } } });
+      }),
+    ),
+
+    http.post(
+      u("/v1/workspaces/:ws/installations/:inst/refresh-tools"),
+      route(({ request, params }) => {
+        const access = workspaceAccess(request, param(params, "ws"));
+        requireRole(access, DEVELOPERS, "refresh tools");
+        assertConsoleMayAct(access, "refresh tools");
+        const row = findInstallation(access, idParam(params, "inst"));
+        if (row.status !== "connected" || !row.connection) {
+          throw new ApiFailure(
+            409,
+            "installation_not_connected",
+            "This installation isn't connected, so its tools can't be listed. Reconnect it first.",
+          );
+        }
+        if (!claimRefresh(db(), row, Date.now())) {
+          throw new ApiFailure(
+            429,
+            "refresh_too_soon",
+            "These tools were refreshed less than a minute ago. Try again in a minute, as a new request.",
+          );
+        }
+        // The backend queues discovery and answers at once; the mock lists the app's tools right away.
+        discoverTools(db(), row, new Date().toISOString());
+        return ok(toInstallation(row));
+      }),
+    ),
+
     http.delete(
       u("/v1/workspaces/:ws/installations/:inst"),
       route(({ request, params }) => {
@@ -1234,6 +1304,7 @@ export function createHandlers(apiBase: string) {
         const d = db();
         d.grants = d.grants.filter((g) => !(inWorkspace(g, access.workspace) && g.installation_id === row.id));
         d.installations = d.installations.filter((i) => i !== row);
+        forgetTools(d, row);
         const app = appInScope(row);
         audit(
           access,

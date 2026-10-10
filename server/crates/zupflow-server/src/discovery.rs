@@ -37,17 +37,26 @@ fn kind() -> Option<Name> {
     Name::new(DISCOVER_TOOLS).ok()
 }
 
-/// Asks for the installation's tools to be discovered. Best effort: a failure
-/// is logged, and the installation is connected either way.
+/// Discovery couldn't be queued; the cause is logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("discovery couldn't be queued")]
+pub struct NotQueued;
+
+/// Asks for the installation's tools to be discovered. A connect treats a
+/// failure as best effort (it's logged, and the installation is connected
+/// either way); a refresh reports it.
 pub async fn enqueue(
     state: &AppState,
     organization_id: OrganizationId,
     workspace_id: WorkspaceId,
     installation_id: InstallationId,
-) {
-    let Some(kind) = kind() else { return };
+) -> Result<(), NotQueued> {
+    let Some(kind) = kind() else {
+        tracing::error!(event = "discovery.kind_invalid", kind = DISCOVER_TOOLS);
+        return Err(NotQueued);
+    };
     let payload = json!({ "installation_id": installation_id.to_string() }).to_string();
-    let enqueued = state
+    state
         .jobs
         .enqueue(
             &Scope::Workspace(organization_id, workspace_id),
@@ -58,10 +67,12 @@ pub async fn enqueue(
                 max_attempts: ATTEMPTS,
             },
         )
-        .await;
-    if let Err(error) = enqueued {
-        tracing::warn!(event = "discovery.enqueue_failed", %organization_id, %workspace_id, %installation_id, %error);
-    }
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            tracing::warn!(event = "discovery.enqueue_failed", %organization_id, %workspace_id, %installation_id, %error);
+            NotQueued
+        })
 }
 
 /// What came of one attempt.

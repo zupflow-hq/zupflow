@@ -46,6 +46,8 @@ pub struct AppState {
     pub jobs: Arc<dyn zupflow_core::jobs::JobQueue>,
     /// The tools apps' MCP servers list, pinned (decision 0038).
     pub tools: Arc<dyn zupflow_core::tools::ToolRegistry>,
+    /// Short-lived values that can be rebuilt: refresh pacing, for now.
+    pub cache: Arc<dyn zupflow_core::storage::Cache>,
     /// Every call to a provider goes through it (`SafeHttpClient` in a deployment).
     pub outbound: Arc<dyn OutboundHttp>,
     /// The origin providers and browsers reach this server at, with no

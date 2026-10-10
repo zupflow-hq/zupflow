@@ -29,6 +29,7 @@ export const qk = {
   availableApps: (wsId: string) => ["ws", wsId, "available-apps"] as const,
   installations: (wsId: string) => ["ws", wsId, "installations"] as const,
   installation: (wsId: string, id: string) => ["ws", wsId, "installations", id] as const,
+  installationTools: (wsId: string, id: string) => ["ws", wsId, "installations", id, "tools"] as const,
   connectSessions: (wsId: string) => ["ws", wsId, "connect-sessions"] as const,
   connectSession: (wsId: string, id: string) => ["ws", wsId, "connect-sessions", id] as const,
   agents: (wsId: string) => ["ws", wsId, "agents"] as const,

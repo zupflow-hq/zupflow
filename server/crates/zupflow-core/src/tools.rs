@@ -32,6 +32,13 @@ pub const MAX_NAME: usize = 128;
 /// The largest definition kept, in bytes of canonical JSON.
 pub const MAX_DEFINITION_BYTES: usize = 64 << 10;
 
+/// The most gone tools an installation keeps: beyond it, a listing deletes
+/// those gone longest, so a server can't grow the registry without bound.
+pub const MAX_GONE: usize = MAX_TOOLS;
+
+/// The largest page [`ToolRegistry::list_tools`] answers.
+pub const MAX_PAGE: u32 = 100;
+
 /// One definition as listed: its canonical JSON and that JSON's SHA-256.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolRevision {
@@ -103,6 +110,16 @@ impl ListingChanges {
     }
 }
 
+/// One page of an installation's tools, by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPage {
+    pub items: Vec<RegisteredTool>,
+    /// The last tool's name when more follow: the next page's `after`.
+    pub next_after: Option<String>,
+    /// How many tools the installation has in all.
+    pub total: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ToolError {
     #[error("the store is unavailable")]
@@ -122,7 +139,8 @@ pub trait ToolRegistry: Send + Sync {
     /// new names pinned as listed; a known name whose hash differs from its
     /// pinned one kept as its latest; one listed as pinned cleared of any
     /// latest; every name not listed marked gone. Effects of known tools are
-    /// never changed by a listing.
+    /// never changed by a listing. Then, in the same transaction, gone tools
+    /// beyond [`MAX_GONE`] are deleted, those gone longest first.
     async fn record_listing(
         &self,
         organization_id: OrganizationId,
@@ -132,13 +150,16 @@ pub trait ToolRegistry: Send + Sync {
         now: Timestamp,
     ) -> Result<ListingChanges, ToolError>;
 
-    /// The installation's tools, by name.
+    /// A page of the installation's tools, by name (byte order): those whose
+    /// name sorts after `after`, at most `limit` (clamped to 1 to [`MAX_PAGE`]).
     async fn list_tools(
         &self,
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         installation_id: InstallationId,
-    ) -> Result<Vec<RegisteredTool>, ToolError>;
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<ToolPage, ToolError>;
 }
 
 /// Checks a listing against the limits every registry holds it to.

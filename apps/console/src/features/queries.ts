@@ -41,6 +41,7 @@ import {
   type WorkspaceId,
   type WorkspaceListQuery,
 } from "@zupflow/sdk";
+import { useEffect, useRef } from "react";
 import { api } from "@/lib/api";
 import { qk } from "@/lib/query-keys";
 
@@ -334,6 +335,44 @@ export function useRenameInstallation(wsId: WorkspaceId, id: InstallationId) {
   return useMutation({
     mutationFn: (label: string) => api.installations.update(wsId, id, { label }),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.workspace(wsId) }),
+  });
+}
+
+/** The tools the installation's app listed to it, a page at a time, by name. */
+export function useInstallationTools(wsId: WorkspaceId, id: InstallationId) {
+  return useInfiniteQuery({
+    queryKey: qk.installationTools(wsId, id),
+    queryFn: ({ pageParam }) => api.installations.tools(wsId, id, { cursor: pageParam ?? undefined }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.pagination.next_cursor,
+  });
+}
+
+/**
+ * Asks the app for the installation's tools again. The server lists them in
+ * the background, so the tools are read again now and once more shortly
+ * after; that second read is dropped if the page closes first.
+ */
+export function useRefreshInstallationTools(wsId: WorkspaceId, id: InstallationId) {
+  const qc = useQueryClient();
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (timer.current) clearTimeout(timer.current);
+    },
+    [],
+  );
+  return useMutation({
+    mutationFn: () => api.installations.refreshTools(wsId, id),
+    onSuccess: () => {
+      const reread = () => qc.invalidateQueries({ queryKey: qk.installationTools(wsId, id) });
+      void reread();
+      if (timer.current) clearTimeout(timer.current);
+      timer.current = setTimeout(() => {
+        timer.current = null;
+        void reread();
+      }, 3_000);
+    },
   });
 }
 

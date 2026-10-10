@@ -31,6 +31,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { canAdminister, canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { ConnectError, ConnectProgress, useConnectFlow } from "@/features/installations/connect-flow";
+import { InstallationTools } from "@/features/installations/installation-tools";
 import {
   useAgents,
   useDeleteInstallation,
@@ -208,6 +209,7 @@ function InstallationPage() {
               )}
             </Panel>
           </section>
+          {i ? <InstallationTools org={org} workspace={ws} installation={i} /> : null}
           {i ? <AgentsWithAccess org={org} workspace={ws} installation={i} /> : null}
         </div>
         <aside className="space-y-6">

@@ -21,6 +21,8 @@ import {
   createClient,
   createHttpTransport,
   ID_PREFIXES,
+  type InstallationId,
+  type InstallationTool,
   type OrganizationId,
   type WorkspaceId,
   ZupflowApiError,
@@ -35,6 +37,7 @@ import type { IdempotencyRow } from "./model";
 import { mulberry32 } from "./random";
 import { runEventsKey, timelineOf } from "./scope";
 import { DEMO_USER_ID, seed } from "./seed";
+import { listedFrom, MAX_GONE, recordListing } from "./tools";
 
 const API = "http://zupflow.test/api";
 const server = setupServer(...createHandlers(API));
@@ -1593,5 +1596,236 @@ describe("two organizations", () => {
     await owner.workspaces.delete(qa.id);
     expect(db().run_events[key]?.map((e) => e.id)).toEqual([stray.id]);
     expect(shown.some((e) => e.id === otherRun.id)).toBe(false);
+  });
+});
+
+describe("installation tools", () => {
+  /** Every tool of the installation, read a page of two at a time. */
+  const allTools = async (workspaceId: WorkspaceId, installationId: InstallationId) => {
+    const tools: InstallationTool[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await owner.installations.tools(workspaceId, installationId, { cursor, limit: 2 });
+      tools.push(...page.items);
+      cursor = page.pagination.next_cursor ?? undefined;
+    } while (cursor);
+    return tools;
+  };
+  const larkspur = () => must(db().organizations.find((o) => o.slug === "larkspur")?.id);
+  /** A fresh installation of the echo server in qa-playground, connected through Connect. */
+  const connectEcho = async () => {
+    const qa = ws("qa-playground");
+    const session = await owner.connectSessions.create(qa.id, {
+      app_id: app("echo-server").id,
+      intent: "create",
+      label: "Tools",
+      installation_id: null,
+      return_url: null,
+    });
+    const { installation } = await owner.connect.submitCredentials(referenceOf(session), {
+      values: { token: "abc123" },
+    });
+    return { qa, installation };
+  };
+
+  it("lists a new installation's tools from its app's definitions, pinned and current", async () => {
+    const { qa, installation } = await connectEcho();
+    const tools = await allTools(qa.id, installation.id);
+    const definitions = [...app("echo-server").tools].sort((a, b) => (a.name < b.name ? -1 : 1));
+    expect(tools.map((t) => [t.name, t.effect, t.status, t.pinned.title, t.pinned.description])).toEqual(
+      definitions.map((d) => [d.name, d.effect, "current", d.title, d.description]),
+    );
+    expect(tools.every((t) => t.latest === null && t.first_seen_at === t.seen_at)).toBe(true);
+  });
+
+  it("keeps the pinned definition on refresh: a changed one waits beside it, a missing one is gone", async () => {
+    const { qa, installation } = await connectEcho();
+    const before = await allTools(qa.id, installation.id);
+    const echoApp = app("echo-server");
+    const [first, ...rest] = echoApp.tools;
+    const original = structuredClone(must(first));
+    // The server now describes the first tool differently, as read-only, drops the rest and adds one.
+    echoApp.tools = [
+      { ...original, description: "Repeat the message back, twice.", effect: "read" },
+      { name: "aaa_new", title: "New", description: "Added later.", effect: "write" },
+    ];
+    await owner.installations.refreshTools(qa.id, installation.id);
+    const after = await allTools(qa.id, installation.id);
+    const byName = new Map(after.map((t) => [t.name, t]));
+    const changed = must(byName.get(original.name));
+    expect(changed.status).toBe("changed");
+    expect(changed.pinned.description).toBe(original.description);
+    expect(changed.latest?.description).toBe("Repeat the message back, twice.");
+    expect(changed.effect, "a listing never changes an effect").toBe(original.effect);
+    expect(changed.first_seen_at).toBe(must(before.find((t) => t.name === original.name)).first_seen_at);
+    expect(changed.changed_at).not.toBeNull();
+    for (const gone of rest) {
+      const tool = must(byName.get(gone.name));
+      expect([tool.status, tool.gone_at !== null]).toEqual(["gone", true]);
+    }
+    expect(must(byName.get("aaa_new")).status).toBe("current");
+    expect(after.map((t) => t.name)).toEqual([...after.map((t) => t.name)].sort());
+
+    // Listed as pinned again, the change is dropped and the gone tools return.
+    const changedAt = changed.changed_at;
+    echoApp.tools = [original, ...rest];
+    // A minute later, as far as pacing goes.
+    db().tool_refreshes = [];
+    await owner.installations.refreshTools(qa.id, installation.id);
+    const restored = await allTools(qa.id, installation.id);
+    for (const tool of restored.filter((t) => t.name !== "aaa_new")) {
+      expect([tool.name, tool.status, tool.latest, tool.changed_at, tool.gone_at]).toEqual([
+        tool.name,
+        "current",
+        null,
+        null,
+        null,
+      ]);
+    }
+    expect(must(restored.find((t) => t.name === "aaa_new")).status).toBe("gone");
+    expect(changedAt).not.toBeNull();
+  });
+
+  it("seeds a Sandbox installation with a changed tool and a gone one", async () => {
+    const sandbox = ws("acme-sandbox");
+    const installation = must(
+      db().installations.find((i) => i.workspace_id === sandbox.id && i.label === "Product"),
+      "Product installation",
+    );
+    const tools = await allTools(sandbox.id, installation.id);
+    const statuses = Object.fromEntries(tools.map((t) => [t.name, t.status]));
+    expect(statuses).toMatchObject({ create_issue: "changed", export_roadmap: "gone", search_issues: "current" });
+    const changed = must(tools.find((t) => t.name === "create_issue"));
+    expect(changed.latest?.description).not.toBe(changed.pinned.description);
+    // Refreshing lists what the app says now: the change stays unreviewed, the gone tool stays gone.
+    await owner.installations.refreshTools(sandbox.id, installation.id);
+    const again = Object.fromEntries((await allTools(sandbox.id, installation.id)).map((t) => [t.name, t.status]));
+    expect(again).toEqual(statuses);
+  });
+
+  it("stores each tool under its installation's full scope, and lists only rows that match it", async () => {
+    const { qa, installation } = await connectEcho();
+    for (const row of db().installation_tools) {
+      expect(Object.keys(row).slice(0, 3)).toEqual(["organization_id", "workspace_id", "installation_id"]);
+    }
+    const mine = must(db().installation_tools.find((t) => t.installation_id === installation.id));
+    // The same installation and workspace IDs, labelled with another organization; and another workspace's.
+    db().installation_tools.push(
+      { ...structuredClone(mine), name: "stray_org", organization_id: larkspur() },
+      { ...structuredClone(mine), name: "stray_ws", workspace_id: ws("acme-sandbox").id },
+    );
+    const names = (await allTools(qa.id, installation.id)).map((t) => t.name);
+    expect(names).not.toContain("stray_org");
+    expect(names).not.toContain("stray_ws");
+  });
+
+  it("removes an installation's tools with it, and a workspace's with the workspace, and no one else's", async () => {
+    const { qa, installation } = await connectEcho();
+    const mine = must(db().installation_tools.find((t) => t.installation_id === installation.id));
+    const stray = { ...structuredClone(mine), name: "stray_org", organization_id: larkspur() };
+    db().installation_tools.push(stray);
+    // Pacing rows: one labelled with another organization, one of a sibling installation.
+    const strayPacing = {
+      organization_id: larkspur(),
+      workspace_id: qa.id,
+      installation_id: installation.id,
+      until: "2999-01-01T00:00:00.000Z",
+    };
+    const siblingPacing = {
+      ...strayPacing,
+      organization_id: mine.organization_id,
+      installation_id: "inst_sibling" as typeof installation.id,
+    };
+    db().tool_refreshes.push({ ...strayPacing, organization_id: mine.organization_id }, strayPacing, siblingPacing);
+    await owner.installations.delete(qa.id, installation.id);
+    expect(db().installation_tools.filter((t) => t.installation_id === installation.id)).toEqual([stray]);
+    expect(db().tool_refreshes.filter((r) => r.workspace_id === qa.id)).toEqual([strayPacing, siblingPacing]);
+    const others = db().installation_tools.filter((t) => t.workspace_id === qa.id && t.organization_id !== larkspur());
+    expect(others.length).toBeGreaterThan(0);
+    await owner.workspaces.delete(qa.id);
+    expect(db().installation_tools.filter((t) => t.workspace_id === qa.id)).toEqual([stray]);
+    expect(db().tool_refreshes.filter((r) => r.workspace_id === qa.id)).toEqual([strayPacing]);
+  });
+
+  it("keeps at most 500 gone tools per installation, dropping those gone longest", async () => {
+    const { qa, installation } = await connectEcho();
+    const row = must(db().installations.find((i) => i.id === installation.id));
+    const batch = (prefix: string) =>
+      Array.from({ length: MAX_GONE }, (_, i) =>
+        listedFrom({
+          name: `${prefix}${String(i).padStart(4, "0")}`,
+          title: "T",
+          description: "D",
+          effect: "read",
+        }),
+      );
+    recordListing(db(), row, batch("a"), "2026-01-01T00:00:00.000Z");
+    recordListing(db(), row, batch("b"), "2026-01-02T00:00:00.000Z");
+    recordListing(db(), row, [], "2026-01-03T00:00:00.000Z");
+    const page = await owner.installations.tools(qa.id, installation.id, { limit: 100 });
+    expect(page.pagination.total).toBe(MAX_GONE);
+    const gone = db().installation_tools.filter((t) => t.installation_id === installation.id);
+    expect(gone.every((t) => t.name.startsWith("b") && t.gone_at === "2026-01-03T00:00:00.000Z")).toBe(true);
+  });
+
+  it("shows everything a definition hashes: its schemas and hints", async () => {
+    const sandbox = ws("acme-sandbox");
+    const installation = must(db().installations.find((i) => i.workspace_id === sandbox.id && i.label === "Product"));
+    const comment = must((await allTools(sandbox.id, installation.id)).find((t) => t.name === "add_comment"));
+    expect(comment.status).toBe("changed");
+    expect([comment.pinned.description, comment.pinned.input_schema]).toEqual([
+      comment.latest?.description,
+      comment.latest?.input_schema,
+    ]);
+    expect(comment.pinned.annotations).toEqual({ readOnlyHint: false });
+    expect(comment.latest?.annotations).toEqual({ readOnlyHint: false, destructiveHint: false });
+    expect(comment.latest?.output_schema).toBeNull();
+  });
+
+  it("refuses a second refresh of one installation within a minute, and keeps the pacing to it", async () => {
+    const { qa, installation } = await connectEcho();
+    await owner.installations.refreshTools(qa.id, installation.id);
+    const error = await failure(owner.installations.refreshTools(qa.id, installation.id));
+    expect([error.status, error.code]).toEqual([429, "refresh_too_soon"]);
+    expect(error.message).toContain("minute");
+    const pacing = must(db().tool_refreshes.find((r) => r.installation_id === installation.id));
+    expect(Object.keys(pacing).slice(0, 3)).toEqual(["organization_id", "workspace_id", "installation_id"]);
+    // Another installation of the workspace isn't held back.
+    const echo = must(
+      db().installations.find((i) => i.workspace_id === qa.id && i.id !== installation.id && i.status === "connected"),
+    );
+    await owner.installations.refreshTools(qa.id, echo.id);
+    // A pacing row labelled with another organization holds nothing back here.
+    db().tool_refreshes = db().tool_refreshes.map((r) =>
+      r.installation_id === installation.id ? { ...r, organization_id: larkspur() } : r,
+    );
+    await owner.installations.refreshTools(qa.id, installation.id);
+    // Once the minute has passed, it refreshes again.
+    for (const r of db().tool_refreshes) r.until = new Date(Date.now() - 1).toISOString();
+    await owner.installations.refreshTools(qa.id, installation.id);
+  });
+
+  it("refuses a tool cursor it didn't issue", async () => {
+    const { qa, installation } = await connectEcho();
+    const error = await failure(owner.installations.tools(qa.id, installation.id, { cursor: "not base64!" }));
+    expect([error.status, error.code, error.fields]).toEqual([
+      400,
+      "validation_failed",
+      { cursor: expect.any(String) },
+    ]);
+  });
+
+  it("lists nothing for an installation that never connected, and refuses to refresh it", async () => {
+    const qa = ws("qa-playground");
+    const old = must(db().installations.find((i) => i.workspace_id === qa.id && i.status === "disconnected"));
+    expect(await allTools(qa.id, old.id)).toEqual([]);
+    const error = await failure(owner.installations.refreshTools(qa.id, old.id));
+    expect([error.status, error.code]).toEqual([409, "installation_not_connected"]);
+    // Reconnect required counts as not connected too.
+    const sandbox = ws("acme-sandbox");
+    const live = must(db().installations.find((i) => i.workspace_id === sandbox.id && i.status === "connected"));
+    live.status = "reconnect_required";
+    const refused = await failure(owner.installations.refreshTools(sandbox.id, live.id));
+    expect(refused.code).toBe("installation_not_connected");
   });
 });

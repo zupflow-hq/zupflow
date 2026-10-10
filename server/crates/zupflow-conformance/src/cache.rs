@@ -1,7 +1,10 @@
 //! The `Cache` suite: entries round-trip, expire, and never cross a scope.
 //! Organization, environment and workspace scopes are separate namespaces, and
-//! deleting one scope removes nothing outside it.
+//! deleting one scope removes nothing outside it. `add_if_absent` stores
+//! only over an absent or expired entry, and of concurrent callers exactly one
+//! wins.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use zupflow_core::environment::Environment;
@@ -15,8 +18,12 @@ fn name(value: &str) -> Name {
     Name::new(value).unwrap()
 }
 
-pub async fn run(cache: &dyn Cache) {
+pub async fn run(cache: Arc<dyn Cache>) {
+    let shared = Arc::clone(&cache);
+    let cache = cache.as_ref();
     round_trips(cache).await;
+    adds_only_when_absent(cache).await;
+    adds_once_among_concurrent_callers(shared).await;
     keeps_scopes_apart(cache).await;
     resists_keys_that_spell_another_keyspace(cache).await;
     deletes_only_inside_a_scope(cache).await;
@@ -162,4 +169,86 @@ async fn expires(cache: &dyn Cache) {
     );
     tokio::time::sleep(Duration::from_millis(3500)).await;
     assert_eq!(cache.get(&scope, &key).await.unwrap(), None, "an expired entry is gone");
+}
+
+async fn adds_only_when_absent(cache: &dyn Cache) {
+    let scope = Scope::Organization(OrganizationId::generate());
+    let key = name("once");
+    assert!(
+        cache
+            .add_if_absent(&scope, &key, b"first".to_vec(), HOUR)
+            .await
+            .unwrap(),
+        "an absent key is stored"
+    );
+    assert!(
+        !cache
+            .add_if_absent(&scope, &key, b"second".to_vec(), HOUR)
+            .await
+            .unwrap(),
+        "a live entry refuses"
+    );
+    assert_eq!(
+        cache.get(&scope, &key).await.unwrap().as_deref(),
+        Some(&b"first"[..]),
+        "and keeps its value"
+    );
+
+    // The same key in every other scope is its own.
+    for (other, value) in scopes() {
+        assert!(
+            cache.add_if_absent(&other, &key, value.to_vec(), HOUR).await.unwrap(),
+            "{other:?} is another namespace"
+        );
+    }
+    let (a, ws) = (OrganizationId::generate(), WorkspaceId::generate());
+    for scope in [
+        Scope::Workspace(a, ws),
+        Scope::Workspace(OrganizationId::generate(), ws),
+    ] {
+        assert!(cache.add_if_absent(&scope, &key, b"ws".to_vec(), HOUR).await.unwrap());
+    }
+
+    // Expired counts as absent: whole seconds, with margins, as in `expires`.
+    let short = Scope::Organization(OrganizationId::generate());
+    assert!(
+        cache
+            .add_if_absent(&short, &key, b"old".to_vec(), Duration::from_secs(2))
+            .await
+            .unwrap()
+    );
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    assert!(
+        cache.add_if_absent(&short, &key, b"new".to_vec(), HOUR).await.unwrap(),
+        "an expired entry counts as absent"
+    );
+    assert_eq!(cache.get(&short, &key).await.unwrap().as_deref(), Some(&b"new"[..]));
+
+    // Deleted, it can be added again.
+    cache.delete(&scope, &key).await.unwrap();
+    assert!(
+        cache
+            .add_if_absent(&scope, &key, b"again".to_vec(), HOUR)
+            .await
+            .unwrap()
+    );
+}
+
+async fn adds_once_among_concurrent_callers(cache: Arc<dyn Cache>) {
+    let scope = Scope::Workspace(OrganizationId::generate(), WorkspaceId::generate());
+    let key = name("race");
+    let tasks: Vec<_> = (0..16u8)
+        .map(|index| {
+            let cache = Arc::clone(&cache);
+            let key = key.clone();
+            tokio::spawn(async move { cache.add_if_absent(&scope, &key, vec![index], HOUR).await })
+        })
+        .collect();
+    let mut won = 0;
+    for task in tasks {
+        if task.await.unwrap().unwrap() {
+            won += 1;
+        }
+    }
+    assert_eq!(won, 1, "exactly one concurrent caller stores");
 }

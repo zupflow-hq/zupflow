@@ -217,6 +217,12 @@ export function contractSuite(target: Target) {
         const installation = must((await owner.installations.list(sandbox.id))[0], "installation in acme-sandbox");
         await owner.installations.get(sandbox.id, installation.id);
         await owner.installations.update(sandbox.id, installation.id, { label: installation.label });
+        const connected = must(
+          (await owner.installations.list(sandbox.id)).find((i) => i.status === "connected"),
+          "connected installation in acme-sandbox",
+        );
+        await owner.installations.tools(sandbox.id, connected.id);
+        await owner.installations.refreshTools(sandbox.id, connected.id);
         const echo = must((await owner.installations.list(qa.id))[0], "installation in qa-playground");
         await owner.installations.disconnect(qa.id, echo.id);
         await owner.installations.delete(qa.id, echo.id);
@@ -1026,6 +1032,130 @@ export function contractSuite(target: Target) {
       });
     });
 
+    describe("installation tools", () => {
+      /** acme-sandbox's connected installation: the reference fixture has discovered its tools. */
+      const sandboxInstallation = async () =>
+        must(
+          (await owner.installations.list(fx.workspaces.acmeSandbox.id)).find(
+            (i) => i.status === "connected" && i.app.id === fx.apps.linear,
+          ),
+          "connected installation of linear in acme-sandbox",
+        );
+
+      it("lists an installation's tools by name, to every member", async () => {
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const installation = await sandboxInstallation();
+        const page = await owner.installations.tools(sandbox, installation.id, { limit: 100 });
+        const tools = page.items;
+        expect(tools.length).toBeGreaterThan(0);
+        expect(page.pagination).toEqual({ next_cursor: null, total: tools.length });
+        const names = tools.map((t) => t.name);
+        expect(names).toEqual([...names].sort());
+        // What a tool's status says matches what it holds.
+        for (const tool of tools) {
+          const held = { latest: tool.latest !== null, changed: tool.changed_at !== null, gone: tool.gone_at !== null };
+          if (tool.status === "current")
+            expect(held, tool.name).toEqual({ latest: false, changed: false, gone: false });
+          if (tool.status === "changed") expect(held, tool.name).toEqual({ latest: true, changed: true, gone: false });
+          if (tool.status === "gone") expect(held.gone, tool.name).toBe(true);
+        }
+        expect(await as("viewer").installations.tools(sandbox, installation.id, { limit: 100 })).toEqual(page);
+      });
+
+      it("pages an installation's tools by name, and refuses a cursor it didn't issue", async () => {
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const installation = await sandboxInstallation();
+        const whole = await owner.installations.tools(sandbox, installation.id, { limit: 100 });
+        expect(whole.items.length, "the fixture's tools span pages").toBeGreaterThan(1);
+        const paged: string[] = [];
+        let cursor: string | undefined;
+        do {
+          const page = await owner.installations.tools(sandbox, installation.id, { cursor, limit: 1 });
+          expect(page.items.length).toBe(1);
+          expect(page.pagination.total).toBe(whole.items.length);
+          paged.push(...page.items.map((t) => t.name));
+          cursor = page.pagination.next_cursor ?? undefined;
+        } while (cursor);
+        expect(paged).toEqual(whole.items.map((t) => t.name));
+        // Out-of-range limits are clamped.
+        expect((await owner.installations.tools(sandbox, installation.id, { limit: 0 })).items.length).toBe(1);
+        const error = await failure(owner.installations.tools(sandbox, installation.id, { cursor: "%%%" }));
+        expect([error.status, error.code]).toEqual([400, "validation_failed"]);
+      });
+
+      it("keeps another workspace's and another organization's installation out of both routes", async () => {
+        const outsider = as("outsider");
+        const harborSlug = async (slug: string) =>
+          must(
+            (await outsider.workspaces.list(fx.otherOrganization, { q: slug, limit: 100 })).items.find(
+              (w) => w.slug === slug,
+            ),
+            `workspace ${slug}`,
+          );
+        const [harbor, harborSandbox, beta] = await Promise.all([
+          harborSlug("harbor"),
+          harborSlug("harbor-sandbox"),
+          workspaceBySlug("beta-labs"),
+        ]);
+        const { acme, acmeSandbox } = fx.workspaces;
+        const first = async (client: ZupflowClient, workspace: WorkspaceId, what: string) =>
+          must((await client.installations.list(workspace))[0], `installation in ${what}`).id;
+        const harborInstallation = await first(outsider, harbor.id, "harbor");
+        const acmeInstallation = await first(owner, acme.id, "acme");
+        const betaInstallation = await first(owner, beta.id, "beta-labs");
+        // Refreshes go through a Sandbox, so Production's read-only refusal can't answer first.
+        const attempts: [string, () => Promise<unknown>][] = [
+          ["other organization", () => owner.installations.tools(acme.id, harborInstallation)],
+          ["other organization", () => owner.installations.refreshTools(acmeSandbox.id, harborInstallation)],
+          ["other organization", () => outsider.installations.tools(harbor.id, acmeInstallation)],
+          ["other organization", () => outsider.installations.refreshTools(harborSandbox.id, acmeInstallation)],
+          ["other organization's path", () => outsider.installations.tools(acme.id, acmeInstallation)],
+          ["sibling workspace", () => owner.installations.tools(acme.id, betaInstallation)],
+          ["sibling workspace", () => owner.installations.refreshTools(acmeSandbox.id, betaInstallation)],
+        ];
+        for (const [what, attempt] of attempts) {
+          const error = await failure(attempt());
+          expect(`${error.status} ${error.code}`, what).toBe("404 not_found");
+        }
+      });
+
+      it("never lets the Console refresh tools in Production", async () => {
+        const acme = fx.workspaces.acme.id;
+        const installation = must(
+          (await owner.installations.list(acme)).find((i) => i.status === "connected"),
+          "connected installation in acme",
+        );
+        const error = await failure(owner.installations.refreshTools(acme, installation.id));
+        expect(`${error.status} ${error.code}`).toBe("403 console_read_only_in_production");
+        // A developer is refused the same way; a viewer by role first.
+        const developer = await failure(as("developer").installations.refreshTools(acme, installation.id));
+        expect(developer.code).toBe("console_read_only_in_production");
+        const viewer = await failure(as("viewer").installations.refreshTools(acme, installation.id));
+        expect(`${viewer.status} ${viewer.code}`).toBe("403 forbidden");
+      });
+
+      it("paces refreshes: a second within a minute answers 429", async () => {
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const installation = await sandboxInstallation();
+        expect((await owner.installations.refreshTools(sandbox, installation.id)).id).toBe(installation.id);
+        const error = await failure(as("developer").installations.refreshTools(sandbox, installation.id));
+        expect(`${error.status} ${error.code}`).toBe("429 refresh_too_soon");
+      });
+
+      it("refreshes a connected installation and refuses one that isn't connected", async () => {
+        const qa = fx.workspaces.qaPlayground.id;
+        const installation = must(
+          (await owner.installations.list(qa)).find((i) => i.status === "connected"),
+          "connected installation in qa-playground",
+        );
+        const refreshed = await as("developer").installations.refreshTools(qa, installation.id);
+        expect([refreshed.id, refreshed.status]).toEqual([installation.id, "connected"]);
+        await owner.installations.disconnect(qa, installation.id);
+        const error = await failure(owner.installations.refreshTools(qa, installation.id));
+        expect(`${error.status} ${error.code}`).toBe("409 installation_not_connected");
+      });
+    });
+
     describe("Connect sessions", () => {
       const qa = () => fx.workspaces.qaPlayground.id;
       const create = (extra: Partial<CreateConnectSessionInput> = {}) =>
@@ -1231,6 +1361,11 @@ export function contractSuite(target: Target) {
               settled(Promise.all(agents.map((a) => c.grants.list(acme, a.id)))),
               settled(c.runs.list(acme, { limit: 100 })),
               settled(c.installations.list(acme)),
+              settled(
+                c.installations
+                  .list(acme)
+                  .then((installations) => Promise.all(installations.map((i) => c.installations.tools(acme, i.id)))),
+              ),
               settled(c.connectSessions.list(acme)),
               settled(c.organizationApps.list(fx.organization)),
               settled(c.workspaceApps.list(acme)),
@@ -1286,6 +1421,7 @@ export function contractSuite(target: Target) {
             () => c.workspaceApps.updateConfiguration(w, t.workspaceApp.id, { mcp_server_url: null }),
           ],
           ["updateInstallation", () => c.installations.update(w, t.installation.id, { label: "Viewed" })],
+          ["refreshInstallationTools", () => c.installations.refreshTools(w, t.installation.id)],
           ["disconnectInstallation", () => c.installations.disconnect(w, t.installation.id)],
           ["deleteInstallation", () => c.installations.delete(w, t.installation.id)],
           [

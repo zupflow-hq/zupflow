@@ -466,7 +466,10 @@ async fn complete(
         .await
     {
         Ok((_, installation)) => {
-            crate::discovery::enqueue(state, session.organization_id, session.workspace_id, installation.id).await;
+            // Best effort: a failure is logged, and the installation is connected either way.
+            crate::discovery::enqueue(state, session.organization_id, session.workspace_id, installation.id)
+                .await
+                .ok();
             Ok(())
         }
         Err(ConnectError::NotPending) => Ok(()),
