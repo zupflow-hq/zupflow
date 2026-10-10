@@ -2788,9 +2788,11 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "zeroize",
  "zupflow-basic",
  "zupflow-core",
  "zupflow-oidc",
+ "zupflow-outbound",
  "zupflow-sqlite",
 ]
 

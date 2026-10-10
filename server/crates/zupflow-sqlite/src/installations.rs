@@ -114,6 +114,157 @@ fn installation_from(row: &SqliteRow) -> Result<Installation, InstallationError>
     })
 }
 
+/// Inserts a connected installation and its credential, inside the caller's
+/// transaction. The caller has checked the app belongs to the scope.
+pub(crate) async fn insert_connected(
+    transaction: &mut Transaction<'static, Sqlite>,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    installation_id: InstallationId,
+    installation: &NewInstallation,
+) -> Result<Installation, InstallationError> {
+    let (catalog_app_id, workspace_app_id) = match installation.app {
+        InstalledApp::Catalog(id) => (Some(id.uuid()), None),
+        InstalledApp::Workspace(id) => (None, Some(id.uuid())),
+    };
+    let scopes = serde_json::to_string(&installation.granted_scopes).map_err(read)?;
+    let now = Timestamp::now().millis();
+    let row = sqlx::query(concat!(
+        "INSERT INTO installations (id, organization_id, workspace_id, catalog_app_id, workspace_app_id, label, \
+         status, configuration_version, account_external_id, account_display_name, account_email, \
+         granted_scopes, credential_version, connected_at, expires_at, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, 'connected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ",
+        returning!()
+    ))
+    .bind(installation_id.uuid())
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(catalog_app_id)
+    .bind(workspace_app_id)
+    .bind(&installation.label)
+    .bind(i64::from(installation.configuration_version))
+    .bind(&installation.account.external_id)
+    .bind(&installation.account.display_name)
+    .bind(&installation.account.email)
+    .bind(scopes)
+    .bind(i64::from(installation.credential.version))
+    .bind(now)
+    .bind(installation.expires_at.map(Timestamp::millis))
+    .bind(now)
+    .bind(now)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(failed("insert_installation"))?;
+    insert_credential(
+        transaction,
+        organization_id,
+        workspace_id,
+        installation_id,
+        &installation.credential,
+        now,
+    )
+    .await?;
+    installation_from(&row)
+}
+
+async fn insert_credential(
+    transaction: &mut Transaction<'static, Sqlite>,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    installation_id: InstallationId,
+    credential: &NewCredential,
+    now: i64,
+) -> Result<(), InstallationError> {
+    sqlx::query(
+        "INSERT INTO installation_credentials (id, organization_id, workspace_id, installation_id, version, \
+         key_id, wrapped_key, nonce, ciphertext, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(installation_id.uuid())
+    .bind(i64::from(credential.version))
+    .bind(&credential.sealed.wrapped_key.key_id)
+    .bind(&credential.sealed.wrapped_key.bytes)
+    .bind(credential.sealed.nonce.as_slice())
+    .bind(&credential.sealed.ciphertext)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(failed("insert_credential"))?;
+    Ok(())
+}
+
+/// Connects the installation again, inside the caller's transaction: its
+/// account, scopes and expiry, and `credential`, which must be the stored
+/// version plus one (1 if it never held one); its old credential goes.
+/// `None` when it isn't in this scope or another version was stored since.
+pub(crate) async fn reconnect(
+    transaction: &mut Transaction<'static, Sqlite>,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    installation_id: InstallationId,
+    renewal: &Renewal<'_>,
+) -> Result<Option<Installation>, InstallationError> {
+    let scopes = serde_json::to_string(renewal.granted_scopes).map_err(read)?;
+    let now = Timestamp::now().millis();
+    let credential = renewal.credential;
+    let row = sqlx::query(concat!(
+        "UPDATE installations SET status = 'connected', configuration_version = ?, account_external_id = ?, \
+         account_display_name = ?, account_email = ?, granted_scopes = ?, credential_version = ?, \
+         connected_at = ?, expires_at = ?, updated_at = ? \
+         WHERE organization_id = ? AND workspace_id = ? AND id = ? AND coalesce(credential_version, 0) = ? RETURNING ",
+        returning!()
+    ))
+    .bind(i64::from(renewal.configuration_version))
+    .bind(&renewal.account.external_id)
+    .bind(&renewal.account.display_name)
+    .bind(&renewal.account.email)
+    .bind(scopes)
+    .bind(i64::from(credential.version))
+    .bind(now)
+    .bind(renewal.expires_at.map(Timestamp::millis))
+    .bind(now)
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(installation_id.uuid())
+    .bind(i64::from(credential.version) - 1)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(failed("reconnect_installation"))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    sqlx::query(
+        "DELETE FROM installation_credentials WHERE organization_id = ? AND workspace_id = ? AND installation_id = ?",
+    )
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(installation_id.uuid())
+    .execute(&mut **transaction)
+    .await
+    .map_err(failed("reconnect_installation"))?;
+    insert_credential(
+        transaction,
+        organization_id,
+        workspace_id,
+        installation_id,
+        credential,
+        now,
+    )
+    .await?;
+    installation_from(&row).map(Some)
+}
+
+/// What [`reconnect`] writes.
+pub(crate) struct Renewal<'a> {
+    pub configuration_version: u32,
+    pub account: &'a ConnectedAccount,
+    pub granted_scopes: &'a [String],
+    pub expires_at: Option<Timestamp>,
+    pub credential: &'a NewCredential,
+}
+
 /// A position in the catalog-wide list: newest first, then by ID.
 struct Position {
     created_at: i64,
@@ -230,67 +381,14 @@ impl InstallationStore for SqliteInstallationStore {
         if app.is_none() {
             return Err(InstallationError::NotFound);
         }
-        let (catalog_app_id, workspace_app_id) = match installation.app {
-            InstalledApp::Catalog(id) => (Some(id.uuid()), None),
-            InstalledApp::Workspace(id) => (None, Some(id.uuid())),
-        };
-        let scopes = serde_json::to_string(&installation.granted_scopes).map_err(read)?;
-        let now = Timestamp::now().millis();
-        sqlx::query(
-            "INSERT INTO installations (id, organization_id, workspace_id, catalog_app_id, workspace_app_id, label, \
-             status, configuration_version, account_external_id, account_display_name, account_email, \
-             granted_scopes, credential_version, connected_at, expires_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, 'connected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        let created = insert_connected(
+            &mut transaction,
+            organization_id,
+            workspace_id,
+            installation_id,
+            installation,
         )
-        .bind(installation_id.uuid())
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(catalog_app_id)
-        .bind(workspace_app_id)
-        .bind(&installation.label)
-        .bind(i64::from(installation.configuration_version))
-        .bind(&installation.account.external_id)
-        .bind(&installation.account.display_name)
-        .bind(&installation.account.email)
-        .bind(scopes)
-        .bind(i64::from(installation.credential.version))
-        .bind(now)
-        .bind(installation.expires_at.map(Timestamp::millis))
-        .bind(now)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(failed("create_installation"))?;
-        let credential = &installation.credential;
-        sqlx::query(
-            "INSERT INTO installation_credentials (id, organization_id, workspace_id, installation_id, version, \
-             key_id, wrapped_key, nonce, ciphertext, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(Uuid::now_v7())
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(installation_id.uuid())
-        .bind(i64::from(credential.version))
-        .bind(&credential.sealed.wrapped_key.key_id)
-        .bind(&credential.sealed.wrapped_key.bytes)
-        .bind(credential.sealed.nonce.as_slice())
-        .bind(&credential.sealed.ciphertext)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(failed("create_installation"))?;
-        let row = sqlx::query(concat!(
-            "SELECT ",
-            columns!(),
-            " FROM installations i WHERE i.organization_id = ? AND i.workspace_id = ? AND i.id = ?"
-        ))
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(installation_id.uuid())
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(failed("create_installation"))?;
-        let created = installation_from(&row)?;
+        .await?;
         transaction.commit().await.map_err(failed("create_installation"))?;
         Ok(created)
     }

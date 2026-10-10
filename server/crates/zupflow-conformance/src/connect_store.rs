@@ -1,6 +1,8 @@
 //! The `ConnectStore` suite: settings per organization and environment;
 //! sessions reached only through their own workspace, or by the hash of
-//! their reference and nothing else; cancelling only what is pending.
+//! their reference and nothing else; cancelling only what is pending;
+//! completing a pending session once, with the installation it makes or
+//! renews written in the same breath.
 //!
 //! `prepare` makes a [`Tenant`] exist: an organization with a Sandbox and a
 //! Production workspace, a catalog app, the Sandbox workspace's own app, and
@@ -11,12 +13,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use zupflow_core::connect::{
-    ConnectError, ConnectIntent, ConnectSession, ConnectSessionStatus, ConnectStore, NewConnectSession, Reference,
-    ReferenceHash, SESSION_TTL_MS,
+    Completion, ConnectError, ConnectIntent, ConnectSession, ConnectSessionStatus, ConnectStore, NewConnectSession,
+    Reference, ReferenceHash, SESSION_TTL_MS,
 };
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, ConnectSessionId, InstallationId, OrganizationId, WorkspaceId};
-use zupflow_core::installations::InstalledApp;
+use zupflow_core::installations::{ConnectedAccount, InstallationStatus, InstalledApp, NewCredential};
+use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::time::Timestamp;
 
 #[derive(Debug, Clone, Copy)]
@@ -79,6 +82,8 @@ pub async fn run(store: &dyn ConnectStore, prepare: Prepare) {
     finds_sessions_within_their_workspace(store, &prepare).await;
     attributes_a_session_by_its_reference_alone(store, &prepare).await;
     cancels_only_what_is_pending(store, &prepare).await;
+    completes_a_pending_session_once(store, &prepare).await;
+    renews_a_reconnects_installation_under_the_next_version(store, &prepare).await;
     refuses_a_workspace_of_another_organization(store, &prepare).await;
 }
 
@@ -288,4 +293,255 @@ async fn refuses_a_workspace_of_another_organization(store: &dyn ConnectStore, p
         Err(ConnectError::NotFound),
         "a Sandbox workspace's session is a Sandbox session"
     );
+}
+
+fn completion(installation_id: InstallationId, version: u32) -> Completion {
+    Completion {
+        installation_id,
+        configuration_version: 3,
+        account: ConnectedAccount {
+            external_id: "acct-1".to_owned(),
+            display_name: "Account".to_owned(),
+            email: None,
+        },
+        granted_scopes: vec!["read".to_owned()],
+        expires_at: None,
+        credential: NewCredential {
+            sealed: Sealed {
+                wrapped_key: WrappedKey {
+                    key_id: "k".to_owned(),
+                    bytes: vec![1; 40],
+                },
+                nonce: [1; 12],
+                ciphertext: vec![1; 16],
+            },
+            version,
+        },
+    }
+}
+
+async fn completes_a_pending_session_once(store: &dyn ConnectStore, prepare: &Prepare) {
+    let a = tenant(prepare).await;
+    let b = tenant(prepare).await;
+    let now = Timestamp::now();
+    let (session, _) = start(store, &a, now).await;
+    let new_installation = InstallationId::generate();
+    for (organization, workspace) in [(b.organization_id, a.sandbox), (a.organization_id, a.production)] {
+        assert_eq!(
+            store
+                .complete_session(
+                    organization,
+                    workspace,
+                    session.id,
+                    &completion(new_installation, 1),
+                    now
+                )
+                .await,
+            Err(ConnectError::NotFound)
+        );
+    }
+    assert_eq!(
+        store
+            .complete_session(
+                a.organization_id,
+                a.sandbox,
+                session.id,
+                &completion(new_installation, 2),
+                now
+            )
+            .await,
+        Err(ConnectError::InstallationChanged),
+        "a new installation's credential is version 1"
+    );
+    let (completed, installation) = store
+        .complete_session(
+            a.organization_id,
+            a.sandbox,
+            session.id,
+            &completion(new_installation, 1),
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (completed.status, completed.completed_at, completed.installation_id),
+        (ConnectSessionStatus::Completed, Some(now), Some(new_installation))
+    );
+    assert_eq!(
+        (
+            installation.id,
+            installation.organization_id,
+            installation.workspace_id,
+            installation.app,
+            installation.label.as_str(),
+            installation.status,
+            installation.configuration_version,
+        ),
+        (
+            new_installation,
+            a.organization_id,
+            a.sandbox,
+            InstalledApp::Catalog(a.catalog_app),
+            "Main",
+            InstallationStatus::Connected,
+            3,
+        ),
+        "of the session's app, with its label"
+    );
+    let connection = installation.connection.unwrap();
+    assert_eq!(
+        (connection.account.external_id.as_str(), connection.credential_version),
+        ("acct-1", 1)
+    );
+    assert_eq!(
+        store
+            .find_session(a.organization_id, a.sandbox, session.id)
+            .await
+            .unwrap(),
+        Some(completed)
+    );
+    assert_eq!(
+        store
+            .complete_session(
+                a.organization_id,
+                a.sandbox,
+                session.id,
+                &completion(InstallationId::generate(), 1),
+                now
+            )
+            .await,
+        Err(ConnectError::NotPending),
+        "once"
+    );
+
+    // Past its expiry, or cancelled, a session completes nothing.
+    let (stale, _) = start(store, &a, Timestamp::from_millis(now.millis() - SESSION_TTL_MS - 1)).await;
+    let (cancelled, _) = start(store, &a, now).await;
+    store
+        .cancel_session(a.organization_id, a.sandbox, cancelled.id, now)
+        .await
+        .unwrap();
+    for refused in [stale.id, cancelled.id] {
+        assert_eq!(
+            store
+                .complete_session(
+                    a.organization_id,
+                    a.sandbox,
+                    refused,
+                    &completion(InstallationId::generate(), 1),
+                    now
+                )
+                .await,
+            Err(ConnectError::NotPending)
+        );
+        assert_eq!(
+            store
+                .find_session(a.organization_id, a.sandbox, refused)
+                .await
+                .unwrap()
+                .unwrap()
+                .installation_id,
+            None
+        );
+    }
+}
+
+async fn renews_a_reconnects_installation_under_the_next_version(store: &dyn ConnectStore, prepare: &Prepare) {
+    let a = tenant(prepare).await;
+    let now = Timestamp::now();
+    let reconnect = |reference: &Reference| {
+        let mut session = new(InstalledApp::Catalog(a.catalog_app), reference);
+        session.intent = ConnectIntent::Reconnect;
+        session.installation_id = Some(a.installation);
+        session
+    };
+    let begin = || async {
+        let reference = Reference::generate().unwrap();
+        store
+            .create_session(
+                a.organization_id,
+                a.sandbox,
+                ConnectSessionId::generate(),
+                &reconnect(&reference),
+                now,
+            )
+            .await
+            .unwrap()
+    };
+
+    let first = begin().await;
+    for refused in [completion(InstallationId::generate(), 1), completion(a.installation, 2)] {
+        assert_eq!(
+            store
+                .complete_session(a.organization_id, a.sandbox, first.id, &refused, now)
+                .await,
+            Err(ConnectError::InstallationChanged),
+            "only its own installation, under the next version"
+        );
+    }
+    assert_eq!(
+        store
+            .find_session(a.organization_id, a.sandbox, first.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ConnectSessionStatus::Pending,
+        "a refused completion writes nothing"
+    );
+    let (_, renewed) = store
+        .complete_session(
+            a.organization_id,
+            a.sandbox,
+            first.id,
+            &completion(a.installation, 1),
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            renewed.id,
+            renewed.status,
+            renewed.connection.map(|c| c.credential_version)
+        ),
+        (a.installation, InstallationStatus::Connected, Some(1)),
+        "a disconnected installation that never held a credential starts at 1"
+    );
+
+    // Two reconnects read the same version; the second to complete loses.
+    let (one, two) = (begin().await, begin().await);
+    store
+        .complete_session(
+            a.organization_id,
+            a.sandbox,
+            one.id,
+            &completion(a.installation, 2),
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .complete_session(
+                a.organization_id,
+                a.sandbox,
+                two.id,
+                &completion(a.installation, 2),
+                now
+            )
+            .await,
+        Err(ConnectError::InstallationChanged)
+    );
+    let (_, again) = store
+        .complete_session(
+            a.organization_id,
+            a.sandbox,
+            two.id,
+            &completion(a.installation, 3),
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.connection.map(|c| c.credential_version), Some(3));
 }

@@ -7,15 +7,16 @@ use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 use uuid::Uuid;
 use zupflow_core::connect::{
-    ConnectError, ConnectIntent, ConnectSession, ConnectSessionStatus, ConnectSettings, ConnectStore,
+    Completion, ConnectError, ConnectIntent, ConnectSession, ConnectSessionStatus, ConnectSettings, ConnectStore,
     NewConnectSession, ReferenceHash, SESSION_TTL_MS,
 };
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, ConnectSessionId, InstallationId, OrganizationId, WorkspaceId};
-use zupflow_core::installations::InstalledApp;
+use zupflow_core::installations::{Installation, InstallationError, InstalledApp, NewInstallation};
 use zupflow_core::time::Timestamp;
 
 use crate::Database;
+use crate::installations::{Renewal, insert_connected, reconnect};
 
 pub struct SqliteConnectStore {
     database: Database,
@@ -78,6 +79,14 @@ fn session_from(row: &SqliteRow) -> Result<ConnectSession, ConnectError> {
         completed_at: completed_at.map(Timestamp::from_millis),
         failure_code: row.try_get("failure_code").map_err(read)?,
     })
+}
+
+/// An installation write that failed inside a completion: the store has logged it.
+fn installation_failed(error: InstallationError) -> ConnectError {
+    match error {
+        InstallationError::NotFound => ConnectError::InstallationChanged,
+        InstallationError::Unavailable | InstallationError::InvalidCursor => ConnectError::Unavailable,
+    }
 }
 
 fn list(value: &str) -> Result<Vec<String>, ConnectError> {
@@ -262,6 +271,102 @@ impl ConnectStore for SqliteConnectStore {
         .await
         .map_err(failed("attribute_session_by_reference"))?;
         row.as_ref().map(session_from).transpose()
+    }
+
+    async fn complete_session(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        session_id: ConnectSessionId,
+        completion: &Completion,
+        now: Timestamp,
+    ) -> Result<(ConnectSession, Installation), ConnectError> {
+        // One writer at a time: the session is read pending and completed
+        // with nothing in between, so it completes once.
+        let mut transaction = self
+            .database
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(failed("complete_session"))?;
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM connect_sessions WHERE organization_id = ? AND workspace_id = ? AND id = ?"
+        ))
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(session_id.uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(failed("complete_session"))?;
+        let session = session_from(&row.ok_or(ConnectError::NotFound)?)?;
+        if session.status_at(now) != ConnectSessionStatus::Pending {
+            return Err(ConnectError::NotPending);
+        }
+        let installation = match session.intent {
+            ConnectIntent::Create => {
+                let installation = NewInstallation {
+                    app: session.app,
+                    label: session.label.clone(),
+                    configuration_version: completion.configuration_version,
+                    account: completion.account.clone(),
+                    granted_scopes: completion.granted_scopes.clone(),
+                    expires_at: completion.expires_at,
+                    credential: completion.credential.clone(),
+                };
+                if completion.credential.version != 1 {
+                    return Err(ConnectError::InstallationChanged);
+                }
+                insert_connected(
+                    &mut transaction,
+                    organization_id,
+                    workspace_id,
+                    completion.installation_id,
+                    &installation,
+                )
+                .await
+                .map_err(installation_failed)?
+            }
+            ConnectIntent::Reconnect => {
+                if session.installation_id != Some(completion.installation_id) {
+                    return Err(ConnectError::InstallationChanged);
+                }
+                let renewal = Renewal {
+                    configuration_version: completion.configuration_version,
+                    account: &completion.account,
+                    granted_scopes: &completion.granted_scopes,
+                    expires_at: completion.expires_at,
+                    credential: &completion.credential,
+                };
+                reconnect(
+                    &mut transaction,
+                    organization_id,
+                    workspace_id,
+                    completion.installation_id,
+                    &renewal,
+                )
+                .await
+                .map_err(installation_failed)?
+                .ok_or(ConnectError::InstallationChanged)?
+            }
+        };
+        let row = sqlx::query(concat!(
+            "UPDATE connect_sessions SET status = 'completed', completed_at = ?, installation_id = ? \
+             WHERE organization_id = ? AND workspace_id = ? AND id = ? AND status = 'pending' RETURNING ",
+            columns!()
+        ))
+        .bind(now.millis())
+        .bind(installation.id.uuid())
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(session_id.uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(failed("complete_session"))?;
+        let session = session_from(&row.ok_or(ConnectError::NotPending)?)?;
+        transaction.commit().await.map_err(failed("complete_session"))?;
+        Ok((session, installation))
     }
 
     async fn cancel_session(

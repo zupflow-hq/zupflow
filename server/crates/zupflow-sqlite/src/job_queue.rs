@@ -407,13 +407,14 @@ mod tests {
             .execute(database.pool())
             .await
             .unwrap();
-        let job = queue.claim_next(&[kind()], MIN_LEASE).await.unwrap().unwrap();
+        // A long lease: a slow runner must not see the first claim lapse and its job come back.
+        let job = queue.claim_next(&[kind()], MAX_LEASE).await.unwrap().unwrap();
         assert_eq!(
             job.scope,
             Scope::Workspace(org, sibling),
             "only the sibling's job is left"
         );
-        assert!(queue.claim_next(&[kind()], MIN_LEASE).await.unwrap().is_none());
+        assert!(queue.claim_next(&[kind()], MAX_LEASE).await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -99,8 +99,9 @@ So far it serves `/health`, `/ready`, `/v1/me`, organizations, members,
 workspaces, API keys, catalog and workspace apps with their client
 configurations, the apps available to a workspace, installations (read,
 renamed, disconnected and deleted), and Connect's settings and sessions with
-the hosted page's read and cancel (submitting credentials and OAuth come
-next);
+the hosted page's read, cancel and a token app's credentials, checked against
+the app's inputs and verified at its `verify_url` through the safe outbound
+path (OAuth comes next);
 every other path answers the API's `404` envelope, and an unsupported method
 on a served path the `405` one.
 

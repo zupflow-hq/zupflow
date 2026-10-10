@@ -81,6 +81,13 @@ async fn main() -> ExitCode {
             }
         },
     };
+    let outbound = match zupflow_outbound::SafeHttpClient::new() {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::error!(event = "server.outbound_failed", %error);
+            return ExitCode::FAILURE;
+        }
+    };
     let state = AppState {
         identity,
         organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
@@ -91,6 +98,7 @@ async fn main() -> ExitCode {
         keys: Arc::new(zupflow_basic::local_keys::LocalKeyService::from_server_secret(
             &secret_key,
         )),
+        outbound: Arc::new(outbound),
         public_url: config.public_url.clone(),
         api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
         api_key_hasher: Arc::new(ApiKeyHasher::new(secret_key)),

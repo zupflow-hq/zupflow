@@ -26,6 +26,7 @@ use zupflow_core::ids::WorkspaceId;
 use zupflow_core::installations::InstallationStore;
 use zupflow_core::keys::KeyService;
 use zupflow_core::organizations::{Member, MemberRole, Organization, OrganizationStore, StoreError, User};
+use zupflow_core::outbound::OutboundHttp;
 use zupflow_core::workspaces::{Workspace, WorkspaceError, WorkspaceStore};
 
 use crate::http::Failure;
@@ -41,6 +42,8 @@ pub struct AppState {
     pub connect: Arc<dyn ConnectStore>,
     /// Seals the secrets Zupflow holds (decision 0033).
     pub keys: Arc<dyn KeyService>,
+    /// Every call to a provider goes through it (`SafeHttpClient` in a deployment).
+    pub outbound: Arc<dyn OutboundHttp>,
     /// The origin providers and browsers reach this server at, with no
     /// trailing slash: OAuth redirect URIs are built on it.
     pub public_url: String,

@@ -4,7 +4,7 @@
 #![allow(dead_code, clippy::unwrap_used)]
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -13,6 +13,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use zupflow_core::identity::{Identity, IdentityError, Profile, VerifiedIdentity};
+use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse};
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{Database, SqliteApiKeyStore, SqliteOrganizationStore, SqliteWorkspaceStore};
 
@@ -37,9 +38,52 @@ impl Identity for TestIdentity {
     }
 }
 
+/// What a provider was sent: the URL, and the credential's header and value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sent {
+    pub url: String,
+    pub credential: Option<(String, String)>,
+}
+
+/// Stands in for every provider: records what it's sent and answers what
+/// the test chose, `200` until told otherwise.
+pub struct Providers {
+    pub sent: Mutex<Vec<Sent>>,
+    pub answer: Mutex<Result<u16, OutboundError>>,
+}
+
+impl Providers {
+    pub fn answer(&self, answer: Result<u16, OutboundError>) {
+        *self.answer.lock().unwrap() = answer;
+    }
+
+    pub fn sent(&self) -> Vec<Sent> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl OutboundHttp for Providers {
+    async fn send(&self, request: OutboundRequest, _: Limits) -> Result<OutboundResponse, OutboundError> {
+        self.sent.lock().unwrap().push(Sent {
+            url: request.url,
+            credential: request
+                .credential
+                .map(|credential| (credential.header, credential.value.to_string())),
+        });
+        let status = (*self.answer.lock().unwrap())?;
+        Ok(OutboundResponse {
+            status,
+            headers: Vec::new(),
+            body: b"{\"error\":\"words from the provider\"}".to_vec(),
+        })
+    }
+}
+
 pub struct Server {
     pub app: axum::Router,
     pub directory: PathBuf,
+    pub providers: Arc<Providers>,
 }
 
 impl Drop for Server {
@@ -96,6 +140,10 @@ impl Server {
         let directory = std::env::temp_dir().join(format!("zupflow-ws-{}", uuid::Uuid::now_v7().simple()));
         std::fs::create_dir(&directory).unwrap();
         let database = Database::open(&directory.join("zupflow.sqlite")).await.unwrap();
+        let providers = Arc::new(Providers {
+            sent: Mutex::new(Vec::new()),
+            answer: Mutex::new(Ok(200)),
+        });
         let state = AppState {
             identity,
             organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
@@ -104,6 +152,7 @@ impl Server {
             installations: Arc::new(zupflow_sqlite::SqliteInstallationStore::new(database.clone())),
             connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
             keys: Arc::new(zupflow_basic::local_keys::LocalKeyService::from_server_secret(&[7; 32])),
+            outbound: providers.clone(),
             public_url: "http://localhost:8080".to_owned(),
             api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
             idempotency: Arc::new(zupflow_sqlite::SqliteIdempotencyStore::new(database)),
@@ -113,6 +162,7 @@ impl Server {
         Self {
             app: zupflow_server::app(state, RequestGuard::default()),
             directory,
+            providers,
         }
     }
 

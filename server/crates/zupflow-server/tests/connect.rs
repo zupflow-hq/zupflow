@@ -599,3 +599,470 @@ async fn keeps_sessions_to_their_own_environment_and_workspace() {
         )
     );
 }
+
+// --- Submitting a token app's credentials -----------------------------------
+
+const VERIFY: &str = "https://verify.example/me";
+
+/// Gives the catalog app `app` a template with two inputs, the first a
+/// patterned key sent in `X-Api-Key`, verified at [`VERIFY`].
+async fn two_inputs(server: &Server, org: &str, app: &str) {
+    let (status, body) = server
+        .send(
+            call("alice", Method::PATCH, format!("/v1/organizations/{org}/apps/{app}")).body(json!({ "auth": {
+                "type": "token",
+                "inputs": [
+                    { "key": "api_key", "label": "API key", "secret": true, "help": null, "placeholder": null, "pattern": "^tk_[a-z0-9]{8,}$" },
+                    { "key": "account", "label": "Account ID", "secret": false, "help": null, "placeholder": null, "pattern": null },
+                ],
+                "placement": { "location": "header", "name": "X-Api-Key", "prefix": "" },
+                "verify_url": VERIFY, "instructions": "", "docs_url": null,
+            }})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+fn submit(reference: &str, values: Value) -> common::Call<'static> {
+    call(
+        "nobody",
+        Method::POST,
+        format!("/v1/connect/sessions/{reference}/credentials"),
+    )
+    .body(json!({ "values": values }))
+}
+
+async fn database(server: &Server) -> sqlx::SqlitePool {
+    sqlx::SqlitePool::connect(&format!("sqlite:{}", server.directory.join("zupflow.sqlite").display()))
+        .await
+        .unwrap()
+}
+
+/// The installation's stored credential: its version and what it opens to
+/// under its own context.
+async fn credential(server: &Server, org: &str, ws: &str, app: &str, installation: &str) -> (i64, Value) {
+    use zupflow_core::environment::Environment;
+    use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
+    use zupflow_core::keys::{self, EncryptionContext, Sealed, WrappedKey};
+    let pool = database(server).await;
+    let installation_id = InstallationId::parse(installation).unwrap();
+    let (version, key_id, wrapped, nonce, ciphertext): (i64, String, Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT version, key_id, wrapped_key, nonce, ciphertext FROM installation_credentials WHERE installation_id = ?",
+    )
+    .bind(installation_id.uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    let sealed = Sealed {
+        wrapped_key: WrappedKey { key_id, bytes: wrapped },
+        nonce: nonce.try_into().unwrap(),
+        ciphertext,
+    };
+    let context = EncryptionContext::installation_credential(
+        OrganizationId::parse(org).unwrap(),
+        WorkspaceId::parse(ws).unwrap(),
+        Environment::Sandbox,
+        AppId::parse(app).unwrap(),
+        installation_id,
+        u32::try_from(version).unwrap(),
+    );
+    let keys = zupflow_basic::local_keys::LocalKeyService::from_server_secret(&[7; 32]);
+    let opened = keys::open(&keys, &context, &sealed).await.unwrap();
+    (version, serde_json::from_slice(opened.expose()).unwrap())
+}
+
+#[tokio::test]
+async fn completes_a_token_session_once_with_a_verified_credential() {
+    let server = Server::new().await;
+    let t = tenant(&server, "alice", "northwind").await;
+    two_inputs(&server, &t.org, &t.ready).await;
+    let (_, created) = server
+        .send(start("alice", &t.org, &t.sandbox, session(&t.ready, Value::Null)))
+        .await;
+    let reference = reference_of(&created["data"]);
+
+    // Checked against the app's inputs before the provider hears of it.
+    for (values, fields) in [
+        (json!({}), json!({ "api_key": "Required.", "account": "Required." })),
+        (
+            json!({ "api_key": "  ", "account": 42 }),
+            json!({ "api_key": "Required.", "account": "Must be a string." }),
+        ),
+        (
+            json!({ "api_key": "sk_live_abcdefgh", "account": "acme" }),
+            json!({ "api_key": "This doesn't look like a api key." }),
+        ),
+        (
+            json!({ "api_key": "tk_abcdefgh", "account": "a".repeat(4097) }),
+            json!({ "account": "Use 4,096 characters or fewer." }),
+        ),
+    ] {
+        let (status, body) = server.send(submit(&reference, values.clone())).await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::BAD_REQUEST, "validation_failed"),
+            "{values}"
+        );
+        assert_eq!(
+            (&body["error"]["message"], &body["error"]["fields"]),
+            (&json!("Check the highlighted fields."), &fields),
+            "{values}"
+        );
+    }
+    assert!(server.providers.sent().is_empty());
+
+    // The provider's answer decides, and its words never come back.
+    let good = json!({ "api_key": " tk_abcd1234wxyz ", "account": "acme", "extra": "dropped" });
+    for (answer, status, expected) in [
+        (Ok(401), StatusCode::UNPROCESSABLE_ENTITY, "credential_rejected"),
+        (Ok(403), StatusCode::UNPROCESSABLE_ENTITY, "credential_rejected"),
+        (Ok(404), StatusCode::BAD_GATEWAY, "provider_unavailable"),
+        (Ok(500), StatusCode::BAD_GATEWAY, "provider_unavailable"),
+        (
+            Err(zupflow_core::outbound::OutboundError::Redirected),
+            StatusCode::BAD_GATEWAY,
+            "provider_unavailable",
+        ),
+        (
+            Err(zupflow_core::outbound::OutboundError::Refused(
+                zupflow_core::outbound::Refusal::NotPublic,
+            )),
+            StatusCode::BAD_GATEWAY,
+            "provider_unavailable",
+        ),
+        (
+            Err(zupflow_core::outbound::OutboundError::TimedOut),
+            StatusCode::BAD_GATEWAY,
+            "provider_unavailable",
+        ),
+    ] {
+        server.providers.answer(answer);
+        let (got, body) = server.send(submit(&reference, good.clone())).await;
+        assert_eq!((got, code(&body)), (status, expected), "{answer:?}");
+        assert!(!body.to_string().contains("words from the provider"));
+        assert!(!body.to_string().contains("tk_abcd1234wxyz"));
+    }
+    let (_, rejected) = {
+        server.providers.answer(Ok(401));
+        server.send(submit(&reference, good.clone())).await
+    };
+    assert_eq!(
+        (&rejected["error"]["message"], &rejected["error"]["fields"]),
+        (
+            &json!("tools rejected that credential. Check it and try again."),
+            &json!({ "api_key": "Rejected by the provider." })
+        )
+    );
+    let (_, hosted) = server
+        .send(call("nobody", Method::GET, format!("/v1/connect/sessions/{reference}")))
+        .await;
+    assert_eq!(hosted["data"]["status"], "pending", "a refusal leaves the session open");
+    let pool = database(&server).await;
+    let (installations,): (i64,) = sqlx::query_as("SELECT count(*) FROM installations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert_eq!(installations, 0);
+
+    // Accepted: one installation, its credential sealed whole, the session done.
+    server.providers.answer(Ok(204));
+    let (status, done) = server.send(submit(&reference, good.clone()).idempotent("k-1")).await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert_eq!(
+        server.providers.sent().last().unwrap(),
+        &common::Sent {
+            url: VERIFY.to_owned(),
+            credential: Some(("X-Api-Key".to_owned(), "tk_abcd1234wxyz".to_owned())),
+        },
+        "the first input, trimmed, as the placement says"
+    );
+    let (session, installation) = (&done["data"]["session"], &done["data"]["installation"]);
+    assert_eq!(
+        (
+            &session["status"],
+            &session["installation_id"],
+            &session["auth"],
+            &session["expected_account"]
+        ),
+        (&json!("completed"), &installation["id"], &Value::Null, &Value::Null)
+    );
+    assert!(session["completed_at"].is_string());
+    assert_eq!(
+        (
+            &installation["workspace_id"],
+            &installation["app"]["id"],
+            &installation["label"],
+            &installation["status"],
+            &installation["connection"]["credential_version"],
+            &installation["connection"]["account"]["display_name"],
+        ),
+        (
+            &json!(t.sandbox),
+            &json!(t.ready),
+            &json!("Main"),
+            &json!("connected"),
+            &json!(1),
+            &json!("tools account ••wxyz"),
+        )
+    );
+    assert!(!done.to_string().contains("tk_abcd1234wxyz"), "never shown");
+    let installation_id = installation["id"].as_str().unwrap();
+    assert_eq!(
+        credential(&server, &t.org, &t.sandbox, &t.ready, installation_id).await,
+        (1, json!({ "api_key": "tk_abcd1234wxyz", "account": "acme" })),
+        "every declared input, nothing else"
+    );
+
+    // Once: a retry with its key replays, anything else is refused.
+    let sent = server.providers.sent().len();
+    assert_eq!(
+        server.send(submit(&reference, good.clone()).idempotent("k-1")).await,
+        (status, done.clone())
+    );
+    let (status, again) = server.send(submit(&reference, good.clone()).idempotent("k-2")).await;
+    assert_eq!((status, code(&again)), (StatusCode::CONFLICT, "session_not_pending"));
+    assert_eq!(server.providers.sent().len(), sent, "nothing more is verified");
+
+    // The Console sees the session completed, naming its installation.
+    let (_, seen) = server
+        .send(
+            call(
+                "alice",
+                Method::GET,
+                format!("/v1/workspaces/{}/connect-sessions/{}", t.sandbox, id(&created["data"])),
+            )
+            .naming(&t.org),
+        )
+        .await;
+    assert_eq!(
+        (&seen["data"]["status"], &seen["data"]["installation_id"]),
+        (&json!("completed"), &json!(installation_id))
+    );
+    let (_, listed) = server
+        .send(
+            call(
+                "alice",
+                Method::GET,
+                format!("/v1/workspaces/{}/installations", t.sandbox),
+            )
+            .naming(&t.org),
+        )
+        .await;
+    assert_eq!(listed["data"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn reconnects_the_same_installation_under_the_next_version() {
+    let server = Server::new().await;
+    let t = tenant(&server, "alice", "northwind").await;
+    let (_, created) = server
+        .send(start("alice", &t.org, &t.sandbox, session(&t.ready, Value::Null)))
+        .await;
+    // No verify URL: the values are checked, and nothing is called.
+    let (status, done) = server
+        .send(submit(
+            &reference_of(&created["data"]),
+            json!({ "token": "first-token" }),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert!(server.providers.sent().is_empty());
+    let installation = done["data"]["installation"].clone();
+    let installation_id = id(&installation).to_owned();
+    let (status, _) = server
+        .send(
+            call(
+                "alice",
+                Method::POST,
+                format!(
+                    "/v1/workspaces/{}/installations/{installation_id}/disconnect",
+                    t.sandbox
+                ),
+            )
+            .naming(&t.org),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let reconnect = json!({ "app_id": t.ready, "intent": "reconnect", "label": "ignored", "installation_id": installation_id, "return_url": null });
+    let (_, renewal) = server.send(start("alice", &t.org, &t.sandbox, reconnect.clone())).await;
+    let (_, racing) = server.send(start("alice", &t.org, &t.sandbox, reconnect)).await;
+    let (status, renewed) = server
+        .send(submit(
+            &reference_of(&renewal["data"]),
+            json!({ "token": "second-token" }),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{renewed}");
+    let (session, after) = (&renewed["data"]["session"], &renewed["data"]["installation"]);
+    assert_eq!(
+        (
+            &session["installation_id"],
+            &after["id"],
+            &after["status"],
+            &after["connection"]["credential_version"],
+            &after["connection"]["account"],
+            &after["label"],
+        ),
+        (
+            &json!(installation_id),
+            &json!(installation_id),
+            &json!("connected"),
+            &json!(2),
+            &installation["connection"]["account"],
+            &json!("Main"),
+        ),
+        "the same installation and account, under the next version"
+    );
+    assert_eq!(
+        credential(&server, &t.org, &t.sandbox, &t.ready, &installation_id).await,
+        (2, json!({ "token": "second-token" }))
+    );
+
+    // Another reconnect started before it renews the same installation again.
+    let (status, third) = server
+        .send(submit(
+            &reference_of(&racing["data"]),
+            json!({ "token": "third-token" }),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{third}");
+    assert_eq!(third["data"]["installation"]["connection"]["credential_version"], 3);
+}
+
+#[tokio::test]
+async fn refuses_a_session_that_is_no_longer_pending_or_eligible() {
+    let server = Server::new().await;
+    let t = tenant(&server, "alice", "northwind").await;
+    let begin = || async {
+        let (status, created) = server
+            .send(start("alice", &t.org, &t.sandbox, session(&t.ready, Value::Null)))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        reference_of(&created["data"])
+    };
+    let values = json!({ "token": "a-token" });
+
+    let cancelled = begin().await;
+    server
+        .send(call(
+            "nobody",
+            Method::POST,
+            format!("/v1/connect/sessions/{cancelled}/cancel"),
+        ))
+        .await;
+    let (status, body) = server.send(submit(&cancelled, values.clone())).await;
+    assert_eq!(
+        (status, &body["error"]["message"]),
+        (
+            StatusCode::CONFLICT,
+            &json!("This Connect session was already used. Start again from the app.")
+        )
+    );
+
+    let expired = begin().await;
+    let pool = database(&server).await;
+    sqlx::query("UPDATE connect_sessions SET expires_at = 0 WHERE status = 'pending'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let (status, body) = server.send(submit(&expired, values.clone())).await;
+    assert_eq!(
+        (status, &body["error"]["message"]),
+        (
+            StatusCode::CONFLICT,
+            &json!("This Connect link has expired. Start again from the app.")
+        )
+    );
+
+    // The app's configuration stopped being ready after the session started.
+    let unready = begin().await;
+    let (status, cleared) = server
+        .send(
+            call(
+                "alice",
+                Method::PUT,
+                format!(
+                    "/v1/organizations/{}/apps/{}/environments/sandbox/configuration",
+                    t.org, t.ready
+                ),
+            )
+            .body(json!({ "mcp_server_url": null })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
+    let (status, body) = server.send(submit(&unready, values.clone())).await;
+    assert_eq!(
+        (status, code(&body), &body["error"]["message"]),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "configuration_not_ready",
+            &json!("tools isn't configured for sandbox anymore.")
+        )
+    );
+
+    // An OAuth app's session takes no token.
+    let (_, oauth) = server
+        .send(
+            call("alice", Method::POST, format!("/v1/organizations/{}/apps", t.org)).body(json!({
+                "kind": "mcp", "name": "Docs", "slug": "docs", "description": "", "auth_type": "oauth2",
+            })),
+        )
+        .await;
+    let oauth = id(&oauth["data"]).to_owned();
+    let (status, ready) = server
+        .send(
+            call(
+                "alice",
+                Method::PUT,
+                format!(
+                    "/v1/organizations/{}/apps/{oauth}/environments/sandbox/configuration",
+                    t.org
+                ),
+            )
+            .body(json!({
+                "mcp_server_url": "https://docs.example/mcp",
+                "oauth_client_id": "client-1",
+                "oauth_client_secret": "a-client-secret-1234",
+            })),
+        )
+        .await;
+    assert_eq!(
+        (status, &ready["data"]["status"]),
+        (StatusCode::OK, &json!("ready")),
+        "{ready}"
+    );
+    let (_, created) = server
+        .send(start("alice", &t.org, &t.sandbox, session(&oauth, Value::Null)))
+        .await;
+    let (status, body) = server
+        .send(submit(&reference_of(&created["data"]), values.clone()))
+        .await;
+    assert_eq!(
+        (status, code(&body), &body["error"]["message"]),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "wrong_auth_type",
+            &json!("Docs connects with OAuth.")
+        )
+    );
+
+    // Nothing was made, and an unknown reference is the same 404 as ever.
+    let (status, _) = server.send(submit("nope", values)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, listed) = server
+        .send(
+            call(
+                "alice",
+                Method::GET,
+                format!("/v1/workspaces/{}/installations", t.sandbox),
+            )
+            .naming(&t.org),
+        )
+        .await;
+    assert_eq!(listed["data"], json!([]));
+    assert!(server.providers.sent().is_empty());
+}

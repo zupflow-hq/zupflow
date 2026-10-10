@@ -70,7 +70,7 @@ pub(crate) struct InstallationAppView {
 
 /// The contract's `Installation`.
 #[derive(Serialize)]
-struct InstallationView {
+pub(crate) struct InstallationView {
     id: InstallationId,
     workspace_id: WorkspaceId,
     app: InstallationAppView,
@@ -140,19 +140,24 @@ impl Apps {
             tracing::error!(event = "installations.app_missing", installation_id = %installation.id);
             Failure(ApiError::internal())
         })?;
-        Ok(InstallationView {
-            id: installation.id,
-            workspace_id: installation.workspace_id,
-            app: installation_app_view(app, installation.app),
-            label: installation.label,
-            status: installation.status,
-            configuration_version: installation.configuration_version,
-            connection: installation.connection,
-            // Grants arrive with agents.
-            grant_count: 0,
-            created_at: installation.created_at,
-            updated_at: installation.updated_at,
-        })
+        Ok(installation_view(app, installation))
+    }
+}
+
+/// An installation of `app` as the contract shows it.
+pub(crate) fn installation_view(app: &App, installation: Installation) -> InstallationView {
+    InstallationView {
+        id: installation.id,
+        workspace_id: installation.workspace_id,
+        app: installation_app_view(app, installation.app),
+        label: installation.label,
+        status: installation.status,
+        configuration_version: installation.configuration_version,
+        connection: installation.connection,
+        // Grants arrive with agents.
+        grant_count: 0,
+        created_at: installation.created_at,
+        updated_at: installation.updated_at,
     }
 }
 

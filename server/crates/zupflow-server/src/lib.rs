@@ -29,7 +29,7 @@ pub use guard::RequestGuard;
 /// The contract's operations this server serves so far, by `operationId`. The
 /// shared contract suite skips, by name, any case that needs another one; a
 /// test holds this list equal to the routes the router actually answers.
-pub const SERVED_OPERATIONS: [&str; 42] = [
+pub const SERVED_OPERATIONS: [&str; 43] = [
     "getViewer",
     "createOrganization",
     "getOrganization",
@@ -72,6 +72,7 @@ pub const SERVED_OPERATIONS: [&str; 42] = [
     "getConnectSession",
     "getHostedConnect",
     "cancelConnect",
+    "submitConnectCredentials",
 ];
 
 /// The whole HTTP surface. Every response under `/v1` is the envelope; the

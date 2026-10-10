@@ -1,13 +1,16 @@
 //! Connect (decision 0005):
 //! - an organization's allowlists, at `/v1/organizations/{org}/connect-settings/{env}`;
 //! - a workspace's sessions, at `/v1/workspaces/{ws}/connect-sessions`;
-//! - the hosted page's view of one session, at `/v1/connect/sessions/{reference}`.
+//! - the hosted page's view of one session, at `/v1/connect/sessions/{reference}`,
+//!   where it cancels, or submits a token app's credentials.
 //!
 //! The hosted routes carry no credential: the link's reference is the
 //! authority. A request's reference is hashed and the session found by that
 //! hash alone, the store's one cross-tenant lookup; everything after it uses
 //! the session's own organization and workspace. A bad, unknown or reused
 //! reference answers the same `404` or `409`, never anything of a session.
+
+use std::collections::BTreeMap;
 
 use axum::Router;
 use axum::extract::{Path, State};
@@ -16,23 +19,26 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use serde::Serialize;
 use serde_json::Value;
-use zupflow_core::apps::{App, AuthTemplate, ConfigurationStatus};
+use zeroize::Zeroizing;
+use zupflow_core::apps::{App, AuthTemplate, ConfigurationStatus, TokenInput, TokenPlacement};
 use zupflow_core::connect::{
-    ConnectError, ConnectIntent, ConnectSession, ConnectSessionStatus, ConnectSettings, NewConnectSession, Reference,
-    ReferenceHash,
+    Completion, ConnectError, ConnectIntent, ConnectSession, ConnectSessionStatus, ConnectSettings, NewConnectSession,
+    Reference, ReferenceHash,
 };
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{AppId, ConnectSessionId, InstallationId, WorkspaceId};
-use zupflow_core::installations::{ConnectedAccount, InstalledApp};
+use zupflow_core::installations::{ConnectedAccount, InstalledApp, NewCredential};
+use zupflow_core::keys::{self, EncryptionContext};
 use zupflow_core::organizations::MemberRole;
+use zupflow_core::outbound::{Credential, Limits, Method, OutboundError, OutboundRequest, Refusal};
 use zupflow_core::time::Timestamp;
 
 use crate::apps::app_failure;
 use crate::auth::{Access, Actor, AppState, Caller, WorkspaceAccess};
 use crate::http::{Failure, envelope};
 use crate::input::{Body, Fields, Object};
-use crate::installations::{InstallationAppView, installation_app_view};
+use crate::installations::{InstallationAppView, InstallationView, installation_app_view, installation_view};
 use crate::workspaces::environment_mismatch;
 
 pub fn routes() -> Router<AppState> {
@@ -48,6 +54,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/workspaces/{ws}/connect-sessions/{session}", get(get_session))
         .route("/v1/connect/sessions/{reference}", get(get_hosted))
         .route("/v1/connect/sessions/{reference}/cancel", post(cancel_hosted))
+        .route("/v1/connect/sessions/{reference}/credentials", post(submit_credentials))
 }
 
 const LIST_MAX: usize = 20;
@@ -67,6 +74,12 @@ pub(crate) fn connect_failure(error: ConnectError) -> Failure {
     match error {
         ConnectError::NotFound => ApiError::not_found("Connect session").into(),
         ConnectError::NotPending => not_pending(ConnectSessionStatus::Completed),
+        ConnectError::InstallationChanged => ApiError::new(
+            409,
+            "installation_changed",
+            "This installation changed while you were connecting. Start again from the app.",
+        )
+        .into(),
         // The store has logged the cause.
         ConnectError::Unavailable => ApiError::new(
             503,
@@ -288,7 +301,7 @@ async fn app_of(state: &AppState, session: &ConnectSession) -> Result<App, Failu
 
 /// For a reconnect, the account it must use again, read in the session's scope.
 async fn expected_account(state: &AppState, session: &ConnectSession) -> Result<Option<ConnectedAccount>, Failure> {
-    let Some(installation_id) = session.installation_id else {
+    let (ConnectIntent::Reconnect, Some(installation_id)) = (session.intent, session.installation_id) else {
         return Ok(None);
     };
     let installation = state
@@ -653,5 +666,344 @@ async fn cancel_hosted(State(state): State<AppState>, Path(reference): Path<Stri
     Ok(envelope(
         StatusCode::OK,
         session_view(&state, cancelled, false, None).await?,
+    ))
+}
+
+// --- Submitting a token app's credentials -----------------------------------
+
+/// What a completed session answers: the contract's `ConnectResult`.
+#[derive(Serialize)]
+struct ConnectResultView {
+    session: SessionView,
+    installation: InstallationView,
+}
+
+/// The longest value one input takes.
+const VALUE_MAX: usize = 4096;
+
+/// Revalidates at completion what made the session's app eligible when it
+/// started: the app is still there, in the session's own scope, and its
+/// configuration for the session's environment is still ready. The
+/// configuration's version is the one the installation connects under.
+async fn still_eligible(state: &AppState, session: &ConnectSession) -> Result<(App, u32), Failure> {
+    let (organization_id, workspace_id) = (session.organization_id, session.workspace_id);
+    let (app, configuration) = match session.app {
+        InstalledApp::Catalog(id) => {
+            let app = state
+                .apps
+                .find_organization_app(organization_id, id)
+                .await
+                .map_err(app_failure)?;
+            let configuration = state
+                .apps
+                .find_organization_configuration(organization_id, id, session.environment)
+                .await
+                .map_err(app_failure)?;
+            (app, configuration)
+        }
+        InstalledApp::Workspace(id) => {
+            let app = state
+                .apps
+                .find_workspace_app(organization_id, workspace_id, id)
+                .await
+                .map_err(app_failure)?;
+            let configuration = state
+                .apps
+                .find_workspace_configuration(organization_id, workspace_id, id)
+                .await
+                .map_err(app_failure)?;
+            (app, configuration)
+        }
+    };
+    let Some(app) = app else {
+        return Err(ApiError::new(
+            422,
+            "app_not_eligible",
+            "This app is no longer available to this workspace.",
+        )
+        .into());
+    };
+    match configuration {
+        Some(configuration) if configuration.status(&app.auth) == ConfigurationStatus::Ready => {
+            let version = configuration.version;
+            Ok((app, version))
+        }
+        _ => Err(ApiError::new(
+            422,
+            "configuration_not_ready",
+            format!(
+                "{} isn't configured for {} anymore.",
+                app.name,
+                session.environment.as_str()
+            ),
+        )
+        .into()),
+    }
+}
+
+/// The submitted values, one per declared input, trimmed: each required,
+/// within [`VALUE_MAX`], and matching its input's pattern if it has one.
+/// Values for anything the app doesn't declare are dropped.
+fn credential_values(body: &Object, inputs: &[TokenInput]) -> Result<BTreeMap<String, Zeroizing<String>>, Failure> {
+    let submitted = match body.0.get("values") {
+        Some(Value::Object(values)) => values,
+        Some(_) => {
+            return Err(validation(
+                [("values".to_owned(), "Must be an object.".to_owned())].into(),
+            ));
+        }
+        None => return Err(validation([("values".to_owned(), "Required.".to_owned())].into())),
+    };
+    let mut fields = BTreeMap::new();
+    let mut values = BTreeMap::new();
+    for input in inputs {
+        let value = match submitted.get(&input.key) {
+            None | Some(Value::Null) => "",
+            Some(Value::String(value)) => value.trim(),
+            Some(_) => {
+                fields.insert(input.key.clone(), "Must be a string.".to_owned());
+                continue;
+            }
+        };
+        if value.is_empty() {
+            fields.insert(input.key.clone(), "Required.".to_owned());
+        } else if value.chars().count() > VALUE_MAX {
+            fields.insert(input.key.clone(), "Use 4,096 characters or fewer.".to_owned());
+        } else if !matches_pattern(input, value)? {
+            fields.insert(
+                input.key.clone(),
+                format!("This doesn't look like a {}.", input.label.to_lowercase()),
+            );
+        } else {
+            values.insert(input.key.clone(), Zeroizing::new(value.to_owned()));
+        }
+    }
+    if fields.is_empty() {
+        Ok(values)
+    } else {
+        Err(validation(fields))
+    }
+}
+
+fn validation(fields: BTreeMap<String, String>) -> Failure {
+    let mut error = ApiError::validation(fields);
+    error.message = "Check the highlighted fields.".to_owned();
+    error.into()
+}
+
+/// Whether `value` matches the input's pattern, anywhere in it, as the
+/// browser's `RegExp.test` does. Patterns were checked when the app saved
+/// them (decision 0035), so one that won't build now is our failure.
+fn matches_pattern(input: &TokenInput, value: &str) -> Result<bool, Failure> {
+    let Some(pattern) = &input.pattern else {
+        return Ok(true);
+    };
+    let regex = regex::RegexBuilder::new(pattern)
+        .size_limit(1 << 16)
+        .build()
+        .map_err(|_| {
+            tracing::error!(event = "connect.pattern_unbuildable", input = %input.key);
+            Failure(ApiError::internal())
+        })?;
+    Ok(regex.is_match(value))
+}
+
+/// The provider couldn't be asked about the credential. The session stays
+/// pending, so the person can try again.
+fn provider_unavailable(app: &App) -> Failure {
+    ApiError::new(
+        502,
+        "provider_unavailable",
+        format!(
+            "{} couldn't be reached to check that credential. Try again shortly.",
+            app.name
+        ),
+    )
+    .into()
+}
+
+/// Asks the provider whether the credential works: `GET verify_url` through
+/// the safe outbound path, the first input's value sent as the app's token
+/// placement says. A `2xx` accepts it; `401` or `403` rejects it; anything
+/// else, or no answer, is the provider being unavailable. What the provider
+/// wrote is never read or passed on.
+async fn verify(
+    state: &AppState,
+    app: &App,
+    url: &str,
+    placement: &TokenPlacement,
+    input: &TokenInput,
+    token: &str,
+) -> Result<(), Failure> {
+    let request = OutboundRequest {
+        method: Method::Get,
+        url: url.to_owned(),
+        headers: vec![("Accept".to_owned(), "application/json".to_owned())],
+        body: None,
+        credential: Some(Credential {
+            header: placement.name.clone(),
+            value: Zeroizing::new(format!("{}{token}", placement.prefix)),
+        }),
+    };
+    match state.outbound.send(request, Limits::default()).await {
+        Ok(response) if (200..300).contains(&response.status) => Ok(()),
+        Ok(response) if response.status == 401 || response.status == 403 => {
+            let mut error = ApiError::new(
+                422,
+                "credential_rejected",
+                format!("{} rejected that credential. Check it and try again.", app.name),
+            );
+            error.fields = Some([(input.key.clone(), "Rejected by the provider.".to_owned())].into());
+            Err(error.into())
+        }
+        // A value no header can carry: a line break, say.
+        Err(OutboundError::Refused(Refusal::InvalidHeader)) => Err(validation(
+            [(
+                input.key.clone(),
+                format!("This doesn't look like a {}.", input.label.to_lowercase()),
+            )]
+            .into(),
+        )),
+        Ok(response) => {
+            tracing::warn!(event = "connect.verify_unexpected_status", app_id = %app.id, status = response.status);
+            Err(provider_unavailable(app))
+        }
+        Err(error) => {
+            tracing::warn!(event = "connect.verify_failed", app_id = %app.id, %error);
+            Err(provider_unavailable(app))
+        }
+    }
+}
+
+/// The last four characters of a value, as a secret's `last4` shows it.
+fn last4(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    chars[chars.len().saturating_sub(4)..].iter().collect()
+}
+
+/// Completes a pending session for a token app: its values checked against
+/// the app's inputs, verified with the provider, sealed as one credential
+/// for the installation it makes or renews, and written with the session's
+/// completion as one.
+async fn submit_credentials(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    body: Body,
+) -> Result<Response, Failure> {
+    let session = attributed(&state, &reference).await?;
+    let status = session.status_at(Timestamp::now());
+    if status != ConnectSessionStatus::Pending {
+        return Err(not_pending(status));
+    }
+    let (app, configuration_version) = still_eligible(&state, &session).await?;
+    let AuthTemplate::Token {
+        inputs,
+        placement,
+        verify_url,
+        ..
+    } = &app.auth
+    else {
+        return Err(ApiError::new(422, "wrong_auth_type", format!("{} connects with OAuth.", app.name)).into());
+    };
+    let body = body.object()?;
+    let values = credential_values(&body, inputs)?;
+    // The token is the first input's value; the rest travel with it in the credential.
+    let (Some(first), Some(token)) = (inputs.first(), inputs.first().and_then(|input| values.get(&input.key))) else {
+        tracing::error!(event = "connect.token_app_without_inputs", app_id = %app.id);
+        return Err(ApiError::internal().into());
+    };
+    if let Some(url) = verify_url {
+        verify(&state, &app, url, placement, first, token).await?;
+    }
+
+    // A reconnect renews its installation as the account it already holds;
+    // a token names no account of its own, so a new one is the installation.
+    let (installation_id, account, version) = match session.intent {
+        ConnectIntent::Create => {
+            let installation_id = InstallationId::generate();
+            let account = ConnectedAccount {
+                external_id: installation_id.to_string(),
+                display_name: format!("{} account ••{}", app.name, last4(token)),
+                email: None,
+            };
+            (installation_id, account, 1)
+        }
+        ConnectIntent::Reconnect => {
+            let Some(installation_id) = session.installation_id else {
+                tracing::error!(event = "connect.reconnect_without_installation", session_id = %session.id);
+                return Err(ApiError::internal().into());
+            };
+            let installation = state
+                .installations
+                .find_installation(session.organization_id, session.workspace_id, installation_id)
+                .await
+                .map_err(|_| connect_failure(ConnectError::Unavailable))?
+                .ok_or_else(|| connect_failure(ConnectError::InstallationChanged))?;
+            let (account, version) = match installation.connection {
+                Some(connection) => (connection.account, connection.credential_version + 1),
+                None => (
+                    ConnectedAccount {
+                        external_id: installation_id.to_string(),
+                        display_name: format!("{} account ••{}", app.name, last4(token)),
+                        email: None,
+                    },
+                    1,
+                ),
+            };
+            (installation_id, account, version)
+        }
+    };
+    let context = EncryptionContext::installation_credential(
+        session.organization_id,
+        session.workspace_id,
+        session.environment,
+        app.id,
+        installation_id,
+        version,
+    );
+    let plaintext: BTreeMap<&str, &str> = values
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let plaintext = Zeroizing::new(serde_json::to_vec(&plaintext).map_err(|_| Failure(ApiError::internal()))?);
+    let sealed = keys::seal(state.keys.as_ref(), &context, &plaintext)
+        .await
+        .map_err(|error| {
+            tracing::error!(event = "connect.seal_failed", %error);
+            connect_failure(ConnectError::Unavailable)
+        })?;
+    let completion = Completion {
+        installation_id,
+        configuration_version,
+        account,
+        granted_scopes: session.requested_scopes.clone(),
+        expires_at: None,
+        credential: NewCredential { sealed, version },
+    };
+    let (completed, installation) = state
+        .connect
+        .complete_session(
+            session.organization_id,
+            session.workspace_id,
+            session.id,
+            &completion,
+            Timestamp::now(),
+        )
+        .await
+        .map_err(|error| match error {
+            // It may have expired while the provider was asked.
+            ConnectError::NotPending => not_pending(match session.status_at(Timestamp::now()) {
+                ConnectSessionStatus::Expired => ConnectSessionStatus::Expired,
+                _ => ConnectSessionStatus::Completed,
+            }),
+            error => connect_failure(error),
+        })?;
+    let installation = installation_view(&app, installation);
+    Ok(envelope(
+        StatusCode::OK,
+        ConnectResultView {
+            session: session_view(&state, completed, false, None).await?,
+            installation,
+        },
     ))
 }

@@ -709,6 +709,19 @@ export function contractSuite(target: Target) {
         expect(replay.code).toBe("session_not_pending");
       });
 
+      it("checks submitted values against the app's inputs", async () => {
+        const session = await start();
+        for (const [values, fields] of [
+          [{}, { token: "Required." }],
+          [{ token: "   " }, { token: "Required." }],
+          [{ token: "x".repeat(4097) }, { token: "Use 4,096 characters or fewer." }],
+        ] as const) {
+          const error = await failure(owner.connect.submitCredentials(referenceOf(session), { values }));
+          expect([error.status, error.code, error.fields]).toEqual([400, "validation_failed", fields]);
+        }
+        expect((await owner.connect.get(referenceOf(session))).status).toBe("pending");
+      });
+
       it("keeps the session open when the provider rejects a credential", async () => {
         const session = await start();
         const error = await failure(

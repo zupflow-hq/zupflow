@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::environment::Environment;
 use crate::ids::{ConnectSessionId, InstallationId, OrganizationId, WorkspaceId};
-use crate::installations::InstalledApp;
+use crate::installations::{ConnectedAccount, Installation, InstalledApp, NewCredential};
 use crate::time::Timestamp;
 
 /// How long a session's link works.
@@ -100,7 +100,8 @@ pub struct ConnectSession {
     /// The app configuration's version when the session started.
     pub configuration_version: u32,
     pub intent: ConnectIntent,
-    /// The installation a reconnect renews; `None` for a new one.
+    /// The installation a reconnect renews, or the one a completed create
+    /// made; `None` for a create until it completes.
     pub installation_id: Option<InstallationId>,
     pub label: String,
     /// As stored. A pending session past `expires_at` reads as expired:
@@ -138,6 +139,23 @@ pub struct NewConnectSession {
     pub return_url: Option<String>,
     pub requested_scopes: Vec<String>,
     pub reference_hash: ReferenceHash,
+}
+
+/// What completing a session writes: the installation it makes (a create)
+/// or renews (a reconnect), with the credential already sealed for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    /// For a create, the new installation's ID; for a reconnect, the
+    /// session's own installation. The credential is sealed for this ID.
+    pub installation_id: InstallationId,
+    /// The app configuration's version it connects under.
+    pub configuration_version: u32,
+    pub account: ConnectedAccount,
+    pub granted_scopes: Vec<String>,
+    pub expires_at: Option<Timestamp>,
+    /// Version 1 for a create; for a reconnect, the installation's stored
+    /// version plus one (1 if it never held one).
+    pub credential: NewCredential,
 }
 
 /// A link's random reference: 32 base62 characters, about 190 bits.
@@ -197,6 +215,11 @@ pub enum ConnectError {
     /// The session isn't pending any more (or has expired).
     #[error("the session isn't pending")]
     NotPending,
+    /// The installation a completion names isn't the one it can make or
+    /// renew: a reconnect's installation is gone, or another credential
+    /// version was stored since it was read.
+    #[error("the installation changed")]
+    InstallationChanged,
 }
 
 #[async_trait]
@@ -250,6 +273,22 @@ pub trait ConnectStore: Send + Sync {
         &self,
         reference_hash: &ReferenceHash,
     ) -> Result<Option<ConnectSession>, ConnectError>;
+
+    /// Completes a pending, unexpired session, as one: for a create, a new
+    /// connected installation of the session's app, with the session's label,
+    /// which the session then names; for a reconnect, the session's
+    /// installation connected again under the next credential version.
+    /// `NotPending` when the session isn't pending or has expired at `now`,
+    /// and `InstallationChanged` per [`ConnectError::InstallationChanged`];
+    /// either way nothing is written.
+    async fn complete_session(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        session_id: ConnectSessionId,
+        completion: &Completion,
+        now: Timestamp,
+    ) -> Result<(ConnectSession, Installation), ConnectError>;
 
     /// Cancels a pending, unexpired session. `NotPending` otherwise.
     async fn cancel_session(

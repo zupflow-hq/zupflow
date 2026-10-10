@@ -1393,6 +1393,7 @@ export function createHandlers(apiBase: string) {
         for (const field of app.auth.inputs) {
           const value = input.values[field.key]?.trim() ?? "";
           if (!value) fields[field.key] = "Required.";
+          else if ([...value].length > 4096) fields[field.key] = "Use 4,096 characters or fewer.";
           else if (field.pattern && !new RegExp(field.pattern).test(value)) {
             fields[field.key] = `This doesn't look like a ${field.label.toLowerCase()}.`;
           }

@@ -34,6 +34,7 @@ use zupflow_core::identity::{Identity, IdentityError, Profile, VerifiedIdentity}
 use zupflow_core::ids::{ApiKeyId, AppId, ConnectSessionId, InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::{InstallationStore, InstalledApp};
 use zupflow_core::organizations::{MemberRole, OrganizationStore, User};
+use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse, Refusal};
 use zupflow_core::time::Timestamp;
 use zupflow_core::workspaces::{NewWorkspace, WorkspaceStore};
 use zupflow_server::{AppState, RequestGuard};
@@ -81,6 +82,29 @@ impl Identity for PersonaIdentity {
     }
 }
 
+/// The providers the suite's apps verify credentials with, as the mock
+/// imitates them: nothing leaves the machine. A credential containing
+/// `invalid` is rejected with `401`; any other is accepted.
+struct FixtureProviders;
+
+#[async_trait]
+impl OutboundHttp for FixtureProviders {
+    async fn send(&self, request: OutboundRequest, _: Limits) -> Result<OutboundResponse, OutboundError> {
+        if !request.url.starts_with("https://") {
+            return Err(OutboundError::Refused(Refusal::NotHttps));
+        }
+        let rejected = request
+            .credential
+            .as_ref()
+            .is_some_and(|credential| credential.value.to_ascii_lowercase().contains("invalid"));
+        Ok(OutboundResponse {
+            status: if rejected { 401 } else { 200 },
+            headers: Vec::new(),
+            body: b"{}".to_vec(),
+        })
+    }
+}
+
 async fn open(path: &str) -> Result<Database, String> {
     Database::open(Path::new(path))
         .await
@@ -107,6 +131,7 @@ async fn serve(path: &str) -> Result<(), String> {
         installations: Arc::new(SqliteInstallationStore::new(database.clone())),
         connect: Arc::new(SqliteConnectStore::new(database.clone())),
         keys: Arc::new(LocalKeyService::from_server_secret(&secret)),
+        outbound: Arc::new(FixtureProviders),
         public_url: format!("http://localhost:{port}"),
         api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
         api_key_hasher: Arc::new(ApiKeyHasher::new(secret)),
