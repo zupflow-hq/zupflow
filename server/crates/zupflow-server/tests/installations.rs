@@ -66,6 +66,7 @@ async fn connect(server: &Server, org: &str, ws: &Value, app: InstalledApp, labe
         granted_scopes: vec!["read".to_owned()],
         expires_at: None,
         credential: NewCredential { sealed, version: 1 },
+        snapshot: common::token_snapshot(),
     };
     store(server)
         .await

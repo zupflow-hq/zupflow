@@ -10,7 +10,7 @@
 //! ```
 
 use zupflow_core::environment::Environment;
-use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WebhookEndpointId, WorkspaceId};
+use zupflow_core::ids::{AppId, ConnectSessionId, InstallationId, OrganizationId, WebhookEndpointId, WorkspaceId};
 use zupflow_core::keys::{self, DataKey, EncryptionContext, KeyError, KeyService};
 
 /// Runs every check. `other` must be an independent instance with different
@@ -49,6 +49,14 @@ async fn round_trips_every_kind_of_secret(keys: &dyn KeyService) {
             1,
         ),
         EncryptionContext::webhook_signing_secret(org, Environment::Production, WebhookEndpointId::generate(), 1),
+        EncryptionContext::connect_authorization(
+            org,
+            WorkspaceId::generate(),
+            Environment::Sandbox,
+            AppId::generate(),
+            ConnectSessionId::generate(),
+            1,
+        ),
     ];
     for context in contexts {
         let key = DataKey::generate().unwrap();
@@ -111,6 +119,10 @@ async fn refuses_every_other_context(keys: &dyn KeyService) {
         (
             "another kind of object",
             EncryptionContext::webhook_signing_secret(org, env, WebhookEndpointId::from_uuid(inst.uuid()), 2),
+        ),
+        (
+            "a Connect authorization with the same UUIDs",
+            EncryptionContext::connect_authorization(org, ws, env, app, ConnectSessionId::from_uuid(inst.uuid()), 2),
         ),
     ];
     for (what, context) in others {

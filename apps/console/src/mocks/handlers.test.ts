@@ -319,6 +319,22 @@ describe("Connect (simulated consent)", () => {
     );
     expect(error.code).toBe("account_mismatch");
   });
+
+  it("starts no consent for an app without the provider's endpoints", async () => {
+    const sandbox = ws("acme-sandbox");
+    const google = app("google-workspace");
+    if (google.auth.type !== "oauth2") throw new Error("an OAuth app");
+    google.auth.token_url = null;
+    const session = await owner.connectSessions.create(sandbox.id, {
+      app_id: google.id,
+      intent: "create",
+      label: "Main",
+      installation_id: null,
+      return_url: null,
+    });
+    const error = await failure(owner.connect.authorize(referenceOf(session)));
+    expect(error.code).toBe("configuration_not_ready");
+  });
 });
 
 describe("approvals", () => {

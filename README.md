@@ -101,7 +101,11 @@ configurations, the apps available to a workspace, installations (read,
 renamed, disconnected and deleted), and Connect's settings and sessions with
 the hosted page's read, cancel and a token app's credentials, checked against
 the app's inputs and verified at its `verify_url` through the safe outbound
-path (OAuth comes next);
+path. An OAuth app's consent starts from the hosted page with a single-use
+`state` and PKCE; the provider sends the browser to
+`/connect/oauth/callback`, which exchanges the code with the client's secret
+(HTTP Basic), identifies the account at the app's `identity_url`, seals the
+tokens for the installation and sends the browser back to the hosted page;
 every other path answers the API's `404` envelope, and an unsupported method
 on a served path the `405` one.
 
@@ -171,8 +175,9 @@ Two pieces exist only because there is no backend yet, and are labelled as such:
 - **Sign-in** is simulated in `src/features/auth/session.ts`, the seam where a
   real build will plug in an auth adapter: `local` (no sign-in; the server
   must listen on loopback only) or `oidc` (any OpenID Connect provider).
-- **OAuth consent** sends the browser to `/connect/:reference/simulated-consent`
-  instead of a real provider.
+- **OAuth consent** in the mock sends the browser to
+  `/connect/:reference/simulated-consent` instead of a real provider; the
+  backend sends it to the app's `authorize_url`.
 
 ## License
 

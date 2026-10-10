@@ -1,18 +1,20 @@
 //! [`SqliteConnectStore`]: Connect settings and sessions. Every statement
-//! repeats the organization, and the workspace for sessions, except the one
-//! the trait declares cross-tenant: [`ConnectStore::attribute_session_by_reference`].
+//! repeats the organization, and the workspace for sessions, except the two
+//! the trait declares cross-tenant: [`ConnectStore::attribute_session_by_reference`]
+//! and the spending of a `state` in [`ConnectStore::claim_authorization`].
 
 use async_trait::async_trait;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 use uuid::Uuid;
 use zupflow_core::connect::{
-    Completion, ConnectError, ConnectIntent, ConnectSession, ConnectSessionStatus, ConnectSettings, ConnectStore,
-    NewConnectSession, ReferenceHash, SESSION_TTL_MS,
+    Authorization, Completion, ConnectError, ConnectIntent, ConnectSession, ConnectSessionStatus, ConnectSettings,
+    ConnectStore, NewConnectSession, ReferenceHash, SESSION_TTL_MS,
 };
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, ConnectSessionId, InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::{Installation, InstallationError, InstalledApp, NewInstallation};
+use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::time::Timestamp;
 
 use crate::Database;
@@ -45,7 +47,7 @@ macro_rules! columns {
     () => {
         "id, organization_id, workspace_id, environment, catalog_app_id, workspace_app_id, configuration_version, \
          intent, installation_id, label, status, return_url, requested_scopes, created_at, expires_at, \
-         completed_at, failure_code"
+         completed_at, failure_code, authorization_attempt"
     };
 }
 
@@ -61,6 +63,7 @@ fn session_from(row: &SqliteRow) -> Result<ConnectSession, ConnectError> {
     let version: i64 = row.try_get("configuration_version").map_err(read)?;
     let installation: Option<Uuid> = row.try_get("installation_id").map_err(read)?;
     let completed_at: Option<i64> = row.try_get("completed_at").map_err(read)?;
+    let attempt: i64 = row.try_get("authorization_attempt").map_err(read)?;
     Ok(ConnectSession {
         id: ConnectSessionId::from_uuid(row.try_get("id").map_err(read)?),
         organization_id: OrganizationId::from_uuid(row.try_get("organization_id").map_err(read)?),
@@ -78,7 +81,27 @@ fn session_from(row: &SqliteRow) -> Result<ConnectSession, ConnectError> {
         expires_at: Timestamp::from_millis(row.try_get("expires_at").map_err(read)?),
         completed_at: completed_at.map(Timestamp::from_millis),
         failure_code: row.try_get("failure_code").map_err(read)?,
+        authorization_attempt: u32::try_from(attempt).map_err(read)?,
     })
+}
+
+/// Deletes a session's authorization in progress, if any, inside the
+/// caller's transaction: once a session leaves `pending`, nothing it sealed
+/// for the provider's consent is kept.
+async fn forget_authorization(
+    connection: &mut sqlx::SqliteConnection,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    session_id: ConnectSessionId,
+) -> Result<(), ConnectError> {
+    sqlx::query("DELETE FROM connect_authorizations WHERE organization_id = ? AND workspace_id = ? AND session_id = ?")
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(session_id.uuid())
+        .execute(connection)
+        .await
+        .map_err(failed("forget_authorization"))?;
+    Ok(())
 }
 
 /// An installation write that failed inside a completion: the store has logged it.
@@ -215,6 +238,7 @@ impl ConnectStore for SqliteConnectStore {
             expires_at,
             completed_at: None,
             failure_code: None,
+            authorization_attempt: 0,
         })
     }
 
@@ -314,6 +338,7 @@ impl ConnectStore for SqliteConnectStore {
                     granted_scopes: completion.granted_scopes.clone(),
                     expires_at: completion.expires_at,
                     credential: completion.credential.clone(),
+                    snapshot: completion.snapshot.clone(),
                 };
                 if completion.credential.version != 1 {
                     return Err(ConnectError::InstallationChanged);
@@ -338,6 +363,7 @@ impl ConnectStore for SqliteConnectStore {
                     granted_scopes: &completion.granted_scopes,
                     expires_at: completion.expires_at,
                     credential: &completion.credential,
+                    snapshot: &completion.snapshot,
                 };
                 reconnect(
                     &mut transaction,
@@ -365,8 +391,177 @@ impl ConnectStore for SqliteConnectStore {
         .await
         .map_err(failed("complete_session"))?;
         let session = session_from(&row.ok_or(ConnectError::NotPending)?)?;
+        forget_authorization(&mut transaction, organization_id, workspace_id, session_id).await?;
         transaction.commit().await.map_err(failed("complete_session"))?;
         Ok((session, installation))
+    }
+
+    async fn begin_authorization(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        session_id: ConnectSessionId,
+        authorization: &Authorization,
+        now: Timestamp,
+    ) -> Result<(), ConnectError> {
+        let mut transaction = self
+            .database
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(failed("begin_authorization"))?;
+        let advanced = sqlx::query(
+            "UPDATE connect_sessions SET authorization_attempt = ? \
+             WHERE organization_id = ? AND workspace_id = ? AND id = ? AND status = 'pending' AND expires_at > ? \
+             AND authorization_attempt = ?",
+        )
+        .bind(i64::from(authorization.attempt))
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(session_id.uuid())
+        .bind(now.millis())
+        .bind(i64::from(authorization.attempt) - 1)
+        .execute(&mut *transaction)
+        .await
+        .map_err(failed("begin_authorization"))?;
+        if advanced.rows_affected() == 0 {
+            let row = sqlx::query(concat!(
+                "SELECT ",
+                columns!(),
+                " FROM connect_sessions WHERE organization_id = ? AND workspace_id = ? AND id = ?"
+            ))
+            .bind(organization_id.uuid())
+            .bind(workspace_id.uuid())
+            .bind(session_id.uuid())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(failed("begin_authorization"))?;
+            let session = session_from(&row.ok_or(ConnectError::NotFound)?)?;
+            return Err(if session.status_at(now) == ConnectSessionStatus::Pending {
+                ConnectError::AuthorizationChanged
+            } else {
+                ConnectError::NotPending
+            });
+        }
+        forget_authorization(&mut transaction, organization_id, workspace_id, session_id).await?;
+        sqlx::query(
+            "INSERT INTO connect_authorizations (id, organization_id, workspace_id, session_id, attempt, state_hash, \
+             key_id, wrapped_key, nonce, ciphertext, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(session_id.uuid())
+        .bind(i64::from(authorization.attempt))
+        .bind(authorization.state_hash.0.as_slice())
+        .bind(&authorization.sealed.wrapped_key.key_id)
+        .bind(&authorization.sealed.wrapped_key.bytes)
+        .bind(authorization.sealed.nonce.as_slice())
+        .bind(&authorization.sealed.ciphertext)
+        .bind(now.millis())
+        .execute(&mut *transaction)
+        .await
+        .map_err(failed("begin_authorization"))?;
+        transaction.commit().await.map_err(failed("begin_authorization"))?;
+        Ok(())
+    }
+
+    async fn claim_authorization(
+        &self,
+        state_hash: &ReferenceHash,
+    ) -> Result<Option<(ConnectSession, Authorization)>, ConnectError> {
+        let mut transaction = self
+            .database
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(failed("claim_authorization"))?;
+        // Cross-tenant by design: the hash is unique across the deployment,
+        // and deleting the row spends the `state`.
+        let row = sqlx::query(
+            "DELETE FROM connect_authorizations WHERE state_hash = ? \
+             RETURNING organization_id, workspace_id, session_id, attempt, key_id, wrapped_key, nonce, ciphertext",
+        )
+        .bind(state_hash.0.as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(failed("claim_authorization"))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let organization_id = OrganizationId::from_uuid(row.try_get("organization_id").map_err(read)?);
+        let workspace_id = WorkspaceId::from_uuid(row.try_get("workspace_id").map_err(read)?);
+        let session_id = ConnectSessionId::from_uuid(row.try_get("session_id").map_err(read)?);
+        let attempt: i64 = row.try_get("attempt").map_err(read)?;
+        let nonce: Vec<u8> = row.try_get("nonce").map_err(read)?;
+        let authorization = Authorization {
+            state_hash: *state_hash,
+            attempt: u32::try_from(attempt).map_err(read)?,
+            sealed: Sealed {
+                wrapped_key: WrappedKey {
+                    key_id: row.try_get("key_id").map_err(read)?,
+                    bytes: row.try_get("wrapped_key").map_err(read)?,
+                },
+                nonce: nonce.try_into().map_err(|_| read("a nonce that isn't 12 bytes"))?,
+                ciphertext: row.try_get("ciphertext").map_err(read)?,
+            },
+        };
+        // Everything from here carries the scope the row named.
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM connect_sessions WHERE organization_id = ? AND workspace_id = ? AND id = ?"
+        ))
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(session_id.uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(failed("claim_authorization"))?;
+        let session = session_from(&row.ok_or_else(|| read("an authorization without its session"))?)?;
+        transaction.commit().await.map_err(failed("claim_authorization"))?;
+        Ok(Some((session, authorization)))
+    }
+
+    async fn fail_session(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        session_id: ConnectSessionId,
+        failure_code: &str,
+        now: Timestamp,
+    ) -> Result<ConnectSession, ConnectError> {
+        let mut transaction = self
+            .database
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(failed("fail_session"))?;
+        let row = sqlx::query(concat!(
+            "UPDATE connect_sessions SET status = 'failed', failure_code = ? \
+             WHERE organization_id = ? AND workspace_id = ? AND id = ? AND status = 'pending' AND expires_at > ? \
+             RETURNING ",
+            columns!()
+        ))
+        .bind(failure_code)
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(session_id.uuid())
+        .bind(now.millis())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(failed("fail_session"))?;
+        let Some(row) = row else {
+            drop(transaction);
+            return match self.find_session(organization_id, workspace_id, session_id).await? {
+                Some(_) => Err(ConnectError::NotPending),
+                None => Err(ConnectError::NotFound),
+            };
+        };
+        let session = session_from(&row)?;
+        forget_authorization(&mut transaction, organization_id, workspace_id, session_id).await?;
+        transaction.commit().await.map_err(failed("fail_session"))?;
+        Ok(session)
     }
 
     async fn cancel_session(
@@ -376,6 +571,12 @@ impl ConnectStore for SqliteConnectStore {
         session_id: ConnectSessionId,
         now: Timestamp,
     ) -> Result<ConnectSession, ConnectError> {
+        let mut transaction = self
+            .database
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(failed("cancel_session"))?;
         let row = sqlx::query(concat!(
             "UPDATE connect_sessions SET status = 'cancelled' \
              WHERE organization_id = ? AND workspace_id = ? AND id = ? AND status = 'pending' AND expires_at > ? \
@@ -386,16 +587,20 @@ impl ConnectStore for SqliteConnectStore {
         .bind(workspace_id.uuid())
         .bind(session_id.uuid())
         .bind(now.millis())
-        .fetch_optional(self.database.pool())
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(failed("cancel_session"))?;
-        match row {
-            Some(row) => session_from(&row),
-            None => match self.find_session(organization_id, workspace_id, session_id).await? {
+        let Some(row) = row else {
+            drop(transaction);
+            return match self.find_session(organization_id, workspace_id, session_id).await? {
                 Some(_) => Err(ConnectError::NotPending),
                 None => Err(ConnectError::NotFound),
-            },
-        }
+            };
+        };
+        let session = session_from(&row)?;
+        forget_authorization(&mut transaction, organization_id, workspace_id, session_id).await?;
+        transaction.commit().await.map_err(failed("cancel_session"))?;
+        Ok(session)
     }
 }
 

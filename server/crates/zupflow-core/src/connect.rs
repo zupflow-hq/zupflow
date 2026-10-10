@@ -15,7 +15,8 @@ use sha2::{Digest, Sha256};
 
 use crate::environment::Environment;
 use crate::ids::{ConnectSessionId, InstallationId, OrganizationId, WorkspaceId};
-use crate::installations::{ConnectedAccount, Installation, InstalledApp, NewCredential};
+use crate::installations::{ConnectedAccount, Installation, InstalledApp, NewCredential, TemplateSnapshot};
+use crate::keys::Sealed;
 use crate::time::Timestamp;
 
 /// How long a session's link works.
@@ -113,6 +114,9 @@ pub struct ConnectSession {
     pub expires_at: Timestamp,
     pub completed_at: Option<Timestamp>,
     pub failure_code: Option<String>,
+    /// How many times an OAuth authorization was started; 0 until the first.
+    /// Only the latest attempt's `state` completes the session.
+    pub authorization_attempt: u32,
 }
 
 impl ConnectSession {
@@ -156,6 +160,19 @@ pub struct Completion {
     /// Version 1 for a create; for a reconnect, the installation's stored
     /// version plus one (1 if it never held one).
     pub credential: NewCredential,
+    /// The app's template and version it connects under (decision 0036).
+    pub snapshot: TemplateSnapshot,
+}
+
+/// An OAuth authorization in progress (decision 0037): the hash of the
+/// `state` sent to the provider, which finds the session again when the
+/// provider sends the user back, and what the callback needs then, sealed
+/// under the `connect_authorization` context of `attempt`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authorization {
+    pub state_hash: ReferenceHash,
+    pub attempt: u32,
+    pub sealed: Sealed,
 }
 
 /// A link's random reference: 32 base62 characters, about 190 bits.
@@ -194,6 +211,10 @@ impl std::fmt::Debug for Reference {
     }
 }
 
+/// An OAuth `state`: as random and as long as a reference, and stored, like
+/// one, only as its hash. It names one authorization attempt of one session.
+pub type OAuthState = Reference;
+
 /// What's stored of a reference: its SHA-256. A reference is random and long,
 /// so an unsalted hash is enough to keep the database from holding links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +241,9 @@ pub enum ConnectError {
     /// version was stored since it was read.
     #[error("the installation changed")]
     InstallationChanged,
+    /// Another authorization was started for the session since it was read.
+    #[error("another authorization started")]
+    AuthorizationChanged,
 }
 
 #[async_trait]
@@ -289,6 +313,42 @@ pub trait ConnectStore: Send + Sync {
         completion: &Completion,
         now: Timestamp,
     ) -> Result<(ConnectSession, Installation), ConnectError>;
+
+    /// Starts an OAuth authorization for a pending, unexpired session,
+    /// replacing any earlier one: only the latest `state` will complete it.
+    /// `authorization.attempt` must be the session's stored attempt plus one;
+    /// `AuthorizationChanged` if another was started since, `NotPending` if
+    /// the session isn't pending at `now`. Nothing is written either way.
+    async fn begin_authorization(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        session_id: ConnectSessionId,
+        authorization: &Authorization,
+        now: Timestamp,
+    ) -> Result<(), ConnectError>;
+
+    /// **Cross-tenant, by design:** the provider sends the user back with
+    /// only the `state`, so this is how the session is learned. In one
+    /// statement it finds the session whose current authorization has this
+    /// `state` hash and spends it, so the same `state` never claims twice; it
+    /// returns the session, whatever its status, and the sealed authorization.
+    /// Every later statement carries the scope it returns.
+    async fn claim_authorization(
+        &self,
+        state_hash: &ReferenceHash,
+    ) -> Result<Option<(ConnectSession, Authorization)>, ConnectError>;
+
+    /// Fails a pending, unexpired session with `failure_code` (at most 60
+    /// characters). `NotPending` otherwise.
+    async fn fail_session(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        session_id: ConnectSessionId,
+        failure_code: &str,
+        now: Timestamp,
+    ) -> Result<ConnectSession, ConnectError>;
 
     /// Cancels a pending, unexpired session. `NotPending` otherwise.
     async fn cancel_session(

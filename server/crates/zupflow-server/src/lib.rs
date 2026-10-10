@@ -11,6 +11,7 @@ pub mod auth;
 pub mod auth_templates;
 pub mod config;
 pub mod connect;
+pub mod connect_oauth;
 pub mod guard;
 pub mod http;
 pub mod idempotency;
@@ -29,7 +30,7 @@ pub use guard::RequestGuard;
 /// The contract's operations this server serves so far, by `operationId`. The
 /// shared contract suite skips, by name, any case that needs another one; a
 /// test holds this list equal to the routes the router actually answers.
-pub const SERVED_OPERATIONS: [&str; 43] = [
+pub const SERVED_OPERATIONS: [&str; 44] = [
     "getViewer",
     "createOrganization",
     "getOrganization",
@@ -73,6 +74,7 @@ pub const SERVED_OPERATIONS: [&str; 43] = [
     "getHostedConnect",
     "cancelConnect",
     "submitConnectCredentials",
+    "authorizeConnect",
 ];
 
 /// The whole HTTP surface. Every response under `/v1` is the envelope; the

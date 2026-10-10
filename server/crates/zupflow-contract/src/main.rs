@@ -32,7 +32,7 @@ use zupflow_core::environment::Environment;
 use zupflow_core::idempotency::Fingerprinter;
 use zupflow_core::identity::{Identity, IdentityError, Profile, VerifiedIdentity};
 use zupflow_core::ids::{ApiKeyId, AppId, ConnectSessionId, InstallationId, OrganizationId, WorkspaceId};
-use zupflow_core::installations::{InstallationStore, InstalledApp};
+use zupflow_core::installations::{InstallationStore, InstalledApp, TemplateSnapshot};
 use zupflow_core::organizations::{MemberRole, OrganizationStore, User};
 use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse, Refusal};
 use zupflow_core::time::Timestamp;
@@ -343,9 +343,19 @@ async fn reset(path: &str) -> Result<(), String> {
             .find(|(owner, seeded, _)| *owner == organization && seeded == slug)
             .map(|(_, _, app)| *app)
             .ok_or_else(|| format!("app {slug}"))?;
+        let found = match app {
+            InstalledApp::Catalog(id) => apps.find_organization_app(organization, id).await,
+            InstalledApp::Workspace(id) => apps.find_workspace_app(organization, workspace, id).await,
+        }
+        .map_err(|error| fail(slug)(&error))?
+        .ok_or_else(|| format!("app {slug}"))?;
         let installation_id = InstallationId::generate();
         let installation = fixture_apps::installation(
             &sealing,
+            TemplateSnapshot {
+                auth: found.auth,
+                app_version: found.version,
+            },
             fixture_apps::Owner {
                 organization_id: organization,
                 workspace_id: workspace,

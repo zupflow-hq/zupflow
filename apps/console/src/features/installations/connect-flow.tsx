@@ -13,6 +13,15 @@ const FAILURE_COPY: Record<string, string> = {
   account_mismatch:
     "A different account was used. Reconnect with the original account, or add a new installation for the other one.",
   credential_rejected: "The provider rejected the credential.",
+  authorization_failed: "The provider ended the sign-in with an error. Start again.",
+  token_exchange_failed:
+    "The provider didn't accept the sign-in. Start again, or check the app's client ID and secret.",
+  provider_unavailable: "The provider couldn't be reached. Start again shortly.",
+  identity_unavailable: "The provider didn't say which account signed in. Start again shortly.",
+  app_not_eligible: "This app is no longer available to this workspace.",
+  configuration_not_ready: "This app's configuration changed while you were signing in. Start again.",
+  installation_changed: "This installation changed while you were connecting. Start again from the app.",
+  unavailable: "Something went wrong on our side. Start again shortly.",
 };
 
 /**

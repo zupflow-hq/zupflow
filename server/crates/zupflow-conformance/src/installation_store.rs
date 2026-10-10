@@ -11,11 +11,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use zupflow_core::apps::{AuthTemplate, OAuthScope};
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::{
     ConnectedAccount, Installation, InstallationError, InstallationStatus, InstallationStore, InstalledApp,
-    NewCredential, NewInstallation,
+    NewCredential, NewInstallation, TemplateSnapshot,
 };
 use zupflow_core::keys::{Sealed, WrappedKey};
 
@@ -58,6 +59,23 @@ fn credential(marker: u8) -> NewCredential {
     }
 }
 
+/// The template an installation connected under: kept and returned exactly.
+pub fn snapshot(app_version: u32) -> TemplateSnapshot {
+    TemplateSnapshot {
+        auth: AuthTemplate::OAuth2 {
+            authorize_url: Some("https://accounts.example/authorize".to_owned()),
+            token_url: Some("https://accounts.example/token".to_owned()),
+            available_scopes: vec![OAuthScope {
+                name: "read".to_owned(),
+                description: "Read".to_owned(),
+            }],
+            pkce: true,
+            identity_url: None,
+        },
+        app_version,
+    }
+}
+
 fn new(app: InstalledApp, label: &str, marker: u8) -> NewInstallation {
     NewInstallation {
         app,
@@ -71,6 +89,7 @@ fn new(app: InstalledApp, label: &str, marker: u8) -> NewInstallation {
         granted_scopes: vec!["read".to_owned()],
         expires_at: None,
         credential: credential(marker),
+        snapshot: snapshot(u32::from(marker)),
     }
 }
 
@@ -128,6 +147,7 @@ async fn creates_and_finds_within_its_workspace(store: &dyn InstallationStore, p
         ("acct-7", 1)
     );
     assert_eq!(connection.granted_scopes, ["read"]);
+    assert_eq!(created.snapshot, Some(snapshot(7)), "the template it connected under");
     assert_eq!(
         store
             .find_installation(a.organization_id, a.sandbox, created.id)

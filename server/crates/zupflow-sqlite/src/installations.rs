@@ -13,7 +13,7 @@ use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::{
     AccountConnection, AppInstallation, ConnectedAccount, Installation, InstallationError, InstallationStatus,
-    InstallationStore, InstalledApp, NewCredential, NewInstallation,
+    InstallationStore, InstalledApp, NewCredential, NewInstallation, TemplateSnapshot,
 };
 use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::time::Timestamp;
@@ -57,7 +57,8 @@ macro_rules! columns {
     () => {
         "i.id, i.organization_id, i.workspace_id, i.catalog_app_id, i.workspace_app_id, i.label, i.status, \
          i.configuration_version, i.account_external_id, i.account_display_name, i.account_email, \
-         i.granted_scopes, i.credential_version, i.connected_at, i.expires_at, i.created_at, i.updated_at"
+         i.granted_scopes, i.credential_version, i.connected_at, i.expires_at, i.created_at, i.updated_at, \
+         i.auth_template, i.app_version"
     };
 }
 
@@ -66,7 +67,8 @@ macro_rules! returning {
     () => {
         "id, organization_id, workspace_id, catalog_app_id, workspace_app_id, label, status, \
          configuration_version, account_external_id, account_display_name, account_email, \
-         granted_scopes, credential_version, connected_at, expires_at, created_at, updated_at"
+         granted_scopes, credential_version, connected_at, expires_at, created_at, updated_at, auth_template, \
+         app_version"
     };
 }
 
@@ -100,6 +102,16 @@ fn installation_from(row: &SqliteRow) -> Result<Installation, InstallationError>
             })
         }
     };
+    let auth_template: Option<String> = row.try_get("auth_template").map_err(read)?;
+    let app_version: Option<i64> = row.try_get("app_version").map_err(read)?;
+    let snapshot = match (auth_template, app_version) {
+        (Some(auth), Some(version)) => Some(TemplateSnapshot {
+            auth: serde_json::from_str(&auth).map_err(read)?,
+            app_version: u32::try_from(version).map_err(read)?,
+        }),
+        (None, None) => None,
+        _ => return Err(read("half a template snapshot")),
+    };
     Ok(Installation {
         id: InstallationId::from_uuid(row.try_get("id").map_err(read)?),
         organization_id: OrganizationId::from_uuid(row.try_get("organization_id").map_err(read)?),
@@ -109,6 +121,7 @@ fn installation_from(row: &SqliteRow) -> Result<Installation, InstallationError>
         status: InstallationStatus::parse(&status).ok_or_else(|| read("an unknown status"))?,
         configuration_version: u32::try_from(configuration_version).map_err(read)?,
         connection,
+        snapshot,
         created_at: Timestamp::from_millis(row.try_get("created_at").map_err(read)?),
         updated_at: Timestamp::from_millis(row.try_get("updated_at").map_err(read)?),
     })
@@ -128,12 +141,14 @@ pub(crate) async fn insert_connected(
         InstalledApp::Workspace(id) => (None, Some(id.uuid())),
     };
     let scopes = serde_json::to_string(&installation.granted_scopes).map_err(read)?;
+    let auth_template = serde_json::to_string(&installation.snapshot.auth).map_err(read)?;
     let now = Timestamp::now().millis();
     let row = sqlx::query(concat!(
         "INSERT INTO installations (id, organization_id, workspace_id, catalog_app_id, workspace_app_id, label, \
          status, configuration_version, account_external_id, account_display_name, account_email, \
-         granted_scopes, credential_version, connected_at, expires_at, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, 'connected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ",
+         granted_scopes, credential_version, connected_at, expires_at, created_at, updated_at, auth_template, \
+         app_version) \
+         VALUES (?, ?, ?, ?, ?, ?, 'connected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ",
         returning!()
     ))
     .bind(installation_id.uuid())
@@ -152,6 +167,8 @@ pub(crate) async fn insert_connected(
     .bind(installation.expires_at.map(Timestamp::millis))
     .bind(now)
     .bind(now)
+    .bind(auth_template)
+    .bind(i64::from(installation.snapshot.app_version))
     .fetch_one(&mut **transaction)
     .await
     .map_err(failed("insert_installation"))?;
@@ -207,12 +224,13 @@ pub(crate) async fn reconnect(
     renewal: &Renewal<'_>,
 ) -> Result<Option<Installation>, InstallationError> {
     let scopes = serde_json::to_string(renewal.granted_scopes).map_err(read)?;
+    let auth_template = serde_json::to_string(&renewal.snapshot.auth).map_err(read)?;
     let now = Timestamp::now().millis();
     let credential = renewal.credential;
     let row = sqlx::query(concat!(
         "UPDATE installations SET status = 'connected', configuration_version = ?, account_external_id = ?, \
          account_display_name = ?, account_email = ?, granted_scopes = ?, credential_version = ?, \
-         connected_at = ?, expires_at = ?, updated_at = ? \
+         connected_at = ?, expires_at = ?, updated_at = ?, auth_template = ?, app_version = ? \
          WHERE organization_id = ? AND workspace_id = ? AND id = ? AND coalesce(credential_version, 0) = ? RETURNING ",
         returning!()
     ))
@@ -225,6 +243,8 @@ pub(crate) async fn reconnect(
     .bind(now)
     .bind(renewal.expires_at.map(Timestamp::millis))
     .bind(now)
+    .bind(auth_template)
+    .bind(i64::from(renewal.snapshot.app_version))
     .bind(organization_id.uuid())
     .bind(workspace_id.uuid())
     .bind(installation_id.uuid())
@@ -263,6 +283,7 @@ pub(crate) struct Renewal<'a> {
     pub granted_scopes: &'a [String],
     pub expires_at: Option<Timestamp>,
     pub credential: &'a NewCredential,
+    pub snapshot: &'a TemplateSnapshot,
 }
 
 /// A position in the catalog-wide list: newest first, then by ID.
@@ -724,6 +745,7 @@ mod tests {
             granted_scopes: Vec::new(),
             expires_at: None,
             credential: credential.clone(),
+            snapshot: zupflow_conformance::installation_store::snapshot(1),
         };
         let org = tenant.organization_id;
         let gone = store
@@ -760,7 +782,21 @@ mod tests {
         assert_eq!(left, 1, "only the sibling's credential is left");
         assert_eq!(
             store.find_installation(org, tenant.production, kept.id).await.unwrap(),
-            Some(kept)
+            Some(kept.clone())
         );
+
+        // A snapshot is whole or absent: the database refuses half of one.
+        for half in [
+            "UPDATE installations SET app_version = NULL WHERE organization_id = ? AND workspace_id = ? AND id = ?",
+            "UPDATE installations SET auth_template = NULL WHERE organization_id = ? AND workspace_id = ? AND id = ?",
+        ] {
+            let refused = sqlx::query(half)
+                .bind(org.uuid())
+                .bind(tenant.production.uuid())
+                .bind(kept.id.uuid())
+                .execute(database.pool())
+                .await;
+            assert!(refused.is_err(), "{half}");
+        }
     }
 }

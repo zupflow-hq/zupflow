@@ -436,6 +436,7 @@ async fn installation(server: &Server, org: &str, ws: &str, app: &str, label: &s
             },
             version: 1,
         },
+        snapshot: common::token_snapshot(),
     };
     store
         .create_installation(
@@ -1065,4 +1066,422 @@ async fn refuses_a_session_that_is_no_longer_pending_or_eligible() {
         .await;
     assert_eq!(listed["data"], json!([]));
     assert!(server.providers.sent().is_empty());
+}
+
+// --- OAuth (decision 0037) ---------------------------------------------------
+
+const AUTHORIZE: &str = "https://accounts.example/authorize";
+const TOKEN: &str = "https://accounts.example/token";
+const IDENTITY: &str = "https://accounts.example/me";
+const CLIENT_SECRET: &str = "not-a-real-client-secret-9f3k-abcd";
+
+/// A ready OAuth catalog app: PKCE, an identity endpoint, `read` requested.
+async fn oauth_app(server: &Server, org: &str) -> String {
+    let (status, created) = server
+        .send(
+            call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(json!({
+                "kind": "mcp", "name": "Tracker", "slug": "tracker", "description": "", "auth_type": "oauth2",
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let app = id(&created["data"]).to_owned();
+    let (status, body) = server
+        .send(
+            call("alice", Method::PATCH, format!("/v1/organizations/{org}/apps/{app}")).body(json!({ "auth": {
+                "type": "oauth2", "authorize_url": AUTHORIZE, "token_url": TOKEN, "identity_url": IDENTITY,
+                "available_scopes": [{ "name": "read", "description": "" }], "pkce": true,
+            }})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = server
+        .send(
+            call(
+                "alice",
+                Method::PUT,
+                format!("/v1/organizations/{org}/apps/{app}/environments/sandbox/configuration"),
+            )
+            .body(json!({
+                "mcp_server_url": "https://tracker.example/mcp", "oauth_client_id": "client 1",
+                "oauth_client_secret": CLIENT_SECRET, "oauth_scopes": ["read"],
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    app
+}
+
+/// Starts the consent: the provider's URL and its query.
+async fn authorize(server: &Server, reference: &str) -> (url::Url, std::collections::BTreeMap<String, String>) {
+    let (status, body) = server
+        .send(call(
+            "nobody",
+            Method::POST,
+            format!("/v1/connect/sessions/{reference}/authorize"),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let url = url::Url::parse(body["data"]["authorization_url"].as_str().unwrap()).unwrap();
+    let query = url.query_pairs().into_owned().collect();
+    (url, query)
+}
+
+fn tokens(access_token: &str) -> Value {
+    json!({
+        "access_token": access_token, "refresh_token": "rt-1", "token_type": "Bearer",
+        "expires_in": 3600, "scope": "read",
+    })
+}
+
+async fn hosted(server: &Server, reference: &str) -> Value {
+    let (status, body) = server
+        .send(call("nobody", Method::GET, format!("/v1/connect/sessions/{reference}")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["data"].clone()
+}
+
+/// Consent, then the callback: the code exchanged with the PKCE verifier
+/// and the client's secret, the account identified, the tokens sealed for
+/// the installation, the browser sent back to the hosted page; a `state`
+/// works once, and only the newest attempt's.
+#[tokio::test]
+async fn connects_an_oauth_app_through_its_callback() {
+    use base64::Engine;
+    use sha2::Digest;
+    let server = Server::new().await;
+    let t = tenant(&server, "alice", "northwind").await;
+    let app = oauth_app(&server, &t.org).await;
+    let (_, created) = server
+        .send(start("alice", &t.org, &t.sandbox, session(&app, Value::Null)))
+        .await;
+    let reference = reference_of(&created["data"]);
+
+    // A token app has no consent to start.
+    let (_, token_session) = server
+        .send(start("alice", &t.org, &t.sandbox, session(&t.ready, Value::Null)))
+        .await;
+    let (status, body) = server
+        .send(call(
+            "nobody",
+            Method::POST,
+            format!(
+                "/v1/connect/sessions/{}/authorize",
+                reference_of(&token_session["data"])
+            ),
+        ))
+        .await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::UNPROCESSABLE_ENTITY, "wrong_auth_type")
+    );
+
+    let (url, first) = authorize(&server, &reference).await;
+    assert_eq!(url.as_str().split('?').next(), Some(AUTHORIZE));
+    assert_eq!(
+        (
+            first["response_type"].as_str(),
+            first["client_id"].as_str(),
+            first["redirect_uri"].as_str(),
+            first["scope"].as_str(),
+            first["code_challenge_method"].as_str(),
+        ),
+        (
+            "code",
+            "client 1",
+            "http://localhost:8080/connect/oauth/callback",
+            "read",
+            "S256"
+        )
+    );
+    assert!(!first["state"].contains(&reference), "the state is not the reference");
+    let (_, second) = authorize(&server, &reference).await;
+    assert_ne!(first["state"], second["state"], "a fresh state per attempt");
+    assert_ne!(first["code_challenge"], second["code_challenge"]);
+
+    // Only the newest attempt's state completes the session.
+    let callback = |query: &str| format!("/connect/oauth/callback?{query}");
+    for stale in [
+        callback(&format!("code=c-1&state={}", first["state"])),
+        callback("code=c-1&state=unknown"),
+        callback("code=c-1"),
+    ] {
+        let (status, location, body) = server.visit(&stale).await;
+        assert_eq!(
+            (status, location, code(&body)),
+            (StatusCode::BAD_REQUEST, None, "invalid_oauth_state"),
+            "{stale}"
+        );
+    }
+    assert!(
+        server.providers.sent().is_empty(),
+        "nothing exchanged for a stale state"
+    );
+
+    server.providers.script(TOKEN, 200, tokens("at-1"));
+    server.providers.script(
+        IDENTITY,
+        200,
+        json!({ "sub": "u-42", "name": "Jordan", "email": "jordan@people.example" }),
+    );
+    let arrival = callback(&format!("code=c-1&state={}", second["state"]));
+    let (status, location, _) = server.visit(&arrival).await;
+    assert_eq!(
+        (status, location.as_deref()),
+        (
+            StatusCode::SEE_OTHER,
+            Some(format!("http://localhost:8080/connect/{reference}").as_str())
+        ),
+        "back to the hosted page"
+    );
+
+    // The code exchanged with the verifier, the client authenticating with Basic.
+    let sent = server.providers.sent();
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("client+1:{CLIENT_SECRET}"));
+    assert_eq!(
+        sent.iter()
+            .map(|sent| (sent.url.as_str(), sent.credential.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (TOKEN, Some(("Authorization".to_owned(), format!("Basic {basic}")))),
+            (IDENTITY, Some(("Authorization".to_owned(), "Bearer at-1".to_owned()))),
+        ]
+    );
+    let form: std::collections::BTreeMap<String, String> =
+        url::form_urlencoded::parse(server.providers.bodies()[0].1.as_deref().unwrap().as_bytes())
+            .into_owned()
+            .collect();
+    let verifier = &form["code_verifier"];
+    assert_eq!(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes())),
+        second["code_challenge"],
+        "the verifier of the challenge sent"
+    );
+    assert_eq!(
+        (
+            form["grant_type"].as_str(),
+            form["code"].as_str(),
+            form["redirect_uri"].as_str()
+        ),
+        (
+            "authorization_code",
+            "c-1",
+            "http://localhost:8080/connect/oauth/callback"
+        )
+    );
+    assert!(
+        !form.contains_key("client_secret"),
+        "the secret travels only as the credential"
+    );
+
+    let completed = hosted(&server, &reference).await;
+    assert_eq!(completed["status"], "completed", "{completed}");
+    let installation = completed["installation_id"].as_str().unwrap().to_owned();
+    let (version, stored) = credential(&server, &t.org, &t.sandbox, &app, &installation).await;
+    assert_eq!(
+        (version, stored),
+        (
+            1,
+            json!({ "access_token": "at-1", "refresh_token": "rt-1", "token_type": "Bearer" })
+        )
+    );
+    let (_, read) = server
+        .send(
+            call(
+                "alice",
+                Method::GET,
+                format!("/v1/workspaces/{}/installations/{installation}", t.sandbox),
+            )
+            .naming(&t.org),
+        )
+        .await;
+    let connection = &read["data"]["connection"];
+    assert_eq!(
+        (&connection["account"], &connection["granted_scopes"]),
+        (
+            &json!({ "external_id": "u-42", "display_name": "Jordan", "email": "jordan@people.example" }),
+            &json!(["read"])
+        ),
+        "{read}"
+    );
+    assert!(connection["expires_at"].is_string(), "{connection}");
+
+    // The state is spent.
+    let (status, _, body) = server.visit(&arrival).await;
+    assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "invalid_oauth_state"));
+    let (status, body) = server
+        .send(call(
+            "nobody",
+            Method::POST,
+            format!("/v1/connect/sessions/{reference}/authorize"),
+        ))
+        .await;
+    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "session_not_pending"));
+
+    // A reconnect with another account fails, and keeps the installation's credential.
+    let (_, created) = server
+        .send(start(
+            "alice",
+            &t.org,
+            &t.sandbox,
+            json!({ "app_id": app, "intent": "reconnect", "label": "Main", "installation_id": installation, "return_url": null }),
+        ))
+        .await;
+    let reconnect = reference_of(&created["data"]);
+    let (_, query) = authorize(&server, &reconnect).await;
+    server.providers.script(TOKEN, 200, tokens("at-2"));
+    server
+        .providers
+        .script(IDENTITY, 200, json!({ "id": 99, "login": "someone" }));
+    let (status, _, _) = server
+        .visit(&callback(&format!("code=c-2&state={}", query["state"])))
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let failed = hosted(&server, &reconnect).await;
+    assert_eq!(
+        (&failed["status"], &failed["failure_code"]),
+        (&json!("failed"), &json!("account_mismatch"))
+    );
+    assert_eq!(credential(&server, &t.org, &t.sandbox, &app, &installation).await.0, 1);
+
+    // The same account renews it under the next version.
+    let (_, created) = server
+        .send(start(
+            "alice",
+            &t.org,
+            &t.sandbox,
+            json!({ "app_id": app, "intent": "reconnect", "label": "Main", "installation_id": installation, "return_url": null }),
+        ))
+        .await;
+    let reconnect = reference_of(&created["data"]);
+    let (_, query) = authorize(&server, &reconnect).await;
+    server.providers.script(IDENTITY, 200, json!({ "sub": "u-42" }));
+    // Only scopes the session asked for or the app offers are recorded.
+    server.providers.script(
+        TOKEN,
+        200,
+        json!({ "access_token": "at-2", "token_type": "bearer", "scope": "read read admin:everything" }),
+    );
+    server
+        .visit(&callback(&format!("code=c-3&state={}", query["state"])))
+        .await;
+    assert_eq!(hosted(&server, &reconnect).await["status"], "completed");
+    let (version, stored) = credential(&server, &t.org, &t.sandbox, &app, &installation).await;
+    assert_eq!((version, &stored["access_token"]), (2, &json!("at-2")));
+    let (_, read) = server
+        .send(
+            call(
+                "alice",
+                Method::GET,
+                format!("/v1/workspaces/{}/installations/{installation}", t.sandbox),
+            )
+            .naming(&t.org),
+        )
+        .await;
+    assert_eq!(read["data"]["connection"]["granted_scopes"], json!(["read"]));
+}
+
+/// A refused consent, a refused code or an unreachable provider fails the
+/// session with a code the hosted page explains; nothing is installed.
+#[tokio::test]
+async fn fails_the_session_when_the_provider_refuses() {
+    let server = Server::new().await;
+    let t = tenant(&server, "alice", "northwind").await;
+    let app = oauth_app(&server, &t.org).await;
+    let callback = |query: &str| format!("/connect/oauth/callback?{query}");
+    for (outcome, failure_code) in [
+        ("error=access_denied", "consent_denied"),
+        ("error=server_error&error_description=words", "authorization_failed"),
+        ("code=c-1&token=400", "token_exchange_failed"),
+        ("code=c-1&token=503", "provider_unavailable"),
+        ("code=c-1&token=200&identity=401", "identity_unavailable"),
+        // A provider that echoes the client's secret: nothing of its answer is kept.
+        ("code=c-1&echo=1", "token_exchange_failed"),
+    ] {
+        let (_, created) = server
+            .send(start("alice", &t.org, &t.sandbox, session(&app, Value::Null)))
+            .await;
+        let reference = reference_of(&created["data"]);
+        let (_, query) = authorize(&server, &reference).await;
+        let script: std::collections::BTreeMap<String, String> =
+            url::form_urlencoded::parse(outcome.as_bytes()).into_owned().collect();
+        if let Some(status) = script.get("token") {
+            server.providers.script(TOKEN, status.parse().unwrap(), tokens("at-1"));
+        }
+        if script.contains_key("echo") {
+            server.providers.script(
+                TOKEN,
+                200,
+                json!({ "access_token": "at-1", "token_type": "Bearer", "scope": CLIENT_SECRET }),
+            );
+        }
+        if let Some(status) = script.get("identity") {
+            server.providers.script(IDENTITY, status.parse().unwrap(), json!({}));
+        }
+        let (status, location, _) = server
+            .visit(&callback(&format!("{outcome}&state={}", query["state"])))
+            .await;
+        assert_eq!(
+            (status, location),
+            (
+                StatusCode::SEE_OTHER,
+                Some(format!("http://localhost:8080/connect/{reference}"))
+            ),
+            "{outcome}"
+        );
+        let failed = hosted(&server, &reference).await;
+        assert_eq!(
+            (&failed["status"], &failed["failure_code"], &failed["installation_id"]),
+            (&json!("failed"), &json!(failure_code), &Value::Null),
+            "{outcome}"
+        );
+    }
+    let (_, listed) = server
+        .send(
+            call(
+                "alice",
+                Method::GET,
+                format!("/v1/workspaces/{}/installations", t.sandbox),
+            )
+            .naming(&t.org),
+        )
+        .await;
+    assert_eq!(listed["data"], json!([]), "nothing installed");
+}
+
+/// An OAuth app whose template has no token URL yet can't start consent.
+#[tokio::test]
+async fn refuses_consent_without_the_providers_endpoints() {
+    let server = Server::new().await;
+    let t = tenant(&server, "alice", "northwind").await;
+    let app = oauth_app(&server, &t.org).await;
+    let (status, body) = server
+        .send(
+            call(
+                "alice",
+                Method::PATCH,
+                format!("/v1/organizations/{}/apps/{app}", t.org),
+            )
+            .body(json!({ "auth": {
+                "type": "oauth2", "authorize_url": AUTHORIZE, "token_url": null, "identity_url": null,
+                "available_scopes": [{ "name": "read", "description": "" }], "pkce": false,
+            }})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, created) = server
+        .send(start("alice", &t.org, &t.sandbox, session(&app, Value::Null)))
+        .await;
+    let (status, body) = server
+        .send(call(
+            "nobody",
+            Method::POST,
+            format!("/v1/connect/sessions/{}/authorize", reference_of(&created["data"])),
+        ))
+        .await;
+    assert_eq!(
+        (status, code(&body)),
+        (StatusCode::UNPROCESSABLE_ENTITY, "configuration_not_ready")
+    );
 }

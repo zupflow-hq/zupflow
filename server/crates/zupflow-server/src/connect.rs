@@ -2,7 +2,8 @@
 //! - an organization's allowlists, at `/v1/organizations/{org}/connect-settings/{env}`;
 //! - a workspace's sessions, at `/v1/workspaces/{ws}/connect-sessions`;
 //! - the hosted page's view of one session, at `/v1/connect/sessions/{reference}`,
-//!   where it cancels, or submits a token app's credentials.
+//!   where it cancels, submits a token app's credentials, or starts an OAuth
+//!   app's consent, whose callback is in [`crate::connect_oauth`].
 //!
 //! The hosted routes carry no credential: the link's reference is the
 //! authority. A request's reference is hashed and the session found by that
@@ -20,7 +21,7 @@ use axum::routing::{get, post};
 use serde::Serialize;
 use serde_json::Value;
 use zeroize::Zeroizing;
-use zupflow_core::apps::{App, AuthTemplate, ConfigurationStatus, TokenInput, TokenPlacement};
+use zupflow_core::apps::{App, AuthTemplate, Configuration, ConfigurationStatus, TokenInput, TokenPlacement};
 use zupflow_core::connect::{
     Completion, ConnectError, ConnectIntent, ConnectSession, ConnectSessionStatus, ConnectSettings, NewConnectSession,
     Reference, ReferenceHash,
@@ -28,7 +29,7 @@ use zupflow_core::connect::{
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{AppId, ConnectSessionId, InstallationId, WorkspaceId};
-use zupflow_core::installations::{ConnectedAccount, InstalledApp, NewCredential};
+use zupflow_core::installations::{ConnectedAccount, InstalledApp, NewCredential, TemplateSnapshot};
 use zupflow_core::keys::{self, EncryptionContext};
 use zupflow_core::organizations::MemberRole;
 use zupflow_core::outbound::{Credential, Limits, Method, OutboundError, OutboundRequest, Refusal};
@@ -55,6 +56,11 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/connect/sessions/{reference}", get(get_hosted))
         .route("/v1/connect/sessions/{reference}/cancel", post(cancel_hosted))
         .route("/v1/connect/sessions/{reference}/credentials", post(submit_credentials))
+        .route(
+            "/v1/connect/sessions/{reference}/authorize",
+            post(crate::connect_oauth::authorize),
+        )
+        .route("/connect/oauth/callback", get(crate::connect_oauth::callback))
 }
 
 const LIST_MAX: usize = 20;
@@ -80,6 +86,12 @@ pub(crate) fn connect_failure(error: ConnectError) -> Failure {
             "This installation changed while you were connecting. Start again from the app.",
         )
         .into(),
+        ConnectError::AuthorizationChanged => ApiError::new(
+            409,
+            "authorization_changed",
+            "Another sign-in started from this link. Use the newest window, or start again from the app.",
+        )
+        .into(),
         // The store has logged the cause.
         ConnectError::Unavailable => ApiError::new(
             503,
@@ -90,7 +102,7 @@ pub(crate) fn connect_failure(error: ConnectError) -> Failure {
     }
 }
 
-fn not_pending(status: ConnectSessionStatus) -> Failure {
+pub(crate) fn not_pending(status: ConnectSessionStatus) -> Failure {
     ApiError::new(
         409,
         "session_not_pending",
@@ -673,7 +685,7 @@ async fn cancel_hosted(State(state): State<AppState>, Path(reference): Path<Stri
 
 /// What a completed session answers: the contract's `ConnectResult`.
 #[derive(Serialize)]
-struct ConnectResultView {
+pub(crate) struct ConnectResultView {
     session: SessionView,
     installation: InstallationView,
 }
@@ -685,7 +697,10 @@ const VALUE_MAX: usize = 4096;
 /// started: the app is still there, in the session's own scope, and its
 /// configuration for the session's environment is still ready. The
 /// configuration's version is the one the installation connects under.
-async fn still_eligible(state: &AppState, session: &ConnectSession) -> Result<(App, u32), Failure> {
+pub(crate) async fn still_eligible(
+    state: &AppState,
+    session: &ConnectSession,
+) -> Result<(App, Configuration), Failure> {
     let (organization_id, workspace_id) = (session.organization_id, session.workspace_id);
     let (app, configuration) = match session.app {
         InstalledApp::Catalog(id) => {
@@ -725,8 +740,7 @@ async fn still_eligible(state: &AppState, session: &ConnectSession) -> Result<(A
     };
     match configuration {
         Some(configuration) if configuration.status(&app.auth) == ConfigurationStatus::Ready => {
-            let version = configuration.version;
-            Ok((app, version))
+            Ok((app, configuration))
         }
         _ => Err(ApiError::new(
             422,
@@ -876,7 +890,7 @@ async fn verify(
 }
 
 /// The last four characters of a value, as a secret's `last4` shows it.
-fn last4(value: &str) -> String {
+pub(crate) fn last4(value: &str) -> String {
     let chars: Vec<char> = value.chars().collect();
     chars[chars.len().saturating_sub(4)..].iter().collect()
 }
@@ -895,7 +909,7 @@ async fn submit_credentials(
     if status != ConnectSessionStatus::Pending {
         return Err(not_pending(status));
     }
-    let (app, configuration_version) = still_eligible(&state, &session).await?;
+    let (app, configuration) = still_eligible(&state, &session).await?;
     let AuthTemplate::Token {
         inputs,
         placement,
@@ -974,11 +988,15 @@ async fn submit_credentials(
         })?;
     let completion = Completion {
         installation_id,
-        configuration_version,
+        configuration_version: configuration.version,
         account,
         granted_scopes: session.requested_scopes.clone(),
         expires_at: None,
         credential: NewCredential { sealed, version },
+        snapshot: TemplateSnapshot {
+            auth: app.auth.clone(),
+            app_version: app.version,
+        },
     };
     let (completed, installation) = state
         .connect

@@ -2,7 +2,9 @@
 //! sessions reached only through their own workspace, or by the hash of
 //! their reference and nothing else; cancelling only what is pending;
 //! completing a pending session once, with the installation it makes or
-//! renews written in the same breath.
+//! renews written in the same breath; an OAuth authorization per attempt,
+//! only the newest one claimable, once, by its `state` alone, and forgotten
+//! when the session finishes.
 //!
 //! `prepare` makes a [`Tenant`] exist: an organization with a Sandbox and a
 //! Production workspace, a catalog app, the Sandbox workspace's own app, and
@@ -13,8 +15,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use zupflow_core::connect::{
-    Completion, ConnectError, ConnectIntent, ConnectSession, ConnectSessionStatus, ConnectStore, NewConnectSession,
-    Reference, ReferenceHash, SESSION_TTL_MS,
+    Authorization, Completion, ConnectError, ConnectIntent, ConnectSession, ConnectSessionStatus, ConnectStore,
+    NewConnectSession, Reference, ReferenceHash, SESSION_TTL_MS,
 };
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, ConnectSessionId, InstallationId, OrganizationId, WorkspaceId};
@@ -85,6 +87,208 @@ pub async fn run(store: &dyn ConnectStore, prepare: Prepare) {
     completes_a_pending_session_once(store, &prepare).await;
     renews_a_reconnects_installation_under_the_next_version(store, &prepare).await;
     refuses_a_workspace_of_another_organization(store, &prepare).await;
+    authorizes_the_newest_attempt_once(store, &prepare).await;
+    forgets_the_authorization_when_a_session_finishes(store, &prepare).await;
+}
+
+/// Opaque to the store: kept and returned exactly.
+fn authorization(state: &Reference, attempt: u32) -> Authorization {
+    Authorization {
+        state_hash: state.hash(),
+        attempt,
+        sealed: Sealed {
+            wrapped_key: WrappedKey {
+                key_id: format!("key-{attempt}"),
+                bytes: vec![2; 40],
+            },
+            nonce: [3; 12],
+            ciphertext: vec![u8::try_from(attempt).unwrap_or(0); 24],
+        },
+    }
+}
+
+async fn authorizes_the_newest_attempt_once(store: &dyn ConnectStore, prepare: &Prepare) {
+    let a = tenant(prepare).await;
+    let b = tenant(prepare).await;
+    let now = Timestamp::now();
+    let (session, _) = start(store, &a, now).await;
+    assert_eq!(session.authorization_attempt, 0);
+    let first = Reference::generate().unwrap();
+    for (organization, workspace) in [(b.organization_id, a.sandbox), (a.organization_id, a.production)] {
+        assert_eq!(
+            store
+                .begin_authorization(organization, workspace, session.id, &authorization(&first, 1), now)
+                .await,
+            Err(ConnectError::NotFound)
+        );
+    }
+    assert_eq!(
+        store
+            .begin_authorization(a.organization_id, a.sandbox, session.id, &authorization(&first, 2), now)
+            .await,
+        Err(ConnectError::AuthorizationChanged),
+        "an attempt follows the one before it"
+    );
+    store
+        .begin_authorization(a.organization_id, a.sandbox, session.id, &authorization(&first, 1), now)
+        .await
+        .unwrap();
+    let found = store
+        .find_session(a.organization_id, a.sandbox, session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (found.authorization_attempt, found.status),
+        (1, ConnectSessionStatus::Pending)
+    );
+    let racing = Reference::generate().unwrap();
+    assert_eq!(
+        store
+            .begin_authorization(
+                a.organization_id,
+                a.sandbox,
+                session.id,
+                &authorization(&racing, 1),
+                now
+            )
+            .await,
+        Err(ConnectError::AuthorizationChanged),
+        "two starts from the same attempt: one wins"
+    );
+
+    // A newer attempt replaces the older one's `state`.
+    let second = Reference::generate().unwrap();
+    store
+        .begin_authorization(
+            a.organization_id,
+            a.sandbox,
+            session.id,
+            &authorization(&second, 2),
+            now,
+        )
+        .await
+        .unwrap();
+    for stale in [&first, &racing] {
+        assert_eq!(store.claim_authorization(&stale.hash()).await.unwrap(), None);
+    }
+    let (claimed, claimed_authorization) = store.claim_authorization(&second.hash()).await.unwrap().unwrap();
+    assert_eq!(
+        (claimed.id, claimed.organization_id, claimed.workspace_id),
+        (session.id, a.organization_id, a.sandbox),
+        "the session it belongs to, with its scope"
+    );
+    assert_eq!(claimed_authorization, authorization(&second, 2), "kept exactly");
+    assert_eq!(
+        store.claim_authorization(&second.hash()).await.unwrap(),
+        None,
+        "a state is spent by its claim"
+    );
+    assert_eq!(
+        store
+            .claim_authorization(&Reference::generate().unwrap().hash())
+            .await
+            .unwrap(),
+        None
+    );
+
+    // The session stays pending: the person can start again.
+    let third = Reference::generate().unwrap();
+    store
+        .begin_authorization(a.organization_id, a.sandbox, session.id, &authorization(&third, 3), now)
+        .await
+        .unwrap();
+    assert!(store.claim_authorization(&third.hash()).await.unwrap().is_some());
+
+    // Past its expiry, a session starts nothing.
+    let (stale, _) = start(store, &a, Timestamp::from_millis(now.millis() - SESSION_TTL_MS - 1)).await;
+    assert_eq!(
+        store
+            .begin_authorization(
+                a.organization_id,
+                a.sandbox,
+                stale.id,
+                &authorization(&Reference::generate().unwrap(), 1),
+                now
+            )
+            .await,
+        Err(ConnectError::NotPending)
+    );
+}
+
+async fn forgets_the_authorization_when_a_session_finishes(store: &dyn ConnectStore, prepare: &Prepare) {
+    let a = tenant(prepare).await;
+    let b = tenant(prepare).await;
+    let now = Timestamp::now();
+    let begin = |session: ConnectSessionId| async move {
+        let state = Reference::generate().unwrap();
+        store
+            .begin_authorization(a.organization_id, a.sandbox, session, &authorization(&state, 1), now)
+            .await
+            .unwrap();
+        state
+    };
+
+    // Failed: only within its own workspace, once, with its code.
+    let (failing, _) = start(store, &a, now).await;
+    let state = begin(failing.id).await;
+    for (organization, workspace) in [(b.organization_id, a.sandbox), (a.organization_id, a.production)] {
+        assert_eq!(
+            store
+                .fail_session(organization, workspace, failing.id, "consent_denied", now)
+                .await,
+            Err(ConnectError::NotFound)
+        );
+    }
+    let failed = store
+        .fail_session(a.organization_id, a.sandbox, failing.id, "consent_denied", now)
+        .await
+        .unwrap();
+    assert_eq!(
+        (failed.status, failed.failure_code.as_deref()),
+        (ConnectSessionStatus::Failed, Some("consent_denied"))
+    );
+    assert_eq!(store.claim_authorization(&state.hash()).await.unwrap(), None);
+    assert_eq!(
+        store
+            .fail_session(a.organization_id, a.sandbox, failing.id, "consent_denied", now)
+            .await,
+        Err(ConnectError::NotPending)
+    );
+    assert_eq!(
+        store
+            .begin_authorization(
+                a.organization_id,
+                a.sandbox,
+                failing.id,
+                &authorization(&Reference::generate().unwrap(), 2),
+                now
+            )
+            .await,
+        Err(ConnectError::NotPending)
+    );
+
+    // Cancelled, or completed another way.
+    let (cancelling, _) = start(store, &a, now).await;
+    let state = begin(cancelling.id).await;
+    store
+        .cancel_session(a.organization_id, a.sandbox, cancelling.id, now)
+        .await
+        .unwrap();
+    assert_eq!(store.claim_authorization(&state.hash()).await.unwrap(), None);
+    let (completing, _) = start(store, &a, now).await;
+    let state = begin(completing.id).await;
+    store
+        .complete_session(
+            a.organization_id,
+            a.sandbox,
+            completing.id,
+            &completion(InstallationId::generate(), 1),
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.claim_authorization(&state.hash()).await.unwrap(), None);
 }
 
 async fn keeps_settings_per_organization_and_environment(store: &dyn ConnectStore, prepare: &Prepare) {
@@ -317,6 +521,7 @@ fn completion(installation_id: InstallationId, version: u32) -> Completion {
             },
             version,
         },
+        snapshot: crate::installation_store::snapshot(version),
     }
 }
 
@@ -387,6 +592,11 @@ async fn completes_a_pending_session_once(store: &dyn ConnectStore, prepare: &Pr
             3,
         ),
         "of the session's app, with its label"
+    );
+    assert_eq!(
+        installation.snapshot,
+        Some(crate::installation_store::snapshot(1)),
+        "under the template it connected with"
     );
     let connection = installation.connection.unwrap();
     assert_eq!(
@@ -543,5 +753,10 @@ async fn renews_a_reconnects_installation_under_the_next_version(store: &dyn Con
         )
         .await
         .unwrap();
+    assert_eq!(
+        again.snapshot,
+        Some(crate::installation_store::snapshot(3)),
+        "a reconnect takes the template it reconnected under"
+    );
     assert_eq!(again.connection.map(|c| c.credential_version), Some(3));
 }

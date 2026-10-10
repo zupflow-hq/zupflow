@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
+use crate::apps::AuthTemplate;
 use crate::environment::Environment;
 use crate::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
 use crate::keys::Sealed;
@@ -77,6 +78,15 @@ pub struct AccountConnection {
     pub expires_at: Option<Timestamp>,
 }
 
+/// The app's authentication template and version as they were when the
+/// installation last connected (decision 0036). The credential service uses
+/// only this: a later template change never redirects a stored credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateSnapshot {
+    pub auth: AuthTemplate,
+    pub app_version: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installation {
     pub id: InstallationId,
@@ -88,6 +98,8 @@ pub struct Installation {
     /// The app configuration's version it connected under.
     pub configuration_version: u32,
     pub connection: Option<AccountConnection>,
+    /// `None` only for an installation that connected before snapshots were kept.
+    pub snapshot: Option<TemplateSnapshot>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -110,6 +122,7 @@ pub struct NewInstallation {
     pub granted_scopes: Vec<String>,
     pub expires_at: Option<Timestamp>,
     pub credential: NewCredential,
+    pub snapshot: TemplateSnapshot,
 }
 
 /// An installation seen from its catalog app's page: the installation and the

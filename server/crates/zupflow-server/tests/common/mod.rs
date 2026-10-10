@@ -46,15 +46,30 @@ pub struct Sent {
 }
 
 /// Stands in for every provider: records what it's sent and answers what
-/// the test chose, `200` until told otherwise.
+/// the test chose, `200` until told otherwise, or what it scripted for a URL.
 pub struct Providers {
     pub sent: Mutex<Vec<Sent>>,
+    /// Each request's URL and body, in order.
+    pub bodies: Mutex<Vec<(String, Option<String>)>>,
     pub answer: Mutex<Result<u16, OutboundError>>,
+    /// A URL's own answer: its status and body.
+    pub scripted: Mutex<Vec<(String, u16, Value)>>,
 }
 
 impl Providers {
     pub fn answer(&self, answer: Result<u16, OutboundError>) {
         *self.answer.lock().unwrap() = answer;
+    }
+
+    /// From now on, `url` answers `status` with `body`.
+    pub fn script(&self, url: &str, status: u16, body: Value) {
+        let mut scripted = self.scripted.lock().unwrap();
+        scripted.retain(|(scripted, _, _)| scripted != url);
+        scripted.push((url.to_owned(), status, body));
+    }
+
+    pub fn bodies(&self) -> Vec<(String, Option<String>)> {
+        self.bodies.lock().unwrap().clone()
     }
 
     pub fn sent(&self) -> Vec<Sent> {
@@ -65,12 +80,33 @@ impl Providers {
 #[async_trait]
 impl OutboundHttp for Providers {
     async fn send(&self, request: OutboundRequest, _: Limits) -> Result<OutboundResponse, OutboundError> {
+        self.bodies.lock().unwrap().push((
+            request.url.clone(),
+            request
+                .body
+                .as_ref()
+                .map(|body| String::from_utf8_lossy(body).into_owned()),
+        ));
+        let scripted = self
+            .scripted
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(url, _, _)| *url == request.url)
+            .cloned();
         self.sent.lock().unwrap().push(Sent {
             url: request.url,
             credential: request
                 .credential
                 .map(|credential| (credential.header, credential.value.to_string())),
         });
+        if let Some((_, status, body)) = scripted {
+            return Ok(OutboundResponse {
+                status,
+                headers: Vec::new(),
+                body: body.to_string().into_bytes(),
+            });
+        }
         let status = (*self.answer.lock().unwrap())?;
         Ok(OutboundResponse {
             status,
@@ -142,7 +178,9 @@ impl Server {
         let database = Database::open(&directory.join("zupflow.sqlite")).await.unwrap();
         let providers = Arc::new(Providers {
             sent: Mutex::new(Vec::new()),
+            bodies: Mutex::new(Vec::new()),
             answer: Mutex::new(Ok(200)),
+            scripted: Mutex::new(Vec::new()),
         });
         let state = AppState {
             identity,
@@ -195,6 +233,26 @@ impl Server {
         (status, json)
     }
 
+    /// A browser arriving at `uri` with no credential, as a provider's
+    /// redirect sends it: the status, the `Location` it's sent on to, and
+    /// the body.
+    pub async fn visit(&self, uri: &str) -> (StatusCode, Option<String>, Value) {
+        let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let response = self.app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let location = response
+            .headers()
+            .get("Location")
+            .map(|value| value.to_str().unwrap().to_owned());
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, location, json)
+    }
+
     pub async fn organization(&self, user: &str, slug: &str) -> String {
         let (status, body) = self
             .send(call(user, Method::POST, "/v1/organizations").body(json!({ "name": "Test", "slug": slug })))
@@ -238,6 +296,25 @@ impl Server {
         .await
         .unwrap();
         pool.close().await;
+    }
+}
+
+/// The template a test installation made through the store connected under.
+pub fn token_snapshot() -> zupflow_core::installations::TemplateSnapshot {
+    use zupflow_core::apps::{AuthTemplate, TokenLocation, TokenPlacement};
+    zupflow_core::installations::TemplateSnapshot {
+        auth: AuthTemplate::Token {
+            inputs: Vec::new(),
+            placement: TokenPlacement {
+                location: TokenLocation::Header,
+                name: "Authorization".to_owned(),
+                prefix: "Bearer ".to_owned(),
+            },
+            verify_url: None,
+            instructions: String::new(),
+            docs_url: None,
+        },
+        app_version: 1,
     }
 }
 

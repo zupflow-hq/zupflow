@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use zupflow_core::apps::{AppIcon, AppKind, ConfigurationChanges, NewApp, NewClientSecret};
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
-use zupflow_core::installations::{ConnectedAccount, InstalledApp, NewCredential, NewInstallation};
+use zupflow_core::installations::{ConnectedAccount, InstalledApp, NewCredential, NewInstallation, TemplateSnapshot};
 use zupflow_core::keys::{self, EncryptionContext, KeyService};
 
 /// A configuration to seed: a server, and for an OAuth app a client.
@@ -225,6 +225,7 @@ pub struct Owner {
 /// `installation_credential` context, version 1.
 pub async fn installation(
     keys: &dyn KeyService,
+    snapshot: TemplateSnapshot,
     owner: Owner,
     app: InstalledApp,
     label: &str,
@@ -253,5 +254,6 @@ pub async fn installation(
         granted_scopes: Vec::new(),
         expires_at: None,
         credential: NewCredential { sealed, version: 1 },
+        snapshot,
     })
 }

@@ -1,5 +1,6 @@
 //! Envelope encryption for the secrets Zupflow holds (OAuth client secrets,
-//! installation credentials, webhook signing secrets).
+//! installation credentials, a Connect session's pending OAuth authorization,
+//! webhook signing secrets).
 //!
 //! Each secret is encrypted with its own random data key, and the data key is
 //! wrapped by a [`KeyService`]: a local key in the open-source build, a managed
@@ -20,13 +21,14 @@ use async_trait::async_trait;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::environment::Environment;
-use crate::ids::{AppId, InstallationId, OrganizationId, WebhookEndpointId, WorkspaceId};
+use crate::ids::{AppId, ConnectSessionId, InstallationId, OrganizationId, WebhookEndpointId, WorkspaceId};
 
 /// What a secret is for, implied by the constructor that built its context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Purpose {
     OauthClientSecret,
     InstallationCredential,
+    ConnectAuthorization,
     WebhookSigningSecret,
 }
 
@@ -35,6 +37,7 @@ impl Purpose {
         match self {
             Self::OauthClientSecret => "oauth_client_secret",
             Self::InstallationCredential => "installation_credential",
+            Self::ConnectAuthorization => "connect_authorization",
             Self::WebhookSigningSecret => "webhook_signing_secret",
         }
     }
@@ -97,6 +100,29 @@ impl EncryptionContext {
             app_id: Some(app_id),
             object: installation_id.to_string(),
             version,
+        }
+    }
+
+    /// What a Connect session keeps while its user is at the provider's
+    /// consent screen: the PKCE verifier and the link's reference, sealed as
+    /// one value per authorization attempt, so an older attempt's value can't
+    /// be opened as the current one.
+    pub fn connect_authorization(
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        environment: Environment,
+        app_id: AppId,
+        session_id: ConnectSessionId,
+        attempt: u32,
+    ) -> Self {
+        Self {
+            organization_id,
+            workspace_id: Some(workspace_id),
+            environment,
+            purpose: Purpose::ConnectAuthorization,
+            app_id: Some(app_id),
+            object: session_id.to_string(),
+            version: attempt,
         }
     }
 
@@ -340,6 +366,13 @@ mod tests {
             EncryptionContext::webhook_signing_secret(org, Environment::Production, we, 2).canonical(),
             format!(
                 "zupflow.v1;org={org};ws=-;env=production;purpose=webhook_signing_secret;app=-;object={we};version=2"
+            )
+        );
+        let cs = ConnectSessionId::generate();
+        assert_eq!(
+            EncryptionContext::connect_authorization(org, ws, Environment::Sandbox, app, cs, 4).canonical(),
+            format!(
+                "zupflow.v1;org={org};ws={ws};env=sandbox;purpose=connect_authorization;app={app};object={cs};version=4"
             )
         );
     }

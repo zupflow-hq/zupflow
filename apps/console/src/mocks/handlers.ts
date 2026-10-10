@@ -1429,6 +1429,13 @@ export function createHandlers(apiBase: string) {
         if (app.auth.type !== "oauth2") {
           throw new ApiFailure(422, "wrong_auth_type", `${app.name} connects with a token.`);
         }
+        if (!app.auth.authorize_url || !app.auth.token_url) {
+          throw new ApiFailure(
+            422,
+            "configuration_not_ready",
+            `${app.name} has no authorization or token URL. Set them in the app's authentication settings.`,
+          );
+        }
         return ok({
           // The caller's own reference: the stored hash can't be turned back into a link.
           authorization_url: `${window.location.origin}/connect/${encodeURIComponent(param(params, "reference"))}/simulated-consent`,
