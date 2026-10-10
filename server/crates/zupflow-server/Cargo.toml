@@ -30,6 +30,7 @@ url = "2"
 zeroize.workspace = true
 zupflow-basic.workspace = true
 zupflow-core.workspace = true
+zupflow-mcp.workspace = true
 zupflow-oidc.workspace = true
 zupflow-outbound.workspace = true
 zupflow-sqlite.workspace = true

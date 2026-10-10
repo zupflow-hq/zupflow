@@ -17,6 +17,7 @@
 //! - [`outbound`]: the one path every outbound call takes, and which addresses are public.
 //! - [`organizations`]: organizations, members and users, and their store.
 //! - [`time`]: instants as stored and as the API writes them.
+//! - [`tools`]: the tools apps' MCP servers list, pinned, and their registry.
 //! - [`workspaces`]: workspaces and their store.
 
 pub mod api_keys;
@@ -36,6 +37,7 @@ pub mod outbound;
 pub mod scope;
 pub mod storage;
 pub mod time;
+pub mod tools;
 pub mod workspaces;
 
 /// Typed IDs make scope mistakes fail to compile. Swapping the organization

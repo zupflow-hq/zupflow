@@ -21,12 +21,13 @@ packages/
 server/           The Rust backend — a Cargo workspace
   crates/zupflow-core/        Shared types and the external-resource traits: typed IDs, API errors, scopes,
                               KeyService, Cache, ObjectStore, EventBus, JobQueue, Identity,
-                              the organizations, workspaces, API key, app and installation stores
+                              the organizations, workspaces, API key, app, installation and tool stores
   crates/zupflow-basic/       The basic implementations: local keys, an in-memory cache, local files,
                               an in-process event bus, local sign-in
   crates/zupflow-sqlite/      The basic database: SQLite, its migrations, the stores, the job queue
   crates/zupflow-oidc/        Console sign-in through any OpenID Connect provider
   crates/zupflow-outbound/    The safe outbound HTTP path: public HTTPS only, no redirects, bounded
+  crates/zupflow-mcp/         A minimal MCP client: lists a server's tools through the safe path
   crates/zupflow-contract/    Development only: the server and fixture the contract suite runs against
   crates/zupflow-conformance/ The suites every implementation of a trait must pass
   crates/zupflow-server/      The API server (`zupflow` binary), on axum
@@ -108,6 +109,14 @@ path. An OAuth app's consent starts from the hosted page with a single-use
 tokens for the installation and sends the browser back to the hosted page;
 every other path answers the API's `404` envelope, and an unsupported method
 on a served path the `405` one.
+
+Once an installation connects, a background worker in the same process lists
+its app's tools from the app's MCP server (Streamable HTTP, through the safe
+outbound path, with the installation's credential) and records them as that
+installation's own in the tool registry: the first definition of each tool is
+pinned, a later one that differs is kept beside it as changed, for review, and
+a listing that repeats the credential is refused. Jobs wait in the
+database's queue, so a restart picks them up again.
 
 ### The contract suite against the backend
 

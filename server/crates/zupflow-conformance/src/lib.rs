@@ -21,4 +21,5 @@ pub mod job_queue;
 pub mod key_service;
 pub mod object_store;
 pub mod organization_store;
+pub mod tool_registry;
 pub mod workspace_store;

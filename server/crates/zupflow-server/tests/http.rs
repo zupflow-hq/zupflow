@@ -66,6 +66,8 @@ impl Server {
             apps: Arc::new(zupflow_sqlite::SqliteAppStore::new(database.clone())),
             installations: Arc::new(zupflow_sqlite::SqliteInstallationStore::new(database.clone())),
             connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
+            jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
+            tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),
             keys: Arc::new(zupflow_basic::local_keys::LocalKeyService::from_server_secret(&[7; 32])),
             outbound: Arc::new(zupflow_outbound::SafeHttpClient::new().unwrap()),
             public_url: "http://localhost:8080".to_owned(),

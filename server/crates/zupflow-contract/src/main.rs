@@ -130,6 +130,8 @@ async fn serve(path: &str) -> Result<(), String> {
         apps: Arc::new(SqliteAppStore::new(database.clone())),
         installations: Arc::new(SqliteInstallationStore::new(database.clone())),
         connect: Arc::new(SqliteConnectStore::new(database.clone())),
+        jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
+        tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),
         keys: Arc::new(LocalKeyService::from_server_secret(&secret)),
         outbound: Arc::new(FixtureProviders),
         public_url: format!("http://localhost:{port}"),

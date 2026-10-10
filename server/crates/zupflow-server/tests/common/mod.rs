@@ -54,6 +54,8 @@ pub struct Providers {
     pub answer: Mutex<Result<u16, OutboundError>>,
     /// A URL's own answer: its status and body.
     pub scripted: Mutex<Vec<(String, u16, Value)>>,
+    /// MCP servers by URL, and the tools each lists.
+    pub mcp: Mutex<Vec<(String, Value)>>,
 }
 
 impl Providers {
@@ -66,6 +68,13 @@ impl Providers {
         let mut scripted = self.scripted.lock().unwrap();
         scripted.retain(|(scripted, _, _)| scripted != url);
         scripted.push((url.to_owned(), status, body));
+    }
+
+    /// From now on, `url` is an MCP server listing `tools`.
+    pub fn serve_mcp(&self, url: &str, tools: Value) {
+        let mut mcp = self.mcp.lock().unwrap();
+        mcp.retain(|(served, _)| served != url);
+        mcp.push((url.to_owned(), tools));
     }
 
     pub fn bodies(&self) -> Vec<(String, Option<String>)> {
@@ -94,12 +103,43 @@ impl OutboundHttp for Providers {
             .iter()
             .find(|(url, _, _)| *url == request.url)
             .cloned();
+        let mcp = self
+            .mcp
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(url, _)| *url == request.url)
+            .map(|(_, tools)| tools.clone());
         self.sent.lock().unwrap().push(Sent {
             url: request.url,
             credential: request
                 .credential
                 .map(|credential| (credential.header, credential.value.to_string())),
         });
+        if let (Some(tools), Some(body)) = (mcp, &request.body) {
+            let message: Value = serde_json::from_slice(body).unwrap();
+            let id = message["id"].clone();
+            let (status, answer) = match message["method"].as_str() {
+                Some("initialize") => (
+                    200,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "protocolVersion": "2025-06-18", "capabilities": { "tools": {} } } }),
+                ),
+                Some("tools/list") => (200, json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tools } })),
+                _ => (202, Value::Null),
+            };
+            return Ok(OutboundResponse {
+                status,
+                headers: vec![
+                    ("content-type".to_owned(), "application/json".to_owned()),
+                    ("mcp-session-id".to_owned(), "session-1".to_owned()),
+                ],
+                body: if answer.is_null() {
+                    Vec::new()
+                } else {
+                    answer.to_string().into_bytes()
+                },
+            });
+        }
         if let Some((_, status, body)) = scripted {
             return Ok(OutboundResponse {
                 status,
@@ -118,6 +158,8 @@ impl OutboundHttp for Providers {
 
 pub struct Server {
     pub app: axum::Router,
+    /// The state the router serves, for driving background work.
+    pub state: AppState,
     pub directory: PathBuf,
     pub providers: Arc<Providers>,
 }
@@ -181,6 +223,7 @@ impl Server {
             bodies: Mutex::new(Vec::new()),
             answer: Mutex::new(Ok(200)),
             scripted: Mutex::new(Vec::new()),
+            mcp: Mutex::new(Vec::new()),
         });
         let state = AppState {
             identity,
@@ -189,6 +232,8 @@ impl Server {
             apps: Arc::new(zupflow_sqlite::SqliteAppStore::new(database.clone())),
             installations: Arc::new(zupflow_sqlite::SqliteInstallationStore::new(database.clone())),
             connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
+            jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
+            tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),
             keys: Arc::new(zupflow_basic::local_keys::LocalKeyService::from_server_secret(&[7; 32])),
             outbound: providers.clone(),
             public_url: "http://localhost:8080".to_owned(),
@@ -198,7 +243,8 @@ impl Server {
             api_key_hasher: Arc::new(zupflow_core::api_keys::ApiKeyHasher::new([7; 32])),
         };
         Self {
-            app: zupflow_server::app(state, RequestGuard::default()),
+            app: zupflow_server::app(state.clone(), RequestGuard::default()),
+            state,
             directory,
             providers,
         }

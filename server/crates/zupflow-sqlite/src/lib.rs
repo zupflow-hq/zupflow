@@ -8,6 +8,7 @@
 //! - [`SqliteInstallationStore`]: installations and their sealed credentials.
 //! - [`SqliteJobQueue`]: the job queue, in the same database.
 //! - [`SqliteOrganizationStore`]: organizations, members and users.
+//! - [`SqliteToolRegistry`]: the tools apps' MCP servers list, pinned.
 //! - [`SqliteWorkspaceStore`]: workspaces, listed by keyset.
 //!
 //! Migrations are in `migrations/`, applied in order at open and never edited
@@ -24,6 +25,7 @@ mod job_queue;
 mod organizations;
 #[cfg(test)]
 mod schema;
+mod tools;
 mod workspaces;
 
 pub use api_keys::SqliteApiKeyStore;
@@ -34,4 +36,5 @@ pub use idempotency::SqliteIdempotencyStore;
 pub use installations::SqliteInstallationStore;
 pub use job_queue::SqliteJobQueue;
 pub use organizations::SqliteOrganizationStore;
+pub use tools::SqliteToolRegistry;
 pub use workspaces::SqliteWorkspaceStore;

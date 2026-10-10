@@ -95,6 +95,8 @@ async fn main() -> ExitCode {
         apps: Arc::new(zupflow_sqlite::SqliteAppStore::new(database.clone())),
         installations: Arc::new(zupflow_sqlite::SqliteInstallationStore::new(database.clone())),
         connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
+        jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
+        tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),
         keys: Arc::new(zupflow_basic::local_keys::LocalKeyService::from_server_secret(
             &secret_key,
         )),
@@ -114,10 +116,13 @@ async fn main() -> ExitCode {
         }
     };
     tracing::info!(event = "server.listening", address = %config.listen);
-    if let Err(error) = axum::serve(listener, zupflow_server::app(state, guard))
+    // Background work, in the same process; stopped with the server.
+    let worker = tokio::spawn(zupflow_server::discovery::run_worker(state.clone()));
+    let served = axum::serve(listener, zupflow_server::app(state, guard))
         .with_graceful_shutdown(shutdown())
-        .await
-    {
+        .await;
+    worker.abort();
+    if let Err(error) = served {
         tracing::error!(event = "server.failed", %error);
         return ExitCode::FAILURE;
     }

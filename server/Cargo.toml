@@ -42,6 +42,7 @@ uuid = { version = "1", features = ["v7"] }
 zupflow-basic = { path = "crates/zupflow-basic" }
 zupflow-conformance = { path = "crates/zupflow-conformance" }
 zupflow-core = { path = "crates/zupflow-core" }
+zupflow-mcp = { path = "crates/zupflow-mcp" }
 zupflow-oidc = { path = "crates/zupflow-oidc" }
 zupflow-outbound = { path = "crates/zupflow-outbound" }
 zupflow-sqlite = { path = "crates/zupflow-sqlite" }

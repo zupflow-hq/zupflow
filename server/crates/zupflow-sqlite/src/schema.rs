@@ -47,6 +47,7 @@ const TABLES: &[(&str, Scoping)] = &[
     ("connect_settings", Scoping::Organization),
     ("connect_sessions", Scoping::Workspace),
     ("connect_authorizations", Scoping::Workspace),
+    ("installation_tools", Scoping::Workspace),
 ];
 
 struct Column {

@@ -12,6 +12,7 @@ pub mod auth_templates;
 pub mod config;
 pub mod connect;
 pub mod connect_oauth;
+pub mod discovery;
 pub mod guard;
 pub mod http;
 pub mod idempotency;

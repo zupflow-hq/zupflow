@@ -42,6 +42,10 @@ pub struct AppState {
     pub connect: Arc<dyn ConnectStore>,
     /// Seals the secrets Zupflow holds (decision 0033).
     pub keys: Arc<dyn KeyService>,
+    /// Background work: tool discovery, for now.
+    pub jobs: Arc<dyn zupflow_core::jobs::JobQueue>,
+    /// The tools apps' MCP servers list, pinned (decision 0038).
+    pub tools: Arc<dyn zupflow_core::tools::ToolRegistry>,
     /// Every call to a provider goes through it (`SafeHttpClient` in a deployment).
     pub outbound: Arc<dyn OutboundHttp>,
     /// The origin providers and browsers reach this server at, with no

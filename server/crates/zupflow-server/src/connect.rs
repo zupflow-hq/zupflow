@@ -1016,6 +1016,7 @@ async fn submit_credentials(
             }),
             error => connect_failure(error),
         })?;
+    crate::discovery::enqueue(&state, session.organization_id, session.workspace_id, installation.id).await;
     let installation = installation_view(&app, installation);
     Ok(envelope(
         StatusCode::OK,

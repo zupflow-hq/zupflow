@@ -465,7 +465,11 @@ async fn complete(
         )
         .await
     {
-        Ok(_) | Err(ConnectError::NotPending) => Ok(()),
+        Ok((_, installation)) => {
+            crate::discovery::enqueue(state, session.organization_id, session.workspace_id, installation.id).await;
+            Ok(())
+        }
+        Err(ConnectError::NotPending) => Ok(()),
         Err(ConnectError::InstallationChanged) => Err(Failed("installation_changed")),
         Err(_) => Err(Failed("unavailable")),
     }
