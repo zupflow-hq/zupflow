@@ -19,7 +19,10 @@ pub mod http;
 pub mod idempotency;
 pub mod input;
 pub mod installations;
+pub mod mcp_access;
 pub mod organizations;
+pub mod run_engine;
+pub mod runs;
 pub mod tool_policy;
 pub mod workspaces;
 
@@ -33,7 +36,7 @@ pub use guard::RequestGuard;
 /// The contract's operations this server serves so far, by `operationId`. The
 /// shared contract suite skips, by name, any case that needs another one; a
 /// test holds this list equal to the routes the router actually answers.
-pub const SERVED_OPERATIONS: [&str; 61] = [
+pub const SERVED_OPERATIONS: [&str; 68] = [
     "getViewer",
     "createOrganization",
     "getOrganization",
@@ -95,6 +98,13 @@ pub const SERVED_OPERATIONS: [&str; 61] = [
     "updateToolPolicy",
     "listAppToolLevels",
     "updateAppToolLevels",
+    "listOrganizationRuns",
+    "startRun",
+    "listRuns",
+    "getRun",
+    "listRunEvents",
+    "cancelRun",
+    "resolveApproval",
 ];
 
 /// The whole HTTP surface. Every response under `/v1` is the envelope; the
@@ -113,6 +123,7 @@ pub fn app(state: AppState, guard: RequestGuard) -> Router {
         .merge(connect::routes())
         .merge(agents::routes())
         .merge(tool_policy::routes())
+        .merge(runs::routes())
         // Matched routes only, after routing, so the middleware knows the route's template.
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

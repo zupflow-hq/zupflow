@@ -14,18 +14,17 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use zupflow_core::apps::AuthTemplate;
 use zupflow_core::ids::{InstallationId, OrganizationId, WorkspaceId};
-use zupflow_core::installations::{InstallationStatus, InstalledApp};
+use zupflow_core::installations::InstalledApp;
 use zupflow_core::jobs::{Job, JobOptions};
-use zupflow_core::keys::{self, EncryptionContext};
 use zupflow_core::policy::PolicyError;
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{ListedTool, ToolError};
-use zupflow_mcp::{McpCredential, McpError};
+use zupflow_mcp::McpError;
 
 use crate::auth::AppState;
+use crate::mcp_access::Unreachable;
 
 /// The job kind.
 pub const DISCOVER_TOOLS: &str = "discover_tools";
@@ -109,108 +108,14 @@ pub async fn discover(
         Ok(None) => return skip("installation_gone"),
         Err(_) => return Outcome::Retry("store_unavailable"),
     };
-    let (Some(connection), InstallationStatus::Connected) = (&installation.connection, installation.status) else {
-        return skip("not_connected");
+    let reach = match crate::mcp_access::reach(state, organization_id, workspace_id, &installation).await {
+        Ok(reach) => reach,
+        Err(Unreachable::Skip(why)) => return skip(why),
+        Err(Unreachable::Retry(why)) => return Outcome::Retry(why),
     };
-    // The credential is used as the installation connected under it (decision 0036).
-    let Some(snapshot) = &installation.snapshot else {
-        return skip("no_template_snapshot");
-    };
-    let workspace = match state.workspaces.find_workspace(organization_id, workspace_id).await {
-        Ok(Some(workspace)) => workspace,
-        Ok(None) => return skip("workspace_gone"),
-        Err(_) => return Outcome::Retry("store_unavailable"),
-    };
-    let environment = workspace.environment;
-    let app_id = installation.app.id();
-    let configuration = match installation.app {
-        InstalledApp::Catalog(app_id) => {
-            state
-                .apps
-                .find_organization_configuration(organization_id, app_id, environment)
-                .await
-        }
-        InstalledApp::Workspace(app_id) => {
-            state
-                .apps
-                .find_workspace_configuration(organization_id, workspace_id, app_id)
-                .await
-        }
-    };
-    let server_url = match configuration {
-        Ok(Some(configuration)) => match configuration.mcp_server_url {
-            Some(url) => url,
-            None => return skip("no_mcp_server"),
-        },
-        Ok(None) => return skip("not_configured"),
-        Err(_) => return Outcome::Retry("store_unavailable"),
-    };
-    // A token signed in through the MCP server was asked for that server
-    // alone (RFC 8707): never sent to another the configuration names since.
-    if let AuthTemplate::McpOAuth { .. } = snapshot.auth
-        && snapshot
-            .client
-            .as_ref()
-            .is_none_or(|client| client.resource != server_url)
-    {
-        return skip("server_moved");
-    }
-    let sealed = match state
-        .installations
-        .find_credential(organization_id, workspace_id, installation_id)
+    let listed = match zupflow_mcp::list_tools(state.outbound.as_ref(), &reach.server_url, Some(reach.credential()))
         .await
     {
-        Ok(Some(sealed)) => sealed,
-        Ok(None) => return skip("no_credential"),
-        Err(_) => return Outcome::Retry("store_unavailable"),
-    };
-    if sealed.version != connection.credential_version {
-        // Reconnected since: that connect queued its own discovery.
-        return skip("credential_replaced");
-    }
-    let context = EncryptionContext::installation_credential(
-        organization_id,
-        workspace_id,
-        environment,
-        app_id,
-        installation_id,
-        sealed.version,
-    );
-    let opened = match keys::open(state.keys.as_ref(), &context, &sealed.sealed).await {
-        Ok(opened) => opened,
-        Err(error) => {
-            tracing::error!(event = "discovery.credential_unopenable", %organization_id, %workspace_id, %installation_id, %error);
-            return Outcome::Retry("credential_unopenable");
-        }
-    };
-    let values: serde_json::Map<String, Value> = match serde_json::from_slice(opened.expose()) {
-        Ok(values) => values,
-        Err(_) => {
-            tracing::error!(event = "discovery.credential_unreadable", %organization_id, %workspace_id, %installation_id);
-            return Outcome::Done;
-        }
-    };
-    let text = |key: &str| values.get(key).and_then(Value::as_str);
-    let (header, prefix, secret) = match &snapshot.auth {
-        AuthTemplate::Token { inputs, placement, .. } => (
-            placement.name.clone(),
-            placement.prefix.as_str(),
-            inputs.first().and_then(|input| text(&input.key)),
-        ),
-        AuthTemplate::OAuth2 { .. } | AuthTemplate::McpOAuth { .. } => {
-            ("Authorization".to_owned(), "Bearer ", text("access_token"))
-        }
-    };
-    let Some(secret) = secret else {
-        return skip("credential_without_token");
-    };
-    let value = zeroize::Zeroizing::new(format!("{prefix}{secret}"));
-    let credential = McpCredential {
-        header: &header,
-        value: &value,
-        secret,
-    };
-    let listed = match zupflow_mcp::list_tools(state.outbound.as_ref(), &server_url, Some(credential)).await {
         Ok(listed) => listed,
         Err(McpError::Unavailable) => return Outcome::Retry("server_unavailable"),
         Err(error) => {

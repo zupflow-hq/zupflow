@@ -4,7 +4,8 @@
 //! with it (decision 0039).
 //!
 //! [`list_tools`] initializes a session, says it's initialized, then pages
-//! through `tools/list`. Every request carries the installation's credential
+//! through `tools/list`. [`call_tool`] does the same, then sends one
+//! `tools/call`, and classifies a failure by whether the tool may have acted. Every request carries the installation's credential
 //! as the outbound path's credential, so it's injected last and scrubbed from
 //! what comes back. An answer may be JSON or a `text/event-stream`; either
 //! way only the JSON-RPC response with the request's ID is read.
@@ -87,6 +88,7 @@ struct Session<'a> {
     id: Option<String>,
     protocol_version: Option<String>,
     next_request: u64,
+    limits: Limits,
 }
 
 /// Lists every tool the server at `url` offers.
@@ -102,6 +104,7 @@ pub async fn list_tools(
         id: None,
         protocol_version: None,
         next_request: 1,
+        limits: Limits::default(),
     };
     session.initialize().await?;
     let mut tools: Vec<ListedTool> = Vec::new();
@@ -136,6 +139,113 @@ pub async fn list_tools(
         }
     }
     Err(McpError::Protocol("more pages than a listing reads"))
+}
+
+/// How a tool call failed, by what it means for whatever the tool does: a
+/// call that may have acted is never sent again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CallError {
+    /// The call itself was never sent: the address was refused, the server
+    /// couldn't be reached, or the session couldn't be set up.
+    #[error("the call wasn't sent: {0}")]
+    NotSent(McpError),
+    /// The server refused the credential (`401` or `403`): the installation
+    /// needs reconnecting. The tool didn't act.
+    #[error("the server refused the credential")]
+    Unauthorized,
+    /// The server refused the call without acting: a JSON-RPC error, or a
+    /// `4xx`.
+    #[error("the server refused the call: {0}")]
+    Rejected(&'static str),
+    /// The call was sent and no usable answer came back (a timeout, a
+    /// broken connection, a `5xx`, an answer that isn't one): it may have
+    /// acted, or not.
+    #[error("the call's outcome is unknown: {0}")]
+    Unknown(&'static str),
+    /// The answer repeated the credential, encoded where the outbound path's
+    /// scrubbing can't see it: it's withheld whole.
+    #[error("the answer repeated the credential")]
+    Withheld,
+}
+
+/// What a tool answered: the call's `result`, as the server wrote it
+/// (`content`, and `structuredContent` when given), and whether the tool
+/// reported an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResult {
+    pub result: Map<String, Value>,
+    pub is_error: bool,
+}
+
+/// Calls `name` with `arguments` on the server at `url`, in a session of its
+/// own, through the outbound path with the credential injected last.
+pub async fn call_tool(
+    http: &dyn OutboundHttp,
+    url: &str,
+    credential: Option<McpCredential<'_>>,
+    name: &str,
+    arguments: &Map<String, Value>,
+    limits: Limits,
+) -> Result<ToolResult, CallError> {
+    let mut session = Session {
+        http,
+        url,
+        credential,
+        id: None,
+        protocol_version: None,
+        next_request: 1,
+        limits,
+    };
+    session.initialize().await.map_err(|error| match error {
+        McpError::Unauthorized => CallError::Unauthorized,
+        error => CallError::NotSent(error),
+    })?;
+    let id = session.next_request;
+    session.next_request += 1;
+    let message = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": name, "arguments": arguments },
+    });
+    let response = session.post(message).await.map_err(|error| match error {
+        OutboundError::Refused(Refusal::Unresolvable) => CallError::NotSent(McpError::Unavailable),
+        OutboundError::Refused(refusal) => CallError::NotSent(McpError::Refused(refusal)),
+        OutboundError::Unreachable => CallError::NotSent(McpError::Unavailable),
+        OutboundError::Redirected => CallError::Unknown("a redirect, which isn't followed"),
+        OutboundError::TooLarge => CallError::Unknown("an answer larger than allowed"),
+        OutboundError::TimedOut => CallError::Unknown("no answer in time"),
+        OutboundError::Failed => CallError::Unknown("the exchange failed"),
+    })?;
+    match response.status {
+        200..=299 => {}
+        401 | 403 => return Err(CallError::Unauthorized),
+        400..=499 => return Err(CallError::Rejected("an unexpected status")),
+        _ => return Err(CallError::Unknown("a server error")),
+    }
+    let message = response_for(&response, id).map_err(|_| CallError::Unknown("no usable answer"))?;
+    if message.contains_key("error") {
+        return Err(CallError::Rejected("the server answered with an error"));
+    }
+    let Some(Value::Object(result)) = message.get("result") else {
+        return Err(CallError::Unknown("an answer without a result"));
+    };
+    if let Some(credential) = credential
+        && repeats(
+            &Value::Object(result.clone()),
+            &[credential.value, bare_secret(credential.secret)],
+        )
+    {
+        return Err(CallError::Withheld);
+    }
+    let is_error = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    let mut kept = Map::new();
+    for key in ["content", "structuredContent"] {
+        if let Some(value) = result.get(key) {
+            kept.insert(key.to_owned(), value.clone());
+        }
+    }
+    Ok(ToolResult { result: kept, is_error })
 }
 
 impl Session<'_> {
@@ -184,6 +294,18 @@ impl Session<'_> {
     }
 
     async fn send(&self, message: Value) -> Result<OutboundResponse, McpError> {
+        self.post(message).await.map_err(|error| match error {
+            // A name that doesn't resolve may resolve later.
+            OutboundError::Refused(Refusal::Unresolvable) => McpError::Unavailable,
+            OutboundError::Refused(refusal) => McpError::Refused(refusal),
+            OutboundError::Redirected => McpError::Protocol("a redirect, which isn't followed"),
+            OutboundError::TooLarge => McpError::Protocol("an answer larger than allowed"),
+            OutboundError::TimedOut | OutboundError::Unreachable | OutboundError::Failed => McpError::Unavailable,
+        })
+    }
+
+    /// One message, through the outbound path, with the credential.
+    async fn post(&self, message: Value) -> Result<OutboundResponse, OutboundError> {
         let mut headers = vec![
             ("Content-Type".to_owned(), "application/json".to_owned()),
             ("Accept".to_owned(), "application/json, text/event-stream".to_owned()),
@@ -204,17 +326,7 @@ impl Session<'_> {
                 value: Zeroizing::new(credential.value.to_owned()),
             }),
         };
-        self.http
-            .send(request, Limits::default())
-            .await
-            .map_err(|error| match error {
-                // A name that doesn't resolve may resolve later.
-                OutboundError::Refused(Refusal::Unresolvable) => McpError::Unavailable,
-                OutboundError::Refused(refusal) => McpError::Refused(refusal),
-                OutboundError::Redirected => McpError::Protocol("a redirect, which isn't followed"),
-                OutboundError::TooLarge => McpError::Protocol("an answer larger than allowed"),
-                OutboundError::TimedOut | OutboundError::Unreachable | OutboundError::Failed => McpError::Unavailable,
-            })
+        self.http.send(request, self.limits).await
     }
 }
 
@@ -736,6 +848,133 @@ mod tests {
                 list_tools(&server, "https://tools.example/mcp", Some(KEY)).await,
                 Err(McpError::Protocol("a listing that repeats the credential"))
             );
+        }
+    }
+
+    fn call_answer(id: u64, result: Value) -> Result<OutboundResponse, OutboundError> {
+        json_answer(json!({ "jsonrpc": "2.0", "id": id, "result": result }), &[])
+    }
+
+    async fn call(server: &Server) -> Result<ToolResult, CallError> {
+        let arguments = json!({ "text": "hi" }).as_object().unwrap().clone();
+        call_tool(
+            server,
+            "https://tools.example/mcp",
+            Some(TOKEN),
+            "echo",
+            &arguments,
+            Limits::default(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn calls_a_tool_within_its_own_session() {
+        let server = Server::new(vec![
+            initialized(1),
+            status(202),
+            call_answer(
+                2,
+                json!({ "content": [{ "type": "text", "text": "hi" }], "isError": false, "_meta": { "trace": 1 } }),
+            ),
+        ]);
+        let result = call(&server).await.unwrap();
+        assert_eq!(
+            Value::Object(result.result),
+            json!({ "content": [{ "type": "text", "text": "hi" }] }),
+            "the content, nothing else the server added"
+        );
+        assert!(!result.is_error);
+        let sent = server.sent();
+        assert_eq!(
+            sent.iter()
+                .map(|sent| sent.body["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["initialize", "notifications/initialized", "tools/call"]
+        );
+        assert_eq!(
+            sent[2].body["params"],
+            json!({ "name": "echo", "arguments": { "text": "hi" } })
+        );
+        assert!(
+            sent[2]
+                .headers
+                .contains(&("Mcp-Session-Id".to_owned(), "session-1".to_owned()))
+        );
+        assert!(
+            sent.iter()
+                .all(|sent| sent.credential == Some(("Authorization".to_owned(), "Bearer secret-token".to_owned())))
+        );
+
+        let failed = Server::new(vec![
+            initialized(1),
+            status(202),
+            call_answer(
+                2,
+                json!({ "content": [{ "type": "text", "text": "no such issue" }], "isError": true }),
+            ),
+        ]);
+        assert!(call(&failed).await.unwrap().is_error, "a tool's own error is an answer");
+    }
+
+    #[tokio::test]
+    async fn classifies_a_call_by_whether_it_may_have_acted() {
+        let setup = || vec![initialized(1), status(202)];
+        let with = |answer: Result<OutboundResponse, OutboundError>| {
+            let mut answers = setup();
+            answers.push(answer);
+            answers
+        };
+        let cases: Vec<(Vec<Result<OutboundResponse, OutboundError>>, CallError)> = vec![
+            (vec![status(401)], CallError::Unauthorized),
+            (
+                vec![Err(OutboundError::TimedOut)],
+                CallError::NotSent(McpError::Unavailable),
+            ),
+            (
+                vec![Err(OutboundError::Refused(Refusal::NotPublic))],
+                CallError::NotSent(McpError::Refused(Refusal::NotPublic)),
+            ),
+            (
+                with(Err(OutboundError::Unreachable)),
+                CallError::NotSent(McpError::Unavailable),
+            ),
+            (
+                with(Err(OutboundError::TimedOut)),
+                CallError::Unknown("no answer in time"),
+            ),
+            (
+                with(Err(OutboundError::Failed)),
+                CallError::Unknown("the exchange failed"),
+            ),
+            (with(status(500)), CallError::Unknown("a server error")),
+            (with(status(403)), CallError::Unauthorized),
+            (with(status(404)), CallError::Rejected("an unexpected status")),
+            (
+                with(json_answer(
+                    json!({ "jsonrpc": "2.0", "id": 2, "error": { "code": -32602, "message": "words" } }),
+                    &[],
+                )),
+                CallError::Rejected("the server answered with an error"),
+            ),
+            (
+                with(json_answer(json!({ "jsonrpc": "2.0", "id": 7, "result": {} }), &[])),
+                CallError::Unknown("no usable answer"),
+            ),
+            (
+                with(Ok(OutboundResponse {
+                    status: 200,
+                    headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+                    body:
+                        br#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"secret\u002dtoken"}]}}"#
+                            .to_vec(),
+                })),
+                CallError::Withheld,
+            ),
+        ];
+        for (answers, expected) in cases {
+            let server = Server::new(answers);
+            assert_eq!(call(&server).await, Err(expected));
         }
     }
 }

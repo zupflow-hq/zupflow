@@ -576,6 +576,29 @@ describe("approvals", () => {
     expect(events.some((e) => e.type === "tool_call.started" && e.data.tool === tool)).toBe(false);
     expect(run.output).not.toMatch(/published the post/);
   });
+
+  it("gives the model a denial's reason", async () => {
+    const run = db().runs.find((r) => r.status === "waiting_for_approval");
+    expect(run).toBeDefined();
+    if (!run) return;
+    const { resolveApproval, advanceRun } = await import("./runner");
+    const requested = [...timelineOf(db(), run)].reverse().find((e) => e.type === "approval.requested");
+    const callId = must(requested?.type === "approval.requested" ? requested.data.call_id : null, "pending call");
+    resolveApproval(
+      db(),
+      run,
+      callId,
+      "denied",
+      approvalKeyFor(run.workspace_id),
+      new Date().toISOString(),
+      "  Not this week.  ",
+    );
+    advanceRun(db(), run, new Date().toISOString(), () => 0.5);
+    const said = [...timelineOf(db(), run)].reverse().find((e) => e.type === "message.assistant");
+    expect(said?.type === "message.assistant" ? said.data.text : "").toMatch(
+      /the request was denied: Not this week\.$/,
+    );
+  });
 });
 
 describe("scale and environments", () => {

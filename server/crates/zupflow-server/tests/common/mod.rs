@@ -65,6 +65,11 @@ pub struct Providers {
     /// URLs that answer a request without a credential `401`, with this
     /// `WWW-Authenticate`.
     pub challenges: Mutex<Vec<(String, String)>>,
+    /// Each `tools/call` an MCP server was sent: the tool and its arguments.
+    pub tool_calls: Mutex<Vec<(String, Value)>>,
+    /// The HTTP status MCP servers answer `tools/call` with; `200` answers
+    /// the call's result.
+    pub tool_status: Mutex<u16>,
 }
 
 impl Providers {
@@ -97,6 +102,11 @@ impl Providers {
         let mut mcp = self.mcp.lock().unwrap();
         mcp.retain(|(served, _)| served != url);
         mcp.push((url.to_owned(), tools));
+    }
+
+    /// The tools called so far, with their arguments, in order.
+    pub fn tool_calls(&self) -> Vec<(String, Value)> {
+        self.tool_calls.lock().unwrap().clone()
     }
 
     pub fn bodies(&self) -> Vec<(String, Option<String>)> {
@@ -162,6 +172,26 @@ impl OutboundHttp for Providers {
                     json!({ "jsonrpc": "2.0", "id": id, "result": { "protocolVersion": "2025-06-18", "capabilities": { "tools": {} } } }),
                 ),
                 Some("tools/list") => (200, json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tools } })),
+                Some("tools/call") => {
+                    let name = message["params"]["name"].as_str().unwrap_or_default().to_owned();
+                    let arguments = message["params"]["arguments"].clone();
+                    self.tool_calls.lock().unwrap().push((name.clone(), arguments.clone()));
+                    let status = *self.tool_status.lock().unwrap();
+                    if status != 200 {
+                        return Ok(OutboundResponse {
+                            status,
+                            headers: Vec::new(),
+                            body: Vec::new(),
+                        });
+                    }
+                    (
+                        200,
+                        json!({ "jsonrpc": "2.0", "id": id, "result": {
+                            "content": [{ "type": "text", "text": format!("{name} done") }],
+                            "structuredContent": { "tool": name, "arguments": arguments },
+                        } }),
+                    )
+                }
                 _ => (202, Value::Null),
             };
             return Ok(OutboundResponse {
@@ -262,6 +292,8 @@ impl Server {
             scripted: Mutex::new(Vec::new()),
             mcp: Mutex::new(Vec::new()),
             challenges: Mutex::new(Vec::new()),
+            tool_calls: Mutex::new(Vec::new()),
+            tool_status: Mutex::new(200),
         });
         let state = AppState {
             identity,
@@ -271,6 +303,14 @@ impl Server {
             installations: Arc::new(zupflow_sqlite::SqliteInstallationStore::new(database.clone())),
             agents: Arc::new(zupflow_sqlite::SqliteAgentStore::new(database.clone())),
             policies: Arc::new(zupflow_sqlite::SqliteToolPolicyStore::new(database.clone())),
+            runs: Arc::new(zupflow_sqlite::SqliteRunStore::new(database.clone())),
+            provider: Arc::new(zupflow_basic::scripted_model::ScriptedModel::serving([
+                "model-a", "model-b",
+            ])),
+            approvals: Arc::new(zupflow_basic::configured_policy::ConfiguredPolicy::new(Arc::new(
+                zupflow_sqlite::SqliteToolPolicyStore::new(database.clone()),
+            ))),
+            events: Arc::new(zupflow_basic::in_process_events::InProcessEventBus::default()),
             models: Arc::new(zupflow_basic::configured_models::ConfiguredModels::parse(MODELS).unwrap()),
             connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
             jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),

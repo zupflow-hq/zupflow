@@ -13,6 +13,7 @@
 //! beside a serving process, against the same database file.
 
 mod fixture_apps;
+mod fixture_runs;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -42,13 +43,15 @@ use zupflow_core::installations::{InstallationStore, InstalledApp, TemplateSnaps
 use zupflow_core::organizations::{MemberRole, OrganizationStore, User};
 use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse, Refusal};
 use zupflow_core::policy::{ToolLevel, ToolPolicyStore};
+use zupflow_core::runs::CallTarget;
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{ListedTool, ToolRegistry, ToolRevision};
 use zupflow_core::workspaces::{NewWorkspace, WorkspaceStore};
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{
     Database, SqliteAgentStore, SqliteApiKeyStore, SqliteAppStore, SqliteConnectStore, SqliteIdempotencyStore,
-    SqliteInstallationStore, SqliteOrganizationStore, SqliteToolPolicyStore, SqliteToolRegistry, SqliteWorkspaceStore,
+    SqliteInstallationStore, SqliteOrganizationStore, SqliteRunStore, SqliteToolPolicyStore, SqliteToolRegistry,
+    SqliteWorkspaceStore,
 };
 
 /// The personas, with the address each signs in with: people's names, as in
@@ -147,6 +150,12 @@ async fn serve(path: &str) -> Result<(), String> {
         installations: Arc::new(SqliteInstallationStore::new(database.clone())),
         agents: Arc::new(SqliteAgentStore::new(database.clone())),
         policies: Arc::new(zupflow_sqlite::SqliteToolPolicyStore::new(database.clone())),
+        runs: Arc::new(zupflow_sqlite::SqliteRunStore::new(database.clone())),
+        provider: Arc::new(zupflow_basic::no_model::NoModelProvider),
+        approvals: Arc::new(zupflow_basic::configured_policy::ConfiguredPolicy::new(Arc::new(
+            zupflow_sqlite::SqliteToolPolicyStore::new(database.clone()),
+        ))),
+        events: Arc::new(zupflow_basic::in_process_events::InProcessEventBus::default()),
         models: Arc::new(ConfiguredModels::parse(MODELS).map_err(|error| error.to_string())?),
         connect: Arc::new(SqliteConnectStore::new(database.clone())),
         jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
@@ -539,6 +548,7 @@ async fn reset(path: &str) -> Result<(), String> {
             .copied()
             .ok_or_else(|| format!("installation {label}"))
     };
+    let mut seeded_agents: Vec<(&str, OrganizationId, WorkspaceId, InstallationId, AgentId, &str)> = Vec::new();
     for (label, name, model, granted, approval) in [
         (
             "Marketing",
@@ -585,6 +595,7 @@ async fn reset(path: &str) -> Result<(), String> {
             )
             .await
             .map_err(|error| fail(name)(&error))?;
+        seeded_agents.push((label, organization, workspace, installation_id, agent.id, model));
         let names = |tools: &[&str]| tools.iter().map(|tool| (*tool).to_owned()).collect::<Vec<_>>();
         if label == "Google" {
             // Made before its levels were set: `list_events` is only
@@ -656,6 +667,46 @@ async fn reset(path: &str) -> Result<(), String> {
         )
         .await
         .map_err(|error| fail("paused agent")(&error))?;
+
+    // Runs, as the run engine leaves them: a finished one for the agent of
+    // `acme`, `beta-labs`, `acme-sandbox` and `harbor`, and in `beta-labs` one
+    // waiting for approval of `send_email`. None is queued or running, so
+    // nothing moves on its own (the contract server runs no worker).
+    let runs = SqliteRunStore::new(database.clone());
+    for (label, tool, waiting) in [
+        ("Marketing", "search_files", false),
+        ("Google", "search_files", false),
+        ("Google", "send_email", true),
+        ("Engineering", "search_issues", false),
+        ("Harbor", "search_issues", false),
+    ] {
+        let (_, organization, workspace, installation_id, agent_id, model) = seeded_agents
+            .iter()
+            .find(|seeded| seeded.0 == label)
+            .copied()
+            .ok_or_else(|| format!("agent of {label}"))?;
+        let installation = installations
+            .find_installation(organization, workspace, installation_id)
+            .await
+            .map_err(|error| fail(label)(&error))?
+            .ok_or_else(|| format!("installation {label}"))?;
+        let app_name = match installation.app {
+            InstalledApp::Catalog(id) => apps.find_organization_app(organization, id).await,
+            InstalledApp::Workspace(id) => apps.find_workspace_app(organization, workspace, id).await,
+        }
+        .map_err(|error| fail(label)(&error))?
+        .ok_or_else(|| format!("app of {label}"))?
+        .name;
+        let target = CallTarget {
+            installation_id,
+            installation_label: label.to_owned(),
+            app_name,
+            tool: tool.to_owned(),
+        };
+        fixture_runs::seed(&runs, organization, workspace, agent_id, model, target, waiting)
+            .await
+            .map_err(|error| fail(label)(&error))?;
+    }
 
     // Connect settings: Northwind's Sandbox allows the suite's return URL,
     // Larkspur's doesn't. And a session in each workspace the suite expects one.

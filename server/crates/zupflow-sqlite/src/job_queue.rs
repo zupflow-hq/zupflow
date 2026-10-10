@@ -75,6 +75,42 @@ fn lease_duration(lease: Duration) -> Duration {
     lease.clamp(MIN_LEASE, MAX_LEASE)
 }
 
+/// Queues a job through `executor`: the pool, or the transaction of the
+/// change that needs it, so the change and its job commit together (a
+/// store-level enqueue, decision 0026).
+pub(crate) async fn insert_job<'e, E: sqlx::Executor<'e, Database = Sqlite>>(
+    executor: E,
+    scope: &Scope,
+    kind: &Name,
+    payload: Vec<u8>,
+    options: JobOptions,
+) -> Result<JobId, JobError> {
+    if payload.len() > MAX_JOB_BYTES {
+        return Err(JobError::TooLarge);
+    }
+    let id = JobId::generate();
+    let scope = columns(scope);
+    let now = SystemTime::now();
+    let run_at = millis(now).saturating_add(duration_millis(options.delay));
+    sqlx::query(
+        "INSERT INTO jobs (id, organization_id, workspace_id, environment, kind, payload, state, attempts, \
+         max_attempts, run_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)",
+    )
+    .bind(id.uuid())
+    .bind(scope.organization_id)
+    .bind(scope.workspace_id)
+    .bind(scope.environment)
+    .bind(kind.as_str())
+    .bind(payload)
+    .bind(options.max_attempts.clamp(1, MAX_ATTEMPTS))
+    .bind(run_at)
+    .bind(millis(now))
+    .execute(executor)
+    .await
+    .map_err(failed("enqueue"))?;
+    Ok(id)
+}
+
 #[async_trait]
 impl JobQueue for SqliteJobQueue {
     async fn enqueue(
@@ -84,30 +120,7 @@ impl JobQueue for SqliteJobQueue {
         payload: Vec<u8>,
         options: JobOptions,
     ) -> Result<JobId, JobError> {
-        if payload.len() > MAX_JOB_BYTES {
-            return Err(JobError::TooLarge);
-        }
-        let id = JobId::generate();
-        let scope = columns(scope);
-        let now = SystemTime::now();
-        let run_at = millis(now).saturating_add(duration_millis(options.delay));
-        sqlx::query(
-            "INSERT INTO jobs (id, organization_id, workspace_id, environment, kind, payload, state, attempts, \
-             max_attempts, run_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)",
-        )
-        .bind(id.uuid())
-        .bind(scope.organization_id)
-        .bind(scope.workspace_id)
-        .bind(scope.environment)
-        .bind(kind.as_str())
-        .bind(payload)
-        .bind(options.max_attempts.clamp(1, MAX_ATTEMPTS))
-        .bind(run_at)
-        .bind(millis(now))
-        .execute(self.database.pool())
-        .await
-        .map_err(failed("enqueue"))?;
-        Ok(id)
+        insert_job(self.database.pool(), scope, kind, payload, options).await
     }
 
     /// **Cross-tenant**, by design: a worker serves every organization. It

@@ -9,8 +9,9 @@ use zupflow_basic::local_identity::LocalIdentity;
 use zupflow_core::api_keys::ApiKeyHasher;
 use zupflow_core::idempotency::Fingerprinter;
 use zupflow_core::identity::Identity;
+use zupflow_core::models::{ModelCatalog, ModelProvider};
 use zupflow_oidc::{OidcConfig, OidcIdentity};
-use zupflow_server::config::{Config, IdentityMode};
+use zupflow_server::config::{Config, IdentityMode, ModelProviderMode};
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{
     Database, SqliteApiKeyStore, SqliteIdempotencyStore, SqliteOrganizationStore, SqliteWorkspaceStore,
@@ -88,6 +89,32 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // No model provider ships with Zupflow (decision 0014): runs are
+    // answered only by one the deployment configures. Without one, every run
+    // fails `model_unavailable`; the scripted model is for local work only.
+    let provider: Arc<dyn ModelProvider> = match config.model_provider {
+        ModelProviderMode::None => {
+            tracing::warn!(
+                event = "server.no_model_provider",
+                "No model provider is configured (ZUPFLOW_MODEL_PROVIDER): every run fails model_unavailable"
+            );
+            Arc::new(zupflow_basic::no_model::NoModelProvider)
+        }
+        ModelProviderMode::Scripted => {
+            let served: Vec<String> = match config.models.list_models().await {
+                Ok(models) => models.into_iter().map(|model| model.id).collect(),
+                Err(error) => {
+                    tracing::error!(event = "server.models_failed", %error);
+                    return ExitCode::FAILURE;
+                }
+            };
+            tracing::warn!(
+                event = "server.scripted_model",
+                "Runs are answered by the scripted model (ZUPFLOW_MODEL_PROVIDER=scripted): for local work only"
+            );
+            Arc::new(zupflow_basic::scripted_model::ScriptedModel::serving(served))
+        }
+    };
     let state = AppState {
         identity,
         organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
@@ -96,6 +123,12 @@ async fn main() -> ExitCode {
         installations: Arc::new(zupflow_sqlite::SqliteInstallationStore::new(database.clone())),
         agents: Arc::new(zupflow_sqlite::SqliteAgentStore::new(database.clone())),
         policies: Arc::new(zupflow_sqlite::SqliteToolPolicyStore::new(database.clone())),
+        runs: Arc::new(zupflow_sqlite::SqliteRunStore::new(database.clone())),
+        provider,
+        approvals: Arc::new(zupflow_basic::configured_policy::ConfiguredPolicy::new(Arc::new(
+            zupflow_sqlite::SqliteToolPolicyStore::new(database.clone()),
+        ))),
+        events: Arc::new(zupflow_basic::in_process_events::InProcessEventBus::default()),
         models: Arc::new(config.models.clone()),
         connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
         jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
@@ -122,10 +155,12 @@ async fn main() -> ExitCode {
     tracing::info!(event = "server.listening", address = %config.listen);
     // Background work, in the same process; stopped with the server.
     let worker = tokio::spawn(zupflow_server::discovery::run_worker(state.clone()));
+    let runner = tokio::spawn(zupflow_server::run_engine::run_worker(state.clone()));
     let served = axum::serve(listener, zupflow_server::app(state, guard))
         .with_graceful_shutdown(shutdown())
         .await;
     worker.abort();
+    runner.abort();
     if let Err(error) = served {
         tracing::error!(event = "server.failed", %error);
         return ExitCode::FAILURE;

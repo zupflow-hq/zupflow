@@ -10,3 +10,5 @@ pub mod local_files;
 pub mod local_identity;
 pub mod local_keys;
 pub mod memory_cache;
+pub mod no_model;
+pub mod scripted_model;

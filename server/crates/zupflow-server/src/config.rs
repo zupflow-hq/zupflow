@@ -34,6 +34,19 @@ pub struct Config {
     /// `[{"id":"model-a","name":"Model A","provider":"Example","description":"…"}]`
     /// (see `ConfiguredModels`). Unset offers none, so no agent can be created.
     pub models: ConfiguredModels,
+    /// `ZUPFLOW_MODEL_PROVIDER`: what answers runs. Unset, none does: every
+    /// run fails `model_unavailable`. `scripted` is the deterministic model
+    /// for local work and tests, never a deployment's: it answers from a
+    /// script, and turns `call <tool> {…}` lines of a run's input into calls.
+    pub model_provider: ModelProviderMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelProviderMode {
+    /// No provider: runs fail `model_unavailable`.
+    None,
+    /// The scripted model in `zupflow-basic`, serving `ZUPFLOW_MODELS`.
+    Scripted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +88,8 @@ pub enum ConfigError {
     InvalidPublicUrl,
     #[error("ZUPFLOW_MODELS {0}")]
     InvalidModels(zupflow_basic::configured_models::ModelsConfigError),
+    #[error("ZUPFLOW_MODEL_PROVIDER must be `scripted`, or unset for none")]
+    UnknownModelProvider,
     #[error("ZUPFLOW_IDENTITY must be `local` or `oidc`")]
     UnknownIdentity,
     #[error("ZUPFLOW_IDENTITY=oidc needs {name}")]
@@ -157,6 +172,11 @@ impl Config {
             Some(value) => ConfiguredModels::parse(&value).map_err(ConfigError::InvalidModels)?,
             None => ConfiguredModels::none(),
         };
+        let model_provider = match set("ZUPFLOW_MODEL_PROVIDER")?.as_deref() {
+            None => ModelProviderMode::None,
+            Some("scripted") => ModelProviderMode::Scripted,
+            Some(_) => return Err(ConfigError::UnknownModelProvider),
+        };
         Ok(Self {
             listen,
             log,
@@ -166,6 +186,7 @@ impl Config {
             allowed_origins,
             public_url,
             models,
+            model_provider,
         })
     }
 
@@ -362,6 +383,31 @@ mod tests {
             assert!(matches!(models(bad), Err(ConfigError::InvalidModels(_))), "{bad}");
         }
         assert!(matches!(models(""), Err(ConfigError::Empty { name: "ZUPFLOW_MODELS" })));
+    }
+
+    #[test]
+    fn answers_runs_with_the_scripted_model_only_when_asked() {
+        let provider = |value: &'static str| {
+            Config::from_vars(move |name| Ok((name == "ZUPFLOW_MODEL_PROVIDER").then(|| value.to_owned())))
+        };
+        assert_eq!(
+            Config::from_vars(|_| Ok(None)).expect("defaults").model_provider,
+            ModelProviderMode::None,
+            "no provider unless configured: runs fail rather than answer from a script"
+        );
+        assert_eq!(
+            provider("scripted").expect("scripted").model_provider,
+            ModelProviderMode::Scripted
+        );
+        for bad in ["Scripted", "openai", "none"] {
+            assert!(matches!(provider(bad), Err(ConfigError::UnknownModelProvider)), "{bad}");
+        }
+        assert!(matches!(
+            provider(""),
+            Err(ConfigError::Empty {
+                name: "ZUPFLOW_MODEL_PROVIDER"
+            })
+        ));
     }
 
     #[test]

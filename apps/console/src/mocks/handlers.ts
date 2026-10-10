@@ -1987,6 +1987,11 @@ export function createHandlers(apiBase: string) {
         if (status && !(RUN_STATUSES as readonly string[]).includes(status)) {
           throw new ApiFailure(400, "validation_failed", "Unknown status.", { status: "Unknown status." });
         }
+        if (env && !(ENVIRONMENTS as readonly string[]).includes(env)) {
+          throw new ApiFailure(400, "validation_failed", "Unknown environment.", {
+            environment: "Unknown environment.",
+          });
+        }
         const workspaces = new Map(
           db()
             .workspaces.filter(

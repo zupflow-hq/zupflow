@@ -12,7 +12,7 @@
 //! Production here: agents and grants are configuration, not acting on a
 //! customer's accounts, and the mock, the API's specification, allows them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use axum::Router;
 use axum::extract::{Path, State};
@@ -26,6 +26,7 @@ use zupflow_core::error::ApiError;
 use zupflow_core::ids::{AgentId, GrantId, InstallationId, WorkspaceId};
 use zupflow_core::models::ModelError;
 use zupflow_core::organizations::MemberRole;
+use zupflow_core::runs::AgentActivity;
 use zupflow_core::time::Timestamp;
 
 use crate::auth::{AppState, Caller, WorkspaceAccess};
@@ -71,7 +72,24 @@ struct AgentView {
     updated_at: Timestamp,
 }
 
-fn agent_view(agent: Agent) -> AgentView {
+/// Each agent's runs in the last 24 hours, and when its last one started.
+async fn activity(state: &AppState, access: &WorkspaceAccess) -> Result<HashMap<AgentId, AgentActivity>, Failure> {
+    let since = Timestamp::from_millis(Timestamp::now().millis() - DAY_MILLIS);
+    let activity = state
+        .runs
+        .agent_activity(access.access.organization_id, access.workspace.id, since)
+        .await
+        .map_err(|_| unavailable())?;
+    Ok(activity
+        .into_iter()
+        .map(|activity| (activity.agent_id, activity))
+        .collect())
+}
+
+const DAY_MILLIS: i64 = 24 * 60 * 60 * 1000;
+
+fn agent_view(agent: Agent, activity: &HashMap<AgentId, AgentActivity>) -> AgentView {
+    let runs = activity.get(&agent.id);
     AgentView {
         id: agent.id,
         workspace_id: agent.workspace_id,
@@ -81,10 +99,8 @@ fn agent_view(agent: Agent) -> AgentView {
         instructions: agent.instructions,
         status: agent.status,
         grant_count: agent.grant_count,
-        // Runs arrive with the run engine (milestone 4, step 3); until then an
-        // agent has run none.
-        runs_last_24h: 0,
-        last_run_at: None,
+        runs_last_24h: runs.map_or(0, |runs| runs.runs_since),
+        last_run_at: runs.and_then(|runs| runs.last_run_at),
         created_at: agent.created_at,
         updated_at: agent.updated_at,
     }
@@ -221,9 +237,13 @@ async fn list_agents(
         .list_agents(access.access.organization_id, access.workspace.id)
         .await
         .map_err(|error| agent_failure(error, "this installation"))?;
+    let activity = activity(&state, &access).await?;
     Ok(envelope(
         StatusCode::OK,
-        agents.into_iter().map(agent_view).collect::<Vec<_>>(),
+        agents
+            .into_iter()
+            .map(|agent| agent_view(agent, &activity))
+            .collect::<Vec<_>>(),
     ))
 }
 
@@ -235,7 +255,8 @@ async fn get_agent(
 ) -> Result<Response, Failure> {
     let access = WorkspaceAccess::resolve(&state, caller, &headers, &ws).await?;
     let agent = find(&state, &access, &agent).await?;
-    Ok(envelope(StatusCode::OK, agent_view(agent)))
+    let activity = activity(&state, &access).await?;
+    Ok(envelope(StatusCode::OK, agent_view(agent, &activity)))
 }
 
 /// A name: trimmed, 1 to 60 characters.
@@ -326,7 +347,8 @@ async fn create_agent(
         )
         .await
         .map_err(|error| agent_failure(error, "this installation"))?;
-    Ok(envelope(StatusCode::CREATED, agent_view(agent)))
+    // A new agent has run nothing.
+    Ok(envelope(StatusCode::CREATED, agent_view(agent, &HashMap::new())))
 }
 
 async fn update_agent(
@@ -378,7 +400,8 @@ async fn update_agent(
         )
         .await
         .map_err(|error| agent_failure(error, "this installation"))?;
-    Ok(envelope(StatusCode::OK, agent_view(updated)))
+    let activity = activity(&state, &access).await?;
+    Ok(envelope(StatusCode::OK, agent_view(updated, &activity)))
 }
 
 async fn delete_agent(

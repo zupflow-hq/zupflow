@@ -92,6 +92,12 @@ impl Server {
             installations: Arc::new(zupflow_sqlite::SqliteInstallationStore::new(database.clone())),
             agents: Arc::new(zupflow_sqlite::SqliteAgentStore::new(database.clone())),
             policies: Arc::new(zupflow_sqlite::SqliteToolPolicyStore::new(database.clone())),
+            runs: Arc::new(zupflow_sqlite::SqliteRunStore::new(database.clone())),
+            provider: Arc::new(zupflow_basic::scripted_model::ScriptedModel::default()),
+            approvals: Arc::new(zupflow_basic::configured_policy::ConfiguredPolicy::new(Arc::new(
+                zupflow_sqlite::SqliteToolPolicyStore::new(database.clone()),
+            ))),
+            events: Arc::new(zupflow_basic::in_process_events::InProcessEventBus::default()),
             models: Arc::new(zupflow_basic::configured_models::ConfiguredModels::none()),
             connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
             jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),

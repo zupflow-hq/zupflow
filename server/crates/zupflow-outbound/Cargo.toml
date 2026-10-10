@@ -20,4 +20,5 @@ zupflow-core.workspace = true
 [dev-dependencies]
 axum.workspace = true
 futures-util = "0.3"
+zupflow-conformance.workspace = true
 zeroize.workspace = true

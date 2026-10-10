@@ -543,4 +543,14 @@ mod tests {
             Err(OutboundError::Unreachable)
         );
     }
+
+    #[tokio::test]
+    async fn passes_the_conformance_suite() {
+        zupflow_conformance::outbound_http::refusals(&SafeHttpClient::new().unwrap()).await;
+        let loopback = SafeHttpClient::with_policy(Policy {
+            loopback_for_tests: true,
+        })
+        .unwrap();
+        zupflow_conformance::outbound_http::answers(&loopback).await;
+    }
 }

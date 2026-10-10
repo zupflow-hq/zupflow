@@ -48,7 +48,7 @@ pub struct AppState {
     pub connect: Arc<dyn ConnectStore>,
     /// Seals the secrets Zupflow holds (decision 0033).
     pub keys: Arc<dyn KeyService>,
-    /// Background work: tool discovery, for now.
+    /// Background work: tool discovery and runs.
     pub jobs: Arc<dyn zupflow_core::jobs::JobQueue>,
     /// The tools apps' MCP servers list, pinned (decision 0038).
     pub tools: Arc<dyn zupflow_core::tools::ToolRegistry>,
@@ -63,6 +63,15 @@ pub struct AppState {
     pub api_key_hasher: Arc<ApiKeyHasher>,
     pub idempotency: Arc<dyn IdempotencyStore>,
     pub fingerprinter: Arc<Fingerprinter>,
+    /// Runs, their timelines and their calls (milestone 4).
+    pub runs: Arc<dyn zupflow_core::runs::RunStore>,
+    /// Answers each turn of a run: the scripted model, unless a deployment
+    /// brings another.
+    pub provider: Arc<dyn zupflow_core::models::ModelProvider>,
+    /// Decides each tool call, inside the floor (decision 0040).
+    pub approvals: Arc<dyn zupflow_core::policy::ApprovalPolicy>,
+    /// Announces run events to listeners in this process.
+    pub events: Arc<dyn zupflow_core::events::EventBus>,
 }
 
 /// A store failure the caller can do nothing about: the database is a

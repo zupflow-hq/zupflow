@@ -127,14 +127,42 @@ of a catalog app's installation is held inside the levels in force
 rewrites no grant. Owners, admins and API keys accept a changed tool's latest
 definition, exactly as reviewed (`409 stale_definition` otherwise), which pins
 it. `ConfiguredPolicy` in `zupflow-basic` is the built-in `ApprovalPolicy`
-that will decide each call once the run engine exists; it fails closed,
-requiring approval when its configuration can't be read.
+that decides each call a run makes; it fails closed, requiring approval when
+its configuration can't be read.
 
 The models are the deployment's to list, in `ZUPFLOW_MODELS`: a JSON array
 of `{"id", "name", "provider", "description"}` objects in the order to offer
 them (`description` optional; IDs of letters, digits and `. - _ : / @`, each
 once; any other field refused). Unset, or `[]`, offers none, and creating an
-agent is refused until one is listed. Nothing calls a model yet.
+agent is refused until one is listed. No model provider ships with Zupflow
+(`ModelProvider` is a trait, with a conformance suite), and none answers runs
+unless one is configured: by default every run fails `model_unavailable`.
+For local work, `ZUPFLOW_MODEL_PROVIDER=scripted` answers runs with the
+scripted model in `zupflow-basic`, which serves the listed IDs and calls a
+tool for each line `call <tool> <json-object>` of a run's input (otherwise it
+answers `You said: …`), so runs are deterministic. Never use it in a
+deployment: it turns what a run's input says into tool calls. Any other value
+stops startup; the server logs which applies.
+
+Runs are served: started (`403 console_read_only_in_production` for a
+Console session in Production, `422 agent_paused`), listed per workspace and
+across the organization, read with their timelines, and cancelled. A worker
+in the same process takes each run through the run engine: every turn, the
+model is offered the agent's granted tools that neither the floor nor the
+policy refuses; each call it asks for is decided again (floor, then policy)
+and recorded with its policy, mode and rule; allowed calls go to the
+installation's MCP server through the safe outbound path with its credential
+injected last. A call that needs approval pauses the run until the
+organization's backend decides with an API key (`POST …/runs/{run}/approvals`;
+a Console session gets `403 approval_requires_api_key`); a denial goes back
+to the model as the call's result. A call is recorded as sent before it is
+sent, and decided again on what holds then (a call that now needs approval
+waits for it; one now refused isn't sent): one cut off by a restart is
+settled as unknown and never sent again. A denial's optional `reason` goes
+back to the model. A run no job takes forward any more (its last job died)
+is failed `run_unavailable` by the worker's periodic sweep.
+Each event is announced on the in-process event bus, to the workspace and to
+its environment.
 
 Once an installation connects, a background worker in the same process lists
 its app's tools from the app's MCP server (Streamable HTTP, through the safe

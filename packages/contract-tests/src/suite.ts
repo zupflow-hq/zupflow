@@ -299,8 +299,7 @@ export function contractSuite(target: Target) {
         await owner.grants.delete(acme.id, newAgent.id, newGrant.id);
         await owner.agents.delete(acme.id, newAgent.id);
 
-        // The rest of the API.
-        await owner.organizations.usage(org, "production");
+        // Runs, then the rest of the API.
         await owner.organizationRuns.list(org, { environment: "production" });
         const run = must((await owner.runs.list(acme.id)).items[0], "run in acme");
         await owner.runs.get(acme.id, run.id);
@@ -311,6 +310,7 @@ export function contractSuite(target: Target) {
         );
         const started = await owner.runs.create(sandbox.id, sandboxAgent.id, { input: "Hello" });
         await owner.runs.cancel(sandbox.id, started.id);
+        await owner.organizations.usage(org, "production");
 
         // Organization settings.
         await owner.webhooks.list(org);
@@ -1092,6 +1092,17 @@ export function contractSuite(target: Target) {
         const runs = await owner.organizationRuns.list(fx.organization, { environment: "sandbox", limit: 100 });
         expect(runs.items.length).toBeGreaterThan(0);
         expect(runs.items.every((r) => r.workspace.environment === "sandbox")).toBe(true);
+      });
+
+      it("refuses an environment that isn't one", async () => {
+        const error = await failure(
+          owner.organizationRuns.list(fx.organization, { environment: "staging" as unknown as "sandbox" }),
+        );
+        expect([error.status, error.code, Object.keys(error.fields ?? {})]).toEqual([
+          400,
+          "validation_failed",
+          ["environment"],
+        ]);
       });
     });
 

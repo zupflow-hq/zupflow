@@ -2698,6 +2698,8 @@ dependencies = [
 name = "zupflow-conformance"
 version = "0.0.0"
 dependencies = [
+ "axum",
+ "serde_json",
  "tokio",
  "zupflow-core",
 ]
@@ -2781,6 +2783,7 @@ dependencies = [
  "tokio",
  "tracing",
  "zeroize",
+ "zupflow-conformance",
  "zupflow-core",
 ]
 

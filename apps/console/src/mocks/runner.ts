@@ -278,6 +278,7 @@ export function resolveApproval(
   decision: "approved" | "denied",
   apiKeyId: ApiKeyId,
   at: string,
+  reason?: string,
 ) {
   pushEvent(db, run, at, "approval.resolved", {
     call_id: callId,
@@ -296,7 +297,10 @@ export function resolveApproval(
     if (skipped && skipped.kind === "tool_call") {
       run.plan.unshift({
         kind: "message",
-        text: `Skipping ${skipped.call.tool} on ${skipped.call.installation_label} — the request was denied.`,
+        // A denial's reason goes back to the model, which works with it.
+        text: reason?.trim()
+          ? `Skipping ${skipped.call.tool} on ${skipped.call.installation_label} — the request was denied: ${reason.trim()}`
+          : `Skipping ${skipped.call.tool} on ${skipped.call.installation_label} — the request was denied.`,
       });
     }
   }

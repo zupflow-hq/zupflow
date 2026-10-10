@@ -922,7 +922,18 @@ export const RunEvent = named(
 export type RunEvent = z.infer<typeof RunEvent>;
 export type RunEventType = RunEvent["type"];
 
-export const ResolveApprovalInput = z.object({ call_id: idSchema("tool_call"), decision: ApprovalDecision });
+/**
+ * The decision your product made on the call a run waits for. A denial's
+ * optional `reason` (trimmed, up to 500 characters) goes back to the agent's
+ * model as the call's result, so it can continue without it; without one, the
+ * model reads that a person denied the call. A reason with an approval is
+ * ignored.
+ */
+export const ResolveApprovalInput = z.object({
+  call_id: idSchema("tool_call"),
+  decision: ApprovalDecision,
+  reason: z.string().max(500).optional(),
+});
 export type ResolveApprovalInput = z.infer<typeof ResolveApprovalInput>;
 
 // ---------------------------------------------------------------------------

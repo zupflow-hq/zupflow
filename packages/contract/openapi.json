@@ -9397,6 +9397,10 @@
                       "approved",
                       "denied"
                     ]
+                  },
+                  "reason": {
+                    "type": "string",
+                    "maxLength": 500
                   }
                 },
                 "required": [

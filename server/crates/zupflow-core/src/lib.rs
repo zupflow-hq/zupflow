@@ -15,10 +15,11 @@
 //! - [`idempotency`]: idempotency keys for `POST`, and their store.
 //! - [`identity`]: Console sign-in, the [`identity::Identity`] trait.
 //! - [`installations`]: connected accounts, their sealed credentials and their store.
-//! - [`models`]: the models agents can use, the [`models::ModelCatalog`] trait.
+//! - [`models`]: the models agents can use and calling them: [`models::ModelCatalog`] and [`models::ModelProvider`].
 //! - [`outbound`]: the one path every outbound call takes, and which addresses are public.
 //! - [`policy`]: tool permissions: the organization's levels and the [`policy::ApprovalPolicy`] trait.
 //! - [`organizations`]: organizations, members and users, and their store.
+//! - [`runs`]: runs, their timelines and tool calls, and their store.
 //! - [`time`]: instants as stored and as the API writes them.
 //! - [`tools`]: the tools apps' MCP servers list, pinned, and their registry.
 //! - [`workspaces`]: workspaces and their store.
@@ -40,6 +41,7 @@ pub mod models;
 pub mod organizations;
 pub mod outbound;
 pub mod policy;
+pub mod runs;
 pub mod scope;
 pub mod storage;
 pub mod time;
