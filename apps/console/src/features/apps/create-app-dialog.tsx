@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import type { AppDefinition, AuthType, CreateAppInput, Environment } from "@zupflow/sdk";
-import { KeyRoundIcon, ShieldCheckIcon } from "lucide-react";
+import { KeyRoundIcon, LogInIcon, ShieldCheckIcon } from "lucide-react";
 import { useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
@@ -28,11 +28,16 @@ const schema = z.object({
   name: z.string().trim().min(1, "Name the app.").max(60),
   slug: z.string().regex(/^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/, "Use lowercase letters, numbers and hyphens."),
   description: z.string().trim().max(280),
-  auth_type: z.enum(["oauth2", "token"], { message: "Choose how accounts authenticate." }),
+  auth_type: z.enum(["mcp_oauth", "oauth2", "token"], { message: "Choose how accounts authenticate." }),
 });
 type Values = z.infer<typeof schema>;
 
 const AUTH: Record<AuthType, { title: string; body: string; icon: typeof KeyRoundIcon }> = {
+  mcp_oauth: {
+    title: "Sign in through the MCP server",
+    body: "Users sign in on the server's own screen. Zupflow finds its sign-in and registers a client; you set only the server URL.",
+    icon: LogInIcon,
+  },
   oauth2: {
     title: "OAuth",
     body: "Users approve access on the provider's consent screen. You register a client per environment.",
@@ -186,8 +191,7 @@ export function CreateAppDialog({
                     label="Authentication"
                     value={field.value}
                     onValueChange={field.onChange}
-                    className="sm:grid-cols-2"
-                    options={(["oauth2", "token"] as const).map((type) => {
+                    options={(["mcp_oauth", "oauth2", "token"] as const).map((type) => {
                       const a = AUTH[type];
                       return {
                         value: type,

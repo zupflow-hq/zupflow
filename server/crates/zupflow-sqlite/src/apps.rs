@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, Sqlite, Transaction};
 use zupflow_core::apps::{
-    App, AppChanges, AppError, AppKind, AppStore, AuthTemplate, Configuration, ConfigurationChanges, NewApp,
+    App, AppChanges, AppError, AppKind, AppStore, AuthTemplate, AuthorizationServer, ClientAuthentication,
+    ClientRegistration, ClientRegistrationId, Configuration, ConfigurationChanges, NewApp, NewClientRegistration,
     NewClientSecret, SecretState, StoredClientSecret,
 };
 use zupflow_core::environment::Environment;
@@ -211,6 +212,46 @@ fn stored_secret_from(row: &SqliteRow) -> Result<Option<StoredClientSecret>, App
         },
         version: u32::try_from(version).map_err(read)?,
     }))
+}
+
+/// The columns both registration tables share, as `registration_from` reads them.
+macro_rules! registration_columns {
+    () => {
+        "id, issuer, authorization_endpoint, token_endpoint, registration_endpoint, client_id, \
+         token_endpoint_auth_method, key_id, wrapped_key, nonce, ciphertext, created_at"
+    };
+}
+
+fn registration_from(row: &SqliteRow) -> Result<ClientRegistration, AppError> {
+    let method: String = row.try_get("token_endpoint_auth_method").map_err(read)?;
+    let ciphertext: Option<Vec<u8>> = row.try_get("ciphertext").map_err(read)?;
+    let sealed = match ciphertext {
+        None => None,
+        Some(ciphertext) => {
+            let nonce: Vec<u8> = row.try_get("nonce").map_err(read)?;
+            Some(Sealed {
+                wrapped_key: WrappedKey {
+                    key_id: row.try_get("key_id").map_err(read)?,
+                    bytes: row.try_get("wrapped_key").map_err(read)?,
+                },
+                nonce: nonce.try_into().map_err(|_| read("a nonce of the wrong length"))?,
+                ciphertext,
+            })
+        }
+    };
+    Ok(ClientRegistration {
+        id: ClientRegistrationId::from_uuid(row.try_get("id").map_err(read)?),
+        server: AuthorizationServer {
+            issuer: row.try_get("issuer").map_err(read)?,
+            authorization_endpoint: row.try_get("authorization_endpoint").map_err(read)?,
+            token_endpoint: row.try_get("token_endpoint").map_err(read)?,
+            registration_endpoint: row.try_get("registration_endpoint").map_err(read)?,
+        },
+        client_id: row.try_get("client_id").map_err(read)?,
+        authentication: ClientAuthentication::parse(&method).ok_or_else(|| read("an unknown authentication"))?,
+        sealed,
+        created_at: Timestamp::from_millis(row.try_get("created_at").map_err(read)?),
+    })
 }
 
 /// The values a write binds, in the order both upserts take them.
@@ -827,6 +868,175 @@ impl AppStore for SqliteAppStore {
         .await
         .map_err(failed("find_workspace_client_secret"))?;
         Ok(row.as_ref().map(stored_secret_from).transpose()?.flatten())
+    }
+
+    async fn find_organization_client_registration(
+        &self,
+        organization_id: OrganizationId,
+        app_id: AppId,
+        environment: Environment,
+        issuer: &str,
+    ) -> Result<Option<ClientRegistration>, AppError> {
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            registration_columns!(),
+            " FROM oauth_client_registrations \
+             WHERE organization_id = ? AND app_id = ? AND environment = ? AND issuer = ?"
+        ))
+        .bind(organization_id.uuid())
+        .bind(app_id.uuid())
+        .bind(environment.as_str())
+        .bind(issuer)
+        .fetch_optional(self.database.pool())
+        .await
+        .map_err(failed("find_organization_client_registration"))?;
+        row.as_ref().map(registration_from).transpose()
+    }
+
+    async fn save_organization_client_registration(
+        &self,
+        organization_id: OrganizationId,
+        app_id: AppId,
+        environment: Environment,
+        registration: &NewClientRegistration,
+    ) -> Result<ClientRegistration, AppError> {
+        let mut transaction = self.immediate().await?;
+        let sealed = registration.sealed.as_ref();
+        // Inserted only for an app of this catalog, and kept only if the
+        // first at its issuer: a concurrent first registration keeps the other's.
+        sqlx::query(
+            "INSERT INTO oauth_client_registrations (id, organization_id, app_id, environment, issuer, \
+             authorization_endpoint, token_endpoint, registration_endpoint, client_id, token_endpoint_auth_method, \
+             key_id, wrapped_key, nonce, ciphertext, created_at) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM apps WHERE organization_id = ? AND id = ? \
+             ON CONFLICT (organization_id, app_id, environment, issuer) DO NOTHING",
+        )
+        .bind(registration.id.uuid())
+        .bind(organization_id.uuid())
+        .bind(app_id.uuid())
+        .bind(environment.as_str())
+        .bind(&registration.server.issuer)
+        .bind(&registration.server.authorization_endpoint)
+        .bind(&registration.server.token_endpoint)
+        .bind(&registration.server.registration_endpoint)
+        .bind(&registration.client_id)
+        .bind(registration.authentication.as_str())
+        .bind(sealed.map(|sealed| sealed.wrapped_key.key_id.as_str()))
+        .bind(sealed.map(|sealed| sealed.wrapped_key.bytes.as_slice()))
+        .bind(sealed.map(|sealed| sealed.nonce.as_slice()))
+        .bind(sealed.map(|sealed| sealed.ciphertext.as_slice()))
+        .bind(Timestamp::now().millis())
+        .bind(organization_id.uuid())
+        .bind(app_id.uuid())
+        .execute(&mut *transaction)
+        .await
+        .map_err(failed("insert_organization_client_registration"))?;
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            registration_columns!(),
+            " FROM oauth_client_registrations \
+             WHERE organization_id = ? AND app_id = ? AND environment = ? AND issuer = ?"
+        ))
+        .bind(organization_id.uuid())
+        .bind(app_id.uuid())
+        .bind(environment.as_str())
+        .bind(&registration.server.issuer)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(failed("read_organization_client_registration"))?;
+        transaction
+            .commit()
+            .await
+            .map_err(failed("commit_organization_client_registration"))?;
+        // Nothing kept: the app isn't in this organization's catalog.
+        row.as_ref()
+            .map(registration_from)
+            .transpose()?
+            .ok_or(AppError::NotFound)
+    }
+
+    async fn find_workspace_client_registration(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        app_id: AppId,
+        issuer: &str,
+    ) -> Result<Option<ClientRegistration>, AppError> {
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            registration_columns!(),
+            " FROM workspace_oauth_client_registrations \
+             WHERE organization_id = ? AND workspace_id = ? AND app_id = ? AND issuer = ?"
+        ))
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(app_id.uuid())
+        .bind(issuer)
+        .fetch_optional(self.database.pool())
+        .await
+        .map_err(failed("find_workspace_client_registration"))?;
+        row.as_ref().map(registration_from).transpose()
+    }
+
+    async fn save_workspace_client_registration(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        app_id: AppId,
+        registration: &NewClientRegistration,
+    ) -> Result<ClientRegistration, AppError> {
+        let mut transaction = self.immediate().await?;
+        let sealed = registration.sealed.as_ref();
+        sqlx::query(
+            "INSERT INTO workspace_oauth_client_registrations (id, organization_id, workspace_id, app_id, issuer, \
+             authorization_endpoint, token_endpoint, registration_endpoint, client_id, token_endpoint_auth_method, \
+             key_id, wrapped_key, nonce, ciphertext, created_at) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM workspace_apps \
+             WHERE organization_id = ? AND workspace_id = ? AND id = ? \
+             ON CONFLICT (organization_id, workspace_id, app_id, issuer) DO NOTHING",
+        )
+        .bind(registration.id.uuid())
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(app_id.uuid())
+        .bind(&registration.server.issuer)
+        .bind(&registration.server.authorization_endpoint)
+        .bind(&registration.server.token_endpoint)
+        .bind(&registration.server.registration_endpoint)
+        .bind(&registration.client_id)
+        .bind(registration.authentication.as_str())
+        .bind(sealed.map(|sealed| sealed.wrapped_key.key_id.as_str()))
+        .bind(sealed.map(|sealed| sealed.wrapped_key.bytes.as_slice()))
+        .bind(sealed.map(|sealed| sealed.nonce.as_slice()))
+        .bind(sealed.map(|sealed| sealed.ciphertext.as_slice()))
+        .bind(Timestamp::now().millis())
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(app_id.uuid())
+        .execute(&mut *transaction)
+        .await
+        .map_err(failed("insert_workspace_client_registration"))?;
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            registration_columns!(),
+            " FROM workspace_oauth_client_registrations \
+             WHERE organization_id = ? AND workspace_id = ? AND app_id = ? AND issuer = ?"
+        ))
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(app_id.uuid())
+        .bind(&registration.server.issuer)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(failed("read_workspace_client_registration"))?;
+        transaction
+            .commit()
+            .await
+            .map_err(failed("commit_workspace_client_registration"))?;
+        row.as_ref()
+            .map(registration_from)
+            .transpose()?
+            .ok_or(AppError::NotFound)
     }
 }
 

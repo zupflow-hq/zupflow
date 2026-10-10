@@ -675,6 +675,152 @@ export function contractSuite(target: Target) {
         });
       });
 
+      describe("sign-in through the MCP server", () => {
+        const signIn = { kind: "mcp", description: "", auth_type: "mcp_oauth" } as const;
+
+        it("starts blank, at both levels, and keeps its type", async () => {
+          const ws = fx.workspaces.qaPlayground.id;
+          const catalog = await owner.organizationApps.create(fx.organization, {
+            ...signIn,
+            name: "Ledger",
+            slug: "ledger",
+          });
+          const own = await owner.workspaceApps.create(ws, { ...signIn, name: "Ledger", slug: "ledger" });
+          for (const app of [catalog, own]) {
+            expect(app.auth).toEqual({ type: "mcp_oauth", scopes: [], identity_url: null });
+          }
+          const auth: AuthTemplate = {
+            type: "mcp_oauth",
+            scopes: [{ name: "read", description: "Read entries" }],
+            identity_url: " https://ledger.provider.example/me ",
+          };
+          const updated = await owner.organizationApps.update(fx.organization, catalog.id, { auth });
+          expect(updated.auth).toEqual({ ...auth, identity_url: "https://ledger.provider.example/me" });
+          expect(updated.version).toBe(catalog.version + 1);
+          const insecure = await failure(
+            owner.workspaceApps.update(ws, own.id, {
+              auth: { ...auth, identity_url: "http://ledger.provider.example/me" },
+            }),
+          );
+          expect([insecure.code, Object.keys(insecure.fields ?? {})]).toEqual(["insecure_url", ["auth.identity_url"]]);
+          const retyped = await failure(
+            owner.organizationApps.update(fx.organization, catalog.id, {
+              auth: {
+                type: "oauth2",
+                authorize_url: null,
+                token_url: null,
+                identity_url: null,
+                available_scopes: [],
+                pkce: true,
+              },
+            }),
+          );
+          expect([retyped.status, retyped.code]).toEqual([422, "auth_type_immutable"]);
+        });
+
+        it("is ready with only its server, and has no OAuth client to configure", async () => {
+          const app = await owner.organizationApps.create(fx.organization, {
+            ...signIn,
+            name: "Ledger",
+            slug: "ledger-ready",
+          });
+          const blank = await owner.organizationApps.getConfiguration(fx.organization, app.id, "sandbox");
+          expect([blank.status, blank.missing, blank.oauth]).toEqual(["unconfigured", ["mcp_server_url"], null]);
+          for (const input of [
+            { oauth_client_id: "client" },
+            { oauth_client_secret: "a-long-client-secret" },
+            { oauth_scopes: ["read"] },
+          ]) {
+            const error = await failure(
+              owner.organizationApps.updateConfiguration(fx.organization, app.id, "sandbox", input),
+            );
+            expect([error.status, error.code]).toEqual([422, "oauth_not_supported"]);
+          }
+          const ready = await owner.organizationApps.updateConfiguration(fx.organization, app.id, "sandbox", {
+            mcp_server_url: "https://ledger.provider.example/mcp",
+          });
+          expect([ready.status, ready.missing, ready.oauth]).toEqual(["ready", [], null]);
+          const offered = await owner.workspaceApps.available(fx.workspaces.qaPlayground.id);
+          expect(offered.find((a) => a.app.id === app.id)?.configuration.status).toBe("ready");
+        });
+
+        it("keeps its identity URL on the MCP server", async () => {
+          const ws = fx.workspaces.qaPlayground.id;
+          const catalog = await owner.organizationApps.create(fx.organization, {
+            ...signIn,
+            name: "Ledger",
+            slug: "ledger-identity",
+          });
+          const own = await owner.workspaceApps.create(ws, { ...signIn, name: "Ledger", slug: "ledger-identity" });
+          await owner.organizationApps.updateConfiguration(fx.organization, catalog.id, "sandbox", {
+            mcp_server_url: "https://ledger.provider.example/mcp",
+          });
+          await owner.workspaceApps.updateConfiguration(ws, own.id, {
+            mcp_server_url: "https://ledger.provider.example/mcp",
+          });
+          const naming = (identity_url: string): AuthTemplate => ({ type: "mcp_oauth", scopes: [], identity_url });
+          for (const elsewhere of ["https://accounts.provider.example/me", "https://ledger.provider.example:8443/me"]) {
+            const refused = await failure(
+              owner.organizationApps.update(fx.organization, catalog.id, { auth: naming(elsewhere) }),
+            );
+            expect([refused.status, refused.code, refused.fields]).toEqual([
+              422,
+              "identity_off_server",
+              {
+                "auth.identity_url":
+                  "Use an address on https://ledger.provider.example, the Sandbox configuration's MCP server.",
+              },
+            ]);
+            const ownRefused = await failure(owner.workspaceApps.update(ws, own.id, { auth: naming(elsewhere) }));
+            expect([ownRefused.status, ownRefused.code]).toEqual([422, "identity_off_server"]);
+          }
+          for (const updated of [
+            await owner.organizationApps.update(fx.organization, catalog.id, {
+              auth: naming("https://LEDGER.provider.example:443/v2/me"),
+            }),
+            await owner.workspaceApps.update(ws, own.id, { auth: naming("https://ledger.provider.example/me") }),
+          ]) {
+            expect(updated.auth.type === "mcp_oauth" && updated.auth.identity_url).toMatch(
+              /^https:\/\/ledger\.provider\.example/i,
+            );
+          }
+        });
+
+        it("asks for its template's scopes, and takes no pasted credential", async () => {
+          const app = await owner.organizationApps.create(fx.organization, {
+            ...signIn,
+            name: "Ledger",
+            slug: "ledger-scopes",
+          });
+          await owner.organizationApps.update(fx.organization, app.id, {
+            auth: {
+              type: "mcp_oauth",
+              scopes: [
+                { name: "read", description: "" },
+                { name: "write", description: "" },
+              ],
+              identity_url: null,
+            },
+          });
+          await owner.organizationApps.updateConfiguration(fx.organization, app.id, "sandbox", {
+            mcp_server_url: "https://ledger.provider.example/mcp",
+          });
+          const session = await owner.connectSessions.create(fx.workspaces.qaPlayground.id, {
+            app_id: app.id,
+            intent: "create",
+            label: "Books",
+            installation_id: null,
+            return_url: null,
+          });
+          expect(session.requested_scopes).toEqual(["read", "write"]);
+          expect(session.app.auth_type).toBe("mcp_oauth");
+          const pasted = await failure(
+            owner.connect.submitCredentials(referenceOf(session), { values: { token: "t" } }),
+          );
+          expect([pasted.status, pasted.code]).toEqual([422, "wrong_auth_type"]);
+        });
+      });
+
       it("never returns a stored client secret", async () => {
         const config = await owner.organizationApps.updateConfiguration(fx.organization, fx.apps.notion, "production", {
           mcp_server_url: "https://mcp.notion.example/mcp",

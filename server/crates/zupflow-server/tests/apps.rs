@@ -132,7 +132,10 @@ async fn checks_what_an_app_is_created_with() {
     let fields = body["error"]["fields"].as_object().unwrap();
     let named: Vec<&str> = fields.keys().map(String::as_str).collect();
     assert_eq!(named, ["auth_type", "description", "kind", "name", "slug"]);
-    assert_eq!(fields["auth_type"], "Choose OAuth or token.");
+    assert_eq!(
+        fields["auth_type"],
+        "Choose OAuth, sign-in through the MCP server, or token."
+    );
 
     let mut wrong = app("ok", "basic");
     wrong["description"] = json!("x".repeat(281));
@@ -141,7 +144,7 @@ async fn checks_what_an_app_is_created_with() {
     assert_eq!(
         body["error"]["fields"],
         json!({
-            "auth_type": "Choose OAuth or token.",
+            "auth_type": "Choose OAuth, sign-in through the MCP server, or token.",
             "description": "Use 280 characters or fewer.",
             "slug": "Use 1–40 lowercase letters, numbers and hyphens.",
         })
@@ -521,7 +524,7 @@ async fn checks_a_new_template_field_by_field() {
         (status, &body["error"]["fields"]),
         (
             StatusCode::BAD_REQUEST,
-            &json!({ "auth.type": "Choose oauth2 or token." })
+            &json!({ "auth.type": "Choose oauth2, mcp_oauth or token." })
         )
     );
 

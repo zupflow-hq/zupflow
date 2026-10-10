@@ -8,7 +8,7 @@
 //! then the workspace.
 
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::apps::AuthTemplate;
 use crate::environment::Environment;
@@ -85,6 +85,21 @@ pub struct AccountConnection {
 pub struct TemplateSnapshot {
     pub auth: AuthTemplate,
     pub app_version: u32,
+    /// For an `mcp_oauth` app, what its sign-in discovered and signed in as;
+    /// `None` for every other type.
+    pub client: Option<DiscoveredClient>,
+}
+
+/// Where an `mcp_oauth` installation signed in (decision 0039): the
+/// authorization server's issuer and token endpoint as discovered, the
+/// client registered there, and the MCP server the token was requested for
+/// (RFC 8707). A refresh goes here, and the token goes only to `resource`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredClient {
+    pub issuer: String,
+    pub token_endpoint: String,
+    pub client_id: String,
+    pub resource: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

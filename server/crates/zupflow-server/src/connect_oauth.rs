@@ -9,6 +9,13 @@
 //! once; everything after uses the session's own organization and workspace.
 //! The callback answers a redirect to the hosted page, which shows what came
 //! of it: the session completed, or failed with a code.
+//!
+//! An `mcp_oauth` app (decision 0039) has no endpoints or client of its own:
+//! each start discovers the MCP server's authorization server, and uses the
+//! client registered there for this app and environment (a workspace app's,
+//! for its workspace), registering one on first use. PKCE is always used, and
+//! both requests name the MCP server as the `resource`. What the start
+//! discovered travels to the callback sealed with the verifier.
 
 use std::collections::BTreeMap;
 
@@ -21,20 +28,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
-use zupflow_core::apps::{App, AuthTemplate, Configuration, OAuthScope};
+use zupflow_core::apps::{
+    App, AppError, AuthTemplate, AuthorizationServer, ClientAuthentication, ClientRegistration, ClientRegistrationId,
+    Configuration, NewClientRegistration, OAuthScope,
+};
 use zupflow_core::connect::{
     Authorization, Completion, ConnectError, ConnectIntent, ConnectSession, ConnectSessionStatus, OAuthState,
     Reference, ReferenceHash,
 };
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::InstallationId;
-use zupflow_core::installations::{ConnectedAccount, InstalledApp, NewCredential, TemplateSnapshot};
+use zupflow_core::installations::{ConnectedAccount, DiscoveredClient, InstalledApp, NewCredential, TemplateSnapshot};
 use zupflow_core::keys::{self, EncryptionContext};
 use zupflow_core::outbound::{Credential, Limits, Method, OutboundRequest};
 use zupflow_core::time::Timestamp;
+use zupflow_mcp::sign_in::{self, SignInError};
 
-use crate::app_configurations::redirect_uri;
+use crate::app_configurations::{check_public_https, redirect_uri};
 use crate::auth::AppState;
+use crate::auth_templates::same_origin;
 use crate::connect::{attributed, connect_failure, not_pending, still_eligible};
 use crate::http::{Failure, envelope};
 
@@ -49,6 +61,8 @@ struct AuthorizeView {
 struct Sealing<'a> {
     reference: &'a str,
     verifier: Option<&'a str>,
+    /// For an `mcp_oauth` app: where the start signed in, and as whom.
+    client: Option<&'a DiscoveredClient>,
 }
 
 /// [`Sealing`], opened.
@@ -56,6 +70,17 @@ struct Sealing<'a> {
 struct Pending {
     reference: String,
     verifier: Option<String>,
+    #[serde(default)]
+    client: Option<DiscoveredClient>,
+}
+
+/// What a start sends the browser to, and as which client.
+struct Consent {
+    authorize_url: String,
+    client_id: String,
+    pkce: bool,
+    /// For an `mcp_oauth` app: its server, the `resource` both requests name.
+    client: Option<DiscoveredClient>,
 }
 
 /// A PKCE verifier: two references, 64 base62 characters (RFC 7636 asks for
@@ -106,32 +131,46 @@ pub async fn authorize(State(state): State<AppState>, Path(reference): Path<Stri
         return Err(not_pending(status));
     }
     let (app, configuration) = still_eligible(&state, &session).await?;
-    let AuthTemplate::OAuth2 {
-        authorize_url,
-        token_url,
-        pkce,
-        ..
-    } = &app.auth
-    else {
-        return Err(ApiError::new(422, "wrong_auth_type", format!("{} connects with a token.", app.name)).into());
-    };
-    let (Some(authorize_url), Some(_)) = (authorize_url, token_url) else {
-        return Err(endpoints_missing(&app));
-    };
-    let Some(client_id) = &configuration.oauth_client_id else {
-        // A ready OAuth configuration has one.
-        tracing::error!(event = "connect.oauth_without_client_id", app_id = %app.id);
-        return Err(ApiError::internal().into());
+    let consent = match &app.auth {
+        AuthTemplate::OAuth2 {
+            authorize_url,
+            token_url,
+            pkce,
+            ..
+        } => {
+            let (Some(authorize_url), Some(_)) = (authorize_url, token_url) else {
+                return Err(endpoints_missing(&app));
+            };
+            let Some(client_id) = &configuration.oauth_client_id else {
+                // A ready OAuth configuration has one.
+                tracing::error!(event = "connect.oauth_without_client_id", app_id = %app.id);
+                return Err(ApiError::internal().into());
+            };
+            Consent {
+                authorize_url: authorize_url.clone(),
+                client_id: client_id.clone(),
+                pkce: *pkce,
+                client: None,
+            }
+        }
+        AuthTemplate::McpOAuth { .. } => match signed_in_consent(&state, &session, &app, &configuration).await {
+            Ok(consent) => consent,
+            Err(Failed(code)) => return Err(failed_start(&state, &session, &app, code).await),
+        },
+        AuthTemplate::Token { .. } => {
+            return Err(ApiError::new(422, "wrong_auth_type", format!("{} connects with a token.", app.name)).into());
+        }
     };
     let Some(attempt) = session.authorization_attempt.checked_add(1) else {
         return Err(ApiError::internal().into());
     };
 
     let oauth_state = OAuthState::generate().map_err(connect_failure)?;
-    let verifier = if *pkce { Some(verifier()?) } else { None };
+    let verifier = if consent.pkce { Some(verifier()?) } else { None };
     let sealing = Sealing {
         reference: &reference,
         verifier: verifier.as_deref().map(String::as_str),
+        client: consent.client.as_ref(),
     };
     let plaintext = Zeroizing::new(serde_json::to_vec(&sealing).map_err(|_| Failure(ApiError::internal()))?);
     let sealed = keys::seal(
@@ -175,8 +214,8 @@ pub async fn authorize(State(state): State<AppState>, Path(reference): Path<Stri
         Err(error) => return Err(connect_failure(error)),
     }
 
-    // Checked when the app saved its template (decision 0035).
-    let mut url = url::Url::parse(authorize_url).map_err(|_| {
+    // Checked when the app saved its template (decision 0035), or by discovery.
+    let mut url = url::Url::parse(&consent.authorize_url).map_err(|_| {
         tracing::error!(event = "connect.authorize_url_unparseable", app_id = %app.id);
         Failure(ApiError::internal())
     })?;
@@ -184,7 +223,7 @@ pub async fn authorize(State(state): State<AppState>, Path(reference): Path<Stri
         let mut query = url.query_pairs_mut();
         query
             .append_pair("response_type", "code")
-            .append_pair("client_id", client_id)
+            .append_pair("client_id", &consent.client_id)
             .append_pair("redirect_uri", &redirect_uri(&state.public_url))
             .append_pair("state", oauth_state.expose());
         if !session.requested_scopes.is_empty() {
@@ -195,6 +234,10 @@ pub async fn authorize(State(state): State<AppState>, Path(reference): Path<Stri
                 .append_pair("code_challenge", &challenge(verifier))
                 .append_pair("code_challenge_method", "S256");
         }
+        // RFC 8707: the token is for this server alone.
+        if let Some(client) = &consent.client {
+            query.append_pair("resource", &client.resource);
+        }
     }
     Ok(envelope(
         StatusCode::OK,
@@ -202,6 +245,337 @@ pub async fn authorize(State(state): State<AppState>, Path(reference): Path<Stri
             authorization_url: url.into(),
         },
     ))
+}
+
+// --- Sign-in through the MCP server (decision 0039) -------------------------
+
+/// What a registration was issued beside its client ID, sealed as one value.
+#[derive(Serialize)]
+struct Issuing<'a> {
+    client_secret: Option<&'a str>,
+    registration_access_token: Option<&'a str>,
+}
+
+/// [`Issuing`], opened.
+#[derive(Deserialize)]
+struct Issued {
+    client_secret: Option<String>,
+    registration_access_token: Option<String>,
+}
+
+fn registration_context(session: &ConnectSession, registration: ClientRegistrationId) -> EncryptionContext {
+    let workspace_id = matches!(session.app, InstalledApp::Workspace(_)).then_some(session.workspace_id);
+    EncryptionContext::oauth_client_registration(
+        session.organization_id,
+        workspace_id,
+        session.environment,
+        session.app.id(),
+        registration,
+    )
+}
+
+/// The client registered at `issuer` for the session's app: in its
+/// environment for a catalog app, in its workspace for a workspace app.
+async fn find_registration(
+    state: &AppState,
+    session: &ConnectSession,
+    issuer: &str,
+) -> Result<Option<ClientRegistration>, AppError> {
+    match session.app {
+        InstalledApp::Catalog(id) => {
+            state
+                .apps
+                .find_organization_client_registration(session.organization_id, id, session.environment, issuer)
+                .await
+        }
+        InstalledApp::Workspace(id) => {
+            state
+                .apps
+                .find_workspace_client_registration(session.organization_id, session.workspace_id, id, issuer)
+                .await
+        }
+    }
+}
+
+/// Why sign-in through the server can't start: unreachable, or unusable.
+/// The server's own words are never logged, only what was wrong.
+fn sign_in_failure(app: &App, error: SignInError) -> Failed {
+    match error {
+        SignInError::Unavailable => {
+            tracing::warn!(event = "connect.sign_in_unavailable", app_id = %app.id);
+            Failed("provider_unavailable")
+        }
+        SignInError::Unsupported(why) => {
+            tracing::warn!(event = "connect.discovery_failed", app_id = %app.id, why);
+            Failed("discovery_failed")
+        }
+    }
+}
+
+/// Finds the MCP server's authorization server, and the client to sign in
+/// as there, registering one on first use. Nothing discovered is cached: it
+/// is recorded on the registration and travels to the callback sealed.
+async fn signed_in_consent(
+    state: &AppState,
+    session: &ConnectSession,
+    app: &App,
+    configuration: &Configuration,
+) -> Result<Consent, Failed> {
+    let Some(resource) = &configuration.mcp_server_url else {
+        return Err(Failed("configuration_not_ready"));
+    };
+    // The template was checked against the server when it was saved; the
+    // configuration may name another server since.
+    if let AuthTemplate::McpOAuth {
+        identity_url: Some(identity_url),
+        ..
+    } = &app.auth
+        && !same_origin(identity_url, resource)
+    {
+        tracing::warn!(event = "connect.identity_off_server", app_id = %app.id);
+        return Err(Failed("identity_off_server"));
+    }
+    // One deadline for discovery and registration together, so a slow
+    // server can't hold the request past its idempotency key's lock.
+    let deadline = tokio::time::Instant::now() + sign_in::SIGN_IN_BUDGET;
+    let server = sign_in::discover(state.outbound.as_ref(), resource, deadline)
+        .await
+        .map_err(|error| sign_in_failure(app, error))?;
+    // The browser goes there: it must pass what a configured authorization URL does.
+    if !public_https(&server.authorization_endpoint) {
+        tracing::warn!(event = "connect.discovery_failed", app_id = %app.id, why = "an authorization endpoint on a private host");
+        return Err(Failed("discovery_failed"));
+    }
+    let registration = match find_registration(state, session, &server.issuer).await {
+        Ok(Some(registration)) => registration,
+        Ok(None) => register(state, session, app, &server, deadline).await?,
+        Err(_) => return Err(Failed("unavailable")),
+    };
+    Ok(Consent {
+        authorize_url: server.authorization_endpoint.clone(),
+        client_id: registration.client_id.clone(),
+        pkce: true,
+        client: Some(DiscoveredClient {
+            issuer: server.issuer,
+            token_endpoint: server.token_endpoint,
+            client_id: registration.client_id,
+            resource: resource.clone(),
+        }),
+    })
+}
+
+/// Registers a client at `server` and keeps it, unless a concurrent start
+/// kept one first: then that one is used, and this one never is.
+async fn register(
+    state: &AppState,
+    session: &ConnectSession,
+    app: &App,
+    server: &AuthorizationServer,
+    deadline: tokio::time::Instant,
+) -> Result<ClientRegistration, Failed> {
+    let registered = sign_in::register(
+        state.outbound.as_ref(),
+        server,
+        &redirect_uri(&state.public_url),
+        deadline,
+    )
+    .await
+    .map_err(|error| sign_in_failure(app, error))?;
+    let id = ClientRegistrationId::generate();
+    let sealed = match (&registered.client_secret, &registered.registration_access_token) {
+        (None, None) => None,
+        (client_secret, registration_access_token) => {
+            let issuing = Issuing {
+                client_secret: client_secret.as_deref().map(String::as_str),
+                registration_access_token: registration_access_token.as_deref().map(String::as_str),
+            };
+            let plaintext = Zeroizing::new(serde_json::to_vec(&issuing).map_err(|_| Failed("unavailable"))?);
+            let sealed = keys::seal(state.keys.as_ref(), &registration_context(session, id), &plaintext)
+                .await
+                .map_err(|error| {
+                    tracing::error!(event = "connect.seal_failed", %error);
+                    Failed("unavailable")
+                })?;
+            Some(sealed)
+        }
+    };
+    let registration = NewClientRegistration {
+        id,
+        server: server.clone(),
+        client_id: registered.client_id.clone(),
+        authentication: registered.authentication,
+        sealed,
+    };
+    let saved = match session.app {
+        InstalledApp::Catalog(app_id) => {
+            state
+                .apps
+                .save_organization_client_registration(
+                    session.organization_id,
+                    app_id,
+                    session.environment,
+                    &registration,
+                )
+                .await
+        }
+        InstalledApp::Workspace(app_id) => {
+            state
+                .apps
+                .save_workspace_client_registration(
+                    session.organization_id,
+                    session.workspace_id,
+                    app_id,
+                    &registration,
+                )
+                .await
+        }
+    }
+    .map_err(|error| match error {
+        AppError::NotFound => Failed("app_not_eligible"),
+        _ => Failed("unavailable"),
+    })?;
+    if saved.id != id {
+        tracing::info!(event = "connect.registration_kept_another", app_id = %app.id);
+    }
+    Ok(saved)
+}
+
+/// The secret the client the start signed in as authenticates with, opened;
+/// `None` for a public client. The registration must still be the one the
+/// start used.
+async fn registered_secret(
+    state: &AppState,
+    session: &ConnectSession,
+    app: &App,
+    client: &DiscoveredClient,
+) -> Result<Option<Zeroizing<String>>, Failed> {
+    let registration = find_registration(state, session, &client.issuer)
+        .await
+        .map_err(|_| Failed("unavailable"))?
+        .filter(|registration| registration.client_id == client.client_id)
+        .ok_or(Failed("configuration_not_ready"))?;
+    if registration.authentication == ClientAuthentication::None {
+        return Ok(None);
+    }
+    let Some(sealed) = &registration.sealed else {
+        tracing::error!(event = "connect.registration_without_secret", app_id = %app.id);
+        return Err(Failed("unavailable"));
+    };
+    let opened = keys::open(
+        state.keys.as_ref(),
+        &registration_context(session, registration.id),
+        sealed,
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(event = "connect.registration_unopenable", app_id = %app.id, %error);
+        Failed("unavailable")
+    })?;
+    let issued: Issued = serde_json::from_slice(opened.expose()).map_err(|_| Failed("unavailable"))?;
+    // Moved, not copied: each is wiped when it drops.
+    let _token = issued.registration_access_token.map(Zeroizing::new);
+    issued
+        .client_secret
+        .map(|secret| Some(Zeroizing::new(secret)))
+        .ok_or(Failed("unavailable"))
+}
+
+/// A start that couldn't sign in through the MCP server fails its session
+/// with `code` when the server is at fault, and says why.
+async fn failed_start(state: &AppState, session: &ConnectSession, app: &App, code: &'static str) -> Failure {
+    let error = match code {
+        "discovery_failed" => ApiError::new(
+            502,
+            "discovery_failed",
+            format!(
+                "{}'s server doesn't offer a sign-in Zupflow can use. Ask whoever set up the app to check its server.",
+                app.name
+            ),
+        ),
+        "provider_unavailable" => ApiError::new(
+            502,
+            "provider_unavailable",
+            format!("{}'s server couldn't be reached. Start again shortly.", app.name),
+        ),
+        "app_not_eligible" => ApiError::new(
+            422,
+            "app_not_eligible",
+            "This app is no longer available to this workspace.",
+        ),
+        "configuration_not_ready" => ApiError::new(
+            422,
+            "configuration_not_ready",
+            format!("{} isn't configured anymore.", app.name),
+        ),
+        "identity_off_server" => ApiError::new(
+            422,
+            "identity_off_server",
+            format!(
+                "{}'s identity URL isn't on its MCP server. Ask whoever set up the app to use an address on the server, or none.",
+                app.name
+            ),
+        ),
+        // Our own store or key service: the session can be started again.
+        _ => {
+            return ApiError::new(
+                503,
+                "unavailable",
+                "The service is unavailable right now. Try again shortly.",
+            )
+            .into();
+        }
+    };
+    match state
+        .connect
+        .fail_session(
+            session.organization_id,
+            session.workspace_id,
+            session.id,
+            code,
+            Timestamp::now(),
+        )
+        .await
+    {
+        Ok(_) | Err(ConnectError::NotPending) => {}
+        Err(error) => {
+            tracing::warn!(event = "connect.fail_session_failed", session_id = %session.id, ?error);
+        }
+    }
+    error.into()
+}
+
+/// The `sub` claim of an access token that is a JWT, unverified: it only
+/// names an anonymous account, and never authorizes anything.
+fn subject(token: &str) -> Option<String> {
+    let mut parts = token.split('.');
+    let (Some(_), Some(payload), Some(_), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+        return None;
+    };
+    let claims = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    let claims: serde_json::Map<String, Value> = serde_json::from_slice(&claims).ok()?;
+    claims
+        .get("sub")
+        .and_then(Value::as_str)
+        .filter(|sub| !sub.is_empty() && sub.len() <= 256)
+        .map(str::to_owned)
+}
+
+/// Whether the browser may be sent to `url`: the check a configured
+/// authorization URL passes when its template is saved.
+fn public_https(url: &str) -> bool {
+    check_public_https(url, "authorization_endpoint").is_ok()
+}
+
+/// An anonymous account's ID: the issuer and subject hashed together, so it
+/// names the same account at the same server, and says nothing of either.
+fn derived_account(issuer: &str, subject: &str) -> String {
+    use std::fmt::Write;
+    let digest = Sha256::digest(format!("{issuer}\n{subject}").as_bytes());
+    let mut id = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(id, "{byte:02x}");
+    }
+    id
 }
 
 // --- The callback -----------------------------------------------------------
@@ -265,6 +639,7 @@ pub async fn callback(State(state): State<AppState>, RawQuery(query): RawQuery) 
     // Moved, not copied: each buffer is wiped when it drops.
     let reference = Zeroizing::new(pending.reference);
     let verifier = pending.verifier.map(Zeroizing::new);
+    let client = pending.client;
 
     let outcome = match (params.get("code"), params.get("error")) {
         (_, Some(error)) => {
@@ -282,6 +657,7 @@ pub async fn callback(State(state): State<AppState>, RawQuery(query): RawQuery) 
                 &session,
                 &Zeroizing::new(code.clone()),
                 verifier.as_deref().map(String::as_str),
+                client.as_ref(),
             )
             .await
         }
@@ -338,6 +714,7 @@ async fn complete(
     session: &ConnectSession,
     code: &str,
     verifier: Option<&str>,
+    client: Option<&DiscoveredClient>,
 ) -> Result<(), Failed> {
     if session.status_at(Timestamp::now()) != ConnectSessionStatus::Pending {
         // Expired while the provider had the browser, or finished another way.
@@ -350,30 +727,69 @@ async fn complete(
             _ => "unavailable",
         })
     })?;
-    let AuthTemplate::OAuth2 {
-        token_url: Some(token_url),
-        identity_url,
-        ..
-    } = &app.auth
-    else {
+    let (tokens, identity_url) = match (&app.auth, client) {
+        (
+            AuthTemplate::OAuth2 {
+                token_url: Some(token_url),
+                identity_url,
+                ..
+            },
+            None,
+        ) => {
+            let (client_id, secret) = configured_client(state, session, &app, &configuration).await?;
+            let client = TokenClient {
+                client_id: &client_id,
+                secret: Some(secret.as_str()),
+                resource: None,
+            };
+            (
+                exchange(state, &app, token_url, &client, code, verifier).await?,
+                identity_url,
+            )
+        }
+        (AuthTemplate::McpOAuth { identity_url, .. }, Some(discovered)) => {
+            // The server the start signed in for is still the one configured.
+            if configuration.mcp_server_url.as_deref() != Some(discovered.resource.as_str()) {
+                return Err(Failed("configuration_not_ready"));
+            }
+            // Tokens stay with their server: the identity URL too.
+            if identity_url
+                .as_deref()
+                .is_some_and(|identity_url| !same_origin(identity_url, &discovered.resource))
+            {
+                return Err(Failed("identity_off_server"));
+            }
+            let secret = registered_secret(state, session, &app, discovered).await?;
+            let client = TokenClient {
+                client_id: &discovered.client_id,
+                secret: secret.as_deref().map(String::as_str),
+                resource: Some(&discovered.resource),
+            };
+            let tokens = exchange(state, &app, &discovered.token_endpoint, &client, code, verifier).await?;
+            (tokens, identity_url)
+        }
         // The template changed since the start.
-        return Err(Failed("configuration_not_ready"));
+        _ => return Err(Failed("configuration_not_ready")),
     };
-    let tokens = exchange(state, session, &app, &configuration, token_url, code, verifier).await?;
     let identified = match identity_url {
         Some(url) => Some(identify(state, &app, url, &tokens.access_token).await?),
         None => None,
+    };
+    // Without an identity, an `mcp_oauth` account is anonymous (decision 0039):
+    // named from the issuer and the token's subject, if it says one.
+    let derived =
+        client.and_then(|client| subject(&tokens.access_token).map(|sub| derived_account(&client.issuer, &sub)));
+    let anonymous = |installation_id: InstallationId| ConnectedAccount {
+        external_id: derived.clone().unwrap_or_else(|| installation_id.to_string()),
+        display_name: format!("{} account", app.name),
+        email: None,
     };
 
     let now = Timestamp::now();
     let (installation_id, account, version) = match session.intent {
         ConnectIntent::Create => {
             let installation_id = InstallationId::generate();
-            let account = identified.unwrap_or_else(|| ConnectedAccount {
-                external_id: installation_id.to_string(),
-                display_name: format!("{} account", app.name),
-                email: None,
-            });
+            let account = identified.unwrap_or_else(|| anonymous(installation_id));
             (installation_id, account, 1)
         }
         ConnectIntent::Reconnect => {
@@ -387,9 +803,35 @@ async fn complete(
                 .await
                 .map_err(|_| Failed("unavailable"))?
                 .ok_or(Failed("installation_changed"))?;
-            match (installation.connection, identified) {
+            // An anonymous account named from a subject, and not after the
+            // installation. Only comparable under the same issuer: a subject
+            // names an account at its issuer, and a server that moved to
+            // another issuer can't say whether its subject is the same person.
+            let derived_before = installation.connection.as_ref().and_then(|connection| {
+                let anonymous = matches!(
+                    &installation.snapshot,
+                    Some(TemplateSnapshot {
+                        auth: AuthTemplate::McpOAuth { identity_url: None, .. },
+                        client: Some(before),
+                        ..
+                    }) if client.as_ref().is_some_and(|now| now.issuer == before.issuer)
+                );
+                (anonymous && connection.account.external_id != installation_id.to_string())
+                    .then_some(connection.account.external_id.as_str())
+            });
+            match (installation.connection.clone(), identified) {
                 // A reconnect must use the same account (decision 0005).
                 (Some(connection), Some(account)) if account.external_id != connection.account.external_id => {
+                    return Err(Failed("account_mismatch"));
+                }
+                // Two anonymous accounts both named from a subject are compared
+                // too. Without a subject on either side, nothing can be checked,
+                // and the reconnect keeps the account it had.
+                (Some(_), None)
+                    if derived_before
+                        .zip(derived.as_deref())
+                        .is_some_and(|(before, now)| before != now) =>
+                {
                     return Err(Failed("account_mismatch"));
                 }
                 (Some(connection), identified) => (
@@ -399,11 +841,7 @@ async fn complete(
                 ),
                 (None, identified) => (
                     installation_id,
-                    identified.unwrap_or_else(|| ConnectedAccount {
-                        external_id: installation_id.to_string(),
-                        display_name: format!("{} account", app.name),
-                        email: None,
-                    }),
+                    identified.unwrap_or_else(|| anonymous(installation_id)),
                     1,
                 ),
             }
@@ -452,6 +890,7 @@ async fn complete(
         snapshot: TemplateSnapshot {
             auth: app.auth.clone(),
             app_version: app.version,
+            client: client.cloned(),
         },
     };
     match state
@@ -488,6 +927,7 @@ const SCOPES_MAX: usize = 50;
 fn granted(app: &App, session: &ConnectSession, scope: &str) -> Vec<String> {
     let offered: &[OAuthScope] = match &app.auth {
         AuthTemplate::OAuth2 { available_scopes, .. } => available_scopes,
+        AuthTemplate::McpOAuth { scopes, .. } => scopes,
         AuthTemplate::Token { .. } => &[],
     };
     let mut granted: Vec<String> = Vec::new();
@@ -515,18 +955,23 @@ struct Tokens {
     scope: Option<String>,
 }
 
-/// `POST token_url` through the safe outbound path, the client
-/// authenticating with HTTP Basic (`client_secret_basic`): the secret
-/// travels as the request's credential, so it is scrubbed from the answer.
-async fn exchange(
+/// The client an exchange authenticates as: with a secret, by HTTP Basic
+/// (`client_secret_basic`); without one, as a public client that names
+/// itself in the form and proves itself with PKCE.
+struct TokenClient<'a> {
+    client_id: &'a str,
+    secret: Option<&'a str>,
+    /// For an `mcp_oauth` app, the MCP server the token is for (RFC 8707).
+    resource: Option<&'a str>,
+}
+
+/// An OAuth app's own client: its configured ID and secret, opened.
+async fn configured_client(
     state: &AppState,
     session: &ConnectSession,
     app: &App,
     configuration: &Configuration,
-    token_url: &str,
-    code: &str,
-    verifier: Option<&str>,
-) -> Result<Tokens, Failed> {
+) -> Result<(String, Zeroizing<String>), Failed> {
     let (Some(client_id), Some(secret)) = (&configuration.oauth_client_id, &configuration.client_secret) else {
         return Err(Failed("configuration_not_ready"));
     };
@@ -562,12 +1007,28 @@ async fn exchange(
             Failed("unavailable")
         })?;
     let client_secret = std::str::from_utf8(client_secret.expose()).map_err(|_| Failed("unavailable"))?;
+    Ok((client_id.clone(), Zeroizing::new(client_secret.to_owned())))
+}
+
+/// `POST token_url` through the safe outbound path. A client with a secret
+/// authenticates with HTTP Basic: the secret travels as the request's
+/// credential, so it is scrubbed from the answer.
+async fn exchange(
+    state: &AppState,
+    app: &App,
+    token_url: &str,
+    client: &TokenClient<'_>,
+    code: &str,
+    verifier: Option<&str>,
+) -> Result<Tokens, Failed> {
     // RFC 6749, section 2.3.1: each part form-encoded before joining.
-    let basic = Zeroizing::new(format!(
-        "{}:{}",
-        url::form_urlencoded::byte_serialize(client_id.as_bytes()).collect::<String>(),
-        Zeroizing::new(url::form_urlencoded::byte_serialize(client_secret.as_bytes()).collect::<String>()).as_str()
-    ));
+    let basic = client.secret.map(|secret| {
+        Zeroizing::new(format!(
+            "{}:{}",
+            url::form_urlencoded::byte_serialize(client.client_id.as_bytes()).collect::<String>(),
+            Zeroizing::new(url::form_urlencoded::byte_serialize(secret.as_bytes()).collect::<String>()).as_str()
+        ))
+    });
     let redirect = redirect_uri(&state.public_url);
     let mut form = vec![
         ("grant_type", "authorization_code"),
@@ -576,6 +1037,13 @@ async fn exchange(
     ];
     if let Some(verifier) = verifier {
         form.push(("code_verifier", verifier));
+    }
+    if client.secret.is_none() {
+        // RFC 6749, section 4.1.3: a public client names itself.
+        form.push(("client_id", client.client_id));
+    }
+    if let Some(resource) = client.resource {
+        form.push(("resource", resource));
     }
     let body = Zeroizing::new(serde_urlencoded::to_string(&form).map_err(|_| Failed("unavailable"))?);
     let request = OutboundRequest {
@@ -589,7 +1057,7 @@ async fn exchange(
             ("Accept".to_owned(), "application/json".to_owned()),
         ],
         body: Some(body.as_bytes().to_vec()),
-        credential: Some(Credential {
+        credential: basic.map(|basic| Credential {
             header: "Authorization".to_owned(),
             value: Zeroizing::new(format!("Basic {}", STANDARD.encode(basic.as_bytes()))),
         }),
@@ -612,14 +1080,16 @@ async fn exchange(
     }
     // The safe path scrubs the Basic credential it sent, not the secret
     // inside it: an answer that carries the secret back is refused whole.
-    let encoded = Zeroizing::new(url::form_urlencoded::byte_serialize(client_secret.as_bytes()).collect::<String>());
-    let escaped = Zeroizing::new(client_secret.replace('/', "\\/"));
-    if [client_secret, encoded.as_str(), escaped.as_str()]
-        .iter()
-        .any(|secret| contains(&body, secret.as_bytes()))
-    {
-        tracing::warn!(event = "connect.token_response_echoes_secret", app_id = %app.id);
-        return Err(Failed("token_exchange_failed"));
+    if let Some(secret) = client.secret {
+        let encoded = Zeroizing::new(url::form_urlencoded::byte_serialize(secret.as_bytes()).collect::<String>());
+        let escaped = Zeroizing::new(secret.replace('/', "\\/"));
+        if [secret, encoded.as_str(), escaped.as_str()]
+            .iter()
+            .any(|secret| contains(&body, secret.as_bytes()))
+        {
+            tracing::warn!(event = "connect.token_response_echoes_secret", app_id = %app.id);
+            return Err(Failed("token_exchange_failed"));
+        }
     }
     let tokens: TokenResponse = serde_json::from_slice(&body).map_err(|_| {
         tracing::warn!(event = "connect.token_response_unreadable", app_id = %app.id);
@@ -694,4 +1164,28 @@ async fn identify(state: &AppState, app: &App, url: &str, access_token: &str) ->
         display_name: display_name.chars().take(200).collect(),
         email: email.map(|email| email.chars().take(320).collect()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sends_the_browser_only_where_a_configured_authorization_url_could_go() {
+        for (url, allowed) in [
+            ("https://auth.example/authorize", true),
+            ("https://auth.example:8443/authorize?tenant=a", true),
+            ("http://auth.example/authorize", false),
+            ("https://localhost/authorize", false),
+            ("https://auth.internal/authorize", false),
+            ("https://10.0.0.7/authorize", false),
+            ("https://169.254.169.254/authorize", false),
+            ("https://[::1]/authorize", false),
+            ("https://user:pw@auth.example/authorize", false),
+            ("javascript:alert(1)", false),
+            ("/authorize", false),
+        ] {
+            assert_eq!(public_https(url), allowed, "{url}");
+        }
+    }
 }

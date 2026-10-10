@@ -20,6 +20,16 @@ const INPUTS: &str = "1 to 10 inputs, each with a unique key (a lowercase letter
                       placeholder up to 200, pattern up to 500.";
 const PATTERN: &str = "Use a simple regular expression: characters, [classes] with ranges, (groups), \\d \\w \\s, and one quantifier (* + ? {m,n}) each.";
 
+/// Whether two URLs share an origin: scheme, host and port. An `mcp_oauth`
+/// app's identity URL must share its MCP server's, so the token it is sent
+/// stays with the server it was issued for.
+pub(crate) fn same_origin(a: &str, b: &str) -> bool {
+    match (url::Url::parse(a), url::Url::parse(b)) {
+        (Ok(a), Ok(b)) => a.origin().is_tuple() && a.origin() == b.origin(),
+        _ => false,
+    }
+}
+
 fn count(value: &str) -> usize {
     value.chars().count()
 }
@@ -61,12 +71,14 @@ fn optional_text(value: Option<&Value>, max: usize) -> Result<Option<String>, ()
     }
 }
 
-fn scopes(raw: &Map<String, Value>, fields: &mut Fields) -> Option<Vec<OAuthScope>> {
+/// The scopes under `key`: `available_scopes` for an OAuth app's offer,
+/// `scopes` for what an `mcp_oauth` app's sign-in asks for.
+fn scopes(raw: &Map<String, Value>, key: &str, fields: &mut Fields) -> Option<Vec<OAuthScope>> {
     let invalid = |fields: &mut Fields| {
-        fields.invalid("auth.available_scopes", SCOPES);
+        fields.invalid(&format!("auth.{key}"), SCOPES);
         None
     };
-    let Some(Value::Array(items)) = raw.get("available_scopes") else {
+    let Some(Value::Array(items)) = raw.get(key) else {
         return invalid(fields);
     };
     if items.len() > 50 {
@@ -383,26 +395,34 @@ fn validation(fields: Fields) -> Failure {
 /// The template to store for an app whose template is `current`, or a
 /// failure: `400` for its shape, `422` for its type or its URLs, `409` for a
 /// scope one of `used` (each configuration's environment and the scopes it
-/// requests) still asks for.
+/// requests) still asks for. An `mcp_oauth` identity URL must share the
+/// origin of each of `servers` (each configuration's environment and MCP
+/// server URL).
 pub fn checked_auth_template(
     current: &AuthTemplate,
     raw: &Value,
     used: &[(Environment, Vec<String>)],
+    servers: &[(Environment, String)],
 ) -> Result<AuthTemplate, Failure> {
     let raw = match raw {
-        Value::Object(raw) if matches!(raw.get("type").and_then(Value::as_str), Some("oauth2" | "token")) => raw,
+        Value::Object(raw)
+            if matches!(
+                raw.get("type").and_then(Value::as_str),
+                Some("oauth2" | "mcp_oauth" | "token")
+            ) =>
+        {
+            raw
+        }
         _ => {
             let mut error = ApiError::new(400, "validation_failed", "Some fields are invalid.");
-            error.fields = Some([("auth.type".to_owned(), "Choose oauth2 or token.".to_owned())].into());
+            error.fields = Some([("auth.type".to_owned(), "Choose oauth2, mcp_oauth or token.".to_owned())].into());
             return Err(error.into());
         }
     };
-    let wants_oauth = raw.get("type").and_then(Value::as_str) == Some("oauth2");
-    let current_type = match current {
-        AuthTemplate::OAuth2 { .. } => "oauth2",
-        AuthTemplate::Token { .. } => "token",
-    };
-    if wants_oauth != (current_type == "oauth2") {
+    let wanted = raw.get("type").and_then(Value::as_str).unwrap_or_default();
+    let wants_oauth = wanted == "oauth2";
+    let current_type = current.type_name();
+    if wanted != current_type {
         let mut error = ApiError::new(
             422,
             "auth_type_immutable",
@@ -412,11 +432,44 @@ pub fn checked_auth_template(
         return Err(error.into());
     }
     let mut fields = Fields::default();
+    if wanted == "mcp_oauth" {
+        // No configuration requests an `mcp_oauth` app's scopes: its sign-in asks for these.
+        let requested = scopes(raw, "scopes", &mut fields);
+        let identity_url = url(raw, "identity_url", &mut fields);
+        let (Some(scopes), Some(identity_url)) = (requested, identity_url) else {
+            return Err(validation(fields));
+        };
+        if let Some(identity_url) = &identity_url {
+            check_public_https(identity_url, "auth.identity_url")?;
+            if let Some((environment, server)) = servers.iter().find(|(_, server)| !same_origin(identity_url, server)) {
+                let origin = url::Url::parse(server)
+                    .map(|server| server.origin().ascii_serialization())
+                    .unwrap_or_else(|_| server.clone());
+                let mut error = ApiError::new(
+                    422,
+                    "identity_off_server",
+                    "The identity URL must be on the app's MCP server, so its token stays there.",
+                );
+                error.fields = Some(
+                    [(
+                        "auth.identity_url".to_owned(),
+                        format!(
+                            "Use an address on {origin}, the {} configuration's MCP server.",
+                            label(*environment)
+                        ),
+                    )]
+                    .into(),
+                );
+                return Err(error.into());
+            }
+        }
+        return Ok(AuthTemplate::McpOAuth { scopes, identity_url });
+    }
     if wants_oauth {
         let authorize_url = url(raw, "authorize_url", &mut fields);
         let token_url = url(raw, "token_url", &mut fields);
         let identity_url = url(raw, "identity_url", &mut fields);
-        let available_scopes = scopes(raw, &mut fields);
+        let available_scopes = scopes(raw, "available_scopes", &mut fields);
         let pkce = raw.get("pkce").and_then(Value::as_bool);
         if pkce.is_none() {
             fields.invalid("auth.pkce", "Must be true or false.");
@@ -505,7 +558,23 @@ pub fn checked_auth_template(
 
 #[cfg(test)]
 mod tests {
-    use super::valid_pattern;
+    use super::{same_origin, valid_pattern};
+
+    #[test]
+    fn compares_scheme_host_and_port() {
+        let server = "https://tools.example/v1/mcp";
+        for (url, same) in [
+            ("https://tools.example/me", true),
+            ("https://TOOLS.example:443/v2/me?x=1", true),
+            ("https://tools.example:8443/me", false),
+            ("https://auth.tools.example/me", false),
+            ("https://other.example/me", false),
+            ("http://tools.example/me", false),
+            ("not a url", false),
+        ] {
+            assert_eq!(same_origin(url, server), same, "{url}");
+        }
+    }
 
     /// The same table as the mock's `auth-templates.test.ts`.
     #[test]

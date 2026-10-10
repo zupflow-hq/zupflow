@@ -58,7 +58,7 @@ macro_rules! columns {
         "i.id, i.organization_id, i.workspace_id, i.catalog_app_id, i.workspace_app_id, i.label, i.status, \
          i.configuration_version, i.account_external_id, i.account_display_name, i.account_email, \
          i.granted_scopes, i.credential_version, i.connected_at, i.expires_at, i.created_at, i.updated_at, \
-         i.auth_template, i.app_version"
+         i.auth_template, i.app_version, i.oauth_client"
     };
 }
 
@@ -68,7 +68,7 @@ macro_rules! returning {
         "id, organization_id, workspace_id, catalog_app_id, workspace_app_id, label, status, \
          configuration_version, account_external_id, account_display_name, account_email, \
          granted_scopes, credential_version, connected_at, expires_at, created_at, updated_at, auth_template, \
-         app_version"
+         app_version, oauth_client"
     };
 }
 
@@ -104,10 +104,15 @@ fn installation_from(row: &SqliteRow) -> Result<Installation, InstallationError>
     };
     let auth_template: Option<String> = row.try_get("auth_template").map_err(read)?;
     let app_version: Option<i64> = row.try_get("app_version").map_err(read)?;
+    let oauth_client: Option<String> = row.try_get("oauth_client").map_err(read)?;
     let snapshot = match (auth_template, app_version) {
         (Some(auth), Some(version)) => Some(TemplateSnapshot {
             auth: serde_json::from_str(&auth).map_err(read)?,
             app_version: u32::try_from(version).map_err(read)?,
+            client: oauth_client
+                .map(|client| serde_json::from_str(&client))
+                .transpose()
+                .map_err(read)?,
         }),
         (None, None) => None,
         _ => return Err(read("half a template snapshot")),
@@ -142,13 +147,20 @@ pub(crate) async fn insert_connected(
     };
     let scopes = serde_json::to_string(&installation.granted_scopes).map_err(read)?;
     let auth_template = serde_json::to_string(&installation.snapshot.auth).map_err(read)?;
+    let oauth_client = installation
+        .snapshot
+        .client
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(read)?;
     let now = Timestamp::now().millis();
     let row = sqlx::query(concat!(
         "INSERT INTO installations (id, organization_id, workspace_id, catalog_app_id, workspace_app_id, label, \
          status, configuration_version, account_external_id, account_display_name, account_email, \
          granted_scopes, credential_version, connected_at, expires_at, created_at, updated_at, auth_template, \
-         app_version) \
-         VALUES (?, ?, ?, ?, ?, ?, 'connected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ",
+         app_version, oauth_client) \
+         VALUES (?, ?, ?, ?, ?, ?, 'connected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ",
         returning!()
     ))
     .bind(installation_id.uuid())
@@ -169,6 +181,7 @@ pub(crate) async fn insert_connected(
     .bind(now)
     .bind(auth_template)
     .bind(i64::from(installation.snapshot.app_version))
+    .bind(oauth_client)
     .fetch_one(&mut **transaction)
     .await
     .map_err(failed("insert_installation"))?;
@@ -225,12 +238,19 @@ pub(crate) async fn reconnect(
 ) -> Result<Option<Installation>, InstallationError> {
     let scopes = serde_json::to_string(renewal.granted_scopes).map_err(read)?;
     let auth_template = serde_json::to_string(&renewal.snapshot.auth).map_err(read)?;
+    let oauth_client = renewal
+        .snapshot
+        .client
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(read)?;
     let now = Timestamp::now().millis();
     let credential = renewal.credential;
     let row = sqlx::query(concat!(
         "UPDATE installations SET status = 'connected', configuration_version = ?, account_external_id = ?, \
          account_display_name = ?, account_email = ?, granted_scopes = ?, credential_version = ?, \
-         connected_at = ?, expires_at = ?, updated_at = ?, auth_template = ?, app_version = ? \
+         connected_at = ?, expires_at = ?, updated_at = ?, auth_template = ?, app_version = ?, oauth_client = ? \
          WHERE organization_id = ? AND workspace_id = ? AND id = ? AND coalesce(credential_version, 0) = ? RETURNING ",
         returning!()
     ))
@@ -245,6 +265,7 @@ pub(crate) async fn reconnect(
     .bind(now)
     .bind(auth_template)
     .bind(i64::from(renewal.snapshot.app_version))
+    .bind(oauth_client)
     .bind(organization_id.uuid())
     .bind(workspace_id.uuid())
     .bind(installation_id.uuid())

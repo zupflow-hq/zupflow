@@ -267,6 +267,20 @@ fn check_against(app: &App, input: &Input) -> Result<(), Failure> {
                 .into());
             }
         }
+        AuthTemplate::McpOAuth { .. } => {
+            let scopes = input.oauth_scopes.as_ref().is_some_and(|scopes| !scopes.is_empty());
+            if matches!(input.oauth_client_id, Some(Some(_))) || input.oauth_client_secret.is_some() || scopes {
+                return Err(ApiError::new(
+                    422,
+                    "oauth_not_supported",
+                    format!(
+                        "{} signs in through its MCP server: there's no OAuth client to configure, and its scopes are set in its authentication settings.",
+                        app.name
+                    ),
+                )
+                .into());
+            }
+        }
         AuthTemplate::OAuth2 { available_scopes, .. } => {
             let unknown = input
                 .oauth_scopes

@@ -18,6 +18,7 @@ import {
   type ResponseChecker,
 } from "@zupflow/contract-tests";
 import {
+  type ConnectResult,
   createClient,
   createHttpTransport,
   ID_PREFIXES,
@@ -30,7 +31,7 @@ import {
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { db, resetDb } from "./db";
-import { createHandlers } from "./handlers";
+import { createHandlers, NO_SIGN_IN_HOST } from "./handlers";
 import { setLatency } from "./http";
 import { hashReference, isId, newId, newReference, uuidOf } from "./ids";
 import type { IdempotencyRow } from "./model";
@@ -321,6 +322,126 @@ describe("Connect (simulated consent)", () => {
       }),
     );
     expect(error.code).toBe("account_mismatch");
+  });
+
+  it("signs in through an MCP server: anonymous without an identity endpoint, kept on reconnect", async () => {
+    const sandbox = ws("acme-sandbox");
+    const org = must(northwindId());
+    const created = await owner.organizationApps.create(org, {
+      kind: "mcp",
+      name: "Ledger",
+      slug: "ledger",
+      description: "",
+      auth_type: "mcp_oauth",
+    });
+    expect(created.auth).toEqual({ type: "mcp_oauth", scopes: [], identity_url: null });
+    await owner.organizationApps.update(org, created.id, {
+      auth: { type: "mcp_oauth", scopes: [{ name: "read", description: "Read entries" }], identity_url: null },
+    });
+    const configuration = await owner.organizationApps.updateConfiguration(org, created.id, "sandbox", {
+      mcp_server_url: "https://ledger.example/mcp",
+    });
+    expect([configuration.status, configuration.oauth, configuration.missing]).toEqual(["ready", null, []]);
+
+    const transport = createHttpTransport({ baseUrl: API, getToken: async () => null });
+    const consent = async (reference: string, email: string) =>
+      (
+        await transport.request<ConnectResult>({
+          method: "POST",
+          path: `/v1/connect/sessions/${reference}/simulate-consent`,
+          body: { decision: "approved", email },
+        })
+      ).data;
+
+    const session = await owner.connectSessions.create(sandbox.id, {
+      app_id: created.id,
+      intent: "create",
+      label: "Books",
+      installation_id: null,
+      return_url: null,
+    });
+    expect(session.requested_scopes).toEqual(["read"]);
+    const pasted = await failure(owner.connect.submitCredentials(referenceOf(session), { values: { token: "t" } }));
+    expect(pasted.code).toBe("wrong_auth_type");
+    const { authorization_url } = await owner.connect.authorize(referenceOf(session));
+    expect(authorization_url).toContain("/simulated-consent");
+    const first = await consent(referenceOf(session), "pat@acme.example");
+    const account = first.installation.connection?.account;
+    expect(account).toMatchObject({ display_name: "Ledger account", email: null });
+
+    // Nothing identifies the account, so a reconnect can't refuse another one: it keeps the account it had.
+    const reconnect = await owner.connectSessions.create(sandbox.id, {
+      app_id: created.id,
+      intent: "reconnect",
+      label: "Books",
+      installation_id: first.installation.id,
+      return_url: null,
+    });
+    const again = await consent(referenceOf(reconnect), "someone-else@acme.example");
+    expect(again.installation.connection?.account).toEqual(account);
+  });
+
+  it("fails a sign-in the server can't offer, and one whose identity URL left the server", async () => {
+    const sandbox = ws("acme-sandbox");
+    const org = must(northwindId());
+    const created = await owner.organizationApps.create(org, {
+      kind: "mcp",
+      name: "Ledger",
+      slug: "ledger",
+      description: "",
+      auth_type: "mcp_oauth",
+    });
+    const serve = (url: string) =>
+      owner.organizationApps.updateConfiguration(org, created.id, "sandbox", { mcp_server_url: url });
+    const start = async () =>
+      referenceOf(
+        await owner.connectSessions.create(sandbox.id, {
+          app_id: created.id,
+          intent: "create",
+          label: "Books",
+          installation_id: null,
+          return_url: null,
+        }),
+      );
+
+    // A server that offers no sign-in Zupflow can use.
+    await serve(`https://${NO_SIGN_IN_HOST}/mcp`);
+    const unusable = await start();
+    const discovery = await failure(owner.connect.authorize(unusable));
+    expect([discovery.status, discovery.code]).toEqual([502, "discovery_failed"]);
+    expect(await owner.connect.get(unusable)).toMatchObject({ status: "failed", failure_code: "discovery_failed" });
+
+    // An identity URL on the server is accepted; the configuration then moves the server away from it.
+    await serve("https://ledger.example/mcp");
+    await owner.organizationApps.update(org, created.id, {
+      auth: { type: "mcp_oauth", scopes: [], identity_url: "https://ledger.example/me" },
+    });
+    await serve("https://moved.example/mcp");
+    const moved = await start();
+    const off = await failure(owner.connect.authorize(moved));
+    expect([off.status, off.code]).toEqual([422, "identity_off_server"]);
+    expect(await owner.connect.get(moved)).toMatchObject({ status: "failed", failure_code: "identity_off_server" });
+  });
+
+  it("configures nothing but the server for an app that signs in through it", async () => {
+    const org = must(northwindId());
+    const created = await owner.organizationApps.create(org, {
+      kind: "mcp",
+      name: "Ledger",
+      slug: "ledger",
+      description: "",
+      auth_type: "mcp_oauth",
+    });
+    for (const input of [
+      { oauth_client_id: "client" },
+      { oauth_client_secret: "a-long-secret" },
+      { oauth_scopes: ["read"] },
+    ]) {
+      const error = await failure(owner.organizationApps.updateConfiguration(org, created.id, "sandbox", input));
+      expect([error.status, error.code]).toEqual([422, "oauth_not_supported"]);
+    }
+    const unconfigured = await owner.organizationApps.getConfiguration(org, created.id, "sandbox");
+    expect([unconfigured.status, unconfigured.missing]).toEqual(["unconfigured", ["mcp_server_url"]]);
   });
 
   it("starts no consent for an app without the provider's endpoints", async () => {

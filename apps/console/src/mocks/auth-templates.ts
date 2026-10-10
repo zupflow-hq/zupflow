@@ -76,10 +76,10 @@ function optionalText(value: unknown, max: number): string | null | false {
   return trimmed === "" ? null : trimmed;
 }
 
-function scopes(raw: Raw, fields: Fields): OAuthScope[] | undefined {
-  const value = raw.available_scopes;
+function scopes(raw: Raw, fields: Fields, key = "available_scopes"): OAuthScope[] | undefined {
+  const value = raw[key];
   if (!Array.isArray(value) || value.length > 50) {
-    fields["auth.available_scopes"] ??= MESSAGES.scopes;
+    fields[`auth.${key}`] ??= MESSAGES.scopes;
     return undefined;
   }
   const out: OAuthScope[] = [];
@@ -94,7 +94,7 @@ function scopes(raw: Raw, fields: Fields): OAuthScope[] | undefined {
       length(description) <= 300 &&
       !out.some((scope) => scope.name === name);
     if (!valid) {
-      fields["auth.available_scopes"] ??= MESSAGES.scopes;
+      fields[`auth.${key}`] ??= MESSAGES.scopes;
       return undefined;
     }
     out.push({ name, description });
@@ -324,16 +324,41 @@ function placement(raw: Raw, fields: Fields) {
 /**
  * The template to store for `current`, or a failure: `400` for its shape,
  * `422` for its type or its URLs, `409` for a scope still in use by one of
- * `usedScopes` (environment → scopes its configuration asks for).
+ * `usedScopes` (environment → scopes its configuration asks for). An
+ * `mcp_oauth` identity URL must share the origin of each of `servers`
+ * (environment → its configuration's MCP server URL).
  */
+function originOf(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Whether two URLs share an origin: scheme, host and port. An `mcp_oauth`
+ * app's identity URL must share its MCP server's, so the token it is sent
+ * stays with the server it was issued for.
+ */
+export function sameOrigin(a: string, b: string): boolean {
+  try {
+    const [x, y] = [new URL(a), new URL(b)];
+    return x.protocol === y.protocol && x.host === y.host && x.origin !== "null";
+  } catch {
+    return false;
+  }
+}
+
 export function checkedAuthTemplate(
   current: AuthTemplate,
   raw: unknown,
   usedScopes: { environment: string; scopes: string[] }[],
+  servers: { environment: string; url: string }[] = [],
 ): AuthTemplate {
-  if (!isObject(raw) || (raw.type !== "oauth2" && raw.type !== "token")) {
+  if (!isObject(raw) || (raw.type !== "oauth2" && raw.type !== "mcp_oauth" && raw.type !== "token")) {
     throw new ApiFailure(400, "validation_failed", "Some fields are invalid.", {
-      "auth.type": "Choose oauth2 or token.",
+      "auth.type": "Choose oauth2, mcp_oauth or token.",
     });
   }
   if (raw.type !== current.type) {
@@ -382,6 +407,29 @@ export function checkedAuthTemplate(
       available_scopes: available_scopes ?? [],
       pkce: raw.pkce as boolean,
     };
+  }
+  if (raw.type === "mcp_oauth") {
+    // No configuration requests scopes of an `mcp_oauth` app: the template's are what sign-in asks for.
+    const requested = scopes(raw, fields, "scopes");
+    const identity_url = url(raw, "identity_url", fields);
+    if (Object.keys(fields).length > 0 || !requested) {
+      throw new ApiFailure(400, "validation_failed", "Some fields are invalid.", fields);
+    }
+    if (identity_url) {
+      assertPublicHttps(identity_url, "auth.identity_url");
+      const elsewhere = servers.find((server) => !sameOrigin(identity_url, server.url));
+      if (elsewhere) {
+        throw new ApiFailure(
+          422,
+          "identity_off_server",
+          "The identity URL must be on the app's MCP server, so its token stays there.",
+          {
+            "auth.identity_url": `Use an address on ${originOf(elsewhere.url)}, the ${label(elsewhere.environment)} configuration's MCP server.`,
+          },
+        );
+      }
+    }
+    return { type: "mcp_oauth", scopes: requested, identity_url: identity_url ?? null };
   }
   const parsedInputs = inputs(raw, fields);
   const parsedPlacement = placement(raw, fields);

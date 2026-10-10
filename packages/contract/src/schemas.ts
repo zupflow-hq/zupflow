@@ -64,7 +64,12 @@ export type AppKind = z.infer<typeof AppKind>;
 
 export const AppOwnerScope = z.enum(["organization", "workspace"]);
 export type AppOwnerScope = z.infer<typeof AppOwnerScope>;
-export const AuthType = z.enum(["oauth2", "token"]);
+/**
+ * `oauth2`: the organization registers its own OAuth client with the
+ * provider. `mcp_oauth`: the MCP server's authorization server is discovered
+ * and Zupflow registers a client with it. `token`: the user pastes a token.
+ */
+export const AuthType = z.enum(["oauth2", "mcp_oauth", "token"]);
 export type AuthType = z.infer<typeof AuthType>;
 export const ConfigurationStatus = z.enum(["unconfigured", "incomplete", "ready"]);
 export type ConfigurationStatus = z.infer<typeof ConfigurationStatus>;
@@ -256,6 +261,33 @@ export const OAuthAuthTemplate = named(
 );
 export type OAuthAuthTemplate = z.infer<typeof OAuthAuthTemplate>;
 
+/**
+ * Sign-in through the MCP server: its authorization server and endpoints are
+ * discovered when a user signs in, and a client is registered with it once
+ * per organization, app and environment (a workspace app's, per workspace).
+ * Nothing to configure but the server's URL.
+ */
+export const McpOAuthAuthTemplate = named(
+  "McpOAuthAuthTemplate",
+  z.object({
+    type: z.literal("mcp_oauth"),
+    /** Scopes asked for at sign-in. Empty asks for the server's default. */
+    scopes: z.array(OAuthScope),
+    /**
+     * Read-only endpoint that identifies the connected account. It must share
+     * the MCP server's origin (scheme, host and port), so the token stays with
+     * the server it was issued for: a template naming another is refused
+     * (`422 identity_off_server`), and so is a sign-in after a configuration
+     * moved the server away from it. Without one, the account is anonymous,
+     * named from the token's subject when it says one; a reconnect whose
+     * token names another subject fails with `account_mismatch`, and one
+     * without a subject on either side keeps the account it had.
+     */
+    identity_url: z.url().nullable(),
+  }),
+);
+export type McpOAuthAuthTemplate = z.infer<typeof McpOAuthAuthTemplate>;
+
 export const TokenInput = z.object({
   key: z.string(),
   label: z.string(),
@@ -284,7 +316,10 @@ export const TokenAuthTemplate = named(
 );
 export type TokenAuthTemplate = z.infer<typeof TokenAuthTemplate>;
 
-export const AuthTemplate = named("AuthTemplate", z.discriminatedUnion("type", [OAuthAuthTemplate, TokenAuthTemplate]));
+export const AuthTemplate = named(
+  "AuthTemplate",
+  z.discriminatedUnion("type", [OAuthAuthTemplate, McpOAuthAuthTemplate, TokenAuthTemplate]),
+);
 export type AuthTemplate = z.infer<typeof AuthTemplate>;
 
 export const ToolDefinition = named(
@@ -347,7 +382,9 @@ export const UpdateAppInput = z.object({
    * Replaces the app's authentication template, whole. Its `type` must be
    * the app's own (`422 auth_type_immutable`). URLs must be public HTTPS
    * (`422 insecure_url`, `422 destination_not_allowed`); a scope a
-   * configuration still requests can't be removed (`409 scope_in_use`).
+   * configuration still requests can't be removed (`409 scope_in_use`). An
+   * `mcp_oauth` identity URL must be on each configured MCP server
+   * (`422 identity_off_server`).
    * Input patterns use a small grammar both the browser and the server read
    * alike. A catalog app's template is shared by both environments, so an API
    * key can't send this field there (`403 console_only`). Raises the app's
@@ -383,7 +420,11 @@ export const ClientConfiguration = named(
     status: ConfigurationStatus,
     version: z.number().int(),
     mcp: McpSettings,
-    /** Present only when the app's authentication type is OAuth. */
+    /**
+     * Present only when the app's authentication type is `oauth2`. An
+     * `mcp_oauth` app has no client to configure: it is ready once it has a
+     * server URL.
+     */
     oauth: OAuthClientSettings.nullable(),
     /** Fields still required before the configuration is ready. */
     missing: z.array(z.string()),
@@ -393,6 +434,12 @@ export const ClientConfiguration = named(
 );
 export type ClientConfiguration = z.infer<typeof ClientConfiguration>;
 
+/**
+ * The `oauth_*` fields apply only to an `oauth2` app; a token or `mcp_oauth`
+ * app refuses a client ID or secret (`422 oauth_not_supported`), and an
+ * `mcp_oauth` app requests the scopes its template names, so it refuses
+ * scopes here too.
+ */
 export const UpdateConfigurationInput = z.object({
   mcp_server_url: z.string().nullable().optional(),
   oauth_client_id: z.string().nullable().optional(),

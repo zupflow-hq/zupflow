@@ -1,5 +1,7 @@
 //! A minimal MCP client (decision 0038): lists a server's tools over the
 //! Streamable HTTP transport, through [`OutboundHttp`] and nothing else.
+//! [`sign_in`] finds a server's authorization server and registers a client
+//! with it (decision 0039).
 //!
 //! [`list_tools`] initializes a session, says it's initialized, then pages
 //! through `tools/list`. Every request carries the installation's credential
@@ -18,6 +20,8 @@
 //! can repeat it encoded (`\/` in JSON, `\u0041`), and parsing decodes it.
 //! So a listing in which any decoded string or key holds the credential's
 //! value or secret is refused whole too: what's pinned is what a model reads.
+
+pub mod sign_in;
 
 use std::collections::HashSet;
 

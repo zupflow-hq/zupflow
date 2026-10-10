@@ -16,6 +16,10 @@ const FAILURE_COPY: Record<string, string> = {
   authorization_failed: "The provider ended the sign-in with an error. Start again.",
   token_exchange_failed:
     "The provider didn't accept the sign-in. Start again, or check the app's client ID and secret.",
+  discovery_failed:
+    "This app's server doesn't offer a sign-in Zupflow can use. Check the MCP server URL in the app's configuration, or ask the server's owner to support OAuth sign-in with client registration.",
+  identity_off_server:
+    "This app's identity URL isn't on its MCP server. Set it to an address on the server, or clear it, in the app's authentication settings.",
   provider_unavailable: "The provider couldn't be reached. Start again shortly.",
   identity_unavailable: "The provider didn't say which account signed in. Start again shortly.",
   app_not_eligible: "This app is no longer available to this workspace.",
@@ -23,6 +27,14 @@ const FAILURE_COPY: Record<string, string> = {
   installation_changed: "This installation changed while you were connecting. Start again from the app.",
   unavailable: "Something went wrong on our side. Start again shortly.",
 };
+
+/** Why a session failed, in words that fit how its app signs in. */
+function failureCopy(session: ConnectSession, code: string): string {
+  if (code === "token_exchange_failed" && session.app.auth_type === "mcp_oauth") {
+    return "The app's server didn't accept the sign-in. Start again; if it keeps failing, ask the server's owner to check its sign-in.";
+  }
+  return FAILURE_COPY[code] ?? `The provider returned ${code}.`;
+}
 
 /**
  * Runs Connect in a popup and watches the session server-side. A browser
@@ -166,9 +178,7 @@ export function ConnectProgress({
               : "Connect didn't finish"}
         </p>
         <p className="max-w-sm text-sm text-muted-foreground">
-          {s.failure_code
-            ? (FAILURE_COPY[s.failure_code] ?? `The provider returned ${s.failure_code}.`)
-            : "Nothing was connected. You can start again."}
+          {s.failure_code ? failureCopy(s, s.failure_code) : "Nothing was connected. You can start again."}
         </p>
       </div>
       <Button variant="outline" onClick={flow.reset}>

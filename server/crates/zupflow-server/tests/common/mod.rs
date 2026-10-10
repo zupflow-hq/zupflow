@@ -56,6 +56,9 @@ pub struct Providers {
     pub scripted: Mutex<Vec<(String, u16, Value)>>,
     /// MCP servers by URL, and the tools each lists.
     pub mcp: Mutex<Vec<(String, Value)>>,
+    /// URLs that answer a request without a credential `401`, with this
+    /// `WWW-Authenticate`.
+    pub challenges: Mutex<Vec<(String, String)>>,
 }
 
 impl Providers {
@@ -68,6 +71,19 @@ impl Providers {
         let mut scripted = self.scripted.lock().unwrap();
         scripted.retain(|(scripted, _, _)| scripted != url);
         scripted.push((url.to_owned(), status, body));
+    }
+
+    /// From now on, `url` answers a request without a credential `401`,
+    /// with `www_authenticate`.
+    pub fn challenge(&self, url: &str, www_authenticate: &str) {
+        let mut challenges = self.challenges.lock().unwrap();
+        challenges.retain(|(challenged, _)| challenged != url);
+        challenges.push((url.to_owned(), www_authenticate.to_owned()));
+    }
+
+    /// The URLs requested so far, in order.
+    pub fn urls(&self) -> Vec<String> {
+        self.sent().into_iter().map(|sent| sent.url).collect()
     }
 
     /// From now on, `url` is an MCP server listing `tools`.
@@ -110,12 +126,27 @@ impl OutboundHttp for Providers {
             .iter()
             .find(|(url, _)| *url == request.url)
             .map(|(_, tools)| tools.clone());
+        let challenge = self
+            .challenges
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(url, _)| *url == request.url)
+            .map(|(_, challenge)| challenge.clone())
+            .filter(|_| request.credential.is_none());
         self.sent.lock().unwrap().push(Sent {
             url: request.url,
             credential: request
                 .credential
                 .map(|credential| (credential.header, credential.value.to_string())),
         });
+        if let Some(challenge) = challenge {
+            return Ok(OutboundResponse {
+                status: 401,
+                headers: vec![("WWW-Authenticate".to_owned(), challenge)],
+                body: Vec::new(),
+            });
+        }
         if let (Some(tools), Some(body)) = (mcp, &request.body) {
             let message: Value = serde_json::from_slice(body).unwrap();
             let id = message["id"].clone();
@@ -224,6 +255,7 @@ impl Server {
             answer: Mutex::new(Ok(200)),
             scripted: Mutex::new(Vec::new()),
             mcp: Mutex::new(Vec::new()),
+            challenges: Mutex::new(Vec::new()),
         });
         let state = AppState {
             identity,
@@ -362,6 +394,7 @@ pub fn token_snapshot() -> zupflow_core::installations::TemplateSnapshot {
             docs_url: None,
         },
         app_version: 1,
+        client: None,
     }
 }
 

@@ -242,6 +242,9 @@ fn checked_description(value: Option<String>, fields: &mut Fields) -> Option<Str
     }
 }
 
+/// What a missing or unknown `auth_type` is told.
+const AUTH_TYPES: &str = "Choose OAuth, sign-in through the MCP server, or token.";
+
 /// `CreateAppInput`, checked field by field; then the kind, which is a string
 /// to the body's rules and `unsupported_app_kind` unless it is `mcp`.
 fn new_app(body: &Object) -> Result<NewApp, Failure> {
@@ -253,12 +256,12 @@ fn new_app(body: &Object) -> Result<NewApp, Failure> {
     let auth_type = body.optional_string("auth_type", &mut fields).and_then(|value| {
         let parsed = AuthType::parse(&value);
         if parsed.is_none() {
-            fields.invalid("auth_type", "Choose OAuth or token.");
+            fields.invalid("auth_type", AUTH_TYPES);
         }
         parsed
     });
     if !body.has("auth_type") {
-        fields.invalid("auth_type", "Choose OAuth or token.");
+        fields.invalid("auth_type", AUTH_TYPES);
     }
     fields.finish()?;
     let (Some(kind), Some(name), Some(slug), Some(description), Some(auth_type)) =
@@ -298,10 +301,18 @@ fn update_of(body: &Object, app: &App, configurations: &[Configuration]) -> Resu
         .filter(|configuration| configuration.app_id == app.id && !configuration.oauth_scopes.is_empty())
         .map(|configuration| (configuration.environment, configuration.oauth_scopes.clone()))
         .collect();
+    let servers: Vec<(Environment, String)> = configurations
+        .iter()
+        .filter(|configuration| configuration.app_id == app.id)
+        .filter_map(|configuration| {
+            let server = configuration.mcp_server_url.clone()?;
+            Some((configuration.environment, server))
+        })
+        .collect();
     let auth = body
         .0
         .get("auth")
-        .map(|raw| checked_auth_template(&app.auth, raw, &used))
+        .map(|raw| checked_auth_template(&app.auth, raw, &used, &servers))
         .transpose()?;
     Ok(Update {
         name,

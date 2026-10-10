@@ -140,6 +140,16 @@ pub async fn discover(
         Ok(None) => return skip("not_configured"),
         Err(_) => return Outcome::Retry("store_unavailable"),
     };
+    // A token signed in through the MCP server was asked for that server
+    // alone (RFC 8707): never sent to another the configuration names since.
+    if let AuthTemplate::McpOAuth { .. } = snapshot.auth
+        && snapshot
+            .client
+            .as_ref()
+            .is_none_or(|client| client.resource != server_url)
+    {
+        return skip("server_moved");
+    }
     let sealed = match state
         .installations
         .find_credential(organization_id, workspace_id, installation_id)
@@ -182,7 +192,9 @@ pub async fn discover(
             placement.prefix.as_str(),
             inputs.first().and_then(|input| text(&input.key)),
         ),
-        AuthTemplate::OAuth2 { .. } => ("Authorization".to_owned(), "Bearer ", text("access_token")),
+        AuthTemplate::OAuth2 { .. } | AuthTemplate::McpOAuth { .. } => {
+            ("Authorization".to_owned(), "Bearer ", text("access_token"))
+        }
     };
     let Some(secret) = secret else {
         return skip("credential_without_token");

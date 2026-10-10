@@ -16,7 +16,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use zupflow_core::apps::{App, AppIcon, AuthTemplate, ToolEffect};
+use zupflow_core::apps::{App, AppIcon, ToolEffect};
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
@@ -108,10 +108,7 @@ pub(crate) fn installation_app_view(app: &App, installed: InstalledApp) -> Insta
             InstalledApp::Workspace(_) => OwnerScope::Workspace,
         },
         icon: app.icon.clone(),
-        auth_type: match app.auth {
-            AuthTemplate::OAuth2 { .. } => "oauth2",
-            AuthTemplate::Token { .. } => "token",
-        },
+        auth_type: app.auth.type_name(),
     }
 }
 

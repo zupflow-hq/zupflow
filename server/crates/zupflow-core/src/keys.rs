@@ -20,6 +20,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use async_trait::async_trait;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use crate::apps::ClientRegistrationId;
 use crate::environment::Environment;
 use crate::ids::{AppId, ConnectSessionId, InstallationId, OrganizationId, WebhookEndpointId, WorkspaceId};
 
@@ -78,6 +79,36 @@ impl EncryptionContext {
             app_id: Some(app_id),
             object: app_id.to_string(),
             version,
+        }
+    }
+
+    /// What an MCP server's authorization server issued to the client Zupflow
+    /// registered with it (decision 0039): the client secret and the
+    /// registration access token, sealed together as one value. The same
+    /// kind of secret as [`EncryptionContext::oauth_client_secret`], but
+    /// owned by the registration, not the configuration: that constructor's
+    /// object is the app and its version the configuration's secret version,
+    /// so a registration sealed under it would share a context with the
+    /// configured secret of the same version, and two issuers' registrations
+    /// with each other. A registration's is its own row, version 1: what it
+    /// was issued never changes, and a new issuer is a new registration.
+    /// `workspace_id` is set for a workspace's own app.
+    pub fn oauth_client_registration(
+        organization_id: OrganizationId,
+        workspace_id: Option<WorkspaceId>,
+        environment: Environment,
+        app_id: AppId,
+        registration: ClientRegistrationId,
+    ) -> Self {
+        Self {
+            organization_id,
+            workspace_id,
+            environment,
+            purpose: Purpose::OauthClientSecret,
+            app_id: Some(app_id),
+            // Hex, so it holds no `;` or `=`, and the prefix keeps it apart from any ID.
+            object: format!("registration.{}", registration.uuid().simple()),
+            version: 1,
         }
     }
 
@@ -366,6 +397,15 @@ mod tests {
             EncryptionContext::webhook_signing_secret(org, Environment::Production, we, 2).canonical(),
             format!(
                 "zupflow.v1;org={org};ws=-;env=production;purpose=webhook_signing_secret;app=-;object={we};version=2"
+            )
+        );
+        let registration = ClientRegistrationId::generate();
+        assert_eq!(
+            EncryptionContext::oauth_client_registration(org, Some(ws), Environment::Sandbox, app, registration)
+                .canonical(),
+            format!(
+                "zupflow.v1;org={org};ws={ws};env=sandbox;purpose=oauth_client_secret;app={app};object=registration.{};version=1",
+                registration.uuid().simple()
             )
         );
         let cs = ConnectSessionId::generate();

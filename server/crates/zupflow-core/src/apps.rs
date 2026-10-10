@@ -83,6 +83,15 @@ pub enum AuthTemplate {
         pkce: bool,
         identity_url: Option<String>,
     },
+    /// Sign-in through the MCP server (decision 0039): its authorization
+    /// server is discovered at each sign-in, and a client registered with
+    /// it once per organization, app and environment.
+    #[serde(rename = "mcp_oauth")]
+    McpOAuth {
+        /// What sign-in asks for; none asks for the server's default.
+        scopes: Vec<OAuthScope>,
+        identity_url: Option<String>,
+    },
     Token {
         inputs: Vec<TokenInput>,
         placement: TokenPlacement,
@@ -92,10 +101,22 @@ pub enum AuthTemplate {
     },
 }
 
+impl AuthTemplate {
+    /// The contract's `AuthType` for this template.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::OAuth2 { .. } => "oauth2",
+            Self::McpOAuth { .. } => "mcp_oauth",
+            Self::Token { .. } => "token",
+        }
+    }
+}
+
 /// Which kind of [`AuthTemplate`] a new app starts with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthType {
     OAuth2,
+    McpOAuth,
     Token,
 }
 
@@ -103,6 +124,7 @@ impl AuthType {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "oauth2" => Some(Self::OAuth2),
+            "mcp_oauth" => Some(Self::McpOAuth),
             "token" => Some(Self::Token),
             _ => None,
         }
@@ -183,6 +205,10 @@ impl NewApp {
                 pkce: true,
                 identity_url: None,
             },
+            AuthType::McpOAuth => AuthTemplate::McpOAuth {
+                scopes: Vec::new(),
+                identity_url: None,
+            },
             AuthType::Token => AuthTemplate::Token {
                 inputs: vec![TokenInput {
                     key: "token".to_owned(),
@@ -248,12 +274,14 @@ pub enum AppError {
 impl AuthTemplate {
     /// For an OAuth app, the first of `requested` it doesn't offer; a token
     /// app offers no scopes and refuses none (its configuration's scopes are
-    /// unused).
+    /// unused). An `mcp_oauth` app's sign-in asks for its template's own
+    /// scopes, so its configurations request none.
     pub fn first_unoffered<'a>(&self, requested: &'a [String]) -> Option<&'a String> {
         match self {
             Self::OAuth2 { available_scopes, .. } => requested
                 .iter()
                 .find(|scope| !available_scopes.iter().any(|offered| &offered.name == *scope)),
+            Self::McpOAuth { .. } => requested.first(),
             Self::Token { .. } => None,
         }
     }
@@ -306,7 +334,8 @@ impl Configuration {
     }
 
     /// The fields still required before the app can be connected: the MCP
-    /// server, and an OAuth app's client ID and secret.
+    /// server, and an OAuth app's client ID and secret. An `mcp_oauth` app
+    /// registers its own client, so it needs only the server.
     pub fn missing(&self, auth: &AuthTemplate) -> Vec<&'static str> {
         let mut missing = Vec::new();
         if self.mcp_server_url.is_none() {
@@ -372,6 +401,91 @@ pub struct ConfigurationChanges {
 pub struct StoredClientSecret {
     pub sealed: Sealed,
     pub version: u32,
+}
+
+/// An authorization server, as discovery read and checked it (decision
+/// 0039): its `issuer` equals the URL its metadata was read for, and every
+/// endpoint is HTTPS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationServer {
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub registration_endpoint: String,
+}
+
+/// How a registered client authenticates at the token endpoint: as a public
+/// client relying on PKCE, or with HTTP Basic when the server issued it a
+/// secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuthentication {
+    None,
+    ClientSecretBasic,
+}
+
+impl ClientAuthentication {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ClientSecretBasic => "client_secret_basic",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "client_secret_basic" => Some(Self::ClientSecretBasic),
+            _ => None,
+        }
+    }
+}
+
+/// A client registration's row, by which what it was issued is sealed.
+/// Never shown outside the server, so it has no prefixed form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClientRegistrationId(uuid::Uuid);
+
+impl ClientRegistrationId {
+    pub fn generate() -> Self {
+        Self(uuid::Uuid::now_v7())
+    }
+
+    /// For row mapping only.
+    pub fn from_uuid(uuid: uuid::Uuid) -> Self {
+        Self(uuid)
+    }
+
+    pub fn uuid(self) -> uuid::Uuid {
+        self.0
+    }
+}
+
+/// A client Zupflow registered with an MCP server's authorization server
+/// (RFC 7591), for one catalog app in one environment or one workspace app.
+/// What the server issued beside the client ID (a client secret, a
+/// registration access token) is sealed together as one value, under the
+/// `oauth_client_registration` context of [`ClientRegistration::id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientRegistration {
+    pub id: ClientRegistrationId,
+    pub server: AuthorizationServer,
+    pub client_id: String,
+    pub authentication: ClientAuthentication,
+    /// `None` when the server issued neither a secret nor a registration access token.
+    pub sealed: Option<Sealed>,
+    pub created_at: Timestamp,
+}
+
+/// What [`AppStore::save_organization_client_registration`] stores. Sealed
+/// under the context of `id`, before the store sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewClientRegistration {
+    pub id: ClientRegistrationId,
+    pub server: AuthorizationServer,
+    pub client_id: String,
+    pub authentication: ClientAuthentication,
+    pub sealed: Option<Sealed>,
 }
 
 #[async_trait]
@@ -494,6 +608,48 @@ pub trait AppStore: Send + Sync {
         workspace_id: WorkspaceId,
         app_id: AppId,
     ) -> Result<Option<StoredClientSecret>, AppError>;
+
+    /// The client registered for a catalog app in one environment at
+    /// `issuer`, if any.
+    async fn find_organization_client_registration(
+        &self,
+        organization_id: OrganizationId,
+        app_id: AppId,
+        environment: Environment,
+        issuer: &str,
+    ) -> Result<Option<ClientRegistration>, AppError>;
+
+    /// Keeps `registration` as the catalog app's client in this environment
+    /// at its issuer, unless one is kept there already: then that one is
+    /// returned, unchanged, and `registration` is dropped. One transaction,
+    /// so concurrent first registrations keep exactly one. `NotFound` unless
+    /// the app is in the organization's catalog.
+    async fn save_organization_client_registration(
+        &self,
+        organization_id: OrganizationId,
+        app_id: AppId,
+        environment: Environment,
+        registration: &NewClientRegistration,
+    ) -> Result<ClientRegistration, AppError>;
+
+    /// As [`AppStore::find_organization_client_registration`], for a workspace app.
+    async fn find_workspace_client_registration(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        app_id: AppId,
+        issuer: &str,
+    ) -> Result<Option<ClientRegistration>, AppError>;
+
+    /// As [`AppStore::save_organization_client_registration`], for a workspace
+    /// app: `NotFound` unless it is this workspace's own.
+    async fn save_workspace_client_registration(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        app_id: AppId,
+        registration: &NewClientRegistration,
+    ) -> Result<ClientRegistration, AppError>;
 }
 
 #[cfg(test)]
@@ -515,6 +671,13 @@ mod tests {
         assert_eq!(json["inputs"][0]["key"], "token");
         let back: AuthTemplate = serde_json::from_value(json).unwrap_or(oauth.auth);
         assert_eq!(back, token.auth);
+        let sign_in = NewApp::blank("Ledger".into(), "ledger".into(), String::new(), AuthType::McpOAuth);
+        let json = serde_json::to_value(&sign_in.auth).unwrap_or_default();
+        assert_eq!(
+            json,
+            serde_json::json!({ "type": "mcp_oauth", "scopes": [], "identity_url": null })
+        );
+        assert_eq!(sign_in.auth.type_name(), "mcp_oauth");
     }
 
     /// The mock's FNV-1a over the slug picks the same tile color.

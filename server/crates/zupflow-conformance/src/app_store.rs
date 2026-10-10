@@ -10,7 +10,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use zupflow_core::apps::{
-    App, AppChanges, AppError, AppStore, AuthTemplate, AuthType, ConfigurationChanges, NewApp, NewClientSecret,
+    App, AppChanges, AppError, AppStore, AuthTemplate, AuthType, AuthorizationServer, ClientAuthentication,
+    ClientRegistration, ClientRegistrationId, ConfigurationChanges, NewApp, NewClientRegistration, NewClientSecret,
     StoredClientSecret,
 };
 use zupflow_core::environment::Environment;
@@ -65,6 +66,249 @@ pub async fn run(store: &dyn AppStore, prepare: Prepare) {
     keeps_configurations_to_their_app_and_environment(store, &prepare).await;
     takes_each_secret_version_once(store, &prepare).await;
     keeps_requested_scopes_offered(store, &prepare).await;
+    keeps_one_client_registration_per_owner_and_issuer(store, &prepare).await;
+    keeps_the_first_of_concurrent_registrations(store, &prepare).await;
+    keeps_workspace_registrations_to_their_workspace(store, &prepare).await;
+}
+
+fn server(issuer: &str) -> AuthorizationServer {
+    AuthorizationServer {
+        issuer: issuer.to_owned(),
+        authorization_endpoint: format!("{issuer}/authorize"),
+        token_endpoint: format!("{issuer}/token"),
+        registration_endpoint: format!("{issuer}/register"),
+    }
+}
+
+/// A registration at `issuer`; with a marker, a client that was issued a secret.
+fn registration(issuer: &str, client_id: &str, marker: Option<u8>) -> NewClientRegistration {
+    NewClientRegistration {
+        id: ClientRegistrationId::generate(),
+        server: server(issuer),
+        client_id: client_id.to_owned(),
+        authentication: if marker.is_some() {
+            ClientAuthentication::ClientSecretBasic
+        } else {
+            ClientAuthentication::None
+        },
+        sealed: marker.map(|marker| Sealed {
+            wrapped_key: WrappedKey {
+                key_id: "local:1".to_owned(),
+                bytes: vec![marker; 40],
+            },
+            nonce: [marker; 12],
+            ciphertext: vec![marker; 24],
+        }),
+    }
+}
+
+/// What the store keeps of `new`.
+fn kept(new: &NewClientRegistration, found: &ClientRegistration) {
+    assert_eq!(
+        (
+            found.id,
+            &found.server,
+            found.client_id.as_str(),
+            found.authentication,
+            &found.sealed
+        ),
+        (
+            new.id,
+            &new.server,
+            new.client_id.as_str(),
+            new.authentication,
+            &new.sealed
+        )
+    );
+}
+
+const ISSUER: &str = "https://auth.example/tenant";
+
+/// One client per catalog app, environment and issuer: a second at the same
+/// issuer keeps the first, another issuer is another registration, and
+/// nothing reaches another app, environment or organization.
+async fn keeps_one_client_registration_per_owner_and_issuer(store: &dyn AppStore, prepare: &Prepare) {
+    let (a, one, _) = organization(prepare).await;
+    let (b, _, _) = organization(prepare).await;
+    let sign_in =
+        |name: &str, slug: &str| NewApp::blank(name.to_owned(), slug.to_owned(), String::new(), AuthType::McpOAuth);
+    let app = catalog_app(store, a, sign_in("Ledger", "ledger")).await;
+    let sibling = catalog_app(store, a, sign_in("Desk", "desk")).await;
+    let own = workspace_app(store, a, one, sign_in("Ledger", "ledger")).await;
+    let sandbox = Environment::Sandbox;
+
+    assert_eq!(
+        store
+            .find_organization_client_registration(a, app.id, sandbox, ISSUER)
+            .await,
+        Ok(None)
+    );
+    let first = registration(ISSUER, "client-1", Some(1));
+    let saved = store
+        .save_organization_client_registration(a, app.id, sandbox, &first)
+        .await
+        .unwrap();
+    kept(&first, &saved);
+    let found = store
+        .find_organization_client_registration(a, app.id, sandbox, ISSUER)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found, saved);
+
+    // A second at the same issuer keeps the first, unchanged.
+    let second = registration(ISSUER, "client-2", None);
+    assert_eq!(
+        store
+            .save_organization_client_registration(a, app.id, sandbox, &second)
+            .await,
+        Ok(saved.clone())
+    );
+
+    // Another issuer is another registration; the first stays.
+    let moved = registration("https://auth.example/moved", "client-3", None);
+    kept(
+        &moved,
+        &store
+            .save_organization_client_registration(a, app.id, sandbox, &moved)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        store
+            .find_organization_client_registration(a, app.id, sandbox, ISSUER)
+            .await,
+        Ok(Some(saved.clone()))
+    );
+
+    // Not another environment's, another app's, or a workspace app's.
+    for (app_id, environment) in [
+        (app.id, Environment::Production),
+        (sibling.id, sandbox),
+        (own.id, sandbox),
+    ] {
+        assert_eq!(
+            store
+                .find_organization_client_registration(a, app_id, environment, ISSUER)
+                .await,
+            Ok(None)
+        );
+    }
+    let production = registration(ISSUER, "client-4", None);
+    kept(
+        &production,
+        &store
+            .save_organization_client_registration(a, app.id, Environment::Production, &production)
+            .await
+            .unwrap(),
+    );
+
+    // Another organization reaches nothing, and keeps nothing for an app not its own.
+    assert_eq!(
+        store
+            .find_organization_client_registration(b, app.id, sandbox, ISSUER)
+            .await,
+        Ok(None)
+    );
+    let new = registration(ISSUER, "client-5", None);
+    assert_eq!(
+        store
+            .save_organization_client_registration(b, app.id, sandbox, &new)
+            .await,
+        Err(AppError::NotFound)
+    );
+    // The catalog's methods don't take a workspace app.
+    assert_eq!(
+        store
+            .save_organization_client_registration(a, own.id, sandbox, &new)
+            .await,
+        Err(AppError::NotFound)
+    );
+}
+
+/// Concurrent first registrations keep exactly one, and both are told which.
+async fn keeps_the_first_of_concurrent_registrations(store: &dyn AppStore, prepare: &Prepare) {
+    let (a, one, _) = organization(prepare).await;
+    let app = catalog_app(
+        store,
+        a,
+        NewApp::blank("Ledger".into(), "ledger".into(), String::new(), AuthType::McpOAuth),
+    )
+    .await;
+    let own = workspace_app(
+        store,
+        a,
+        one,
+        NewApp::blank("Ledger".into(), "ledger".into(), String::new(), AuthType::McpOAuth),
+    )
+    .await;
+    let (left, right) = (
+        registration(ISSUER, "left", Some(2)),
+        registration(ISSUER, "right", None),
+    );
+    let (l, r) = tokio::join!(
+        store.save_organization_client_registration(a, app.id, Environment::Sandbox, &left),
+        store.save_organization_client_registration(a, app.id, Environment::Sandbox, &right),
+    );
+    let (l, r) = (l.unwrap(), r.unwrap());
+    assert_eq!(l, r, "both use the one kept");
+    assert!(l.id == left.id || l.id == right.id);
+    let (l, r) = tokio::join!(
+        store.save_workspace_client_registration(a, one, own.id, &left),
+        store.save_workspace_client_registration(a, one, own.id, &right),
+    );
+    let (l, r) = (l.unwrap(), r.unwrap());
+    assert_eq!(l, r, "both use the one kept");
+}
+
+/// A workspace app's client belongs to its workspace alone.
+async fn keeps_workspace_registrations_to_their_workspace(store: &dyn AppStore, prepare: &Prepare) {
+    let (a, one, two) = organization(prepare).await;
+    let (b, other, _) = organization(prepare).await;
+    let sign_in = || NewApp::blank("Ledger".into(), "ledger".into(), String::new(), AuthType::McpOAuth);
+    let own = workspace_app(store, a, one, sign_in()).await;
+    let neighbour = workspace_app(store, a, two, sign_in()).await;
+    let catalog = catalog_app(store, a, sign_in()).await;
+
+    let first = registration(ISSUER, "client-1", None);
+    let saved = store
+        .save_workspace_client_registration(a, one, own.id, &first)
+        .await
+        .unwrap();
+    kept(&first, &saved);
+    assert_eq!(
+        store.find_workspace_client_registration(a, one, own.id, ISSUER).await,
+        Ok(Some(saved))
+    );
+    // Not through another workspace, another organization, or the catalog.
+    for (organization_id, workspace_id, app_id) in [(a, two, own.id), (b, other, own.id), (a, one, neighbour.id)] {
+        assert_eq!(
+            store
+                .find_workspace_client_registration(organization_id, workspace_id, app_id, ISSUER)
+                .await,
+            Ok(None)
+        );
+    }
+    assert_eq!(
+        store
+            .find_organization_client_registration(a, own.id, Environment::Sandbox, ISSUER)
+            .await,
+        Ok(None)
+    );
+    // Nothing kept for another workspace's app, or a catalog app.
+    for (organization_id, workspace_id, app_id) in [(a, two, own.id), (b, other, own.id), (a, one, catalog.id)] {
+        assert_eq!(
+            store
+                .save_workspace_client_registration(
+                    organization_id,
+                    workspace_id,
+                    app_id,
+                    &registration(ISSUER, "client-2", None)
+                )
+                .await,
+            Err(AppError::NotFound)
+        );
+    }
 }
 
 fn oauth_template(scopes: &[&str]) -> AuthTemplate {

@@ -362,6 +362,7 @@ async fn reset(path: &str) -> Result<(), String> {
             TemplateSnapshot {
                 auth: found.auth,
                 app_version: found.version,
+                client: None,
             },
             fixture_apps::Owner {
                 organization_id: organization,

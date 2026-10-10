@@ -118,7 +118,7 @@ export function EditAuthSheet({
             onCancel={() => onOpenChange(false)}
             pending={pending}
           />
-        ) : (
+        ) : app.auth.type === "token" ? (
           <TokenForm
             auth={app.auth}
             open={open}
@@ -126,7 +126,7 @@ export function EditAuthSheet({
             onCancel={() => onOpenChange(false)}
             pending={pending}
           />
-        )}
+        ) : null}
       </SheetContent>
     </Sheet>
   );

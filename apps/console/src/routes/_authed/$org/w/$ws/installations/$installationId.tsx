@@ -29,6 +29,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
+import { authTypeLabel } from "@/features/apps/app-definition";
 import { canAdminister, canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { ConnectError, ConnectProgress, useConnectFlow } from "@/features/installations/connect-flow";
 import { InstallationTools } from "@/features/installations/installation-tools";
@@ -86,7 +87,7 @@ function InstallationPage() {
               </div>
               <p className="text-sm text-muted-foreground">
                 {i.app.name} · {i.app.owner_scope === "workspace" ? "Workspace app" : "Organization app"} ·{" "}
-                {i.app.auth_type === "oauth2" ? "OAuth" : "API token"}
+                {authTypeLabel(i.app.auth_type)}
               </p>
             </>
           ) : (

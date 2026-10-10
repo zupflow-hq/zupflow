@@ -26,7 +26,7 @@ import {
 } from "@zupflow/sdk";
 import { HttpResponse, http } from "msw";
 import { z } from "zod";
-import { checkedAuthTemplate } from "./auth-templates";
+import { checkedAuthTemplate, sameOrigin } from "./auth-templates";
 import { defaultToolsFor } from "./catalog";
 import { cancelScheduledRun, db, resetDb, scheduleRun } from "./db";
 import {
@@ -99,6 +99,9 @@ const slug = z.string().regex(SLUG_PATTERN, "Use 1–40 lowercase letters, numbe
 const environment = z.enum(ENVIRONMENTS, "Choose Sandbox or Production.");
 const name = (max = 60) => z.string().trim().min(1, "Required.").max(max, `Use ${max} characters or fewer.`);
 const MINUTE = 60_000;
+
+/** The host of an MCP server whose sign-in the mock can't use: it answers `discovery_failed`. */
+export const NO_SIGN_IN_HOST = "no-sign-in.example";
 
 function param(params: Record<string, string | readonly string[] | undefined>, key: string): string {
   const value = params[key];
@@ -263,8 +266,18 @@ function applyConfiguration(
   input: z.infer<typeof configurationInput>,
 ) {
   if (input.mcp_server_url) assertPublicHttps(input.mcp_server_url, "mcp_server_url");
-  if (app.auth.type !== "oauth2" && (input.oauth_client_id || input.oauth_client_secret)) {
+  if (app.auth.type === "token" && (input.oauth_client_id || input.oauth_client_secret)) {
     throw new ApiFailure(422, "oauth_not_supported", `${app.name} authenticates with a token, not OAuth.`);
+  }
+  if (
+    app.auth.type === "mcp_oauth" &&
+    (input.oauth_client_id || input.oauth_client_secret || (input.oauth_scopes?.length ?? 0) > 0)
+  ) {
+    throw new ApiFailure(
+      422,
+      "oauth_not_supported",
+      `${app.name} signs in through its MCP server: there's no OAuth client to configure, and its scopes are set in its authentication settings.`,
+    );
   }
   if (input.oauth_scopes && app.auth.type === "oauth2") {
     const known = new Set(app.auth.available_scopes.map((s) => s.name));
@@ -301,20 +314,20 @@ const appUpdateInput = z.object({
  * anything changes. A new template raises the app's version.
  */
 function applyAppUpdate(app: AppRow, input: z.infer<typeof appUpdateInput>) {
+  const configurations = db().configurations.filter(
+    (c) =>
+      c.organization_id === app.organization_id && c.workspace_id === app.owner_workspace_id && c.app_id === app.id,
+  );
   const auth =
     input.auth === undefined
       ? undefined
       : checkedAuthTemplate(
           app.auth,
           input.auth,
-          db()
-            .configurations.filter(
-              (c) =>
-                c.organization_id === app.organization_id &&
-                c.workspace_id === app.owner_workspace_id &&
-                c.app_id === app.id,
-            )
-            .map((c) => ({ environment: c.environment, scopes: c.oauth_scopes })),
+          configurations.map((c) => ({ environment: c.environment, scopes: c.oauth_scopes })),
+          configurations.flatMap((c) =>
+            c.mcp_server_url ? [{ environment: c.environment, url: c.mcp_server_url }] : [],
+          ),
         );
   if (input.name) app.name = input.name;
   if (input.description !== undefined) app.description = input.description;
@@ -330,7 +343,7 @@ const appInput = z.object({
   name: name(),
   slug,
   description: z.string().trim().max(280),
-  auth_type: z.enum(["oauth2", "token"], "Choose OAuth or token."),
+  auth_type: z.enum(["oauth2", "mcp_oauth", "token"], "Choose OAuth, sign-in through the MCP server, or token."),
 });
 
 function createApp(access: OrgAccess, input: z.infer<typeof appInput>, ownerWorkspaceId: WorkspaceId | null) {
@@ -370,23 +383,25 @@ function createApp(access: OrgAccess, input: z.infer<typeof appInput>, ownerWork
             pkce: true,
             identity_url: null,
           }
-        : {
-            type: "token",
-            inputs: [
-              {
-                key: "token",
-                label: "API token",
-                secret: true,
-                help: null,
-                placeholder: null,
-                pattern: null,
-              },
-            ],
-            placement: { location: "header", name: "Authorization", prefix: "Bearer " },
-            verify_url: null,
-            instructions: `Paste an API token for ${input.name}.`,
-            docs_url: null,
-          },
+        : input.auth_type === "mcp_oauth"
+          ? { type: "mcp_oauth", scopes: [], identity_url: null }
+          : {
+              type: "token",
+              inputs: [
+                {
+                  key: "token",
+                  label: "API token",
+                  secret: true,
+                  help: null,
+                  placeholder: null,
+                  pattern: null,
+                },
+              ],
+              placement: { location: "header", name: "Authorization", prefix: "Bearer " },
+              verify_url: null,
+              instructions: `Paste an API token for ${input.name}.`,
+              docs_url: null,
+            },
     tools: defaultToolsFor(input.name),
     version: 1,
     created_at: now,
@@ -394,6 +409,16 @@ function createApp(access: OrgAccess, input: z.infer<typeof appInput>, ownerWork
   };
   db().apps.push(app);
   return app;
+}
+
+/**
+ * What a new session asks for: an OAuth app's configured scopes, an
+ * `mcp_oauth` app's template scopes, a token app nothing.
+ */
+function requestedScopes(app: AppRow | undefined, config: ConfigurationRow | undefined): string[] {
+  if (app?.auth.type === "oauth2") return config?.oauth_scopes ?? [];
+  if (app?.auth.type === "mcp_oauth") return app.auth.scopes.map((s) => s.name);
+  return [];
 }
 
 /** Simulated provider identity for a credential or a consenting account. */
@@ -429,6 +454,37 @@ function sessionScope(session: ConnectSessionRow) {
           i.organization_id === organization_id && i.workspace_id === workspace_id && i.id === session.installation_id,
       ),
   };
+}
+
+/**
+ * Sign-in through an `mcp_oauth` app's server (decision 0039). The mock
+ * discovers nothing: a server on `no-sign-in.example` stands for one that
+ * offers no sign-in Zupflow can use, and every other server's is found. An
+ * identity URL the configuration has moved the server away from is refused
+ * first, before anything would be sent.
+ */
+function startSignIn(session: ConnectSessionRow, app: AppRow) {
+  if (app.auth.type !== "mcp_oauth") return;
+  const server = configurationOf(db().configurations, app, session.environment)?.mcp_server_url;
+  if (!server) return;
+  if (app.auth.identity_url && !sameOrigin(app.auth.identity_url, server)) {
+    session.status = "failed";
+    session.failure_code = "identity_off_server";
+    throw new ApiFailure(
+      422,
+      "identity_off_server",
+      `${app.name}'s identity URL isn't on its MCP server. Ask whoever set up the app to use an address on the server, or none.`,
+    );
+  }
+  if (new URL(server).hostname === NO_SIGN_IN_HOST) {
+    session.status = "failed";
+    session.failure_code = "discovery_failed";
+    throw new ApiFailure(
+      502,
+      "discovery_failed",
+      `${app.name}'s server doesn't offer a sign-in Zupflow can use. Ask whoever set up the app to check its server.`,
+    );
+  }
 }
 
 /** Revalidate eligibility at completion, not only at session creation. */
@@ -480,7 +536,7 @@ function completeSession(
       granted_scopes: session.requested_scopes,
       credential_version: (existing.connection?.credential_version ?? 0) + 1,
       connected_at: now,
-      expires_at: app.auth.type === "oauth2" ? new Date(Date.now() + 60 * MINUTE).toISOString() : null,
+      expires_at: app.auth.type !== "token" ? new Date(Date.now() + 60 * MINUTE).toISOString() : null,
     };
     existing.updated_at = now;
     installation = existing;
@@ -498,7 +554,7 @@ function completeSession(
         granted_scopes: session.requested_scopes,
         credential_version: 1,
         connected_at: now,
-        expires_at: app.auth.type === "oauth2" ? new Date(Date.now() + 60 * MINUTE).toISOString() : null,
+        expires_at: app.auth.type !== "token" ? new Date(Date.now() + 60 * MINUTE).toISOString() : null,
       },
       created_at: now,
       updated_at: now,
@@ -1420,7 +1476,7 @@ export function createHandlers(apiBase: string) {
           label,
           status: "pending",
           return_url: input.return_url,
-          requested_scopes: app?.auth.type === "oauth2" ? (config?.oauth_scopes ?? []) : [],
+          requested_scopes: requestedScopes(app, config),
           created_at: new Date(now).toISOString(),
           expires_at: new Date(now + 15 * MINUTE).toISOString(),
           completed_at: null,
@@ -1457,7 +1513,13 @@ export function createHandlers(apiBase: string) {
         assertSessionPending(session);
         const app = assertStillEligible(session);
         if (app.auth.type !== "token") {
-          throw new ApiFailure(422, "wrong_auth_type", `${app.name} connects with OAuth.`);
+          throw new ApiFailure(
+            422,
+            "wrong_auth_type",
+            app.auth.type === "oauth2"
+              ? `${app.name} connects with OAuth.`
+              : `${app.name} connects by signing in through its MCP server.`,
+          );
         }
         const input = await body(request, z.object({ values: z.record(z.string(), z.string()) }));
         const fields: Record<string, string> = {};
@@ -1497,10 +1559,11 @@ export function createHandlers(apiBase: string) {
         const session = await findSessionByReferenceCrossTenant(param(params, "reference"));
         assertSessionPending(session);
         const app = assertStillEligible(session);
-        if (app.auth.type !== "oauth2") {
+        if (app.auth.type === "token") {
           throw new ApiFailure(422, "wrong_auth_type", `${app.name} connects with a token.`);
         }
-        if (!app.auth.authorize_url || !app.auth.token_url) {
+        if (app.auth.type === "mcp_oauth") startSignIn(session, app);
+        if (app.auth.type === "oauth2" && (!app.auth.authorize_url || !app.auth.token_url)) {
           throw new ApiFailure(
             422,
             "configuration_not_ready",
@@ -1529,6 +1592,15 @@ export function createHandlers(apiBase: string) {
           session.status = "failed";
           session.failure_code = "consent_denied";
           throw new ApiFailure(422, "consent_denied", "Access was not granted. Nothing was connected.");
+        }
+        if (app.auth.type === "mcp_oauth" && !app.auth.identity_url) {
+          // Nothing identifies the account (decision 0039): a new installation's is anonymous, and a
+          // reconnect keeps the account it had, unchecked.
+          const previous = session.intent === "reconnect" ? sessionScope(session).installation() : undefined;
+          const account =
+            previous?.connection?.account ??
+            accountFor(app, `${session.id}:${input.email}`, `${app.name} account`, null);
+          return ok(completeSession(session, app, account));
         }
         const account = accountFor(app, input.email, input.email.split("@")[0] ?? input.email, input.email);
         return ok(completeSession(session, app, account));

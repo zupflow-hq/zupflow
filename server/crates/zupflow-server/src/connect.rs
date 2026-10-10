@@ -446,8 +446,10 @@ async fn ready_app(
     let environment = workspace.environment.as_str();
     match configuration {
         Some(configuration) if configuration.status(&app.auth) == ConfigurationStatus::Ready => {
-            let scopes = match app.auth {
+            let scopes = match &app.auth {
                 AuthTemplate::OAuth2 { .. } => configuration.oauth_scopes.clone(),
+                // Sign-in through the MCP server asks for its template's own scopes (decision 0039).
+                AuthTemplate::McpOAuth { scopes, .. } => scopes.iter().map(|scope| scope.name.clone()).collect(),
                 AuthTemplate::Token { .. } => Vec::new(),
             };
             Ok((installed, configuration.version, scopes))
@@ -917,7 +919,11 @@ async fn submit_credentials(
         ..
     } = &app.auth
     else {
-        return Err(ApiError::new(422, "wrong_auth_type", format!("{} connects with OAuth.", app.name)).into());
+        let how = match app.auth {
+            AuthTemplate::McpOAuth { .. } => "by signing in through its MCP server",
+            _ => "with OAuth",
+        };
+        return Err(ApiError::new(422, "wrong_auth_type", format!("{} connects {how}.", app.name)).into());
     };
     let body = body.object()?;
     let values = credential_values(&body, inputs)?;
@@ -996,6 +1002,7 @@ async fn submit_credentials(
         snapshot: TemplateSnapshot {
             auth: app.auth.clone(),
             app_version: app.version,
+            client: None,
         },
     };
     let (completed, installation) = state

@@ -1,12 +1,23 @@
-import type { AppDefinition } from "@zupflow/sdk";
+import type { AppDefinition, AuthType } from "@zupflow/sdk";
 import { CheckIcon, ExternalLinkIcon, LockIcon, PencilIcon } from "lucide-react";
 import { MonoValue } from "@/components/app/misc";
 import { Panel, Properties, Property, SectionHeader } from "@/components/app/page";
 import { ToolEffectTag } from "@/components/app/status";
 import { Button } from "@/components/ui/button";
 
+const AUTH_TYPE_LABELS: Record<AuthType, string> = {
+  oauth2: "OAuth",
+  mcp_oauth: "MCP sign-in",
+  token: "API token",
+};
+
+/** A short name for how an app's accounts authenticate. */
+export function authTypeLabel(type: AuthType): string {
+  return AUTH_TYPE_LABELS[type];
+}
+
 export function AuthTypeLabel({ app }: { app: Pick<AppDefinition, "auth"> }) {
-  return <>{app.auth.type === "oauth2" ? "OAuth" : "API token"}</>;
+  return <>{authTypeLabel(app.auth.type)}</>;
 }
 
 /** Tools the app's MCP server exposes. Agents get them only through grants. */
@@ -45,7 +56,8 @@ export function AuthTemplatePanel({ app, onEdit }: { app: AppDefinition; onEdit?
       <SectionHeader
         title="Authentication"
         actions={
-          onEdit ? (
+          // Sign-in through the MCP server isn't edited in the Console yet; the API takes it.
+          onEdit && auth.type !== "mcp_oauth" ? (
             <Button variant="outline" size="sm" onClick={onEdit}>
               <PencilIcon /> Edit
             </Button>
@@ -54,11 +66,41 @@ export function AuthTemplatePanel({ app, onEdit }: { app: AppDefinition; onEdit?
         description={
           auth.type === "oauth2"
             ? "Defined once. Each environment brings its own OAuth client."
-            : "What Connect asks for, and where the credential is sent."
+            : auth.type === "mcp_oauth"
+              ? "Users sign in through the MCP server. Zupflow finds its endpoints and registers its own client."
+              : "What Connect asks for, and where the credential is sent."
         }
       />
       <Panel>
-        {auth.type === "oauth2" ? (
+        {auth.type === "mcp_oauth" ? (
+          <Properties>
+            <Property label="Type">Sign-in through the MCP server</Property>
+            <Property label="Endpoints">
+              <span className="text-muted-foreground">Found from the server when a user signs in</span>
+            </Property>
+            <Property label="Client">
+              <span className="text-muted-foreground">
+                {app.owner_workspace_id
+                  ? "Registered by Zupflow for this workspace"
+                  : "Registered by Zupflow, once per environment"}
+              </span>
+            </Property>
+            <Property label="Account identity">
+              {auth.identity_url ? (
+                <MonoValue value={auth.identity_url} />
+              ) : (
+                <span className="text-muted-foreground">Not verified</span>
+              )}
+            </Property>
+            <Property label="Scopes asked for">
+              {auth.scopes.length > 0 ? (
+                <span className="tabular">{auth.scopes.length}</span>
+              ) : (
+                <span className="text-muted-foreground">The server's default</span>
+              )}
+            </Property>
+          </Properties>
+        ) : auth.type === "oauth2" ? (
           <Properties>
             <Property label="Type">OAuth 2.0 authorization code</Property>
             <Property label="PKCE">

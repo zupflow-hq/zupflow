@@ -15,8 +15,8 @@ use zupflow_core::apps::{AuthTemplate, OAuthScope};
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::{
-    ConnectedAccount, Installation, InstallationError, InstallationStatus, InstallationStore, InstalledApp,
-    NewCredential, NewInstallation, TemplateSnapshot,
+    ConnectedAccount, DiscoveredClient, Installation, InstallationError, InstallationStatus, InstallationStore,
+    InstalledApp, NewCredential, NewInstallation, TemplateSnapshot,
 };
 use zupflow_core::keys::{Sealed, WrappedKey};
 
@@ -73,6 +73,25 @@ pub fn snapshot(app_version: u32) -> TemplateSnapshot {
             identity_url: None,
         },
         app_version,
+        client: None,
+    }
+}
+
+/// An `mcp_oauth` installation's template, with where it signed in: kept
+/// and returned exactly too.
+pub fn signed_in_snapshot(app_version: u32) -> TemplateSnapshot {
+    TemplateSnapshot {
+        auth: AuthTemplate::McpOAuth {
+            scopes: Vec::new(),
+            identity_url: None,
+        },
+        app_version,
+        client: Some(DiscoveredClient {
+            issuer: "https://auth.example/tenant".to_owned(),
+            token_endpoint: "https://auth.example/tenant/token".to_owned(),
+            client_id: "client-1".to_owned(),
+            resource: "https://tools.example/mcp".to_owned(),
+        }),
     }
 }
 
@@ -148,6 +167,27 @@ async fn creates_and_finds_within_its_workspace(store: &dyn InstallationStore, p
     );
     assert_eq!(connection.granted_scopes, ["read"]);
     assert_eq!(created.snapshot, Some(snapshot(7)), "the template it connected under");
+    let signed_in = store
+        .create_installation(
+            a.organization_id,
+            a.sandbox,
+            InstallationId::generate(),
+            &NewInstallation {
+                snapshot: signed_in_snapshot(2),
+                ..new(InstalledApp::Catalog(a.catalog_app), "Signed in", 8)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(signed_in.snapshot, Some(signed_in_snapshot(2)), "where it signed in");
+    assert_eq!(
+        store
+            .find_installation(a.organization_id, a.sandbox, signed_in.id)
+            .await
+            .unwrap()
+            .and_then(|found| found.snapshot),
+        Some(signed_in_snapshot(2))
+    );
     assert_eq!(
         store
             .find_installation(a.organization_id, a.sandbox, created.id)

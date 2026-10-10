@@ -17,6 +17,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
+import { authTypeLabel } from "@/features/apps/app-definition";
 import { canAdminister } from "@/features/context";
 import { useAvailableApps, useOrgApps } from "@/features/queries";
 import { cn } from "@/lib/utils";
@@ -122,7 +123,7 @@ export function AddInstallationDialog({
                         ) : null}
                       </p>
                       <p className="truncate text-xs text-muted-foreground">
-                        {a.app.auth.type === "oauth2" ? "OAuth" : "API token"} · {a.app.tools.length} tools
+                        {authTypeLabel(a.app.auth.type)} · {a.app.tools.length} tools
                       </p>
                     </div>
                   </button>
