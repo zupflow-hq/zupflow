@@ -15,3 +15,25 @@ export function ConnectFrame({ children }: { children: React.ReactNode }) {
     </main>
   );
 }
+
+/** A finished Connect state: an icon, what happened, and what to do next. */
+export function ConnectOutcome({
+  icon,
+  title,
+  body,
+  children,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  body: React.ReactNode;
+  children?: React.ReactNode;
+}) {
+  return (
+    <div className="flex flex-col items-center gap-3 text-center">
+      {icon}
+      <h1 className="text-lg font-semibold text-balance">{title}</h1>
+      <p className="text-sm text-pretty text-muted-foreground">{body}</p>
+      {children}
+    </div>
+  );
+}

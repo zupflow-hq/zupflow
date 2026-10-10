@@ -35,7 +35,7 @@ import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 import { appIn, timelineOf } from "./scope";
 import { listedFrom, recordListing } from "./tools";
 
-export const DB_SCHEMA = 16;
+export const DB_SCHEMA = 17;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -218,6 +218,10 @@ export function seed(nowMs: number = Date.now()): Db {
   const echo = addApp(CATALOG.echoServer, qa, 11 * DAY);
   configure(echo, "sandbox", "ready", qa.id, sam, 11 * DAY);
 
+  const fieldnote = addApp(CATALOG.fieldnote, null, 8 * DAY);
+  configure(fieldnote, "sandbox", "ready", null, priya, 8 * DAY);
+  configure(fieldnote, "production", "unconfigured", null, priya, 8 * DAY);
+
   // --- Installations ----------------------------------------------------------
 
   const installations: InstallationRow[] = [];
@@ -237,7 +241,10 @@ export function seed(nowMs: number = Date.now()): Db {
             display_name: account.name,
             email: account.email,
           },
-          granted_scopes: configuration?.oauth_scopes ?? [],
+          granted_scopes:
+            app.auth.type === "mcp_oauth"
+              ? app.auth.scopes.map((scope) => scope.name)
+              : (configuration?.oauth_scopes ?? []),
           credential_version: 1 + Math.floor(rng() * 3),
           connected_at: ago(createdAgo),
           expires_at: app.auth.type === "oauth2" ? ago(-50 * MINUTE) : null,
@@ -298,6 +305,8 @@ export function seed(nowMs: number = Date.now()): Db {
     28 * DAY,
   );
   const qaEcho = install(qa, echo, "Default", { name: "echo", email: null }, 11 * DAY);
+  // Nothing names a Fieldnote account: it's anonymous, as sign-in through an MCP server without an identity URL leaves it.
+  install(acmeSandbox, fieldnote, "Field team", { name: "Fieldnote account", email: null }, 7 * DAY);
   install(qa, github, "Old bot", null, 9 * DAY, "disconnected");
 
   // --- Agents and grants ------------------------------------------------------

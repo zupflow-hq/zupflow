@@ -2,7 +2,14 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import type { AppDefinition, AuthTemplate } from "@zupflow/sdk";
 import { PlusIcon, Trash2Icon } from "lucide-react";
 import { useEffect } from "react";
-import { type FieldPath, type UseFormReturn, useFieldArray, useForm } from "react-hook-form";
+import {
+  type FieldArray,
+  type FieldArrayPath,
+  type FieldPath,
+  type UseFormReturn,
+  useFieldArray,
+  useForm,
+} from "react-hook-form";
 import { z } from "zod";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -12,7 +19,7 @@ import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetT
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { applyFieldErrors, toastError } from "@/lib/errors";
+import { applyFieldErrors, isApiError, toastError } from "@/lib/errors";
 
 /** A URL field: blank means none. The server checks it's public HTTPS. */
 const optionalUrl = z
@@ -20,16 +27,23 @@ const optionalUrl = z
   .trim()
   .refine((value) => value === "" || /^https:\/\//i.test(value), "Use an https:// URL, or leave it blank.");
 
+const scopeList = z
+  .array(
+    z.object({ name: z.string().trim().min(1, "Name the scope.").max(300), description: z.string().trim().max(300) }),
+  )
+  .max(50, "Up to 50 scopes.");
+
 const oauthSchema = z.object({
   authorize_url: optionalUrl,
   token_url: optionalUrl,
   identity_url: optionalUrl,
   pkce: z.boolean(),
-  scopes: z
-    .array(
-      z.object({ name: z.string().trim().min(1, "Name the scope.").max(300), description: z.string().trim().max(300) }),
-    )
-    .max(50, "Up to 50 scopes."),
+  scopes: scopeList,
+});
+
+const mcpSchema = z.object({
+  identity_url: optionalUrl,
+  scopes: scopeList,
 });
 
 const tokenSchema = z.object({
@@ -58,7 +72,9 @@ const tokenSchema = z.object({
 });
 
 type OAuthValues = z.infer<typeof oauthSchema>;
+type McpValues = z.infer<typeof mcpSchema>;
 type TokenValues = z.infer<typeof tokenSchema>;
+type AnyValues = OAuthValues | McpValues | TokenValues;
 
 const orNull = (value: string) => (value.trim() === "" ? null : value.trim());
 
@@ -69,6 +85,10 @@ const OAUTH_FIELDS: Record<string, FieldPath<OAuthValues>> = {
   "auth.identity_url": "identity_url",
   "auth.pkce": "pkce",
   "auth.available_scopes": "scopes",
+};
+const MCP_FIELDS: Record<string, FieldPath<McpValues>> = {
+  "auth.identity_url": "identity_url",
+  "auth.scopes": "scopes",
 };
 const TOKEN_FIELDS: Record<string, FieldPath<TokenValues>> = {
   "auth.inputs": "inputs",
@@ -83,7 +103,8 @@ type Save = (auth: AuthTemplate, callbacks: { onSuccess: () => void; onError: (e
 
 /**
  * Edits how an app's accounts authenticate: an OAuth app's endpoints and the
- * scopes it offers, or what a token app asks for and where it sends it. The
+ * scopes it offers, what sign-in through an MCP server asks for and how it
+ * checks the account, or what a token app asks for and where it sends it. The
  * type itself is fixed when the app is created.
  */
 export function EditAuthSheet({
@@ -107,11 +128,21 @@ export function EditAuthSheet({
           <SheetDescription>
             {app.auth.type === "oauth2"
               ? "Where Connect sends people to approve access, and the scopes configurations can ask for."
-              : "What Connect asks people for, and how Zupflow sends it to the server."}
+              : app.auth.type === "mcp_oauth"
+                ? "People sign in through the MCP server. Choose the scopes sign-in asks for, and how Zupflow checks the account."
+                : "What Connect asks people for, and how Zupflow sends it to the server."}
           </SheetDescription>
         </SheetHeader>
         {app.auth.type === "oauth2" ? (
           <OAuthForm
+            auth={app.auth}
+            open={open}
+            onSave={onSave}
+            onCancel={() => onOpenChange(false)}
+            pending={pending}
+          />
+        ) : app.auth.type === "mcp_oauth" ? (
+          <McpOAuthForm
             auth={app.auth}
             open={open}
             onSave={onSave}
@@ -155,13 +186,7 @@ function Footer({ form, onCancel, pending }: { form: string; onCancel: () => voi
 }
 
 /** A list's own error: the server's, or the client's on the array itself. */
-function ListMessage<T extends OAuthValues | TokenValues>({
-  form,
-  name,
-}: {
-  form: UseFormReturn<T>;
-  name: "scopes" | "inputs";
-}) {
+function ListMessage<T extends AnyValues>({ form, name }: { form: UseFormReturn<T>; name: "scopes" | "inputs" }) {
   const error = (
     form.formState.errors as Record<string, { message?: string; root?: { message?: string } } | undefined>
   )[name];
@@ -169,7 +194,7 @@ function ListMessage<T extends OAuthValues | TokenValues>({
   return message ? <p className="text-sm text-destructive">{message}</p> : null;
 }
 
-function UrlField<T extends OAuthValues | TokenValues>({
+function UrlField<T extends AnyValues>({
   form,
   name,
   label,
@@ -228,7 +253,6 @@ function OAuthForm({
     scopes: auth.available_scopes.map((scope) => ({ ...scope })),
   });
   const form = useForm<OAuthValues>({ resolver: zodResolver(oauthSchema), defaultValues: defaults() });
-  const scopes = useFieldArray({ control: form.control, name: "scopes" });
   // biome-ignore lint/correctness/useExhaustiveDependencies: reset to the stored template each time the sheet opens
   useEffect(() => {
     if (open) form.reset(defaults());
@@ -289,71 +313,161 @@ function OAuthForm({
             </FormItem>
           )}
         />
-        <fieldset className="space-y-3">
-          <div>
-            <legend className="text-sm font-medium">Scopes offered</legend>
-            <p className="text-sm text-muted-foreground">
-              Each environment's configuration picks from these. A scope a configuration asks for can't be removed.
-            </p>
-          </div>
-          {scopes.fields.length > 0 ? (
-            <ul className="space-y-2">
-              {scopes.fields.map((scope, index) => (
-                <li key={scope.id} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_auto] items-start gap-2">
-                  <FormField
-                    control={form.control}
-                    name={`scopes.${index}.name`}
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormControl>
-                          <Input
-                            aria-label={`Scope ${index + 1}`}
-                            className="font-mono text-sm"
-                            placeholder="read"
-                            autoComplete="off"
-                            spellCheck={false}
-                            {...field}
-                          />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                  <FormField
-                    control={form.control}
-                    name={`scopes.${index}.description`}
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormControl>
-                          <Input
-                            aria-label={`What scope ${index + 1} allows`}
-                            placeholder="What it allows"
-                            {...field}
-                          />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                  <RemoveButton label={`Remove scope ${index + 1}`} onClick={() => scopes.remove(index)} />
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p className="rounded-lg border border-dashed p-3 text-sm text-muted-foreground">
-              None listed: configurations request the provider's defaults.
-            </p>
-          )}
-          <ListMessage form={form} name="scopes" />
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => scopes.append({ name: "", description: "" })}
-          >
-            <PlusIcon /> Add scope
-          </Button>
-        </fieldset>
+        <ScopesFieldset
+          form={form}
+          legend="Scopes offered"
+          description="Each environment's configuration picks from these. A scope a configuration asks for can't be removed."
+          empty="None listed: configurations request the provider's defaults."
+        />
+      </form>
+      <Footer form="edit-auth" onCancel={onCancel} pending={pending} />
+    </Form>
+  );
+}
+
+/** A list of scopes, each a name and what it allows. */
+function ScopesFieldset<T extends OAuthValues | McpValues>({
+  form,
+  legend,
+  description,
+  empty,
+}: {
+  form: UseFormReturn<T>;
+  legend: string;
+  description: string;
+  empty: string;
+}) {
+  const scopes = useFieldArray({ control: form.control, name: "scopes" as FieldArrayPath<T> });
+  const path = (index: number, key: "name" | "description") => `scopes.${index}.${key}` as FieldPath<T>;
+  return (
+    <fieldset className="space-y-3">
+      <div>
+        <legend className="text-sm font-medium">{legend}</legend>
+        <p className="text-sm text-muted-foreground">{description}</p>
+      </div>
+      {scopes.fields.length > 0 ? (
+        <ul className="space-y-2">
+          {scopes.fields.map((scope, index) => (
+            <li key={scope.id} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_auto] items-start gap-2">
+              <FormField
+                control={form.control}
+                name={path(index, "name")}
+                render={({ field }) => (
+                  <FormItem>
+                    <FormControl>
+                      <Input
+                        aria-label={`Scope ${index + 1}`}
+                        className="font-mono text-sm"
+                        placeholder="read"
+                        autoComplete="off"
+                        spellCheck={false}
+                        {...field}
+                        value={field.value as string}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name={path(index, "description")}
+                render={({ field }) => (
+                  <FormItem>
+                    <FormControl>
+                      <Input
+                        aria-label={`What scope ${index + 1} allows`}
+                        placeholder="What it allows"
+                        {...field}
+                        value={field.value as string}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <RemoveButton label={`Remove scope ${index + 1}`} onClick={() => scopes.remove(index)} />
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="rounded-lg border border-dashed p-3 text-sm text-muted-foreground">{empty}</p>
+      )}
+      <ListMessage form={form} name="scopes" />
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={() => scopes.append({ name: "", description: "" } as FieldArray<T, FieldArrayPath<T>>)}
+      >
+        <PlusIcon /> Add scope
+      </Button>
+    </fieldset>
+  );
+}
+
+function McpOAuthForm({
+  auth,
+  open,
+  onSave,
+  onCancel,
+  pending,
+}: {
+  auth: Extract<AuthTemplate, { type: "mcp_oauth" }>;
+  open: boolean;
+  onSave: Save;
+  onCancel: () => void;
+  pending: boolean;
+}) {
+  const defaults = (): McpValues => ({
+    identity_url: auth.identity_url ?? "",
+    scopes: auth.scopes.map((scope) => ({ ...scope })),
+  });
+  const form = useForm<McpValues>({ resolver: zodResolver(mcpSchema), defaultValues: defaults() });
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset to the stored template each time the sheet opens
+  useEffect(() => {
+    if (open) form.reset(defaults());
+  }, [open]);
+
+  return (
+    <Form {...form}>
+      <form
+        id="edit-auth"
+        className="flex-1 space-y-5 overflow-y-auto p-4"
+        onSubmit={form.handleSubmit((values) =>
+          onSave(
+            { type: "mcp_oauth", identity_url: orNull(values.identity_url), scopes: values.scopes },
+            {
+              onSuccess: onCancel,
+              onError: (error) => {
+                if (isApiError(error, "identity_off_server")) {
+                  // Why, then where: the field's own message names the server's address.
+                  const where = error.fields?.["auth.identity_url"];
+                  form.setError("identity_url", {
+                    type: "server",
+                    message: where ? `${error.message} ${where}` : error.message,
+                  });
+                  return;
+                }
+                if (!applyFieldErrors(form, error, MCP_FIELDS)) toastError(error, "Couldn't save authentication");
+              },
+            },
+          ),
+        )}
+      >
+        <ScopesFieldset
+          form={form}
+          legend="Scopes asked for"
+          description="Sign-in asks the server for these. Use the names the server documents."
+          empty="None listed: sign-in asks for the server's default scopes."
+        />
+        <UrlField
+          form={form}
+          name="identity_url"
+          label="Account identity URL"
+          placeholder="https://mcp.provider.example/me"
+          description="Optional. A read-only request on the MCP server's own address that names the connected account, so a reconnect can check it's the same one. Without it, Zupflow can check only when the server's token names a subject."
+        />
       </form>
       <Footer form="edit-auth" onCancel={onCancel} pending={pending} />
     </Form>

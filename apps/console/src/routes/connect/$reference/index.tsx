@@ -2,7 +2,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import type { ConnectSession, TokenAuthTemplate } from "@zupflow/sdk";
 import { ZupflowApiError } from "@zupflow/sdk";
-import { CheckCircle2Icon, ClockIcon, ExternalLinkIcon, XCircleIcon } from "lucide-react";
+import { CheckCircle2Icon, ExternalLinkIcon, RotateCwIcon, XCircleIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { EnvBadge } from "@/components/app/environment";
 import { AppIcon } from "@/components/app/misc";
@@ -11,7 +11,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
-import { ConnectFrame } from "@/features/connect/frame";
+import { hostedFailure } from "@/features/connect/failure";
+import { ConnectFrame, ConnectOutcome } from "@/features/connect/frame";
+import { returnUrlFor, SessionEnded } from "@/features/connect/session-ended";
 import { useDocumentTitle } from "@/features/context";
 import { useHostedConnectSession } from "@/features/queries";
 import { api } from "@/lib/api";
@@ -36,11 +38,12 @@ function HostedConnectPage() {
   const session = useHostedConnectSession(reference);
   useDocumentTitle(session.data ? `Connect ${session.data.app.name}` : "Connect");
 
-  if (session.isError) {
+  // A failed re-read keeps the session it already had: it may still be pending.
+  if (session.isError && !session.data) {
     const notFound = session.error instanceof ZupflowApiError && session.error.status === 404;
     return (
       <ConnectFrame>
-        <Final
+        <ConnectOutcome
           icon={<XCircleIcon className="size-9 text-destructive" />}
           title={notFound ? "This link isn't valid" : "Connect couldn't load"}
           body={notFound ? "Start again from the app that sent you here." : errorMessage(session.error)}
@@ -70,50 +73,28 @@ function HostedConnectPage() {
   );
 }
 
-function Final({
-  icon,
-  title,
-  body,
-  children,
-}: {
-  icon: React.ReactNode;
-  title: string;
-  body: React.ReactNode;
-  children?: React.ReactNode;
-}) {
-  return (
-    <div className="flex flex-col items-center gap-3 text-center">
-      {icon}
-      <h1 className="text-lg font-semibold">{title}</h1>
-      <p className="text-sm text-muted-foreground">{body}</p>
-      {children}
-    </div>
-  );
-}
-
 function ConnectBody({ session, reference }: { session: ConnectSession; reference: string }) {
   const queryClient = useQueryClient();
   const refresh = () => queryClient.invalidateQueries({ queryKey: qk.hostedConnect(reference) });
   const cancel = useMutation({ mutationFn: () => api.connect.cancel(reference), onSettled: refresh });
 
+  const back = returnUrlFor(session);
   useEffect(() => {
     if (session.status === "pending") return;
     notifyOpener(session.id);
-    if (session.status === "completed" && session.return_url) {
-      const url = new URL(session.return_url);
-      url.searchParams.set("zupflow_session", session.id);
-      const t = setTimeout(() => window.location.assign(url.toString()), 1200);
+    if (session.status === "completed" && back) {
+      const t = setTimeout(() => window.location.assign(back), 1200);
       return () => clearTimeout(t);
     }
     if (session.status === "completed" && window.opener) {
       const t = setTimeout(() => window.close(), 1600);
       return () => clearTimeout(t);
     }
-  }, [session.status, session.id, session.return_url]);
+  }, [session.status, session.id, back]);
 
   if (session.status === "completed") {
     return (
-      <Final
+      <ConnectOutcome
         icon={<CheckCircle2Icon className="size-9 text-success" />}
         title={`${session.app.name} connected`}
         body={session.return_url ? "Taking you back…" : "You can close this window."}
@@ -121,32 +102,7 @@ function ConnectBody({ session, reference }: { session: ConnectSession; referenc
     );
   }
   if (session.status !== "pending") {
-    const copy = {
-      expired: ["This link expired", "Connect links last 15 minutes. Start again from the app."],
-      cancelled: ["Connect was cancelled", "Nothing was connected."],
-      failed: [
-        "Couldn't connect",
-        session.failure_code === "account_mismatch"
-          ? "That was a different account from the one being reconnected. Nothing changed."
-          : session.failure_code === "consent_denied"
-            ? "Access wasn't granted. Nothing was connected."
-            : "Nothing was connected. Start again from the app.",
-      ],
-    } as const;
-    const [title, body] = copy[session.status];
-    return (
-      <Final
-        icon={
-          session.status === "expired" ? (
-            <ClockIcon className="size-9 text-muted-foreground" />
-          ) : (
-            <XCircleIcon className="size-9 text-destructive" />
-          )
-        }
-        title={title}
-        body={body}
-      />
-    );
+    return <SessionEnded session={session} canClose={Boolean(window.opener)} />;
   }
 
   return (
@@ -158,9 +114,12 @@ function ConnectBody({ session, reference }: { session: ConnectSession; referenc
             {session.intent === "reconnect" ? "Reconnect" : "Connect"} {session.app.name}
           </h1>
           <p className="text-sm text-muted-foreground">
-            {session.expected_account
-              ? `Use ${session.expected_account.email ?? session.expected_account.display_name} — the account already linked.`
-              : `So your assistant can work with your ${session.app.name} account.`}
+            {!session.expected_account
+              ? `So your assistant can work with your ${session.app.name} account.`
+              : session.auth?.type === "mcp_oauth" && !session.auth.identity_url
+                ? // Nothing names the account, so the person is the only check that it's the same one.
+                  `Sign in with the same ${session.app.name} account you connected before. Zupflow may not be able to tell which account it is, so make sure it's the same one.`
+                : `Use ${session.expected_account.email ?? session.expected_account.display_name} — the account already linked.`}
           </p>
         </div>
         {session.environment === "sandbox" ? <EnvBadge environment="sandbox" size="sm" /> : null}
@@ -169,7 +128,7 @@ function ConnectBody({ session, reference }: { session: ConnectSession; referenc
         {session.auth?.type === "token" ? (
           <TokenForm session={session} reference={reference} auth={session.auth} onDone={refresh} />
         ) : (
-          <OAuthStart session={session} reference={reference} />
+          <OAuthStart session={session} reference={reference} onFailed={refresh} />
         )}
       </div>
       <Button
@@ -184,11 +143,25 @@ function ConnectBody({ session, reference }: { session: ConnectSession; referenc
   );
 }
 
-function OAuthStart({ session, reference }: { session: ConnectSession; reference: string }) {
+function OAuthStart({
+  session,
+  reference,
+  onFailed,
+}: {
+  session: ConnectSession;
+  reference: string;
+  /** Re-reads the session: a start the provider's side refused fails it, and the page shows why. */
+  onFailed: () => Promise<void>;
+}) {
   const authorize = useMutation({
     mutationFn: () => api.connect.authorize(reference),
     onSuccess: ({ authorization_url }) => window.location.assign(authorization_url),
+    // Awaited, so the button stays busy until the page knows whether the session is still pending.
+    onError: () => onFailed(),
   });
+  // The session is still pending here (a failed one shows why instead). Our side or the network failing can pass;
+  // anything the request itself got wrong fails the same way again.
+  const retry = authorize.isError && (!(authorize.error instanceof ZupflowApiError) || authorize.error.status >= 500);
   return (
     <div className="space-y-4">
       {session.requested_scopes.length > 0 ? (
@@ -203,10 +176,24 @@ function OAuthStart({ session, reference }: { session: ConnectSession; reference
           </ul>
         </div>
       ) : null}
-      {authorize.isError ? <p className="text-sm text-destructive">{errorMessage(authorize.error)}</p> : null}
-      <Button className="h-10 w-full" disabled={authorize.isPending} onClick={() => authorize.mutate()}>
-        {authorize.isPending ? <Spinner /> : <ExternalLinkIcon />}
-        Continue to {session.app.name}
+      {authorize.isError ? (
+        <p role="alert" className="text-sm text-destructive">
+          {retry
+            ? errorMessage(authorize.error)
+            : // The server's words are for the app's developer; the person here gets what they can do.
+              hostedFailure({
+                app: session.app,
+                failure_code: authorize.error instanceof ZupflowApiError ? authorize.error.code : null,
+              }).body}
+        </p>
+      ) : null}
+      <Button
+        className="h-10 w-full"
+        disabled={authorize.isPending || (authorize.isError && !retry)}
+        onClick={() => authorize.mutate()}
+      >
+        {authorize.isPending ? <Spinner /> : retry ? <RotateCwIcon /> : <ExternalLinkIcon />}
+        {retry ? "Try again" : `Continue to ${session.app.name}`}
       </Button>
       <p className="text-center text-xs text-muted-foreground">
         You'll sign in on {session.app.name}. Zupflow never sees your password.
@@ -233,6 +220,8 @@ function TokenForm({
       setValues({});
       onDone();
     },
+    // A session that ended meanwhile shows why; a pending one keeps the form and its values.
+    onError: () => onDone(),
   });
   const fieldErrors = submit.error instanceof ZupflowApiError ? (submit.error.fields ?? {}) : {};
 

@@ -104,8 +104,12 @@ export function setLatency(range: [number, number]) {
 
 /**
  * Wrap a resolver: add latency, apply `Idempotency-Key` to every `POST`, turn
- * {@link ApiFailure} into an error envelope and persist after successful
- * mutations.
+ * {@link ApiFailure} into an error envelope and persist after every mutating
+ * request. A refused one can still change state on purpose (a Connect session
+ * fails with its reason), and another tab, like Connect's own window and the
+ * Console watching it, only sees what was persisted. A keyed `POST` is also
+ * persisted by the idempotency wrapper; this is what covers requests without a
+ * key (the mock-only simulated consent) and every `PUT`, `PATCH` and `DELETE`.
  */
 type ResolverArgs = {
   request: Request;
@@ -118,11 +122,11 @@ export function route<A extends ResolverArgs>(fn: (args: A) => Promise<Response>
     if (max > 0) await delay(min + Math.floor(Math.random() * (max - min)));
     const handle = async () => {
       try {
-        const response = await fn(args);
-        if (args.request.method !== "GET" && response.ok) persist();
-        return response;
+        return await fn(args);
       } catch (error) {
         return failureFor(error);
+      } finally {
+        if (args.request.method !== "GET") persist();
       }
     };
     try {

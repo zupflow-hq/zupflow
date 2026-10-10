@@ -1,5 +1,5 @@
-import type { AppDefinition, AuthType } from "@zupflow/sdk";
-import { CheckIcon, ExternalLinkIcon, LockIcon, PencilIcon } from "lucide-react";
+import type { AppDefinition, AuthTemplate, AuthType } from "@zupflow/sdk";
+import { CheckIcon, ExternalLinkIcon, InfoIcon, LockIcon, PencilIcon } from "lucide-react";
 import { MonoValue } from "@/components/app/misc";
 import { Panel, Properties, Property, SectionHeader } from "@/components/app/page";
 import { ToolEffectTag } from "@/components/app/status";
@@ -14,6 +14,28 @@ const AUTH_TYPE_LABELS: Record<AuthType, string> = {
 /** A short name for how an app's accounts authenticate. */
 export function authTypeLabel(type: AuthType): string {
   return AUTH_TYPE_LABELS[type];
+}
+
+/**
+ * Whether nothing names an app's connected accounts: sign-in through an MCP
+ * server without an identity URL. A reconnect is then checked only when the
+ * server's tokens name a subject.
+ */
+export function accountUnchecked(auth: AuthTemplate): boolean {
+  return auth.type === "mcp_oauth" && !auth.identity_url;
+}
+
+/** Says that a reconnect may not be checked, and how to fix it. */
+export function UncheckedAccountNote({ children }: { children?: React.ReactNode }) {
+  return (
+    <p className="flex gap-2 text-sm text-muted-foreground">
+      <InfoIcon className="mt-0.5 size-4 shrink-0" />
+      <span>
+        Zupflow can't confirm a reconnect is the same account unless the server's token names a subject. Set an identity
+        URL so it always can.{children ? <> {children}</> : null}
+      </span>
+    </p>
+  );
 }
 
 export function AuthTypeLabel({ app }: { app: Pick<AppDefinition, "auth"> }) {
@@ -56,8 +78,7 @@ export function AuthTemplatePanel({ app, onEdit }: { app: AppDefinition; onEdit?
       <SectionHeader
         title="Authentication"
         actions={
-          // Sign-in through the MCP server isn't edited in the Console yet; the API takes it.
-          onEdit && auth.type !== "mcp_oauth" ? (
+          onEdit ? (
             <Button variant="outline" size="sm" onClick={onEdit}>
               <PencilIcon /> Edit
             </Button>
@@ -89,7 +110,10 @@ export function AuthTemplatePanel({ app, onEdit }: { app: AppDefinition; onEdit?
               {auth.identity_url ? (
                 <MonoValue value={auth.identity_url} />
               ) : (
-                <span className="text-muted-foreground">Not verified</span>
+                <div className="space-y-1.5">
+                  <span>Not set</span>
+                  <UncheckedAccountNote />
+                </div>
               )}
             </Property>
             <Property label="Scopes asked for">

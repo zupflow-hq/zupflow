@@ -284,6 +284,27 @@ const acmePublishing: CatalogEntry = {
   ],
 };
 
+/** Signs in through its MCP server, with no identity URL: its accounts can't be checked on reconnect. */
+const fieldnote: CatalogEntry = {
+  slug: "fieldnote",
+  name: "Fieldnote",
+  description: "Shared notes and field reports. People sign in through its MCP server.",
+  icon: { glyph: "Fn", color: "#4D7C0F" },
+  mcp_server_url: "https://mcp.fieldnote.example/mcp",
+  auth: {
+    type: "mcp_oauth",
+    scopes: [
+      { name: "notes:read", description: "Read notes and reports" },
+      { name: "notes:write", description: "Create and edit notes" },
+    ],
+    identity_url: null,
+  },
+  tools: [
+    { name: "search_notes", title: "Search notes", description: "Find notes by text or tag.", effect: "read" },
+    { name: "create_note", title: "Create note", description: "Add a note to a notebook.", effect: "write" },
+  ],
+};
+
 const echoServer: CatalogEntry = {
   slug: "echo-server",
   name: "Echo test server",
@@ -325,6 +346,7 @@ export const CATALOG = {
   stripe,
   github,
   acmePublishing,
+  fieldnote,
   echoServer,
 } as const;
 

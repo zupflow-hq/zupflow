@@ -29,7 +29,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
-import { authTypeLabel } from "@/features/apps/app-definition";
+import { accountUnchecked, authTypeLabel, UncheckedAccountNote } from "@/features/apps/app-definition";
 import { canAdminister, canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { ConnectError, ConnectProgress, useConnectFlow } from "@/features/installations/connect-flow";
 import { InstallationTools } from "@/features/installations/installation-tools";
@@ -38,7 +38,9 @@ import {
   useDeleteInstallation,
   useDisconnectInstallation,
   useInstallation,
+  useOrgApp,
   useRenameInstallation,
+  useWorkspaceApp,
 } from "@/features/queries";
 import { api } from "@/lib/api";
 import { useDetailCrumb } from "@/lib/crumbs";
@@ -63,6 +65,7 @@ function InstallationPage() {
   const [dialog, setDialog] = useState<null | "reconnect" | "rename" | "disconnect" | "delete">(null);
   useDetailCrumb(installation.data?.label);
   useDocumentTitle(installation.data?.label, "Installations", ws.name);
+  const unchecked = useAccountUnchecked(org, ws, installation.data);
 
   if (installation.isError) {
     return (
@@ -169,6 +172,13 @@ function InstallationPage() {
                       {i.connection.account.email ? (
                         <span className="text-muted-foreground"> · {i.connection.account.email}</span>
                       ) : null}
+                      {unchecked ? (
+                        <div className="mt-1.5">
+                          <UncheckedAccountNote>
+                            <AppAuthLink org={org} workspace={ws} installation={i} />
+                          </UncheckedAccountNote>
+                        </div>
+                      ) : null}
                     </Property>
                     <Property label="Provider account ID">
                       <MonoValue value={i.connection.account.external_id} />
@@ -247,6 +257,7 @@ function InstallationPage() {
           <ReconnectDialog
             workspace={ws}
             installation={i}
+            unchecked={unchecked}
             open={dialog === "reconnect"}
             onOpenChange={(o) => setDialog(o ? "reconnect" : null)}
           />
@@ -373,14 +384,60 @@ function AgentsWithAccess({
   );
 }
 
+/**
+ * Whether a reconnect of this installation may go unchecked: its app signs in
+ * through an MCP server and has no identity URL. Only such apps are read.
+ */
+function useAccountUnchecked(org: Organization, workspace: Workspace, installation: Installation | undefined) {
+  const mcp = installation?.app.auth_type === "mcp_oauth";
+  const catalog = useOrgApp(
+    org.id,
+    mcp && installation.app.owner_scope === "organization" ? installation.app.id : undefined,
+  );
+  const own = useWorkspaceApp(
+    workspace.id,
+    mcp && installation.app.owner_scope === "workspace" ? installation.app.id : undefined,
+  );
+  const app = catalog.data ?? own.data;
+  return mcp && app !== undefined && accountUnchecked(app.auth);
+}
+
+/** Where the app's authentication is edited: its organization page, or this workspace's. */
+function AppAuthLink({
+  org,
+  workspace,
+  installation,
+}: {
+  org: Organization;
+  workspace: Workspace;
+  installation: Installation;
+}) {
+  const className = "text-brand-ink underline-offset-4 hover:underline";
+  return installation.app.owner_scope === "workspace" ? (
+    <Link
+      to="/$org/w/$ws/apps/$appId"
+      params={{ org: org.slug, ws: workspace.id, appId: installation.app.id }}
+      className={className}
+    >
+      Open {installation.app.name}
+    </Link>
+  ) : (
+    <Link to="/$org/apps/$appId" params={{ org: org.slug, appId: installation.app.id }} className={className}>
+      Open {installation.app.name}
+    </Link>
+  );
+}
+
 function ReconnectDialog({
   workspace,
   installation,
+  unchecked,
   open,
   onOpenChange,
 }: {
   workspace: Workspace;
   installation: Installation;
+  unchecked: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -396,9 +453,11 @@ function ReconnectDialog({
         <DialogHeader>
           <DialogTitle>Reconnect {installation.label}</DialogTitle>
           <DialogDescription>
-            {account
-              ? `Sign in again as ${account.email ?? account.display_name}. A different account is refused, so existing grants keep their meaning.`
-              : "Authorize an account for this installation."}
+            {!account
+              ? "Authorize an account for this installation."
+              : unchecked
+                ? `Sign in again with the same ${installation.app.name} account. Zupflow may not be able to tell if it's a different one, and existing grants would then apply to that account.`
+                : `Sign in again as ${account.email ?? account.display_name}. A different account is refused, so existing grants keep their meaning.`}
           </DialogDescription>
         </DialogHeader>
         {flow.sessionId ? (

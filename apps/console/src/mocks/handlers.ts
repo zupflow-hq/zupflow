@@ -102,6 +102,8 @@ const MINUTE = 60_000;
 
 /** The host of an MCP server whose sign-in the mock can't use: it answers `discovery_failed`. */
 export const NO_SIGN_IN_HOST = "no-sign-in.example";
+/** The host of an MCP server the mock can't reach: sign-in through it answers `provider_unavailable`. */
+export const UNREACHABLE_HOST = "unreachable.example";
 
 function param(params: Record<string, string | readonly string[] | undefined>, key: string): string {
   const value = params[key];
@@ -457,9 +459,10 @@ function sessionScope(session: ConnectSessionRow) {
 }
 
 /**
- * Sign-in through an `mcp_oauth` app's server (decision 0039). The mock
- * discovers nothing: a server on `no-sign-in.example` stands for one that
- * offers no sign-in Zupflow can use, and every other server's is found. An
+ * Sign-in through an `mcp_oauth` app's server. The mock discovers nothing: a
+ * server on `no-sign-in.example` stands for one that offers no sign-in
+ * Zupflow can use, one on `unreachable.example` for one that's down, and
+ * every other server's is found. Either failure ends the session. An
  * identity URL the configuration has moved the server away from is refused
  * first, before anything would be sent.
  */
@@ -475,6 +478,11 @@ function startSignIn(session: ConnectSessionRow, app: AppRow) {
       "identity_off_server",
       `${app.name}'s identity URL isn't on its MCP server. Ask whoever set up the app to use an address on the server, or none.`,
     );
+  }
+  if (new URL(server).hostname === UNREACHABLE_HOST) {
+    session.status = "failed";
+    session.failure_code = "provider_unavailable";
+    throw new ApiFailure(502, "provider_unavailable", `${app.name}'s server couldn't be reached. Start again shortly.`);
   }
   if (new URL(server).hostname === NO_SIGN_IN_HOST) {
     session.status = "failed";

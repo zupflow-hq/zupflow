@@ -31,7 +31,7 @@ import {
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { db, resetDb } from "./db";
-import { createHandlers, NO_SIGN_IN_HOST } from "./handlers";
+import { createHandlers, NO_SIGN_IN_HOST, UNREACHABLE_HOST } from "./handlers";
 import { setLatency } from "./http";
 import { hashReference, isId, newId, newReference, uuidOf } from "./ids";
 import type { IdempotencyRow } from "./model";
@@ -411,6 +411,15 @@ describe("Connect (simulated consent)", () => {
     expect([discovery.status, discovery.code]).toEqual([502, "discovery_failed"]);
     expect(await owner.connect.get(unusable)).toMatchObject({ status: "failed", failure_code: "discovery_failed" });
 
+    // A server that can't be reached fails the session too: Connect's page can't start it again.
+    await serve(`https://${UNREACHABLE_HOST}/mcp`);
+    const down = await start();
+    const unreachable = await failure(owner.connect.authorize(down));
+    expect([unreachable.status, unreachable.code]).toEqual([502, "provider_unavailable"]);
+    expect(await owner.connect.get(down)).toMatchObject({ status: "failed", failure_code: "provider_unavailable" });
+    const again = await failure(owner.connect.authorize(down));
+    expect(again.status).toBe(409);
+
     // An identity URL on the server is accepted; the configuration then moves the server away from it.
     await serve("https://ledger.example/mcp");
     await owner.organizationApps.update(org, created.id, {
@@ -421,6 +430,92 @@ describe("Connect (simulated consent)", () => {
     const off = await failure(owner.connect.authorize(moved));
     expect([off.status, off.code]).toEqual([422, "identity_off_server"]);
     expect(await owner.connect.get(moved)).toMatchObject({ status: "failed", failure_code: "identity_off_server" });
+  });
+
+  it("persists a session a refused start failed, so the Console's window sees it", async () => {
+    const sandbox = ws("acme-sandbox");
+    const org = must(northwindId());
+    const fieldnote = app("fieldnote");
+    await owner.organizationApps.updateConfiguration(org, fieldnote.id, "sandbox", {
+      mcp_server_url: `https://${NO_SIGN_IN_HOST}/mcp`,
+    });
+    const session = await owner.connectSessions.create(sandbox.id, {
+      app_id: fieldnote.id,
+      intent: "create",
+      label: "Field team 2",
+      installation_id: null,
+      return_url: null,
+    });
+    await failure(owner.connect.authorize(referenceOf(session)));
+    // What another tab reads: the stored copy, not this one's memory.
+    const stored = JSON.parse(must(localStorage.getItem("zupflow.mock.db"), "stored database")) as ReturnType<
+      typeof db
+    >;
+    expect(stored.connect_sessions.find((s) => s.id === session.id)).toMatchObject({
+      status: "failed",
+      failure_code: "discovery_failed",
+    });
+  });
+
+  it("persists a session that consent failed, though the request answered an error", async () => {
+    const sandbox = ws("acme-sandbox");
+    const transport = createHttpTransport({ baseUrl: API, getToken: async () => null });
+    // Mock-only and sent without an Idempotency-Key, so nothing but the route itself stores what it changed.
+    const consent = (reference: string, body: { decision: "approved" | "denied"; email: string | null }) =>
+      failure(transport.request({ method: "POST", path: `/v1/connect/sessions/${reference}/simulate-consent`, body }));
+    const stored = (id: string) =>
+      (
+        JSON.parse(must(localStorage.getItem("zupflow.mock.db"), "stored database")) as ReturnType<typeof db>
+      ).connect_sessions.find((s) => s.id === id);
+
+    const denied = await owner.connectSessions.create(sandbox.id, {
+      app_id: app("google-workspace").id,
+      intent: "create",
+      label: "Denied",
+      installation_id: null,
+      return_url: null,
+    });
+    expect((await consent(referenceOf(denied), { decision: "denied", email: null })).code).toBe("consent_denied");
+    expect(stored(denied.id)).toMatchObject({ status: "failed", failure_code: "consent_denied" });
+
+    const installation = must(
+      db().installations.find((i) => i.workspace_id === sandbox.id && i.label === "Marketing (test)"),
+      "Marketing (test)",
+    );
+    const other = await owner.connectSessions.create(sandbox.id, {
+      app_id: app("google-workspace").id,
+      intent: "reconnect",
+      label: "ignored",
+      installation_id: installation.id,
+      return_url: null,
+    });
+    const mismatch = await consent(referenceOf(other), { decision: "approved", email: "someone-else@acme.example" });
+    expect(mismatch.code).toBe("account_mismatch");
+    expect(stored(other.id)).toMatchObject({ status: "failed", failure_code: "account_mismatch" });
+  });
+
+  it("seeds an app that signs in through its MCP server, whose account a reconnect can't check", async () => {
+    const sandbox = ws("acme-sandbox");
+    const fieldnote = app("fieldnote");
+    expect(fieldnote.auth).toMatchObject({ type: "mcp_oauth", identity_url: null });
+    expect(fieldnote.auth.type === "mcp_oauth" && fieldnote.auth.scopes.length).toBeGreaterThan(0);
+    const installation = must(
+      db().installations.find((i) => i.workspace_id === sandbox.id && i.app_id === fieldnote.id),
+      "Fieldnote installation",
+    );
+    expect(installation.connection?.account.email).toBeNull();
+
+    // The hosted page reads the template, so it can say the account won't be checked.
+    const session = await owner.connectSessions.create(sandbox.id, {
+      app_id: fieldnote.id,
+      intent: "reconnect",
+      label: installation.label,
+      installation_id: installation.id,
+      return_url: null,
+    });
+    const hosted = await owner.connect.get(referenceOf(session));
+    expect(hosted.auth).toMatchObject({ type: "mcp_oauth", identity_url: null });
+    expect(hosted.expected_account).toEqual(installation.connection?.account);
   });
 
   it("configures nothing but the server for an app that signs in through it", async () => {
