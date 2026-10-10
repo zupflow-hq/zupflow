@@ -1845,6 +1845,19 @@ export function contractSuite(target: Target) {
         expect((await failure(owner.connect.get(session.id))).status).toBe(404);
         expect(referenceOf(await create())).not.toBe(reference);
       });
+
+      it("shows a used link its outcome, which the OAuth callback sends the browser back to read", async () => {
+        // Until five minutes past the link's expiry; after that, and for a
+        // link that expired unused, the same 404 as no session (the mock's
+        // and the backend's own tests move the clock).
+        const completed = await create();
+        await owner.connect.submitCredentials(referenceOf(completed), { values: { token: "abc123" } });
+        expect((await owner.connect.get(referenceOf(completed))).status).toBe("completed");
+        const cancelled = await create();
+        await owner.connect.cancel(referenceOf(cancelled));
+        const read = await owner.connect.get(referenceOf(cancelled));
+        expect([read.id, read.status]).toEqual([cancelled.id, "cancelled"]);
+      });
     });
 
     describe("idempotency", () => {

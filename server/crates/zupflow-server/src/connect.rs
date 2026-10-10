@@ -145,7 +145,7 @@ fn environment(access: &Access, env: &str) -> Result<Environment, Failure> {
 }
 
 /// `http://localhost` is allowed only in Sandbox; everything else is `https`.
-fn secure_enough(url: &url::Url, environment: Environment) -> bool {
+pub(crate) fn secure_enough(url: &url::Url, environment: Environment) -> bool {
     url.scheme() == "https"
         || (url.scheme() == "http" && environment == Environment::Sandbox && url.host_str() == Some("localhost"))
 }
@@ -312,7 +312,10 @@ async fn app_of(state: &AppState, session: &ConnectSession) -> Result<App, Failu
 }
 
 /// For a reconnect, the account it must use again, read in the session's scope.
-async fn expected_account(state: &AppState, session: &ConnectSession) -> Result<Option<ConnectedAccount>, Failure> {
+pub(crate) async fn expected_account(
+    state: &AppState,
+    session: &ConnectSession,
+) -> Result<Option<ConnectedAccount>, Failure> {
     let (ConnectIntent::Reconnect, Some(installation_id)) = (session.intent, session.installation_id) else {
         return Ok(None);
     };
@@ -653,8 +656,13 @@ pub(crate) async fn attributed(state: &AppState, reference: &str) -> Result<Conn
         .ok_or_else(|| connect_failure(ConnectError::NotFound))
 }
 
+/// The hosted page's session, under the page's own rule: pending, or ended
+/// within its grace; past that, or expired, the same `404` as no session.
 async fn get_hosted(State(state): State<AppState>, Path(reference): Path<String>) -> Result<Response, Failure> {
     let session = attributed(&state, &reference).await?;
+    if crate::connect_page::shown(&session, Timestamp::now()).is_none() {
+        return Err(connect_failure(ConnectError::NotFound));
+    }
     Ok(envelope(
         StatusCode::OK,
         session_view(&state, session, true, None).await?,

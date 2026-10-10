@@ -71,7 +71,9 @@ async fn main() -> ExitCode {
     let guard = match config.identity {
         IdentityMode::Local => RequestGuard::local(config.listen.port(), &config.allowed_origins),
         IdentityMode::Oidc { .. } => RequestGuard::with_origins(&config.allowed_origins),
-    };
+    }
+    // The hosted Connect page calls the API from the server's own public origin.
+    .with_public_url(&config.public_url);
     let guard = match &config.console_origin {
         Some(origin) => {
             tracing::info!(event = "server.console_origin", origin = %origin);

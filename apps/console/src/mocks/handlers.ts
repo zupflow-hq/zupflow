@@ -118,6 +118,21 @@ const environment = z.enum(ENVIRONMENTS, "Choose Sandbox or Production.");
 const name = (max = 60) => z.string().trim().min(1, "Required.").max(max, `Use ${max} characters or fewer.`);
 const MINUTE = 60_000;
 
+/** How long past its link's expiry a used link still shows its outcome. */
+export const OUTCOME_GRACE_MS = 5 * MINUTE;
+
+/**
+ * A link shows its session while it's pending, and once it ended until
+ * `OUTCOME_GRACE_MS` past the link's expiry (the OAuth callback sends the
+ * browser back to it to read the outcome). An expired link, or one used
+ * longer ago, is the same 404 as a reference that names no session.
+ */
+function assertLinkShows(session: ConnectSessionRow) {
+  if (session.status === "pending") return;
+  if (session.status !== "expired" && Date.now() < Date.parse(session.expires_at) + OUTCOME_GRACE_MS) return;
+  throw notFound("Connect session");
+}
+
 /** The host of an MCP server whose sign-in the mock can't use: it answers `discovery_failed`. */
 export const NO_SIGN_IN_HOST = "no-sign-in.example";
 /** The host of an MCP server the mock can't reach: sign-in through it answers `provider_unavailable`. */
@@ -1634,9 +1649,11 @@ export function createHandlers(apiBase: string) {
     // Hosted Connect: authorized by the session reference alone.
     http.get(
       u("/v1/connect/sessions/:reference"),
-      route(async ({ params }) =>
-        ok(toConnectSession(await findSessionByReferenceCrossTenant(param(params, "reference")), true)),
-      ),
+      route(async ({ params }) => {
+        const session = await findSessionByReferenceCrossTenant(param(params, "reference"));
+        assertLinkShows(session);
+        return ok(toConnectSession(session, true));
+      }),
     ),
 
     http.post(

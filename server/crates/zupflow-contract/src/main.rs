@@ -155,6 +155,7 @@ async fn serve(path: &str, console: Option<&str>) -> Result<(), String> {
         .await
         .map_err(|error| format!("can't listen on loopback: {error}"))?;
     let port = listener.local_addr().map_err(|error| error.to_string())?.port();
+    let public_url = format!("http://localhost:{port}");
     let state = AppState {
         identity: Arc::new(PersonaIdentity {
             signed_out_as_owner: console.is_some(),
@@ -178,7 +179,7 @@ async fn serve(path: &str, console: Option<&str>) -> Result<(), String> {
         cache: Arc::new(zupflow_basic::memory_cache::MemoryCache::default()),
         keys: Arc::new(LocalKeyService::from_server_secret(&secret)),
         outbound: Arc::new(FixtureProviders),
-        public_url: format!("http://localhost:{port}"),
+        public_url: public_url.clone(),
         // The suite's personas are verified identities from a provider of
         // their own, so it says `oidc`, naming a fictional one; a browser
         // run signs in as with `local`.
@@ -204,7 +205,8 @@ async fn serve(path: &str, console: Option<&str>) -> Result<(), String> {
     let guard = match console {
         Some(origin) => RequestGuard::local(port, &[]).with_console(origin),
         None => RequestGuard::local(port, &[]),
-    };
+    }
+    .with_public_url(&public_url);
     axum::serve(listener, zupflow_server::app(state, guard))
         .await
         .map_err(|error| error.to_string())

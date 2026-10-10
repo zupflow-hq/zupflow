@@ -10,7 +10,11 @@
 //!   (`evil.example` resolving to 127.0.0.1) is refused.
 //! - **Origin.** A browser request (one with `Origin`) must come from an
 //!   allowed origin: one in `ZUPFLOW_ALLOWED_ORIGINS`, or, with `local`, the
-//!   server's own loopback origin.
+//!   server's own loopback origin. The server's public origin
+//!   (`ZUPFLOW_PUBLIC_URL`, where the hosted Connect page is served) is
+//!   admitted for hosted Connect alone: the page, its files and the hosted
+//!   Connect API (`/connect/…`, `/v1/connect/sessions/…`), never a Console
+//!   or workspace route.
 //! - **Content type.** Request bodies must be `application/json` (checked
 //!   where a body is read, in `input.rs`), so a cross-site form or `text/plain`
 //!   post can't carry one without a preflight.
@@ -42,6 +46,9 @@ pub struct RequestGuard {
     hosts: Option<Arc<[String]>>,
     /// Origins a browser request may come from, lowercased, no trailing slash.
     origins: Arc<[String]>,
+    /// The server's public origin, as `origins` holds them, when it isn't one
+    /// of them: admitted for hosted Connect's paths only.
+    public: Option<Arc<str>>,
     /// The Console's origin, as `origins` holds it: the one origin CORS
     /// answers. `None` answers none.
     console: Option<Arc<str>>,
@@ -69,6 +76,7 @@ impl RequestGuard {
         Self {
             hosts: Some(hosts.into()),
             origins: allowed.into(),
+            public: None,
             console: None,
         }
     }
@@ -78,7 +86,24 @@ impl RequestGuard {
         Self {
             hosts: None,
             origins: origins.iter().map(|origin| normalized(origin)).collect(),
+            public: None,
             console: None,
+        }
+    }
+
+    /// Admits the server's own public origin, `ZUPFLOW_PUBLIC_URL`, for
+    /// hosted Connect's paths only: the page is served there and calls the
+    /// hosted Connect API from it. Same-origin, so no CORS.
+    #[must_use]
+    pub fn with_public_url(self, public_url: &str) -> Self {
+        let origin = normalized(public_url);
+        // Already allowed everywhere (the loopback origin with `local`, say).
+        if self.origins.contains(&origin) {
+            return self;
+        }
+        Self {
+            public: Some(origin.into()),
+            ..self
         }
     }
 
@@ -93,6 +118,7 @@ impl RequestGuard {
         Self {
             hosts: self.hosts,
             origins: origins.into(),
+            public: self.public,
             console: Some(origin.into()),
         }
     }
@@ -102,9 +128,15 @@ fn normalized(origin: &str) -> String {
     origin.trim_end_matches('/').to_ascii_lowercase()
 }
 
+/// Hosted Connect's paths: the page and its files, the OAuth callback, and
+/// the hosted Connect API, which the link's reference authorizes.
+fn hosted_connect(path: &str) -> bool {
+    path.starts_with("/connect/") || path.starts_with("/v1/connect/sessions/")
+}
+
 pub async fn guard(State(guard): State<RequestGuard>, request: Request, next: Next) -> Response {
     // Decided before awaiting: the request is borrowed only here.
-    if let Some(refusal) = refusal(&guard, request.headers()) {
+    if let Some(refusal) = refusal(&guard, request.headers(), request.uri().path()) {
         return refusal.into_response();
     }
     let Some(console) = guard.console.clone() else {
@@ -146,7 +178,7 @@ fn preflight_response() -> Response {
     response
 }
 
-fn refusal(guard: &RequestGuard, headers: &HeaderMap) -> Option<Failure> {
+fn refusal(guard: &RequestGuard, headers: &HeaderMap, path: &str) -> Option<Failure> {
     let header = |name| {
         headers
             .get(name)
@@ -166,6 +198,9 @@ fn refusal(guard: &RequestGuard, headers: &HeaderMap) -> Option<Failure> {
     match header(ORIGIN) {
         None => None,
         Some(Ok(origin)) if guard.origins.contains(&normalized(&origin)) => None,
+        Some(Ok(origin)) if guard.public.as_deref() == Some(normalized(&origin).as_str()) && hosted_connect(path) => {
+            None
+        }
         Some(_) => {
             tracing::warn!(event = "guard.origin_refused");
             Some(Failure(ApiError::new(

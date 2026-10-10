@@ -1,7 +1,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import type { ConnectSession, ConnectSessionId, CreateConnectSessionInput, WorkspaceId } from "@zupflow/sdk";
 import { CheckCircle2Icon, ExternalLinkIcon, XCircleIcon } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useCreateConnectSession, useWatchedConnectSession } from "@/features/queries";
@@ -52,9 +52,22 @@ export function useConnectFlow(workspaceId: WorkspaceId) {
   const session = useWatchedConnectSession(workspaceId, sessionId);
   const { refetch } = session;
 
+  // The hosted page lives at the session's URL, which with a backend is the
+  // server's public origin, not the Console's. It posts only to its
+  // environment's allowed origins, so a Console not among them never hears
+  // it: polling the session (`useWatchedConnectSession`) is what finds the
+  // outcome, and a message only makes that happen sooner.
+  const hostedOrigin = useMemo(() => {
+    try {
+      return hostedUrl ? new URL(hostedUrl).origin : null;
+    } catch {
+      return null;
+    }
+  }, [hostedUrl]);
+
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
-      if (event.origin !== window.location.origin) return;
+      if (hostedOrigin === null || event.origin !== hostedOrigin) return;
       const data = event.data as { type?: string; session_id?: string } | null;
       if (data?.type === "zupflow.connect.finished" && data.session_id === sessionId) {
         void refetch();
@@ -62,7 +75,7 @@ export function useConnectFlow(workspaceId: WorkspaceId) {
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [sessionId, refetch]);
+  }, [sessionId, refetch, hostedOrigin]);
 
   const status = session.data?.status;
   useEffect(() => {

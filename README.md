@@ -159,7 +159,41 @@ path. An OAuth app's consent starts from the hosted page with a single-use
 (HTTP Basic), identifies the account at the app's `identity_url`, seals the
 tokens for the installation and sends the browser back to the hosted page;
 every other path answers the API's `404` envelope, and an unsupported method
-on a served path the `405` one. It also serves the models an agent can use,
+on a served path the `405` one.
+
+The hosted Connect page itself is served too, at
+`{ZUPFLOW_PUBLIC_URL}/connect/{reference}`: a small page of its own in
+`server/crates/zupflow-server/connect-page` (one stylesheet, one script, built
+into the binary), with none of the Console's code. The server renders each
+state with everything escaped; the script sends the token form, the OAuth
+start and the cancel to the hosted Connect API on the same origin. The request
+guard admits that public origin for hosted Connect's paths only (`/connect/…`
+and `/v1/connect/sessions/…`), never for a Console or workspace route, and
+answers it no CORS. The page's Content-Security-Policy allows only its own
+files (pinned by integrity hashes), one inline style by its hash, requests and
+forms to itself, and no script sinks; it may be framed only by the session's
+environment's `allowed_origins` (by nobody when there are none; `http://localhost`
+only in Sandbox), and only they hear
+`postMessage({ type: "zupflow.connect.finished", session_id, status })` when it
+finishes, from an opener or a parent frame. The message is a hint, not a
+result: an embedder checks its origin, then reads the session through the API
+(`GET /v1/workspaces/{ws}/connect-sessions/{session}`) before believing it,
+and keeps polling, since a window the provider's sign-in passed through may
+have lost its opener. The Console does exactly that, and hears the message only
+when its origin is among the allowed ones. The page sends no referrer, is never
+cached (its files are, for a year, each at an address naming its version), and
+the link's reference, a bearer secret, is never logged or written into the
+page. A link that names no session, one that expired, and one used more than
+five minutes past its expiry all answer the same generic `404` page, and the
+hosted API's `GET /v1/connect/sessions/{reference}` the same `404` as no
+session; until then a used link shows its outcome, so the OAuth callback can
+send the browser back to it. A session whose app is gone shows the generic page
+too. When it finishes in a popup, the page tells the opener and closes; in a
+tab, a completed session sends the person to its return URL, told
+`zupflow_session` (replacing any it carried), only while that URL is still on
+the allowlist.
+
+It also serves the models an agent can use,
 and agents and their grants: a grant names tools of one installation of the
 same workspace, and only tools that installation's registry holds and doesn't
 hold as gone (`422 unknown_tool`, `422 tool_gone`); a tool that goes later

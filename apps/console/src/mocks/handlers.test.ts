@@ -31,7 +31,7 @@ import {
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { db, resetDb } from "./db";
-import { createHandlers, NO_SIGN_IN_HOST, UNREACHABLE_HOST } from "./handlers";
+import { createHandlers, NO_SIGN_IN_HOST, OUTCOME_GRACE_MS, UNREACHABLE_HOST } from "./handlers";
 import { setLatency } from "./http";
 import { hashReference, isId, newId, newReference, uuidOf } from "./ids";
 import type { IdempotencyRow } from "./model";
@@ -742,6 +742,39 @@ describe("identifiers", () => {
     const error = await failure(owner.connect.submitCredentials(referenceOf(session), { values: { token: "abc123" } }));
     expect(error.status).toBe(409);
     expect(error.code).toBe("session_not_pending");
+  });
+
+  it("shows a link's session only while pending, or ended within its grace", async () => {
+    const start = (label: string) =>
+      owner.connectSessions.create(ws("qa-playground").id, {
+        app_id: app("echo-server").id,
+        intent: "create",
+        label,
+        installation_id: null,
+        return_url: null,
+      });
+    const unknown = await failure(owner.connect.get("A".repeat(32)));
+    expect(unknown.status).toBe(404);
+    const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
+
+    // Expired unused: nothing to show, exactly as no session.
+    const expired = await start("Echo 8");
+    must(db().connect_sessions.find((x) => x.id === expired.id)).expires_at = ago(1000);
+    const expiredError = await failure(owner.connect.get(referenceOf(expired)));
+    expect([expiredError.status, expiredError.code, expiredError.message]).toEqual([
+      unknown.status,
+      unknown.code,
+      unknown.message,
+    ]);
+
+    // Ended: its outcome until the grace past its expiry is over.
+    const ended = await start("Echo 9");
+    await owner.connect.cancel(referenceOf(ended));
+    const row = must(db().connect_sessions.find((x) => x.id === ended.id));
+    row.expires_at = ago(OUTCOME_GRACE_MS - 60_000);
+    expect((await owner.connect.get(referenceOf(ended))).status).toBe("cancelled");
+    row.expires_at = ago(OUTCOME_GRACE_MS + 1000);
+    expect((await failure(owner.connect.get(referenceOf(ended)))).code).toBe(unknown.code);
   });
 
   it("stores only a hash of the Connect reference", async () => {

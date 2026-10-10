@@ -13,6 +13,7 @@ pub mod auth_templates;
 pub mod config;
 pub mod connect;
 pub mod connect_oauth;
+pub mod connect_page;
 pub mod discovery;
 pub mod guard;
 pub mod http;
@@ -132,6 +133,7 @@ pub fn app(state: AppState, guard: RequestGuard) -> Router {
         .merge(app_configurations::routes())
         .merge(installations::routes())
         .merge(connect::routes())
+        .merge(connect_page::routes())
         .merge(agents::routes())
         .merge(tool_policy::routes())
         .merge(runs::routes())

@@ -1,0 +1,404 @@
+/*
+ * Zupflow's hosted Connect page. Served by the backend under a strict
+ * Content-Security-Policy: no inline styles, no third-party anything.
+ * Colors follow the Console's tokens (ink #10191D, cyan #35C8F5).
+ */
+:root {
+  color-scheme: light dark;
+  --background: #f7f9fb;
+  --foreground: #10191d;
+  --card: #ffffff;
+  --muted: #eef3f6;
+  --muted-foreground: #5a6a72;
+  --border: #dbe3e8;
+  --primary: #10191d;
+  --primary-foreground: #ffffff;
+  --brand: #35c8f5;
+  --brand-ink: #0b6f93;
+  --destructive: #d63a3a;
+  --success: #1f9d6b;
+  --sandbox-ink: #8a5800;
+  --sandbox-soft: #fdf3df;
+  --ring: #35c8f5;
+  --shadow: 0 1px 2px rgb(16 25 29 / 0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0d1417;
+    --foreground: #e4ecef;
+    --card: #141f24;
+    --muted: #1a262c;
+    --muted-foreground: #8fa0a8;
+    --border: #26363d;
+    --primary: #35c8f5;
+    --primary-foreground: #10191d;
+    --brand-ink: #6fd8f8;
+    --destructive: #e5534b;
+    --success: #3cc28c;
+    --sandbox-ink: #f0c26e;
+    --sandbox-soft: #2b2112;
+    --shadow: none;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+.frame {
+  display: flex;
+  min-height: 100svh;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 16px;
+}
+
+.card {
+  width: 100%;
+  max-width: 400px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--card);
+  box-shadow: var(--shadow);
+  padding: 24px;
+}
+
+@media (min-width: 640px) {
+  .card {
+    padding: 32px;
+  }
+}
+
+h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.4;
+  text-wrap: balance;
+  overflow-wrap: anywhere;
+}
+
+p {
+  margin: 0;
+}
+
+.muted {
+  color: var(--muted-foreground);
+  font-size: 14px;
+  text-wrap: pretty;
+  overflow-wrap: anywhere;
+}
+
+.intro,
+.outcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+}
+
+.intro-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.app-icon {
+  display: inline-flex;
+  width: 48px;
+  height: 48px;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: #10191d;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.12);
+  color: #ffffff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.env-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 4px;
+  background: var(--sandbox-soft);
+  color: var(--sandbox-ink);
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.env-badge::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  background: currentColor;
+}
+
+.body {
+  margin-top: 28px;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+label {
+  font-size: 14px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+input {
+  width: 100%;
+  height: 40px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--foreground);
+  padding: 0 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 14px;
+}
+
+input::placeholder {
+  color: var(--muted-foreground);
+}
+
+input:focus-visible,
+.button:focus-visible,
+.link:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+input[aria-invalid="true"] {
+  border-color: var(--destructive);
+}
+
+.hint {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.field-error,
+.form-error {
+  color: var(--destructive);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.fine {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  align-self: flex-start;
+  color: var(--brand-ink);
+  font-size: 14px;
+  text-decoration: none;
+  text-underline-offset: 4px;
+}
+
+.link:hover {
+  text-decoration: underline;
+}
+
+.button {
+  display: inline-flex;
+  width: 100%;
+  height: 40px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0 16px;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.button.primary {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+
+.button.outline {
+  margin-top: 8px;
+  border-color: var(--border);
+  background: transparent;
+  color: var(--foreground);
+}
+
+.button.ghost {
+  margin-top: 8px;
+  background: transparent;
+  color: var(--muted-foreground);
+}
+
+.button.primary:not(:disabled):hover {
+  opacity: 0.9;
+}
+
+.button.outline:hover,
+.button.ghost:not(:disabled):hover {
+  background: var(--muted);
+}
+
+.button svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.spinner {
+  display: none;
+  width: 16px;
+  height: 16px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+.button[aria-busy="true"] .spinner {
+  display: inline-block;
+}
+
+.button[aria-busy="true"] .glyph {
+  display: none;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 2s;
+  }
+}
+
+.scopes {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--muted) 30%, transparent);
+  padding: 12px;
+}
+
+.scopes-label {
+  margin-bottom: 8px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.scopes ul {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.scopes li {
+  overflow: hidden;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.outcome-icon {
+  width: 36px;
+  height: 36px;
+}
+
+.outcome-icon.success {
+  color: var(--success);
+}
+
+.outcome-icon.failure {
+  color: var(--destructive);
+}
+
+.outcome-icon.neutral {
+  color: var(--muted-foreground);
+}
+
+.secured {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 20px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.secured svg {
+  width: 12px;
+  height: 12px;
+}
+
+.secured .mark {
+  width: 14px;
+  height: 14px;
+}
+
+.secured strong {
+  color: var(--foreground);
+  font-weight: 500;
+}
+
+/* Last, so it wins over every display rule above. */
+[hidden] {
+  display: none;
+}

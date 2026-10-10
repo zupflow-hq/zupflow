@@ -560,7 +560,7 @@ async fn keeps_sessions_to_their_own_environment_and_workspace() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "read through another workspace");
 
-    // Past its expiry a session reads as expired everywhere, and can't be cancelled.
+    // Past its expiry a session reads as expired to its workspace, and can't be cancelled.
     let reference = reference_of(&renewed["data"]);
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", server.directory.join("zupflow.sqlite").display()))
         .await
@@ -581,10 +581,11 @@ async fn keeps_sessions_to_their_own_environment_and_workspace() {
         )
         .await;
     assert_eq!(read["data"]["status"], "expired");
-    let (_, hosted) = server
+    // The link shows nothing: the same 404 as one that names no session.
+    let (status, hosted) = server
         .send(call("nobody", Method::GET, format!("/v1/connect/sessions/{reference}")))
         .await;
-    assert_eq!(hosted["data"]["status"], "expired");
+    assert_eq!((status, code(&hosted)), (StatusCode::NOT_FOUND, "not_found"));
     let (status, body) = server
         .send(call(
             "nobody",
