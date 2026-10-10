@@ -37,7 +37,7 @@ import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 import { appIn, timelineOf } from "./scope";
 import { listedFrom, recordListing } from "./tools";
 
-export const DB_SCHEMA = 18;
+export const DB_SCHEMA = 19;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -73,6 +73,7 @@ export function seed(nowMs: number = Date.now()): Db {
       role: "owner" as const,
       status: "active" as const,
       invited_at: org.created_at,
+      invited_by: null,
       joined_at: org.created_at,
       last_active_at: ago(4 * MINUTE),
     },
@@ -83,6 +84,7 @@ export function seed(nowMs: number = Date.now()): Db {
       role: "admin" as const,
       status: "active" as const,
       invited_at: ago(39 * DAY),
+      invited_by: jordan.id,
       joined_at: ago(39 * DAY),
       last_active_at: ago(3 * HOUR),
     },
@@ -93,6 +95,7 @@ export function seed(nowMs: number = Date.now()): Db {
       role: "developer" as const,
       status: "active" as const,
       invited_at: ago(20 * DAY),
+      invited_by: jordan.id,
       joined_at: ago(19 * DAY),
       last_active_at: ago(2 * DAY),
     },
@@ -103,6 +106,7 @@ export function seed(nowMs: number = Date.now()): Db {
       role: "developer" as const,
       status: "invited" as const,
       invited_at: ago(2 * DAY),
+      invited_by: jordan.id,
       joined_at: null,
       last_active_at: null,
     },
@@ -114,6 +118,7 @@ export function seed(nowMs: number = Date.now()): Db {
       role: "viewer" as const,
       status: "active" as const,
       invited_at: ago(15 * DAY),
+      invited_by: jordan.id,
       joined_at: ago(15 * DAY),
       last_active_at: ago(1 * DAY),
     },
@@ -635,6 +640,7 @@ export function seed(nowMs: number = Date.now()): Db {
   );
 
   seedLarkspur(db, nowMs);
+  seedFernhill(db, nowMs);
   seedTools(db, nowMs, sandboxLinear);
   seedLevels(db, nowMs, { google, linear, stripe, github }, jordan.id);
   return db;
@@ -755,6 +761,64 @@ function seedTools(db: Db, nowMs: number, reviewed: InstallationRow) {
  * webhook, so the contract tests can use each organization's real IDs against
  * the other. Its own randomness, so adding it changes nothing about Northwind.
  */
+/**
+ * Fernhill: an organization that invited Jordan yesterday, so the demo has an
+ * invitation to accept or decline. Nothing else of it is seeded. Its own
+ * randomness, so adding it changes nothing about the others.
+ */
+function seedFernhill(db: Db, nowMs: number) {
+  const rng = mulberry32(20261010);
+  const ago = (ms: number) => new Date(nowMs - ms).toISOString();
+  const id = <K extends IdKind>(kind: K, agoMs: number) => newId(kind, { rng, at: nowMs - agoMs });
+  const casey: User = {
+    id: id("user", 30 * DAY),
+    name: "Casey Morgan",
+    email: "casey@fernhill.example",
+    avatar_url: null,
+  };
+  const org: OrganizationRow = {
+    id: id("organization", 30 * DAY),
+    name: "Fernhill",
+    slug: "fernhill",
+    created_at: ago(30 * DAY),
+  };
+  db.users.push(casey);
+  db.organizations.push(org);
+  for (const environment of ["sandbox", "production"] as const) {
+    db.connect_settings.push({
+      organization_id: org.id,
+      environment,
+      return_urls: [],
+      allowed_origins: [],
+      updated_at: null,
+    });
+  }
+  db.memberships.push(
+    {
+      id: id("member", 30 * DAY),
+      organization_id: org.id,
+      user_id: casey.id,
+      role: "owner",
+      status: "active",
+      invited_at: org.created_at,
+      invited_by: null,
+      joined_at: org.created_at,
+      last_active_at: ago(2 * HOUR),
+    },
+    {
+      id: id("member", DAY),
+      organization_id: org.id,
+      user_id: DEMO_USER_ID,
+      role: "developer",
+      status: "invited",
+      invited_at: ago(DAY),
+      invited_by: casey.id,
+      joined_at: null,
+      last_active_at: null,
+    },
+  );
+}
+
 function seedLarkspur(db: Db, nowMs: number) {
   const rng = mulberry32(20261004);
   const ago = (ms: number) => new Date(nowMs - ms).toISOString();
@@ -781,8 +845,24 @@ function seedLarkspur(db: Db, nowMs: number) {
     role: "owner",
     status: "active",
     invited_at: org.created_at,
+    invited_by: null,
     joined_at: org.created_at,
     last_active_at: ago(HOUR),
+  });
+  // An invitation for Northwind's viewer that ran out before anyone accepted it:
+  // the contract suite's expired invitation.
+  const alex = db.users.find((u) => u.email === "alex@northwind.example");
+  if (!alex) throw new Error("Larkspur's seed needs Northwind's viewer");
+  db.memberships.push({
+    id: id("member", 10 * DAY),
+    organization_id: org.id,
+    user_id: alex.id,
+    role: "developer",
+    status: "invited",
+    invited_at: ago(10 * DAY),
+    invited_by: rowan.id,
+    joined_at: null,
+    last_active_at: null,
   });
 
   const harbor: WorkspaceRow = {

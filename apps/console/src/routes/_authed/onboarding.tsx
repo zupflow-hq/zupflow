@@ -1,5 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { INVITATION_TTL_DAYS } from "@zupflow/sdk";
 import { useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
@@ -8,9 +9,11 @@ import { Button } from "@/components/ui/button";
 import { Form, FormControl, FormDescription, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { InputGroup, InputGroupAddon, InputGroupInput, InputGroupText } from "@/components/ui/input-group";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { session } from "@/features/auth/session";
-import { useCreateOrganization, useViewer } from "@/features/queries";
+import { InvitationList } from "@/features/invitations/invitation-list";
+import { useCreateOrganization, useInvitations, useViewer } from "@/features/queries";
 import { applyFieldErrors, toastError } from "@/lib/errors";
 import { slugify } from "@/lib/format";
 
@@ -46,6 +49,12 @@ function OnboardingPage() {
   }, [name, slugTouched, form]);
 
   const hasOrgs = (viewer.data?.organizations.length ?? 0) > 0;
+  const invitations = useInvitations();
+  // While they load, and whenever there are some (or they couldn't load), they come first; but only
+  // invitations that have loaded say anyone was invited.
+  const showInvitations = !invitations.isSuccess || invitations.data.length > 0;
+  const hasInvitations = invitations.isSuccess && invitations.data.length > 0;
+  const onlyExpired = hasInvitations && invitations.data.every((i) => i.status === "expired");
 
   return (
     <main className="min-h-svh px-4 py-8 sm:px-10">
@@ -67,7 +76,37 @@ function OnboardingPage() {
           <p className="font-mono text-[11px] tracking-[0.14em] text-muted-foreground uppercase">
             {viewer.data ? `Welcome, ${viewer.data.user.name.split(" ")[0]}` : "Welcome"}
           </p>
-          <h1 className="mt-2 text-3xl font-semibold tracking-[-0.025em]">Name your organization</h1>
+          {showInvitations ? (
+            <div className="mb-12 max-w-xl">
+              {hasInvitations ? (
+                <>
+                  <h1 className="mt-2 text-3xl font-semibold tracking-[-0.025em]">
+                    {onlyExpired ? "Your invitations" : "Join your team"}
+                  </h1>
+                  <p className="mt-2 max-w-md text-sm text-muted-foreground">
+                    {onlyExpired
+                      ? `Invitations can be accepted for ${INVITATION_TTL_DAYS} days. Ask for a new one, or create your own organization.`
+                      : "You've been invited to an organization. Accept to join it, with the role you were invited as."}
+                  </p>
+                </>
+              ) : invitations.isPending ? (
+                <div aria-hidden>
+                  <Skeleton className="mt-3 h-8 w-56" />
+                  <Skeleton className="mt-3 h-4 w-80 max-w-full" />
+                </div>
+              ) : (
+                <h1 className="mt-2 text-3xl font-semibold tracking-[-0.025em]">Your invitations</h1>
+              )}
+              <InvitationList className={hasInvitations || invitations.isPending ? "mt-5 border-y" : "mt-5"} />
+            </div>
+          ) : null}
+          {showInvitations ? (
+            <h2 className="text-xl font-semibold tracking-[-0.02em]">
+              {hasInvitations ? "Or create your own organization" : "Create your own organization"}
+            </h2>
+          ) : (
+            <h1 className="mt-2 text-3xl font-semibold tracking-[-0.025em]">Name your organization</h1>
+          )}
           <p className="mt-2 max-w-md text-sm text-muted-foreground">
             The organization is your company's account. Teammates, apps, API keys and every workspace live inside it.
           </p>
@@ -91,7 +130,12 @@ function OnboardingPage() {
                   <FormItem>
                     <FormLabel>Organization name</FormLabel>
                     <FormControl>
-                      <Input placeholder="Northwind" autoFocus autoComplete="organization" {...field} />
+                      <Input
+                        placeholder="Northwind"
+                        autoFocus={!showInvitations}
+                        autoComplete="organization"
+                        {...field}
+                      />
                     </FormControl>
                     <FormMessage />
                   </FormItem>

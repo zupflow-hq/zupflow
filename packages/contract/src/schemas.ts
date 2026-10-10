@@ -176,15 +176,71 @@ export const Member = named(
     role: MemberRole,
     status: MemberStatus,
     invited_at: instant,
+    /** When an invitation stops being accepted: `INVITATION_TTL_DAYS` after `invited_at`. Null once active. */
+    expires_at: instant.nullable(),
     joined_at: instant.nullable(),
     last_active_at: instant.nullable(),
   }),
 );
 export type Member = z.infer<typeof Member>;
 
+/**
+ * How long an invitation can be accepted after it was sent. An expired one
+ * can still be declined, and inviting the same address again renews it.
+ */
+export const INVITATION_TTL_DAYS = 7;
+/** `GET /v1/me/invitations` lists at most this many, newest first. */
+export const INVITATION_LIST_LIMIT = 50;
+/** An invitation expired longer ago than this is left out of `GET /v1/me/invitations`. */
+export const EXPIRED_INVITATION_SHOWN_DAYS = 30;
+
+/** `expired`: past `expires_at`, so it can't be accepted any more. */
+export const InvitationStatus = z.enum(["pending", "expired"]);
+export type InvitationStatus = z.infer<typeof InvitationStatus>;
+
+/**
+ * An invitation to the signed-in person. Click to accept (decided 2026-10-10):
+ * Nobody joins an organization without accepting; signing in with an invited
+ * address joins nothing by itself. Only the person whose verified email was
+ * invited ever sees it.
+ *
+ * An invitation grants only what its grantor (`invited_by`, or whoever last
+ * changed its role) can still grant: an owner or admin, and an owner for an
+ * owner invitation. Once the grantor is removed or demoted below that, it's
+ * withdrawn, exactly as if an admin had cancelled it.
+ */
+export const Invitation = named(
+  "Invitation",
+  z.object({
+    /** The membership it becomes once accepted. */
+    id: idSchema("member"),
+    organization: named(
+      "InvitationOrganization",
+      z.object({ id: idSchema("organization"), name: z.string(), slug: z.string() }),
+    ),
+    /** The role accepting grants. */
+    role: MemberRole,
+    /** Who sent it, or last changed its role: the grantor. */
+    invited_by: named("Inviter", z.object({ name: z.string(), email: z.email() })),
+    status: InvitationStatus,
+    invited_at: instant,
+    expires_at: instant,
+  }),
+);
+export type Invitation = z.infer<typeof Invitation>;
+
 export const InviteMemberInput = z.object({ email: z.string(), role: MemberRole });
 export type InviteMemberInput = z.infer<typeof InviteMemberInput>;
 export const UpdateMemberInput = z.object({ role: MemberRole });
+export const RemoveMemberQuery = z.object({
+  status: z
+    .enum(["invited"])
+    .optional()
+    .describe(
+      "`invited`: withdraw an invitation only. One accepted in the meantime is left alone, and answers `409 invitation_accepted`.",
+    ),
+});
+export type RemoveMemberQuery = z.infer<typeof RemoveMemberQuery>;
 export type UpdateMemberInput = z.infer<typeof UpdateMemberInput>;
 
 // ---------------------------------------------------------------------------

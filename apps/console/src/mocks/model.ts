@@ -58,6 +58,8 @@ export interface MembershipRow {
   role: MemberRole;
   status: MemberStatus;
   invited_at: string;
+  /** Who sent the invitation; null for an organization's creator, or once that user is gone. */
+  invited_by: UserId | null;
   joined_at: string | null;
   last_active_at: string | null;
 }

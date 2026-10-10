@@ -48,6 +48,19 @@ to explore the seeded Northwind organization (a fictional product that embeds
 Zupflow), or **Create a new account** to walk through onboarding from an empty
 organization.
 
+Nobody joins an organization without accepting an invitation: after sign-in,
+pending invitations are listed on the onboarding screen and under
+**Invitations** in the user menu, each with **Accept** and **Decline**. Jordan
+has one from Fernhill; signing up as `mei@northwind.example` shows Northwind's.
+
+An invitation goes to an address, and stands only while whoever sent it (or
+last changed its role) can still grant that role: removing or demoting them
+withdraws it. Inviting an address whose invitation expired sends it again.
+An account keeps the address it was created with: if the sign-in provider
+later sends another one, invitations don't follow it, and only a sign-in that
+verifies the original address can answer them (the backend answers `403
+email_unverified` otherwise; the mock doesn't simulate verification).
+
 With no `VITE_ZUPFLOW_API_URL` set, `pnpm dev` serves every request from the
 mock API in `apps/console/src/mocks` through a service worker. Data is kept in
 this browser's localStorage; **Reset demo data** in the user menu reseeds it.
@@ -147,7 +160,9 @@ client secret.
 `{ZUPFLOW_PUBLIC_URL}/connect/oauth/callback`, one per deployment, registered
 once per OAuth client.
 
-So far it serves `/health`, `/ready`, `/v1/sign-in-settings`, `/v1/me`, organizations, members,
+So far it serves `/health`, `/ready`, `/v1/sign-in-settings`, `/v1/me`, the
+signed-in person's invitations (accepted or declined only by the person whose
+verified email was invited), organizations, members,
 workspaces, API keys, catalog and workspace apps with their client
 configurations, the apps available to a workspace, installations (read,
 renamed, disconnected and deleted), and Connect's settings and sessions with

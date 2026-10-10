@@ -17,6 +17,7 @@ import {
   MemberRole,
   type ModelOption,
   type OrganizationId,
+  RemoveMemberQuery,
   RUN_STATUSES,
   type SignInSettings,
   TERMINAL_RUN_STATUSES,
@@ -42,6 +43,9 @@ import {
   created,
   DEVELOPERS,
   findSessionByReferenceCrossTenant,
+  grantorAllows,
+  invitationsOf,
+  isExpiredInvitation,
   noContent,
   notFound,
   type OrgAccess,
@@ -59,6 +63,7 @@ import {
   toConnectSession,
   toGrant,
   toInstallation,
+  toInvitation,
   toMember,
   toOrganization,
   toRun,
@@ -66,11 +71,22 @@ import {
   toUser,
   toWorkspace,
   type WorkspaceAccess,
+  withdrawUngrantable,
   withExpiry,
   workspaceAccess,
 } from "./http";
 import { hashReference, isId, newId, newReference } from "./ids";
-import type { AgentRow, AppRow, ConfigurationRow, ConnectSessionRow, GrantRow, InstallationRow, RunRow } from "./model";
+import type {
+  AgentRow,
+  AppRow,
+  ConfigurationRow,
+  ConnectSessionRow,
+  GrantRow,
+  InstallationRow,
+  MembershipRow,
+  OrganizationRow,
+  RunRow,
+} from "./model";
 import { levelInForce, levelRowsOf, levelsInput, policyRowOf, setLevels, toAppToolLevel, toToolPolicy } from "./policy";
 import { hash, token } from "./random";
 import { cancelRun, enqueueRun, planRun } from "./runner";
@@ -154,6 +170,7 @@ const idOf = <K extends IdKind>(_kind: K) =>
 /** Path parameters that carry an ID, with the object type each must be. */
 const ID_PARAMS = {
   member: ["member", "Member"],
+  invitation: ["member", "Invitation"],
   app: ["app", "App"],
   inst: ["installation", "Installation"],
   session: ["connect_session", "Connect session"],
@@ -163,6 +180,27 @@ const ID_PARAMS = {
   key: ["api_key", "API key"],
   hook: ["webhook_endpoint", "Webhook endpoint"],
 } as const satisfies Record<string, readonly [IdKind, string]>;
+
+/**
+ * The signed-in person's own invitation, or their membership once it's
+ * accepted: 401 first, then a 404 that says nothing about whose it is.
+ * Found by the invitee alone, across organizations by design.
+ */
+function ownInvitation(
+  request: Request,
+  params: Record<string, string | readonly string[] | undefined>,
+): { user: ReturnType<typeof authenticate>; invitation: MembershipRow; org: OrganizationRow } {
+  const user = authenticate(request);
+  const id = idParam(params, "invitation");
+  const invitation = db().memberships.find((m) => m.id === id && m.user_id === user.id);
+  const org = invitation ? db().organizations.find((o) => o.id === invitation.organization_id) : undefined;
+  if (!invitation || !org) throw notFound("Invitation");
+  // Withdrawn once its grantor can't grant it any more: as gone as one an admin cancelled.
+  if (invitation.status === "invited" && !grantorAllows(invitation)) throw notFound("Invitation");
+  return { user, invitation, org };
+}
+
+const invitationAccepted = () => new ApiFailure(409, "invitation_accepted", "You've already accepted this invitation.");
 
 /**
  * A path ID of the right type. Anything else (a wrong prefix, a bad length, a
@@ -684,6 +722,67 @@ export function createHandlers(apiBase: string) {
       }),
     ),
 
+    // --- Invitations: the signed-in person's own ----------------------------
+    // Click to accept: nobody joins an organization without accepting, and
+    // signing in with an invited address joins nothing by itself. An
+    // invitation is the invitee's pending membership, found by the invitee
+    // alone: anyone else's, and one withdrawn or declined, is the same 404.
+    // There's no member role to check: it's the person's own answer.
+    http.get(
+      u("/v1/me/invitations"),
+      route(({ request }) => {
+        const user = authenticate(request);
+        const invitations = invitationsOf(user.id).flatMap((m) => {
+          const org = db().organizations.find((o) => o.id === m.organization_id);
+          return org ? [toInvitation(m, org)] : [];
+        });
+        return ok(invitations);
+      }),
+    ),
+
+    http.post(
+      u("/v1/me/invitations/:invitation/accept"),
+      route(({ request, params }) => {
+        const { user, invitation, org } = ownInvitation(request, params);
+        if (invitation.status === "active") throw invitationAccepted();
+        if (isExpiredInvitation(invitation)) {
+          throw new ApiFailure(
+            422,
+            "invitation_expired",
+            "This invitation has expired. Ask an admin of the organization to invite you again.",
+          );
+        }
+        // The role is the invitation's as it stands now: an owner may have changed it since it was sent.
+        const now = new Date().toISOString();
+        invitation.status = "active";
+        invitation.joined_at = now;
+        invitation.last_active_at = now;
+        audit({ user, org, membership: invitation }, "member.joined", {
+          type: "member",
+          id: invitation.id,
+          name: user.email,
+        });
+        return ok(toOrganization(org, invitation));
+      }),
+    ),
+
+    http.post(
+      u("/v1/me/invitations/:invitation/decline"),
+      route(({ request, params }) => {
+        const { user, invitation, org } = ownInvitation(request, params);
+        if (invitation.status === "active") throw invitationAccepted();
+        // Expired or not, declining withdraws it.
+        const d = db();
+        d.memberships = d.memberships.filter((m) => m !== invitation);
+        audit({ user, org, membership: invitation }, "member.declined", {
+          type: "member",
+          id: invitation.id,
+          name: user.email,
+        });
+        return noContent();
+      }),
+    ),
+
     http.get(
       u("/v1/models"),
       route(({ request }) => {
@@ -715,6 +814,7 @@ export function createHandlers(apiBase: string) {
           role: "owner" as const,
           status: "active" as const,
           invited_at: now,
+          invited_by: null,
           joined_at: now,
           last_active_at: now,
         };
@@ -842,7 +942,18 @@ export function createHandlers(apiBase: string) {
           throw new ApiFailure(403, "forbidden", "Only owners can invite owners.");
         }
         let user = db().users.find((x) => x.email === input.email);
-        if (user && db().memberships.some((m) => m.organization_id === access.org.id && m.user_id === user?.id)) {
+        const existing = user
+          ? db().memberships.find((m) => m.organization_id === access.org.id && m.user_id === user?.id)
+          : undefined;
+        if (existing && isExpiredInvitation(existing)) {
+          // An expired invitation is sent again: as new, with this role and this grantor.
+          existing.role = input.role;
+          existing.invited_at = new Date().toISOString();
+          existing.invited_by = access.user.id;
+          audit(access, "member.invited", { type: "member", id: existing.id, name: input.email });
+          return created(toMember(existing));
+        }
+        if (existing) {
           throw new ApiFailure(409, "already_member", `${input.email} is already in this organization.`, {
             email: "Already a member or invited.",
           });
@@ -863,6 +974,7 @@ export function createHandlers(apiBase: string) {
           role: input.role,
           status: "invited" as const,
           invited_at: new Date().toISOString(),
+          invited_by: access.user.id,
           joined_at: null,
           last_active_at: null,
         };
@@ -890,6 +1002,12 @@ export function createHandlers(apiBase: string) {
           throw new ApiFailure(422, "last_owner", "An organization needs at least one owner.");
         }
         member.role = input.role;
+        if (member.status === "invited") {
+          // Whoever changes an invitation's role grants it now.
+          member.invited_by = access.user.id;
+        } else {
+          withdrawUngrantable(access.org.id, member.user_id, input.role);
+        }
         audit(access, "member.role_changed", { type: "member", id: member.id, name: toMember(member).user.email });
         return ok(toMember(member));
       }),
@@ -904,7 +1022,17 @@ export function createHandlers(apiBase: string) {
         const member = d.memberships.find(
           (m) => m.organization_id === access.org.id && m.id === idParam(params, "member"),
         );
+        const query = RemoveMemberQuery.safeParse({
+          status: new URL(request.url).searchParams.get("status") ?? undefined,
+        });
+        if (!query.success) {
+          throw new ApiFailure(400, "validation_failed", "Some fields are invalid.", { status: "Use `invited`." });
+        }
         if (!member) throw notFound("Member");
+        // Withdrawing an invitation never removes someone who has just accepted it.
+        if (query.data.status === "invited" && member.status !== "invited") {
+          throw new ApiFailure(409, "invitation_accepted", "That invitation was accepted: they're a member now.");
+        }
         // Only owners remove an owner, invited or active (403 before any 422).
         if (member.role === "owner") requireRole(access, ["owner"], "remove an owner");
         if (member.role === "owner" && member.status === "active") {
@@ -917,6 +1045,8 @@ export function createHandlers(apiBase: string) {
           }
         }
         d.memberships = d.memberships.filter((m) => m !== member);
+        // What they granted goes with them.
+        if (member.status === "active") withdrawUngrantable(access.org.id, member.user_id, null);
         audit(access, "member.removed", { type: "member", id: member.id, name: toMember(member).user.email });
         return noContent();
       }),

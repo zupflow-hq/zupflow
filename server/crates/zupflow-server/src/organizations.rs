@@ -2,7 +2,7 @@
 //! and who you work with. All of them are Console-only.
 
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch};
@@ -47,7 +47,7 @@ const NAME_MAX: usize = 60;
 
 /// The contract's `Organization`: the organization as the caller sees it.
 #[derive(Serialize)]
-struct OrganizationView {
+pub(crate) struct OrganizationView {
     id: OrganizationId,
     name: String,
     slug: String,
@@ -62,7 +62,11 @@ struct Viewer {
     organizations: Vec<OrganizationView>,
 }
 
-async fn view(state: &AppState, organization: Organization, role: MemberRole) -> Result<OrganizationView, Failure> {
+pub(crate) async fn view(
+    state: &AppState,
+    organization: Organization,
+    role: MemberRole,
+) -> Result<OrganizationView, Failure> {
     let setup = state
         .organizations
         .load_setup(organization.id)
@@ -293,9 +297,14 @@ async fn invite_member(
     }
     let member = state
         .organizations
-        .invite_member(access.organization.id, &email, role)
+        .invite_member(access.organization.id, &email, role, access.member.id)
         .await
         .map_err(|error| match error {
+            // Demoted or removed since the check above: the store reads the role again.
+            StoreError::NotAllowed => Failure(ApiError::forbidden(format!(
+                "Your role can't invite {}s any more. Ask an organization owner.",
+                role.as_str()
+            ))),
             StoreError::AlreadyMember => {
                 let mut error = ApiError::new(
                     409,
@@ -346,23 +355,56 @@ async fn update_member(
     Ok(envelope(StatusCode::OK, member))
 }
 
+/// `?status=invited`: withdraw an invitation only, never a member who
+/// accepted it in the meantime. Any other value is refused.
+fn only_invited(raw: Option<&str>) -> Result<bool, Failure> {
+    let pairs: Vec<(String, String)> = serde_urlencoded::from_str(raw.unwrap_or_default()).map_err(|_| {
+        Failure(ApiError::new(
+            400,
+            "validation_failed",
+            "The query string can't be read.",
+        ))
+    })?;
+    match pairs
+        .iter()
+        .find(|(name, _)| name == "status")
+        .map(|(_, value)| value.as_str())
+    {
+        None => Ok(false),
+        Some("invited") => Ok(true),
+        Some(_) => {
+            let mut error = ApiError::new(400, "validation_failed", "Some fields are invalid.");
+            error.fields = Some([("status".to_owned(), "Use `invited`.".to_owned())].into());
+            Err(Failure(error))
+        }
+    }
+}
+
 async fn remove_member(
     State(state): State<AppState>,
     ConsoleUser(user): ConsoleUser,
     Path((org, member)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Response, Failure> {
     let access = OrganizationAccess::resolve(&state, user, &org).await?;
     access.require(MemberRole::is_admin, "remove members")?;
+    let only_invited = only_invited(raw.as_deref())?;
     let member_id = MemberId::parse(&member).map_err(|_| member_not_found())?;
     // The store checks in one transaction: the caller's role as of now (403),
     // missing (404), an owner removed by a non-owner (403), then the last
     // active owner (422).
     state
         .organizations
-        .remove_member(access.organization.id, member_id, access.member.id)
+        .remove_member(access.organization.id, member_id, access.member.id, only_invited)
         .await
         .map_err(|error| match error {
             StoreError::NotFound => member_not_found(),
+            StoreError::InvitationAccepted => ApiError::new(
+                409,
+                "invitation_accepted",
+                "That invitation was accepted: they're a member now.",
+            )
+            .into(),
             // An owner removed by a non-owner, or a caller demoted since the check above.
             StoreError::NotAllowed => ApiError::forbidden(format!(
                 "Your role ({}) can't remove that member. Ask an organization owner.",

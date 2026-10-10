@@ -119,11 +119,52 @@ impl FromRequestParts<AppState> for Caller {
                 .into()),
             };
         }
-        console_user(bearer, state).await.map(Self::Console)
+        console_session(bearer, state)
+            .await
+            .map(|session| Self::Console(session.user))
     }
 }
 
-async fn console_user(bearer: Option<&str>, state: &AppState) -> Result<User, Failure> {
+/// A signed-in Console user, with what this sign-in says of their address
+/// now. Invitations go by the user's address, so only a sign-in that vouches
+/// for it sees or answers one.
+pub struct ConsoleSession {
+    pub user: User,
+    pub address: SignInAddress,
+}
+
+/// What a sign-in says of its user's address, the one invitations go to.
+pub enum SignInAddress {
+    /// The provider verified the email it sent, and it's the user's own.
+    Vouched,
+    /// The provider sent the user's address, but hasn't verified it.
+    Unverified,
+    /// The provider sends another address now: the identity was linked under
+    /// the user's, which never follows the profile.
+    Changed,
+}
+
+impl FromRequestParts<AppState> for ConsoleSession {
+    type Rejection = Failure;
+
+    /// Like [`ConsoleUser`]: `401` without a valid credential, `403
+    /// console_only` for a valid API key.
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        let bearer = parts
+            .headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        if bearer.is_some_and(|bearer| bearer.starts_with(SECRET_PREFIX)) {
+            // A key is never a Console session: an unknown one is `401`, a valid one refused.
+            Caller::from_request_parts(parts, state).await?;
+            return Err(console_only());
+        }
+        console_session(bearer, state).await
+    }
+}
+
+async fn console_session(bearer: Option<&str>, state: &AppState) -> Result<ConsoleSession, Failure> {
     let identity = state.identity.verify(bearer).await.map_err(|error| match error {
         IdentityError::Unauthenticated => Failure(ApiError::unauthenticated()),
         IdentityError::Unavailable => {
@@ -136,7 +177,16 @@ async fn console_user(bearer: Option<&str>, state: &AppState) -> Result<User, Fa
         }
     })?;
     match state.organizations.user_for_identity(&identity).await {
-        Ok(user) => Ok(user),
+        Ok(user) => {
+            let address = if identity.profile.email.to_lowercase() != user.email {
+                SignInAddress::Changed
+            } else if identity.profile.email_verified {
+                SignInAddress::Vouched
+            } else {
+                SignInAddress::Unverified
+            };
+            Ok(ConsoleSession { user, address })
+        }
         Err(StoreError::EmailUnverified) => {
             tracing::warn!(event = "auth.email_unverified", provider = %identity.provider);
             Err(ApiError::new(
@@ -159,6 +209,15 @@ async fn console_user(bearer: Option<&str>, state: &AppState) -> Result<User, Fa
     }
 }
 
+fn console_only() -> Failure {
+    ApiError::new(
+        403,
+        "console_only",
+        "This route is for Console sessions; an API key can't call it.",
+    )
+    .into()
+}
+
 /// The signed-in Console user, for Console-only routes. A valid API key gets
 /// `403`: its credential is fine, its type isn't allowed here.
 pub struct ConsoleUser(pub User);
@@ -169,12 +228,7 @@ impl FromRequestParts<AppState> for ConsoleUser {
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
         match Caller::from_request_parts(parts, state).await? {
             Caller::Console(user) => Ok(Self(user)),
-            Caller::ApiKey(_) => Err(ApiError::new(
-                403,
-                "console_only",
-                "This route is for Console sessions; an API key can't call it.",
-            )
-            .into()),
+            Caller::ApiKey(_) => Err(console_only()),
         }
     }
 }

@@ -6,6 +6,8 @@ import type { Environment, RunListQuery } from "@zupflow/sdk";
  */
 export const qk = {
   viewer: ["viewer"] as const,
+  /** The signed-in person's own invitations: not an organization's. */
+  invitations: ["invitations"] as const,
   models: ["models"] as const,
 
   org: (orgId: string) => ["org", orgId] as const,

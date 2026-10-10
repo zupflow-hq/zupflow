@@ -8,6 +8,7 @@ import {
   KeyRoundIcon,
   LayoutDashboardIcon,
   type LucideIcon,
+  MailIcon,
   PlugIcon,
   PlusIcon,
   ScrollTextIcon,
@@ -15,6 +16,7 @@ import {
   UsersIcon,
   WebhookIcon,
 } from "lucide-react";
+import { useState } from "react";
 import { ZupflowMark } from "@/components/brand/logo";
 import {
   DropdownMenu,
@@ -39,6 +41,7 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { useOrg } from "@/features/context";
+import { InvitationsDialog, usePendingInvitations } from "@/features/invitations/invitation-list";
 import { useViewer } from "@/features/queries";
 import { EnvironmentMenu } from "./environment-menu";
 import { UserMenu } from "./user-menu";
@@ -98,38 +101,54 @@ function OrgSwitcher() {
   const org = useOrg();
   const viewer = useViewer();
   const navigate = useNavigate();
+  const pending = usePendingInvitations().length;
+  const [invitationsOpen, setInvitationsOpen] = useState(false);
+  const { setOpenMobile } = useSidebar();
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <SidebarMenuButton size="lg" className="data-[state=open]:bg-sidebar-accent">
-          <span className="grid size-8 shrink-0 place-items-center rounded-md bg-[#10191D] dark:bg-[#132027]">
-            <ZupflowMark className="size-5" />
-          </span>
-          <span className="grid min-w-0 flex-1 text-left leading-tight">
-            <span className="truncate font-semibold">{org.name}</span>
-            <span className="truncate text-xs text-muted-foreground capitalize">{org.role}</span>
-          </span>
-          <ChevronsUpDownIcon className="ml-auto size-4 text-muted-foreground" />
-        </SidebarMenuButton>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent className="w-64" align="start" sideOffset={6}>
-        <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">Organizations</DropdownMenuLabel>
-        {viewer.data?.organizations.map((o) => (
-          <DropdownMenuItem key={o.id} onSelect={() => navigate({ to: "/$org", params: { org: o.slug } })}>
-            <span className="grid size-6 place-items-center rounded bg-muted font-mono text-[11px] font-semibold">
-              {o.name.slice(0, 1).toUpperCase()}
+    <>
+      <InvitationsDialog
+        open={invitationsOpen}
+        onOpenChange={setInvitationsOpen}
+        onJoined={() => setOpenMobile(false)}
+      />
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <SidebarMenuButton size="lg" className="data-[state=open]:bg-sidebar-accent">
+            <span className="grid size-8 shrink-0 place-items-center rounded-md bg-[#10191D] dark:bg-[#132027]">
+              <ZupflowMark className="size-5" />
             </span>
-            <span className="flex-1 truncate">{o.name}</span>
-            {o.id === org.id ? <CheckIcon className="size-4" /> : null}
+            <span className="grid min-w-0 flex-1 text-left leading-tight">
+              <span className="truncate font-semibold">{org.name}</span>
+              <span className="truncate text-xs text-muted-foreground capitalize">{org.role}</span>
+            </span>
+            <ChevronsUpDownIcon className="ml-auto size-4 text-muted-foreground" />
+          </SidebarMenuButton>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent className="w-64" align="start" sideOffset={6}>
+          <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">Organizations</DropdownMenuLabel>
+          {viewer.data?.organizations.map((o) => (
+            <DropdownMenuItem key={o.id} onSelect={() => navigate({ to: "/$org", params: { org: o.slug } })}>
+              <span className="grid size-6 place-items-center rounded bg-muted font-mono text-[11px] font-semibold">
+                {o.name.slice(0, 1).toUpperCase()}
+              </span>
+              <span className="flex-1 truncate">{o.name}</span>
+              {o.id === org.id ? <CheckIcon className="size-4" /> : null}
+            </DropdownMenuItem>
+          ))}
+          <DropdownMenuSeparator />
+          {pending > 0 ? (
+            <DropdownMenuItem onSelect={() => setInvitationsOpen(true)}>
+              <MailIcon />
+              {pending === 1 ? "1 invitation" : `${pending} invitations`}
+            </DropdownMenuItem>
+          ) : null}
+          <DropdownMenuItem onSelect={() => navigate({ to: "/onboarding" })}>
+            <PlusIcon />
+            Create organization
           </DropdownMenuItem>
-        ))}
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => navigate({ to: "/onboarding" })}>
-          <PlusIcon />
-          Create organization
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </>
   );
 }
 

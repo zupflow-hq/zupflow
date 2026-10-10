@@ -17,6 +17,7 @@ import type {
   Environment,
   Installation,
   InstallationApp,
+  Invitation,
   Member,
   MemberRole,
   Organization,
@@ -28,7 +29,12 @@ import type {
   Workspace,
   WorkspaceId,
 } from "@zupflow/sdk";
-import { ORGANIZATION_HEADER } from "@zupflow/sdk";
+import {
+  EXPIRED_INVITATION_SHOWN_DAYS,
+  INVITATION_LIST_LIMIT,
+  INVITATION_TTL_DAYS,
+  ORGANIZATION_HEADER,
+} from "@zupflow/sdk";
 import { delay, HttpResponse } from "msw";
 import type { z } from "zod";
 import { db, persist } from "./db";
@@ -356,6 +362,17 @@ export function toOrganization(org: OrganizationRow, membership: MembershipRow):
   };
 }
 
+/** When an invitation stops being accepted; null once it's a membership. */
+export function invitationExpiresAt(m: MembershipRow): string | null {
+  if (m.status !== "invited") return null;
+  return new Date(Date.parse(m.invited_at) + INVITATION_TTL_DAYS * 86_400_000).toISOString();
+}
+
+export function isExpiredInvitation(m: MembershipRow, now = Date.now()): boolean {
+  const expiresAt = invitationExpiresAt(m);
+  return expiresAt !== null && Date.parse(expiresAt) <= now;
+}
+
 export function toMember(m: MembershipRow): Member {
   return {
     id: m.id,
@@ -364,8 +381,74 @@ export function toMember(m: MembershipRow): Member {
     role: m.role,
     status: m.status,
     invited_at: m.invited_at,
+    expires_at: invitationExpiresAt(m),
     joined_at: m.joined_at,
     last_active_at: m.last_active_at,
+  };
+}
+
+/** Whether a member with role `grantor` can grant `role`: an owner or admin, and an owner for an owner. */
+export function canGrant(grantor: MemberRole, role: MemberRole): boolean {
+  return (grantor === "owner" || grantor === "admin") && (role !== "owner" || grantor === "owner");
+}
+
+/**
+ * Whether an invitation still stands: its grantor is an active member of its
+ * organization who can still grant its role. One that doesn't is withdrawn,
+ * whatever row is left: an invitation with no grantor known grants nothing.
+ */
+export function grantorAllows(m: MembershipRow): boolean {
+  if (m.invited_by === null) return false;
+  const grantor = db().memberships.find(
+    (g) => g.organization_id === m.organization_id && g.user_id === m.invited_by && g.status === "active",
+  );
+  return grantor !== undefined && canGrant(grantor.role, m.role);
+}
+
+/**
+ * Withdraws the pending invitations `grantor` granted in `organizationId`
+ * that `role` can't grant: all of them once they're removed (`null`).
+ */
+export function withdrawUngrantable(organizationId: OrganizationId, grantor: UserId, role: MemberRole | null) {
+  const d = db();
+  d.memberships = d.memberships.filter(
+    (m) =>
+      !(
+        m.organization_id === organizationId &&
+        m.status === "invited" &&
+        m.invited_by === grantor &&
+        (role === null || !canGrant(role, m.role))
+      ),
+  );
+}
+
+/**
+ * The person's own invitations as `GET /v1/me/invitations` lists them: still
+ * granted, not expired more than `EXPIRED_INVITATION_SHOWN_DAYS` ago, newest
+ * first, at most `INVITATION_LIST_LIMIT`.
+ */
+export function invitationsOf(userId: UserId, now = Date.now()): MembershipRow[] {
+  const shownUntil = (m: MembershipRow) =>
+    Date.parse(m.invited_at) + (INVITATION_TTL_DAYS + EXPIRED_INVITATION_SHOWN_DAYS) * 86_400_000;
+  return db()
+    .memberships.filter((m) => m.user_id === userId && m.status === "invited")
+    .filter((m) => grantorAllows(m) && shownUntil(m) > now)
+    .sort((a, b) => b.invited_at.localeCompare(a.invited_at) || b.id.localeCompare(a.id))
+    .slice(0, INVITATION_LIST_LIMIT);
+}
+
+/** An invitation as its invitee sees it: the organization's name, never its members. */
+export function toInvitation(m: MembershipRow, org: OrganizationRow): Invitation {
+  const inviter = db().users.find((u) => u.id === m.invited_by);
+  if (!inviter) throw new Error("An invitation is shown only while its grantor can grant it");
+  return {
+    id: m.id,
+    organization: { id: org.id, name: org.name, slug: org.slug },
+    role: m.role,
+    invited_by: { name: inviter.name, email: inviter.email },
+    status: isExpiredInvitation(m) ? "expired" : "pending",
+    invited_at: m.invited_at,
+    expires_at: invitationExpiresAt(m) ?? m.invited_at,
   };
 }
 

@@ -44,7 +44,7 @@ use zupflow_core::ids::{
 };
 use zupflow_core::installations::{InstallationStore, InstalledApp, TemplateSnapshot};
 use zupflow_core::keys::{EncryptionContext, seal};
-use zupflow_core::organizations::{MemberRole, OrganizationStore, User};
+use zupflow_core::organizations::{INVITATION_TTL_MS, MemberRole, OrganizationStore, User};
 use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse, Refusal};
 use zupflow_core::policy::{ToolLevel, ToolPolicyStore};
 use zupflow_core::runs::CallTarget;
@@ -253,31 +253,38 @@ async fn reset(path: &str) -> Result<(), String> {
     };
     let (owner, outsider) = (user("owner").ok_or("owner")?, user("outsider").ok_or("outsider")?);
 
-    let (northwind, _) = organizations
+    let (northwind, owner_member) = organizations
         .create_organization(OrganizationId::generate(), "Northwind", "northwind", owner.id)
         .await
         .map_err(|error| fail("northwind")(&error))?;
-    let (larkspur, _) = organizations
+    let (larkspur, outsider_member) = organizations
         .create_organization(OrganizationId::generate(), "Larkspur", "larkspur", outsider.id)
         .await
         .map_err(|error| fail("larkspur")(&error))?;
     for (name, role) in [("developer", MemberRole::Developer), ("viewer", MemberRole::Viewer)] {
         let member = user(name).ok_or("member")?;
-        organizations
-            .invite_member(northwind.id, &member.email, role)
+        let invitation = organizations
+            .invite_member(northwind.id, &member.email, role, owner_member.id)
             .await
             .map_err(|error| fail("invite")(&error))?;
-        // Accepted at once: the API has no acceptance route yet.
-        sqlx::query(
-            "UPDATE members SET status = 'active', joined_at = invited_at \
-             WHERE organization_id = ? AND user_id = ?",
-        )
-        .bind(northwind.id.uuid())
-        .bind(member.id.uuid())
+        organizations
+            .accept_invitation_of_user(member.id, invitation.id, Timestamp::now())
+            .await
+            .map_err(|error| fail("accept")(&error))?;
+    }
+    // Larkspur invited the viewer long enough ago that the invitation expired.
+    let viewer = user("viewer").ok_or("viewer")?;
+    let expired = organizations
+        .invite_member(larkspur.id, &viewer.email, MemberRole::Developer, outsider_member.id)
+        .await
+        .map_err(|error| fail("invite")(&error))?;
+    sqlx::query("UPDATE members SET invited_at = ? WHERE organization_id = ? AND id = ?")
+        .bind(Timestamp::now().millis() - INVITATION_TTL_MS - 3 * 24 * 60 * 60 * 1000)
+        .bind(larkspur.id.uuid())
+        .bind(expired.id.uuid())
         .execute(&pool)
         .await
-        .map_err(|error| fail("accept")(&error))?;
-    }
+        .map_err(|error| fail("expire")(&error))?;
     pool.close().await;
 
     let workspaces = SqliteWorkspaceStore::new(database.clone());

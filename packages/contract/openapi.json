@@ -1800,6 +1800,87 @@
         "format": "date-time",
         "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
       },
+      "Invitation": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/MemberId"
+          },
+          "organization": {
+            "$ref": "#/components/schemas/InvitationOrganization"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "owner",
+              "admin",
+              "developer",
+              "viewer"
+            ]
+          },
+          "invited_by": {
+            "$ref": "#/components/schemas/Inviter"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "expired"
+            ]
+          },
+          "invited_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "expires_at": {
+            "$ref": "#/components/schemas/Instant"
+          }
+        },
+        "required": [
+          "id",
+          "organization",
+          "role",
+          "invited_by",
+          "status",
+          "invited_at",
+          "expires_at"
+        ]
+      },
+      "InvitationOrganization": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "name": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug"
+        ]
+      },
+      "Inviter": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "pattern": "^(?:[A-Za-z0-9_'+\\-]+\\.)*[A-Za-z0-9_'+\\-]*[A-Za-z0-9_+-]@(?:[A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"
+          }
+        },
+        "required": [
+          "name",
+          "email"
+        ]
+      },
       "LocalSignIn": {
         "type": "object",
         "properties": {
@@ -1886,6 +1967,16 @@
           "invited_at": {
             "$ref": "#/components/schemas/Instant"
           },
+          "expires_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "joined_at": {
             "anyOf": [
               {
@@ -1914,6 +2005,7 @@
           "role",
           "status",
           "invited_at",
+          "expires_at",
           "joined_at",
           "last_active_at"
         ]
@@ -4126,6 +4218,164 @@
         }
       }
     },
+    "/v1/me/invitations": {
+      "get": {
+        "operationId": "listInvitations",
+        "summary": "The signed-in person's own invitations, pending and expired, newest first: at most `INVITATION_LIST_LIMIT` (50), leaving out any expired more than `EXPIRED_INVITATION_SHOWN_DAYS` (30) days ago. `403 email_unverified` when the sign-in doesn't vouch for the user's address now (backend only: the mock doesn't simulate verification)",
+        "security": [
+          {
+            "consoleSession": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console"
+        ],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Invitation"
+                      }
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/me/invitations/{invitation}/accept": {
+      "post": {
+        "operationId": "acceptInvitation",
+        "summary": "Join the invitation's organization with the invited role. Someone else's invitation, or one withdrawn (by an admin, or because its grantor can't grant it any more) or declined, is `404`; an accepted one `409 invitation_accepted`; an expired one `422 invitation_expired`; `403 email_unverified` as for the list (backend only)",
+        "security": [
+          {
+            "consoleSession": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console"
+        ],
+        "parameters": [
+          {
+            "name": "invitation",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/MemberId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Organization"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/me/invitations/{invitation}/decline": {
+      "post": {
+        "operationId": "declineInvitation",
+        "summary": "Decline an invitation, expired or not: it's withdrawn. Someone else's, or one already gone, is `404`; an accepted one `409 invitation_accepted`; `403 email_unverified` as for the list (backend only)",
+        "security": [
+          {
+            "consoleSession": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console"
+        ],
+        "parameters": [
+          {
+            "name": "invitation",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/MemberId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Done"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/v1/models": {
       "get": {
         "operationId": "listModels",
@@ -4560,7 +4810,7 @@
       },
       "post": {
         "operationId": "inviteMember",
-        "summary": "Invite a member",
+        "summary": "Invite a member: an owner or admin, and an owner to invite an owner. Inviting an address whose invitation expired renews it, with this role and grantor",
         "security": [
           {
             "consoleSession": []
@@ -4654,7 +4904,7 @@
     "/v1/organizations/{org}/members/{member}": {
       "patch": {
         "operationId": "updateMember",
-        "summary": "Change a member's role",
+        "summary": "Change a member's role. On an invitation, the owner changing it becomes its grantor; a member demoted loses the invitations they granted above what they can grant now",
         "security": [
           {
             "consoleSession": []
@@ -4748,7 +4998,7 @@
       },
       "delete": {
         "operationId": "removeMember",
-        "summary": "Remove a member or withdraw an invitation",
+        "summary": "Remove a member or withdraw an invitation. Removing a member withdraws the invitations they granted; so does a demotion, for the roles they can't grant any more",
         "security": [
           {
             "consoleSession": []
@@ -4775,6 +5025,18 @@
               "$ref": "#/components/schemas/MemberId"
             },
             "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "`invited`: withdraw an invitation only. One accepted in the meantime is left alone, and answers `409 invitation_accepted`.",
+              "type": "string",
+              "enum": [
+                "invited"
+              ]
+            }
           }
         ],
         "responses": {

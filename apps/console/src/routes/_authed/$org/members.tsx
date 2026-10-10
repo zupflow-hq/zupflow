@@ -30,7 +30,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { canAdminister, useDocumentTitle, useOrg, useViewerUser } from "@/features/context";
 import { useInviteMember, useMembers, useRemoveMember, useUpdateMember } from "@/features/queries";
-import { applyFieldErrors, toastError } from "@/lib/errors";
+import { applyFieldErrors, isApiError, toastError } from "@/lib/errors";
 
 export const Route = createFileRoute("/_authed/$org/members")({
   staticData: { crumb: "Members" },
@@ -43,6 +43,9 @@ const ROLES: { value: MemberRole; label: string; body: string }[] = [
   { value: "developer", label: "Developer", body: "Agents, installations, runs and Sandbox keys." },
   { value: "viewer", label: "Viewer", body: "Sees what developers see. Changes nothing." },
 ];
+
+/** An invitation past its expiry: it can't be accepted. Cancel it and invite again. */
+const expired = (m: Member) => m.expires_at !== null && Date.parse(m.expires_at) <= Date.now();
 
 function MembersPage() {
   const org = useOrg();
@@ -101,7 +104,13 @@ function MembersPage() {
                             <p className="flex min-w-0 items-center gap-2 font-medium">
                               <span className="truncate">{m.status === "invited" ? m.user.email : m.user.name}</span>
                               {isMe ? <span className="text-xs font-normal text-muted-foreground">You</span> : null}
-                              {m.status === "invited" ? <StatusPill tone="info">Invited</StatusPill> : null}
+                              {m.status === "invited" ? (
+                                expired(m) ? (
+                                  <StatusPill tone="neutral">Expired</StatusPill>
+                                ) : (
+                                  <StatusPill tone="info">Invited</StatusPill>
+                                )
+                              ) : null}
                             </p>
                             {m.status === "active" ? (
                               <p className="truncate text-xs text-muted-foreground">{m.user.email}</p>
@@ -129,9 +138,15 @@ function MembersPage() {
                       </TableCell>
                       <TableCell className="hidden text-muted-foreground md:table-cell">
                         {m.status === "invited" ? (
-                          <>
-                            Invited <RelativeTime iso={m.invited_at} />
-                          </>
+                          expired(m) ? (
+                            <>
+                              Expired <RelativeTime iso={m.expires_at} />
+                            </>
+                          ) : (
+                            <>
+                              Invited <RelativeTime iso={m.invited_at} />
+                            </>
+                          )
                         ) : (
                           <RelativeTime iso={m.last_active_at} />
                         )}
@@ -169,17 +184,36 @@ function MembersPage() {
             ? `Cancel the invite for ${removing.user.email}?`
             : `Remove ${removing?.user.name}?`
         }
-        description={<p>They lose Console access immediately. Their past actions stay in the audit log.</p>}
+        description={
+          removing?.status === "invited" ? (
+            <p>They can't accept it any more. You can invite them again later.</p>
+          ) : (
+            <>
+              <p>They lose Console access immediately. Their past actions stay in the audit log.</p>
+              {removing?.role === "owner" || removing?.role === "admin" ? (
+                <p>Invitations they sent that nobody has accepted yet are cancelled too.</p>
+              ) : null}
+            </>
+          )
+        }
         actionLabel={removing?.status === "invited" ? "Cancel invite" : "Remove member"}
         pending={remove.isPending}
         onConfirm={() =>
           removing &&
-          remove.mutate(removing.id, {
+          remove.mutate(removing, {
             onSuccess: () => {
               toast.success(removing.status === "invited" ? "Invite cancelled" : `Removed ${removing.user.name}`);
               setRemoving(null);
             },
-            onError: (e) => toastError(e),
+            onError: (e) => {
+              if (isApiError(e, "invitation_accepted")) {
+                // Accepted while the dialog was open: they stay, and the list shows them as a member.
+                toast.info(`${removing.user.email} accepted before the invite was cancelled: they're a member now.`);
+                setRemoving(null);
+                return;
+              }
+              toastError(e);
+            },
           })
         }
       />

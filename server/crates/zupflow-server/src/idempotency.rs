@@ -6,7 +6,8 @@
 //!   key answers `400 invalid_idempotency_key`, before the route's own checks.
 //! - A key belongs to that caller: the organization, the workspace on
 //!   workspace routes, the environment and the credential. Creating an
-//!   organization is the user's own key space. Hosted Connect holds no
+//!   organization and answering one's own invitation are the user's own key
+//!   space. Hosted Connect holds no
 //!   credential: its key belongs to the session its link names.
 //! - The same key and request replays the saved status and body; another
 //!   request answers `422`, one still in flight `409`.
@@ -55,8 +56,10 @@ fn unavailable() -> Response {
 /// (`x-zupflow-callers` without `api_key`); a test holds the two equal. A key
 /// on one passes straight through, so the route answers `403 console_only`
 /// whatever key or organization the request names.
-pub const NOT_FOR_API_KEYS: [&str; 7] = [
+pub const NOT_FOR_API_KEYS: [&str; 9] = [
     "/v1/organizations",
+    "/v1/me/invitations/{invitation}/accept",
+    "/v1/me/invitations/{invitation}/decline",
     "/v1/organizations/{org}/members",
     "/v1/organizations/{org}/api-keys",
     "/v1/organizations/{org}/api-keys/{key}/revoke",
@@ -115,7 +118,12 @@ async fn scope_of(state: &AppState, parts: &mut Parts, template: &str) -> Result
     if matches!(caller, Caller::ApiKey(_)) && NOT_FOR_API_KEYS.contains(&template) {
         return Ok(None);
     }
-    if template == "/v1/organizations" {
+    // Creating an organization, and answering one's own invitation, act in no
+    // organization the caller belongs to yet: the key is the user's own.
+    if matches!(
+        template,
+        "/v1/organizations" | "/v1/me/invitations/{invitation}/accept" | "/v1/me/invitations/{invitation}/decline"
+    ) {
         return Ok(match caller {
             Caller::Console(user) => Some(IdempotencyScope::User { user_id: user.id }),
             Caller::ApiKey(_) => None,

@@ -20,6 +20,7 @@ pub mod http;
 pub mod idempotency;
 pub mod input;
 pub mod installations;
+pub mod invitations;
 pub mod mcp_access;
 pub mod organizations;
 pub mod run_engine;
@@ -40,9 +41,12 @@ pub use guard::RequestGuard;
 /// The contract's operations this server serves so far, by `operationId`. The
 /// shared contract suite skips, by name, any case that needs another one; a
 /// test holds this list equal to the routes the router actually answers.
-pub const SERVED_OPERATIONS: [&str; 75] = [
+pub const SERVED_OPERATIONS: [&str; 78] = [
     "getSignInSettings",
     "getViewer",
+    "listInvitations",
+    "acceptInvitation",
+    "declineInvitation",
     "createOrganization",
     "getOrganization",
     "updateOrganization",
@@ -127,6 +131,7 @@ pub fn app(state: AppState, guard: RequestGuard) -> Router {
         .route("/ready", get(http::ready))
         .merge(sign_in::routes())
         .merge(organizations::routes())
+        .merge(invitations::routes())
         .merge(api_keys::routes())
         .merge(workspaces::routes())
         .merge(apps::routes())

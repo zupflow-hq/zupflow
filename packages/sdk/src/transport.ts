@@ -93,9 +93,10 @@ function isEnvelope(value: unknown): value is Envelope<unknown> {
 
 /**
  * A fresh key: 128 random bits as hex. `crypto.getRandomValues`, unlike
- * `crypto.randomUUID`, works outside secure contexts too.
+ * `crypto.randomUUID`, works outside secure contexts too. Make one per
+ * intent (a click), so sending it again can't do it twice.
  */
-function newIdempotencyKey(): string {
+export function newIdempotencyKey(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 

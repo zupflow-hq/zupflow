@@ -77,8 +77,9 @@ export interface Target {
  * grant and a finished run, an installation, a Connect session and a workspace
  * app of its own; in the organization: a catalog app `linear`, ready in Sandbox,
  * an API key, a webhook endpoint and Sandbox Connect settings that do not
- * allow Northwind's return URL. Each organization's real IDs are aimed at
- * the other.
+ * allow Northwind's return URL, and an invitation for the viewer, sent more
+ * than `INVITATION_TTL_DAYS` ago: expired. Each organization's real IDs are
+ * aimed at the other.
  *
  * Every Sandbox workspace the suite uses as one (`acme-sandbox`,
  * `qa-playground`, `harbor-sandbox`) offers at least one catalog app.

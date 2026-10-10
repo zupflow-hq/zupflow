@@ -35,6 +35,7 @@ import type {
   Installation,
   InstallationId,
   InstallationTool,
+  Invitation,
   InviteMemberInput,
   Member,
   MemberId,
@@ -44,6 +45,7 @@ import type {
   OrganizationRun,
   OrganizationRunListQuery,
   PageQuery,
+  RemoveMemberQuery,
   ResolveApprovalInput,
   Run,
   RunEvent,
@@ -105,8 +107,12 @@ export function createClient(transport: Transport) {
       pagination: meta?.pagination ?? { next_cursor: null, total: data.length },
     };
   };
-  const send = async <T>(method: "PUT" | "PATCH" | "DELETE", path: string, body?: unknown) =>
-    (await transport.request<T>({ method, path, body })).data;
+  const send = async <T>(
+    method: "PUT" | "PATCH" | "DELETE",
+    path: string,
+    body?: unknown,
+    query?: Record<string, QueryValue>,
+  ) => (await transport.request<T>({ method, path, body, query })).data;
   const post = async <T>(path: string, body: unknown, options?: PostOptions) =>
     (await transport.request<T>({ method: "POST", path, body, idempotencyKey: options?.idempotencyKey })).data;
 
@@ -121,6 +127,15 @@ export function createClient(transport: Transport) {
 
     me: {
       get: () => get<Viewer>("/v1/me"),
+    },
+
+    /** The signed-in person's own invitations. Accepting one is the only way into an organization. */
+    invitations: {
+      list: () => get<Invitation[]>("/v1/me/invitations"),
+      accept: (invitationId: MemberId, options?: PostOptions) =>
+        post<Organization>(`/v1/me/invitations/${enc(invitationId)}/accept`, undefined, options),
+      decline: (invitationId: MemberId, options?: PostOptions) =>
+        post<void>(`/v1/me/invitations/${enc(invitationId)}/decline`, undefined, options),
     },
 
     models: {
@@ -143,8 +158,9 @@ export function createClient(transport: Transport) {
         post<Member>(`${org(organizationId)}/members`, input, options),
       update: (organizationId: OrganizationId, memberId: MemberId, input: UpdateMemberInput) =>
         send<Member>("PATCH", `${org(organizationId)}/members/${enc(memberId)}`, input),
-      remove: (organizationId: OrganizationId, memberId: MemberId) =>
-        send<void>("DELETE", `${org(organizationId)}/members/${enc(memberId)}`),
+      /** With `{ status: "invited" }`, withdraws an invitation only, never a member who has just accepted it. */
+      remove: (organizationId: OrganizationId, memberId: MemberId, query: RemoveMemberQuery = {}) =>
+        send<void>("DELETE", `${org(organizationId)}/members/${enc(memberId)}`, undefined, { ...query }),
     },
 
     workspaces: {

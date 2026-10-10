@@ -72,6 +72,36 @@ export const routes: readonly Route[] = [
     response: ok(s.Viewer),
   },
   {
+    operationId: "listInvitations",
+    method: "get",
+    path: "/v1/me/invitations",
+    summary:
+      "The signed-in person's own invitations, pending and expired, newest first: at most `INVITATION_LIST_LIMIT` (50), leaving out any expired more than `EXPIRED_INVITATION_SHOWN_DAYS` (30) days ago. `403 email_unverified` when the sign-in doesn't vouch for the user's address now (backend only: the mock doesn't simulate verification)",
+    callers: consoleOnly,
+    params: {},
+    response: ok(s.Invitation, { list: true }),
+  },
+  {
+    operationId: "acceptInvitation",
+    method: "post",
+    path: "/v1/me/invitations/{invitation}/accept",
+    summary:
+      "Join the invitation's organization with the invited role. Someone else's invitation, or one withdrawn (by an admin, or because its grantor can't grant it any more) or declined, is `404`; an accepted one `409 invitation_accepted`; an expired one `422 invitation_expired`; `403 email_unverified` as for the list (backend only)",
+    callers: consoleOnly,
+    params: { invitation: idSchema("member") },
+    response: ok(s.Organization),
+  },
+  {
+    operationId: "declineInvitation",
+    method: "post",
+    path: "/v1/me/invitations/{invitation}/decline",
+    summary:
+      "Decline an invitation, expired or not: it's withdrawn. Someone else's, or one already gone, is `404`; an accepted one `409 invitation_accepted`; `403 email_unverified` as for the list (backend only)",
+    callers: consoleOnly,
+    params: { invitation: idSchema("member") },
+    response: noContent,
+  },
+  {
     operationId: "listModels",
     method: "get",
     path: "/v1/models",
@@ -141,7 +171,8 @@ export const routes: readonly Route[] = [
     operationId: "inviteMember",
     method: "post",
     path: "/v1/organizations/{org}/members",
-    summary: "Invite a member",
+    summary:
+      "Invite a member: an owner or admin, and an owner to invite an owner. Inviting an address whose invitation expired renews it, with this role and grantor",
     callers: consoleOnly,
     params: org,
     body: s.InviteMemberInput,
@@ -151,7 +182,8 @@ export const routes: readonly Route[] = [
     operationId: "updateMember",
     method: "patch",
     path: "/v1/organizations/{org}/members/{member}",
-    summary: "Change a member's role",
+    summary:
+      "Change a member's role. On an invitation, the owner changing it becomes its grantor; a member demoted loses the invitations they granted above what they can grant now",
     callers: consoleOnly,
     params: { ...org, member: idSchema("member") },
     body: s.UpdateMemberInput,
@@ -161,9 +193,11 @@ export const routes: readonly Route[] = [
     operationId: "removeMember",
     method: "delete",
     path: "/v1/organizations/{org}/members/{member}",
-    summary: "Remove a member or withdraw an invitation",
+    summary:
+      "Remove a member or withdraw an invitation. Removing a member withdraws the invitations they granted; so does a demotion, for the roles they can't grant any more",
     callers: consoleOnly,
     params: { ...org, member: idSchema("member") },
+    query: s.RemoveMemberQuery,
     response: noContent,
   },
   {

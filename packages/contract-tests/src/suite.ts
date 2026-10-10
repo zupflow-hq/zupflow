@@ -6,7 +6,7 @@
  * Call `contractSuite(target)` from a test file; see `Target` for what a
  * server provides and the reference fixture it loads.
  */
-import { matchRoute, routes, WEBHOOK_EVENT_TYPES } from "@zupflow/contract";
+import { INVITATION_TTL_DAYS, matchRoute, routes, WEBHOOK_EVENT_TYPES } from "@zupflow/contract";
 import {
   type AgentId,
   type ApiKeyId,
@@ -15,6 +15,7 @@ import {
   type CreateConnectSessionInput,
   createClient,
   createHttpTransport,
+  type MemberId,
   type OrganizationId,
   type WorkspaceId,
   ZupflowApiError,
@@ -171,6 +172,14 @@ export function contractSuite(target: Target) {
         const invited = await owner.members.invite(org, { email: "contract@northwind.example", role: "developer" });
         await owner.members.update(org, invited.id, { role: "admin" });
         await owner.members.remove(org, invited.id);
+        // Invitations are answered by the person invited: the outsider declines one, then accepts another.
+        const outsider = as("outsider");
+        const outsiderEmail = (await outsider.me.get()).user.email;
+        const declined = await owner.members.invite(org, { email: outsiderEmail, role: "viewer" });
+        await outsider.invitations.list();
+        await outsider.invitations.decline(declined.id);
+        const accepted = await owner.members.invite(org, { email: outsiderEmail, role: "viewer" });
+        await outsider.invitations.accept(accepted.id);
         await owner.workspaces.list(org, { environment: "production" });
         const workspace = await owner.workspaces.create(org, {
           name: "Contract",
@@ -456,6 +465,288 @@ export function contractSuite(target: Target) {
         }
         const wrongType = await failure(owner.agents.get(acme, acme as unknown as AgentId));
         expect(wrongType.status).toBe(404);
+      });
+    });
+
+    describe("invitations", () => {
+      /** The outsider, invited to Northwind by the owner: someone who signs in and belongs to it only once they accept. */
+      const inviteOutsider = async (role: "owner" | "admin" | "developer" | "viewer" = "developer") => {
+        const email = (await as("outsider").me.get()).user.email;
+        return owner.members.invite(fx.organization, { email, role });
+      };
+      const inNorthwind = async (persona: Persona) =>
+        (await as(persona).me.get()).organizations.find((o) => o.id === fx.organization);
+
+      it("shows an invitation to the invited person only, who joins nothing until they accept", async () => {
+        const invited = await inviteOutsider();
+        const ownerUser = (await owner.me.get()).user;
+        const listed = must(
+          (await as("outsider").invitations.list()).find((i) => i.id === invited.id),
+          "the outsider's invitation",
+        );
+        expect(listed.organization).toEqual({ id: fx.organization, name: expect.any(String), slug: "northwind" });
+        expect([listed.role, listed.status, listed.invited_by.email]).toEqual([
+          "developer",
+          "pending",
+          ownerUser.email,
+        ]);
+        expect(Date.parse(listed.expires_at) - Date.parse(listed.invited_at)).toBe(INVITATION_TTL_DAYS * 86_400_000);
+        // Nobody else sees it: not the inviter, not another member.
+        for (const persona of ["owner", "developer", "viewer"] as const) {
+          expect(
+            (await as(persona).invitations.list()).map((i) => i.id),
+            persona,
+          ).not.toContain(invited.id);
+        }
+        // Signing in with the invited address joins nothing.
+        expect(await inNorthwind("outsider")).toBeUndefined();
+        const acme = fx.workspaces.acme.id;
+        expect((await failure(naming("outsider", () => fx.organization).workspaces.get(acme))).status).toBe(404);
+      });
+
+      it("joins on accept, with the invited role, and answers a second accept or decline with 409", async () => {
+        const invited = await inviteOutsider();
+        const outsider = as("outsider");
+        const joined = await outsider.invitations.accept(invited.id, { idempotencyKey: "suite-accept" });
+        expect([joined.id, joined.role]).toEqual([fx.organization, "developer"]);
+        // The same key replays the answer instead of running again.
+        expect(await outsider.invitations.accept(invited.id, { idempotencyKey: "suite-accept" })).toEqual(joined);
+        expect((await inNorthwind("outsider"))?.role).toBe("developer");
+        const member = must(
+          (await owner.members.list(fx.organization)).find((m) => m.id === invited.id),
+          "the outsider's membership",
+        );
+        expect([member.status, member.expires_at]).toEqual(["active", null]);
+        expect(member.joined_at).not.toBeNull();
+        // A member now: Northwind's workspaces open to them.
+        const acme = fx.workspaces.acme.id;
+        expect((await naming("outsider", () => fx.organization).workspaces.get(acme)).id).toBe(acme);
+        expect((await outsider.invitations.list()).map((i) => i.id)).not.toContain(invited.id);
+        for (const again of [
+          () => outsider.invitations.accept(invited.id),
+          () => outsider.invitations.decline(invited.id),
+        ]) {
+          const error = await failure(again());
+          expect(`${error.status} ${error.code}`).toBe("409 invitation_accepted");
+        }
+      });
+
+      it("accepts the role the invitation holds when accepted", async () => {
+        const invited = await inviteOutsider("viewer");
+        await owner.members.update(fx.organization, invited.id, { role: "admin" });
+        expect((await as("outsider").invitations.accept(invited.id)).role).toBe("admin");
+      });
+
+      it("answers anyone but the invited person with the same 404 as a missing invitation", async () => {
+        const invited = await inviteOutsider();
+        const developerId = (await as("developer").me.get()).user.id;
+        const developerMembership = must(
+          (await owner.members.list(fx.organization)).find((m) => m.user.id === developerId),
+          "the developer's membership",
+        );
+        for (const persona of ["owner", "developer", "viewer"] as const) {
+          for (const call of [
+            () => as(persona).invitations.accept(invited.id),
+            () => as(persona).invitations.decline(invited.id),
+          ]) {
+            const error = await failure(call());
+            expect(`${error.status} ${error.code}`, persona).toBe("404 not_found");
+          }
+        }
+        // Someone else's membership, a malformed ID and a bare UUID are no different.
+        for (const id of [developerMembership.id, "mem_short", uuidOf(invited.id)]) {
+          const error = await failure(as("outsider").invitations.accept(id as typeof invited.id));
+          expect(`${error.status} ${error.code}`, id).toBe("404 not_found");
+        }
+        expect((await failure(as(null).invitations.list())).status).toBe(401);
+        expect((await failure(as(null).invitations.accept(invited.id))).status).toBe(401);
+        // Nothing changed: the invitation still waits for the outsider.
+        const still = must(
+          (await owner.members.list(fx.organization)).find((m) => m.id === invited.id),
+          "the invitation",
+        );
+        expect(still.status).toBe("invited");
+        expect((await as("outsider").invitations.list()).map((i) => i.id)).toContain(invited.id);
+      });
+
+      it("withdraws an invitation on decline, which can then be sent again", async () => {
+        const invited = await inviteOutsider();
+        const outsider = as("outsider");
+        await outsider.invitations.decline(invited.id);
+        expect((await outsider.invitations.list()).map((i) => i.id)).not.toContain(invited.id);
+        expect((await owner.members.list(fx.organization)).map((m) => m.id)).not.toContain(invited.id);
+        expect(await inNorthwind("outsider")).toBeUndefined();
+        for (const call of [
+          () => outsider.invitations.accept(invited.id),
+          () => outsider.invitations.decline(invited.id),
+        ]) {
+          expect(`${(await failure(call())).status}`).toBe("404");
+        }
+        expect((await inviteOutsider()).status).toBe("invited");
+      });
+
+      it("refuses a withdrawn invitation as missing", async () => {
+        const invited = await inviteOutsider();
+        await owner.members.remove(fx.organization, invited.id);
+        expect((await as("outsider").invitations.list()).map((i) => i.id)).not.toContain(invited.id);
+        const error = await failure(as("outsider").invitations.accept(invited.id));
+        expect(`${error.status} ${error.code}`).toBe("404 not_found");
+        expect(await inNorthwind("outsider")).toBeUndefined();
+      });
+
+      it("refuses an expired invitation, which can still be declined", async () => {
+        const viewer = as("viewer");
+        const expired = must(
+          (await viewer.invitations.list()).find((i) => i.organization.id === fx.otherOrganization),
+          "the viewer's expired invitation to larkspur",
+        );
+        expect(expired.status).toBe("expired");
+        expect(Date.parse(expired.expires_at)).toBeLessThanOrEqual(Date.now());
+        const error = await failure(viewer.invitations.accept(expired.id));
+        expect(`${error.status} ${error.code}`).toBe("422 invitation_expired");
+        expect((await viewer.me.get()).organizations.map((o) => o.id)).not.toContain(fx.otherOrganization);
+        await viewer.invitations.decline(expired.id);
+        expect((await viewer.invitations.list()).map((i) => i.id)).not.toContain(expired.id);
+      });
+
+      it("renews an expired invitation when the address is invited again", async () => {
+        const viewer = as("viewer");
+        const expired = must(
+          (await viewer.invitations.list()).find((i) => i.organization.id === fx.otherOrganization),
+          "the viewer's expired invitation to larkspur",
+        );
+        const email = (await viewer.me.get()).user.email;
+        const outsider = await as("outsider").me.get();
+        const renewed = await as("outsider").members.invite(fx.otherOrganization, { email, role: "viewer" });
+        expect([renewed.id, renewed.role, renewed.status]).toEqual([expired.id, "viewer", "invited"]);
+        expect(Date.parse(renewed.invited_at)).toBeGreaterThan(Date.parse(expired.invited_at));
+        const listed = must(
+          (await viewer.invitations.list()).find((i) => i.id === expired.id),
+          "the renewed one",
+        );
+        expect([listed.status, listed.role, listed.invited_by.email]).toEqual([
+          "pending",
+          "viewer",
+          outsider.user.email,
+        ]);
+        expect((await viewer.invitations.accept(expired.id)).role).toBe("viewer");
+        // Pending, an invitation isn't sent twice.
+        const pending = await inviteOutsider();
+        const again = await failure(inviteOutsider("viewer"));
+        expect(`${again.status} ${again.code}`).toBe("409 already_member");
+        expect((await as("outsider").invitations.list()).find((i) => i.id === pending.id)?.role).toBe("developer");
+      });
+
+      it("cancels only an invitation still pending, never a member who accepted it", async () => {
+        const invited = await inviteOutsider();
+        await as("outsider").invitations.accept(invited.id);
+        const error = await failure(owner.members.remove(fx.organization, invited.id, { status: "invited" }));
+        expect(`${error.status} ${error.code}`).toBe("409 invitation_accepted");
+        expect((await inNorthwind("outsider"))?.role).toBe("developer");
+        const invalid = await failure(
+          owner.members.remove(fx.organization, invited.id, { status: "active" as "invited" }),
+        );
+        expect(`${invalid.status} ${invalid.code}`).toBe("400 validation_failed");
+        expect((await inNorthwind("outsider"))?.role).toBe("developer");
+        const pending = await owner.members.invite(fx.organization, {
+          email: "cancel@northwind.example",
+          role: "viewer",
+        });
+        await owner.members.remove(fx.organization, pending.id, { status: "invited" });
+        expect((await owner.members.list(fx.organization)).map((m) => m.id)).not.toContain(pending.id);
+      });
+
+      describe("grants only what its grantor can still grant", () => {
+        /** The developer's own membership in Northwind, promoted to `role` by the owner. */
+        const promoteDeveloper = async (role: "owner" | "admin") => {
+          const developerId = (await as("developer").me.get()).user.id;
+          const membership = must(
+            (await owner.members.list(fx.organization)).find((m) => m.user.id === developerId),
+            "the developer's membership",
+          );
+          await owner.members.update(fx.organization, membership.id, { role });
+          return membership;
+        };
+        const outsiderEmail = async () => (await as("outsider").me.get()).user.email;
+        const pendingIds = async () =>
+          (await owner.members.list(fx.organization)).filter((m) => m.status === "invited").map((m) => m.id);
+        const expectWithdrawn = async (id: MemberId) => {
+          expect(await pendingIds()).not.toContain(id);
+          expect((await as("outsider").invitations.list()).map((i) => i.id)).not.toContain(id);
+          const error = await failure(as("outsider").invitations.accept(id));
+          expect(`${error.status} ${error.code}`).toBe("404 not_found");
+          expect(await inNorthwind("outsider")).toBeUndefined();
+        };
+
+        it("withdraws a removed member's invitations, and nobody else's", async () => {
+          const grantor = await promoteDeveloper("admin");
+          const theirs = await as("developer").members.invite(fx.organization, {
+            email: await outsiderEmail(),
+            role: "developer",
+          });
+          const owners = await owner.members.invite(fx.organization, {
+            email: "kept@northwind.example",
+            role: "admin",
+          });
+          await owner.members.remove(fx.organization, grantor.id);
+          await expectWithdrawn(theirs.id);
+          expect(await pendingIds()).toContain(owners.id);
+        });
+
+        it("withdraws, on a demotion, the invitations above what the grantor can grant now", async () => {
+          const grantor = await promoteDeveloper("owner");
+          const developer = as("developer");
+          const ownerInvite = await developer.members.invite(fx.organization, {
+            email: await outsiderEmail(),
+            role: "owner",
+          });
+          const adminInvite = await developer.members.invite(fx.organization, {
+            email: "admin-invite@northwind.example",
+            role: "admin",
+          });
+          // Admin now: owner invitations go, the rest stand.
+          await owner.members.update(fx.organization, grantor.id, { role: "admin" });
+          await expectWithdrawn(ownerInvite.id);
+          expect(await pendingIds()).toContain(adminInvite.id);
+          // Developer now: they grant nothing.
+          await owner.members.update(fx.organization, grantor.id, { role: "developer" });
+          expect(await pendingIds()).not.toContain(adminInvite.id);
+        });
+
+        it("makes whoever changes an invitation's role its grantor", async () => {
+          const grantor = await promoteDeveloper("admin");
+          const invited = await as("developer").members.invite(fx.organization, {
+            email: await outsiderEmail(),
+            role: "viewer",
+          });
+          await owner.members.update(fx.organization, invited.id, { role: "developer" });
+          await owner.members.update(fx.organization, grantor.id, { role: "viewer" });
+          const listed = must(
+            (await as("outsider").invitations.list()).find((i) => i.id === invited.id),
+            "the invitation, granted by the owner now",
+          );
+          expect(listed.invited_by.email).toBe((await owner.me.get()).user.email);
+          expect((await as("outsider").invitations.accept(invited.id)).role).toBe("developer");
+        });
+
+        it("never lets an accept outrun the grantor's demotion", async () => {
+          const grantor = await promoteDeveloper("owner");
+          const invited = await as("developer").members.invite(fx.organization, {
+            email: await outsiderEmail(),
+            role: "owner",
+          });
+          const [accepted, demoted] = await Promise.allSettled([
+            as("outsider").invitations.accept(invited.id),
+            owner.members.update(fx.organization, grantor.id, { role: "admin" }),
+          ]);
+          expect(demoted.status).toBe("fulfilled");
+          if (accepted.status === "fulfilled") {
+            // Accepted first: they joined while it was still granted.
+            expect((await inNorthwind("outsider"))?.role).toBe("owner");
+          } else {
+            await expectWithdrawn(invited.id);
+          }
+        });
       });
     });
 
@@ -2148,9 +2439,14 @@ export function contractSuite(target: Target) {
         ];
       };
 
-      /** Every change a Console member could make: the route table's, minus creating one's own organization. */
+      /**
+       * Changes that are the person's own, with no member role to check: creating their own organization, and
+       * answering an invitation to them (they aren't a member until they accept; anyone else gets 404).
+       */
+      const OWN_CHANGES = new Set(["createOrganization", "acceptInvitation", "declineInvitation"]);
+      /** Every change a Console member could make: the route table's, minus the person's own. */
       const MUTATING = routes
-        .filter((r) => r.method !== "get" && r.callers.includes("console") && r.operationId !== "createOrganization")
+        .filter((r) => r.method !== "get" && r.callers.includes("console") && !OWN_CHANGES.has(r.operationId))
         .map((r) => r.operationId);
       /** A Sandbox key, so a developer's revoke isn't refused for being Production's. */
       const sandboxKey = async () =>
@@ -2159,7 +2455,7 @@ export function contractSuite(target: Target) {
       it("changes nothing: every change answers 403 and leaves the organization as it was", async () => {
         const t = await northwind();
         const changes = changesBy(as("viewer"), t, await sandboxKey());
-        // Every change a Console member could make is tried; only creating one's own organization is open to all.
+        // Every change a Console member could make is tried; only the person's own changes are open to all.
         expect(changes.map(([id]) => id).sort()).toEqual([...MUTATING].sort());
 
         const before = await snapshotOf(owner, t);

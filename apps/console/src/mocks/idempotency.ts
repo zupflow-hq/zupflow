@@ -62,8 +62,12 @@ async function scopeOf(route: Route, request: Request, params: Params): Promise<
       caller: `connect:${session.id}|${session.environment}`,
     };
   }
-  if (route.operationId === "createOrganization") {
-    // No organization exists yet: these keys belong to the user alone.
+  if (
+    route.operationId === "createOrganization" ||
+    route.operationId === "acceptInvitation" ||
+    route.operationId === "declineInvitation"
+  ) {
+    // No organization yet, or the person's own invitations: these keys belong to the user alone.
     return { organization_id: null, workspace_id: null, caller: `member:${authenticate(request).id}|-` };
   }
   throw new Error(`No idempotency scope for ${route.operationId}`);

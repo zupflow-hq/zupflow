@@ -5,10 +5,10 @@
  */
 
 import { config } from "@/lib/env";
+import { signUp } from "@/mocks/accounts";
 import { startMockApi } from "@/mocks/browser";
-import { db, persist, resetDb } from "@/mocks/db";
+import { resetDb } from "@/mocks/db";
 import { MOCK_SESSION_KEY } from "@/mocks/http";
-import { newId } from "@/mocks/ids";
 import { DEMO_USER_ID } from "@/mocks/seed";
 import type { AuthAdapter } from "./adapter";
 
@@ -39,31 +39,7 @@ export async function createMockAdapter(changed: () => void): Promise<AuthAdapte
     controls: {
       mode: "mock",
       signInAsDemo: () => write(DEMO_USER_ID),
-      signUp(input) {
-        const existing = db().users.find((u) => u.email === input.email.toLowerCase());
-        if (existing) {
-          // Signing up with an invited address accepts the invitations.
-          const now = new Date().toISOString();
-          for (const m of db().memberships) {
-            if (m.user_id === existing.id && m.status === "invited") {
-              m.status = "active";
-              m.joined_at = now;
-            }
-          }
-          persist();
-          write(existing.id);
-          return;
-        }
-        const user = {
-          id: newId("user"),
-          name: input.name.trim(),
-          email: input.email.trim().toLowerCase(),
-          avatar_url: null,
-        };
-        db().users.push(user);
-        persist();
-        write(user.id);
-      },
+      signUp: (input) => write(signUp(input)),
       resetDemoData() {
         resetDb();
         write(DEMO_USER_ID);

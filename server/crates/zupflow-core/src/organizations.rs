@@ -3,8 +3,9 @@
 //!
 //! Users are global (one person belongs to many organizations); everything
 //! else here is organization-scoped, and every store method on it takes the
-//! organization first. The few user-keyed reads that span organizations
-//! (a user's own memberships, for `/v1/me`) are named for the user.
+//! organization first. The few user-keyed reads and changes that span
+//! organizations (a user's own memberships, for `/v1/me`, and their own
+//! invitations) are named for the user, and reach only the user's own rows.
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -46,6 +47,12 @@ impl MemberRole {
     /// Everyone but viewers: building with apps, installations and agents.
     pub fn is_developer(self) -> bool {
         !matches!(self, Self::Viewer)
+    }
+
+    /// Whether a member with this role can grant `role` by inviting someone:
+    /// owners and admins, and only owners an owner invitation.
+    pub fn can_grant(self, role: MemberRole) -> bool {
+        self.is_admin() && (role != Self::Owner || self == Self::Owner)
     }
 }
 
@@ -102,6 +109,22 @@ pub struct OrganizationSetup {
     pub has_run: bool,
 }
 
+/// How long an invitation can be accepted after it was sent: the contract's
+/// `INVITATION_TTL_DAYS`, 7 days. An expired one can still be declined.
+pub const INVITATION_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// `GET /v1/me/invitations` lists at most this many: the contract's `INVITATION_LIST_LIMIT`.
+pub const INVITATION_LIST_LIMIT: u32 = 50;
+
+/// An invitation expired longer ago than this is left out of the invitee's
+/// list: the contract's `EXPIRED_INVITATION_SHOWN_DAYS`, 30 days.
+pub const EXPIRED_INVITATION_SHOWN_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// When an invitation sent at `invited_at` stops being accepted.
+pub fn invitation_expires_at(invited_at: Timestamp) -> Timestamp {
+    Timestamp::from_millis(invited_at.millis().saturating_add(INVITATION_TTL_MS))
+}
+
 /// The contract's `Member`: a membership with its user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Member {
@@ -111,8 +134,44 @@ pub struct Member {
     pub role: MemberRole,
     pub status: MemberStatus,
     pub invited_at: Timestamp,
+    /// An invitation's expiry; `None` once it's an active membership.
+    pub expires_at: Option<Timestamp>,
     pub joined_at: Option<Timestamp>,
     pub last_active_at: Option<Timestamp>,
+}
+
+/// The contract's `Inviter`: who sent an invitation, as its invitee sees them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Inviter {
+    pub name: String,
+    pub email: String,
+}
+
+/// An invitation as its invitee sees it: the organization, the role it
+/// grants and who sent it, never the organization's members.
+///
+/// An invitation grants only what its grantor (who sent it, or last changed
+/// its role) can still grant: they're an active member of its organization
+/// whose role [can grant](MemberRole::can_grant) it. Removed or demoted below
+/// that, their invitations are withdrawn in the same transaction; one whose
+/// grantor isn't known (sent before grantors were recorded, or the user is
+/// gone) grants nothing, and is answered like a withdrawn one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invitation {
+    /// The membership it becomes once accepted.
+    pub id: MemberId,
+    pub organization: Organization,
+    pub role: MemberRole,
+    /// The grantor.
+    pub invited_by: Inviter,
+    pub invited_at: Timestamp,
+    pub expires_at: Timestamp,
+}
+
+impl Invitation {
+    pub fn is_expired(&self, now: Timestamp) -> bool {
+        self.expires_at <= now
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -139,6 +198,12 @@ pub enum StoreError {
     /// identity. Only an invitee nobody has signed in as can be claimed.
     #[error("that email belongs to a user who signs in another way")]
     EmailInUse,
+    /// The invitation was accepted already: it's a membership now.
+    #[error("the invitation was already accepted")]
+    InvitationAccepted,
+    /// The invitation is past its expiry, so it can't be accepted.
+    #[error("the invitation has expired")]
+    InvitationExpired,
 }
 
 #[async_trait]
@@ -185,13 +250,46 @@ pub trait OrganizationStore: Send + Sync {
     /// Members and invitations, oldest first.
     async fn list_members(&self, organization_id: OrganizationId) -> Result<Vec<Member>, StoreError>;
 
-    /// Invites `email` (lowercased), creating a user for it if there's none.
+    /// Invites `email` (lowercased), creating a user for it if there's none,
+    /// granted by `acting`, whose role is read again in the transaction: an
+    /// active member who [can grant](MemberRole::can_grant) `role`, or
+    /// [`StoreError::NotAllowed`]. An expired invitation for the address is
+    /// renewed (sent now, with this role and grantor); anyone else already in
+    /// the organization, invited or not, is [`StoreError::AlreadyMember`].
     async fn invite_member(
         &self,
         organization_id: OrganizationId,
         email: &str,
         role: MemberRole,
+        acting: MemberId,
     ) -> Result<Member, StoreError>;
+
+    /// The user's own invitations, pending and expired, that their grantor
+    /// can still grant, newest first: at most [`INVITATION_LIST_LIMIT`],
+    /// leaving out those expired more than [`EXPIRED_INVITATION_SHOWN_MS`]
+    /// before `now`. Spans organizations by design: it's the user's own list.
+    /// Nobody else's.
+    async fn list_invitations_of_user(&self, user_id: UserId, now: Timestamp) -> Result<Vec<Invitation>, StoreError>;
+
+    /// Accepts the user's own invitation as of `now`: an active membership
+    /// with the role the invitation holds when it's accepted. In one
+    /// transaction, the invitation is read again, the user's own only
+    /// ([`StoreError::NotFound`] for anyone else's, or one withdrawn or
+    /// declined), still an invitation ([`StoreError::InvitationAccepted`]),
+    /// still granted by its grantor (else withdrawn: [`StoreError::NotFound`])
+    /// and not expired ([`StoreError::InvitationExpired`]), so concurrent
+    /// accepts, a decline, a withdrawal or the grantor's demotion can't both
+    /// succeed.
+    async fn accept_invitation_of_user(
+        &self,
+        user_id: UserId,
+        invitation_id: MemberId,
+        now: Timestamp,
+    ) -> Result<(Organization, Member), StoreError>;
+
+    /// Declines the user's own invitation, expired or not: it's withdrawn.
+    /// The same checks as accepting, in one transaction, but expiry.
+    async fn decline_invitation_of_user(&self, user_id: UserId, invitation_id: MemberId) -> Result<(), StoreError>;
 
     /// The member, in this organization only.
     async fn find_member(
@@ -203,7 +301,9 @@ pub trait OrganizationStore: Send + Sync {
     /// Changes a role, for `acting`, who must be an active owner. Refuses to
     /// leave the organization without an active owner. The acting member's
     /// role, the target and the owners are read and written in one
-    /// transaction, so a concurrent demotion can't slip by.
+    /// transaction, so a concurrent demotion can't slip by. On an invitation,
+    /// `acting` becomes its grantor; on an active member, the invitations
+    /// they granted that the new role can't grant are withdrawn with it.
     async fn update_member_role(
         &self,
         organization_id: OrganizationId,
@@ -214,12 +314,16 @@ pub trait OrganizationStore: Send + Sync {
 
     /// Removes a member or withdraws an invitation, for `acting`, who must be
     /// an active owner or admin, and an owner to remove an owner (invited or
-    /// active). Never the last active owner. All read and written in one
+    /// active). Never the last active owner. With `only_invited`, an active
+    /// member (an invitation accepted in the meantime) is left alone:
+    /// [`StoreError::InvitationAccepted`]. Removing an active member
+    /// withdraws every invitation they granted. All read and written in one
     /// transaction, like [`OrganizationStore::update_member_role`].
     async fn remove_member(
         &self,
         organization_id: OrganizationId,
         member_id: MemberId,
         acting: MemberId,
+        only_invited: bool,
     ) -> Result<(), StoreError>;
 }

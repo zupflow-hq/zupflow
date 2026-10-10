@@ -21,8 +21,9 @@ Read `README.md` first.
 - **Every change checks a role.** Each mutating Console route calls
   `requireRole` right after resolving access: `DEVELOPERS` (every role but
   `viewer`) or stricter. The exceptions have no member role to check:
-  creating one's own organization, API-key-only routes (approvals) and hosted
-  Connect, which the session's reference authorizes. The shared suite tries
+  creating one's own organization, answering one's own invitation (which the
+  signed-in person's verified email authorizes), API-key-only routes
+  (approvals) and hosted Connect, which the session's reference authorizes. The shared suite tries
   every Console-callable change as a viewer (all refused) and as a developer
   (only the named admin- and owner-only ones refused), and fails if a
   mutating route is missing from its list.

@@ -21,7 +21,10 @@ import {
   type ConnectResult,
   createClient,
   createHttpTransport,
+  EXPIRED_INVITATION_SHOWN_DAYS,
   ID_PREFIXES,
+  INVITATION_LIST_LIMIT,
+  INVITATION_TTL_DAYS,
   type InstallationId,
   type InstallationTool,
   type OrganizationId,
@@ -30,6 +33,7 @@ import {
 } from "@zupflow/sdk";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { signUp } from "./accounts";
 import { db, resetDb } from "./db";
 import { createHandlers, NO_SIGN_IN_HOST, OUTCOME_GRACE_MS, UNREACHABLE_HOST } from "./handlers";
 import { setLatency } from "./http";
@@ -271,6 +275,7 @@ describe("idempotency store", () => {
       role: "owner",
       status: "active",
       invited_at: new Date().toISOString(),
+      invited_by: null,
       joined_at: new Date().toISOString(),
       last_active_at: null,
     });
@@ -829,6 +834,7 @@ describe("two organizations", () => {
       role: "owner",
       status: "active",
       invited_at: new Date().toISOString(),
+      invited_by: null,
       joined_at: new Date().toISOString(),
       last_active_at: null,
     });
@@ -1770,6 +1776,194 @@ describe("two organizations", () => {
     const another = await owner.members.invite(org, { email: "uninvited@northwind.example", role: "owner" });
     await owner.members.remove(org, another.id);
     expect(db().memberships.some((m) => m.id === another.id)).toBe(false);
+  });
+
+  it("expires an invitation exactly INVITATION_TTL_DAYS after it was sent", async () => {
+    const org = must(northwindId());
+    const invited = must(db().memberships.find((m) => m.organization_id === org && m.status === "invited"));
+    const invitee = clientFor(invited.user_id, northwindId);
+    const ttl = INVITATION_TTL_DAYS * 86_400_000;
+    invited.invited_at = new Date(Date.now() - ttl + 60_000).toISOString();
+    expect((await invitee.invitations.list()).find((i) => i.id === invited.id)?.status).toBe("pending");
+    invited.invited_at = new Date(Date.now() - ttl).toISOString();
+    expect((await invitee.invitations.list()).find((i) => i.id === invited.id)?.status).toBe("expired");
+    expect((await owner.members.list(org)).find((m) => m.id === invited.id)?.expires_at).toBe(
+      new Date(Date.parse(invited.invited_at) + ttl).toISOString(),
+    );
+    expect((await failure(invitee.invitations.accept(invited.id))).code).toBe("invitation_expired");
+    expect(must(db().memberships.find((m) => m.id === invited.id)).status).toBe("invited");
+  });
+
+  it("names the inviter on an invitation, and withdraws it once its grantor is unknown", async () => {
+    const fernhill = must(db().organizations.find((o) => o.slug === "fernhill"));
+    const [invitation] = (await owner.invitations.list()).filter((i) => i.organization.id === fernhill.id);
+    expect(invitation?.invited_by).toEqual({ name: "Casey Morgan", email: "casey@fernhill.example" });
+    const row = must(db().memberships.find((m) => m.id === invitation?.id));
+    // A grantor no longer known, or none recorded, grants nothing: the invitation is gone.
+    for (const grantor of [newId("user"), null]) {
+      row.invited_by = grantor;
+      expect((await owner.invitations.list()).some((i) => i.id === row.id)).toBe(false);
+      expect((await failure(owner.invitations.accept(row.id))).status).toBe(404);
+      expect((await failure(owner.invitations.decline(row.id))).status).toBe(404);
+    }
+    // Not even for an owner invitation.
+    row.role = "owner";
+    expect((await failure(owner.invitations.accept(row.id))).status).toBe(404);
+    expect(must(db().memberships.find((m) => m.id === row.id)).status).toBe("invited");
+    // An invitation sent through the API records who sent it.
+    const sent = await owner.members.invite(must(northwindId()), { email: "new@northwind.example", role: "viewer" });
+    expect(must(db().memberships.find((m) => m.id === sent.id)).invited_by).toBe(DEMO_USER_ID);
+  });
+
+  it("withdraws what a member granted beyond what they can still grant", async () => {
+    const org = must(northwindId());
+    // A second owner, so there is one to demote and remove.
+    const second = signUp({ name: "Second Owner", email: "second.owner@northwind.example" });
+    db().memberships.push({
+      id: newId("member"),
+      organization_id: org,
+      user_id: second,
+      role: "owner",
+      status: "active",
+      invited_at: new Date().toISOString(),
+      invited_by: DEMO_USER_ID,
+      joined_at: new Date().toISOString(),
+      last_active_at: null,
+    });
+    const secondRow = must(db().memberships.find((m) => m.organization_id === org && m.user_id === second));
+    const asSecond = clientFor(second, northwindId);
+    const ownerInvite = await asSecond.members.invite(org, { email: "o@northwind.example", role: "owner" });
+    const adminInvite = await asSecond.members.invite(org, { email: "a@northwind.example", role: "admin" });
+    const viewerInvite = await asSecond.members.invite(org, { email: "v@northwind.example", role: "viewer" });
+    const byJordan = await owner.members.invite(org, { email: "j@northwind.example", role: "owner" });
+    const pending = async () => (await owner.members.list(org)).filter((m) => m.status === "invited").map((m) => m.id);
+
+    // Demoted to admin: they can't grant owner any more, everything else stands.
+    await owner.members.update(org, secondRow.id, { role: "admin" });
+    expect(await pending()).not.toContain(ownerInvite.id);
+    expect(await pending()).toEqual(expect.arrayContaining([adminInvite.id, viewerInvite.id, byJordan.id]));
+    // Changing an invitation's role makes whoever changed it its grantor.
+    await owner.members.update(org, viewerInvite.id, { role: "developer" });
+    expect(must(db().memberships.find((m) => m.id === viewerInvite.id)).invited_by).toBe(DEMO_USER_ID);
+    // Removed: what they still granted goes with them; others' invitations stay.
+    await owner.members.remove(org, secondRow.id);
+    expect(await pending()).not.toContain(adminInvite.id);
+    expect(await pending()).toEqual(expect.arrayContaining([viewerInvite.id, byJordan.id]));
+
+    // Demoted to developer, an admin can grant nothing.
+    const admin = must(
+      db().memberships.find((m) => m.organization_id === org && m.role === "admin" && m.status === "active"),
+    );
+    const fromAdmin = await clientFor(admin.user_id, northwindId).members.invite(org, {
+      email: "d@northwind.example",
+      role: "developer",
+    });
+    await owner.members.update(org, admin.id, { role: "developer" });
+    expect(await pending()).not.toContain(fromAdmin.id);
+  });
+
+  it("withdraws only an invitation still pending when asked to cancel one", async () => {
+    const org = must(northwindId());
+    const active = must(
+      db().memberships.find((m) => m.organization_id === org && m.role === "developer" && m.status === "active"),
+    );
+    expect((await failure(owner.members.remove(org, active.id, { status: "invited" }))).code).toBe(
+      "invitation_accepted",
+    );
+    expect(db().memberships.some((m) => m.id === active.id)).toBe(true);
+    expect((await failure(owner.members.remove(org, active.id, { status: "member" as "invited" }))).code).toBe(
+      "validation_failed",
+    );
+    const invited = must(db().memberships.find((m) => m.organization_id === org && m.status === "invited"));
+    await owner.members.remove(org, invited.id, { status: "invited" });
+    expect(db().memberships.some((m) => m.id === invited.id)).toBe(false);
+  });
+
+  it("renews an expired invitation when the address is invited again", async () => {
+    const org = must(northwindId());
+    const invited = must(db().memberships.find((m) => m.organization_id === org && m.status === "invited"));
+    const email = must(db().users.find((u) => u.id === invited.user_id)).email;
+    // Pending: inviting again is refused.
+    expect((await failure(owner.members.invite(org, { email, role: "viewer" }))).code).toBe("already_member");
+    invited.invited_at = new Date(Date.now() - (INVITATION_TTL_DAYS + 1) * 86_400_000).toISOString();
+    invited.invited_by = newId("user");
+    const renewed = await owner.members.invite(org, { email, role: "viewer" });
+    expect(renewed).toMatchObject({ id: invited.id, role: "viewer", status: "invited" });
+    expect(Date.parse(renewed.invited_at)).toBeGreaterThan(Date.now() - 60_000);
+    expect(invited.invited_by).toBe(DEMO_USER_ID);
+    const invitee = clientFor(invited.user_id, northwindId);
+    expect((await invitee.invitations.list()).find((i) => i.id === invited.id)?.status).toBe("pending");
+  });
+
+  it("lists at most INVITATION_LIST_LIMIT invitations, none long expired", async () => {
+    const casey = must(db().users.find((u) => u.email === "casey@fernhill.example"));
+    const day = 86_400_000;
+    const now = Date.now();
+    const invite = (sentAgo: number) => {
+      const template = must(db().organizations.find((o) => o.slug === "fernhill"));
+      const org = { ...structuredClone(template), id: newId("organization"), slug: `org-${db().organizations.length}` };
+      db().organizations.push(org);
+      const sentAt = new Date(now - sentAgo).toISOString();
+      const grantor = { ...structuredClone(must(db().memberships[0])), id: newId("member") };
+      db().memberships.push(
+        { ...grantor, organization_id: org.id, user_id: casey.id, role: "owner", status: "active", invited_by: null },
+        {
+          ...grantor,
+          id: newId("member"),
+          organization_id: org.id,
+          user_id: DEMO_USER_ID,
+          role: "developer",
+          status: "invited",
+          invited_at: sentAt,
+          invited_by: casey.id,
+          joined_at: null,
+        },
+      );
+      return must(db().memberships.at(-1)).id;
+    };
+    const shownFor = (INVITATION_TTL_DAYS + EXPIRED_INVITATION_SHOWN_DAYS) * day;
+    const stillShown = invite(shownFor - 60_000);
+    const longGone = invite(shownFor + 60_000);
+    let listed = (await owner.invitations.list()).map((i) => i.id);
+    expect(listed).toContain(stillShown);
+    expect(listed).not.toContain(longGone);
+    const newest = Array.from({ length: INVITATION_LIST_LIMIT }, (_, i) => invite(i * 1000));
+    listed = (await owner.invitations.list()).map((i) => i.id);
+    expect(listed).toEqual(newest);
+  });
+
+  it("joins once when two accepts race, and audits the answer", async () => {
+    const fernhill = must(db().organizations.find((o) => o.slug === "fernhill"));
+    const invitation = must((await owner.invitations.list()).find((i) => i.organization.id === fernhill.id));
+    const outcomes = await Promise.allSettled([
+      owner.invitations.accept(invitation.id, { idempotencyKey: "race-1" }),
+      owner.invitations.accept(invitation.id, { idempotencyKey: "race-2" }),
+    ]);
+    expect(outcomes.filter((o) => o.status === "fulfilled")).toHaveLength(1);
+    const refused = outcomes.find((o) => o.status === "rejected");
+    expect((refused as PromiseRejectedResult | undefined)?.reason).toMatchObject({ code: "invitation_accepted" });
+    expect(
+      db().memberships.filter((m) => m.organization_id === fernhill.id && m.user_id === DEMO_USER_ID),
+    ).toMatchObject([{ status: "active", role: "developer" }]);
+    expect((await owner.me.get()).organizations.map((o) => o.slug)).toContain("fernhill");
+    expect(db().audit.find((e) => e.organization_id === fernhill.id)).toMatchObject({
+      action: "member.joined",
+      actor: { id: DEMO_USER_ID },
+    });
+  });
+
+  it("joins nobody by signing up with an invited address", async () => {
+    const pending = db().memberships.filter((m) => m.status === "invited");
+    const invitee = must(db().users.find((u) => u.id === pending[0]?.user_id));
+    // The same person, whatever the address's case: their invitations wait for them.
+    expect(signUp({ name: "Someone", email: invitee.email.toUpperCase() })).toBe(invitee.id);
+    expect(db().memberships.filter((m) => m.status === "invited")).toEqual(pending);
+    const client = clientFor(invitee.id);
+    expect((await client.me.get()).organizations).toEqual([]);
+    expect((await client.invitations.list()).length).toBeGreaterThan(0);
+    // A new address is a new person, with no invitations.
+    const fresh = signUp({ name: "New Person", email: "new.person@example.com" });
+    expect(await clientFor(fresh).invitations.list()).toEqual([]);
   });
 
   it("plans a run only with apps of the run's own organization", async () => {

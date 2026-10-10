@@ -22,6 +22,7 @@ import {
   type GrantId,
   type InstallationId,
   type InviteMemberInput,
+  type Member,
   type MemberId,
   type MemberRole,
   type OrganizationId,
@@ -79,6 +80,37 @@ export function useCreateOrganization() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Invitations: the signed-in person's own
+
+export function useInvitations() {
+  return useQuery({ queryKey: qk.invitations, queryFn: () => api.invitations.list(), staleTime: 30_000 });
+}
+
+/**
+ * Joins the invitation's organization. Each click sends its own idempotency
+ * key, so a retried request joins once. Settles once the viewer and the
+ * invitations are fresh, whatever the answer, so the caller can go straight
+ * into the organization: after joining, or after finding it already joined.
+ */
+export function useAcceptInvitation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ invitationId, idempotencyKey }: { invitationId: MemberId; idempotencyKey: string }) =>
+      api.invitations.accept(invitationId, { idempotencyKey }),
+    onSettled: () =>
+      Promise.all([qc.invalidateQueries({ queryKey: qk.viewer }), qc.invalidateQueries({ queryKey: qk.invitations })]),
+  });
+}
+
+export function useDeclineInvitation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (invitationId: MemberId) => api.invitations.decline(invitationId),
+    onSettled: () => qc.invalidateQueries({ queryKey: qk.invitations }),
+  });
+}
+
 export function useUpdateOrganization(orgId: OrganizationId) {
   const qc = useQueryClient();
   return useMutation({
@@ -121,8 +153,10 @@ export function useUpdateMember(orgId: OrganizationId) {
 export function useRemoveMember(orgId: OrganizationId) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (memberId: MemberId) => api.members.remove(orgId, memberId),
-    onSuccess: () => qc.invalidateQueries({ queryKey: qk.members(orgId) }),
+    /** An invitation is cancelled as one only: never a member who accepted it meanwhile (`409 invitation_accepted`). */
+    mutationFn: (member: Pick<Member, "id" | "status">) =>
+      api.members.remove(orgId, member.id, member.status === "invited" ? { status: "invited" } : {}),
+    onSettled: () => qc.invalidateQueries({ queryKey: qk.members(orgId) }),
   });
 }
 

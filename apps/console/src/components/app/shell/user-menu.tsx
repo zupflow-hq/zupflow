@@ -1,5 +1,14 @@
 import { useNavigate } from "@tanstack/react-router";
-import { ChevronsUpDownIcon, DatabaseZapIcon, LogOutIcon, MonitorIcon, MoonIcon, SunIcon } from "lucide-react";
+import {
+  ChevronsUpDownIcon,
+  DatabaseZapIcon,
+  LogOutIcon,
+  MailIcon,
+  MonitorIcon,
+  MoonIcon,
+  SunIcon,
+} from "lucide-react";
+import { useState } from "react";
 import { toast } from "sonner";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
@@ -12,9 +21,10 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { SidebarMenu, SidebarMenuButton, SidebarMenuItem } from "@/components/ui/sidebar";
+import { SidebarMenu, SidebarMenuButton, SidebarMenuItem, useSidebar } from "@/components/ui/sidebar";
 import { session } from "@/features/auth/session";
 import { useViewerUser } from "@/features/context";
+import { InvitationsDialog, usePendingInvitations } from "@/features/invitations/invitation-list";
 import { type ThemePreference, useTheme } from "@/lib/theme";
 
 export function initials(name: string) {
@@ -33,9 +43,17 @@ export function UserMenu() {
   const { preference, setPreference } = useTheme();
   const navigate = useNavigate();
   const controls = session.controls();
+  const pending = usePendingInvitations().length;
+  const [invitationsOpen, setInvitationsOpen] = useState(false);
+  const { setOpenMobile } = useSidebar();
 
   return (
     <SidebarMenu>
+      <InvitationsDialog
+        open={invitationsOpen}
+        onOpenChange={setInvitationsOpen}
+        onJoined={() => setOpenMobile(false)}
+      />
       <SidebarMenuItem>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -49,10 +67,23 @@ export function UserMenu() {
                 <span className="truncate font-medium">{user.name}</span>
                 <span className="truncate text-xs text-muted-foreground">{user.email}</span>
               </span>
+              {pending > 0 ? (
+                <span className="size-2 shrink-0 rounded-full bg-brand" role="img" aria-label="Pending invitations" />
+              ) : null}
               <ChevronsUpDownIcon className="ml-auto size-4 text-muted-foreground" />
             </SidebarMenuButton>
           </DropdownMenuTrigger>
           <DropdownMenuContent className="w-60" side="top" align="start" sideOffset={6}>
+            <DropdownMenuItem onSelect={() => setInvitationsOpen(true)}>
+              <MailIcon />
+              Invitations
+              {pending > 0 ? (
+                <span className="ml-auto rounded-full bg-brand-soft px-1.5 font-mono text-[11px] text-brand-ink">
+                  {pending}
+                </span>
+              ) : null}
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
             <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">Theme</DropdownMenuLabel>
             <DropdownMenuRadioGroup value={preference} onValueChange={(v) => setPreference(v as ThemePreference)}>
               <DropdownMenuRadioItem value="light">

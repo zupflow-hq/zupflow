@@ -1,8 +1,10 @@
 //! [`SqliteOrganizationStore`]: organizations, members and users.
 //!
 //! Every statement on `members` repeats `organization_id`, even beside a
-//! unique member ID. The user-keyed reads (`user_for_identity`, a user's own
-//! memberships) read global tables or the user's own rows only. Changes that
+//! unique member ID. The user-keyed reads and changes (`user_for_identity`, a
+//! user's own memberships and invitations) read global tables or the user's
+//! own rows only: they find a row by the user and its ID, and every statement
+//! after that repeats the organization it belongs to as well. Changes that
 //! check before they write (the last-owner rule) run in an immediate
 //! transaction, which takes SQLite's write lock first, so two changes can't
 //! both pass the check.
@@ -13,7 +15,8 @@ use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 use zupflow_core::identity::VerifiedIdentity;
 use zupflow_core::ids::{MemberId, OrganizationId, UserId};
 use zupflow_core::organizations::{
-    Member, MemberRole, MemberStatus, Organization, OrganizationSetup, OrganizationStore, StoreError, User,
+    EXPIRED_INVITATION_SHOWN_MS, INVITATION_LIST_LIMIT, INVITATION_TTL_MS, Invitation, Inviter, Member, MemberRole,
+    MemberStatus, Organization, OrganizationSetup, OrganizationStore, StoreError, User, invitation_expires_at,
 };
 use zupflow_core::time::Timestamp;
 
@@ -28,6 +31,17 @@ macro_rules! member_columns {
         "m.id AS member_id, m.organization_id AS member_organization_id, m.role, m.status, \
      m.invited_at, m.joined_at, m.last_active_at, \
      u.id AS user_id, u.name AS user_name, u.email AS user_email, u.avatar_url AS user_avatar_url"
+    };
+}
+
+/// Whether the invitation `m` still stands: its grantor is an active member
+/// of its organization who can grant its role (`MemberRole::can_grant`). A
+/// null grantor matches no member, so it grants nothing.
+macro_rules! granted {
+    () => {
+        "EXISTS (SELECT 1 FROM members g WHERE g.organization_id = m.organization_id \
+         AND g.user_id = m.invited_by_user_id AND g.status = 'active' \
+         AND (g.role = 'owner' OR (g.role = 'admin' AND m.role <> 'owner')))"
     };
 }
 
@@ -46,6 +60,23 @@ pub struct SqliteOrganizationStore {
 impl SqliteOrganizationStore {
     pub fn new(database: Database) -> Self {
         Self { database }
+    }
+
+    /// Reads the invitation without the write lock first, so an ID that isn't
+    /// the caller's to answer never contends for it. Only a hint: the answer
+    /// is decided by the same read inside the transaction.
+    async fn answerable(
+        &self,
+        user_id: UserId,
+        invitation_id: MemberId,
+        now: Timestamp,
+        expiring: bool,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.database.pool().acquire().await.map_err(failed("acquire"))?;
+        let invitation = own_invitation(&mut connection, user_id, invitation_id)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        invitation.refusal(now, expiring).map_or(Ok(()), Err)
     }
 
     async fn immediate(&self) -> Result<Transaction<'static, Sqlite>, StoreError> {
@@ -93,13 +124,16 @@ fn member_from(row: &SqliteRow) -> Result<Member, StoreError> {
             .map_err(read)?
             .map(Timestamp::from_millis))
     };
+    let status = MemberStatus::parse(&status).ok_or(StoreError::Unavailable)?;
+    let invited_at = Timestamp::from_millis(row.try_get("invited_at").map_err(read)?);
     Ok(Member {
         id: MemberId::from_uuid(row.try_get("member_id").map_err(read)?),
         organization_id: OrganizationId::from_uuid(row.try_get("member_organization_id").map_err(read)?),
         user: user_from(row)?,
         role: MemberRole::parse(&role).ok_or(StoreError::Unavailable)?,
-        status: MemberStatus::parse(&status).ok_or(StoreError::Unavailable)?,
-        invited_at: Timestamp::from_millis(row.try_get("invited_at").map_err(read)?),
+        status,
+        invited_at,
+        expires_at: (status == MemberStatus::Invited).then(|| invitation_expires_at(invited_at)),
         joined_at: optional("joined_at")?,
         last_active_at: optional("last_active_at")?,
     })
@@ -136,17 +170,112 @@ async fn member_in(
     .transpose()
 }
 
-/// The acting member's role as of this transaction: [`StoreError::NotAllowed`]
-/// if they're no longer an active member of the organization.
-async fn acting_role(
+fn invitation_from(row: &SqliteRow) -> Result<Invitation, StoreError> {
+    let role: String = row.try_get("role").map_err(read)?;
+    let invited_at = Timestamp::from_millis(row.try_get("invited_at").map_err(read)?);
+    Ok(Invitation {
+        id: MemberId::from_uuid(row.try_get("member_id").map_err(read)?),
+        organization: organization_from(row)?,
+        role: MemberRole::parse(&role).ok_or(StoreError::Unavailable)?,
+        invited_by: Inviter {
+            name: row.try_get("inviter_name").map_err(read)?,
+            email: row.try_get("inviter_email").map_err(read)?,
+        },
+        invited_at,
+        expires_at: invitation_expires_at(invited_at),
+    })
+}
+
+/// The user's own membership or invitation with this ID: its organization,
+/// status, when it was sent and whether its grantor still grants it. Keyed by
+/// the user, the trust context: anyone else's is `None`, like a missing one.
+struct OwnInvitation {
+    organization_id: OrganizationId,
+    status: MemberStatus,
+    invited_at: Timestamp,
+    granted: bool,
+}
+
+impl OwnInvitation {
+    /// What answering it would meet as of `now`: accepted already, withdrawn
+    /// (its grantor can't grant it), or, when `expiring`, expired.
+    fn refusal(&self, now: Timestamp, expiring: bool) -> Option<StoreError> {
+        if self.status == MemberStatus::Active {
+            Some(StoreError::InvitationAccepted)
+        } else if !self.granted {
+            Some(StoreError::NotFound)
+        } else if expiring && invitation_expires_at(self.invited_at) <= now {
+            Some(StoreError::InvitationExpired)
+        } else {
+            None
+        }
+    }
+}
+
+async fn own_invitation(
+    connection: &mut SqliteConnection,
+    user_id: UserId,
+    invitation_id: MemberId,
+) -> Result<Option<OwnInvitation>, StoreError> {
+    let Some(row) = sqlx::query(concat!(
+        "SELECT m.organization_id, m.status, m.invited_at, ",
+        granted!(),
+        " AS granted FROM members m WHERE m.user_id = ? AND m.id = ?"
+    ))
+    .bind(user_id.uuid())
+    .bind(invitation_id.uuid())
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(failed("find_invitation"))?
+    else {
+        return Ok(None);
+    };
+    let status: String = row.try_get("status").map_err(read)?;
+    Ok(Some(OwnInvitation {
+        organization_id: OrganizationId::from_uuid(row.try_get("organization_id").map_err(read)?),
+        status: MemberStatus::parse(&status).ok_or(StoreError::Unavailable)?,
+        invited_at: Timestamp::from_millis(row.try_get("invited_at").map_err(read)?),
+        granted: row.try_get("granted").map_err(read)?,
+    }))
+}
+
+/// The acting member as of this transaction: [`StoreError::NotAllowed`] if
+/// they're no longer an active member of the organization.
+async fn acting_member(
     connection: &mut SqliteConnection,
     organization_id: OrganizationId,
     acting: MemberId,
-) -> Result<MemberRole, StoreError> {
+) -> Result<Member, StoreError> {
     match member_in(connection, organization_id, acting).await? {
-        Some(member) if member.status == MemberStatus::Active => Ok(member.role),
+        Some(member) if member.status == MemberStatus::Active => Ok(member),
         _ => Err(StoreError::NotAllowed),
     }
+}
+
+/// Withdraws the pending invitations `grantor` granted in the organization
+/// that `role` can't grant: every one of them once they're removed (`None`).
+async fn withdraw_ungrantable(
+    connection: &mut SqliteConnection,
+    organization_id: OrganizationId,
+    grantor: UserId,
+    role: Option<MemberRole>,
+) -> Result<(), StoreError> {
+    for granted in MemberRole::ALL {
+        if role.is_some_and(|role| role.can_grant(granted)) {
+            continue;
+        }
+        sqlx::query(
+            "DELETE FROM members WHERE organization_id = ? AND invited_by_user_id = ? \
+             AND status = 'invited' AND role = ?",
+        )
+        .bind(organization_id.uuid())
+        .bind(grantor.uuid())
+        .bind(granted.as_str())
+        .execute(&mut *connection)
+        .await
+        .map_err(failed("withdraw_invitations"))?;
+    }
+    Ok(())
 }
 
 /// Whether taking `member` out of the owners would leave its organization
@@ -518,35 +647,181 @@ impl OrganizationStore for SqliteOrganizationStore {
         organization_id: OrganizationId,
         email: &str,
         role: MemberRole,
+        acting: MemberId,
     ) -> Result<Member, StoreError> {
         let email = email.to_lowercase();
         let mut transaction = self.immediate().await?;
+        let grantor = acting_member(&mut transaction, organization_id, acting).await?;
+        if !grantor.role.can_grant(role) {
+            return Err(StoreError::NotAllowed);
+        }
         let (user, _) =
             user_with_email(&mut transaction, &email, &bounded(&name_from_email(&email), 200), None).await?;
-        let member_id = MemberId::generate();
-        sqlx::query(
-            "INSERT INTO members (id, organization_id, user_id, role, status, invited_at) \
-             VALUES (?, ?, ?, ?, 'invited', ?)",
-        )
-        .bind(member_id.uuid())
-        .bind(organization_id.uuid())
-        .bind(user.id.uuid())
-        .bind(role.as_str())
-        .bind(Timestamp::now().millis())
-        .execute(&mut *transaction)
-        .await
-        .map_err(|error| {
-            if is_unique_violation(&error) {
-                StoreError::AlreadyMember
-            } else {
-                failed("insert_member")(error)
+        let now = Timestamp::now();
+        let existing =
+            sqlx::query("SELECT id, status, invited_at FROM members WHERE organization_id = ? AND user_id = ?")
+                .bind(organization_id.uuid())
+                .bind(user.id.uuid())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(failed("find_membership"))?;
+        let member_id = match existing {
+            None => {
+                let member_id = MemberId::generate();
+                sqlx::query(
+                    "INSERT INTO members (id, organization_id, user_id, role, status, invited_at, invited_by_user_id) \
+                     VALUES (?, ?, ?, ?, 'invited', ?, ?)",
+                )
+                .bind(member_id.uuid())
+                .bind(organization_id.uuid())
+                .bind(user.id.uuid())
+                .bind(role.as_str())
+                .bind(now.millis())
+                .bind(grantor.user.id.uuid())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    if is_unique_violation(&error) {
+                        StoreError::AlreadyMember
+                    } else {
+                        failed("insert_member")(error)
+                    }
+                })?;
+                member_id
             }
-        })?;
+            Some(row) => {
+                let status: String = row.try_get("status").map_err(read)?;
+                let invited_at = Timestamp::from_millis(row.try_get("invited_at").map_err(read)?);
+                if MemberStatus::parse(&status) != Some(MemberStatus::Invited)
+                    || invitation_expires_at(invited_at) > now
+                {
+                    return Err(StoreError::AlreadyMember);
+                }
+                // Expired: sent again, as new, with this role and grantor.
+                let member_id = MemberId::from_uuid(row.try_get("id").map_err(read)?);
+                sqlx::query(
+                    "UPDATE members SET role = ?, invited_at = ?, invited_by_user_id = ? \
+                     WHERE organization_id = ? AND id = ? AND status = 'invited'",
+                )
+                .bind(role.as_str())
+                .bind(now.millis())
+                .bind(grantor.user.id.uuid())
+                .bind(organization_id.uuid())
+                .bind(member_id.uuid())
+                .execute(&mut *transaction)
+                .await
+                .map_err(failed("renew_invitation"))?;
+                member_id
+            }
+        };
         let member = member_in(&mut transaction, organization_id, member_id)
             .await?
             .ok_or(StoreError::Unavailable)?;
         transaction.commit().await.map_err(failed("commit"))?;
         Ok(member)
+    }
+
+    async fn list_invitations_of_user(&self, user_id: UserId, now: Timestamp) -> Result<Vec<Invitation>, StoreError> {
+        // Sent after this, it expired at most EXPIRED_INVITATION_SHOWN_MS ago.
+        let sent_after = now
+            .millis()
+            .saturating_sub(INVITATION_TTL_MS)
+            .saturating_sub(EXPIRED_INVITATION_SHOWN_MS);
+        sqlx::query(concat!(
+            "SELECT ",
+            organization_columns!(),
+            ", m.id AS member_id, m.role, m.invited_at, i.name AS inviter_name, i.email AS inviter_email \
+             FROM members m JOIN organizations o ON o.id = m.organization_id \
+             JOIN users i ON i.id = m.invited_by_user_id \
+             WHERE m.user_id = ? AND m.status = 'invited' AND m.invited_at > ? AND ",
+            granted!(),
+            " ORDER BY m.invited_at DESC, m.id DESC LIMIT ?"
+        ))
+        .bind(user_id.uuid())
+        .bind(sent_after)
+        .bind(INVITATION_LIST_LIMIT)
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(failed("list_invitations"))?
+        .iter()
+        .map(invitation_from)
+        .collect()
+    }
+
+    async fn accept_invitation_of_user(
+        &self,
+        user_id: UserId,
+        invitation_id: MemberId,
+        now: Timestamp,
+    ) -> Result<(Organization, Member), StoreError> {
+        self.answerable(user_id, invitation_id, now, true).await?;
+        let mut transaction = self.immediate().await?;
+        let invitation = own_invitation(&mut transaction, user_id, invitation_id)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        if let Some(refusal) = invitation.refusal(now, true) {
+            return Err(refusal);
+        }
+        let organization_id = invitation.organization_id;
+        // The role stays the invitation's own as of now: an owner may have changed it since it was sent.
+        let accepted = sqlx::query(
+            "UPDATE members SET status = 'active', joined_at = ?, last_active_at = ? \
+             WHERE organization_id = ? AND id = ? AND user_id = ? AND status = 'invited'",
+        )
+        .bind(now.millis())
+        .bind(now.millis())
+        .bind(organization_id.uuid())
+        .bind(invitation_id.uuid())
+        .bind(user_id.uuid())
+        .execute(&mut *transaction)
+        .await
+        .map_err(failed("accept_invitation"))?;
+        if accepted.rows_affected() != 1 {
+            // The transaction holds the write lock since the read above, so this can't happen.
+            tracing::error!(event = "organizations.invitation_changed_mid_transaction");
+            return Err(StoreError::Unavailable);
+        }
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            organization_columns!(),
+            ", ",
+            member_columns!(),
+            " FROM members m \
+             JOIN organizations o ON o.id = m.organization_id JOIN users u ON u.id = m.user_id \
+             WHERE m.organization_id = ? AND o.id = ? AND m.id = ? AND m.user_id = ?"
+        ))
+        .bind(organization_id.uuid())
+        .bind(organization_id.uuid())
+        .bind(invitation_id.uuid())
+        .bind(user_id.uuid())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(failed("read_membership"))?;
+        let joined = (organization_from(&row)?, member_from(&row)?);
+        transaction.commit().await.map_err(failed("commit"))?;
+        Ok(joined)
+    }
+
+    async fn decline_invitation_of_user(&self, user_id: UserId, invitation_id: MemberId) -> Result<(), StoreError> {
+        let now = Timestamp::now();
+        self.answerable(user_id, invitation_id, now, false).await?;
+        let mut transaction = self.immediate().await?;
+        let invitation = own_invitation(&mut transaction, user_id, invitation_id)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        if let Some(refusal) = invitation.refusal(now, false) {
+            return Err(refusal);
+        }
+        let organization_id = invitation.organization_id;
+        sqlx::query("DELETE FROM members WHERE organization_id = ? AND id = ? AND user_id = ? AND status = 'invited'")
+            .bind(organization_id.uuid())
+            .bind(invitation_id.uuid())
+            .bind(user_id.uuid())
+            .execute(&mut *transaction)
+            .await
+            .map_err(failed("decline_invitation"))?;
+        transaction.commit().await.map_err(failed("commit"))?;
+        Ok(())
     }
 
     async fn find_member(
@@ -566,7 +841,8 @@ impl OrganizationStore for SqliteOrganizationStore {
         acting: MemberId,
     ) -> Result<Member, StoreError> {
         let mut transaction = self.immediate().await?;
-        if acting_role(&mut transaction, organization_id, acting).await? != MemberRole::Owner {
+        let acting = acting_member(&mut transaction, organization_id, acting).await?;
+        if acting.role != MemberRole::Owner {
             return Err(StoreError::NotAllowed);
         }
         let member = member_in(&mut transaction, organization_id, member_id)
@@ -575,13 +851,30 @@ impl OrganizationStore for SqliteOrganizationStore {
         if role != MemberRole::Owner && is_last_owner(&mut transaction, organization_id, &member).await? {
             return Err(StoreError::LastOwner);
         }
-        sqlx::query("UPDATE members SET role = ? WHERE organization_id = ? AND id = ?")
+        if member.status == MemberStatus::Invited {
+            // Whoever changes an invitation's role grants it now.
+            sqlx::query(
+                "UPDATE members SET role = ?, invited_by_user_id = ? WHERE organization_id = ? AND id = ? \
+                 AND status = 'invited'",
+            )
             .bind(role.as_str())
+            .bind(acting.user.id.uuid())
             .bind(organization_id.uuid())
             .bind(member_id.uuid())
             .execute(&mut *transaction)
             .await
             .map_err(failed("update_role"))?;
+        } else {
+            sqlx::query("UPDATE members SET role = ? WHERE organization_id = ? AND id = ?")
+                .bind(role.as_str())
+                .bind(organization_id.uuid())
+                .bind(member_id.uuid())
+                .execute(&mut *transaction)
+                .await
+                .map_err(failed("update_role"))?;
+            // A demotion withdraws what they can't grant any more.
+            withdraw_ungrantable(&mut transaction, organization_id, member.user.id, Some(role)).await?;
+        }
         let member = member_in(&mut transaction, organization_id, member_id)
             .await?
             .ok_or(StoreError::Unavailable)?;
@@ -594,15 +887,19 @@ impl OrganizationStore for SqliteOrganizationStore {
         organization_id: OrganizationId,
         member_id: MemberId,
         acting: MemberId,
+        only_invited: bool,
     ) -> Result<(), StoreError> {
         let mut transaction = self.immediate().await?;
-        let acting_role = acting_role(&mut transaction, organization_id, acting).await?;
+        let acting_role = acting_member(&mut transaction, organization_id, acting).await?.role;
         if !acting_role.is_admin() {
             return Err(StoreError::NotAllowed);
         }
         let member = member_in(&mut transaction, organization_id, member_id)
             .await?
             .ok_or(StoreError::NotFound)?;
+        if only_invited && member.status != MemberStatus::Invited {
+            return Err(StoreError::InvitationAccepted);
+        }
         if member.role == MemberRole::Owner && acting_role != MemberRole::Owner {
             return Err(StoreError::NotAllowed);
         }
@@ -615,6 +912,10 @@ impl OrganizationStore for SqliteOrganizationStore {
             .execute(&mut *transaction)
             .await
             .map_err(failed("remove_member"))?;
+        if member.status == MemberStatus::Active {
+            // What they granted goes with them.
+            withdraw_ungrantable(&mut transaction, organization_id, member.user.id, None).await?;
+        }
         transaction.commit().await.map_err(failed("commit"))?;
         Ok(())
     }
@@ -742,18 +1043,16 @@ mod tests {
             .create_organization(OrganizationId::generate(), "Two owners", "two-owners", alice.id)
             .await
             .unwrap();
-        // Make bob an active owner directly: invitations have no acceptance yet.
-        let bob_member = MemberId::generate();
-        sqlx::query(
-            "INSERT INTO members (id, organization_id, user_id, role, status, invited_at, joined_at) \
-             VALUES (?, ?, ?, 'owner', 'active', 0, 0)",
-        )
-        .bind(bob_member.uuid())
-        .bind(org.id.uuid())
-        .bind(bob.id.uuid())
-        .execute(database.pool())
-        .await
-        .unwrap();
+        // Bob is invited as an owner and accepts.
+        let invitation = store
+            .invite_member(org.id, &bob.email, MemberRole::Owner, alice_member.id)
+            .await
+            .unwrap();
+        let (_, bob_member) = store
+            .accept_invitation_of_user(bob.id, invitation.id, Timestamp::now())
+            .await
+            .unwrap();
+        let bob_member = bob_member.id;
 
         let a = alice_member.id;
         let owners = || async {
@@ -800,5 +1099,128 @@ mod tests {
             assert_eq!(owners().await, 1);
             restore().await;
         }
+    }
+
+    /// An invitation with no grantor recorded (sent before grantors were, or
+    /// its grantor's user is gone) grants nothing: it isn't listed, and
+    /// answering it meets the same `NotFound` as a withdrawn one, whatever
+    /// its role.
+    #[tokio::test]
+    async fn treats_an_invitation_without_a_grantor_as_withdrawn() {
+        let Temporary {
+            database,
+            directory: _directory,
+        } = temporary().await;
+        let store = SqliteOrganizationStore::new(database.clone());
+        let alice = store.user_for_identity(&person("alice")).await.unwrap();
+        let bob = store.user_for_identity(&person("bob")).await.unwrap();
+        let (org, alice_member) = store
+            .create_organization(OrganizationId::generate(), "A", "org-a", alice.id)
+            .await
+            .unwrap();
+        for role in [MemberRole::Owner, MemberRole::Viewer] {
+            let invitation = store
+                .invite_member(org.id, &bob.email, role, alice_member.id)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE members SET invited_by_user_id = NULL WHERE organization_id = ? AND id = ?")
+                .bind(org.id.uuid())
+                .bind(invitation.id.uuid())
+                .execute(database.pool())
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .list_invitations_of_user(bob.id, Timestamp::now())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                store
+                    .accept_invitation_of_user(bob.id, invitation.id, Timestamp::now())
+                    .await,
+                Err(StoreError::NotFound)
+            );
+            assert_eq!(
+                store.decline_invitation_of_user(bob.id, invitation.id).await,
+                Err(StoreError::NotFound)
+            );
+            assert_eq!(store.find_active_membership(org.id, bob.id).await.unwrap(), None);
+            // An admin still withdraws it.
+            store
+                .remove_member(org.id, invitation.id, alice_member.id, true)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Inviting an address whose invitation expired sends it again, as new:
+    /// this role, this grantor, from now. A pending one isn't sent twice.
+    #[tokio::test]
+    async fn renews_an_expired_invitation() {
+        let Temporary {
+            database,
+            directory: _directory,
+        } = temporary().await;
+        let store = SqliteOrganizationStore::new(database.clone());
+        let alice = store.user_for_identity(&person("alice")).await.unwrap();
+        let bob = store.user_for_identity(&person("bob")).await.unwrap();
+        let carol = store.user_for_identity(&person("carol")).await.unwrap();
+        let (org, alice_member) = store
+            .create_organization(OrganizationId::generate(), "A", "org-a", alice.id)
+            .await
+            .unwrap();
+        let invitation = store
+            .invite_member(org.id, &carol.email, MemberRole::Viewer, alice_member.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .invite_member(org.id, &carol.email, MemberRole::Admin, alice_member.id)
+                .await,
+            Err(StoreError::AlreadyMember)
+        );
+        let invitation_b = store
+            .invite_member(org.id, &bob.email, MemberRole::Admin, alice_member.id)
+            .await
+            .unwrap();
+        let (_, bob_member) = store
+            .accept_invitation_of_user(bob.id, invitation_b.id, Timestamp::now())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE members SET invited_at = 0 WHERE organization_id = ? AND id = ?")
+            .bind(org.id.uuid())
+            .bind(invitation.id.uuid())
+            .execute(database.pool())
+            .await
+            .unwrap();
+        let before = Timestamp::now();
+        let renewed = store
+            .invite_member(org.id, &carol.email, MemberRole::Developer, bob_member.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            (renewed.id, renewed.role, renewed.status),
+            (invitation.id, MemberRole::Developer, MemberStatus::Invited)
+        );
+        assert!(renewed.invited_at >= before);
+        let listed = store
+            .list_invitations_of_user(carol.id, Timestamp::now())
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].invited_by.email, bob.email, "bob granted it now");
+        store
+            .accept_invitation_of_user(carol.id, invitation.id, Timestamp::now())
+            .await
+            .unwrap();
+        // A member isn't renewed into an invitation.
+        assert_eq!(
+            store
+                .invite_member(org.id, &carol.email, MemberRole::Viewer, alice_member.id)
+                .await,
+            Err(StoreError::AlreadyMember)
+        );
     }
 }

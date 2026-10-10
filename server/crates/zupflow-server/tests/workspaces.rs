@@ -165,29 +165,22 @@ impl Server {
         body["data"].clone()
     }
 
-    /// Makes `user` an active member of `org` with `role`, straight in the
-    /// database: the API has no invitation acceptance yet.
+    /// Makes `user` an active member of `org` with `role`: invited by `owner`,
+    /// and accepted.
     async fn member(&self, owner: &str, org: &str, user: &str, role: &str) {
         self.send(call(user, Method::GET, "/v1/me")).await;
-        let (status, _) = self
+        let (status, invitation) = self
             .send(
                 call(owner, Method::POST, format!("/v1/organizations/{org}/members"))
                     .body(json!({ "email": format!("{user}@people.example"), "role": role })),
             )
             .await;
         assert_eq!(status, StatusCode::CREATED);
-        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", self.directory.join("zupflow.sqlite").display()))
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE members SET status = 'active', joined_at = 0 \
-             WHERE user_id = (SELECT id FROM users WHERE email = ?)",
-        )
-        .bind(format!("{user}@people.example"))
-        .execute(&pool)
-        .await
-        .unwrap();
-        pool.close().await;
+        let id = invitation["data"]["id"].as_str().unwrap();
+        let (status, joined) = self
+            .send(call(user, Method::POST, format!("/v1/me/invitations/{id}/accept")))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{joined}");
     }
 }
 
