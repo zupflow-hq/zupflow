@@ -19,6 +19,12 @@ enum Scoping {
     /// Starts `id UUID NOT NULL PRIMARY KEY, organization_id UUID NOT NULL, workspace_id UUID NOT NULL`.
     #[allow(dead_code)]
     Workspace,
+    /// Organization-scoped history (decision: keep history): starts like
+    /// `Organization`, and its `workspace_id` names a workspace without
+    /// referencing it, so a row outlives the workspace it happened in. The
+    /// one exception to "a workspace column references workspaces"; the
+    /// organization still always applies, and its rows go with it.
+    History,
     /// Not tenant data, declared by name: users, who belong to many
     /// organizations, the identities they sign in with, and the installation's
     /// own settings. Holds no
@@ -61,6 +67,8 @@ const TABLES: &[(&str, Scoping)] = &[
     ("webhook_endpoints", Scoping::Organization),
     ("webhook_events", Scoping::Organization),
     ("webhook_deliveries", Scoping::Organization),
+    // A deleted workspace's events stay in the log.
+    ("audit_events", Scoping::History),
 ];
 
 struct Column {
@@ -74,6 +82,7 @@ struct Column {
 struct ForeignKey {
     parent: String,
     columns: Vec<(String, String)>,
+    on_delete: String,
 }
 
 /// A database in a directory of its own, removed with everything in it
@@ -136,11 +145,13 @@ async fn columns(database: &Database, table: &str) -> Vec<Column> {
 }
 
 async fn foreign_keys(database: &Database, table: &str) -> Vec<ForeignKey> {
-    let rows = sqlx::query("SELECT id, \"table\", \"from\", \"to\" FROM pragma_foreign_key_list(?) ORDER BY id, seq")
-        .bind(table)
-        .fetch_all(database.pool())
-        .await
-        .unwrap();
+    let rows = sqlx::query(
+        "SELECT id, \"table\", \"from\", \"to\", on_delete FROM pragma_foreign_key_list(?) ORDER BY id, seq",
+    )
+    .bind(table)
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
     let mut keys: Vec<(i64, ForeignKey)> = Vec::new();
     for row in rows {
         let id: i64 = row.get("id");
@@ -152,6 +163,7 @@ async fn foreign_keys(database: &Database, table: &str) -> Vec<ForeignKey> {
                 ForeignKey {
                     parent: row.get("table"),
                     columns: vec![pair],
+                    on_delete: row.get("on_delete"),
                 },
             )),
         }
@@ -206,6 +218,17 @@ async fn holds_every_table_to_the_isolation_rules() {
         .filter(|(_, scoping)| matches!(scoping, Scoping::Global))
         .map(|(name, _)| *name)
         .collect();
+    // Keeping history is a decision, not a convenience: one table does.
+    let history: HashSet<&str> = TABLES
+        .iter()
+        .filter(|(_, scoping)| matches!(scoping, Scoping::History))
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(
+        history,
+        HashSet::from(["audit_events"]),
+        "only the audit log keeps history"
+    );
     let workspace_scoped: HashSet<&str> = TABLES
         .iter()
         .filter(|(_, scoping)| matches!(scoping, Scoping::Workspace))
@@ -233,7 +256,7 @@ async fn holds_every_table_to_the_isolation_rules() {
                     );
                 }
             }
-            Scoping::Organization => {
+            Scoping::Organization | Scoping::History => {
                 starts_with(table, &columns, &["id", "organization_id"]);
                 assert!(
                     has_key(&keys, "organizations", &[("organization_id", "id")]),
@@ -243,9 +266,27 @@ async fn holds_every_table_to_the_isolation_rules() {
             Scoping::Workspace => starts_with(table, &columns, &["id", "organization_id", "workspace_id"]),
         }
 
-        // A workspace column, required or not, always references the
-        // workspace together with its organization.
-        if columns.iter().any(|column| column.name == "workspace_id") {
+        // History names a workspace and never references it, so nothing
+        // it holds goes when the workspace does.
+        if matches!(scoping, Scoping::History) {
+            let workspace = columns.iter().find(|column| column.name == "workspace_id");
+            assert_eq!(
+                workspace.map(|column| column.declared_type.as_str()),
+                Some("UUID"),
+                "{table} keeps history of workspaces, so it names one by UUID"
+            );
+            assert!(
+                keys.iter().all(|key| key.parent == "organizations"),
+                "{table} keeps history: it references its organization only"
+            );
+            assert!(
+                keys.iter().all(|key| key.on_delete == "CASCADE"),
+                "{table}'s rows go with their organization"
+            );
+        }
+        // Otherwise a workspace column, required or not, always references
+        // the workspace together with its organization.
+        else if columns.iter().any(|column| column.name == "workspace_id") {
             assert!(
                 has_key(
                     &keys,

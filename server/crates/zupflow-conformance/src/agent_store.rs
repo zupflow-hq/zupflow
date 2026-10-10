@@ -24,6 +24,8 @@ use zupflow_core::policy::{ApprovalMode, NewToolLevel, PolicySettings, ToolLevel
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{ListedTool, ToolRegistry, ToolRevision};
 
+use crate::audit_store::{by_suite, by_suite_in};
+
 #[derive(Debug, Clone, Copy)]
 pub struct Tenant {
     pub organization_id: OrganizationId,
@@ -131,7 +133,13 @@ async fn registry_of(stores: &Stores<'_>, t: &Tenant, workspace: WorkspaceId, in
 async fn create(stores: &Stores<'_>, t: &Tenant, name: &str) -> Agent {
     stores
         .agents
-        .create_agent(t.organization_id, t.workspace, AgentId::generate(), &new_agent(name))
+        .create_agent(
+            t.organization_id,
+            t.workspace,
+            AgentId::generate(),
+            &new_agent(name),
+            &|_| by_suite_in(t.workspace),
+        )
         .await
         .unwrap()
 }
@@ -189,6 +197,7 @@ async fn creates_reads_changes_and_deletes_agents(stores: &Stores<'_>, prepare: 
                 status: Some(AgentStatus::Paused),
                 ..AgentChanges::default()
             },
+            &|_| by_suite_in(ws),
         )
         .await
         .unwrap();
@@ -211,6 +220,7 @@ async fn creates_reads_changes_and_deletes_agents(stores: &Stores<'_>, prepare: 
                 instructions: Some("Be thorough.".to_owned()),
                 status: Some(AgentStatus::Active),
             },
+            &|_| by_suite_in(ws),
         )
         .await
         .unwrap();
@@ -226,14 +236,19 @@ async fn creates_reads_changes_and_deletes_agents(stores: &Stores<'_>, prepare: 
     assert_eq!(renamed.status, AgentStatus::Active);
     assert_eq!(store.find_agent(org, ws, beta.id).await.unwrap(), Some(renamed));
 
-    store.delete_agent(org, ws, alpha.id).await.unwrap();
+    store
+        .delete_agent(org, ws, alpha.id, &|_| by_suite_in(ws))
+        .await
+        .unwrap();
     assert_eq!(store.find_agent(org, ws, alpha.id).await.unwrap(), None);
     assert_eq!(
-        store.delete_agent(org, ws, alpha.id).await,
+        store.delete_agent(org, ws, alpha.id, &|_| by_suite_in(ws)).await,
         Err(AgentError::AgentNotFound)
     );
     assert_eq!(
-        store.update_agent(org, ws, alpha.id, &AgentChanges::default()).await,
+        store
+            .update_agent(org, ws, alpha.id, &AgentChanges::default(), &|_| by_suite_in(ws))
+            .await,
         Err(AgentError::AgentNotFound)
     );
     assert_eq!(
@@ -260,6 +275,7 @@ async fn keeps_agents_and_grants_to_their_scope(stores: &Stores<'_>, prepare: &P
             GrantId::generate(),
             a.installation,
             &tools,
+            &|_| by_suite_in(a.workspace),
         )
         .await
         .unwrap();
@@ -293,14 +309,15 @@ async fn keeps_agents_and_grants_to_their_scope(stores: &Stores<'_>, prepare: &P
                     &AgentChanges {
                         status: Some(AgentStatus::Paused),
                         ..AgentChanges::default()
-                    }
+                    },
+                    &|_| by_suite_in(ws)
                 )
                 .await,
             Err(AgentError::AgentNotFound),
             "{what}"
         );
         assert_eq!(
-            store.delete_agent(org, ws, agent.id).await,
+            store.delete_agent(org, ws, agent.id, &|_| by_suite_in(ws)).await,
             Err(AgentError::AgentNotFound),
             "{what}"
         );
@@ -311,18 +328,24 @@ async fn keeps_agents_and_grants_to_their_scope(stores: &Stores<'_>, prepare: &P
         );
         assert_eq!(
             store
-                .create_grant(org, ws, agent.id, GrantId::generate(), a.installation, &tools)
+                .create_grant(org, ws, agent.id, GrantId::generate(), a.installation, &tools, &|_| {
+                    by_suite_in(ws)
+                })
                 .await,
             Err(AgentError::AgentNotFound),
             "{what}"
         );
         assert_eq!(
-            store.update_grant(org, ws, agent.id, grant.id, &tools).await,
+            store
+                .update_grant(org, ws, agent.id, grant.id, &tools, &|_| by_suite_in(ws))
+                .await,
             Err(AgentError::AgentNotFound),
             "{what}"
         );
         assert_eq!(
-            store.delete_grant(org, ws, agent.id, grant.id).await,
+            store
+                .delete_grant(org, ws, agent.id, grant.id, &|_| by_suite_in(ws))
+                .await,
             Err(AgentError::AgentNotFound),
             "{what}"
         );
@@ -352,7 +375,8 @@ async fn keeps_agents_and_grants_to_their_scope(stores: &Stores<'_>, prepare: &P
                     other.id,
                     GrantId::generate(),
                     installation,
-                    &tools
+                    &tools,
+                    &|_| by_suite_in(a.workspace)
                 )
                 .await,
             Err(AgentError::InstallationNotFound),
@@ -370,13 +394,17 @@ async fn keeps_agents_and_grants_to_their_scope(stores: &Stores<'_>, prepare: &P
     let other = create(stores, &a, "Another").await;
     assert_eq!(
         store
-            .update_grant(a.organization_id, a.workspace, other.id, grant.id, &tools)
+            .update_grant(a.organization_id, a.workspace, other.id, grant.id, &tools, &|_| {
+                by_suite_in(a.workspace)
+            })
             .await,
         Err(AgentError::GrantNotFound)
     );
     assert_eq!(
         store
-            .delete_grant(a.organization_id, a.workspace, other.id, grant.id)
+            .delete_grant(a.organization_id, a.workspace, other.id, grant.id, &|_| by_suite_in(
+                a.workspace
+            ))
             .await,
         Err(AgentError::GrantNotFound)
     );
@@ -418,7 +446,9 @@ async fn grants_only_what_the_registry_holds(stores: &Stores<'_>, prepare: &Prep
     let agent = create(stores, &t, "Granted").await;
     let attempt = |tools: GrantTools| async move {
         store
-            .create_grant(org, ws, agent.id, GrantId::generate(), t.installation, &tools)
+            .create_grant(org, ws, agent.id, GrantId::generate(), t.installation, &tools, &|_| {
+                by_suite_in(ws)
+            })
             .await
     };
     for (tools, refusal) in [
@@ -469,6 +499,7 @@ async fn grants_only_what_the_registry_holds(stores: &Stores<'_>, prepare: &Prep
             id,
             t.installation,
             &grant_of(&["current", "changed"], &["changed"]),
+            &|_| by_suite_in(ws),
         )
         .await
         .unwrap();
@@ -501,7 +532,9 @@ async fn grants_only_what_the_registry_holds(stores: &Stores<'_>, prepare: &Prep
         ),
     ] {
         assert_eq!(
-            store.update_grant(org, ws, agent.id, grant.id, &tools).await,
+            store
+                .update_grant(org, ws, agent.id, grant.id, &tools, &|_| by_suite_in(ws))
+                .await,
             Err(refusal),
             "{tools:?}"
         );
@@ -511,7 +544,9 @@ async fn grants_only_what_the_registry_holds(stores: &Stores<'_>, prepare: &Prep
         std::slice::from_ref(&grant)
     );
     let updated = store
-        .update_grant(org, ws, agent.id, grant.id, &grant_of(&["changed"], &[]))
+        .update_grant(org, ws, agent.id, grant.id, &grant_of(&["changed"], &[]), &|_| {
+            by_suite_in(ws)
+        })
         .await
         .unwrap();
     assert_eq!(
@@ -525,7 +560,14 @@ async fn grants_only_what_the_registry_holds(stores: &Stores<'_>, prepare: &Prep
     assert!(updated.updated_at >= grant.updated_at);
     assert_eq!(
         store
-            .update_grant(org, ws, agent.id, GrantId::generate(), &grant_of(&["current"], &[]))
+            .update_grant(
+                org,
+                ws,
+                agent.id,
+                GrantId::generate(),
+                &grant_of(&["current"], &[]),
+                &|_| by_suite_in(ws)
+            )
             .await,
         Err(AgentError::GrantNotFound)
     );
@@ -539,6 +581,7 @@ async fn grants_only_what_the_registry_holds(stores: &Stores<'_>, prepare: &Prep
             GrantId::generate(),
             t.second_installation,
             &grant_of(&["elsewhere"], &["elsewhere"]),
+            &|_| by_suite_in(ws),
         )
         .await
         .unwrap();
@@ -562,9 +605,14 @@ async fn grants_only_what_the_registry_holds(stores: &Stores<'_>, prepare: &Prep
     expected.sort_by_key(|(installation, _)| *installation);
     assert_eq!(counts, expected);
 
-    store.delete_grant(org, ws, agent.id, grant.id).await.unwrap();
+    store
+        .delete_grant(org, ws, agent.id, grant.id, &|_| by_suite_in(ws))
+        .await
+        .unwrap();
     assert_eq!(
-        store.delete_grant(org, ws, agent.id, grant.id).await,
+        store
+            .delete_grant(org, ws, agent.id, grant.id, &|_| by_suite_in(ws))
+            .await,
         Err(AgentError::GrantNotFound)
     );
     assert_eq!(store.list_grants(org, ws, agent.id).await.unwrap().len(), 1);
@@ -578,7 +626,7 @@ async fn set_levels(stores: &Stores<'_>, t: &Tenant, levels: &[(&str, ToolLevel)
         .collect();
     stores
         .policies
-        .set_levels(t.organization_id, t.app, &levels, None, Timestamp::now())
+        .set_levels(t.organization_id, t.app, &levels, None, Timestamp::now(), &by_suite)
         .await
         .unwrap();
 }
@@ -597,7 +645,9 @@ async fn holds_grants_inside_the_organization_levels(stores: &Stores<'_>, prepar
     let agent = create(stores, &t, "Held").await;
     let attempt = |tools: GrantTools| async move {
         store
-            .create_grant(org, ws, agent.id, GrantId::generate(), t.installation, &tools)
+            .create_grant(org, ws, agent.id, GrantId::generate(), t.installation, &tools, &|_| {
+                by_suite_in(ws)
+            })
             .await
     };
     for (tools, refusal) in [
@@ -664,7 +714,9 @@ async fn holds_grants_inside_the_organization_levels(stores: &Stores<'_>, prepar
         ),
     ] {
         assert_eq!(
-            store.update_grant(org, ws, agent.id, grant.id, &tools).await,
+            store
+                .update_grant(org, ws, agent.id, grant.id, &tools, &|_| by_suite_in(ws))
+                .await,
             Err(refusal)
         );
     }
@@ -674,7 +726,15 @@ async fn holds_grants_inside_the_organization_levels(stores: &Stores<'_>, prepar
     let other = create(stores, &t, "Other").await;
     let other_attempt = |tools: GrantTools| async move {
         store
-            .create_grant(org, ws, other.id, GrantId::generate(), t.second_installation, &tools)
+            .create_grant(
+                org,
+                ws,
+                other.id,
+                GrantId::generate(),
+                t.second_installation,
+                &tools,
+                &|_| by_suite_in(ws),
+            )
             .await
     };
     stores
@@ -696,6 +756,7 @@ async fn holds_grants_inside_the_organization_levels(stores: &Stores<'_>, prepar
             },
             None,
             Timestamp::now(),
+            &by_suite,
         )
         .await
         .unwrap();
@@ -739,7 +800,8 @@ async fn reads_the_levels_when_it_writes_the_grant(stores: &Stores<'_>, prepare:
                 agent.id,
                 GrantId::generate(),
                 t.installation,
-                &grant_of(&["current"], &[])
+                &grant_of(&["current"], &[]),
+                &|_| by_suite_in(ws)
             )
             .await,
         Err(AgentError::ToolDenied("current".to_owned()))
@@ -752,7 +814,8 @@ async fn reads_the_levels_when_it_writes_the_grant(stores: &Stores<'_>, prepare:
                 agent.id,
                 GrantId::generate(),
                 t.installation,
-                &grant_of(&["changed"], &[])
+                &grant_of(&["changed"], &[]),
+                &|_| by_suite_in(ws)
             )
             .await,
         Err(AgentError::ApprovalRequiredByPolicy("changed".to_owned()))
@@ -767,20 +830,30 @@ async fn reads_the_levels_when_it_writes_the_grant(stores: &Stores<'_>, prepare:
             GrantId::generate(),
             t.installation,
             &grant_of(&["changed"], &[]),
+            &|_| by_suite_in(ws),
         )
         .await
         .unwrap();
     set_levels(stores, &t, &[("changed", ToolLevel::Approve)]).await;
     assert_eq!(
         store
-            .update_grant(org, ws, agent.id, grant.id, &grant_of(&["changed"], &[]))
+            .update_grant(org, ws, agent.id, grant.id, &grant_of(&["changed"], &[]), &|_| {
+                by_suite_in(ws)
+            })
             .await,
         Err(AgentError::ApprovalRequiredByPolicy("changed".to_owned()))
     );
     set_levels(stores, &t, &[("changed", ToolLevel::Deny)]).await;
     assert_eq!(
         store
-            .update_grant(org, ws, agent.id, grant.id, &grant_of(&["changed"], &["changed"]))
+            .update_grant(
+                org,
+                ws,
+                agent.id,
+                grant.id,
+                &grant_of(&["changed"], &["changed"]),
+                &|_| by_suite_in(ws)
+            )
             .await,
         Err(AgentError::ToolDenied("changed".to_owned()))
     );
@@ -800,7 +873,9 @@ async fn keeps_one_grant_per_agent_and_installation(stores: &Stores<'_>, prepare
     let second = create(stores, &t, "Second").await;
     let tools = grant_of(&["current"], &[]);
     store
-        .create_grant(org, ws, first.id, GrantId::generate(), t.installation, &tools)
+        .create_grant(org, ws, first.id, GrantId::generate(), t.installation, &tools, &|_| {
+            by_suite_in(ws)
+        })
         .await
         .unwrap();
     assert_eq!(
@@ -811,14 +886,17 @@ async fn keeps_one_grant_per_agent_and_installation(stores: &Stores<'_>, prepare
                 first.id,
                 GrantId::generate(),
                 t.installation,
-                &grant_of(&["changed"], &[])
+                &grant_of(&["changed"], &[]),
+                &|_| by_suite_in(ws)
             )
             .await,
         Err(AgentError::GrantExists)
     );
     // Another agent may hold its own grant of the same installation.
     store
-        .create_grant(org, ws, second.id, GrantId::generate(), t.installation, &tools)
+        .create_grant(org, ws, second.id, GrantId::generate(), t.installation, &tools, &|_| {
+            by_suite_in(ws)
+        })
         .await
         .unwrap();
     assert_eq!(store.list_grants(org, ws, first.id).await.unwrap().len(), 1);
@@ -835,9 +913,10 @@ async fn keeps_one_grant_when_two_are_made_at_once(stores: &Stores<'_>, prepare:
     registry_of(stores, &t, ws, t.installation).await;
     let agent = create(stores, &t, "Racer").await;
     let tools = grant_of(&["current"], &[]);
+    let placed = |_: &zupflow_core::agents::Grant| by_suite_in(ws);
     let (one, other) = tokio::join!(
-        store.create_grant(org, ws, agent.id, GrantId::generate(), t.installation, &tools),
-        store.create_grant(org, ws, agent.id, GrantId::generate(), t.installation, &tools),
+        store.create_grant(org, ws, agent.id, GrantId::generate(), t.installation, &tools, &placed),
+        store.create_grant(org, ws, agent.id, GrantId::generate(), t.installation, &tools, &placed),
     );
     // One is made; the other is told so, never that the store failed.
     let mut outcomes = [one.map(|_| ()), other.map(|_| ())];
@@ -861,6 +940,7 @@ async fn changes_and_deletes_only_the_grant_named(stores: &Stores<'_>, prepare: 
             GrantId::generate(),
             t.installation,
             &grant_of(&["current"], &[]),
+            &|_| by_suite_in(ws),
         )
         .await
         .unwrap();
@@ -872,6 +952,7 @@ async fn changes_and_deletes_only_the_grant_named(stores: &Stores<'_>, prepare: 
             GrantId::generate(),
             t.second_installation,
             &grant_of(&["current", "changed"], &["changed"]),
+            &|_| by_suite_in(ws),
         )
         .await
         .unwrap();
@@ -882,6 +963,7 @@ async fn changes_and_deletes_only_the_grant_named(stores: &Stores<'_>, prepare: 
             agent.id,
             first.id,
             &grant_of(&["current", "changed"], &["current"]),
+            &|_| by_suite_in(ws),
         )
         .await
         .unwrap();
@@ -889,7 +971,10 @@ async fn changes_and_deletes_only_the_grant_named(stores: &Stores<'_>, prepare: 
     assert_eq!(grants.len(), 2);
     assert!(grants.contains(&changed));
     assert!(grants.contains(&second), "the agent's other grant is unchanged");
-    store.delete_grant(org, ws, agent.id, first.id).await.unwrap();
+    store
+        .delete_grant(org, ws, agent.id, first.id, &|_| by_suite_in(ws))
+        .await
+        .unwrap();
     assert_eq!(store.list_grants(org, ws, agent.id).await.unwrap(), [second]);
 }
 
@@ -907,6 +992,7 @@ async fn leaves_a_grant_alone_when_its_tool_goes(stores: &Stores<'_>, prepare: &
             GrantId::generate(),
             t.installation,
             &grant_of(&["current", "changed"], &["current"]),
+            &|_| by_suite_in(ws),
         )
         .await
         .unwrap();
@@ -928,14 +1014,17 @@ async fn leaves_a_grant_alone_when_its_tool_goes(stores: &Stores<'_>, prepare: &
                 ws,
                 agent.id,
                 grant.id,
-                &grant_of(&["current", "changed"], &["current"])
+                &grant_of(&["current", "changed"], &["current"]),
+                &|_| by_suite_in(ws)
             )
             .await,
         Err(AgentError::ToolGone("current".to_owned())),
         "but the gone tool can't be granted again"
     );
     let trimmed = store
-        .update_grant(org, ws, agent.id, grant.id, &grant_of(&["changed"], &[]))
+        .update_grant(org, ws, agent.id, grant.id, &grant_of(&["changed"], &[]), &|_| {
+            by_suite_in(ws)
+        })
         .await
         .unwrap();
     assert_eq!(trimmed.tools, ["changed"]);
@@ -954,14 +1043,18 @@ async fn deletes_grants_with_their_agent_or_installation(stores: &Stores<'_>, pr
     for agent in [gone.id, kept.id] {
         for installation in [t.installation, t.second_installation] {
             store
-                .create_grant(org, ws, agent, GrantId::generate(), installation, &tools)
+                .create_grant(org, ws, agent, GrantId::generate(), installation, &tools, &|_| {
+                    by_suite_in(ws)
+                })
                 .await
                 .unwrap();
         }
     }
     let sibling_agent = stores
         .agents
-        .create_agent(org, t.sibling, AgentId::generate(), &new_agent("Sibling"))
+        .create_agent(org, t.sibling, AgentId::generate(), &new_agent("Sibling"), &|_| {
+            by_suite_in(t.sibling)
+        })
         .await
         .unwrap();
     store
@@ -972,11 +1065,15 @@ async fn deletes_grants_with_their_agent_or_installation(stores: &Stores<'_>, pr
             GrantId::generate(),
             t.sibling_installation,
             &tools,
+            &|_| by_suite_in(t.sibling),
         )
         .await
         .unwrap();
 
-    store.delete_agent(org, ws, gone.id).await.unwrap();
+    store
+        .delete_agent(org, ws, gone.id, &|_| by_suite_in(ws))
+        .await
+        .unwrap();
     let mut counts = store.count_grants_by_installation(org, ws).await.unwrap();
     counts.sort_by_key(|(installation, _)| *installation);
     let mut expected = vec![(t.installation, 1), (t.second_installation, 1)];
@@ -986,7 +1083,7 @@ async fn deletes_grants_with_their_agent_or_installation(stores: &Stores<'_>, pr
 
     stores
         .installations
-        .delete_installation(org, ws, t.installation)
+        .delete_installation(org, ws, t.installation, &|_| by_suite_in(ws))
         .await
         .unwrap();
     let grants = store.list_grants(org, ws, kept.id).await.unwrap();

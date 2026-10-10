@@ -9,6 +9,7 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, Sqlite, Transaction};
 use uuid::Uuid;
 use zupflow_core::apps::ToolEffect;
+use zupflow_core::audit::Audit;
 use zupflow_core::ids::{AppId, OrganizationId, UserId};
 use zupflow_core::organizations::User;
 use zupflow_core::policy::{
@@ -197,6 +198,7 @@ impl ToolPolicyStore for SqliteToolPolicyStore {
         settings: PolicySettings,
         updated_by: Option<UserId>,
         now: Timestamp,
+        audit: &Audit<'_, ToolPolicy>,
     ) -> Result<ToolPolicy, PolicyError> {
         let mut transaction = self
             .database
@@ -215,6 +217,9 @@ impl ToolPolicyStore for SqliteToolPolicyStore {
             .await
             .map_err(failed("save_policy"))?;
         let policy = load(&mut transaction, organization_id).await?;
+        crate::audit::record(&mut transaction, organization_id, &audit(&policy))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("save_policy"))?;
         Ok(policy)
     }
@@ -280,6 +285,7 @@ impl ToolPolicyStore for SqliteToolPolicyStore {
         levels: &[(String, ToolLevel)],
         updated_by: Option<UserId>,
         now: Timestamp,
+        audit: &Audit<'_, Vec<AppToolLevel>>,
     ) -> Result<Vec<AppToolLevel>, PolicyError> {
         validate_levels(levels)?;
         let mut transaction = self
@@ -304,6 +310,9 @@ impl ToolPolicyStore for SqliteToolPolicyStore {
         }
         let names: Vec<String> = levels.iter().map(|(tool, _)| tool.clone()).collect();
         let written = find(&mut transaction, organization_id, app_id, &names).await?;
+        crate::audit::record(&mut transaction, organization_id, &audit(&written))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("set_levels"))?;
         Ok(written)
     }
@@ -441,7 +450,13 @@ mod tests {
         let org = tenant.organization_id;
         let now = Timestamp::now();
         store
-            .save_policy(org, PolicySettings::default(), Some(tenant.user), now)
+            .save_policy(
+                org,
+                PolicySettings::default(),
+                Some(tenant.user),
+                now,
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         for app in [tenant.catalog_app, tenant.second_catalog_app] {
@@ -452,6 +467,7 @@ mod tests {
                     &[("search".to_owned(), ToolLevel::Allow)],
                     Some(tenant.user),
                     now,
+                    &zupflow_conformance::audit_store::by_suite,
                 )
                 .await
                 .unwrap();

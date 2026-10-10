@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
+use crate::audit::Audit;
 use crate::environment::Environment;
 use crate::ids::{OrganizationId, WorkspaceId};
 use crate::time::Timestamp;
@@ -92,11 +93,13 @@ pub trait WorkspaceStore: Send + Sync {
         limit: u32,
     ) -> Result<Page<Workspace>, WorkspaceError>;
 
+    /// Creates the workspace, recording `audit` of it with it.
     async fn create_workspace(
         &self,
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         workspace: &NewWorkspace,
+        audit: &Audit<'_, Workspace>,
     ) -> Result<Workspace, WorkspaceError>;
 
     /// The workspace, in this organization only.
@@ -106,20 +109,24 @@ pub trait WorkspaceStore: Send + Sync {
         workspace_id: WorkspaceId,
     ) -> Result<Option<Workspace>, WorkspaceError>;
 
-    /// Renames it and/or changes its External ID (`Some(None)` clears it).
+    /// Renames it and/or changes its External ID (`Some(None)` clears it),
+    /// recording `audit` of the workspace as changed.
     async fn update_workspace(
         &self,
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         name: Option<&str>,
         external_id: Option<Option<&str>>,
+        audit: &Audit<'_, Workspace>,
     ) -> Result<Workspace, WorkspaceError>;
 
-    /// Deletes the workspace and everything in it.
+    /// Deletes the workspace and everything in it but its audit history,
+    /// recording `audit` of the workspace as it was.
     async fn delete_workspace(
         &self,
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
+        audit: &Audit<'_, Workspace>,
     ) -> Result<(), WorkspaceError>;
 
     /// What the workspace holds: its agents, its installations and the

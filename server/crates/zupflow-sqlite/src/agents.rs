@@ -19,6 +19,7 @@ use zupflow_core::agents::{
     Agent, AgentChanges, AgentError, AgentStatus, AgentStore, Grant, GrantTools, NewAgent, approval_outside,
     levels_refusal,
 };
+use zupflow_core::audit::Audit;
 use zupflow_core::ids::{AgentId, AppId, GrantId, InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::policy::{AppToolLevel, GrantLevels, NewToolLevel, PolicySettings, ToolLevel};
 use zupflow_core::time::Timestamp;
@@ -301,6 +302,7 @@ impl AgentStore for SqliteAgentStore {
         workspace_id: WorkspaceId,
         agent_id: AgentId,
         agent: &NewAgent,
+        audit: &Audit<'_, Agent>,
     ) -> Result<Agent, AgentError> {
         let now = Timestamp::now().millis();
         let mut transaction = self.immediate("create_agent").await?;
@@ -328,6 +330,9 @@ impl AgentStore for SqliteAgentStore {
             .await
             .map_err(failed("create_agent"))?;
         let created = agent_from(&row)?;
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&created))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("create_agent"))?;
         Ok(created)
     }
@@ -338,6 +343,7 @@ impl AgentStore for SqliteAgentStore {
         workspace_id: WorkspaceId,
         agent_id: AgentId,
         changes: &AgentChanges,
+        audit: &Audit<'_, Agent>,
     ) -> Result<Agent, AgentError> {
         let mut transaction = self.immediate("update_agent").await?;
         let updated = sqlx::query(
@@ -368,6 +374,9 @@ impl AgentStore for SqliteAgentStore {
             .await
             .map_err(failed("update_agent"))?;
         let agent = agent_from(&row)?;
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&agent))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("update_agent"))?;
         Ok(agent)
     }
@@ -377,18 +386,29 @@ impl AgentStore for SqliteAgentStore {
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
+        audit: &Audit<'_, Agent>,
     ) -> Result<(), AgentError> {
-        // Its grants reference it with a cascading key: they go in this one statement.
-        let deleted = sqlx::query("DELETE FROM agents WHERE organization_id = ? AND workspace_id = ? AND id = ?")
+        let mut transaction = self.immediate("delete_agent").await?;
+        let row = sqlx::query(FIND_AGENT)
             .bind(organization_id.uuid())
             .bind(workspace_id.uuid())
             .bind(agent_id.uuid())
-            .execute(self.database.pool())
+            .fetch_optional(&mut *transaction)
             .await
             .map_err(failed("delete_agent"))?;
-        if deleted.rows_affected() == 0 {
-            return Err(AgentError::AgentNotFound);
-        }
+        let agent = agent_from(&row.ok_or(AgentError::AgentNotFound)?)?;
+        // Its grants reference it with a cascading key: they go in this one statement.
+        sqlx::query("DELETE FROM agents WHERE organization_id = ? AND workspace_id = ? AND id = ?")
+            .bind(organization_id.uuid())
+            .bind(workspace_id.uuid())
+            .bind(agent_id.uuid())
+            .execute(&mut *transaction)
+            .await
+            .map_err(failed("delete_agent"))?;
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&agent))
+            .await
+            .map_err(failed("audit"))?;
+        transaction.commit().await.map_err(failed("delete_agent"))?;
         Ok(())
     }
 
@@ -422,6 +442,7 @@ impl AgentStore for SqliteAgentStore {
         grant_id: GrantId,
         installation_id: InstallationId,
         tools: &GrantTools,
+        audit: &Audit<'_, Grant>,
     ) -> Result<Grant, AgentError> {
         let mut transaction = self.immediate("create_grant").await?;
         if !agent_exists(&mut transaction, organization_id, workspace_id, agent_id).await? {
@@ -464,6 +485,9 @@ impl AgentStore for SqliteAgentStore {
             .await
             .map_err(failed("create_grant"))?;
         let grant = grant_from(&row)?;
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&grant))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("create_grant"))?;
         Ok(grant)
     }
@@ -475,6 +499,7 @@ impl AgentStore for SqliteAgentStore {
         agent_id: AgentId,
         grant_id: GrantId,
         tools: &GrantTools,
+        audit: &Audit<'_, Grant>,
     ) -> Result<Grant, AgentError> {
         let mut transaction = self.immediate("update_grant").await?;
         if !agent_exists(&mut transaction, organization_id, workspace_id, agent_id).await? {
@@ -505,6 +530,9 @@ impl AgentStore for SqliteAgentStore {
             .await
             .map_err(failed("update_grant"))?;
         let grant = grant_from(&row)?;
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&grant))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("update_grant"))?;
         Ok(grant)
     }
@@ -515,6 +543,7 @@ impl AgentStore for SqliteAgentStore {
         workspace_id: WorkspaceId,
         agent_id: AgentId,
         grant_id: GrantId,
+        audit: &Audit<'_, ()>,
     ) -> Result<(), AgentError> {
         let mut transaction = self.immediate("delete_grant").await?;
         if !agent_exists(&mut transaction, organization_id, workspace_id, agent_id).await? {
@@ -533,6 +562,9 @@ impl AgentStore for SqliteAgentStore {
         if deleted.rows_affected() == 0 {
             return Err(AgentError::GrantNotFound);
         }
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&()))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("delete_grant"))?;
         Ok(())
     }
@@ -680,11 +712,15 @@ mod tests {
             instructions: String::new(),
         };
         let here = store
-            .create_agent(org, tenant.workspace, AgentId::generate(), &new)
+            .create_agent(org, tenant.workspace, AgentId::generate(), &new, &|_| {
+                zupflow_conformance::audit_store::by_suite_in(tenant.workspace)
+            })
             .await
             .unwrap();
         let there = store
-            .create_agent(org, tenant.sibling, AgentId::generate(), &new)
+            .create_agent(org, tenant.sibling, AgentId::generate(), &new, &|_| {
+                zupflow_conformance::audit_store::by_suite_in(tenant.sibling)
+            })
             .await
             .unwrap();
         let insert = |agent: AgentId, installation: InstallationId| {
@@ -717,7 +753,9 @@ mod tests {
             "one grant per agent and installation"
         );
         crate::SqliteWorkspaceStore::new(database.clone())
-            .delete_workspace(org, tenant.workspace)
+            .delete_workspace(org, tenant.workspace, &|_| {
+                zupflow_conformance::audit_store::by_suite_in(tenant.workspace)
+            })
             .await
             .unwrap();
         let left: Vec<(i64, i64)> =

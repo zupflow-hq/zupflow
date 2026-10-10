@@ -15,6 +15,7 @@ use axum::response::Response;
 use axum::routing::get;
 use serde::Serialize;
 use serde_json::{Value, json};
+use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{AppId, OrganizationId};
 use zupflow_core::organizations::{MemberRole, User};
@@ -24,7 +25,7 @@ use zupflow_core::policy::{
 };
 use zupflow_core::time::Timestamp;
 
-use crate::apps::app_id;
+use crate::apps::{app_failure, app_id};
 use crate::auth::{Access, AppState, Caller, ConsoleUser, OrganizationAccess};
 use crate::http::{Failure, envelope, envelope_with_meta};
 use crate::input::{Body, Fields, Object};
@@ -151,6 +152,14 @@ async fn update_tool_policy(
             PolicySettings { mode, new_tool_level },
             Some(access.user.id),
             Timestamp::now(),
+            &|_: &ToolPolicy| {
+                AuditEntry::new(
+                    access.audit_actor(),
+                    AuditAction::ToolPolicyUpdated,
+                    AuditTarget::tool_policy(),
+                    AuditPlace::Organization,
+                )
+            },
         )
         .await
         .map_err(policy_failure)?;
@@ -247,6 +256,13 @@ async fn update_app_tool_levels(
         .list_levels(access.organization.id, app, None, 1)
         .await
         .map_err(policy_failure)?;
+    // As the audit log names it.
+    let app_name = state
+        .apps
+        .find_organization_app(access.organization.id, app)
+        .await
+        .map_err(app_failure)?
+        .map_or_else(|| "App".to_owned(), |app| app.name);
     let body = body.object()?;
     let mut fields = Fields::default();
     let levels = levels_input(&body, &mut fields);
@@ -262,6 +278,14 @@ async fn update_app_tool_levels(
             &levels,
             Some(access.user.id),
             Timestamp::now(),
+            &|_: &Vec<AppToolLevel>| {
+                AuditEntry::new(
+                    access.audit_actor(),
+                    AuditAction::AppToolLevelsUpdated,
+                    AuditTarget::new(AuditObject::App(app), &app_name),
+                    AuditPlace::Organization,
+                )
+            },
         )
         .await
         .map_err(policy_failure)?;

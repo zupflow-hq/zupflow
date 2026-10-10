@@ -9,6 +9,7 @@ use sqlx::sqlite::{SqliteArguments, SqliteRow};
 use sqlx::{Sqlite, Transaction};
 use uuid::Uuid;
 use zupflow_core::apps::ToolEffect;
+use zupflow_core::audit::Audit;
 use zupflow_core::ids::{InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::scope::Scope;
 use zupflow_core::time::Timestamp;
@@ -347,6 +348,7 @@ impl ToolRegistry for SqliteToolRegistry {
         installation_id: InstallationId,
         name: &str,
         expected: Option<[u8; 32]>,
+        audit: &Audit<'_, RegisteredTool>,
     ) -> Result<RegisteredTool, ToolError> {
         let owner = Owner {
             organization_id,
@@ -380,6 +382,9 @@ impl ToolRegistry for SqliteToolRegistry {
             .await
             .map_err(failed("accept_change"))?;
         let accepted = tool_from(&row)?;
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&accepted))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("accept_change"))?;
         Ok(accepted)
     }
@@ -529,7 +534,9 @@ mod tests {
             .unwrap();
         assert_eq!(count().await, 1);
         crate::SqliteWorkspaceStore::new(database.clone())
-            .delete_workspace(org, tenant.sibling)
+            .delete_workspace(org, tenant.sibling, &|_| {
+                zupflow_conformance::audit_store::by_suite_in(tenant.sibling)
+            })
             .await
             .unwrap();
         assert_eq!(count().await, 0);

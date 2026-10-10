@@ -18,6 +18,8 @@ use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, OrganizationId, WorkspaceId};
 use zupflow_core::keys::{Sealed, WrappedKey};
 
+use crate::audit_store::{by_suite, by_suite_in};
+
 pub type Prepare =
     Arc<dyn Fn(OrganizationId, Vec<WorkspaceId>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
@@ -43,14 +45,14 @@ async fn organization(prepare: &Prepare) -> (OrganizationId, WorkspaceId, Worksp
 
 async fn catalog_app(store: &dyn AppStore, org: OrganizationId, app: NewApp) -> App {
     store
-        .create_organization_app(org, AppId::generate(), &app)
+        .create_organization_app(org, AppId::generate(), &app, &by_suite)
         .await
         .unwrap()
 }
 
 async fn workspace_app(store: &dyn AppStore, org: OrganizationId, workspace: WorkspaceId, app: NewApp) -> App {
     store
-        .create_workspace_app(org, workspace, AppId::generate(), &app)
+        .create_workspace_app(org, workspace, AppId::generate(), &app, &|_| by_suite_in(workspace))
         .await
         .unwrap()
 }
@@ -354,11 +356,14 @@ async fn keeps_requested_scopes_offered(store: &dyn AppStore, prepare: &Prepare)
     let beside = workspace_app(store, a, one, oauth("Desk", "desk")).await;
     let read = oauth_template(&["read"]);
     for app in [catalog.id, sibling.id] {
-        store.update_organization_app(a, app, with(&read)).await.unwrap();
+        store
+            .update_organization_app(a, app, with(&read), &by_suite)
+            .await
+            .unwrap();
     }
     for (workspace, app) in [(one, own.id), (two, neighbour.id), (one, beside.id)] {
         store
-            .update_workspace_app(a, workspace, app, with(&read))
+            .update_workspace_app(a, workspace, app, with(&read), &|_| by_suite_in(workspace))
             .await
             .unwrap();
     }
@@ -366,45 +371,61 @@ async fn keeps_requested_scopes_offered(store: &dyn AppStore, prepare: &Prepare)
     // A scope the template doesn't offer can't be requested.
     assert_eq!(
         store
-            .save_organization_configuration(a, catalog.id, Environment::Production, &requesting(&["write"]))
+            .save_organization_configuration(
+                a,
+                catalog.id,
+                Environment::Production,
+                &requesting(&["write"]),
+                &by_suite
+            )
             .await,
         Err(AppError::UnknownScope("write".to_owned()))
     );
     assert_eq!(
         store
-            .save_workspace_configuration(a, one, own.id, &requesting(&["write"]))
+            .save_workspace_configuration(a, one, own.id, &requesting(&["write"]), &|_| by_suite_in(one))
             .await,
         Err(AppError::UnknownScope("write".to_owned()))
     );
 
     // Others requesting `read` don't hold this app's template back...
     store
-        .save_organization_configuration(a, sibling.id, Environment::Sandbox, &requesting(&["read"]))
+        .save_organization_configuration(a, sibling.id, Environment::Sandbox, &requesting(&["read"]), &by_suite)
         .await
         .unwrap();
     store
-        .save_workspace_configuration(a, two, neighbour.id, &requesting(&["read"]))
+        .save_workspace_configuration(a, two, neighbour.id, &requesting(&["read"]), &|_| by_suite_in(two))
         .await
         .unwrap();
     // An app beside it in the same workspace doesn't either.
     store
-        .save_workspace_configuration(a, one, beside.id, &requesting(&["read"]))
+        .save_workspace_configuration(a, one, beside.id, &requesting(&["read"]), &|_| by_suite_in(one))
         .await
         .unwrap();
     let none = oauth_template(&[]);
-    store.update_organization_app(a, catalog.id, with(&none)).await.unwrap();
-    store.update_workspace_app(a, one, own.id, with(&none)).await.unwrap();
+    store
+        .update_organization_app(a, catalog.id, with(&none), &by_suite)
+        .await
+        .unwrap();
+    store
+        .update_workspace_app(a, one, own.id, with(&none), &|_| by_suite_in(one))
+        .await
+        .unwrap();
 
     // ...but its own configuration requesting it does.
     assert_eq!(
-        store.update_organization_app(a, sibling.id, with(&none)).await,
+        store
+            .update_organization_app(a, sibling.id, with(&none), &by_suite)
+            .await,
         Err(AppError::ScopeInUse {
             environment: Environment::Sandbox,
             scope: "read".to_owned(),
         })
     );
     assert_eq!(
-        store.update_workspace_app(a, two, neighbour.id, with(&none)).await,
+        store
+            .update_workspace_app(a, two, neighbour.id, with(&none), &|_| by_suite_in(two))
+            .await,
         Err(AppError::ScopeInUse {
             environment: Environment::Sandbox,
             scope: "read".to_owned(),
@@ -457,7 +478,13 @@ async fn saves_configurations_field_by_field(store: &dyn AppStore, prepare: &Pre
     );
 
     let first = store
-        .save_organization_configuration(org, app.id, sandbox, &set_url("https://mcp.linear.example/mcp"))
+        .save_organization_configuration(
+            org,
+            app.id,
+            sandbox,
+            &set_url("https://mcp.linear.example/mcp"),
+            &by_suite,
+        )
         .await
         .unwrap();
     assert_eq!((first.app_id, first.environment, first.version), (app.id, sandbox, 1));
@@ -480,6 +507,7 @@ async fn saves_configurations_field_by_field(store: &dyn AppStore, prepare: &Pre
                 client_secret: Some(new_secret(1, 7)),
                 ..ConfigurationChanges::default()
             },
+            &by_suite,
         )
         .await
         .unwrap();
@@ -507,6 +535,7 @@ async fn saves_configurations_field_by_field(store: &dyn AppStore, prepare: &Pre
                 mcp_server_url: Some(None),
                 ..ConfigurationChanges::default()
             },
+            &by_suite,
         )
         .await
         .unwrap();
@@ -520,7 +549,9 @@ async fn saves_configurations_field_by_field(store: &dyn AppStore, prepare: &Pre
         None
     );
     let saved = store
-        .save_workspace_configuration(org, one, own.id, &set_url("https://echo.example/mcp"))
+        .save_workspace_configuration(org, one, own.id, &set_url("https://echo.example/mcp"), &|_| {
+            by_suite_in(one)
+        })
         .await
         .unwrap();
     assert_eq!(
@@ -541,11 +572,11 @@ async fn keeps_configurations_to_their_app_and_environment(store: &dyn AppStore,
     let theirs = catalog_app(store, b, new("Linear", "linear")).await;
     let changes = set_url("https://mcp.example/mcp");
     store
-        .save_organization_configuration(a, catalog.id, Environment::Sandbox, &changes)
+        .save_organization_configuration(a, catalog.id, Environment::Sandbox, &changes, &by_suite)
         .await
         .unwrap();
     store
-        .save_workspace_configuration(a, one, own.id, &changes)
+        .save_workspace_configuration(a, one, own.id, &changes, &|_| by_suite_in(one))
         .await
         .unwrap();
 
@@ -575,7 +606,7 @@ async fn keeps_configurations_to_their_app_and_environment(store: &dyn AppStore,
         );
         assert_eq!(
             store
-                .save_workspace_configuration(org, workspace, own.id, &changes)
+                .save_workspace_configuration(org, workspace, own.id, &changes, &|_| by_suite_in(workspace))
                 .await,
             Err(AppError::NotFound)
         );
@@ -583,13 +614,15 @@ async fn keeps_configurations_to_their_app_and_environment(store: &dyn AppStore,
     for (org, app) in [(b, catalog.id), (a, own.id), (a, theirs.id)] {
         assert_eq!(
             store
-                .save_organization_configuration(org, app, Environment::Sandbox, &changes)
+                .save_organization_configuration(org, app, Environment::Sandbox, &changes, &by_suite)
                 .await,
             Err(AppError::NotFound)
         );
     }
     assert_eq!(
-        store.save_workspace_configuration(a, one, catalog.id, &changes).await,
+        store
+            .save_workspace_configuration(a, one, catalog.id, &changes, &|_| by_suite_in(one))
+            .await,
         Err(AppError::NotFound),
         "a catalog app isn't a workspace's"
     );
@@ -622,7 +655,7 @@ async fn takes_each_secret_version_once(store: &dyn AppStore, prepare: &Prepare)
     for wrong in [0, 2] {
         assert_eq!(
             store
-                .save_organization_configuration(a, catalog.id, env, &with(new_secret(wrong, 1)))
+                .save_organization_configuration(a, catalog.id, env, &with(new_secret(wrong, 1)), &by_suite)
                 .await,
             Err(AppError::SecretVersionTaken),
             "version {wrong} first"
@@ -634,18 +667,18 @@ async fn takes_each_secret_version_once(store: &dyn AppStore, prepare: &Prepare)
         "a refused write writes nothing"
     );
     store
-        .save_organization_configuration(a, catalog.id, env, &with(new_secret(1, 1)))
+        .save_organization_configuration(a, catalog.id, env, &with(new_secret(1, 1)), &by_suite)
         .await
         .unwrap();
     assert_eq!(
         store
-            .save_organization_configuration(a, catalog.id, env, &with(new_secret(1, 2)))
+            .save_organization_configuration(a, catalog.id, env, &with(new_secret(1, 2)), &by_suite)
             .await,
         Err(AppError::SecretVersionTaken),
         "version 1 is taken"
     );
     let saved = store
-        .save_organization_configuration(a, catalog.id, env, &with(new_secret(2, 3)))
+        .save_organization_configuration(a, catalog.id, env, &with(new_secret(2, 3)), &by_suite)
         .await
         .unwrap();
     assert_eq!(saved.client_secret.unwrap().version, 2);
@@ -671,12 +704,12 @@ async fn takes_each_secret_version_once(store: &dyn AppStore, prepare: &Prepare)
     );
 
     store
-        .save_workspace_configuration(a, one, own.id, &with(new_secret(1, 4)))
+        .save_workspace_configuration(a, one, own.id, &with(new_secret(1, 4)), &|_| by_suite_in(one))
         .await
         .unwrap();
     assert_eq!(
         store
-            .save_workspace_configuration(a, one, own.id, &with(new_secret(1, 5)))
+            .save_workspace_configuration(a, one, own.id, &with(new_secret(1, 5)), &|_| by_suite_in(one))
             .await,
         Err(AppError::SecretVersionTaken)
     );
@@ -751,13 +784,13 @@ async fn keeps_slugs_unique_within_their_owner(store: &dyn AppStore, prepare: &P
     workspace_app(store, b, b_workspace, new("Tools", "tools")).await;
     assert_eq!(
         store
-            .create_organization_app(a, AppId::generate(), &new("Other", "tools"))
+            .create_organization_app(a, AppId::generate(), &new("Other", "tools"), &by_suite)
             .await,
         Err(AppError::SlugTaken)
     );
     assert_eq!(
         store
-            .create_workspace_app(a, one, AppId::generate(), &new("Other", "tools"))
+            .create_workspace_app(a, one, AppId::generate(), &new("Other", "tools"), &|_| by_suite_in(one))
             .await,
         Err(AppError::SlugTaken)
     );
@@ -804,12 +837,20 @@ async fn updates_only_within_the_owner(store: &dyn AppStore, prepare: &Prepare) 
 
     // Through the wrong owner, nothing changes.
     for result in [
-        store.update_organization_app(b, catalog.id, rename).await,
-        store.update_organization_app(a, own.id, rename).await,
-        store.update_workspace_app(a, one, catalog.id, rename).await,
-        store.update_workspace_app(a, two, own.id, rename).await,
-        store.update_workspace_app(b, b_workspace, own.id, rename).await,
-        store.update_workspace_app(b, one, own.id, rename).await,
+        store.update_organization_app(b, catalog.id, rename, &by_suite).await,
+        store.update_organization_app(a, own.id, rename, &by_suite).await,
+        store
+            .update_workspace_app(a, one, catalog.id, rename, &|_| by_suite_in(one))
+            .await,
+        store
+            .update_workspace_app(a, two, own.id, rename, &|_| by_suite_in(two))
+            .await,
+        store
+            .update_workspace_app(b, b_workspace, own.id, rename, &|_| by_suite_in(b_workspace))
+            .await,
+        store
+            .update_workspace_app(b, one, own.id, rename, &|_| by_suite_in(one))
+            .await,
     ] {
         assert_eq!(result, Err(AppError::NotFound));
     }
@@ -822,7 +863,10 @@ async fn updates_only_within_the_owner(store: &dyn AppStore, prepare: &Prepare) 
         Some(own.clone())
     );
 
-    let updated = store.update_organization_app(a, catalog.id, rename).await.unwrap();
+    let updated = store
+        .update_organization_app(a, catalog.id, rename, &by_suite)
+        .await
+        .unwrap();
     assert_eq!(
         (
             updated.name.as_str(),
@@ -841,6 +885,7 @@ async fn updates_only_within_the_owner(store: &dyn AppStore, prepare: &Prepare) 
                 description: Some(""),
                 ..AppChanges::default()
             },
+            &|_| by_suite_in(one),
         )
         .await
         .unwrap();
@@ -867,6 +912,7 @@ async fn updates_only_within_the_owner(store: &dyn AppStore, prepare: &Prepare) 
                 auth: Some(&template),
                 ..AppChanges::default()
             },
+            &by_suite,
         )
         .await
         .unwrap();
@@ -881,6 +927,7 @@ async fn updates_only_within_the_owner(store: &dyn AppStore, prepare: &Prepare) 
                 auth: Some(&template),
                 ..AppChanges::default()
             },
+            &|_| by_suite_in(one),
         )
         .await
         .unwrap();
@@ -898,7 +945,9 @@ async fn refuses_a_workspace_of_another_organization(store: &dyn AppStore, prepa
     let (a, _, _) = organization(prepare).await;
     let (_, b_workspace, _) = organization(prepare).await;
     let result = store
-        .create_workspace_app(a, b_workspace, AppId::generate(), &new("Sneaky", "sneaky"))
+        .create_workspace_app(a, b_workspace, AppId::generate(), &new("Sneaky", "sneaky"), &|_| {
+            by_suite_in(b_workspace)
+        })
         .await;
     assert_eq!(result, Err(AppError::NotFound));
     assert_eq!(store.list_workspace_apps(a, b_workspace).await.unwrap(), []);

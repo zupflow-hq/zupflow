@@ -19,6 +19,7 @@ use serde_json::Value;
 use zupflow_core::apps::{
     App, AppError, AuthTemplate, Configuration, ConfigurationChanges, ConfigurationStatus, NewClientSecret,
 };
+use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{AppId, UserId, WorkspaceId};
@@ -379,17 +380,28 @@ async fn save(
             oauth_scopes: input.oauth_scopes.clone(),
             updated_by: writer(access),
         };
+        let audit = |_: &Configuration| {
+            AuditEntry::new(
+                access.audit_actor(),
+                AuditAction::AppConfigurationUpdated,
+                AuditTarget::new(AuditObject::App(app.id), &app.name),
+                match owner {
+                    Owner::Catalog(environment) => AuditPlace::Environment(environment),
+                    Owner::Workspace(workspace_id, _) => AuditPlace::Workspace(workspace_id),
+                },
+            )
+        };
         let saved = match owner {
             Owner::Catalog(environment) => {
                 state
                     .apps
-                    .save_organization_configuration(organization_id, app.id, environment, &changes)
+                    .save_organization_configuration(organization_id, app.id, environment, &changes, &audit)
                     .await
             }
             Owner::Workspace(workspace_id, _) => {
                 state
                     .apps
-                    .save_workspace_configuration(organization_id, workspace_id, app.id, &changes)
+                    .save_workspace_configuration(organization_id, workspace_id, app.id, &changes, &audit)
                     .await
             }
         };

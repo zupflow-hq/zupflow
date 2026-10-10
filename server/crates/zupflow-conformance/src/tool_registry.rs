@@ -27,6 +27,8 @@ use zupflow_core::tools::{
 };
 use zupflow_core::webhooks::{ANNOUNCE, Announcement, Subject, WebhookEventType};
 
+use crate::audit_store::by_suite_in;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Tenant {
     pub organization_id: OrganizationId,
@@ -504,7 +506,8 @@ async fn accepts_exactly_the_change_reviewed(registry: &dyn ToolRegistry, prepar
                 other.workspace,
                 other.installation,
                 "gone",
-                Some([3; 32])
+                Some([3; 32]),
+                &|_| by_suite_in(other.workspace)
             )
             .await,
         Err(ToolError::NotChanged),
@@ -513,7 +516,9 @@ async fn accepts_exactly_the_change_reviewed(registry: &dyn ToolRegistry, prepar
 
     let before = list(registry, t.at()).await.unwrap();
     let accept = |at: At, name: &'static str, hash: u8| async move {
-        registry.accept_change(at.0, at.1, at.2, name, Some([hash; 32])).await
+        registry
+            .accept_change(at.0, at.1, at.2, name, Some([hash; 32]), &|_| by_suite_in(at.1))
+            .await
     };
     assert_eq!(
         accept(t.at(), "changed", 1).await,
@@ -521,8 +526,10 @@ async fn accepts_exactly_the_change_reviewed(registry: &dyn ToolRegistry, prepar
         "the pinned hash isn't the change"
     );
     assert_eq!(accept(t.at(), "changed", 3).await, Err(ToolError::Stale));
-    let unhashed =
-        |name: &'static str| registry.accept_change(t.organization_id, t.workspace, t.installation, name, None);
+    let placed = |_: &RegisteredTool| by_suite_in(t.workspace);
+    let unhashed = |name: &'static str| {
+        registry.accept_change(t.organization_id, t.workspace, t.installation, name, None, &placed)
+    };
     assert_eq!(unhashed("changed").await, Err(ToolError::Stale), "no hash matches none");
     assert_eq!(
         unhashed("current").await,

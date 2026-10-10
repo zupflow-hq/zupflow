@@ -162,6 +162,7 @@ async fn main() -> ExitCode {
         idempotency: Arc::new(SqliteIdempotencyStore::new(database.clone())),
         fingerprinter: Arc::new(Fingerprinter::new(secret_key)),
         webhooks: Arc::new(zupflow_sqlite::SqliteWebhookStore::new(database.clone())),
+        audit: Arc::new(zupflow_sqlite::SqliteAuditStore::new(database.clone())),
     };
 
     let listener = match TcpListener::bind(config.listen).await {

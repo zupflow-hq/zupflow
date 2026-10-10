@@ -47,7 +47,7 @@ use zupflow_mcp::sign_in::{self, SignInError};
 use crate::app_configurations::{check_public_https, redirect_uri};
 use crate::auth::AppState;
 use crate::auth_templates::same_origin;
-use crate::connect::{attributed, connect_failure, not_pending, still_eligible};
+use crate::connect::{attributed, completion_audit, connect_failure, not_pending, still_eligible};
 use crate::http::{Failure, envelope};
 
 /// What the start answers: the contract's `AuthorizeConnectResult`.
@@ -901,6 +901,7 @@ async fn complete(
             session.id,
             &completion,
             Timestamp::now(),
+            &completion_audit(&app.name),
         )
         .await
     {

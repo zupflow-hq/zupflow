@@ -89,7 +89,7 @@ import type {
 } from "./model";
 import { levelInForce, levelRowsOf, levelsInput, policyRowOf, setLevels, toAppToolLevel, toToolPolicy } from "./policy";
 import { hash, token } from "./random";
-import { cancelRun, enqueueRun, planRun } from "./runner";
+import { cancelRun, enqueueRun, planRun, runTarget } from "./runner";
 import { appIn, configurationOf, inWorkspace, runEventsKey, timelineOf } from "./scope";
 import {
   acceptChange,
@@ -659,6 +659,19 @@ function completeSession(
   return { session: toConnectSession(session), installation: toInstallation(installation) };
 }
 
+/**
+ * A webhook URL as the audit log names it: scheme, host and path. A query
+ * or fragment may carry a token, so neither is ever recorded.
+ */
+export function auditUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+  } catch {
+    return "Webhook endpoint";
+  }
+}
+
 function webhookSecret(env: Environment) {
   return `whsec_${env === "production" ? "live" : "test"}_${token(32)}`;
 }
@@ -1205,7 +1218,8 @@ export function createHandlers(apiBase: string) {
           access,
           "workspace.deleted",
           { type: "workspace", id: workspace.id, name: workspace.name },
-          { environment: access.workspace.environment },
+          // Kept with the workspace's ID, so its history still finds it.
+          { workspace: access.workspace },
         );
         return noContent();
       }),
@@ -1445,6 +1459,7 @@ export function createHandlers(apiBase: string) {
         requireRole(access, ADMINS, "edit apps");
         const app = findWorkspaceApp(access, idParam(params, "app"));
         applyAppUpdate(app, await body(request, appUpdateInput));
+        audit(access, "app.updated", { type: "app", id: app.id, name: app.name }, { workspace: access.workspace });
         return ok(toApp(app));
       }),
     ),
@@ -1537,6 +1552,13 @@ export function createHandlers(apiBase: string) {
         const input = await body(request, z.object({ label: name(40) }));
         row.label = input.label;
         row.updated_at = new Date().toISOString();
+        const app = appInScope(row);
+        audit(
+          access,
+          "installation.updated",
+          { type: "installation", id: row.id, name: `${app?.name ?? "App"} · ${row.label}` },
+          { workspace: access.workspace },
+        );
         return ok(toInstallation(row));
       }),
     ),
@@ -2265,6 +2287,7 @@ export function createHandlers(apiBase: string) {
         }
         cancelScheduledRun(run);
         cancelRun(db(), run, access.user.name, new Date().toISOString());
+        audit(access, "run.cancelled", runTarget(db(), run), { workspace: access.workspace });
         return ok(toRun(run));
       }),
     ),
@@ -2495,7 +2518,7 @@ export function createHandlers(apiBase: string) {
         audit(
           access,
           "webhook.created",
-          { type: "webhook", id: endpoint.id, name: endpoint.url },
+          { type: "webhook", id: endpoint.id, name: auditUrl(endpoint.url) },
           { environment: endpoint.environment },
         );
         return created({ endpoint, signing_secret: secret });
@@ -2524,6 +2547,12 @@ export function createHandlers(apiBase: string) {
         if (input.url !== undefined) assertPublicHttps(input.url, "url");
         if (input.events) input.events = [...new Set(input.events)];
         Object.assign(endpoint, Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined)));
+        audit(
+          access,
+          "webhook.updated",
+          { type: "webhook", id: endpoint.id, name: auditUrl(endpoint.url) },
+          { environment: endpoint.environment },
+        );
         return ok(endpoint);
       }),
     ),
@@ -2542,7 +2571,7 @@ export function createHandlers(apiBase: string) {
         audit(
           access,
           "webhook.deleted",
-          { type: "webhook", id: endpoint.id, name: endpoint.url },
+          { type: "webhook", id: endpoint.id, name: auditUrl(endpoint.url) },
           { environment: endpoint.environment },
         );
         return noContent();

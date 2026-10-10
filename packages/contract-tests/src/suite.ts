@@ -114,6 +114,19 @@ export function contractSuite(target: Target) {
         (await owner.workspaces.list(fx.organization, { q: slug, limit: 100 })).items.find((w) => w.slug === slug),
         `workspace ${slug}`,
       );
+    /** A client acting with an API key's secret, in the reference organization. */
+    const withKey = (secret: string): ZupflowClient => {
+      if (target.apiKeys === false) throw new NotServed("API-key credentials");
+      return createClient(
+        createHttpTransport({
+          baseUrl: target.baseUrl,
+          getToken: async () => secret,
+          getOrganization: () => fx?.organization ?? null,
+          fetch: servedFetch,
+          retries: 0,
+        }),
+      );
+    };
     const owner = as("owner");
     const northwind = () => loadTenant(owner, fx.organization, "acme", "acme-sandbox");
     /** `beta-labs`, given a workspace app of its own first: the fixture has none there. */
@@ -1197,6 +1210,19 @@ export function contractSuite(target: Target) {
           owner.connect.submitCredentials(referenceOf(session), { values: { token: "abc123" } }),
         );
         expect(replay.code).toBe("session_not_pending");
+        // Connect records the installation, once, as Zupflow itself.
+        const events = (await owner.audit.list(fx.organization, { workspace_id: fx.workspaces.qaPlayground.id })).items;
+        expect(events[0]).toMatchObject({
+          action: "installation.connected",
+          actor: { type: "system", id: null, name: "Connect" },
+          target: {
+            type: "installation",
+            id: result.installation.id,
+            name: expect.stringMatching(new RegExp(` · ${result.installation.label}$`)),
+          },
+          environment: "sandbox",
+        });
+        expect(events[1]?.action).not.toBe("installation.connected");
       });
 
       it("checks submitted values against the app's inputs", async () => {
@@ -2527,6 +2553,279 @@ export function contractSuite(target: Target) {
           as("developer").agents.create(qa, { name: "x", description: "", instructions: "", model: await anyModel() }),
         );
         expect(`${error.status} ${error.code}`).toBe("403 forbidden");
+      });
+    });
+
+    describe("the audit log", () => {
+      /** The reference organization's events, newest first: the whole log, or one workspace's. */
+      const log = async (workspace_id?: string) =>
+        await owner.audit.list(fx.organization, {
+          limit: 100,
+          // Malformed IDs are sent as they are: the server must find nothing for them.
+          ...(workspace_id ? { workspace_id: workspace_id as WorkspaceId } : {}),
+        });
+      const sandboxWorkspace = async (slug: string) =>
+        await owner.workspaces.create(fx.organization, {
+          name: slug,
+          slug,
+          environment: "sandbox",
+          external_id: null,
+        });
+      /** A run waiting for approval, and the call it waits on. */
+      const waitingRun = async () => {
+        const pages = await Promise.all(
+          (["production", "sandbox"] as const).map((environment) =>
+            owner.organizationRuns.list(fx.organization, { environment, status: "waiting_for_approval" }),
+          ),
+        );
+        const run = must(pages.flatMap((page) => page.items)[0], "run waiting for approval");
+        const events = await owner.runs.events(run.workspace_id, run.id);
+        const requested = [...events].reverse().find((e) => e.type === "approval.requested");
+        const callId = must(requested?.type === "approval.requested" ? requested.data.call_id : null, "pending call");
+        return { run, callId };
+      };
+
+      it("records each change with who made it, what it changed and where", async () => {
+        const me = (await owner.me.get()).user;
+        const sandbox = fx.workspaces.acmeSandbox;
+        const workspace = await sandboxWorkspace("audit-trail");
+        await owner.workspaces.update(workspace.id, { name: "Audit trail" });
+        const hook = (
+          await owner.webhooks.create(fx.organization, {
+            environment: "sandbox",
+            url: "https://hooks.northwind.example/audit?token=hook-secret#top",
+            description: "Audit",
+            events: ["run.completed"],
+          })
+        ).endpoint;
+        await owner.webhooks.update(fx.organization, hook.id, { enabled: false });
+        await owner.webhooks.update(fx.organization, hook.id, {
+          url: "https://hooks.northwind.example/moved?signature=moved-secret",
+        });
+        const installation = must((await owner.installations.list(sandbox.id))[0], "installation in acme-sandbox");
+        await owner.installations.update(sandbox.id, installation.id, { label: "Audited" });
+        const agent = must(
+          (await owner.agents.list(sandbox.id)).find((a) => a.status === "active"),
+          "active agent in acme-sandbox",
+        );
+        const run = await owner.runs.create(sandbox.id, agent.id, { input: "Hello" });
+        await owner.runs.cancel(sandbox.id, run.id);
+
+        const page = await log();
+        const recorded = page.items.slice(0, 7).map((e) => ({
+          action: e.action,
+          target: [e.target.type, e.target.id, e.target.name],
+          where: [e.workspace_id, e.environment],
+        }));
+        expect(recorded).toEqual([
+          { action: "run.cancelled", target: ["run", run.id, agent.name], where: [sandbox.id, "sandbox"] },
+          {
+            action: "installation.updated",
+            target: ["installation", installation.id, expect.stringMatching(/ · Audited$/)],
+            where: [sandbox.id, "sandbox"],
+          },
+          // A webhook is named by its URL's scheme, host and path: never its query or fragment.
+          {
+            action: "webhook.updated",
+            target: ["webhook", hook.id, "https://hooks.northwind.example/moved"],
+            where: [null, "sandbox"],
+          },
+          {
+            action: "webhook.updated",
+            target: ["webhook", hook.id, "https://hooks.northwind.example/audit"],
+            where: [null, "sandbox"],
+          },
+          {
+            action: "webhook.created",
+            target: ["webhook", hook.id, "https://hooks.northwind.example/audit"],
+            where: [null, "sandbox"],
+          },
+          {
+            action: "workspace.updated",
+            target: ["workspace", workspace.id, "Audit trail"],
+            where: [workspace.id, "sandbox"],
+          },
+          {
+            action: "workspace.created",
+            target: ["workspace", workspace.id, "audit-trail"],
+            where: [workspace.id, "sandbox"],
+          },
+        ]);
+        for (const event of page.items.slice(0, 7)) {
+          expect(event.organization_id).toBe(fx.organization);
+          expect(event.actor).toEqual({ type: "user", id: me.id, name: me.name });
+        }
+        // The workspace reference reads as the workspace is now.
+        expect(page.items[6]?.workspace).toEqual({
+          id: workspace.id,
+          name: "Audit trail",
+          slug: "audit-trail",
+          environment: "sandbox",
+        });
+        const text = JSON.stringify(page);
+        for (const secret of ["hook-secret", "moved-secret", "#top"]) expect(text).not.toContain(secret);
+      });
+
+      it("records members and invitations, each answer by the person invited", async () => {
+        const outsider = as("outsider");
+        const them = (await outsider.me.get()).user;
+        const me = (await owner.me.get()).user;
+        const declined = await owner.members.invite(fx.organization, { email: them.email, role: "viewer" });
+        await outsider.invitations.decline(declined.id);
+        const joined = await owner.members.invite(fx.organization, { email: them.email, role: "viewer" });
+        await outsider.invitations.accept(joined.id);
+        await owner.members.update(fx.organization, joined.id, { role: "developer" });
+        await owner.members.remove(fx.organization, joined.id);
+        const events = (await log()).items.slice(0, 6);
+        expect(events.map((e) => [e.action, e.actor.id, e.target.type, e.target.id, e.target.name])).toEqual([
+          ["member.removed", me.id, "member", joined.id, them.email],
+          ["member.role_changed", me.id, "member", joined.id, them.email],
+          ["member.joined", them.id, "member", joined.id, them.email],
+          ["member.invited", me.id, "member", joined.id, them.email],
+          ["member.declined", them.id, "member", declined.id, them.email],
+          ["member.invited", me.id, "member", declined.id, them.email],
+        ]);
+        expect(events.every((e) => e.workspace_id === null && e.environment === null)).toBe(true);
+      });
+
+      it("records nothing for a refused change", async () => {
+        const before = (await log()).pagination.total;
+        const refusals = await Promise.all([
+          failure(
+            as("viewer").workspaces.create(fx.organization, {
+              name: "x",
+              slug: "x",
+              environment: "sandbox",
+              external_id: null,
+            }),
+          ),
+          failure(
+            as("developer").webhooks.create(fx.organization, {
+              environment: "sandbox",
+              url: "https://hooks.northwind.example/refused",
+              description: "",
+              events: ["run.completed"],
+            }),
+          ),
+          failure(as("developer").apiKeys.create(fx.organization, { name: "x", environment: "production" })),
+          failure(as("outsider").workspaces.update(fx.workspaces.acme.id, { name: "Taken" })),
+        ]);
+        expect(refusals.map((e) => e.status)).toEqual([403, 403, 403, 404]);
+        const taken = await failure(
+          owner.workspaces.create(fx.organization, {
+            name: "Acme",
+            slug: fx.workspaces.acme.slug,
+            environment: "production",
+            external_id: null,
+          }),
+        );
+        expect(taken.status).toBe(409);
+        expect((await log()).pagination.total).toBe(before);
+      });
+
+      it("filters by workspace, and finds nothing for one the organization doesn't hold", async () => {
+        const acme = fx.workspaces.acme;
+        const agent = must((await owner.agents.list(acme.id))[0], "agent in acme");
+        await owner.agents.update(acme.id, agent.id, { name: `${agent.name} (audited)` });
+        const page = await log(acme.id);
+        expect(page.items[0]).toMatchObject({
+          action: "agent.updated",
+          target: { type: "agent", id: agent.id, name: `${agent.name} (audited)` },
+          workspace_id: acme.id,
+          workspace: { id: acme.id, name: acme.name, slug: acme.slug, environment: acme.environment },
+          environment: acme.environment,
+        });
+        expect(page.items.every((e) => e.workspace_id === acme.id)).toBe(true);
+        expect(page.pagination.total).toBe(page.items.length);
+        const harbor = (await larkspur()).workspace.id;
+        for (const other of [harbor, "ws_short", uuidOf(acme.id)]) {
+          const none = await log(other);
+          expect([none.items, none.pagination.total]).toEqual([[], 0]);
+        }
+      });
+
+      it("keeps a deleted workspace's history", async () => {
+        const doomed = await sandboxWorkspace("doomed");
+        await owner.workspaces.update(doomed.id, { name: "Doomed" });
+        await owner.workspaces.delete(doomed.id);
+        const history = await log(doomed.id);
+        expect(history.items.map((e) => e.action)).toEqual([
+          "workspace.deleted",
+          "workspace.updated",
+          "workspace.created",
+        ]);
+        for (const event of history.items) {
+          expect([event.workspace_id, event.workspace, event.environment]).toEqual([doomed.id, null, "sandbox"]);
+        }
+        expect(history.items[0]?.target).toEqual({ type: "workspace", id: doomed.id, name: "Doomed" });
+      });
+
+      it("pages newest first, without repeating or skipping an event", async () => {
+        const workspace = await sandboxWorkspace("paged");
+        for (const n of [1, 2, 3, 4]) await owner.workspaces.update(workspace.id, { name: `Paged ${n}` });
+        const whole = await log(workspace.id);
+        expect(whole.items.map((e) => e.target.name)).toEqual(["Paged 4", "Paged 3", "Paged 2", "Paged 1", "paged"]);
+        const seen: string[] = [];
+        let cursor: string | undefined;
+        let pages = 0;
+        do {
+          const page = await owner.audit.list(fx.organization, { workspace_id: workspace.id, limit: 2, cursor });
+          expect(page.pagination.total).toBe(5);
+          expect(page.items.length).toBeLessThanOrEqual(2);
+          seen.push(...page.items.map((e) => e.id));
+          cursor = page.pagination.next_cursor ?? undefined;
+          pages += 1;
+        } while (cursor);
+        expect(pages).toBe(3);
+        expect(seen).toEqual(whole.items.map((e) => e.id));
+        const times = whole.items.map((e) => Date.parse(e.created_at));
+        expect(times).toEqual([...times].sort((a, b) => b - a));
+        // Limits are clamped to 1–100, and a non-integer one means the default.
+        for (const [limit, count] of [
+          [0, 1],
+          [1000, 5],
+          [2.5, 5],
+        ] as const) {
+          const page = await owner.audit.list(fx.organization, { workspace_id: workspace.id, limit });
+          expect(page.items.length).toBe(count);
+        }
+      });
+
+      it("is read by owners and admins only", async () => {
+        for (const persona of ["developer", "viewer"] as const) {
+          const refused = await failure(as(persona).audit.list(fx.organization));
+          expect([refused.status, refused.code]).toEqual([403, "forbidden"]);
+        }
+        expect((await failure(as("outsider").audit.list(fx.organization))).status).toBe(404);
+      });
+
+      it("is read from the Console only, and names the API key that made a change", async () => {
+        const sandbox = fx.workspaces.acmeSandbox;
+        const key = await owner.apiKeys.create(fx.organization, { name: "Backend", environment: "sandbox" });
+        const refused = await failure(withKey(key.secret).audit.list(fx.organization));
+        expect([refused.status, refused.code]).toEqual([403, "console_only"]);
+        const { run, callId } = await waitingRun();
+        const environment = (await owner.workspaces.get(run.workspace_id)).environment;
+        const approver = await owner.apiKeys.create(fx.organization, { name: "Approver", environment });
+        const installation = must((await owner.installations.list(sandbox.id))[0], "installation in acme-sandbox");
+        await withKey(key.secret).installations.update(sandbox.id, installation.id, { label: "By key" });
+        await withKey(approver.secret).runs.resolveApproval(run.workspace_id, run.id, {
+          call_id: callId,
+          decision: "denied",
+        });
+        const [resolved, renamed] = (await log()).items;
+        expect(renamed).toMatchObject({
+          action: "installation.updated",
+          actor: { type: "api_key", id: key.key.id, name: "Backend" },
+          workspace_id: sandbox.id,
+        });
+        expect(resolved).toMatchObject({
+          action: "approval.resolved",
+          actor: { type: "api_key", id: approver.key.id, name: "Approver" },
+          target: { type: "run", id: run.id },
+          workspace_id: run.workspace_id,
+          environment,
+        });
       });
     });
 

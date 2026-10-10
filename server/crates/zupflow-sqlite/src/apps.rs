@@ -10,6 +10,7 @@ use zupflow_core::apps::{
     ClientRegistration, ClientRegistrationId, Configuration, ConfigurationChanges, NewApp, NewClientRegistration,
     NewClientSecret, SecretState, StoredClientSecret,
 };
+use zupflow_core::audit::Audit;
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, OrganizationId, UserId, WorkspaceId};
 use zupflow_core::keys::{Sealed, WrappedKey};
@@ -385,9 +386,11 @@ impl AppStore for SqliteAppStore {
         organization_id: OrganizationId,
         app_id: AppId,
         app: &NewApp,
+        audit: &Audit<'_, App>,
     ) -> Result<App, AppError> {
         let (auth, tools) = encoded(app)?;
         let now = Timestamp::now();
+        let mut transaction = self.immediate().await?;
         sqlx::query(
             "INSERT INTO apps (id, organization_id, kind, name, slug, description, icon_glyph, icon_color, \
              auth, tools, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
@@ -404,10 +407,15 @@ impl AppStore for SqliteAppStore {
         .bind(tools)
         .bind(now.millis())
         .bind(now.millis())
-        .execute(self.database.pool())
+        .execute(&mut *transaction)
         .await
         .map_err(inserted("insert_organization_app"))?;
-        Ok(created(organization_id, None, app_id, app, now))
+        let app = created(organization_id, None, app_id, app, now);
+        crate::audit::record(&mut transaction, organization_id, &audit(&app))
+            .await
+            .map_err(failed("audit"))?;
+        transaction.commit().await.map_err(failed("commit"))?;
+        Ok(app)
     }
 
     async fn find_organization_app(
@@ -433,6 +441,7 @@ impl AppStore for SqliteAppStore {
         organization_id: OrganizationId,
         app_id: AppId,
         changes: AppChanges<'_>,
+        audit: &Audit<'_, App>,
     ) -> Result<App, AppError> {
         let auth = changes.auth.map(serde_json::to_string).transpose().map_err(read)?;
         // A new template and a configuration write are serialised, so neither
@@ -466,6 +475,9 @@ impl AppStore for SqliteAppStore {
         .await
         .map_err(failed("update_organization_app"))?;
         let app = app_from(&row.ok_or(AppError::NotFound)?, None)?;
+        crate::audit::record(&mut transaction, organization_id, &audit(&app))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("update_organization_app"))?;
         Ok(app)
     }
@@ -494,9 +506,11 @@ impl AppStore for SqliteAppStore {
         workspace_id: WorkspaceId,
         app_id: AppId,
         app: &NewApp,
+        audit: &Audit<'_, App>,
     ) -> Result<App, AppError> {
         let (auth, tools) = encoded(app)?;
         let now = Timestamp::now();
+        let mut transaction = self.immediate().await?;
         let inserted_rows = sqlx::query(
             "INSERT INTO workspace_apps (id, organization_id, workspace_id, kind, name, slug, description, \
              icon_glyph, icon_color, auth, tools, version, created_at, updated_at) \
@@ -520,13 +534,18 @@ impl AppStore for SqliteAppStore {
         .bind(now.millis())
         .bind(organization_id.uuid())
         .bind(workspace_id.uuid())
-        .execute(self.database.pool())
+        .execute(&mut *transaction)
         .await
         .map_err(inserted("insert_workspace_app"))?;
         if inserted_rows.rows_affected() == 0 {
             return Err(AppError::NotFound);
         }
-        Ok(created(organization_id, Some(workspace_id), app_id, app, now))
+        let app = created(organization_id, Some(workspace_id), app_id, app, now);
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&app))
+            .await
+            .map_err(failed("audit"))?;
+        transaction.commit().await.map_err(failed("commit"))?;
+        Ok(app)
     }
 
     async fn find_workspace_app(
@@ -555,6 +574,7 @@ impl AppStore for SqliteAppStore {
         workspace_id: WorkspaceId,
         app_id: AppId,
         changes: AppChanges<'_>,
+        audit: &Audit<'_, App>,
     ) -> Result<App, AppError> {
         let auth = changes.auth.map(serde_json::to_string).transpose().map_err(read)?;
         let mut transaction = self.immediate().await?;
@@ -590,6 +610,9 @@ impl AppStore for SqliteAppStore {
         .await
         .map_err(failed("update_workspace_app"))?;
         let app = workspace_app_from(&row.ok_or(AppError::NotFound)?)?;
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&app))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("update_workspace_app"))?;
         Ok(app)
     }
@@ -640,6 +663,7 @@ impl AppStore for SqliteAppStore {
         app_id: AppId,
         environment: Environment,
         changes: &ConfigurationChanges,
+        audit: &Audit<'_, Configuration>,
     ) -> Result<Configuration, AppError> {
         let write = Write::of(changes)?;
         let mut transaction = self.immediate().await?;
@@ -699,6 +723,9 @@ impl AppStore for SqliteAppStore {
         .await
         .map_err(failed("save_organization_configuration"))?;
         let configuration = configuration_from(&row, environment)?;
+        crate::audit::record(&mut transaction, organization_id, &audit(&configuration))
+            .await
+            .map_err(failed("audit"))?;
         transaction
             .commit()
             .await
@@ -778,6 +805,7 @@ impl AppStore for SqliteAppStore {
         workspace_id: WorkspaceId,
         app_id: AppId,
         changes: &ConfigurationChanges,
+        audit: &Audit<'_, Configuration>,
     ) -> Result<Configuration, AppError> {
         let write = Write::of(changes)?;
         let mut transaction = self.immediate().await?;
@@ -844,6 +872,9 @@ impl AppStore for SqliteAppStore {
         .await
         .map_err(failed("save_workspace_configuration"))?;
         let configuration = configuration_from(&row, environment_of(&row)?)?;
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&configuration))
+            .await
+            .map_err(failed("audit"))?;
         transaction
             .commit()
             .await
@@ -1112,7 +1143,12 @@ mod tests {
             };
             ids.push(
                 workspaces
-                    .create_workspace(org, WorkspaceId::generate(), &workspace)
+                    .create_workspace(
+                        org,
+                        WorkspaceId::generate(),
+                        &workspace,
+                        &zupflow_conformance::audit_store::by_suite,
+                    )
                     .await
                     .unwrap()
                     .id,
@@ -1121,18 +1157,30 @@ mod tests {
         let apps = SqliteAppStore::new(database);
         let app = || NewApp::blank("Tools".into(), "tools".into(), String::new(), AuthType::Token);
         let gone = apps
-            .create_workspace_app(org, ids[0], AppId::generate(), &app())
+            .create_workspace_app(org, ids[0], AppId::generate(), &app(), &|_| {
+                zupflow_conformance::audit_store::by_suite_in(ids[0])
+            })
             .await
             .unwrap();
         let kept = apps
-            .create_workspace_app(org, ids[1], AppId::generate(), &app())
+            .create_workspace_app(org, ids[1], AppId::generate(), &app(), &|_| {
+                zupflow_conformance::audit_store::by_suite_in(ids[1])
+            })
             .await
             .unwrap();
         let catalog = apps
-            .create_organization_app(org, AppId::generate(), &app())
+            .create_organization_app(
+                org,
+                AppId::generate(),
+                &app(),
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
-        workspaces.delete_workspace(org, ids[0]).await.unwrap();
+        workspaces
+            .delete_workspace(org, ids[0], &|_| zupflow_conformance::audit_store::by_suite_in(ids[0]))
+            .await
+            .unwrap();
         assert_eq!(apps.find_workspace_app(org, ids[0], gone.id).await.unwrap(), None);
         assert_eq!(apps.find_workspace_app(org, ids[1], kept.id).await.unwrap(), Some(kept));
         assert_eq!(

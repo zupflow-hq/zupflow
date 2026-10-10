@@ -3,6 +3,7 @@
 //! - [`Database`]: opens the file, sets it up and applies the migrations.
 //! - [`SqliteAgentStore`]: agents and their grants, held to the tool registry.
 //! - [`SqliteApiKeyStore`]: API keys, by keyed hash.
+//! - [`SqliteAuditStore`]: the audit log, which every store writes with the change it records.
 //! - [`SqliteAppStore`]: catalog apps and workspace apps.
 //! - [`SqliteConnectStore`]: Connect settings and sessions.
 //! - [`SqliteIdempotencyStore`]: idempotency keys for `POST`.
@@ -22,6 +23,7 @@
 mod agents;
 mod api_keys;
 mod apps;
+mod audit;
 mod connect;
 mod database;
 mod idempotency;
@@ -39,6 +41,7 @@ mod workspaces;
 pub use agents::SqliteAgentStore;
 pub use api_keys::SqliteApiKeyStore;
 pub use apps::SqliteAppStore;
+pub use audit::SqliteAuditStore;
 pub use connect::SqliteConnectStore;
 pub use database::{Database, DatabaseError};
 pub use idempotency::SqliteIdempotencyStore;

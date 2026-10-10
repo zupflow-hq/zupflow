@@ -85,7 +85,8 @@ Read `README.md` first.
   `id, organization_id`, workspace-scoped ones `id, organization_id,
   workspace_id`, all `UUID` and declared NOT NULL (`id UUID NOT NULL PRIMARY
   KEY`: SQLite lets a primary key hold NULL); a `workspace_id` references
-  `workspaces (organization_id, id)`; every reference carries the
+  `workspaces (organization_id, id)` (except `audit_events`, which keeps a
+  deleted workspace's history); every reference carries the
   organization. UUIDs are 16-byte blobs, instants INTEGER milliseconds UTC.
   Every statement after the trust context repeats the full scope, even next to
   a unique ID; the few that can't (a worker's claim) are named and documented

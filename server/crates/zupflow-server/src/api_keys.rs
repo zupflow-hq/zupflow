@@ -8,6 +8,7 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use serde::Serialize;
 use zupflow_core::api_keys::{ApiKey, ApiKeyError, NewApiKey, NewSecret};
+use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::ApiKeyId;
@@ -107,6 +108,14 @@ async fn create_api_key(
                 secret_hash: state.api_key_hasher.hash(&secret.secret),
                 created_by: access.user.id,
             },
+            &|key: &ApiKey| {
+                AuditEntry::new(
+                    access.audit_actor(),
+                    AuditAction::ApiKeyCreated,
+                    AuditTarget::new(AuditObject::ApiKey(key.id), &key.name),
+                    AuditPlace::Environment(key.environment),
+                )
+            },
         )
         .await
         .map_err(unavailable)?;
@@ -137,7 +146,14 @@ async fn revoke_api_key(
     may_manage(&access, key.environment, "revoke")?;
     let revoked = state
         .api_keys
-        .revoke_api_key(access.organization.id, key_id)
+        .revoke_api_key(access.organization.id, key_id, &|key: &ApiKey| {
+            AuditEntry::new(
+                access.audit_actor(),
+                AuditAction::ApiKeyRevoked,
+                AuditTarget::new(AuditObject::ApiKey(key.id), &key.name),
+                AuditPlace::Environment(key.environment),
+            )
+        })
         .await
         .map_err(|error| match error {
             ApiKeyError::NotFound => not_found(),

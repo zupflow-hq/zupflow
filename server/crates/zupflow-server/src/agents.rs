@@ -22,6 +22,7 @@ use axum::routing::get;
 use serde::Serialize;
 use serde_json::Value;
 use zupflow_core::agents::{Agent, AgentChanges, AgentError, AgentStatus, Grant, GrantTools, NewAgent};
+use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{AgentId, GrantId, InstallationId, WorkspaceId};
 use zupflow_core::models::ModelError;
@@ -344,6 +345,14 @@ async fn create_agent(
                 model,
                 instructions,
             },
+            &|agent: &Agent| {
+                AuditEntry::new(
+                    access.access.audit_actor(),
+                    AuditAction::AgentCreated,
+                    AuditTarget::new(AuditObject::Agent(agent.id), &agent.name),
+                    AuditPlace::Workspace(access.workspace.id),
+                )
+            },
         )
         .await
         .map_err(|error| agent_failure(error, "this installation"))?;
@@ -384,6 +393,12 @@ async fn update_agent(
         parsed
     });
     fields.finish()?;
+    // As the Console reads it: a status sent pauses or resumes the agent.
+    let action = match status {
+        Some(AgentStatus::Paused) => AuditAction::AgentPaused,
+        Some(AgentStatus::Active) => AuditAction::AgentResumed,
+        None => AuditAction::AgentUpdated,
+    };
     let updated = state
         .agents
         .update_agent(
@@ -396,6 +411,14 @@ async fn update_agent(
                 model,
                 instructions,
                 status,
+            },
+            &|agent: &Agent| {
+                AuditEntry::new(
+                    access.access.audit_actor(),
+                    action,
+                    AuditTarget::new(AuditObject::Agent(agent.id), &agent.name),
+                    AuditPlace::Workspace(access.workspace.id),
+                )
             },
         )
         .await
@@ -415,7 +438,19 @@ async fn delete_agent(
     let agent = find(&state, &access, &agent).await?;
     state
         .agents
-        .delete_agent(access.access.organization_id, access.workspace.id, agent.id)
+        .delete_agent(
+            access.access.organization_id,
+            access.workspace.id,
+            agent.id,
+            &|agent: &Agent| {
+                AuditEntry::new(
+                    access.access.audit_actor(),
+                    AuditAction::AgentDeleted,
+                    AuditTarget::new(AuditObject::Agent(agent.id), &agent.name),
+                    AuditPlace::Workspace(access.workspace.id),
+                )
+            },
+        )
         .await
         .map_err(|error| agent_failure(error, "this installation"))?;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -530,6 +565,14 @@ async fn create_grant(
             GrantId::generate(),
             installation,
             &tools,
+            &|_: &Grant| {
+                AuditEntry::new(
+                    access.access.audit_actor(),
+                    AuditAction::AgentGrantCreated,
+                    AuditTarget::new(AuditObject::Agent(agent.id), &agent.name),
+                    AuditPlace::Workspace(access.workspace.id),
+                )
+            },
         )
         .await
     {
@@ -573,6 +616,14 @@ async fn update_grant(
             agent.id,
             grant,
             &tools,
+            &|_: &Grant| {
+                AuditEntry::new(
+                    access.access.audit_actor(),
+                    AuditAction::AgentGrantUpdated,
+                    AuditTarget::new(AuditObject::Agent(agent.id), &agent.name),
+                    AuditPlace::Workspace(access.workspace.id),
+                )
+            },
         )
         .await
     {
@@ -598,6 +649,14 @@ async fn delete_grant(
             access.workspace.id,
             agent.id,
             grant_id(&grant)?,
+            &|_: &()| {
+                AuditEntry::new(
+                    access.access.audit_actor(),
+                    AuditAction::AgentGrantRevoked,
+                    AuditTarget::new(AuditObject::Agent(agent.id), &agent.name),
+                    AuditPlace::Workspace(access.workspace.id),
+                )
+            },
         )
         .await
         .map_err(|error| agent_failure(error, "this installation"))?;

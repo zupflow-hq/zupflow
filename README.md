@@ -229,6 +229,13 @@ it. `ConfiguredPolicy` in `zupflow-basic` is the built-in `ApprovalPolicy`
 that decides each call a run makes; it fails closed, requiring approval when
 its configuration can't be read.
 
+The audit log is served too: owners and admins read their organization's
+events from the Console, newest first, paged and filtered by workspace on the
+server. Each change the mock records writes its event in the same transaction,
+naming who made it (a member, an API key, or Connect), what changed and where;
+never a secret. A deleted workspace's events stay (decision: keep history);
+they go only with their organization.
+
 The models are the deployment's to list, in `ZUPFLOW_MODELS`: a JSON array
 of `{"id", "name", "provider", "description"}` objects in the order to offer
 them (`description` optional; IDs of letters, digits and `. - _ : / @`, each

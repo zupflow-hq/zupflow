@@ -160,6 +160,8 @@ contractSuite({
       outsider: () => userByEmail("rowan@larkspur.example"),
     }[persona]()}`,
   reset: async () => resetDb(),
+  // The mock has no API keys: Console sessions only.
+  apiKeys: false,
 });
 
 describe("the contract", () => {
@@ -603,6 +605,35 @@ describe("approvals", () => {
     expect(said?.type === "message.assistant" ? said.data.text : "").toMatch(
       /the request was denied: Not this week\.$/,
     );
+  });
+});
+
+describe("approvals in the audit log", () => {
+  it("names the API key that recorded the decision", async () => {
+    const run = must(
+      db().runs.find((r) => r.status === "waiting_for_approval"),
+      "waiting run",
+    );
+    const { resolveApproval } = await import("./runner");
+    const requested = [...timelineOf(db(), run)].reverse().find((e) => e.type === "approval.requested");
+    const callId = must(requested?.type === "approval.requested" ? requested.data.call_id : null, "pending call");
+    const keyId = approvalKeyFor(run.workspace_id);
+    const key = must(
+      db().api_keys.find((k) => k.id === keyId),
+      "key",
+    );
+    resolveApproval(db(), run, callId, "approved", keyId, new Date().toISOString());
+    const agent = must(
+      db().agents.find((a) => a.organization_id === run.organization_id && a.id === run.agent_id),
+      "agent",
+    );
+    expect(must(db().audit[0], "event")).toMatchObject({
+      organization_id: run.organization_id,
+      workspace_id: run.workspace_id,
+      actor: { type: "api_key", id: key.id, name: key.name },
+      action: "approval.resolved",
+      target: { type: "run", id: run.id, name: agent.name },
+    });
   });
 });
 
@@ -1744,6 +1775,26 @@ describe("two organizations", () => {
     const listed = await owner.workspaceApps.list(acme.id);
     expect(listed.find((a) => a.id === publishing.id)?.configurations.map((c) => c.environment)).toEqual([
       "production",
+    ]);
+  });
+
+  it("records a workspace app's changes in its workspace", async () => {
+    const acme = ws("acme");
+    const created = await owner.workspaceApps.create(acme.id, {
+      kind: "mcp",
+      name: "Ledger",
+      slug: "ledger",
+      description: "",
+      auth_type: "token",
+    });
+    await owner.workspaceApps.update(acme.id, created.id, { name: "Ledger 2" });
+    const events = db()
+      .audit.filter((e) => e.organization_id === acme.organization_id)
+      .slice(0, 2)
+      .map((e) => [e.action, e.workspace_id, e.target.name]);
+    expect(events).toEqual([
+      ["app.updated", acme.id, "Ledger 2"],
+      ["app.created", acme.id, "Ledger"],
     ]);
   });
 

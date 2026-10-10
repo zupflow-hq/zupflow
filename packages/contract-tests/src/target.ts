@@ -32,6 +32,12 @@ export interface Target {
    * never sends that request.
    */
   operations?: readonly string[];
+  /**
+   * Whether the server accepts the API keys it issues as credentials; it
+   * does when omitted. On one that doesn't (the mock has no API keys), a case
+   * that needs a key is skipped.
+   */
+  apiKeys?: boolean;
 }
 
 /**

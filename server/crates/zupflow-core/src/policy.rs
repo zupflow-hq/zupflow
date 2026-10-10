@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 
 use crate::apps::ToolEffect;
+use crate::audit::Audit;
 use crate::ids::{AgentId, AppId, InstallationId, OrganizationId, UserId, WorkspaceId};
 use crate::organizations::User;
 use crate::time::Timestamp;
@@ -225,13 +226,15 @@ pub trait ToolPolicyStore: Send + Sync {
     /// The organization's policy; the defaults when it was never saved.
     async fn load_policy(&self, organization_id: OrganizationId) -> Result<ToolPolicy, PolicyError>;
 
-    /// Saves the policy, as written by `updated_by` (`None` for an API key).
+    /// Saves the policy, as written by `updated_by` (`None` for an API key),
+    /// recording `audit` of it as saved.
     async fn save_policy(
         &self,
         organization_id: OrganizationId,
         settings: PolicySettings,
         updated_by: Option<UserId>,
         now: Timestamp,
+        audit: &Audit<'_, ToolPolicy>,
     ) -> Result<ToolPolicy, PolicyError>;
 
     /// A page of the app's levels, by tool name (byte order): those whose
@@ -258,7 +261,8 @@ pub trait ToolPolicyStore: Send + Sync {
     /// Sets levels by tool name, each confirmed by `updated_by`, in one
     /// transaction; answers the levels written, by tool name. A name no
     /// installation listed yet can be set ahead of it. Checked with
-    /// [`validate_levels`] first (`InvalidLevels`).
+    /// [`validate_levels`] first (`InvalidLevels`). Records `audit` of the
+    /// levels written.
     async fn set_levels(
         &self,
         organization_id: OrganizationId,
@@ -266,6 +270,7 @@ pub trait ToolPolicyStore: Send + Sync {
         levels: &[(String, ToolLevel)],
         updated_by: Option<UserId>,
         now: Timestamp,
+        audit: &Audit<'_, Vec<AppToolLevel>>,
     ) -> Result<Vec<AppToolLevel>, PolicyError>;
 
     /// Suggests a level from its hints for each listed tool the app has no

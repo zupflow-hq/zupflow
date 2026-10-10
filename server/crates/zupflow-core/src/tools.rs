@@ -20,6 +20,7 @@
 use async_trait::async_trait;
 
 use crate::apps::ToolEffect;
+use crate::audit::Audit;
 use crate::ids::{InstallationId, OrganizationId, WorkspaceId};
 use crate::time::Timestamp;
 
@@ -176,7 +177,7 @@ pub trait ToolRegistry: Send + Sync {
     /// accept (`NotChanged`: none, or the tool is gone), then the latest
     /// definition's hash against `expected`, the hash reviewed (`Stale`;
     /// `None`, for what can't be a hash, matches none). The tool's effect
-    /// stays as first seen.
+    /// stays as first seen. Records `audit` of the tool as accepted.
     async fn accept_change(
         &self,
         organization_id: OrganizationId,
@@ -184,6 +185,7 @@ pub trait ToolRegistry: Send + Sync {
         installation_id: InstallationId,
         name: &str,
         expected: Option<[u8; 32]>,
+        audit: &Audit<'_, RegisteredTool>,
     ) -> Result<RegisteredTool, ToolError>;
 }
 

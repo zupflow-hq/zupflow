@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, Sqlite, Transaction};
+use zupflow_core::audit::Audit;
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{OrganizationId, WebhookDeliveryId, WebhookEndpointId, WebhookEventId};
 use zupflow_core::jobs::LeaseToken;
@@ -175,7 +176,9 @@ impl WebhookStore for SqliteWebhookStore {
         endpoint_id: WebhookEndpointId,
         endpoint: &NewEndpoint,
         now: Timestamp,
+        audit: &Audit<'_, WebhookEndpoint>,
     ) -> Result<WebhookEndpoint, WebhookError> {
+        let mut transaction = self.immediate("create_endpoint").await?;
         sqlx::query(
             "INSERT INTO webhook_endpoints (id, organization_id, environment, url, description, events, enabled, \
              secret_version, secret_key_id, secret_wrapped_key, secret_nonce, secret_ciphertext, secret_last4, \
@@ -194,12 +197,21 @@ impl WebhookStore for SqliteWebhookStore {
         .bind(endpoint.secret.ciphertext.as_slice())
         .bind(&endpoint.secret_last4)
         .bind(now.millis())
-        .execute(self.database.pool())
+        .execute(&mut *transaction)
         .await
         .map_err(failed("create_endpoint"))?;
-        self.find_endpoint(organization_id, endpoint_id)
-            .await?
-            .ok_or(WebhookError::Unavailable)
+        let row = sqlx::query(concat!(select_endpoint!(), " WHERE organization_id = ? AND id = ?"))
+            .bind(organization_id.uuid())
+            .bind(endpoint_id.uuid())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(failed("create_endpoint"))?;
+        let created = endpoint_from(&row)?;
+        crate::audit::record(&mut transaction, organization_id, &audit(&created))
+            .await
+            .map_err(failed("audit"))?;
+        transaction.commit().await.map_err(failed("create_endpoint"))?;
+        Ok(created)
     }
 
     async fn update_endpoint(
@@ -207,7 +219,9 @@ impl WebhookStore for SqliteWebhookStore {
         organization_id: OrganizationId,
         endpoint_id: WebhookEndpointId,
         changes: &EndpointChanges,
+        audit: &Audit<'_, WebhookEndpoint>,
     ) -> Result<WebhookEndpoint, WebhookError> {
+        let mut transaction = self.immediate("update_endpoint").await?;
         let updated = sqlx::query(
             "UPDATE webhook_endpoints SET url = coalesce(?, url), description = coalesce(?, description), \
              events = coalesce(?, events), \
@@ -221,32 +235,51 @@ impl WebhookStore for SqliteWebhookStore {
         .bind(changes.enabled.map(i64::from))
         .bind(organization_id.uuid())
         .bind(endpoint_id.uuid())
-        .execute(self.database.pool())
+        .execute(&mut *transaction)
         .await
         .map_err(failed("update_endpoint"))?;
         if updated.rows_affected() == 0 {
             return Err(WebhookError::NotFound);
         }
-        self.find_endpoint(organization_id, endpoint_id)
-            .await?
-            .ok_or(WebhookError::NotFound)
+        let row = sqlx::query(concat!(select_endpoint!(), " WHERE organization_id = ? AND id = ?"))
+            .bind(organization_id.uuid())
+            .bind(endpoint_id.uuid())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(failed("update_endpoint"))?;
+        let endpoint = endpoint_from(&row.ok_or(WebhookError::NotFound)?)?;
+        crate::audit::record(&mut transaction, organization_id, &audit(&endpoint))
+            .await
+            .map_err(failed("audit"))?;
+        transaction.commit().await.map_err(failed("update_endpoint"))?;
+        Ok(endpoint)
     }
 
     async fn delete_endpoint(
         &self,
         organization_id: OrganizationId,
         endpoint_id: WebhookEndpointId,
+        audit: &Audit<'_, WebhookEndpoint>,
     ) -> Result<(), WebhookError> {
-        // Its deliveries go with it, by their cascading key.
-        let deleted = sqlx::query("DELETE FROM webhook_endpoints WHERE organization_id = ? AND id = ?")
+        let mut transaction = self.immediate("delete_endpoint").await?;
+        let row = sqlx::query(concat!(select_endpoint!(), " WHERE organization_id = ? AND id = ?"))
             .bind(organization_id.uuid())
             .bind(endpoint_id.uuid())
-            .execute(self.database.pool())
+            .fetch_optional(&mut *transaction)
             .await
             .map_err(failed("delete_endpoint"))?;
-        if deleted.rows_affected() == 0 {
-            return Err(WebhookError::NotFound);
-        }
+        let endpoint = endpoint_from(&row.ok_or(WebhookError::NotFound)?)?;
+        // Its deliveries go with it, by their cascading key.
+        sqlx::query("DELETE FROM webhook_endpoints WHERE organization_id = ? AND id = ?")
+            .bind(organization_id.uuid())
+            .bind(endpoint_id.uuid())
+            .execute(&mut *transaction)
+            .await
+            .map_err(failed("delete_endpoint"))?;
+        crate::audit::record(&mut transaction, organization_id, &audit(&endpoint))
+            .await
+            .map_err(failed("audit"))?;
+        transaction.commit().await.map_err(failed("delete_endpoint"))?;
         Ok(())
     }
 
@@ -729,6 +762,7 @@ mod tests {
                     secret_last4: "abcd".to_owned(),
                 },
                 Timestamp::now(),
+                &zupflow_conformance::audit_store::by_suite,
             )
             .await
             .unwrap();
@@ -755,7 +789,9 @@ mod tests {
 
         let delivery = store.record_event(a.organization_id, &event(a.sandbox)).await.unwrap()[0];
         crate::SqliteWorkspaceStore::new(database.clone())
-            .delete_workspace(a.organization_id, a.sandbox)
+            .delete_workspace(a.organization_id, a.sandbox, &|_| {
+                zupflow_conformance::audit_store::by_suite_in(a.sandbox)
+            })
             .await
             .unwrap();
         assert!(

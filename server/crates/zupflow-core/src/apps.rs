@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::audit::Audit;
 use crate::environment::Environment;
 use crate::ids::{AppId, OrganizationId, UserId, WorkspaceId};
 use crate::keys::Sealed;
@@ -488,6 +489,8 @@ pub struct NewClientRegistration {
     pub sealed: Option<Sealed>,
 }
 
+/// Creating or changing an app or its configuration records its [`Audit`]
+/// in the same transaction; keeping a registered client doesn't.
 #[async_trait]
 pub trait AppStore: Send + Sync {
     /// The organization's catalog, by name.
@@ -498,6 +501,7 @@ pub trait AppStore: Send + Sync {
         organization_id: OrganizationId,
         app_id: AppId,
         app: &NewApp,
+        audit: &Audit<'_, App>,
     ) -> Result<App, AppError>;
 
     /// A catalog app, in this organization only; never a workspace app.
@@ -512,6 +516,7 @@ pub trait AppStore: Send + Sync {
         organization_id: OrganizationId,
         app_id: AppId,
         changes: AppChanges<'_>,
+        audit: &Audit<'_, App>,
     ) -> Result<App, AppError>;
 
     /// The workspace's own apps, by name.
@@ -528,6 +533,7 @@ pub trait AppStore: Send + Sync {
         workspace_id: WorkspaceId,
         app_id: AppId,
         app: &NewApp,
+        audit: &Audit<'_, App>,
     ) -> Result<App, AppError>;
 
     /// A workspace app, in this workspace of this organization only.
@@ -544,6 +550,7 @@ pub trait AppStore: Send + Sync {
         workspace_id: WorkspaceId,
         app_id: AppId,
         changes: AppChanges<'_>,
+        audit: &Audit<'_, App>,
     ) -> Result<App, AppError>;
 
     /// Every written configuration of the organization's catalog apps.
@@ -569,6 +576,7 @@ pub trait AppStore: Send + Sync {
         app_id: AppId,
         environment: Environment,
         changes: &ConfigurationChanges,
+        audit: &Audit<'_, Configuration>,
     ) -> Result<Configuration, AppError>;
 
     async fn find_organization_client_secret(
@@ -600,6 +608,7 @@ pub trait AppStore: Send + Sync {
         workspace_id: WorkspaceId,
         app_id: AppId,
         changes: &ConfigurationChanges,
+        audit: &Audit<'_, Configuration>,
     ) -> Result<Configuration, AppError>;
 
     async fn find_workspace_client_secret(

@@ -16,6 +16,7 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use zupflow_core::api_keys::{ApiKey, ApiKeyHasher, ApiKeyStore, SECRET_PREFIX};
 use zupflow_core::apps::AppStore;
+use zupflow_core::audit::{AuditActor, AuditStore};
 use zupflow_core::connect::ConnectStore;
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
@@ -74,6 +75,8 @@ pub struct AppState {
     pub events: Arc<dyn zupflow_core::events::EventBus>,
     /// Webhook endpoints, their events and deliveries (decision 0017).
     pub webhooks: Arc<dyn zupflow_core::webhooks::WebhookStore>,
+    /// The audit log, which the other stores write with each change.
+    pub audit: Arc<dyn AuditStore>,
     /// How the Console signs in, as `GET /v1/sign-in-settings` tells it:
     /// the same mode `identity` verifies.
     pub sign_in: crate::sign_in::SignInSettings,
@@ -266,6 +269,11 @@ impl OrganizationAccess {
         })
     }
 
+    /// Who the audit log says made a change: this person, by their name now.
+    pub fn audit_actor(&self) -> AuditActor {
+        user_actor(&self.user)
+    }
+
     /// `403` unless the caller's role is one of `roles`.
     pub fn require(&self, allowed: impl Fn(MemberRole) -> bool, action: &str) -> Result<(), Failure> {
         if allowed(self.member.role) {
@@ -276,6 +284,14 @@ impl OrganizationAccess {
             self.member.role.as_str()
         ))
         .into())
+    }
+}
+
+/// A signed-in person as the audit log names them.
+pub fn user_actor(user: &User) -> AuditActor {
+    AuditActor::User {
+        id: user.id,
+        name: user.name.clone(),
     }
 }
 
@@ -344,6 +360,17 @@ impl Access {
         match &self.actor {
             Actor::Member(access) => access.require(allowed, action),
             Actor::ApiKey(_) => Ok(()),
+        }
+    }
+
+    /// Who the audit log says made a change: the member, or the key by its name.
+    pub fn audit_actor(&self) -> AuditActor {
+        match &self.actor {
+            Actor::Member(access) => access.audit_actor(),
+            Actor::ApiKey(key) => AuditActor::ApiKey {
+                id: key.id,
+                name: key.name.clone(),
+            },
         }
     }
 

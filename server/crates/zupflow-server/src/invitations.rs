@@ -17,12 +17,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Serialize;
+use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{MemberId, OrganizationId};
-use zupflow_core::organizations::{Invitation, Inviter, MemberRole, StoreError, User};
+use zupflow_core::organizations::{Invitation, Inviter, Member, MemberRole, Organization, StoreError, User};
 use zupflow_core::time::Timestamp;
 
-use crate::auth::{AppState, ConsoleSession, SignInAddress, unavailable};
+use crate::auth::{AppState, ConsoleSession, SignInAddress, unavailable, user_actor};
 use crate::http::{Failure, envelope};
 use crate::organizations::view;
 
@@ -137,7 +138,17 @@ async fn accept_invitation(
     let invitation_id = MemberId::parse(&invitation).map_err(|_| invitation_not_found())?;
     let (organization, member) = state
         .organizations
-        .accept_invitation_of_user(user.id, invitation_id, Timestamp::now())
+        .accept_invitation_of_user(user.id, invitation_id, Timestamp::now(), &|(_, member): &(
+            Organization,
+            Member,
+        )| {
+            AuditEntry::new(
+                user_actor(&user),
+                AuditAction::MemberJoined,
+                AuditTarget::new(AuditObject::Member(member.id), &user.email),
+                AuditPlace::Organization,
+            )
+        })
         .await
         .map_err(refused)?;
     tracing::info!(
@@ -158,7 +169,14 @@ async fn decline_invitation(
     let invitation_id = MemberId::parse(&invitation).map_err(|_| invitation_not_found())?;
     state
         .organizations
-        .decline_invitation_of_user(user.id, invitation_id)
+        .decline_invitation_of_user(user.id, invitation_id, &|_: &()| {
+            AuditEntry::new(
+                user_actor(&user),
+                AuditAction::MemberDeclined,
+                AuditTarget::new(AuditObject::Member(invitation_id), &user.email),
+                AuditPlace::Organization,
+            )
+        })
         .await
         .map_err(refused)?;
     tracing::info!(event = "invitations.declined", member_id = %invitation_id);

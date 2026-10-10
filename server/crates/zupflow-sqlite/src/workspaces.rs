@@ -13,6 +13,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, Sqlite};
 use uuid::Uuid;
+use zupflow_core::audit::Audit;
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{OrganizationId, WorkspaceId};
 use zupflow_core::time::Timestamp;
@@ -32,6 +33,14 @@ pub struct SqliteWorkspaceStore {
 impl SqliteWorkspaceStore {
     pub fn new(database: Database) -> Self {
         Self { database }
+    }
+
+    async fn immediate(&self) -> Result<sqlx::Transaction<'static, Sqlite>, WorkspaceError> {
+        self.database
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(failed("begin"))
     }
 }
 
@@ -187,8 +196,10 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         workspace: &NewWorkspace,
+        audit: &Audit<'_, Workspace>,
     ) -> Result<Workspace, WorkspaceError> {
         let created_at = Timestamp::now();
+        let mut transaction = self.immediate().await?;
         sqlx::query(
             "INSERT INTO workspaces (id, organization_id, environment, name, slug, external_id, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -200,7 +211,7 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         .bind(&workspace.slug)
         .bind(&workspace.external_id)
         .bind(created_at.millis())
-        .execute(self.database.pool())
+        .execute(&mut *transaction)
         .await
         .map_err(|error| {
             if error
@@ -212,7 +223,7 @@ impl WorkspaceStore for SqliteWorkspaceStore {
                 failed("insert_workspace")(error)
             }
         })?;
-        Ok(Workspace {
+        let created = Workspace {
             id: workspace_id,
             organization_id,
             name: workspace.name.clone(),
@@ -220,7 +231,12 @@ impl WorkspaceStore for SqliteWorkspaceStore {
             environment: workspace.environment,
             external_id: workspace.external_id.clone(),
             created_at,
-        })
+        };
+        crate::audit::record(&mut transaction, organization_id, &audit(&created))
+            .await
+            .map_err(failed("audit"))?;
+        transaction.commit().await.map_err(failed("commit"))?;
+        Ok(created)
     }
 
     async fn find_workspace(
@@ -249,7 +265,9 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         workspace_id: WorkspaceId,
         name: Option<&str>,
         external_id: Option<Option<&str>>,
+        audit: &Audit<'_, Workspace>,
     ) -> Result<Workspace, WorkspaceError> {
+        let mut transaction = self.immediate().await?;
         let row = sqlx::query(concat!(
             "UPDATE workspaces SET name = coalesce(?, name), \
              external_id = CASE WHEN ? THEN ? ELSE external_id END \
@@ -261,28 +279,53 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         .bind(external_id.flatten())
         .bind(organization_id.uuid())
         .bind(workspace_id.uuid())
-        .fetch_optional(self.database.pool())
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(failed("update_workspace"))?;
-        workspace_from(&row.ok_or(WorkspaceError::NotFound)?)
+        let workspace = workspace_from(&row.ok_or(WorkspaceError::NotFound)?)?;
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&workspace))
+            .await
+            .map_err(failed("audit"))?;
+        transaction.commit().await.map_err(failed("commit"))?;
+        Ok(workspace)
     }
 
     async fn delete_workspace(
         &self,
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
+        audit: &Audit<'_, Workspace>,
     ) -> Result<(), WorkspaceError> {
-        // Everything workspace-scoped references the workspace with a
-        // cascading key, so its rows go with it in this one statement.
+        // The event is recorded first, while the workspace is there to place
+        // it: it keeps the workspace's ID, so the workspace's history finds
+        // its deletion. Everything workspace-scoped references the workspace
+        // with a cascading key, so its rows go with it in the one DELETE.
+        // The audit log doesn't reference it: its history stays.
+        let mut transaction = self.immediate().await?;
+        let found = sqlx::query(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM workspaces WHERE organization_id = ? AND id = ?"
+        ))
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(failed("delete_workspace"))?;
+        let workspace = workspace_from(&found.ok_or(WorkspaceError::NotFound)?)?;
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&workspace))
+            .await
+            .map_err(failed("audit"))?;
         let deleted = sqlx::query("DELETE FROM workspaces WHERE organization_id = ? AND id = ?")
             .bind(organization_id.uuid())
             .bind(workspace_id.uuid())
-            .execute(self.database.pool())
+            .execute(&mut *transaction)
             .await
             .map_err(failed("delete_workspace"))?;
-        if deleted.rows_affected() == 0 {
+        if deleted.rows_affected() != 1 {
             return Err(WorkspaceError::NotFound);
         }
+        transaction.commit().await.map_err(failed("commit"))?;
         Ok(())
     }
 
@@ -367,11 +410,21 @@ mod tests {
             external_id: None,
         };
         let doomed = store
-            .create_workspace(org, WorkspaceId::generate(), &new("doomed"))
+            .create_workspace(
+                org,
+                WorkspaceId::generate(),
+                &new("doomed"),
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         let sibling = store
-            .create_workspace(org, WorkspaceId::generate(), &new("sibling"))
+            .create_workspace(
+                org,
+                WorkspaceId::generate(),
+                &new("sibling"),
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         let queue = crate::SqliteJobQueue::new(database.clone());
@@ -387,7 +440,12 @@ mod tests {
                 .await
                 .unwrap();
         }
-        store.delete_workspace(org, doomed.id).await.unwrap();
+        store
+            .delete_workspace(org, doomed.id, &|_| {
+                zupflow_conformance::audit_store::by_suite_in(doomed.id)
+            })
+            .await
+            .unwrap();
         let left: Vec<Uuid> = sqlx::query_scalar("SELECT workspace_id FROM jobs WHERE organization_id = ?")
             .bind(org.uuid())
             .fetch_all(database.pool())

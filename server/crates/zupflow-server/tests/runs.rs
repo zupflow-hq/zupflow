@@ -982,8 +982,11 @@ impl ToolPolicyStore for UnreadableLevels {
         settings: PolicySettings,
         updated_by: Option<UserId>,
         now: Timestamp,
+        audit: &zupflow_core::audit::Audit<'_, ToolPolicy>,
     ) -> Result<ToolPolicy, PolicyError> {
-        self.0.save_policy(organization_id, settings, updated_by, now).await
+        self.0
+            .save_policy(organization_id, settings, updated_by, now, audit)
+            .await
     }
 
     async fn list_levels(
@@ -1007,9 +1010,10 @@ impl ToolPolicyStore for UnreadableLevels {
         levels: &[(String, ToolLevel)],
         updated_by: Option<UserId>,
         now: Timestamp,
+        audit: &zupflow_core::audit::Audit<'_, Vec<AppToolLevel>>,
     ) -> Result<Vec<AppToolLevel>, PolicyError> {
         self.0
-            .set_levels(organization_id, app_id, levels, updated_by, now)
+            .set_levels(organization_id, app_id, levels, updated_by, now, audit)
             .await
     }
 

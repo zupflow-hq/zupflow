@@ -643,6 +643,8 @@ export function seed(nowMs: number = Date.now()): Db {
   seedFernhill(db, nowMs);
   seedTools(db, nowMs, sandboxLinear);
   seedLevels(db, nowMs, { google, linear, stripe, github }, jordan.id);
+  // Seeded runs record their approvals as they're decided: newest first, like the log.
+  db.audit.sort((a, b) => b.created_at.localeCompare(a.created_at));
   return db;
 }
 

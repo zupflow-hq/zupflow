@@ -20,6 +20,8 @@ use zupflow_core::policy::{
 };
 use zupflow_core::time::Timestamp;
 
+use crate::audit_store::by_suite;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Tenant {
     pub organization_id: OrganizationId,
@@ -128,7 +130,10 @@ async fn reads_the_defaults_until_saved(store: &dyn ToolPolicyStore, prepare: &P
         new_tool_level: NewToolLevel::Deny,
     };
     let now = Timestamp::from_millis(Timestamp::now().millis());
-    let saved = store.save_policy(org, deny, Some(t.user), now).await.unwrap();
+    let saved = store
+        .save_policy(org, deny, Some(t.user), now, &by_suite)
+        .await
+        .unwrap();
     assert_eq!(
         (saved.organization_id, saved.settings, saved.updated_at),
         (org, deny, Some(now))
@@ -144,7 +149,7 @@ async fn reads_the_defaults_until_saved(store: &dyn ToolPolicyStore, prepare: &P
     // Saved again, by an API key: one record, no writer.
     let later = Timestamp::from_millis(now.millis() + 1);
     let again = store
-        .save_policy(org, PolicySettings::default(), None, later)
+        .save_policy(org, PolicySettings::default(), None, later, &by_suite)
         .await
         .unwrap();
     assert_eq!(
@@ -189,7 +194,14 @@ async fn suggests_levels_without_replacing_any(store: &dyn ToolPolicyStore, prep
     );
 
     store
-        .set_levels(org, app, &set(&[("send", ToolLevel::Allow)]), Some(t.user), now)
+        .set_levels(
+            org,
+            app,
+            &set(&[("send", ToolLevel::Allow)]),
+            Some(t.user),
+            now,
+            &by_suite,
+        )
         .await
         .unwrap();
     // Listed again with other hints, and a new tool: only the new one is suggested.
@@ -236,6 +248,7 @@ async fn sets_levels_confirmed_by_their_writer(store: &dyn ToolPolicyStore, prep
             &set(&[("drop", ToolLevel::Deny), ("ahead", ToolLevel::Allow)]),
             Some(t.user),
             now,
+            &by_suite,
         )
         .await
         .unwrap();
@@ -254,7 +267,7 @@ async fn sets_levels_confirmed_by_their_writer(store: &dyn ToolPolicyStore, prep
 
     // Set by an API key: confirmed, no writer.
     let changed = store
-        .set_levels(org, app, &set(&[("ahead", ToolLevel::Approve)]), None, now)
+        .set_levels(org, app, &set(&[("ahead", ToolLevel::Approve)]), None, now, &by_suite)
         .await
         .unwrap();
     assert_eq!(summary(&changed), [("ahead", ToolLevel::Approve, true, false)]);
@@ -287,7 +300,7 @@ async fn writes_a_malformed_change_not_at_all(store: &dyn ToolPolicyStore, prepa
         too_many,
     ] {
         assert_eq!(
-            store.set_levels(org, app, &levels, Some(t.user), now).await,
+            store.set_levels(org, app, &levels, Some(t.user), now, &by_suite).await,
             Err(PolicyError::InvalidLevels),
             "{} levels",
             levels.len()
@@ -295,7 +308,14 @@ async fn writes_a_malformed_change_not_at_all(store: &dyn ToolPolicyStore, prepa
     }
     assert_eq!(all(store, org, app).await.unwrap(), [], "nothing written");
     let longest = vec![("x".repeat(128), ToolLevel::Deny)];
-    assert_eq!(store.set_levels(org, app, &longest, None, now).await.unwrap().len(), 1);
+    assert_eq!(
+        store
+            .set_levels(org, app, &longest, None, now, &by_suite)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 async fn pages_by_name(store: &dyn ToolPolicyStore, prepare: &Prepare) {
@@ -312,6 +332,7 @@ async fn pages_by_name(store: &dyn ToolPolicyStore, prepare: &Prepare) {
                 .collect::<Vec<_>>(),
             None,
             Timestamp::now(),
+            &by_suite,
         )
         .await
         .unwrap();
@@ -343,7 +364,14 @@ async fn keeps_levels_to_their_organization_and_catalog_app(store: &dyn ToolPoli
     let now = Timestamp::now();
     let org = a.organization_id;
     store
-        .set_levels(org, a.catalog_app, &set(&[("search", ToolLevel::Deny)]), None, now)
+        .set_levels(
+            org,
+            a.catalog_app,
+            &set(&[("search", ToolLevel::Deny)]),
+            None,
+            now,
+            &by_suite,
+        )
         .await
         .unwrap();
     store
@@ -385,7 +413,7 @@ async fn keeps_levels_to_their_organization_and_catalog_app(store: &dyn ToolPoli
         );
         assert_eq!(
             store
-                .set_levels(org, app, &set(&[("search", ToolLevel::Allow)]), None, now)
+                .set_levels(org, app, &set(&[("search", ToolLevel::Allow)]), None, now, &by_suite)
                 .await,
             Err(PolicyError::AppNotFound),
             "{what}"

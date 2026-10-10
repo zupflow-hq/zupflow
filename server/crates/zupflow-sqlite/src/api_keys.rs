@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 use zupflow_core::api_keys::{ApiKey, ApiKeyError, ApiKeyStore, NewApiKey};
+use zupflow_core::audit::Audit;
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{ApiKeyId, OrganizationId, UserId};
 use zupflow_core::organizations::User;
@@ -34,6 +35,31 @@ impl SqliteApiKeyStore {
     pub fn new(database: Database) -> Self {
         Self { database }
     }
+
+    async fn immediate(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, ApiKeyError> {
+        self.database
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(failed("begin"))
+    }
+}
+
+/// The key, in this organization only, on the connection given.
+async fn key_in(
+    connection: &mut sqlx::SqliteConnection,
+    organization_id: OrganizationId,
+    api_key_id: ApiKeyId,
+) -> Result<Option<ApiKey>, ApiKeyError> {
+    sqlx::query(concat!(select_keys!(), " WHERE k.organization_id = ? AND k.id = ?"))
+        .bind(organization_id.uuid())
+        .bind(api_key_id.uuid())
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(failed("find_api_key"))?
+        .as_ref()
+        .map(api_key_from)
+        .transpose()
 }
 
 fn failed(operation: &'static str) -> impl FnOnce(sqlx::Error) -> ApiKeyError {
@@ -96,7 +122,9 @@ impl ApiKeyStore for SqliteApiKeyStore {
         organization_id: OrganizationId,
         api_key_id: ApiKeyId,
         key: &NewApiKey,
+        audit: &Audit<'_, ApiKey>,
     ) -> Result<ApiKey, ApiKeyError> {
+        let mut transaction = self.immediate().await?;
         sqlx::query(
             "INSERT INTO api_keys (id, organization_id, environment, name, prefix, last4, secret_hash, \
              created_by_user_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -110,12 +138,17 @@ impl ApiKeyStore for SqliteApiKeyStore {
         .bind(key.secret_hash.to_vec())
         .bind(key.created_by.uuid())
         .bind(Timestamp::now().millis())
-        .execute(self.database.pool())
+        .execute(&mut *transaction)
         .await
         .map_err(failed("insert_api_key"))?;
-        self.find_api_key(organization_id, api_key_id)
+        let created = key_in(&mut transaction, organization_id, api_key_id)
             .await?
-            .ok_or(ApiKeyError::Unavailable)
+            .ok_or(ApiKeyError::Unavailable)?;
+        crate::audit::record(&mut transaction, organization_id, &audit(&created))
+            .await
+            .map_err(failed("audit"))?;
+        transaction.commit().await.map_err(failed("commit"))?;
+        Ok(created)
     }
 
     async fn find_api_key(
@@ -123,38 +156,36 @@ impl ApiKeyStore for SqliteApiKeyStore {
         organization_id: OrganizationId,
         api_key_id: ApiKeyId,
     ) -> Result<Option<ApiKey>, ApiKeyError> {
-        sqlx::query(concat!(select_keys!(), " WHERE k.organization_id = ? AND k.id = ?"))
-            .bind(organization_id.uuid())
-            .bind(api_key_id.uuid())
-            .fetch_optional(self.database.pool())
-            .await
-            .map_err(failed("find_api_key"))?
-            .as_ref()
-            .map(api_key_from)
-            .transpose()
+        let mut connection = self.database.pool().acquire().await.map_err(failed("acquire"))?;
+        key_in(&mut connection, organization_id, api_key_id).await
     }
 
     async fn revoke_api_key(
         &self,
         organization_id: OrganizationId,
         api_key_id: ApiKeyId,
+        audit: &Audit<'_, ApiKey>,
     ) -> Result<ApiKey, ApiKeyError> {
+        let mut transaction = self.immediate().await?;
         let revoked = sqlx::query(
             "UPDATE api_keys SET revoked_at = ? WHERE organization_id = ? AND id = ? AND revoked_at IS NULL",
         )
         .bind(Timestamp::now().millis())
         .bind(organization_id.uuid())
         .bind(api_key_id.uuid())
-        .execute(self.database.pool())
+        .execute(&mut *transaction)
         .await
         .map_err(failed("revoke_api_key"))?;
-        let key = self
-            .find_api_key(organization_id, api_key_id)
+        let key = key_in(&mut transaction, organization_id, api_key_id)
             .await?
             .ok_or(ApiKeyError::NotFound)?;
         if revoked.rows_affected() == 0 {
             return Err(ApiKeyError::AlreadyRevoked);
         }
+        crate::audit::record(&mut transaction, organization_id, &audit(&key))
+            .await
+            .map_err(failed("audit"))?;
+        transaction.commit().await.map_err(failed("commit"))?;
         Ok(key)
     }
 

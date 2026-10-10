@@ -23,6 +23,7 @@
 
 use async_trait::async_trait;
 
+use crate::audit::Audit;
 use crate::ids::{AgentId, GrantId, InstallationId, OrganizationId, WorkspaceId};
 use crate::policy::{GrantLevels, LevelRefusal, level_refusal};
 use crate::time::Timestamp;
@@ -142,6 +143,8 @@ pub enum AgentError {
     ApprovalRequiredByPolicy(String),
 }
 
+/// Every change to an agent or a grant records its [`Audit`] in the
+/// change's transaction.
 #[async_trait]
 pub trait AgentStore: Send + Sync {
     /// The workspace's agents, by name.
@@ -166,6 +169,7 @@ pub trait AgentStore: Send + Sync {
         workspace_id: WorkspaceId,
         agent_id: AgentId,
         agent: &NewAgent,
+        audit: &Audit<'_, Agent>,
     ) -> Result<Agent, AgentError>;
 
     async fn update_agent(
@@ -174,14 +178,17 @@ pub trait AgentStore: Send + Sync {
         workspace_id: WorkspaceId,
         agent_id: AgentId,
         changes: &AgentChanges,
+        audit: &Audit<'_, Agent>,
     ) -> Result<Agent, AgentError>;
 
-    /// Deletes the agent and its grants, as one.
+    /// Deletes the agent and its grants, as one, recording `audit` of the
+    /// agent as it was.
     async fn delete_agent(
         &self,
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
+        audit: &Audit<'_, Agent>,
     ) -> Result<(), AgentError>;
 
     /// The agent's grants, oldest first. `AgentNotFound` when the agent isn't here.
@@ -201,6 +208,7 @@ pub trait AgentStore: Send + Sync {
     /// `ToolDenied`, `ApprovalRequiredByPolicy`), then one grant per agent
     /// and installation (`GrantExists`). A workspace app's tools have no
     /// organization level.
+    #[allow(clippy::too_many_arguments)]
     async fn create_grant(
         &self,
         organization_id: OrganizationId,
@@ -209,6 +217,7 @@ pub trait AgentStore: Send + Sync {
         grant_id: GrantId,
         installation_id: InstallationId,
         tools: &GrantTools,
+        audit: &Audit<'_, Grant>,
     ) -> Result<Grant, AgentError>;
 
     /// Replaces a grant's tools and approvals, checked as
@@ -220,6 +229,7 @@ pub trait AgentStore: Send + Sync {
         agent_id: AgentId,
         grant_id: GrantId,
         tools: &GrantTools,
+        audit: &Audit<'_, Grant>,
     ) -> Result<Grant, AgentError>;
 
     async fn delete_grant(
@@ -228,6 +238,7 @@ pub trait AgentStore: Send + Sync {
         workspace_id: WorkspaceId,
         agent_id: AgentId,
         grant_id: GrantId,
+        audit: &Audit<'_, ()>,
     ) -> Result<(), AgentError>;
 
     /// How many grants each of the workspace's installations has; those

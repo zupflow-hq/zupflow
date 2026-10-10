@@ -17,6 +17,7 @@ use zupflow_core::apps::{
     App, AppChanges, AppError, AppIcon, AppKind, AuthTemplate, AuthType, Configuration, ConfigurationStatus, NewApp,
     ToolDefinition,
 };
+use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{AppId, OrganizationId, WorkspaceId};
@@ -366,7 +367,14 @@ async fn create_organization_app(
     let app = new_app(&body.object()?)?;
     let app = state
         .apps
-        .create_organization_app(access.organization_id, AppId::generate(), &app)
+        .create_organization_app(access.organization_id, AppId::generate(), &app, &|app: &App| {
+            AuditEntry::new(
+                access.audit_actor(),
+                AuditAction::AppCreated,
+                AuditTarget::new(AuditObject::App(app.id), &app.name),
+                AuditPlace::Organization,
+            )
+        })
         .await
         .map_err(app_failure)?;
     Ok(envelope(
@@ -436,7 +444,14 @@ async fn update_organization_app(
     let update = update_of(&body, &current, &configurations)?;
     let app = state
         .apps
-        .update_organization_app(access.organization_id, app_id, update.changes())
+        .update_organization_app(access.organization_id, app_id, update.changes(), &|app: &App| {
+            AuditEntry::new(
+                access.audit_actor(),
+                AuditAction::AppUpdated,
+                AuditTarget::new(AuditObject::App(app.id), &app.name),
+                AuditPlace::Organization,
+            )
+        })
         .await
         .map_err(app_failure)?;
     let installations = installation_counts(&state, &access).await?;
@@ -489,6 +504,14 @@ async fn create_workspace_app(
             access.workspace.id,
             AppId::generate(),
             &app,
+            &|app: &App| {
+                AuditEntry::new(
+                    access.access.audit_actor(),
+                    AuditAction::AppCreated,
+                    AuditTarget::new(AuditObject::App(app.id), &app.name),
+                    AuditPlace::Workspace(access.workspace.id),
+                )
+            },
         )
         .await
         .map_err(app_failure)?;
@@ -550,7 +573,14 @@ async fn update_workspace_app(
     let update = update_of(&body.object()?, &current, &configurations)?;
     let app = state
         .apps
-        .update_workspace_app(organization_id, workspace_id, app_id, update.changes())
+        .update_workspace_app(organization_id, workspace_id, app_id, update.changes(), &|app: &App| {
+            AuditEntry::new(
+                access.access.audit_actor(),
+                AuditAction::AppUpdated,
+                AuditTarget::new(AuditObject::App(app.id), &app.name),
+                AuditPlace::Workspace(workspace_id),
+            )
+        })
         .await
         .map_err(app_failure)?;
     let installations = installation_counts(&state, &access.access).await?;

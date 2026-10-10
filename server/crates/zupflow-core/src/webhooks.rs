@@ -26,6 +26,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
 
+use crate::audit::Audit;
 use crate::environment::Environment;
 use crate::ids::{
     InstallationId, OrganizationId, RunId, WebhookDeliveryId, WebhookEndpointId, WebhookEventId, WorkspaceId,
@@ -291,22 +292,27 @@ pub trait WebhookStore: Send + Sync {
         endpoint_id: WebhookEndpointId,
         endpoint: &NewEndpoint,
         now: Timestamp,
+        audit: &Audit<'_, WebhookEndpoint>,
     ) -> Result<WebhookEndpoint, WebhookError>;
 
     /// Changes what `changes` names. Enabling an endpoint forgets how long
-    /// it was failing. `NotFound` unless it's here.
+    /// it was failing. Records `audit` of it, changed. `NotFound` unless
+    /// it's here.
     async fn update_endpoint(
         &self,
         organization_id: OrganizationId,
         endpoint_id: WebhookEndpointId,
         changes: &EndpointChanges,
+        audit: &Audit<'_, WebhookEndpoint>,
     ) -> Result<WebhookEndpoint, WebhookError>;
 
-    /// Deletes the endpoint with its deliveries. `NotFound` unless it's here.
+    /// Deletes the endpoint with its deliveries, recording `audit` of it as
+    /// it was. `NotFound` unless it's here.
     async fn delete_endpoint(
         &self,
         organization_id: OrganizationId,
         endpoint_id: WebhookEndpointId,
+        audit: &Audit<'_, WebhookEndpoint>,
     ) -> Result<(), WebhookError>;
 
     /// The endpoint's sealed signing secret, for the code that signs.

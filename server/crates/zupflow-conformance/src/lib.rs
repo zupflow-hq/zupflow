@@ -12,6 +12,7 @@ pub mod agent_store;
 pub mod api_key_store;
 pub mod app_store;
 pub mod approval_policy;
+pub mod audit_store;
 pub mod cache;
 pub mod connect_store;
 pub mod event_bus;

@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 use uuid::Uuid;
+use zupflow_core::audit::Audit;
 use zupflow_core::connect::{
     Authorization, Completion, ConnectError, ConnectIntent, ConnectSession, ConnectSessionStatus, ConnectSettings,
     ConnectStore, NewConnectSession, ReferenceHash, SESSION_TTL_MS,
@@ -148,10 +149,17 @@ impl ConnectStore for SqliteConnectStore {
         environment: Environment,
         return_urls: &[String],
         allowed_origins: &[String],
+        audit: &Audit<'_, ConnectSettings>,
     ) -> Result<ConnectSettings, ConnectError> {
         let now = Timestamp::now();
         let urls = serde_json::to_string(return_urls).map_err(read)?;
         let origins = serde_json::to_string(allowed_origins).map_err(read)?;
+        let mut transaction = self
+            .database
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(failed("save_settings"))?;
         sqlx::query(
             "INSERT INTO connect_settings (id, organization_id, environment, return_urls, allowed_origins, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (organization_id, environment) DO UPDATE SET \
@@ -164,14 +172,19 @@ impl ConnectStore for SqliteConnectStore {
         .bind(urls)
         .bind(origins)
         .bind(now.millis())
-        .execute(self.database.pool())
+        .execute(&mut *transaction)
         .await
         .map_err(failed("save_settings"))?;
-        Ok(ConnectSettings {
+        let settings = ConnectSettings {
             return_urls: return_urls.to_vec(),
             allowed_origins: allowed_origins.to_vec(),
             updated_at: Some(now),
-        })
+        };
+        crate::audit::record(&mut transaction, organization_id, &audit(&settings))
+            .await
+            .map_err(failed("audit"))?;
+        transaction.commit().await.map_err(failed("save_settings"))?;
+        Ok(settings)
     }
 
     async fn create_session(
@@ -304,6 +317,7 @@ impl ConnectStore for SqliteConnectStore {
         session_id: ConnectSessionId,
         completion: &Completion,
         now: Timestamp,
+        audit: &Audit<'_, (ConnectSession, Installation)>,
     ) -> Result<(ConnectSession, Installation), ConnectError> {
         // One writer at a time: the session is read pending and completed
         // with nothing in between, so it completes once.
@@ -392,8 +406,12 @@ impl ConnectStore for SqliteConnectStore {
         .map_err(failed("complete_session"))?;
         let session = session_from(&row.ok_or(ConnectError::NotPending)?)?;
         forget_authorization(&mut transaction, organization_id, workspace_id, session_id).await?;
+        let completed = (session, installation);
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&completed))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("complete_session"))?;
-        Ok((session, installation))
+        Ok(completed)
     }
 
     async fn begin_authorization(

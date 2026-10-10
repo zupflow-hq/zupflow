@@ -9,6 +9,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, Sqlite, Transaction};
 use uuid::Uuid;
+use zupflow_core::audit::Audit;
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::{
@@ -441,7 +442,9 @@ impl InstallationStore for SqliteInstallationStore {
         workspace_id: WorkspaceId,
         installation_id: InstallationId,
         label: &str,
+        audit: &Audit<'_, Installation>,
     ) -> Result<Installation, InstallationError> {
+        let mut transaction = self.immediate().await?;
         let row = sqlx::query(concat!(
             "UPDATE installations SET label = ?, updated_at = ? \
              WHERE organization_id = ? AND workspace_id = ? AND id = ? RETURNING ",
@@ -452,10 +455,15 @@ impl InstallationStore for SqliteInstallationStore {
         .bind(organization_id.uuid())
         .bind(workspace_id.uuid())
         .bind(installation_id.uuid())
-        .fetch_optional(self.database.pool())
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(failed("rename_installation"))?;
-        installation_from(&row.ok_or(InstallationError::NotFound)?)
+        let installation = installation_from(&row.ok_or(InstallationError::NotFound)?)?;
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&installation))
+            .await
+            .map_err(failed("audit"))?;
+        transaction.commit().await.map_err(failed("rename_installation"))?;
+        Ok(installation)
     }
 
     async fn disconnect_installation(
@@ -463,6 +471,7 @@ impl InstallationStore for SqliteInstallationStore {
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         installation_id: InstallationId,
+        audit: &Audit<'_, Installation>,
     ) -> Result<Installation, InstallationError> {
         let mut transaction = self.immediate().await?;
         let row = sqlx::query(concat!(
@@ -488,6 +497,9 @@ impl InstallationStore for SqliteInstallationStore {
         .execute(&mut *transaction)
         .await
         .map_err(failed("disconnect_installation"))?;
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&installation))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("disconnect_installation"))?;
         Ok(installation)
     }
@@ -497,19 +509,25 @@ impl InstallationStore for SqliteInstallationStore {
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         installation_id: InstallationId,
+        audit: &Audit<'_, Installation>,
     ) -> Result<(), InstallationError> {
         // The credential references the installation with a cascading key.
-        let deleted =
-            sqlx::query("DELETE FROM installations WHERE organization_id = ? AND workspace_id = ? AND id = ?")
-                .bind(organization_id.uuid())
-                .bind(workspace_id.uuid())
-                .bind(installation_id.uuid())
-                .execute(self.database.pool())
-                .await
-                .map_err(failed("delete_installation"))?;
-        if deleted.rows_affected() == 0 {
-            return Err(InstallationError::NotFound);
-        }
+        let mut transaction = self.immediate().await?;
+        let deleted = sqlx::query(concat!(
+            "DELETE FROM installations WHERE organization_id = ? AND workspace_id = ? AND id = ? RETURNING ",
+            returning!()
+        ))
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(installation_id.uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(failed("delete_installation"))?;
+        let installation = installation_from(&deleted.ok_or(InstallationError::NotFound)?)?;
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&installation))
+            .await
+            .map_err(failed("audit"))?;
+        transaction.commit().await.map_err(failed("delete_installation"))?;
         Ok(())
     }
 
@@ -788,7 +806,9 @@ mod tests {
             .await
             .unwrap();
         crate::SqliteWorkspaceStore::new(database.clone())
-            .delete_workspace(org, tenant.sandbox)
+            .delete_workspace(org, tenant.sandbox, &|_| {
+                zupflow_conformance::audit_store::by_suite_in(tenant.sandbox)
+            })
             .await
             .unwrap();
         assert_eq!(

@@ -20,6 +20,7 @@ use axum::routing::{get, post};
 use serde::Serialize;
 use serde_json::{Value, json};
 use zupflow_core::agents::{AgentError, AgentStatus};
+use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{AgentId, RunEventId, RunId, SessionId, ToolCallId, WorkspaceId};
@@ -205,7 +206,7 @@ async fn find(state: &AppState, access: &WorkspaceAccess, run: &str) -> Result<R
 }
 
 /// A list's query, first value of each name.
-fn query(raw: Option<&str>) -> Result<BTreeMap<String, String>, Failure> {
+pub(crate) fn query(raw: Option<&str>) -> Result<BTreeMap<String, String>, Failure> {
     let pairs: Vec<(String, String)> = serde_urlencoded::from_str(raw.unwrap_or_default()).map_err(|_| {
         Failure(ApiError::new(
             400,
@@ -579,6 +580,35 @@ async fn start_run(
     Ok(envelope(StatusCode::CREATED, run_view(run)))
 }
 
+/// What the audit log records of a change to a run: the run, named by its
+/// agent ("Agent" once the agent is gone), in its workspace.
+async fn run_audit(
+    state: &AppState,
+    access: &WorkspaceAccess,
+    run: &Run,
+    action: AuditAction,
+) -> Result<impl Fn(&Run) -> AuditEntry + Send + Sync + use<>, Failure> {
+    let agent = state
+        .agents
+        .find_agent(access.access.organization_id, access.workspace.id, run.agent_id)
+        .await
+        .map_err(|error| match error {
+            AgentError::Unavailable => unavailable(),
+            _ => Failure(ApiError::internal()),
+        })?;
+    let name = agent.map_or_else(|| "Agent".to_owned(), |agent| agent.name);
+    let actor = access.access.audit_actor();
+    let workspace_id = access.workspace.id;
+    Ok(move |run: &Run| {
+        AuditEntry::new(
+            actor.clone(),
+            action,
+            AuditTarget::new(AuditObject::Run(run.id), &name),
+            AuditPlace::Workspace(workspace_id),
+        )
+    })
+}
+
 async fn cancel_run(
     State(state): State<AppState>,
     caller: Caller,
@@ -595,6 +625,7 @@ async fn cancel_run(
         Actor::Member(member) => member.user.name.clone(),
         Actor::ApiKey(key) => key.name.clone(),
     };
+    let audit = run_audit(&state, &access, &run, AuditAction::RunCancelled).await?;
     let (run, events) = state
         .runs
         .cancel_run(
@@ -606,6 +637,7 @@ async fn cancel_run(
                 json!({ "cancelled_by": cancelled_by }),
             )],
             Timestamp::now(),
+            &audit,
         )
         .await
         .map_err(run_failure)?;
@@ -675,6 +707,7 @@ async fn resolve_approval(
     let Some(job) = run_engine::job(run.id) else {
         return Err(ApiError::internal().into());
     };
+    let audit = run_audit(&state, &access, &run, AuditAction::ApprovalResolved).await?;
     let (run, events) = state
         .runs
         .resolve_approval(
@@ -697,6 +730,7 @@ async fn resolve_approval(
             )],
             &job,
             Timestamp::now(),
+            &audit,
         )
         .await
         .map_err(run_failure)?;

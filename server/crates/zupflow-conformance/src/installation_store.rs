@@ -20,6 +20,8 @@ use zupflow_core::installations::{
 };
 use zupflow_core::keys::{Sealed, WrappedKey};
 
+use crate::audit_store::by_suite_in;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Tenant {
     pub organization_id: OrganizationId,
@@ -327,19 +329,21 @@ async fn changes_only_within_its_workspace(store: &dyn InstallationStore, prepar
     ] {
         assert_eq!(
             store
-                .rename_installation(organization, workspace, installation.id, "Stolen")
+                .rename_installation(organization, workspace, installation.id, "Stolen", &|_| by_suite_in(
+                    workspace
+                ))
                 .await,
             Err(InstallationError::NotFound)
         );
         assert_eq!(
             store
-                .disconnect_installation(organization, workspace, installation.id)
+                .disconnect_installation(organization, workspace, installation.id, &|_| by_suite_in(workspace))
                 .await,
             Err(InstallationError::NotFound)
         );
         assert_eq!(
             store
-                .delete_installation(organization, workspace, installation.id)
+                .delete_installation(organization, workspace, installation.id, &|_| by_suite_in(workspace))
                 .await,
             Err(InstallationError::NotFound)
         );
@@ -360,7 +364,9 @@ async fn changes_only_within_its_workspace(store: &dyn InstallationStore, prepar
             .is_some()
     );
     let renamed = store
-        .rename_installation(a.organization_id, a.sandbox, installation.id, "Renamed")
+        .rename_installation(a.organization_id, a.sandbox, installation.id, "Renamed", &|_| {
+            by_suite_in(a.sandbox)
+        })
         .await
         .unwrap();
     assert_eq!(
@@ -377,7 +383,9 @@ async fn forgets_the_credential_when_disconnected_or_deleted(store: &dyn Install
     let deleted = install(store, &a, a.production, InstalledApp::Catalog(a.catalog_app)).await;
 
     let after = store
-        .disconnect_installation(a.organization_id, a.sandbox, disconnected.id)
+        .disconnect_installation(a.organization_id, a.sandbox, disconnected.id, &|_| {
+            by_suite_in(a.sandbox)
+        })
         .await
         .unwrap();
     assert_eq!(after.status, InstallationStatus::Disconnected);
@@ -394,7 +402,9 @@ async fn forgets_the_credential_when_disconnected_or_deleted(store: &dyn Install
     );
 
     store
-        .delete_installation(a.organization_id, a.production, deleted.id)
+        .delete_installation(a.organization_id, a.production, deleted.id, &|_| {
+            by_suite_in(a.production)
+        })
         .await
         .unwrap();
     assert_eq!(

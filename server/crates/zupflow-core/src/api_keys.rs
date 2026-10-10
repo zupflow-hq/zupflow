@@ -15,6 +15,7 @@ use serde::Serialize;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
+use crate::audit::Audit;
 use crate::environment::Environment;
 use crate::ids::{ApiKeyId, OrganizationId, UserId};
 use crate::organizations::User;
@@ -137,6 +138,8 @@ pub struct NewApiKey {
     pub created_by: UserId,
 }
 
+/// Creating and revoking a key record their [`Audit`] of the key, in the
+/// same transaction.
 #[async_trait]
 pub trait ApiKeyStore: Send + Sync {
     /// The organization's keys, revoked ones included, newest first.
@@ -147,6 +150,7 @@ pub trait ApiKeyStore: Send + Sync {
         organization_id: OrganizationId,
         api_key_id: ApiKeyId,
         key: &NewApiKey,
+        audit: &Audit<'_, ApiKey>,
     ) -> Result<ApiKey, ApiKeyError>;
 
     async fn find_api_key(
@@ -160,6 +164,7 @@ pub trait ApiKeyStore: Send + Sync {
         &self,
         organization_id: OrganizationId,
         api_key_id: ApiKeyId,
+        audit: &Audit<'_, ApiKey>,
     ) -> Result<ApiKey, ApiKeyError>;
 
     /// **Cross-tenant**, by design: a request presents only its key, so this

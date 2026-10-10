@@ -8,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
 use serde_json::json;
+use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{OrganizationId, WorkspaceId};
@@ -299,6 +300,14 @@ async fn create_workspace(
                 environment,
                 external_id,
             },
+            &|workspace: &Workspace| {
+                AuditEntry::new(
+                    access.audit_actor(),
+                    AuditAction::WorkspaceCreated,
+                    AuditTarget::new(AuditObject::Workspace(workspace.id), &workspace.name),
+                    AuditPlace::Workspace(workspace.id),
+                )
+            },
         )
         .await
         .map_err(|error| match error {
@@ -360,6 +369,14 @@ async fn update_workspace(
             access.workspace.id,
             name.as_deref(),
             external_id.as_ref().map(|external_id| external_id.as_deref()),
+            &|workspace: &Workspace| {
+                AuditEntry::new(
+                    access.access.audit_actor(),
+                    AuditAction::WorkspaceUpdated,
+                    AuditTarget::new(AuditObject::Workspace(workspace.id), &workspace.name),
+                    AuditPlace::Workspace(workspace.id),
+                )
+            },
         )
         .await
         .map_err(|error| match error {
@@ -384,7 +401,20 @@ async fn delete_workspace(
         .require(|role| role == MemberRole::Owner, "delete workspaces")?;
     state
         .workspaces
-        .delete_workspace(access.access.organization_id, access.workspace.id)
+        // Its history stays; the deletion is recorded in its environment.
+        .delete_workspace(
+            access.access.organization_id,
+            access.workspace.id,
+            &|workspace: &Workspace| {
+                AuditEntry::new(
+                    access.access.audit_actor(),
+                    AuditAction::WorkspaceDeleted,
+                    AuditTarget::new(AuditObject::Workspace(workspace.id), &workspace.name),
+                    // Recorded before it goes, keeping its ID: its history finds it.
+                    AuditPlace::Workspace(workspace.id),
+                )
+            },
+        )
         .await
         .map_err(|error| match error {
             WorkspaceError::NotFound => ApiError::not_found("Workspace").into(),

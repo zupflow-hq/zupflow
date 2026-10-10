@@ -34,6 +34,8 @@ use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
 use zupflow_core::webhooks::{ANNOUNCE, Announcement, Subject, WebhookEventType};
 
+use crate::audit_store::by_suite_in;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Tenant {
     pub organization_id: OrganizationId,
@@ -77,6 +79,7 @@ async fn agent(stores: &Stores<'_>, organization_id: OrganizationId, workspace: 
                 model: "model-a".to_owned(),
                 instructions: "Be brief.".to_owned(),
             },
+            &|_| by_suite_in(workspace),
         )
         .await
         .unwrap()
@@ -288,7 +291,14 @@ async fn creates_runs_only_of_the_workspaces_agents(
         assert_eq!(
             stores
                 .runs
-                .cancel_run(organization, workspace, id, &[event(RunEventType::RunCancelled)], now)
+                .cancel_run(
+                    organization,
+                    workspace,
+                    id,
+                    &[event(RunEventType::RunCancelled)],
+                    now,
+                    &|_| by_suite_in(workspace)
+                )
                 .await
                 .map(|_| ()),
             Err(RunError::NotFound)
@@ -681,6 +691,7 @@ async fn takes_each_step_once(stores: &Stores<'_>, a: Tenant, b: Tenant, agent_a
                 &[event(RunEventType::ApprovalResolved)],
                 &job(id),
                 Timestamp::now(),
+                &|_| by_suite_in(ws),
             )
             .await
             .map(|(run, _)| run.status)
@@ -725,6 +736,7 @@ async fn takes_each_step_once(stores: &Stores<'_>, a: Tenant, b: Tenant, agent_a
                 &[],
                 &job(id),
                 now,
+                &|_| by_suite_in(b.workspace),
             )
             .await
             .map(|_| ()),
@@ -747,6 +759,7 @@ async fn takes_each_step_once(stores: &Stores<'_>, a: Tenant, b: Tenant, agent_a
                     &[],
                     &job(id),
                     now,
+                    &|_| by_suite_in(workspace),
                 )
                 .await
                 .map(|_| ()),
@@ -948,7 +961,7 @@ async fn cancels_and_finishes_once(stores: &Stores<'_>, a: Tenant, agent_a: Agen
     let cancelled = || NewRunEvent::new(RunEventType::RunCancelled, json!({ "cancelled_by": "Someone" }));
     let (run, events) = stores
         .runs
-        .cancel_run(org, ws, queued, &[cancelled()], now)
+        .cancel_run(org, ws, queued, &[cancelled()], now, &|_| by_suite_in(ws))
         .await
         .unwrap();
     assert_eq!(run.status, RunStatus::Cancelled);
@@ -961,7 +974,7 @@ async fn cancels_and_finishes_once(stores: &Stores<'_>, a: Tenant, agent_a: Agen
     assert_eq!(
         stores
             .runs
-            .cancel_run(org, ws, queued, &[cancelled()], now)
+            .cancel_run(org, ws, queued, &[cancelled()], now, &|_| by_suite_in(ws))
             .await
             .map(|_| ()),
         Err(RunError::Finished)
@@ -1023,7 +1036,11 @@ async fn cancels_and_finishes_once(stores: &Stores<'_>, a: Tenant, agent_a: Agen
         Err(RunError::Finished)
     );
     assert_eq!(
-        stores.runs.cancel_run(org, ws, failing, &[], now).await.map(|_| ()),
+        stores
+            .runs
+            .cancel_run(org, ws, failing, &[], now, &|_| by_suite_in(ws))
+            .await
+            .map(|_| ()),
         Err(RunError::Finished)
     );
     claim_all(stores).await;
@@ -1033,7 +1050,11 @@ async fn keeps_runs_of_a_deleted_agent(stores: &Stores<'_>, a: Tenant) {
     let org = a.organization_id;
     let agent_id = agent(stores, org, a.workspace, "Short-lived").await;
     let id = create(stores, org, a.workspace, agent_id, "Before", Timestamp::now()).await;
-    stores.agents.delete_agent(org, a.workspace, agent_id).await.unwrap();
+    stores
+        .agents
+        .delete_agent(org, a.workspace, agent_id, &|_| by_suite_in(a.workspace))
+        .await
+        .unwrap();
     let run = stores.runs.find_run(org, a.workspace, id).await.unwrap().unwrap();
     assert_eq!(
         (run.agent_id, run.agent_name),
@@ -1152,7 +1173,11 @@ async fn decides_a_call_again_before_sending(stores: &Stores<'_>, a: Tenant, age
         Err(RunError::Moved),
         "a refused call is never begun"
     );
-    stores.runs.cancel_run(org, ws, id, &[], now).await.unwrap();
+    stores
+        .runs
+        .cancel_run(org, ws, id, &[], now, &|_| by_suite_in(ws))
+        .await
+        .unwrap();
     assert_eq!(
         stores
             .runs
@@ -1256,6 +1281,7 @@ async fn announces_what_webhooks_name(stores: &Stores<'_>, a: Tenant, agent_a: A
                 json!({ "cancelled_by": "Someone" }),
             )],
             now,
+            &|_| by_suite_in(ws),
         )
         .await
         .unwrap();

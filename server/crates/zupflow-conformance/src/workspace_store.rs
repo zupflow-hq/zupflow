@@ -16,6 +16,8 @@ use zupflow_core::workspaces::{
     NewWorkspace, Workspace, WorkspaceError, WorkspaceFilter, WorkspaceSort, WorkspaceStats, WorkspaceStore,
 };
 
+use crate::audit_store::{by_suite, by_suite_in};
+
 pub type Prepare = Arc<dyn Fn(OrganizationId) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 fn new(name: &str, slug: &str, environment: Environment, external_id: Option<&str>) -> NewWorkspace {
@@ -35,7 +37,7 @@ async fn organization(prepare: &Prepare) -> OrganizationId {
 
 async fn create(store: &dyn WorkspaceStore, org: OrganizationId, workspace: NewWorkspace) -> Workspace {
     store
-        .create_workspace(org, WorkspaceId::generate(), &workspace)
+        .create_workspace(org, WorkspaceId::generate(), &workspace, &by_suite)
         .await
         .unwrap()
 }
@@ -84,7 +86,8 @@ async fn keeps_slugs_unique_within_an_organization(store: &dyn WorkspaceStore, p
             .create_workspace(
                 a,
                 WorkspaceId::generate(),
-                &new("Acme 2", "acme", Environment::Sandbox, None)
+                &new("Acme 2", "acme", Environment::Sandbox, None),
+                &by_suite,
             )
             .await,
         Err(WorkspaceError::SlugTaken),
@@ -213,7 +216,11 @@ async fn updates_only_within_its_organization(store: &dyn WorkspaceStore, prepar
     let (a, b) = (organization(prepare).await, organization(prepare).await);
     let workspace = create(store, a, new("Acme", "acme", Environment::Production, Some("t-1"))).await;
     assert_eq!(
-        store.update_workspace(b, workspace.id, Some("Taken"), Some(None)).await,
+        store
+            .update_workspace(b, workspace.id, Some("Taken"), Some(None), &|_| by_suite_in(
+                workspace.id
+            ))
+            .await,
         Err(WorkspaceError::NotFound)
     );
     assert_eq!(
@@ -222,7 +229,7 @@ async fn updates_only_within_its_organization(store: &dyn WorkspaceStore, prepar
     );
 
     let renamed = store
-        .update_workspace(a, workspace.id, Some("Acme Inc"), None)
+        .update_workspace(a, workspace.id, Some("Acme Inc"), None, &|_| by_suite_in(workspace.id))
         .await
         .unwrap();
     assert_eq!(
@@ -230,10 +237,13 @@ async fn updates_only_within_its_organization(store: &dyn WorkspaceStore, prepar
         ("Acme Inc", Some("t-1")),
         "the External ID is kept when not given"
     );
-    let cleared = store.update_workspace(a, workspace.id, None, Some(None)).await.unwrap();
+    let cleared = store
+        .update_workspace(a, workspace.id, None, Some(None), &|_| by_suite_in(workspace.id))
+        .await
+        .unwrap();
     assert_eq!((cleared.name.as_str(), cleared.external_id), ("Acme Inc", None));
     let set = store
-        .update_workspace(a, workspace.id, None, Some(Some("t-2")))
+        .update_workspace(a, workspace.id, None, Some(Some("t-2")), &|_| by_suite_in(workspace.id))
         .await
         .unwrap();
     assert_eq!(set.external_id.as_deref(), Some("t-2"));
@@ -250,14 +260,17 @@ async fn deletes_one_workspace_only(store: &dyn WorkspaceStore, prepare: &Prepar
     let sibling = create(store, a, new("Sibling", "sibling", Environment::Production, None)).await;
     let other = create(store, b, new("Other", "other", Environment::Production, None)).await;
     assert_eq!(
-        store.delete_workspace(b, doomed.id).await,
+        store.delete_workspace(b, doomed.id, &|_| by_suite_in(doomed.id)).await,
         Err(WorkspaceError::NotFound)
     );
     assert!(store.find_workspace(a, doomed.id).await.unwrap().is_some(), "untouched");
-    store.delete_workspace(a, doomed.id).await.unwrap();
+    store
+        .delete_workspace(a, doomed.id, &|_| by_suite_in(doomed.id))
+        .await
+        .unwrap();
     assert_eq!(store.find_workspace(a, doomed.id).await.unwrap(), None);
     assert_eq!(
-        store.delete_workspace(a, doomed.id).await,
+        store.delete_workspace(a, doomed.id, &|_| by_suite_in(doomed.id)).await,
         Err(WorkspaceError::NotFound)
     );
     assert_eq!(store.find_workspace(a, sibling.id).await.unwrap(), Some(sibling));

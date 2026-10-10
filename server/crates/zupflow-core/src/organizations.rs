@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
+use crate::audit::Audit;
 use crate::identity::VerifiedIdentity;
 use crate::ids::{MemberId, OrganizationId, UserId};
 use crate::time::Timestamp;
@@ -206,6 +207,11 @@ pub enum StoreError {
     InvitationExpired,
 }
 
+/// Every change records its [`Audit`] in its own transaction: of the
+/// organization and its owner when created, of the organization as changed,
+/// of the member as invited, joined or changed, and as it was when removed;
+/// a declined invitation's with nothing more (the store learns its
+/// organization).
 #[async_trait]
 pub trait OrganizationStore: Send + Sync {
     /// The user an identity signs in as. A linked identity is its user, whose
@@ -236,6 +242,7 @@ pub trait OrganizationStore: Send + Sync {
         name: &str,
         slug: &str,
         user_id: UserId,
+        audit: &Audit<'_, (Organization, Member)>,
     ) -> Result<(Organization, Member), StoreError>;
 
     async fn update_organization(
@@ -243,6 +250,7 @@ pub trait OrganizationStore: Send + Sync {
         organization_id: OrganizationId,
         name: Option<&str>,
         slug: Option<&str>,
+        audit: &Audit<'_, Organization>,
     ) -> Result<Organization, StoreError>;
 
     async fn load_setup(&self, organization_id: OrganizationId) -> Result<OrganizationSetup, StoreError>;
@@ -262,6 +270,7 @@ pub trait OrganizationStore: Send + Sync {
         email: &str,
         role: MemberRole,
         acting: MemberId,
+        audit: &Audit<'_, Member>,
     ) -> Result<Member, StoreError>;
 
     /// The user's own invitations, pending and expired, that their grantor
@@ -285,11 +294,17 @@ pub trait OrganizationStore: Send + Sync {
         user_id: UserId,
         invitation_id: MemberId,
         now: Timestamp,
+        audit: &Audit<'_, (Organization, Member)>,
     ) -> Result<(Organization, Member), StoreError>;
 
     /// Declines the user's own invitation, expired or not: it's withdrawn.
     /// The same checks as accepting, in one transaction, but expiry.
-    async fn decline_invitation_of_user(&self, user_id: UserId, invitation_id: MemberId) -> Result<(), StoreError>;
+    async fn decline_invitation_of_user(
+        &self,
+        user_id: UserId,
+        invitation_id: MemberId,
+        audit: &Audit<'_, ()>,
+    ) -> Result<(), StoreError>;
 
     /// The member, in this organization only.
     async fn find_member(
@@ -310,6 +325,7 @@ pub trait OrganizationStore: Send + Sync {
         member_id: MemberId,
         role: MemberRole,
         acting: MemberId,
+        audit: &Audit<'_, Member>,
     ) -> Result<Member, StoreError>;
 
     /// Removes a member or withdraws an invitation, for `acting`, who must be
@@ -325,5 +341,6 @@ pub trait OrganizationStore: Send + Sync {
         member_id: MemberId,
         acting: MemberId,
         only_invited: bool,
+        audit: &Audit<'_, Member>,
     ) -> Result<(), StoreError>;
 }

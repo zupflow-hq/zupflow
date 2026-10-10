@@ -3,6 +3,7 @@
 //! - [`agents`]: agents and their grants of installations' tools, and their store.
 //! - [`api_keys`]: API keys, their hashing and their store.
 //! - [`apps`]: catalog apps and workspace apps, and their store.
+//! - [`audit`]: the audit log, written by each store with the change it records.
 //! - [`connect`]: Connect settings and sessions, and their store.
 //! - [`ids`]: typed, prefixed identifiers (`run_…`) over UUIDv7.
 //! - [`error`]: the API's error codes and the envelope's `error` field.
@@ -28,6 +29,7 @@
 pub mod agents;
 pub mod api_keys;
 pub mod apps;
+pub mod audit;
 pub mod connect;
 pub mod environment;
 pub mod error;

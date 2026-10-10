@@ -22,6 +22,7 @@ use serde::Serialize;
 use serde_json::Value;
 use zeroize::Zeroizing;
 use zupflow_core::apps::{App, AuthTemplate, Configuration, ConfigurationStatus, TokenInput, TokenPlacement};
+use zupflow_core::audit::{AuditAction, AuditActor, AuditEntry, AuditPlace, AuditTarget};
 use zupflow_core::connect::{
     Completion, ConnectError, ConnectIntent, ConnectSession, ConnectSessionStatus, ConnectSettings, NewConnectSession,
     Reference, ReferenceHash,
@@ -29,7 +30,7 @@ use zupflow_core::connect::{
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{AppId, ConnectSessionId, InstallationId, WorkspaceId};
-use zupflow_core::installations::{ConnectedAccount, InstalledApp, NewCredential, TemplateSnapshot};
+use zupflow_core::installations::{ConnectedAccount, Installation, InstalledApp, NewCredential, TemplateSnapshot};
 use zupflow_core::keys::{self, EncryptionContext};
 use zupflow_core::organizations::MemberRole;
 use zupflow_core::outbound::{Credential, Limits, Method, OutboundError, OutboundRequest, Refusal};
@@ -75,6 +76,27 @@ fn entries_invalid(fields: Fields) -> Result<(), Failure> {
     })
 }
 const LABEL_MAX: usize = 40;
+
+/// What the audit log records of a session completed through Connect: done
+/// by Zupflow itself, on the downstream user's behalf, in its workspace.
+pub(crate) fn completion_audit(
+    app_name: &str,
+) -> impl Fn(&(ConnectSession, Installation)) -> AuditEntry + Send + Sync + use<> {
+    let app_name = app_name.to_owned();
+    move |(session, installation): &(ConnectSession, Installation)| {
+        AuditEntry::new(
+            AuditActor::System {
+                name: "Connect".to_owned(),
+            },
+            match session.intent {
+                ConnectIntent::Reconnect => AuditAction::InstallationReconnected,
+                ConnectIntent::Create => AuditAction::InstallationConnected,
+            },
+            AuditTarget::installation(installation.id, &app_name, &installation.label),
+            AuditPlace::Workspace(session.workspace_id),
+        )
+    }
+}
 
 pub(crate) fn connect_failure(error: ConnectError) -> Failure {
     match error {
@@ -261,7 +283,20 @@ async fn update_settings(
     }
     let settings = state
         .connect
-        .save_settings(access.organization_id, environment, &urls, &unique_origins)
+        .save_settings(
+            access.organization_id,
+            environment,
+            &urls,
+            &unique_origins,
+            &|_: &ConnectSettings| {
+                AuditEntry::new(
+                    access.audit_actor(),
+                    AuditAction::ConnectSettingsUpdated,
+                    AuditTarget::connect_settings(environment),
+                    AuditPlace::Environment(environment),
+                )
+            },
+        )
         .await
         .map_err(connect_failure)?;
     Ok(envelope(StatusCode::OK, settings_view(environment, settings)))
@@ -1021,6 +1056,7 @@ async fn submit_credentials(
             session.id,
             &completion,
             Timestamp::now(),
+            &completion_audit(&app.name),
         )
         .await
         .map_err(|error| match error {

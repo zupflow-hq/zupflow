@@ -12,6 +12,8 @@ use zupflow_core::api_keys::{ApiKey, ApiKeyError, ApiKeyStore, NewApiKey};
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{ApiKeyId, OrganizationId, UserId};
 
+use crate::audit_store::by_suite;
+
 pub type Prepare = Arc<dyn Fn(OrganizationId, UserId) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 struct Tenant {
@@ -55,6 +57,7 @@ async fn create(
                 secret_hash,
                 created_by: tenant.user,
             },
+            &by_suite,
         )
         .await
         .unwrap()
@@ -85,7 +88,10 @@ async fn keeps_keys_inside_their_organization(store: &dyn ApiKeyStore, prepare: 
         None,
         "another organization's key"
     );
-    assert_eq!(store.revoke_api_key(a.org, theirs.id).await, Err(ApiKeyError::NotFound));
+    assert_eq!(
+        store.revoke_api_key(a.org, theirs.id, &by_suite).await,
+        Err(ApiKeyError::NotFound)
+    );
     assert_eq!(
         store.find_api_key(b.org, theirs.id).await.unwrap().unwrap().revoked_at,
         None,
@@ -114,7 +120,7 @@ async fn revokes_once_and_for_good(store: &dyn ApiKeyStore, prepare: &Prepare) {
     let a = tenant(prepare).await;
     let secret_hash = hash();
     let key = create(store, &a, "Doomed", Environment::Sandbox, secret_hash).await;
-    let revoked = store.revoke_api_key(a.org, key.id).await.unwrap();
+    let revoked = store.revoke_api_key(a.org, key.id, &by_suite).await.unwrap();
     assert!(revoked.revoked_at.is_some());
     assert_eq!(
         store.find_active_api_key_by_hash(&secret_hash).await.unwrap(),
@@ -122,11 +128,11 @@ async fn revokes_once_and_for_good(store: &dyn ApiKeyStore, prepare: &Prepare) {
         "no longer works"
     );
     assert_eq!(
-        store.revoke_api_key(a.org, key.id).await,
+        store.revoke_api_key(a.org, key.id, &by_suite).await,
         Err(ApiKeyError::AlreadyRevoked)
     );
     assert_eq!(
-        store.revoke_api_key(a.org, ApiKeyId::generate()).await,
+        store.revoke_api_key(a.org, ApiKeyId::generate(), &by_suite).await,
         Err(ApiKeyError::NotFound)
     );
     assert_eq!(

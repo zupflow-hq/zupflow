@@ -30,6 +30,7 @@
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 
+use crate::audit::Audit;
 use crate::environment::Environment;
 use crate::ids::{
     AgentId, ApiKeyId, InstallationId, OrganizationId, RunEventId, RunId, SessionId, ToolCallId, WorkspaceId,
@@ -653,7 +654,7 @@ pub trait RunStore: Send + Sync {
     /// run running and queues `job`, in one transaction. A denial settles
     /// the call with `denial` as what the model reads back. `NotFound`
     /// unless the run is here; `NotWaiting` unless it's waiting for
-    /// approval of exactly this call.
+    /// approval of exactly this call. Records `audit` of the run, resolved.
     #[allow(clippy::too_many_arguments)]
     async fn resolve_approval(
         &self,
@@ -667,6 +668,7 @@ pub trait RunStore: Send + Sync {
         events: &[NewRunEvent],
         job: &QueuedJob,
         now: Timestamp,
+        audit: &Audit<'_, Run>,
     ) -> Result<(Run, Vec<RunEvent>), RunError>;
 
     /// Records an allowed or approved call as sent, before it's sent, and
@@ -740,7 +742,9 @@ pub trait RunStore: Send + Sync {
     async fn abandoned_runs(&self, limit: u32) -> Result<Vec<(OrganizationId, WorkspaceId, RunId)>, RunError>;
 
     /// Cancels a run that isn't finished (`Finished` otherwise). A call
-    /// already sent isn't stopped; its outcome is still recorded.
+    /// already sent isn't stopped; its outcome is still recorded. Records
+    /// `audit` of the run, cancelled.
+    #[allow(clippy::too_many_arguments)]
     async fn cancel_run(
         &self,
         organization_id: OrganizationId,
@@ -748,5 +752,6 @@ pub trait RunStore: Send + Sync {
         run_id: RunId,
         events: &[NewRunEvent],
         now: Timestamp,
+        audit: &Audit<'_, Run>,
     ) -> Result<(Run, Vec<RunEvent>), RunError>;
 }

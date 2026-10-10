@@ -7,12 +7,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch};
 use serde::Serialize;
+use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{MemberId, OrganizationId};
 use zupflow_core::organizations::{Member, MemberRole, Organization, OrganizationSetup, StoreError, User};
 use zupflow_core::time::Timestamp;
 
-use crate::auth::{AppState, ConsoleUser, OrganizationAccess, unavailable};
+use crate::auth::{AppState, ConsoleUser, OrganizationAccess, unavailable, user_actor};
 use crate::http::{Failure, envelope};
 use crate::input::{Body, Fields};
 
@@ -207,7 +208,20 @@ async fn create_organization(
     reserved(&slug, "Reserved. Choose another.")?;
     let (organization, member) = state
         .organizations
-        .create_organization(OrganizationId::generate(), &name, &slug, user.id)
+        .create_organization(OrganizationId::generate(), &name, &slug, user.id, &|(
+            organization,
+            _,
+        ): &(
+            Organization,
+            Member,
+        )| {
+            AuditEntry::new(
+                user_actor(&user),
+                AuditAction::OrganizationCreated,
+                AuditTarget::new(AuditObject::Organization(organization.id), &organization.name),
+                AuditPlace::Organization,
+            )
+        })
         .await
         .map_err(|error| match error {
             StoreError::SlugTaken => slug_taken(),
@@ -250,7 +264,19 @@ async fn update_organization(
     }
     let organization = state
         .organizations
-        .update_organization(access.organization.id, name.as_deref(), slug.as_deref())
+        .update_organization(
+            access.organization.id,
+            name.as_deref(),
+            slug.as_deref(),
+            &|organization: &Organization| {
+                AuditEntry::new(
+                    access.audit_actor(),
+                    AuditAction::OrganizationUpdated,
+                    AuditTarget::new(AuditObject::Organization(organization.id), &organization.name),
+                    AuditPlace::Organization,
+                )
+            },
+        )
         .await
         .map_err(|error| match error {
             StoreError::SlugTaken => slug_taken(),
@@ -297,7 +323,20 @@ async fn invite_member(
     }
     let member = state
         .organizations
-        .invite_member(access.organization.id, &email, role, access.member.id)
+        .invite_member(
+            access.organization.id,
+            &email,
+            role,
+            access.member.id,
+            &|member: &Member| {
+                AuditEntry::new(
+                    access.audit_actor(),
+                    AuditAction::MemberInvited,
+                    AuditTarget::new(AuditObject::Member(member.id), &email),
+                    AuditPlace::Organization,
+                )
+            },
+        )
         .await
         .map_err(|error| match error {
             // Demoted or removed since the check above: the store reads the role again.
@@ -341,7 +380,20 @@ async fn update_member(
     let member_id = MemberId::parse(&member).map_err(|_| member_not_found())?;
     let member = state
         .organizations
-        .update_member_role(access.organization.id, member_id, role, access.member.id)
+        .update_member_role(
+            access.organization.id,
+            member_id,
+            role,
+            access.member.id,
+            &|member: &Member| {
+                AuditEntry::new(
+                    access.audit_actor(),
+                    AuditAction::MemberRoleChanged,
+                    AuditTarget::new(AuditObject::Member(member.id), &member.user.email),
+                    AuditPlace::Organization,
+                )
+            },
+        )
         .await
         .map_err(|error| match error {
             StoreError::NotFound => member_not_found(),
@@ -395,7 +447,20 @@ async fn remove_member(
     // active owner (422).
     state
         .organizations
-        .remove_member(access.organization.id, member_id, access.member.id, only_invited)
+        .remove_member(
+            access.organization.id,
+            member_id,
+            access.member.id,
+            only_invited,
+            &|member: &Member| {
+                AuditEntry::new(
+                    access.audit_actor(),
+                    AuditAction::MemberRemoved,
+                    AuditTarget::new(AuditObject::Member(member.id), &member.user.email),
+                    AuditPlace::Organization,
+                )
+            },
+        )
         .await
         .map_err(|error| match error {
             StoreError::NotFound => member_not_found(),

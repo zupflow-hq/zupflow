@@ -17,6 +17,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use zupflow_core::apps::{App, AppIcon, ToolEffect};
+use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
@@ -260,6 +261,46 @@ async fn find(state: &AppState, access: &WorkspaceAccess, inst: &str) -> Result<
         .ok_or_else(|| installation_failure(InstallationError::NotFound))
 }
 
+/// The name of an installation's app, as the audit log names the
+/// installation: `App` if the app is gone.
+pub(crate) async fn app_name(
+    state: &AppState,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    app: InstalledApp,
+) -> Result<String, Failure> {
+    let found = match app {
+        InstalledApp::Catalog(app_id) => state.apps.find_organization_app(organization_id, app_id).await,
+        InstalledApp::Workspace(app_id) => {
+            state
+                .apps
+                .find_workspace_app(organization_id, workspace_id, app_id)
+                .await
+        }
+    }
+    .map_err(app_failure)?;
+    Ok(found.map_or_else(|| "App".to_owned(), |app| app.name))
+}
+
+/// What the audit log records of a change to an installation.
+fn installation_audit(
+    access: &WorkspaceAccess,
+    action: AuditAction,
+    app_name: &str,
+) -> impl Fn(&Installation) -> AuditEntry + Send + Sync {
+    let actor = access.access.audit_actor();
+    let workspace_id = access.workspace.id;
+    let app_name = app_name.to_owned();
+    move |installation: &Installation| {
+        AuditEntry::new(
+            actor.clone(),
+            action,
+            AuditTarget::installation(installation.id, &app_name, &installation.label),
+            AuditPlace::Workspace(workspace_id),
+        )
+    }
+}
+
 async fn list_installations(
     State(state): State<AppState>,
     caller: Caller,
@@ -325,6 +366,13 @@ async fn rename_installation(
     let Some(label) = label else {
         return Err(ApiError::internal().into());
     };
+    let app_name = app_name(
+        &state,
+        access.access.organization_id,
+        access.workspace.id,
+        installation.app,
+    )
+    .await?;
     let renamed = state
         .installations
         .rename_installation(
@@ -332,6 +380,7 @@ async fn rename_installation(
             access.workspace.id,
             installation.id,
             &label,
+            &installation_audit(&access, AuditAction::InstallationUpdated, &app_name),
         )
         .await
         .map_err(installation_failure)?;
@@ -350,9 +399,21 @@ async fn disconnect_installation(
         .access
         .require(MemberRole::is_developer, "disconnect installations")?;
     let installation = find(&state, &access, &inst).await?;
+    let app_name = app_name(
+        &state,
+        access.access.organization_id,
+        access.workspace.id,
+        installation.app,
+    )
+    .await?;
     let disconnected = state
         .installations
-        .disconnect_installation(access.access.organization_id, access.workspace.id, installation.id)
+        .disconnect_installation(
+            access.access.organization_id,
+            access.workspace.id,
+            installation.id,
+            &installation_audit(&access, AuditAction::InstallationDisconnected, &app_name),
+        )
         .await
         .map_err(installation_failure)?;
     let apps = Apps::of(&state, access.access.organization_id, Some(access.workspace.id)).await?;
@@ -368,9 +429,21 @@ async fn delete_installation(
     let access = WorkspaceAccess::resolve(&state, caller, &headers, &ws).await?;
     access.access.require(MemberRole::is_admin, "remove installations")?;
     let installation = find(&state, &access, &inst).await?;
+    let app_name = app_name(
+        &state,
+        access.access.organization_id,
+        access.workspace.id,
+        installation.app,
+    )
+    .await?;
     state
         .installations
-        .delete_installation(access.access.organization_id, access.workspace.id, installation.id)
+        .delete_installation(
+            access.access.organization_id,
+            access.workspace.id,
+            installation.id,
+            &installation_audit(&access, AuditAction::InstallationDeleted, &app_name),
+        )
         .await
         .map_err(installation_failure)?;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -569,6 +642,25 @@ async fn accept_tool_change(
     let (Some(name), Some(latest_hash)) = (name, latest_hash) else {
         return Err(ApiError::internal().into());
     };
+    let app_name = app_name(
+        &state,
+        access.access.organization_id,
+        access.workspace.id,
+        installation.app,
+    )
+    .await?;
+    let actor = access.access.audit_actor();
+    let audit = |tool: &RegisteredTool| {
+        AuditEntry::new(
+            actor.clone(),
+            AuditAction::InstallationToolChangeAccepted,
+            AuditTarget::new(
+                AuditObject::Installation(installation.id),
+                format!("{app_name} · {} · {}", installation.label, tool.name),
+            ),
+            AuditPlace::Workspace(access.workspace.id),
+        )
+    };
     // A malformed hash matches no definition: `stale_definition`, once the
     // tool is found and changed.
     let accepted = match state
@@ -579,6 +671,7 @@ async fn accept_tool_change(
             installation.id,
             &name,
             hash_from_hex(&latest_hash),
+            &audit,
         )
         .await
     {

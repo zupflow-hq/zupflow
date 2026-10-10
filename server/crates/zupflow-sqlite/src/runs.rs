@@ -17,6 +17,7 @@ use serde_json::{Map, Value};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, Sqlite, Transaction};
 use uuid::Uuid;
+use zupflow_core::audit::Audit;
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{
     AgentId, ApiKeyId, InstallationId, OrganizationId, RunEventId, RunId, SessionId, ToolCallId, WorkspaceId,
@@ -936,6 +937,7 @@ impl RunStore for SqliteRunStore {
         events: &[NewRunEvent],
         job: &QueuedJob,
         now: Timestamp,
+        audit: &Audit<'_, Run>,
     ) -> Result<(Run, Vec<RunEvent>), RunError> {
         let mut transaction = self.immediate("resolve_approval").await?;
         match state_of(&mut transaction, organization_id, workspace_id, run_id).await? {
@@ -981,6 +983,9 @@ impl RunStore for SqliteRunStore {
         .map_err(failed("resolve_approval"))?;
         let appended = append(&mut transaction, organization_id, workspace_id, run_id, events, now).await?;
         let run = find_in(&mut transaction, organization_id, workspace_id, run_id).await?;
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&run))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("resolve_approval"))?;
         Ok((run, appended))
     }
@@ -1186,6 +1191,7 @@ impl RunStore for SqliteRunStore {
         run_id: RunId,
         events: &[NewRunEvent],
         now: Timestamp,
+        audit: &Audit<'_, Run>,
     ) -> Result<(Run, Vec<RunEvent>), RunError> {
         let mut transaction = self.immediate("cancel_run").await?;
         match state_of(&mut transaction, organization_id, workspace_id, run_id).await? {
@@ -1205,6 +1211,9 @@ impl RunStore for SqliteRunStore {
         .map_err(failed("cancel_run"))?;
         let appended = append(&mut transaction, organization_id, workspace_id, run_id, events, now).await?;
         let run = find_in(&mut transaction, organization_id, workspace_id, run_id).await?;
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&run))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("cancel_run"))?;
         Ok((run, appended))
     }
@@ -1301,6 +1310,7 @@ mod tests {
                     model: "m".to_owned(),
                     instructions: String::new(),
                 },
+                &|_| zupflow_conformance::audit_store::by_suite_in(tenant.workspace),
             )
             .await
             .unwrap();

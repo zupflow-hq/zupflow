@@ -18,6 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use serde::Serialize;
 use serde_json::{Value, json};
+use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{WebhookEndpointId, WebhookEventId};
@@ -216,6 +217,14 @@ async fn create_webhook(
                 secret_last4: secret[secret.len() - 4..].to_owned(),
             },
             Timestamp::now(),
+            &|endpoint: &WebhookEndpoint| {
+                AuditEntry::new(
+                    access.audit_actor(),
+                    AuditAction::WebhookCreated,
+                    webhook_target(endpoint),
+                    AuditPlace::Environment(endpoint.environment),
+                )
+            },
         )
         .await
         .map_err(unavailable)?;
@@ -226,6 +235,26 @@ async fn create_webhook(
             signing_secret: &secret,
         },
     ))
+}
+
+/// An endpoint as the audit log names it: by its URL's scheme, host and
+/// path. A query or fragment may carry a token, so neither is recorded.
+fn webhook_target(endpoint: &WebhookEndpoint) -> AuditTarget {
+    AuditTarget::new(AuditObject::Webhook(endpoint.id), audit_url(&endpoint.url))
+}
+
+/// `url` without its query, fragment or credentials: what the log may keep.
+pub(crate) fn audit_url(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or_default();
+            match parsed.port() {
+                Some(port) => format!("{}://{host}:{port}{}", parsed.scheme(), parsed.path()),
+                None => format!("{}://{host}{}", parsed.scheme(), parsed.path()),
+            }
+        }
+        Err(_) => "Webhook endpoint".to_owned(),
+    }
 }
 
 async fn update_webhook(
@@ -265,6 +294,14 @@ async fn update_webhook(
                 events,
                 enabled,
             },
+            &|endpoint: &WebhookEndpoint| {
+                AuditEntry::new(
+                    access.audit_actor(),
+                    AuditAction::WebhookUpdated,
+                    webhook_target(endpoint),
+                    AuditPlace::Environment(endpoint.environment),
+                )
+            },
         )
         .await
         .map_err(|error| match error {
@@ -284,7 +321,14 @@ async fn delete_webhook(
     let endpoint = find(&state, &access, &hook).await?;
     state
         .webhooks
-        .delete_endpoint(access.organization_id, endpoint.id)
+        .delete_endpoint(access.organization_id, endpoint.id, &|endpoint: &WebhookEndpoint| {
+            AuditEntry::new(
+                access.audit_actor(),
+                AuditAction::WebhookDeleted,
+                webhook_target(endpoint),
+                AuditPlace::Environment(endpoint.environment),
+            )
+        })
         .await
         .map_err(|error| match error {
             WebhookError::NotFound => not_found(),
@@ -372,4 +416,22 @@ async fn test_webhook(
             delivered_at: at,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::audit_url;
+
+    #[test]
+    fn keeps_only_scheme_host_and_path_for_the_audit_log() {
+        for (url, kept) in [
+            ("https://hooks.example/in?token=secret#top", "https://hooks.example/in"),
+            ("https://HOOKS.example:8443/a/b/?x=1", "https://hooks.example:8443/a/b/"),
+            ("https://user:pass@hooks.example/in", "https://hooks.example/in"),
+            ("https://hooks.example", "https://hooks.example/"),
+            ("not a url", "Webhook endpoint"),
+        ] {
+            assert_eq!(audit_url(url), kept, "{url}");
+        }
+    }
 }

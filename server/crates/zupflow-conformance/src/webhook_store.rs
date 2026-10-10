@@ -29,6 +29,8 @@ use zupflow_core::webhooks::{
     WebhookError, WebhookEventType, WebhookStore, delivery_of,
 };
 
+use crate::audit_store::by_suite;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Tenant {
     pub organization_id: OrganizationId,
@@ -87,6 +89,7 @@ async fn endpoint(
                 secret_last4: format!("{marker:04}"),
             },
             at,
+            &by_suite,
         )
         .await
         .unwrap();
@@ -243,14 +246,18 @@ async fn keeps_endpoints_in_their_organization(stores: &Stores<'_>, a: Tenant, b
     assert_eq!(
         stores
             .webhooks
-            .update_endpoint(org, theirs, &changes)
+            .update_endpoint(org, theirs, &changes, &by_suite)
             .await
             .unwrap_err(),
         WebhookError::NotFound,
         "another organization's can't be changed"
     );
     assert_eq!(
-        stores.webhooks.delete_endpoint(org, theirs).await.unwrap_err(),
+        stores
+            .webhooks
+            .delete_endpoint(org, theirs, &by_suite)
+            .await
+            .unwrap_err(),
         WebhookError::NotFound,
         "nor deleted"
     );
@@ -272,6 +279,7 @@ async fn keeps_endpoints_in_their_organization(stores: &Stores<'_>, a: Tenant, b
                 events: Some(vec![WebhookEventType::RunCancelled, WebhookEventType::AppToolsChanged]),
                 ..EndpointChanges::default()
             },
+            &by_suite,
         )
         .await
         .unwrap();
@@ -285,19 +293,27 @@ async fn keeps_endpoints_in_their_organization(stores: &Stores<'_>, a: Tenant, b
         ("Endpoint 1", true),
         "what an update doesn't name stays"
     );
-    let disabled = stores.webhooks.update_endpoint(org, first, &changes).await.unwrap();
+    let disabled = stores
+        .webhooks
+        .update_endpoint(org, first, &changes, &by_suite)
+        .await
+        .unwrap();
     assert!(!disabled.enabled);
 
-    stores.webhooks.delete_endpoint(org, first).await.unwrap();
-    stores.webhooks.delete_endpoint(org, second).await.unwrap();
+    stores.webhooks.delete_endpoint(org, first, &by_suite).await.unwrap();
+    stores.webhooks.delete_endpoint(org, second, &by_suite).await.unwrap();
     assert!(stores.webhooks.list_endpoints(org, None).await.unwrap().is_empty());
     assert_eq!(
-        stores.webhooks.delete_endpoint(org, first).await.unwrap_err(),
+        stores
+            .webhooks
+            .delete_endpoint(org, first, &by_suite)
+            .await
+            .unwrap_err(),
         WebhookError::NotFound
     );
     stores
         .webhooks
-        .delete_endpoint(b.organization_id, theirs)
+        .delete_endpoint(b.organization_id, theirs, &by_suite)
         .await
         .unwrap();
 }
@@ -327,6 +343,7 @@ async fn records_each_event_once_for_its_subscribers(stores: &Stores<'_>, a: Ten
                 enabled: Some(false),
                 ..EndpointChanges::default()
             },
+            &by_suite,
         )
         .await
         .unwrap();
@@ -428,6 +445,7 @@ async fn records_each_event_once_for_its_subscribers(stores: &Stores<'_>, a: Ten
                 events: Some(vec![WebhookEventType::RunFailed]),
                 ..EndpointChanges::default()
             },
+            &by_suite,
         )
         .await
         .unwrap();
@@ -465,11 +483,11 @@ async fn records_each_event_once_for_its_subscribers(stores: &Stores<'_>, a: Ten
     );
     claim_deliveries(stores).await;
     for id in [subscriber, other_type, disabled, production] {
-        stores.webhooks.delete_endpoint(org, id).await.unwrap();
+        stores.webhooks.delete_endpoint(org, id, &by_suite).await.unwrap();
     }
     stores
         .webhooks
-        .delete_endpoint(b.organization_id, theirs)
+        .delete_endpoint(b.organization_id, theirs, &by_suite)
         .await
         .unwrap();
 }
@@ -570,7 +588,7 @@ async fn records_attempts_on_pending_deliveries(stores: &Stores<'_>, a: Tenant, 
         Some(0)
     );
     claim_deliveries(stores).await;
-    stores.webhooks.delete_endpoint(org, hook).await.unwrap();
+    stores.webhooks.delete_endpoint(org, hook, &by_suite).await.unwrap();
 }
 
 async fn disables_an_endpoint_failing_for_days(stores: &Stores<'_>, a: Tenant) {
@@ -613,6 +631,7 @@ async fn disables_an_endpoint_failing_for_days(stores: &Stores<'_>, a: Tenant) {
                 enabled: Some(true),
                 ..EndpointChanges::default()
             },
+            &by_suite,
         )
         .await
         .unwrap();
@@ -648,7 +667,7 @@ async fn disables_an_endpoint_failing_for_days(stores: &Stores<'_>, a: Tenant) {
     fail_at(6 * window).await;
     assert!(enabled().await, "a failed test isn't when it started failing");
     claim_deliveries(stores).await;
-    stores.webhooks.delete_endpoint(org, hook).await.unwrap();
+    stores.webhooks.delete_endpoint(org, hook, &by_suite).await.unwrap();
 }
 
 async fn records_the_test_buttons_event(stores: &Stores<'_>, a: Tenant, b: Tenant) {
@@ -695,7 +714,7 @@ async fn records_the_test_buttons_event(stores: &Stores<'_>, a: Tenant, b: Tenan
         claim_deliveries(stores).await.is_empty(),
         "a test is sent outside the queue"
     );
-    stores.webhooks.delete_endpoint(org, hook).await.unwrap();
+    stores.webhooks.delete_endpoint(org, hook, &by_suite).await.unwrap();
 }
 
 async fn deletes_deliveries_with_their_endpoint(stores: &Stores<'_>, a: Tenant) {
@@ -711,7 +730,7 @@ async fn deletes_deliveries_with_their_endpoint(stores: &Stores<'_>, a: Tenant) 
     .await;
     let recorded = event(Environment::Sandbox, Some(a.sandbox), "run.completed");
     let delivery = stores.webhooks.record_event(org, &recorded).await.unwrap()[0];
-    stores.webhooks.delete_endpoint(org, hook).await.unwrap();
+    stores.webhooks.delete_endpoint(org, hook, &by_suite).await.unwrap();
     assert!(
         stores.webhooks.find_delivery(org, delivery).await.unwrap().is_none(),
         "a deleted endpoint's deliveries go with it"
@@ -768,7 +787,7 @@ async fn abandons_a_delivery_without_charging_its_endpoint(stores: &Stores<'_>, 
         "only a pending delivery is abandoned"
     );
     claim_deliveries(stores).await;
-    stores.webhooks.delete_endpoint(org, hook).await.unwrap();
+    stores.webhooks.delete_endpoint(org, hook, &by_suite).await.unwrap();
 }
 
 async fn holds_an_endpoint_for_one_delivery_at_a_time(stores: &Stores<'_>, a: Tenant, b: Tenant) {
@@ -842,6 +861,6 @@ async fn holds_an_endpoint_for_one_delivery_at_a_time(stores: &Stores<'_>, a: Te
     stores.webhooks.release_endpoint(org, hook, &first).await.unwrap();
     stores.webhooks.release_endpoint(org, other, &second).await.unwrap();
     for id in [hook, other] {
-        stores.webhooks.delete_endpoint(org, id).await.unwrap();
+        stores.webhooks.delete_endpoint(org, id, &by_suite).await.unwrap();
     }
 }

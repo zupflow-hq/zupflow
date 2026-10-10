@@ -270,7 +270,16 @@ export function advanceRun(db: Db, run: RunRow, at: string, rng: Rng): StepOutco
   }
 }
 
-/** Apply a human decision to a run waiting for approval. */
+/** A run as the audit log names it: by its agent, within the run's own workspace. */
+export function runTarget(db: Db, run: RunRow) {
+  const agent = db.agents.find((a) => sameWorkspace(a, run) && a.id === run.agent_id);
+  return { type: "run", id: run.id, name: agent?.name ?? "Agent" };
+}
+
+/**
+ * Apply a human decision to a run waiting for approval. The customer's
+ * backend records it with an API key, so the key is the audit log's actor.
+ */
 export function resolveApproval(
   db: Db,
   run: RunRow,
@@ -284,6 +293,18 @@ export function resolveApproval(
     call_id: callId,
     decision,
     api_key_id: apiKeyId,
+  });
+  const key = db.api_keys.find((k) => k.organization_id === run.organization_id && k.id === apiKeyId);
+  const workspace = db.workspaces.find((w) => w.organization_id === run.organization_id && w.id === run.workspace_id);
+  db.audit.unshift({
+    id: newId("audit_event", { at: Date.parse(at) }),
+    organization_id: run.organization_id,
+    workspace_id: run.workspace_id,
+    environment: workspace?.environment ?? null,
+    actor: { type: "api_key", id: apiKeyId, name: key?.name ?? "API key" },
+    action: "approval.resolved",
+    target: runTarget(db, run),
+    created_at: at,
   });
   run.status = "running";
   if (decision === "denied") {

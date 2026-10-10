@@ -24,6 +24,8 @@ use zupflow_core::installations::{ConnectedAccount, InstallationStatus, Installe
 use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::time::Timestamp;
 
+use crate::audit_store::{by_suite, by_suite_in};
+
 #[derive(Debug, Clone, Copy)]
 pub struct Tenant {
     pub organization_id: OrganizationId,
@@ -285,6 +287,7 @@ async fn forgets_the_authorization_when_a_session_finishes(store: &dyn ConnectSt
             completing.id,
             &completion(InstallationId::generate(), 1),
             now,
+            &|_| by_suite_in(a.sandbox),
         )
         .await
         .unwrap();
@@ -306,7 +309,7 @@ async fn keeps_settings_per_organization_and_environment(store: &dyn ConnectStor
     let urls = vec!["https://app.example/done".to_owned()];
     let origins = vec!["https://app.example".to_owned()];
     let saved = store
-        .save_settings(a.organization_id, Environment::Sandbox, &urls, &origins)
+        .save_settings(a.organization_id, Environment::Sandbox, &urls, &origins, &by_suite)
         .await
         .unwrap();
     assert_eq!((&saved.return_urls, &saved.allowed_origins), (&urls, &origins));
@@ -333,7 +336,7 @@ async fn keeps_settings_per_organization_and_environment(store: &dyn ConnectStor
         );
     }
     let replaced = store
-        .save_settings(a.organization_id, Environment::Sandbox, &[], &origins)
+        .save_settings(a.organization_id, Environment::Sandbox, &[], &origins, &by_suite)
         .await
         .unwrap();
     assert!(replaced.return_urls.is_empty(), "a write replaces the lists");
@@ -539,7 +542,8 @@ async fn completes_a_pending_session_once(store: &dyn ConnectStore, prepare: &Pr
                     workspace,
                     session.id,
                     &completion(new_installation, 1),
-                    now
+                    now,
+                    &|_| by_suite_in(workspace)
                 )
                 .await,
             Err(ConnectError::NotFound)
@@ -552,7 +556,8 @@ async fn completes_a_pending_session_once(store: &dyn ConnectStore, prepare: &Pr
                 a.sandbox,
                 session.id,
                 &completion(new_installation, 2),
-                now
+                now,
+                &|_| by_suite_in(a.sandbox)
             )
             .await,
         Err(ConnectError::InstallationChanged),
@@ -565,6 +570,7 @@ async fn completes_a_pending_session_once(store: &dyn ConnectStore, prepare: &Pr
             session.id,
             &completion(new_installation, 1),
             now,
+            &|_| by_suite_in(a.sandbox),
         )
         .await
         .unwrap();
@@ -617,7 +623,8 @@ async fn completes_a_pending_session_once(store: &dyn ConnectStore, prepare: &Pr
                 a.sandbox,
                 session.id,
                 &completion(InstallationId::generate(), 1),
-                now
+                now,
+                &|_| by_suite_in(a.sandbox)
             )
             .await,
         Err(ConnectError::NotPending),
@@ -639,7 +646,8 @@ async fn completes_a_pending_session_once(store: &dyn ConnectStore, prepare: &Pr
                     a.sandbox,
                     refused,
                     &completion(InstallationId::generate(), 1),
-                    now
+                    now,
+                    &|_| by_suite_in(a.sandbox)
                 )
                 .await,
             Err(ConnectError::NotPending)
@@ -683,7 +691,9 @@ async fn renews_a_reconnects_installation_under_the_next_version(store: &dyn Con
     for refused in [completion(InstallationId::generate(), 1), completion(a.installation, 2)] {
         assert_eq!(
             store
-                .complete_session(a.organization_id, a.sandbox, first.id, &refused, now)
+                .complete_session(a.organization_id, a.sandbox, first.id, &refused, now, &|_| by_suite_in(
+                    a.sandbox
+                ))
                 .await,
             Err(ConnectError::InstallationChanged),
             "only its own installation, under the next version"
@@ -706,6 +716,7 @@ async fn renews_a_reconnects_installation_under_the_next_version(store: &dyn Con
             first.id,
             &completion(a.installation, 1),
             now,
+            &|_| by_suite_in(a.sandbox),
         )
         .await
         .unwrap();
@@ -728,6 +739,7 @@ async fn renews_a_reconnects_installation_under_the_next_version(store: &dyn Con
             one.id,
             &completion(a.installation, 2),
             now,
+            &|_| by_suite_in(a.sandbox),
         )
         .await
         .unwrap();
@@ -738,7 +750,8 @@ async fn renews_a_reconnects_installation_under_the_next_version(store: &dyn Con
                 a.sandbox,
                 two.id,
                 &completion(a.installation, 2),
-                now
+                now,
+                &|_| by_suite_in(a.sandbox)
             )
             .await,
         Err(ConnectError::InstallationChanged)
@@ -750,6 +763,7 @@ async fn renews_a_reconnects_installation_under_the_next_version(store: &dyn Con
             two.id,
             &completion(a.installation, 3),
             now,
+            &|_| by_suite_in(a.sandbox),
         )
         .await
         .unwrap();

@@ -12,6 +12,7 @@
 use async_trait::async_trait;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
+use zupflow_core::audit::Audit;
 use zupflow_core::identity::VerifiedIdentity;
 use zupflow_core::ids::{MemberId, OrganizationId, UserId};
 use zupflow_core::organizations::{
@@ -517,6 +518,7 @@ impl OrganizationStore for SqliteOrganizationStore {
         name: &str,
         slug: &str,
         user_id: UserId,
+        audit: &Audit<'_, (Organization, Member)>,
     ) -> Result<(Organization, Member), StoreError> {
         let now = Timestamp::now();
         let mut transaction = self.immediate().await?;
@@ -551,14 +553,18 @@ impl OrganizationStore for SqliteOrganizationStore {
         let member = member_in(&mut transaction, organization_id, member_id)
             .await?
             .ok_or(StoreError::Unavailable)?;
-        transaction.commit().await.map_err(failed("commit"))?;
         let organization = Organization {
             id: organization_id,
             name: name.to_owned(),
             slug: slug.to_owned(),
             created_at: now,
         };
-        Ok((organization, member))
+        let created = (organization, member);
+        crate::audit::record(&mut transaction, organization_id, &audit(&created))
+            .await
+            .map_err(failed("audit"))?;
+        transaction.commit().await.map_err(failed("commit"))?;
+        Ok(created)
     }
 
     async fn update_organization(
@@ -566,7 +572,9 @@ impl OrganizationStore for SqliteOrganizationStore {
         organization_id: OrganizationId,
         name: Option<&str>,
         slug: Option<&str>,
+        audit: &Audit<'_, Organization>,
     ) -> Result<Organization, StoreError> {
+        let mut transaction = self.immediate().await?;
         let row = sqlx::query(
             "UPDATE organizations SET name = coalesce(?, name), slug = coalesce(?, slug) WHERE id = ? \
              RETURNING id AS organization_id, name AS organization_name, slug AS organization_slug, \
@@ -575,7 +583,7 @@ impl OrganizationStore for SqliteOrganizationStore {
         .bind(name)
         .bind(slug)
         .bind(organization_id.uuid())
-        .fetch_optional(self.database.pool())
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(|error| {
             if is_unique_violation(&error) {
@@ -584,7 +592,12 @@ impl OrganizationStore for SqliteOrganizationStore {
                 failed("update_organization")(error)
             }
         })?;
-        organization_from(&row.ok_or(StoreError::NotFound)?)
+        let organization = organization_from(&row.ok_or(StoreError::NotFound)?)?;
+        crate::audit::record(&mut transaction, organization_id, &audit(&organization))
+            .await
+            .map_err(failed("audit"))?;
+        transaction.commit().await.map_err(failed("commit"))?;
+        Ok(organization)
     }
 
     async fn load_setup(&self, organization_id: OrganizationId) -> Result<OrganizationSetup, StoreError> {
@@ -648,6 +661,7 @@ impl OrganizationStore for SqliteOrganizationStore {
         email: &str,
         role: MemberRole,
         acting: MemberId,
+        audit: &Audit<'_, Member>,
     ) -> Result<Member, StoreError> {
         let email = email.to_lowercase();
         let mut transaction = self.immediate().await?;
@@ -717,6 +731,9 @@ impl OrganizationStore for SqliteOrganizationStore {
         let member = member_in(&mut transaction, organization_id, member_id)
             .await?
             .ok_or(StoreError::Unavailable)?;
+        crate::audit::record(&mut transaction, organization_id, &audit(&member))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("commit"))?;
         Ok(member)
     }
@@ -753,6 +770,7 @@ impl OrganizationStore for SqliteOrganizationStore {
         user_id: UserId,
         invitation_id: MemberId,
         now: Timestamp,
+        audit: &Audit<'_, (Organization, Member)>,
     ) -> Result<(Organization, Member), StoreError> {
         self.answerable(user_id, invitation_id, now, true).await?;
         let mut transaction = self.immediate().await?;
@@ -798,11 +816,19 @@ impl OrganizationStore for SqliteOrganizationStore {
         .await
         .map_err(failed("read_membership"))?;
         let joined = (organization_from(&row)?, member_from(&row)?);
+        crate::audit::record(&mut transaction, organization_id, &audit(&joined))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("commit"))?;
         Ok(joined)
     }
 
-    async fn decline_invitation_of_user(&self, user_id: UserId, invitation_id: MemberId) -> Result<(), StoreError> {
+    async fn decline_invitation_of_user(
+        &self,
+        user_id: UserId,
+        invitation_id: MemberId,
+        audit: &Audit<'_, ()>,
+    ) -> Result<(), StoreError> {
         let now = Timestamp::now();
         self.answerable(user_id, invitation_id, now, false).await?;
         let mut transaction = self.immediate().await?;
@@ -820,6 +846,9 @@ impl OrganizationStore for SqliteOrganizationStore {
             .execute(&mut *transaction)
             .await
             .map_err(failed("decline_invitation"))?;
+        crate::audit::record(&mut transaction, organization_id, &audit(&()))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("commit"))?;
         Ok(())
     }
@@ -839,6 +868,7 @@ impl OrganizationStore for SqliteOrganizationStore {
         member_id: MemberId,
         role: MemberRole,
         acting: MemberId,
+        audit: &Audit<'_, Member>,
     ) -> Result<Member, StoreError> {
         let mut transaction = self.immediate().await?;
         let acting = acting_member(&mut transaction, organization_id, acting).await?;
@@ -878,6 +908,9 @@ impl OrganizationStore for SqliteOrganizationStore {
         let member = member_in(&mut transaction, organization_id, member_id)
             .await?
             .ok_or(StoreError::Unavailable)?;
+        crate::audit::record(&mut transaction, organization_id, &audit(&member))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("commit"))?;
         Ok(member)
     }
@@ -888,6 +921,7 @@ impl OrganizationStore for SqliteOrganizationStore {
         member_id: MemberId,
         acting: MemberId,
         only_invited: bool,
+        audit: &Audit<'_, Member>,
     ) -> Result<(), StoreError> {
         let mut transaction = self.immediate().await?;
         let acting_role = acting_member(&mut transaction, organization_id, acting).await?.role;
@@ -916,6 +950,9 @@ impl OrganizationStore for SqliteOrganizationStore {
             // What they granted goes with them.
             withdraw_ungrantable(&mut transaction, organization_id, member.user.id, None).await?;
         }
+        crate::audit::record(&mut transaction, organization_id, &audit(&member))
+            .await
+            .map_err(failed("audit"))?;
         transaction.commit().await.map_err(failed("commit"))?;
         Ok(())
     }
@@ -961,11 +998,23 @@ mod tests {
         let store = SqliteOrganizationStore::new(database.clone());
         let alice = store.user_for_identity(&person("alice")).await.unwrap();
         let (a, _) = store
-            .create_organization(OrganizationId::generate(), "A", "org-a", alice.id)
+            .create_organization(
+                OrganizationId::generate(),
+                "A",
+                "org-a",
+                alice.id,
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         let (b, _) = store
-            .create_organization(OrganizationId::generate(), "B", "org-b", alice.id)
+            .create_organization(
+                OrganizationId::generate(),
+                "B",
+                "org-b",
+                alice.id,
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         sqlx::query("UPDATE members SET last_active_at = 0")
@@ -998,11 +1047,23 @@ mod tests {
         let store = SqliteOrganizationStore::new(database.clone());
         let alice = store.user_for_identity(&person("alice")).await.unwrap();
         let (a, _) = store
-            .create_organization(OrganizationId::generate(), "A", "org-a", alice.id)
+            .create_organization(
+                OrganizationId::generate(),
+                "A",
+                "org-a",
+                alice.id,
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         let (b, _) = store
-            .create_organization(OrganizationId::generate(), "B", "org-b", alice.id)
+            .create_organization(
+                OrganizationId::generate(),
+                "B",
+                "org-b",
+                alice.id,
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         sqlx::query(
@@ -1040,16 +1101,33 @@ mod tests {
         let alice = store.user_for_identity(&identity("alice")).await.unwrap();
         let bob = store.user_for_identity(&identity("bob")).await.unwrap();
         let (org, alice_member) = store
-            .create_organization(OrganizationId::generate(), "Two owners", "two-owners", alice.id)
+            .create_organization(
+                OrganizationId::generate(),
+                "Two owners",
+                "two-owners",
+                alice.id,
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         // Bob is invited as an owner and accepts.
         let invitation = store
-            .invite_member(org.id, &bob.email, MemberRole::Owner, alice_member.id)
+            .invite_member(
+                org.id,
+                &bob.email,
+                MemberRole::Owner,
+                alice_member.id,
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         let (_, bob_member) = store
-            .accept_invitation_of_user(bob.id, invitation.id, Timestamp::now())
+            .accept_invitation_of_user(
+                bob.id,
+                invitation.id,
+                Timestamp::now(),
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         let bob_member = bob_member.id;
@@ -1074,8 +1152,20 @@ mod tests {
         for _ in 0..20 {
             // Each steps down: one wins, and the other is then the last owner.
             let (first, second) = tokio::join!(
-                store.update_member_role(org.id, a, MemberRole::Admin, a),
-                store.update_member_role(org.id, bob_member, MemberRole::Admin, bob_member),
+                store.update_member_role(
+                    org.id,
+                    a,
+                    MemberRole::Admin,
+                    a,
+                    &zupflow_conformance::audit_store::by_suite
+                ),
+                store.update_member_role(
+                    org.id,
+                    bob_member,
+                    MemberRole::Admin,
+                    bob_member,
+                    &zupflow_conformance::audit_store::by_suite
+                ),
             );
             let mut outcomes = [first.map(|_| ()), second.map(|_| ())];
             outcomes.sort_by_key(Result::is_err);
@@ -1090,8 +1180,20 @@ mod tests {
             // Each demotes the other: the loser is no longer an owner when its
             // change runs, which the transaction sees.
             let (first, second) = tokio::join!(
-                store.update_member_role(org.id, bob_member, MemberRole::Admin, a),
-                store.update_member_role(org.id, a, MemberRole::Admin, bob_member),
+                store.update_member_role(
+                    org.id,
+                    bob_member,
+                    MemberRole::Admin,
+                    a,
+                    &zupflow_conformance::audit_store::by_suite
+                ),
+                store.update_member_role(
+                    org.id,
+                    a,
+                    MemberRole::Admin,
+                    bob_member,
+                    &zupflow_conformance::audit_store::by_suite
+                ),
             );
             let mut outcomes = [first.map(|_| ()), second.map(|_| ())];
             outcomes.sort_by_key(Result::is_err);
@@ -1115,12 +1217,24 @@ mod tests {
         let alice = store.user_for_identity(&person("alice")).await.unwrap();
         let bob = store.user_for_identity(&person("bob")).await.unwrap();
         let (org, alice_member) = store
-            .create_organization(OrganizationId::generate(), "A", "org-a", alice.id)
+            .create_organization(
+                OrganizationId::generate(),
+                "A",
+                "org-a",
+                alice.id,
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         for role in [MemberRole::Owner, MemberRole::Viewer] {
             let invitation = store
-                .invite_member(org.id, &bob.email, role, alice_member.id)
+                .invite_member(
+                    org.id,
+                    &bob.email,
+                    role,
+                    alice_member.id,
+                    &zupflow_conformance::audit_store::by_suite,
+                )
                 .await
                 .unwrap();
             sqlx::query("UPDATE members SET invited_by_user_id = NULL WHERE organization_id = ? AND id = ?")
@@ -1138,18 +1252,31 @@ mod tests {
             );
             assert_eq!(
                 store
-                    .accept_invitation_of_user(bob.id, invitation.id, Timestamp::now())
+                    .accept_invitation_of_user(
+                        bob.id,
+                        invitation.id,
+                        Timestamp::now(),
+                        &zupflow_conformance::audit_store::by_suite
+                    )
                     .await,
                 Err(StoreError::NotFound)
             );
             assert_eq!(
-                store.decline_invitation_of_user(bob.id, invitation.id).await,
+                store
+                    .decline_invitation_of_user(bob.id, invitation.id, &zupflow_conformance::audit_store::by_suite)
+                    .await,
                 Err(StoreError::NotFound)
             );
             assert_eq!(store.find_active_membership(org.id, bob.id).await.unwrap(), None);
             // An admin still withdraws it.
             store
-                .remove_member(org.id, invitation.id, alice_member.id, true)
+                .remove_member(
+                    org.id,
+                    invitation.id,
+                    alice_member.id,
+                    true,
+                    &zupflow_conformance::audit_store::by_suite,
+                )
                 .await
                 .unwrap();
         }
@@ -1168,25 +1295,54 @@ mod tests {
         let bob = store.user_for_identity(&person("bob")).await.unwrap();
         let carol = store.user_for_identity(&person("carol")).await.unwrap();
         let (org, alice_member) = store
-            .create_organization(OrganizationId::generate(), "A", "org-a", alice.id)
+            .create_organization(
+                OrganizationId::generate(),
+                "A",
+                "org-a",
+                alice.id,
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         let invitation = store
-            .invite_member(org.id, &carol.email, MemberRole::Viewer, alice_member.id)
+            .invite_member(
+                org.id,
+                &carol.email,
+                MemberRole::Viewer,
+                alice_member.id,
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         assert_eq!(
             store
-                .invite_member(org.id, &carol.email, MemberRole::Admin, alice_member.id)
+                .invite_member(
+                    org.id,
+                    &carol.email,
+                    MemberRole::Admin,
+                    alice_member.id,
+                    &zupflow_conformance::audit_store::by_suite
+                )
                 .await,
             Err(StoreError::AlreadyMember)
         );
         let invitation_b = store
-            .invite_member(org.id, &bob.email, MemberRole::Admin, alice_member.id)
+            .invite_member(
+                org.id,
+                &bob.email,
+                MemberRole::Admin,
+                alice_member.id,
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         let (_, bob_member) = store
-            .accept_invitation_of_user(bob.id, invitation_b.id, Timestamp::now())
+            .accept_invitation_of_user(
+                bob.id,
+                invitation_b.id,
+                Timestamp::now(),
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         sqlx::query("UPDATE members SET invited_at = 0 WHERE organization_id = ? AND id = ?")
@@ -1197,7 +1353,13 @@ mod tests {
             .unwrap();
         let before = Timestamp::now();
         let renewed = store
-            .invite_member(org.id, &carol.email, MemberRole::Developer, bob_member.id)
+            .invite_member(
+                org.id,
+                &carol.email,
+                MemberRole::Developer,
+                bob_member.id,
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1212,13 +1374,24 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].invited_by.email, bob.email, "bob granted it now");
         store
-            .accept_invitation_of_user(carol.id, invitation.id, Timestamp::now())
+            .accept_invitation_of_user(
+                carol.id,
+                invitation.id,
+                Timestamp::now(),
+                &zupflow_conformance::audit_store::by_suite,
+            )
             .await
             .unwrap();
         // A member isn't renewed into an invitation.
         assert_eq!(
             store
-                .invite_member(org.id, &carol.email, MemberRole::Viewer, alice_member.id)
+                .invite_member(
+                    org.id,
+                    &carol.email,
+                    MemberRole::Viewer,
+                    alice_member.id,
+                    &zupflow_conformance::audit_store::by_suite
+                )
                 .await,
             Err(StoreError::AlreadyMember)
         );

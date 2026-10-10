@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::apps::AuthTemplate;
+use crate::audit::Audit;
 use crate::environment::Environment;
 use crate::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
 use crate::keys::Sealed;
@@ -187,29 +188,33 @@ pub trait InstallationStore: Send + Sync {
         installation: &NewInstallation,
     ) -> Result<Installation, InstallationError>;
 
+    /// Renames it, recording `audit` of it, renamed.
     async fn rename_installation(
         &self,
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         installation_id: InstallationId,
         label: &str,
+        audit: &Audit<'_, Installation>,
     ) -> Result<Installation, InstallationError>;
 
     /// Marks it disconnected and deletes its credential, as one: nothing can
-    /// use an account it no longer holds.
+    /// use an account it no longer holds. Records `audit` of it, disconnected.
     async fn disconnect_installation(
         &self,
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         installation_id: InstallationId,
+        audit: &Audit<'_, Installation>,
     ) -> Result<Installation, InstallationError>;
 
-    /// Deletes it and its credential.
+    /// Deletes it and its credential, recording `audit` of it as it was.
     async fn delete_installation(
         &self,
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         installation_id: InstallationId,
+        audit: &Audit<'_, Installation>,
     ) -> Result<(), InstallationError>;
 
     /// The sealed credential, while the installation holds one.

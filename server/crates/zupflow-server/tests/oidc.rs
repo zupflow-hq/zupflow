@@ -92,6 +92,7 @@ async fn setup() -> Setup {
         },
         api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
         webhooks: Arc::new(zupflow_sqlite::SqliteWebhookStore::new(database.clone())),
+        audit: Arc::new(zupflow_sqlite::SqliteAuditStore::new(database.clone())),
         idempotency: Arc::new(zupflow_sqlite::SqliteIdempotencyStore::new(database)),
         fingerprinter: Arc::new(zupflow_core::idempotency::Fingerprinter::new([7; 32])),
         api_key_hasher: Arc::new(zupflow_core::api_keys::ApiKeyHasher::new([7; 32])),

@@ -271,6 +271,7 @@ mod tests {
             settings: PolicySettings,
             _updated_by: Option<UserId>,
             _now: Timestamp,
+            _audit: &zupflow_core::audit::Audit<'_, ToolPolicy>,
         ) -> Result<ToolPolicy, PolicyError> {
             *self.settings.lock().unwrap() = settings;
             self.load_policy(organization_id).await
@@ -322,6 +323,7 @@ mod tests {
             levels: &[(String, ToolLevel)],
             _updated_by: Option<UserId>,
             _now: Timestamp,
+            _audit: &zupflow_core::audit::Audit<'_, Vec<AppToolLevel>>,
         ) -> Result<Vec<AppToolLevel>, PolicyError> {
             self.found(organization_id, app_id)?;
             validate_levels(levels)?;

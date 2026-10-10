@@ -32,10 +32,11 @@ use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use zupflow_basic::configured_models::ConfiguredModels;
 use zupflow_basic::local_keys::LocalKeyService;
-use zupflow_core::agents::{AgentStore, GrantTools, NewAgent};
-use zupflow_core::api_keys::{ApiKeyHasher, ApiKeyStore, NewApiKey, NewSecret};
-use zupflow_core::apps::AppStore;
-use zupflow_core::connect::{ConnectIntent, ConnectStore, NewConnectSession, Reference};
+use zupflow_core::agents::{Agent, AgentStore, Grant, GrantTools, NewAgent};
+use zupflow_core::api_keys::{ApiKey, ApiKeyHasher, ApiKeyStore, NewApiKey, NewSecret};
+use zupflow_core::apps::{App, AppStore, Configuration};
+use zupflow_core::audit::{AuditAction, AuditActor, AuditEntry, AuditObject, AuditPlace, AuditTarget};
+use zupflow_core::connect::{ConnectIntent, ConnectSettings, ConnectStore, NewConnectSession, Reference};
 use zupflow_core::environment::Environment;
 use zupflow_core::idempotency::Fingerprinter;
 use zupflow_core::identity::{Identity, IdentityError, Profile, VerifiedIdentity};
@@ -44,14 +45,16 @@ use zupflow_core::ids::{
 };
 use zupflow_core::installations::{InstallationStore, InstalledApp, TemplateSnapshot};
 use zupflow_core::keys::{EncryptionContext, seal};
-use zupflow_core::organizations::{INVITATION_TTL_MS, MemberRole, OrganizationStore, User};
+use zupflow_core::organizations::{INVITATION_TTL_MS, Member, MemberRole, Organization, OrganizationStore, User};
 use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse, Refusal};
-use zupflow_core::policy::{ToolLevel, ToolPolicyStore};
+use zupflow_core::policy::{AppToolLevel, ToolLevel, ToolPolicyStore};
 use zupflow_core::runs::CallTarget;
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{ListedTool, ToolRegistry, ToolRevision};
-use zupflow_core::webhooks::{NewEndpoint, SECRET_VERSION, WebhookEventType, WebhookStore, new_signing_secret};
-use zupflow_core::workspaces::{NewWorkspace, WorkspaceStore};
+use zupflow_core::webhooks::{
+    NewEndpoint, SECRET_VERSION, WebhookEndpoint, WebhookEventType, WebhookStore, new_signing_secret,
+};
+use zupflow_core::workspaces::{NewWorkspace, Workspace, WorkspaceStore};
 use zupflow_server::sign_in::SignInSettings;
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{
@@ -193,6 +196,7 @@ async fn serve(path: &str, console: Option<&str>) -> Result<(), String> {
         api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
         api_key_hasher: Arc::new(ApiKeyHasher::new(secret)),
         webhooks: Arc::new(zupflow_sqlite::SqliteWebhookStore::new(database.clone())),
+        audit: Arc::new(zupflow_sqlite::SqliteAuditStore::new(database.clone())),
         idempotency: Arc::new(SqliteIdempotencyStore::new(database)),
         fingerprinter: Arc::new(Fingerprinter::new(secret)),
     };
@@ -254,28 +258,85 @@ async fn reset(path: &str) -> Result<(), String> {
     let (owner, outsider) = (user("owner").ok_or("owner")?, user("outsider").ok_or("outsider")?);
 
     let (northwind, owner_member) = organizations
-        .create_organization(OrganizationId::generate(), "Northwind", "northwind", owner.id)
+        .create_organization(
+            OrganizationId::generate(),
+            "Northwind",
+            "northwind",
+            owner.id,
+            &|(organization, _): &(Organization, Member)| {
+                by_fixture(
+                    AuditAction::OrganizationCreated,
+                    AuditTarget::new(AuditObject::Organization(organization.id), &organization.name),
+                    AuditPlace::Organization,
+                )
+            },
+        )
         .await
         .map_err(|error| fail("northwind")(&error))?;
     let (larkspur, outsider_member) = organizations
-        .create_organization(OrganizationId::generate(), "Larkspur", "larkspur", outsider.id)
+        .create_organization(
+            OrganizationId::generate(),
+            "Larkspur",
+            "larkspur",
+            outsider.id,
+            &|(organization, _): &(Organization, Member)| {
+                by_fixture(
+                    AuditAction::OrganizationCreated,
+                    AuditTarget::new(AuditObject::Organization(organization.id), &organization.name),
+                    AuditPlace::Organization,
+                )
+            },
+        )
         .await
         .map_err(|error| fail("larkspur")(&error))?;
     for (name, role) in [("developer", MemberRole::Developer), ("viewer", MemberRole::Viewer)] {
         let member = user(name).ok_or("member")?;
         let invitation = organizations
-            .invite_member(northwind.id, &member.email, role, owner_member.id)
+            .invite_member(
+                northwind.id,
+                &member.email,
+                role,
+                owner_member.id,
+                &|invited: &Member| {
+                    by_fixture(
+                        AuditAction::MemberInvited,
+                        AuditTarget::new(AuditObject::Member(invited.id), &invited.user.email),
+                        AuditPlace::Organization,
+                    )
+                },
+            )
             .await
             .map_err(|error| fail("invite")(&error))?;
         organizations
-            .accept_invitation_of_user(member.id, invitation.id, Timestamp::now())
+            .accept_invitation_of_user(member.id, invitation.id, Timestamp::now(), &|(_, joined): &(
+                Organization,
+                Member,
+            )| {
+                by_fixture(
+                    AuditAction::MemberJoined,
+                    AuditTarget::new(AuditObject::Member(joined.id), &joined.user.email),
+                    AuditPlace::Organization,
+                )
+            })
             .await
             .map_err(|error| fail("accept")(&error))?;
     }
     // Larkspur invited the viewer long enough ago that the invitation expired.
     let viewer = user("viewer").ok_or("viewer")?;
     let expired = organizations
-        .invite_member(larkspur.id, &viewer.email, MemberRole::Developer, outsider_member.id)
+        .invite_member(
+            larkspur.id,
+            &viewer.email,
+            MemberRole::Developer,
+            outsider_member.id,
+            &|invited: &Member| {
+                by_fixture(
+                    AuditAction::MemberInvited,
+                    AuditTarget::new(AuditObject::Member(invited.id), &invited.user.email),
+                    AuditPlace::Organization,
+                )
+            },
+        )
         .await
         .map_err(|error| fail("invite")(&error))?;
     sqlx::query("UPDATE members SET invited_at = ? WHERE organization_id = ? AND id = ?")
@@ -304,7 +365,18 @@ async fn reset(path: &str) -> Result<(), String> {
             external_id: None,
         };
         let created = workspaces
-            .create_workspace(organization, WorkspaceId::generate(), &workspace)
+            .create_workspace(
+                organization,
+                WorkspaceId::generate(),
+                &workspace,
+                &|created: &Workspace| {
+                    by_fixture(
+                        AuditAction::WorkspaceCreated,
+                        AuditTarget::new(AuditObject::Workspace(created.id), &created.name),
+                        AuditPlace::Workspace(created.id),
+                    )
+                },
+            )
             .await
             .map_err(|error| fail(slug)(&error))?;
         workspace_ids.push((slug, created.id, environment));
@@ -356,7 +428,13 @@ async fn reset(path: &str) -> Result<(), String> {
         ),
     ] {
         let created = apps
-            .create_organization_app(organization, AppId::generate(), &app)
+            .create_organization_app(organization, AppId::generate(), &app, &|created: &App| {
+                by_fixture(
+                    AuditAction::AppCreated,
+                    AuditTarget::new(AuditObject::App(created.id), &created.name),
+                    AuditPlace::Organization,
+                )
+            })
             .await
             .map_err(|error| fail(&app.slug)(&error))?;
         seeded.push((organization, app.slug.clone(), InstalledApp::Catalog(created.id)));
@@ -365,9 +443,21 @@ async fn reset(path: &str) -> Result<(), String> {
             let changes = configuration
                 .changes(&sealing, organization, None, environment, created.id)
                 .await?;
-            apps.save_organization_configuration(organization, created.id, environment, &changes)
-                .await
-                .map_err(|error| fail(&app.slug)(&error))?;
+            apps.save_organization_configuration(
+                organization,
+                created.id,
+                environment,
+                &changes,
+                &|_: &Configuration| {
+                    by_fixture(
+                        AuditAction::AppConfigurationUpdated,
+                        AuditTarget::new(AuditObject::App(created.id), &created.name),
+                        AuditPlace::Environment(environment),
+                    )
+                },
+            )
+            .await
+            .map_err(|error| fail(&app.slug)(&error))?;
         }
     }
     for (organization, workspace, app) in [
@@ -385,7 +475,13 @@ async fn reset(path: &str) -> Result<(), String> {
     ] {
         let (workspace, environment) = workspace_id(workspace)?;
         let created = apps
-            .create_workspace_app(organization, workspace, AppId::generate(), &app)
+            .create_workspace_app(organization, workspace, AppId::generate(), &app, &|created: &App| {
+                by_fixture(
+                    AuditAction::AppCreated,
+                    AuditTarget::new(AuditObject::App(created.id), &created.name),
+                    AuditPlace::Workspace(workspace),
+                )
+            })
             .await
             .map_err(|error| fail(&app.slug)(&error))?;
         seeded.push((organization, app.slug.clone(), InstalledApp::Workspace(created.id)));
@@ -393,9 +489,15 @@ async fn reset(path: &str) -> Result<(), String> {
         let changes = ready(&format!("https://{}.example/mcp", app.slug), false)
             .changes(&sealing, organization, Some(workspace), environment, created.id)
             .await?;
-        apps.save_workspace_configuration(organization, workspace, created.id, &changes)
-            .await
-            .map_err(|error| fail(&app.slug)(&error))?;
+        apps.save_workspace_configuration(organization, workspace, created.id, &changes, &|_: &Configuration| {
+            by_fixture(
+                AuditAction::AppConfigurationUpdated,
+                AuditTarget::new(AuditObject::App(created.id), &created.name),
+                AuditPlace::Workspace(workspace),
+            )
+        })
+        .await
+        .map_err(|error| fail(&app.slug)(&error))?;
     }
 
     // Connected installations, each with its credential sealed as Connect seals it.
@@ -571,7 +673,20 @@ async fn reset(path: &str) -> Result<(), String> {
             .map(|(tool, level)| ((*tool).to_owned(), *level))
             .collect();
         policies
-            .set_levels(organization, app, &levels, Some(writer), Timestamp::now())
+            .set_levels(
+                organization,
+                app,
+                &levels,
+                Some(writer),
+                Timestamp::now(),
+                &|_: &Vec<AppToolLevel>| {
+                    by_fixture(
+                        AuditAction::AppToolLevelsUpdated,
+                        AuditTarget::new(AuditObject::App(app), slug),
+                        AuditPlace::Organization,
+                    )
+                },
+            )
             .await
             .map_err(|error| fail("levels")(&error))?;
     }
@@ -631,6 +746,13 @@ async fn reset(path: &str) -> Result<(), String> {
                     model: model.to_owned(),
                     instructions: "Be brief.".to_owned(),
                 },
+                &|created: &Agent| {
+                    by_fixture(
+                        AuditAction::AgentCreated,
+                        AuditTarget::new(AuditObject::Agent(created.id), &created.name),
+                        AuditPlace::Workspace(workspace),
+                    )
+                },
             )
             .await
             .map_err(|error| fail(name)(&error))?;
@@ -675,6 +797,13 @@ async fn reset(path: &str) -> Result<(), String> {
                     tools: names(granted),
                     approval_required: names(approval),
                 },
+                &|_: &Grant| {
+                    by_fixture(
+                        AuditAction::AgentGrantCreated,
+                        AuditTarget::new(AuditObject::Agent(agent.id), &agent.name),
+                        AuditPlace::Workspace(workspace),
+                    )
+                },
             )
             .await
             .map_err(|error| fail(name)(&error))?;
@@ -691,6 +820,13 @@ async fn reset(path: &str) -> Result<(), String> {
                 model: "model-fast".to_owned(),
                 instructions: "Answer support questions briefly.".to_owned(),
             },
+            &|created: &Agent| {
+                by_fixture(
+                    AuditAction::AgentCreated,
+                    AuditTarget::new(AuditObject::Agent(created.id), &created.name),
+                    AuditPlace::Workspace(workspace),
+                )
+            },
         )
         .await
         .map_err(|error| fail("paused agent")(&error))?;
@@ -702,6 +838,13 @@ async fn reset(path: &str) -> Result<(), String> {
             &zupflow_core::agents::AgentChanges {
                 status: Some(zupflow_core::agents::AgentStatus::Paused),
                 ..Default::default()
+            },
+            &|agent: &Agent| {
+                by_fixture(
+                    AuditAction::AgentPaused,
+                    AuditTarget::new(AuditObject::Agent(agent.id), &agent.name),
+                    AuditPlace::Workspace(workspace),
+                )
             },
         )
         .await
@@ -763,7 +906,19 @@ async fn reset(path: &str) -> Result<(), String> {
         ),
     ] {
         connect
-            .save_settings(organization, Environment::Sandbox, &return_urls, &origins)
+            .save_settings(
+                organization,
+                Environment::Sandbox,
+                &return_urls,
+                &origins,
+                &|_: &ConnectSettings| {
+                    by_fixture(
+                        AuditAction::ConnectSettingsUpdated,
+                        AuditTarget::connect_settings(Environment::Sandbox),
+                        AuditPlace::Environment(Environment::Sandbox),
+                    )
+                },
+            )
             .await
             .map_err(|error| fail("connect settings")(&error))?;
     }
@@ -840,6 +995,13 @@ async fn reset(path: &str) -> Result<(), String> {
                     secret_last4: secret[secret.len() - 4..].to_owned(),
                 },
                 Timestamp::now(),
+                &|endpoint: &WebhookEndpoint| {
+                    by_fixture(
+                        AuditAction::WebhookCreated,
+                        AuditTarget::new(AuditObject::Webhook(endpoint.id), &endpoint.url),
+                        AuditPlace::Environment(endpoint.environment),
+                    )
+                },
             )
             .await
             .map_err(|error| fail("webhook")(&error))?;
@@ -861,11 +1023,30 @@ async fn reset(path: &str) -> Result<(), String> {
             secret_hash: hasher.hash(&secret.secret),
             created_by: creator.id,
         };
-        keys.create_api_key(organization, ApiKeyId::generate(), &key)
-            .await
-            .map_err(|error| fail("key")(&error))?;
+        keys.create_api_key(organization, ApiKeyId::generate(), &key, &|key: &ApiKey| {
+            by_fixture(
+                AuditAction::ApiKeyCreated,
+                AuditTarget::new(AuditObject::ApiKey(key.id), &key.name),
+                AuditPlace::Environment(key.environment),
+            )
+        })
+        .await
+        .map_err(|error| fail("key")(&error))?;
     }
     Ok(())
+}
+
+/// The fixture is built by changes like any other, so each records its
+/// audit event as it would in the API; Zupflow itself made them.
+fn by_fixture(action: AuditAction, target: AuditTarget, place: AuditPlace) -> AuditEntry {
+    AuditEntry::new(
+        AuditActor::System {
+            name: "Fixture".to_owned(),
+        },
+        action,
+        target,
+        place,
+    )
 }
 
 /// A tool as the MCP client records it: canonical JSON and its SHA-256.

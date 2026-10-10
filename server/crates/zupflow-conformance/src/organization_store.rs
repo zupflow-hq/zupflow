@@ -11,6 +11,8 @@ use zupflow_core::organizations::{
 };
 use zupflow_core::time::Timestamp;
 
+use crate::audit_store::by_suite;
+
 /// A unique token, so the suite can run against a store that already has data.
 fn unique() -> String {
     OrganizationId::generate().uuid().simple().to_string()
@@ -41,7 +43,7 @@ async fn organization(store: &dyn OrganizationStore, owner: &User) -> (Organizat
     // A slug of 1–40 lowercase letters, numbers and hyphens.
     let slug = format!("org-{}", &unique()[..30]);
     store
-        .create_organization(OrganizationId::generate(), "Test", &slug, owner.id)
+        .create_organization(OrganizationId::generate(), "Test", &slug, owner.id, &by_suite)
         .await
         .unwrap()
 }
@@ -90,7 +92,13 @@ async fn lets_only_a_verified_email_claim_an_invitee(store: &dyn OrganizationSto
         "an unverified email creates no user"
     );
     let invitation = store
-        .invite_member(org.id, &email.to_uppercase(), MemberRole::Owner, owner_member.id)
+        .invite_member(
+            org.id,
+            &email.to_uppercase(),
+            MemberRole::Owner,
+            owner_member.id,
+            &by_suite,
+        )
         .await
         .unwrap();
     assert_eq!(invitation.user.email, email, "emails are lowercased");
@@ -144,14 +152,17 @@ async fn creates_an_organization_with_its_owner(store: &dyn OrganizationStore) {
     let setup = store.load_setup(org.id).await.unwrap();
     assert!(!setup.has_workspace, "a new organization has no workspace");
 
-    let renamed = store.update_organization(org.id, Some("Renamed"), None).await.unwrap();
+    let renamed = store
+        .update_organization(org.id, Some("Renamed"), None, &by_suite)
+        .await
+        .unwrap();
     assert_eq!(
         (renamed.name.as_str(), renamed.slug.as_str()),
         ("Renamed", org.slug.as_str())
     );
     assert_eq!(
         store
-            .update_organization(OrganizationId::generate(), Some("Nobody"), None)
+            .update_organization(OrganizationId::generate(), Some("Nobody"), None, &by_suite)
             .await,
         Err(StoreError::NotFound)
     );
@@ -163,12 +174,14 @@ async fn keeps_slugs_unique(store: &dyn OrganizationStore) {
     let (second, _) = organization(store, &owner).await;
     assert_eq!(
         store
-            .create_organization(OrganizationId::generate(), "Copy", &first.slug, owner.id)
+            .create_organization(OrganizationId::generate(), "Copy", &first.slug, owner.id, &by_suite)
             .await,
         Err(StoreError::SlugTaken)
     );
     assert_eq!(
-        store.update_organization(second.id, None, Some(&first.slug)).await,
+        store
+            .update_organization(second.id, None, Some(&first.slug), &by_suite)
+            .await,
         Err(StoreError::SlugTaken)
     );
     assert_eq!(
@@ -188,6 +201,7 @@ async fn keeps_members_inside_their_organization(store: &dyn OrganizationStore) 
             &format!("{}@people.example", unique()),
             MemberRole::Viewer,
             b_owner.id,
+            &by_suite,
         )
         .await
         .unwrap();
@@ -200,24 +214,28 @@ async fn keeps_members_inside_their_organization(store: &dyn OrganizationStore) 
         assert_eq!(store.find_member(a.id, foreign.id).await.unwrap(), None);
         assert_eq!(
             store
-                .update_member_role(a.id, foreign.id, MemberRole::Admin, a_owner.id)
+                .update_member_role(a.id, foreign.id, MemberRole::Admin, a_owner.id, &by_suite)
                 .await,
             Err(StoreError::NotFound)
         );
         assert_eq!(
-            store.remove_member(a.id, foreign.id, a_owner.id, false).await,
+            store
+                .remove_member(a.id, foreign.id, a_owner.id, false, &by_suite)
+                .await,
             Err(StoreError::NotFound)
         );
     }
     // Nor does b's owner act in a.
     assert_eq!(
         store
-            .update_member_role(a.id, a_owner.id, MemberRole::Admin, b_owner.id)
+            .update_member_role(a.id, a_owner.id, MemberRole::Admin, b_owner.id, &by_suite)
             .await,
         Err(StoreError::NotAllowed)
     );
     assert_eq!(
-        store.remove_member(a.id, a_owner.id, b_owner.id, false).await,
+        store
+            .remove_member(a.id, a_owner.id, b_owner.id, false, &by_suite)
+            .await,
         Err(StoreError::NotAllowed)
     );
     assert_eq!(
@@ -237,7 +255,7 @@ async fn treats_an_invitation_as_not_yet_a_membership(store: &dyn OrganizationSt
     let (alice, bob) = (person(store).await, person(store).await);
     let (a, alice_member) = organization(store, &alice).await;
     let invitation = store
-        .invite_member(a.id, &bob.email, MemberRole::Owner, alice_member.id)
+        .invite_member(a.id, &bob.email, MemberRole::Owner, alice_member.id, &by_suite)
         .await
         .unwrap();
     assert_eq!(
@@ -261,29 +279,32 @@ async fn never_leaves_an_organization_without_an_active_owner(store: &dyn Organi
             &format!("{}@people.example", unique()),
             MemberRole::Owner,
             alice_member.id,
+            &by_suite,
         )
         .await
         .unwrap();
     assert_eq!(
         store
-            .update_member_role(a.id, alice_member.id, MemberRole::Admin, alice_member.id)
+            .update_member_role(a.id, alice_member.id, MemberRole::Admin, alice_member.id, &by_suite)
             .await,
         Err(StoreError::LastOwner)
     );
     assert_eq!(
-        store.remove_member(a.id, alice_member.id, alice_member.id, false).await,
+        store
+            .remove_member(a.id, alice_member.id, alice_member.id, false, &by_suite)
+            .await,
         Err(StoreError::LastOwner)
     );
     // An invited owner can't act yet.
     assert_eq!(
         store
-            .update_member_role(a.id, alice_member.id, MemberRole::Admin, invited_owner.id)
+            .update_member_role(a.id, alice_member.id, MemberRole::Admin, invited_owner.id, &by_suite)
             .await,
         Err(StoreError::NotAllowed)
     );
     assert_eq!(
         store
-            .remove_member(a.id, alice_member.id, invited_owner.id, false)
+            .remove_member(a.id, alice_member.id, invited_owner.id, false, &by_suite)
             .await,
         Err(StoreError::NotAllowed)
     );
@@ -292,18 +313,24 @@ async fn never_leaves_an_organization_without_an_active_owner(store: &dyn Organi
 
     // An invited owner can always be changed or withdrawn.
     let demoted = store
-        .update_member_role(a.id, invited_owner.id, MemberRole::Developer, alice_member.id)
+        .update_member_role(
+            a.id,
+            invited_owner.id,
+            MemberRole::Developer,
+            alice_member.id,
+            &by_suite,
+        )
         .await
         .unwrap();
     assert_eq!(demoted.role, MemberRole::Developer);
     store
-        .remove_member(a.id, invited_owner.id, alice_member.id, false)
+        .remove_member(a.id, invited_owner.id, alice_member.id, false, &by_suite)
         .await
         .unwrap();
     assert_eq!(store.find_member(a.id, invited_owner.id).await.unwrap(), None);
     assert_eq!(
         store
-            .update_member_role(a.id, alice_member.id, MemberRole::Owner, alice_member.id)
+            .update_member_role(a.id, alice_member.id, MemberRole::Owner, alice_member.id, &by_suite)
             .await
             .unwrap()
             .role,
@@ -317,18 +344,18 @@ async fn refuses_a_second_membership(store: &dyn OrganizationStore) {
     let (a, alice_member) = organization(store, &alice).await;
     let email = format!("{}@people.example", unique());
     store
-        .invite_member(a.id, &email, MemberRole::Viewer, alice_member.id)
+        .invite_member(a.id, &email, MemberRole::Viewer, alice_member.id, &by_suite)
         .await
         .unwrap();
     assert_eq!(
         store
-            .invite_member(a.id, &email, MemberRole::Admin, alice_member.id)
+            .invite_member(a.id, &email, MemberRole::Admin, alice_member.id, &by_suite)
             .await,
         Err(StoreError::AlreadyMember)
     );
     assert_eq!(
         store
-            .invite_member(a.id, &alice.email, MemberRole::Admin, alice_member.id)
+            .invite_member(a.id, &alice.email, MemberRole::Admin, alice_member.id, &by_suite)
             .await,
         Err(StoreError::AlreadyMember),
         "nor the owner"
@@ -340,7 +367,7 @@ async fn shows_an_invitation_to_its_invitee_only(store: &dyn OrganizationStore) 
     let (alice, bob, carol) = (person(store).await, person(store).await, person(store).await);
     let (a, alice_member) = organization(store, &alice).await;
     let sent = store
-        .invite_member(a.id, &bob.email, MemberRole::Developer, alice_member.id)
+        .invite_member(a.id, &bob.email, MemberRole::Developer, alice_member.id, &by_suite)
         .await
         .unwrap();
     assert_eq!(
@@ -371,7 +398,7 @@ async fn shows_an_invitation_to_its_invitee_only(store: &dyn OrganizationStore) 
     // Another organization's invitation comes first: newest first.
     let (b, carol_member) = organization(store, &carol).await;
     let newer = store
-        .invite_member(b.id, &bob.email, MemberRole::Viewer, carol_member.id)
+        .invite_member(b.id, &bob.email, MemberRole::Viewer, carol_member.id, &by_suite)
         .await
         .unwrap();
     let listed = store.list_invitations_of_user(bob.id, Timestamp::now()).await.unwrap();
@@ -390,44 +417,46 @@ async fn joins_only_when_the_invitee_accepts(store: &dyn OrganizationStore) {
     let (alice, bob, carol) = (person(store).await, person(store).await, person(store).await);
     let (a, alice_member) = organization(store, &alice).await;
     let invitation = store
-        .invite_member(a.id, &bob.email, MemberRole::Viewer, alice_member.id)
+        .invite_member(a.id, &bob.email, MemberRole::Viewer, alice_member.id, &by_suite)
         .await
         .unwrap();
     // Nobody but bob answers it, the inviter included, as if it didn't exist.
     for other in [&alice, &carol] {
         assert_eq!(
             store
-                .accept_invitation_of_user(other.id, invitation.id, Timestamp::now())
+                .accept_invitation_of_user(other.id, invitation.id, Timestamp::now(), &by_suite)
                 .await,
             Err(StoreError::NotFound)
         );
         assert_eq!(
-            store.decline_invitation_of_user(other.id, invitation.id).await,
+            store
+                .decline_invitation_of_user(other.id, invitation.id, &by_suite)
+                .await,
             Err(StoreError::NotFound)
         );
     }
     assert_eq!(
         store
-            .accept_invitation_of_user(bob.id, MemberId::generate(), Timestamp::now())
+            .accept_invitation_of_user(bob.id, MemberId::generate(), Timestamp::now(), &by_suite)
             .await,
         Err(StoreError::NotFound)
     );
     // Nor is anyone's membership an invitation of someone else's.
     assert_eq!(
         store
-            .accept_invitation_of_user(bob.id, alice_member.id, Timestamp::now())
+            .accept_invitation_of_user(bob.id, alice_member.id, Timestamp::now(), &by_suite)
             .await,
         Err(StoreError::NotFound)
     );
 
     // The role is the invitation's as accepted, not as sent.
     store
-        .update_member_role(a.id, invitation.id, MemberRole::Admin, alice_member.id)
+        .update_member_role(a.id, invitation.id, MemberRole::Admin, alice_member.id, &by_suite)
         .await
         .unwrap();
     let now = Timestamp::now();
     let (joined, member) = store
-        .accept_invitation_of_user(bob.id, invitation.id, now)
+        .accept_invitation_of_user(bob.id, invitation.id, now, &by_suite)
         .await
         .unwrap();
     assert_eq!(joined, a);
@@ -445,11 +474,13 @@ async fn joins_only_when_the_invitee_accepts(store: &dyn OrganizationStore) {
 
     // Answered once: a second accept or a decline is refused, and changes nothing.
     assert_eq!(
-        store.accept_invitation_of_user(bob.id, invitation.id, now).await,
+        store
+            .accept_invitation_of_user(bob.id, invitation.id, now, &by_suite)
+            .await,
         Err(StoreError::InvitationAccepted)
     );
     assert_eq!(
-        store.decline_invitation_of_user(bob.id, invitation.id).await,
+        store.decline_invitation_of_user(bob.id, invitation.id, &by_suite).await,
         Err(StoreError::InvitationAccepted)
     );
     assert_eq!(
@@ -462,19 +493,21 @@ async fn refuses_an_expired_invitation(store: &dyn OrganizationStore) {
     let (alice, bob) = (person(store).await, person(store).await);
     let (a, alice_member) = organization(store, &alice).await;
     let invitation = store
-        .invite_member(a.id, &bob.email, MemberRole::Developer, alice_member.id)
+        .invite_member(a.id, &bob.email, MemberRole::Developer, alice_member.id, &by_suite)
         .await
         .unwrap();
     let expires_at = invitation.expires_at.expect("an invitation expires");
     let just_before = Timestamp::from_millis(expires_at.millis() - 1);
     assert_eq!(
-        store.accept_invitation_of_user(bob.id, invitation.id, expires_at).await,
+        store
+            .accept_invitation_of_user(bob.id, invitation.id, expires_at, &by_suite)
+            .await,
         Err(StoreError::InvitationExpired)
     );
     assert_eq!(store.find_active_membership(a.id, bob.id).await.unwrap(), None);
     // Until then it's accepted.
     let (_, member) = store
-        .accept_invitation_of_user(bob.id, invitation.id, just_before)
+        .accept_invitation_of_user(bob.id, invitation.id, just_before, &by_suite)
         .await
         .unwrap();
     assert_eq!(member.status, MemberStatus::Active);
@@ -484,10 +517,13 @@ async fn withdraws_an_invitation_its_invitee_declines(store: &dyn OrganizationSt
     let (alice, bob) = (person(store).await, person(store).await);
     let (a, alice_member) = organization(store, &alice).await;
     let invitation = store
-        .invite_member(a.id, &bob.email, MemberRole::Developer, alice_member.id)
+        .invite_member(a.id, &bob.email, MemberRole::Developer, alice_member.id, &by_suite)
         .await
         .unwrap();
-    store.decline_invitation_of_user(bob.id, invitation.id).await.unwrap();
+    store
+        .decline_invitation_of_user(bob.id, invitation.id, &by_suite)
+        .await
+        .unwrap();
     assert_eq!(store.find_member(a.id, invitation.id).await.unwrap(), None);
     assert!(
         store
@@ -497,27 +533,27 @@ async fn withdraws_an_invitation_its_invitee_declines(store: &dyn OrganizationSt
             .is_empty()
     );
     assert_eq!(
-        store.decline_invitation_of_user(bob.id, invitation.id).await,
+        store.decline_invitation_of_user(bob.id, invitation.id, &by_suite).await,
         Err(StoreError::NotFound)
     );
     assert_eq!(
         store
-            .accept_invitation_of_user(bob.id, invitation.id, Timestamp::now())
+            .accept_invitation_of_user(bob.id, invitation.id, Timestamp::now(), &by_suite)
             .await,
         Err(StoreError::NotFound)
     );
     // Withdrawn by an admin, it's just as gone.
     let again = store
-        .invite_member(a.id, &bob.email, MemberRole::Developer, alice_member.id)
+        .invite_member(a.id, &bob.email, MemberRole::Developer, alice_member.id, &by_suite)
         .await
         .unwrap();
     store
-        .remove_member(a.id, again.id, alice_member.id, false)
+        .remove_member(a.id, again.id, alice_member.id, false, &by_suite)
         .await
         .unwrap();
     assert_eq!(
         store
-            .accept_invitation_of_user(bob.id, again.id, Timestamp::now())
+            .accept_invitation_of_user(bob.id, again.id, Timestamp::now(), &by_suite)
             .await,
         Err(StoreError::NotFound)
     );
@@ -530,37 +566,37 @@ async fn joins_once_when_answers_race(store: &dyn OrganizationStore) {
     for _ in 0..10 {
         // Two accepts at once: one joins, the other finds it accepted.
         let invitation = store
-            .invite_member(a.id, &bob.email, MemberRole::Developer, alice_member.id)
+            .invite_member(a.id, &bob.email, MemberRole::Developer, alice_member.id, &by_suite)
             .await
             .unwrap();
         let now = Timestamp::now();
         let (first, second) = tokio::join!(
-            store.accept_invitation_of_user(bob.id, invitation.id, now),
-            store.accept_invitation_of_user(bob.id, invitation.id, now),
+            store.accept_invitation_of_user(bob.id, invitation.id, now, &by_suite),
+            store.accept_invitation_of_user(bob.id, invitation.id, now, &by_suite),
         );
         let mut outcomes = [first.map(|_| ()), second.map(|_| ())];
         outcomes.sort_by_key(Result::is_err);
         assert_eq!(outcomes, [Ok(()), Err(StoreError::InvitationAccepted)]);
         store
-            .remove_member(a.id, invitation.id, alice_member.id, false)
+            .remove_member(a.id, invitation.id, alice_member.id, false, &by_suite)
             .await
             .unwrap();
 
         // An accept and a decline at once: exactly one of them answers it.
         let invitation = store
-            .invite_member(a.id, &bob.email, MemberRole::Developer, alice_member.id)
+            .invite_member(a.id, &bob.email, MemberRole::Developer, alice_member.id, &by_suite)
             .await
             .unwrap();
         let (accepted, declined) = tokio::join!(
-            store.accept_invitation_of_user(bob.id, invitation.id, Timestamp::now()),
-            store.decline_invitation_of_user(bob.id, invitation.id),
+            store.accept_invitation_of_user(bob.id, invitation.id, Timestamp::now(), &by_suite),
+            store.decline_invitation_of_user(bob.id, invitation.id, &by_suite),
         );
         let member = store.find_member(a.id, invitation.id).await.unwrap();
         match (accepted, declined) {
             (Ok(_), Err(StoreError::InvitationAccepted)) => {
                 assert_eq!(member.map(|m| m.status), Some(MemberStatus::Active));
                 store
-                    .remove_member(a.id, invitation.id, alice_member.id, false)
+                    .remove_member(a.id, invitation.id, alice_member.id, false, &by_suite)
                     .await
                     .unwrap();
             }
@@ -570,12 +606,12 @@ async fn joins_once_when_answers_race(store: &dyn OrganizationStore) {
 
         // An accept and a withdrawal at once: bob ends up a member only if the withdrawal found nothing to withdraw.
         let invitation = store
-            .invite_member(a.id, &bob.email, MemberRole::Developer, alice_member.id)
+            .invite_member(a.id, &bob.email, MemberRole::Developer, alice_member.id, &by_suite)
             .await
             .unwrap();
         let (accepted, withdrawn) = tokio::join!(
-            store.accept_invitation_of_user(bob.id, invitation.id, Timestamp::now()),
-            store.remove_member(a.id, invitation.id, alice_member.id, false),
+            store.accept_invitation_of_user(bob.id, invitation.id, Timestamp::now(), &by_suite),
+            store.remove_member(a.id, invitation.id, alice_member.id, false, &by_suite),
         );
         assert_eq!(withdrawn, Ok(()), "the owner may remove an invitation or a member");
         assert!(matches!(accepted, Ok(_) | Err(StoreError::NotFound)), "{accepted:?}");
@@ -583,19 +619,19 @@ async fn joins_once_when_answers_race(store: &dyn OrganizationStore) {
 
         // An accept and a cancel (an invitation only) at once: exactly one of them answers it.
         let invitation = store
-            .invite_member(a.id, &bob.email, MemberRole::Developer, alice_member.id)
+            .invite_member(a.id, &bob.email, MemberRole::Developer, alice_member.id, &by_suite)
             .await
             .unwrap();
         let (accepted, cancelled) = tokio::join!(
-            store.accept_invitation_of_user(bob.id, invitation.id, Timestamp::now()),
-            store.remove_member(a.id, invitation.id, alice_member.id, true),
+            store.accept_invitation_of_user(bob.id, invitation.id, Timestamp::now(), &by_suite),
+            store.remove_member(a.id, invitation.id, alice_member.id, true, &by_suite),
         );
         let member = store.find_member(a.id, invitation.id).await.unwrap();
         match (accepted, cancelled) {
             (Ok(_), Err(StoreError::InvitationAccepted)) => {
                 assert_eq!(member.map(|m| m.status), Some(MemberStatus::Active));
                 store
-                    .remove_member(a.id, invitation.id, alice_member.id, false)
+                    .remove_member(a.id, invitation.id, alice_member.id, false, &by_suite)
                     .await
                     .unwrap();
             }
@@ -613,9 +649,12 @@ async fn joined(
     role: MemberRole,
     acting: &Member,
 ) -> Member {
-    let invitation = store.invite_member(a.id, &bob.email, role, acting.id).await.unwrap();
+    let invitation = store
+        .invite_member(a.id, &bob.email, role, acting.id, &by_suite)
+        .await
+        .unwrap();
     store
-        .accept_invitation_of_user(bob.id, invitation.id, Timestamp::now())
+        .accept_invitation_of_user(bob.id, invitation.id, Timestamp::now(), &by_suite)
         .await
         .unwrap()
         .1
@@ -647,7 +686,7 @@ async fn grants_only_what_the_grantor_can_still_grant(store: &dyn OrganizationSt
     let (a, alice_member) = organization(store, &alice).await;
     let bob_member = joined(store, &a, &bob, MemberRole::Owner, &alice_member).await;
     let invite = |email: String, role: MemberRole, acting: MemberId| async move {
-        store.invite_member(a.id, &email, role, acting).await
+        store.invite_member(a.id, &email, role, acting, &by_suite).await
     };
     let for_carol = invite(carol.email.clone(), MemberRole::Owner, bob_member.id)
         .await
@@ -661,19 +700,19 @@ async fn grants_only_what_the_grantor_can_still_grant(store: &dyn OrganizationSt
     // Bob's invitations elsewhere are no business of a's.
     let (b, b_bob) = organization(store, &bob).await;
     let in_b = store
-        .invite_member(b.id, &gus.email, MemberRole::Owner, b_bob.id)
+        .invite_member(b.id, &gus.email, MemberRole::Owner, b_bob.id, &by_suite)
         .await
         .unwrap();
 
     // Demoted to admin: bob can't grant owner any more, so carol's invitation goes, at once.
     store
-        .update_member_role(a.id, bob_member.id, MemberRole::Admin, alice_member.id)
+        .update_member_role(a.id, bob_member.id, MemberRole::Admin, alice_member.id, &by_suite)
         .await
         .unwrap();
     assert!(!stands(store, &a, &carol, &for_carol).await);
     assert_eq!(
         store
-            .accept_invitation_of_user(carol.id, for_carol.id, Timestamp::now())
+            .accept_invitation_of_user(carol.id, for_carol.id, Timestamp::now(), &by_suite)
             .await,
         Err(StoreError::NotFound)
     );
@@ -690,7 +729,7 @@ async fn grants_only_what_the_grantor_can_still_grant(store: &dyn OrganizationSt
 
     // Changing an invitation's role makes whoever changed it its grantor.
     store
-        .update_member_role(a.id, for_erin.id, MemberRole::Developer, alice_member.id)
+        .update_member_role(a.id, for_erin.id, MemberRole::Developer, alice_member.id, &by_suite)
         .await
         .unwrap();
     let erins = store.list_invitations_of_user(erin.id, Timestamp::now()).await.unwrap();
@@ -698,7 +737,7 @@ async fn grants_only_what_the_grantor_can_still_grant(store: &dyn OrganizationSt
 
     // Removed: everything bob still granted here goes, nothing anyone else did.
     store
-        .remove_member(a.id, bob_member.id, alice_member.id, false)
+        .remove_member(a.id, bob_member.id, alice_member.id, false, &by_suite)
         .await
         .unwrap();
     assert!(!stands(store, &a, &dave, &for_dave).await);
@@ -711,7 +750,7 @@ async fn grants_only_what_the_grantor_can_still_grant(store: &dyn OrganizationSt
         Err(StoreError::NotAllowed)
     );
     let (_, member) = store
-        .accept_invitation_of_user(erin.id, for_erin.id, Timestamp::now())
+        .accept_invitation_of_user(erin.id, for_erin.id, Timestamp::now(), &by_suite)
         .await
         .unwrap();
     assert_eq!(member.role, MemberRole::Developer);
@@ -722,7 +761,7 @@ async fn grants_only_what_the_grantor_can_still_grant(store: &dyn OrganizationSt
         .await
         .unwrap();
     store
-        .update_member_role(a.id, dave_member.id, MemberRole::Developer, alice_member.id)
+        .update_member_role(a.id, dave_member.id, MemberRole::Developer, alice_member.id, &by_suite)
         .await
         .unwrap();
     assert!(!stands(store, &a, &frank, &for_frank).await);
@@ -732,7 +771,7 @@ async fn grants_only_what_the_grantor_can_still_grant(store: &dyn OrganizationSt
     );
     // Promoted again, nothing comes back.
     store
-        .update_member_role(a.id, dave_member.id, MemberRole::Owner, alice_member.id)
+        .update_member_role(a.id, dave_member.id, MemberRole::Owner, alice_member.id, &by_suite)
         .await
         .unwrap();
     assert_eq!(store.find_member(a.id, for_frank.id).await.unwrap(), None);
@@ -743,16 +782,18 @@ async fn cancels_only_an_invitation(store: &dyn OrganizationStore) {
     let (a, alice_member) = organization(store, &alice).await;
     let bob_member = joined(store, &a, &bob, MemberRole::Developer, &alice_member).await;
     assert_eq!(
-        store.remove_member(a.id, bob_member.id, alice_member.id, true).await,
+        store
+            .remove_member(a.id, bob_member.id, alice_member.id, true, &by_suite)
+            .await,
         Err(StoreError::InvitationAccepted)
     );
     assert!(store.find_active_membership(a.id, bob.id).await.unwrap().is_some());
     let invitation = store
-        .invite_member(a.id, &carol.email, MemberRole::Viewer, alice_member.id)
+        .invite_member(a.id, &carol.email, MemberRole::Viewer, alice_member.id, &by_suite)
         .await
         .unwrap();
     store
-        .remove_member(a.id, invitation.id, alice_member.id, true)
+        .remove_member(a.id, invitation.id, alice_member.id, true, &by_suite)
         .await
         .unwrap();
     assert_eq!(store.find_member(a.id, invitation.id).await.unwrap(), None);
@@ -762,7 +803,7 @@ async fn lists_the_newest_invitations_and_none_long_expired(store: &dyn Organiza
     let (alice, bob) = (person(store).await, person(store).await);
     let (a, alice_member) = organization(store, &alice).await;
     let invitation = store
-        .invite_member(a.id, &bob.email, MemberRole::Viewer, alice_member.id)
+        .invite_member(a.id, &bob.email, MemberRole::Viewer, alice_member.id, &by_suite)
         .await
         .unwrap();
     let shown_until = invitation.invited_at.millis() + INVITATION_TTL_MS + EXPIRED_INVITATION_SHOWN_MS;
@@ -782,7 +823,7 @@ async fn lists_the_newest_invitations_and_none_long_expired(store: &dyn Organiza
         let owner = person(store).await;
         let (org, owner_member) = organization(store, &owner).await;
         store
-            .invite_member(org.id, &bob.email, MemberRole::Viewer, owner_member.id)
+            .invite_member(org.id, &bob.email, MemberRole::Viewer, owner_member.id, &by_suite)
             .await
             .unwrap();
     }
@@ -801,12 +842,12 @@ async fn never_lets_an_accept_outrun_its_grantor(store: &dyn OrganizationStore) 
         // Bob, an owner, invites carol as an owner just as alice demotes him.
         let bob_member = joined(store, &a, &bob, MemberRole::Owner, &alice_member).await;
         let invitation = store
-            .invite_member(a.id, &carol.email, MemberRole::Owner, bob_member.id)
+            .invite_member(a.id, &carol.email, MemberRole::Owner, bob_member.id, &by_suite)
             .await
             .unwrap();
         let (accepted, demoted) = tokio::join!(
-            store.accept_invitation_of_user(carol.id, invitation.id, Timestamp::now()),
-            store.update_member_role(a.id, bob_member.id, MemberRole::Admin, alice_member.id),
+            store.accept_invitation_of_user(carol.id, invitation.id, Timestamp::now(), &by_suite),
+            store.update_member_role(a.id, bob_member.id, MemberRole::Admin, alice_member.id, &by_suite),
         );
         assert!(demoted.is_ok(), "{demoted:?}");
         let carol_member = store.find_active_membership(a.id, carol.id).await.unwrap();
@@ -821,19 +862,19 @@ async fn never_lets_an_accept_outrun_its_grantor(store: &dyn OrganizationStore) 
         }
         if let Some((_, member)) = carol_member {
             store
-                .remove_member(a.id, member.id, alice_member.id, false)
+                .remove_member(a.id, member.id, alice_member.id, false, &by_suite)
                 .await
                 .unwrap();
         }
 
         // The same, as alice removes him.
         let invitation = store
-            .invite_member(a.id, &carol.email, MemberRole::Viewer, bob_member.id)
+            .invite_member(a.id, &carol.email, MemberRole::Viewer, bob_member.id, &by_suite)
             .await
             .unwrap();
         let (accepted, removed) = tokio::join!(
-            store.accept_invitation_of_user(carol.id, invitation.id, Timestamp::now()),
-            store.remove_member(a.id, bob_member.id, alice_member.id, false),
+            store.accept_invitation_of_user(carol.id, invitation.id, Timestamp::now(), &by_suite),
+            store.remove_member(a.id, bob_member.id, alice_member.id, false, &by_suite),
         );
         assert_eq!(removed, Ok(()));
         let carol_member = store.find_active_membership(a.id, carol.id).await.unwrap();
@@ -844,7 +885,7 @@ async fn never_lets_an_accept_outrun_its_grantor(store: &dyn OrganizationStore) 
         }
         if let Some((_, member)) = carol_member {
             store
-                .remove_member(a.id, member.id, alice_member.id, false)
+                .remove_member(a.id, member.id, alice_member.id, false, &by_suite)
                 .await
                 .unwrap();
         }

@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::audit::Audit;
 use crate::environment::Environment;
 use crate::ids::{ConnectSessionId, InstallationId, OrganizationId, WorkspaceId};
 use crate::installations::{ConnectedAccount, Installation, InstalledApp, NewCredential, TemplateSnapshot};
@@ -262,6 +263,7 @@ pub trait ConnectStore: Send + Sync {
         environment: Environment,
         return_urls: &[String],
         allowed_origins: &[String],
+        audit: &Audit<'_, ConnectSettings>,
     ) -> Result<ConnectSettings, ConnectError>;
 
     /// `NotFound` unless the workspace is in the organization and in the
@@ -304,7 +306,8 @@ pub trait ConnectStore: Send + Sync {
     /// installation connected again under the next credential version.
     /// `NotPending` when the session isn't pending or has expired at `now`,
     /// and `InstallationChanged` per [`ConnectError::InstallationChanged`];
-    /// either way nothing is written.
+    /// either way nothing is written. Records `audit` of the completed
+    /// session and its installation.
     async fn complete_session(
         &self,
         organization_id: OrganizationId,
@@ -312,6 +315,7 @@ pub trait ConnectStore: Send + Sync {
         session_id: ConnectSessionId,
         completion: &Completion,
         now: Timestamp,
+        audit: &Audit<'_, (ConnectSession, Installation)>,
     ) -> Result<(ConnectSession, Installation), ConnectError>;
 
     /// Starts an OAuth authorization for a pending, unexpired session,
