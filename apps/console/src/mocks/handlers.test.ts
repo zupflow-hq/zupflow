@@ -2141,3 +2141,136 @@ describe("installation tools", () => {
     expect(refused.code).toBe("installation_not_connected");
   });
 });
+
+describe("tool policy", () => {
+  const northwind = () => must(northwindId());
+  const larkspur = () => must(db().organizations.find((o) => o.slug === "larkspur")?.id);
+  const sandboxLinear = () =>
+    must(
+      db().installations.find(
+        (i) => i.workspace_id === ws("acme-sandbox").id && i.app_id === app("linear").id && i.status === "connected",
+      ),
+    );
+  const probe = async (workspaceId: WorkspaceId) =>
+    owner.agents.create(workspaceId, {
+      name: "Policy probe",
+      description: "",
+      model: must((await owner.models.list())[0]).id,
+      instructions: "",
+    });
+
+  it("suggests a level for each tool a catalog app's installation lists first, and never changes one", async () => {
+    const linear = app("linear");
+    const sandbox = ws("acme-sandbox");
+    linear.tools.push(
+      { name: "list_cycles", title: "List cycles", description: "List a team's cycles.", effect: "read" },
+      { name: "delete_issue", title: "Delete issue", description: "Delete an issue.", effect: "destructive" },
+    );
+    // A person already set create_issue; the listing describes it as destructive now.
+    const createIssue = must(linear.tools.find((t) => t.name === "create_issue"));
+    createIssue.effect = "destructive";
+    await owner.installations.refreshTools(sandbox.id, sandboxLinear().id);
+    const levels = (await owner.toolPolicy.levels(northwind(), linear.id, { limit: 100 })).items;
+    const of = (tool: string) => {
+      const level = must(levels.find((l) => l.tool === tool));
+      return [level.level, level.confirmed, level.destructive, level.updated_by];
+    };
+    expect(of("list_cycles")).toEqual(["allow", false, false, null]);
+    expect(of("delete_issue")).toEqual(["approve", false, true, null]);
+    expect(of("create_issue").slice(0, 2)).toEqual(["allow", true]);
+    // Larkspur's levels for its own Linear are its own.
+    expect(db().app_tool_levels.some((l) => l.organization_id === larkspur() && l.tool === "list_cycles")).toBe(false);
+  });
+
+  it("suggests no level for a workspace app's tools", async () => {
+    const before = db().app_tool_levels.length;
+    const qa = ws("qa-playground");
+    const echo = must(db().installations.find((i) => i.workspace_id === qa.id && i.status === "connected"));
+    app("echo-server").tools.push({ name: "echo_twice", title: "Twice", description: "", effect: "read" });
+    await owner.installations.refreshTools(qa.id, echo.id);
+    expect(db().app_tool_levels.length).toBe(before);
+    expect(db().app_tool_levels.some((l) => l.app_id === app("echo-server").id)).toBe(false);
+  });
+
+  it("seeds levels that hold every grant in acme", () => {
+    const d = db();
+    const acme = ws("acme");
+    for (const grant of d.grants.filter((g) => g.workspace_id === acme.id)) {
+      const installation = must(d.installations.find((i) => i.id === grant.installation_id));
+      const own = must(d.apps.find((a) => a.id === installation.app_id));
+      if (own.owner_workspace_id !== null) continue;
+      for (const tool of grant.tools) {
+        const level = d.app_tool_levels.find(
+          (l) => l.organization_id === own.organization_id && l.app_id === own.id && l.tool === tool,
+        );
+        expect(level?.confirmed, `${tool} is confirmed`).toBe(true);
+        expect(level?.level, `${tool} isn't denied`).not.toBe("deny");
+        if (level?.level === "approve") expect(grant.approval_required, tool).toContain(tool);
+      }
+    }
+  });
+
+  it("ignores a level labelled with another organization, in reads and grants", async () => {
+    const linear = app("linear");
+    // Larkspur's label on Northwind's app: it must decide nothing for Northwind.
+    db().app_tool_levels.push({
+      organization_id: larkspur(),
+      app_id: linear.id,
+      tool: "search_issues",
+      level: "deny",
+      confirmed: true,
+      destructive: false,
+      updated_at: new Date().toISOString(),
+      updated_by_user_id: null,
+    });
+    db().tool_policies.push({
+      organization_id: larkspur(),
+      mode: "manual",
+      new_tool_level: "deny",
+      updated_at: new Date().toISOString(),
+      updated_by_user_id: null,
+    });
+    const levels = (await owner.toolPolicy.levels(northwind(), linear.id, { limit: 100 })).items;
+    expect(levels.filter((l) => l.tool === "search_issues").map((l) => l.level)).toEqual(["allow"]);
+    expect((await owner.toolPolicy.get(northwind())).new_tool_level).toBe("approve");
+    const sandbox = ws("acme-sandbox");
+    const agent = await probe(sandbox.id);
+    const grant = await owner.grants.create(sandbox.id, agent.id, {
+      installation_id: sandboxLinear().id,
+      tools: ["search_issues"],
+      approval_required: [],
+    });
+    expect(grant.tools).toEqual(["search_issues"]);
+  });
+
+  it("accepts a change only of a tool in the installation's own scope", async () => {
+    const sandbox = ws("acme-sandbox");
+    const installation = sandboxLinear();
+    const changed = must(
+      db().installation_tools.find((t) => t.installation_id === installation.id && t.latest !== null),
+    );
+    // The same name labelled with another workspace isn't this installation's.
+    changed.workspace_id = ws("acme").id;
+    const tools = await owner.installations.tools(sandbox.id, installation.id, { limit: 100 });
+    expect(tools.items.some((t) => t.name === changed.name)).toBe(false);
+    const error = await failure(
+      owner.installations.acceptToolChange(sandbox.id, installation.id, {
+        name: changed.name,
+        latest_hash: "0".repeat(64),
+      }),
+    );
+    expect(`${error.status} ${error.code}`).toBe("404 not_found");
+  });
+
+  it("records who changed the policy and the levels in the audit log", async () => {
+    await owner.toolPolicy.update(northwind(), { mode: "manual", new_tool_level: "deny" });
+    await owner.toolPolicy.setLevels(northwind(), app("linear").id, {
+      levels: [{ tool: "add_comment", level: "approve" }],
+    });
+    const actions = db()
+      .audit.filter((e) => e.organization_id === northwind())
+      .slice(0, 2)
+      .map((e) => e.action);
+    expect(actions).toEqual(["app.tool_levels_updated", "tool_policy.updated"]);
+  });
+});

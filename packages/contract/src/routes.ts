@@ -303,6 +303,47 @@ export const routes: readonly Route[] = [
     response: ok(s.AppInstallationRef, { list: true, paginated: true }),
   },
 
+  // Tool permissions
+  {
+    operationId: "getToolPolicy",
+    method: "get",
+    path: "/v1/organizations/{org}/tool-policy",
+    summary: "The organization's tool policy",
+    callers: both,
+    params: org,
+    response: ok(s.ToolPolicy),
+  },
+  {
+    operationId: "updateToolPolicy",
+    method: "put",
+    path: "/v1/organizations/{org}/tool-policy",
+    summary: "Set the organization's tool policy; owners and admins",
+    callers: consoleOnly,
+    params: org,
+    body: s.UpdateToolPolicyInput,
+    response: ok(s.ToolPolicy),
+  },
+  {
+    operationId: "listAppToolLevels",
+    method: "get",
+    path: "/v1/organizations/{org}/apps/{app}/tool-levels",
+    summary: "The organization's levels for a catalog app's tools, a page at a time by name",
+    callers: both,
+    params: { ...org, app: idSchema("app") },
+    query: s.PageQuery,
+    response: ok(s.AppToolLevel, { list: true, paginated: true }),
+  },
+  {
+    operationId: "updateAppToolLevels",
+    method: "patch",
+    path: "/v1/organizations/{org}/apps/{app}/tool-levels",
+    summary: "Set levels for a catalog app's tools, by name; owners and admins",
+    callers: consoleOnly,
+    params: { ...org, app: idSchema("app") },
+    body: s.UpdateAppToolLevelsInput,
+    response: ok(s.AppToolLevel, { list: true }),
+  },
+
   // Workspace apps
   {
     operationId: "listWorkspaceApps",
@@ -427,6 +468,16 @@ export const routes: readonly Route[] = [
     callers: both,
     params: { ...ws, inst: idSchema("installation") },
     response: ok(s.Installation),
+  },
+  {
+    operationId: "acceptToolChange",
+    method: "post",
+    path: "/v1/workspaces/{ws}/installations/{inst}/accept-tool-change",
+    summary: "Accept a changed tool's latest definition; owners and admins",
+    callers: both,
+    params: { ...ws, inst: idSchema("installation") },
+    body: s.AcceptToolChangeInput,
+    response: ok(s.InstallationTool),
   },
   {
     operationId: "deleteInstallation",

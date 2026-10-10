@@ -223,6 +223,20 @@ export function contractSuite(target: Target) {
         );
         await owner.installations.tools(sandbox.id, connected.id);
         await owner.installations.refreshTools(sandbox.id, connected.id);
+        const reviewed = must(
+          (await owner.installations.list(sandbox.id)).find((i) => i.app.id === fx.apps.linear),
+          "installation of linear in acme-sandbox",
+        );
+        const changed = must(
+          (await owner.installations.tools(sandbox.id, reviewed.id, { limit: 100 })).items.find(
+            (t) => t.status === "changed",
+          ),
+          "changed tool in acme-sandbox",
+        );
+        await owner.installations.acceptToolChange(sandbox.id, reviewed.id, {
+          name: changed.name,
+          latest_hash: must(changed.latest_hash, "latest hash"),
+        });
         const echo = must((await owner.installations.list(qa.id))[0], "installation in qa-playground");
         await owner.installations.disconnect(qa.id, echo.id);
         await owner.installations.delete(qa.id, echo.id);
@@ -248,6 +262,14 @@ export function contractSuite(target: Target) {
         await owner.connect.cancel(referenceOf(await session(fx.apps.echoServer)));
         await owner.connect.submitCredentials(referenceOf(tokenSession), { values: { token: "abc" } });
         await owner.connect.authorize(referenceOf(await session(fx.apps.googleWorkspace, sandbox.id)));
+
+        // The tool policy and a catalog app's levels.
+        const policy = await owner.toolPolicy.get(org);
+        await owner.toolPolicy.update(org, { mode: policy.mode, new_tool_level: policy.new_tool_level });
+        await owner.toolPolicy.levels(org, fx.apps.googleWorkspace);
+        await owner.toolPolicy.setLevels(org, fx.apps.googleWorkspace, {
+          levels: [{ tool: "search_files", level: "allow" }],
+        });
 
         // Models, agents and their grants.
         await owner.models.list();
@@ -1507,6 +1529,227 @@ export function contractSuite(target: Target) {
       });
     });
 
+    describe("tool permissions", () => {
+      const google = async () =>
+        must(
+          (await owner.installations.list(fx.workspaces.acme.id)).find((i) => i.app.id === fx.apps.googleWorkspace),
+          "installation of google-workspace in acme",
+        );
+      const probe = async (workspace: WorkspaceId) =>
+        owner.agents.create(workspace, {
+          name: "Policy probe",
+          description: "",
+          model: await anyModel(),
+          instructions: "",
+        });
+      const refusal = async (promise: Promise<unknown>) => {
+        const error = await failure(promise);
+        return [error.status, error.code, Object.keys(error.fields ?? {})];
+      };
+
+      it("reads the policy to every member, and lets only owners and admins set it", async () => {
+        const policy = await owner.toolPolicy.get(fx.organization);
+        expect([policy.organization_id, policy.mode, policy.new_tool_level, policy.updated_at]).toEqual([
+          fx.organization,
+          "manual",
+          "approve",
+          null,
+        ]);
+        expect(await as("viewer").toolPolicy.get(fx.organization)).toEqual(policy);
+        const refused = await failure(
+          as("developer").toolPolicy.update(fx.organization, { mode: "manual", new_tool_level: "deny" }),
+        );
+        expect(`${refused.status} ${refused.code}`).toBe("403 forbidden");
+        const invalid = await failure(
+          // @ts-expect-error: a tool nobody set a level for is never allowed
+          owner.toolPolicy.update(fx.organization, { mode: "manual", new_tool_level: "allow" }),
+        );
+        expect([invalid.status, invalid.code, Object.keys(invalid.fields ?? {})]).toEqual([
+          400,
+          "validation_failed",
+          ["new_tool_level"],
+        ]);
+        expect(await owner.toolPolicy.get(fx.organization)).toEqual(policy);
+        const saved = await owner.toolPolicy.update(fx.organization, { mode: "manual", new_tool_level: "deny" });
+        const ownerId = (await owner.me.get()).user.id;
+        expect([saved.new_tool_level, saved.updated_by?.id, saved.updated_at === null]).toEqual([
+          "deny",
+          ownerId,
+          false,
+        ]);
+        expect(await as("viewer").toolPolicy.get(fx.organization)).toEqual(saved);
+      });
+
+      it("lists a catalog app's levels by name, suggested and confirmed, and only a catalog app's", async () => {
+        const page = await owner.toolPolicy.levels(fx.organization, fx.apps.googleWorkspace, { limit: 100 });
+        const names = page.items.map((l) => l.tool);
+        expect(names).toEqual([...names].sort());
+        expect(page.pagination.total).toBe(page.items.length);
+        const level = (tool: string) => {
+          const found = must(
+            page.items.find((l) => l.tool === tool),
+            `level of ${tool}`,
+          );
+          return [found.app_id, found.level, found.confirmed];
+        };
+        const app = fx.apps.googleWorkspace;
+        expect(level("send_email")).toEqual([app, "approve", true]);
+        expect(level("delete_file")).toEqual([app, "deny", true]);
+        expect(level("list_events")).toEqual([app, "allow", false]);
+        const first = await owner.toolPolicy.levels(fx.organization, app, { limit: 2 });
+        const second = await owner.toolPolicy.levels(fx.organization, app, {
+          limit: 2,
+          cursor: must(first.pagination.next_cursor, "next cursor"),
+        });
+        expect([...first.items, ...second.items]).toEqual(page.items.slice(0, 4));
+        const workspaceApp = await failure(owner.toolPolicy.levels(fx.organization, fx.apps.echoServer));
+        expect(`${workspaceApp.status} ${workspaceApp.code}`).toBe("404 not_found");
+      });
+
+      it("sets levels by name, confirmed, and refuses a malformed list", async () => {
+        const app = fx.apps.googleWorkspace;
+        const refused = await failure(
+          as("developer").toolPolicy.setLevels(fx.organization, app, {
+            levels: [{ tool: "list_events", level: "allow" }],
+          }),
+        );
+        expect(`${refused.status} ${refused.code}`).toBe("403 forbidden");
+        for (const levels of [
+          [],
+          [
+            { tool: "list_events", level: "allow" as const },
+            { tool: "list_events", level: "deny" as const },
+          ],
+          [{ tool: "", level: "allow" as const }],
+          [{ tool: "x".repeat(129), level: "allow" as const }],
+        ]) {
+          const invalid = await failure(owner.toolPolicy.setLevels(fx.organization, app, { levels }));
+          expect(
+            [invalid.status, invalid.code, Object.keys(invalid.fields ?? {})],
+            JSON.stringify(levels).slice(0, 60),
+          ).toEqual([400, "validation_failed", ["levels"]]);
+        }
+        const set = await owner.toolPolicy.setLevels(fx.organization, app, {
+          levels: [
+            { tool: "list_events", level: "allow" },
+            { tool: "archive_everything", level: "deny" },
+          ],
+        });
+        const ownerId = (await owner.me.get()).user.id;
+        expect(set.map((l) => [l.tool, l.level, l.confirmed, l.updated_by?.id])).toEqual([
+          ["archive_everything", "deny", true, ownerId],
+          ["list_events", "allow", true, ownerId],
+        ]);
+        const after = (await owner.toolPolicy.levels(fx.organization, app, { limit: 100 })).items;
+        expect(after).toEqual(expect.arrayContaining(set));
+      });
+
+      it("holds grants inside the organization's levels", async () => {
+        const acme = fx.workspaces.acme.id;
+        const installation = (await google()).id;
+        const agent = await probe(acme);
+        const grant = (tools: string[], approval_required: string[] = []) =>
+          owner.grants.create(acme, agent.id, { installation_id: installation, tools, approval_required });
+        expect(await refusal(grant(["search_files", "delete_file"]))).toEqual([422, "tool_denied", ["tools"]]);
+        expect(await refusal(grant(["search_files", "send_email"]))).toEqual([
+          422,
+          "approval_required_by_policy",
+          ["approval_required"],
+        ]);
+        // Only suggested, so the policy's level for new tools applies: approve, then deny.
+        expect(await refusal(grant(["list_events"]))).toEqual([
+          422,
+          "approval_required_by_policy",
+          ["approval_required"],
+        ]);
+        await owner.toolPolicy.update(fx.organization, { mode: "manual", new_tool_level: "deny" });
+        expect(await refusal(grant(["list_events"], ["list_events"]))).toEqual([422, "tool_denied", ["tools"]]);
+        // The registry's own rules come first.
+        expect(await refusal(grant(["not_listed", "delete_file"]))).toEqual([422, "unknown_tool", ["tools"]]);
+        expect(await owner.grants.list(acme, agent.id)).toEqual([]);
+
+        await owner.toolPolicy.setLevels(fx.organization, fx.apps.googleWorkspace, {
+          levels: [{ tool: "list_events", level: "allow" }],
+        });
+        const made = await grant(["list_events", "send_email"], ["send_email"]);
+        expect([made.tools, made.approval_required]).toEqual([["list_events", "send_email"], ["send_email"]]);
+        // Tightening a level rewrites no grant; a change to the grant is held to it.
+        await owner.toolPolicy.setLevels(fx.organization, fx.apps.googleWorkspace, {
+          levels: [{ tool: "list_events", level: "deny" }],
+        });
+        expect(await owner.grants.list(acme, agent.id)).toEqual([made]);
+        expect(
+          await refusal(
+            owner.grants.update(acme, agent.id, made.id, {
+              tools: made.tools,
+              approval_required: made.approval_required,
+            }),
+          ),
+        ).toEqual([422, "tool_denied", ["tools"]]);
+        expect(await owner.grants.list(acme, agent.id)).toEqual([made]);
+      });
+
+      it("leaves a workspace app's tools to the grant alone", async () => {
+        const qa = fx.workspaces.qaPlayground.id;
+        const echo = must(
+          (await owner.installations.list(qa)).find((i) => i.app.id === fx.apps.echoServer),
+          "installation of echo-server in qa-playground",
+        );
+        await owner.toolPolicy.update(fx.organization, { mode: "manual", new_tool_level: "deny" });
+        const agent = await probe(qa);
+        const grant = await owner.grants.create(qa, agent.id, {
+          installation_id: echo.id,
+          tools: ["echo", "echo_write"],
+          approval_required: [],
+        });
+        expect(grant.approval_required).toEqual([]);
+      });
+
+      it("accepts a reviewed change exactly as reviewed, for owners and admins", async () => {
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const installation = must(
+          (await owner.installations.list(sandbox)).find(
+            (i) => i.status === "connected" && i.app.id === fx.apps.linear,
+          ),
+          "connected installation of linear in acme-sandbox",
+        );
+        const tools = (await owner.installations.tools(sandbox, installation.id, { limit: 100 })).items;
+        const changed = must(
+          tools.find((t) => t.status === "changed"),
+          "changed tool",
+        );
+        const current = must(
+          tools.find((t) => t.status === "current"),
+          "current tool",
+        );
+        const latest = must(changed.latest_hash, "latest hash");
+        expect(changed.pinned_hash).not.toBe(latest);
+        const accept = (name: string, latest_hash: string, c = owner) =>
+          c.installations.acceptToolChange(sandbox, installation.id, { name, latest_hash });
+        expect(await refusal(accept(changed.name, latest, as("developer")))).toEqual([403, "forbidden", []]);
+        expect(await refusal(accept(changed.name, changed.pinned_hash))).toEqual([409, "stale_definition", []]);
+        expect(await refusal(accept(current.name, current.pinned_hash))).toEqual([409, "tool_not_changed", []]);
+        expect(await refusal(accept("not_listed", latest))).toEqual([404, "not_found", []]);
+        expect(await owner.installations.tools(sandbox, installation.id, { limit: 100 })).toEqual(
+          expect.objectContaining({ items: tools }),
+        );
+
+        const accepted = await accept(changed.name, latest);
+        expect(accepted).toEqual({
+          ...changed,
+          status: "current",
+          pinned: changed.latest,
+          pinned_hash: latest,
+          latest: null,
+          latest_hash: null,
+          changed_at: null,
+        });
+        const after = (await owner.installations.tools(sandbox, installation.id, { limit: 100 })).items;
+        expect(after.find((t) => t.name === changed.name)).toEqual(accepted);
+        expect(await refusal(accept(changed.name, latest))).toEqual([409, "tool_not_changed", []]);
+      });
+    });
+
     describe("Connect sessions", () => {
       const qa = () => fx.workspaces.qaPlayground.id;
       const create = (extra: Partial<CreateConnectSessionInput> = {}) =>
@@ -1724,6 +1967,8 @@ export function contractSuite(target: Target) {
               settled(c.apiKeys.list(fx.organization)),
               settled(c.webhooks.list(fx.organization)),
               settled(c.connectSettings.get(fx.organization, "sandbox")),
+              settled(c.toolPolicy.get(fx.organization)),
+              settled(c.toolPolicy.levels(fx.organization, fx.apps.googleWorkspace, { limit: 100 })),
               settled(c.organizations.usage(fx.organization, "production")),
               settled(c.organizationRuns.list(fx.organization, { environment: "production", limit: 100 })),
               settled(c.audit.list(fx.organization)),
@@ -1773,6 +2018,19 @@ export function contractSuite(target: Target) {
           ],
           ["updateInstallation", () => c.installations.update(w, t.installation.id, { label: "Viewed" })],
           ["refreshInstallationTools", () => c.installations.refreshTools(w, t.installation.id)],
+          [
+            "acceptToolChange",
+            () =>
+              c.installations.acceptToolChange(w, t.installation.id, {
+                name: "search_files",
+                latest_hash: "0".repeat(64),
+              }),
+          ],
+          ["updateToolPolicy", () => c.toolPolicy.update(t.org, { mode: "manual", new_tool_level: "deny" })],
+          [
+            "updateAppToolLevels",
+            () => c.toolPolicy.setLevels(t.org, t.orgApp.id, { levels: [{ tool: "viewer_x", level: "deny" }] }),
+          ],
           ["disconnectInstallation", () => c.installations.disconnect(w, t.installation.id)],
           ["deleteInstallation", () => c.installations.delete(w, t.installation.id)],
           [
@@ -1867,6 +2125,9 @@ export function contractSuite(target: Target) {
           "updateWorkspaceApp",
           "updateWorkspaceAppConfiguration",
           "deleteInstallation",
+          "acceptToolChange",
+          "updateToolPolicy",
+          "updateAppToolLevels",
           "updateConnectSettings",
           "createWebhook",
           "updateWebhook",

@@ -2,7 +2,8 @@
 //! through their own organization and workspace; the first definition
 //! pinned, a changed one held beside it unreviewed, a missing one gone; a
 //! listing that breaks the limits recorded not at all; read a page at a
-//! time, by name; gone tools kept up to a bound.
+//! time, by name; gone tools kept up to a bound; a change accepted only as
+//! reviewed, and only in its own installation.
 //!
 //! `prepare` makes a [`Tenant`] exist: its organization, two workspaces, and
 //! an installation of one app in each.
@@ -118,6 +119,7 @@ pub async fn run(registry: &dyn ToolRegistry, prepare: Prepare) {
     records_an_invalid_listing_not_at_all(registry, &prepare).await;
     pages_by_name(registry, &prepare).await;
     keeps_a_bounded_number_of_gone_tools(registry, &prepare).await;
+    accepts_exactly_the_change_reviewed(registry, &prepare).await;
 }
 
 async fn pages_by_name(registry: &dyn ToolRegistry, prepare: &Prepare) {
@@ -456,5 +458,123 @@ async fn records_an_invalid_listing_not_at_all(registry: &dyn ToolRegistry, prep
         names(&list(registry, owner).await.unwrap()),
         [("kept", ToolStatus::Current)],
         "an invalid listing marks nothing gone"
+    );
+}
+
+async fn accepts_exactly_the_change_reviewed(registry: &dyn ToolRegistry, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let earlier = Timestamp::from_millis(Timestamp::now().millis() - 60_000);
+    let first = [
+        listed("current", 1, ToolEffect::Read),
+        listed("changed", 1, ToolEffect::Read),
+        listed("gone", 1, ToolEffect::Read),
+    ];
+    // The change lists `changed` as destructive: the effect stays as first seen.
+    let second = [
+        listed("current", 1, ToolEffect::Read),
+        listed("changed", 2, ToolEffect::Destructive),
+    ];
+    for at in [t.at(), t.sibling_at()] {
+        record(registry, at, &first, earlier).await.unwrap();
+        record(registry, at, &second, Timestamp::now()).await.unwrap();
+    }
+    // The gone tool had changed before it went: still nothing to accept.
+    let gone_changed = [
+        listed("current", 1, ToolEffect::Read),
+        listed("changed", 2, ToolEffect::Read),
+        listed("gone", 3, ToolEffect::Read),
+    ];
+    let other = tenant(prepare).await;
+    record(registry, other.at(), &first, earlier).await.unwrap();
+    record(registry, other.at(), &gone_changed, earlier).await.unwrap();
+    record(registry, other.at(), &second, Timestamp::now()).await.unwrap();
+    assert_eq!(
+        registry
+            .accept_change(
+                other.organization_id,
+                other.workspace,
+                other.installation,
+                "gone",
+                Some([3; 32])
+            )
+            .await,
+        Err(ToolError::NotChanged),
+        "a gone tool has no change to accept"
+    );
+
+    let before = list(registry, t.at()).await.unwrap();
+    let accept = |at: At, name: &'static str, hash: u8| async move {
+        registry.accept_change(at.0, at.1, at.2, name, Some([hash; 32])).await
+    };
+    assert_eq!(
+        accept(t.at(), "changed", 1).await,
+        Err(ToolError::Stale),
+        "the pinned hash isn't the change"
+    );
+    assert_eq!(accept(t.at(), "changed", 3).await, Err(ToolError::Stale));
+    let unhashed =
+        |name: &'static str| registry.accept_change(t.organization_id, t.workspace, t.installation, name, None);
+    assert_eq!(unhashed("changed").await, Err(ToolError::Stale), "no hash matches none");
+    assert_eq!(
+        unhashed("current").await,
+        Err(ToolError::NotChanged),
+        "after the tool's own checks"
+    );
+    assert_eq!(unhashed("missing").await, Err(ToolError::ToolNotFound));
+    assert_eq!(accept(t.at(), "current", 1).await, Err(ToolError::NotChanged));
+    assert_eq!(accept(t.at(), "missing", 2).await, Err(ToolError::ToolNotFound));
+    // The full scope, or nothing: another workspace or organization never reaches it.
+    let stranger = tenant(prepare).await;
+    for at in [
+        At(t.organization_id, t.sibling, t.installation),
+        At(stranger.organization_id, t.workspace, t.installation),
+        At(t.organization_id, t.workspace, t.sibling_installation),
+    ] {
+        assert_eq!(accept(at, "changed", 2).await, Err(ToolError::NotFound), "{at:?}");
+    }
+    assert_eq!(
+        list(registry, t.at()).await.unwrap(),
+        before,
+        "a refused accept changes nothing"
+    );
+
+    let accepted = accept(t.at(), "changed", 2).await.unwrap();
+    let was = before.iter().find(|tool| tool.name == "changed").unwrap();
+    assert_eq!(
+        accepted,
+        RegisteredTool {
+            pinned: revision("changed", 2),
+            latest: None,
+            changed_at: None,
+            ..was.clone()
+        }
+    );
+    assert_eq!(accepted.effect, ToolEffect::Read);
+    assert_eq!(accepted.status(), ToolStatus::Current);
+    let after = list(registry, t.at()).await.unwrap();
+    assert_eq!(after.iter().find(|tool| tool.name == "changed"), Some(&accepted));
+    assert_eq!(
+        accept(t.at(), "changed", 2).await,
+        Err(ToolError::NotChanged),
+        "accepted once"
+    );
+    // The sibling's own change is still waiting.
+    let sibling = list(registry, t.sibling_at()).await.unwrap();
+    assert_eq!(
+        sibling
+            .iter()
+            .find(|tool| tool.name == "changed")
+            .map(RegisteredTool::status),
+        Some(ToolStatus::Changed)
+    );
+    // Listed as now pinned, it stays current.
+    record(registry, t.at(), &second, Timestamp::now()).await.unwrap();
+    assert_eq!(
+        names(&list(registry, t.at()).await.unwrap()),
+        [
+            ("changed", ToolStatus::Current),
+            ("current", ToolStatus::Current),
+            ("gone", ToolStatus::Gone)
+        ]
     );
 }

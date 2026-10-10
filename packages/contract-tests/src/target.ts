@@ -56,6 +56,15 @@ export interface Target {
  *   no approval, and not `echo_write`; `qa-playground` has a connected
  *   installation of it.
  * - At least one model in `GET /v1/models`.
+ * - The default tool policy (never saved: `manual`, new tools at `approve`)
+ *   and levels for its catalog apps' tools: in `google-workspace`, confirmed
+ *   `allow` for `search_files`, `read_document` and `create_document`,
+ *   `approve` for `send_email` and `deny` for `delete_file`, and
+ *   `list_events` only suggested (`allow`, unconfirmed); in `linear`,
+ *   confirmed `allow` for `search_issues`, `create_issue` and, where listed,
+ *   `add_comment`. `acme`'s grants hold inside them (a grant elsewhere may
+ *   not: tightening a level rewrites no grant), and `acme` has an installation
+ *   of `google-workspace` that lists all six of its tools.
  * - Runs in Sandbox as well as Production, at least one of them in
  *   `acme-sandbox`. At reset no run is queued or running; each is finished
  *   or waiting for approval, so nothing changes on its own during a test.

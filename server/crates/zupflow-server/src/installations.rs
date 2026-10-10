@@ -56,6 +56,10 @@ pub fn routes() -> Router<AppState> {
             post(refresh_installation_tools),
         )
         .route(
+            "/v1/workspaces/{ws}/installations/{inst}/accept-tool-change",
+            post(accept_tool_change),
+        )
+        .route(
             "/v1/organizations/{org}/apps/{app}/installations",
             get(list_app_installations),
         )
@@ -398,7 +402,10 @@ struct InstallationToolView {
     effect: ToolEffect,
     status: ToolStatusView,
     pinned: ToolText,
+    /// The pinned definition's SHA-256, in lowercase hex.
+    pinned_hash: String,
     latest: Option<ToolText>,
+    latest_hash: Option<String>,
     first_seen_at: Timestamp,
     seen_at: Timestamp,
     changed_at: Option<Timestamp>,
@@ -423,6 +430,23 @@ fn tool_text(definition: &str) -> ToolText {
     }
 }
 
+/// A definition's hash as the API writes it: 64 lowercase hex digits.
+fn hash_hex(hash: &[u8; 32]) -> String {
+    hash.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A hash as the API wrote it; `None` for anything else.
+fn hash_from_hex(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 || !hex.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let mut hash = [0; 32];
+    for (index, byte) in hash.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(index * 2..index * 2 + 2)?, 16).ok()?;
+    }
+    Some(hash)
+}
+
 fn tool_view(tool: RegisteredTool) -> InstallationToolView {
     InstallationToolView {
         status: match tool.status() {
@@ -431,7 +455,9 @@ fn tool_view(tool: RegisteredTool) -> InstallationToolView {
             ToolStatus::Gone => ToolStatusView::Gone,
         },
         pinned: tool_text(&tool.pinned.definition),
+        pinned_hash: hash_hex(&tool.pinned.hash),
         latest: tool.latest.as_ref().map(|latest| tool_text(&latest.definition)),
+        latest_hash: tool.latest.as_ref().map(|latest| hash_hex(&latest.hash)),
         name: tool.name,
         effect: tool.effect,
         first_seen_at: tool.first_seen_at,
@@ -446,6 +472,14 @@ fn tool_failure(error: ToolError) -> Failure {
         ToolError::NotFound => ApiError::not_found("Installation").into(),
         // Only recording a listing refuses one; reading never does.
         ToolError::InvalidListing => ApiError::internal().into(),
+        ToolError::ToolNotFound => ApiError::not_found("Tool").into(),
+        ToolError::NotChanged => ApiError::new(409, "tool_not_changed", "This tool has no change to accept.").into(),
+        ToolError::Stale => ApiError::new(
+            409,
+            "stale_definition",
+            "This tool changed again since you reviewed it. Review its latest definition, then accept that.",
+        )
+        .into(),
         // The store has logged the cause.
         ToolError::Unavailable => ApiError::new(
             503,
@@ -458,11 +492,11 @@ fn tool_failure(error: ToolError) -> Failure {
 
 /// A tool list's cursor: the last name of the page before, so the next page
 /// starts after it. Opaque to callers.
-fn tool_cursor(name: &str) -> String {
+pub(crate) fn tool_cursor(name: &str) -> String {
     URL_SAFE_NO_PAD.encode(name)
 }
 
-fn tool_after(cursor: &str) -> Result<String, Failure> {
+pub(crate) fn tool_after(cursor: &str) -> Result<String, Failure> {
     URL_SAFE_NO_PAD
         .decode(cursor)
         .ok()
@@ -503,6 +537,71 @@ async fn list_installation_tools(
     let views: Vec<InstallationToolView> = page.items.into_iter().map(tool_view).collect();
     let meta = json!({ "pagination": { "next_cursor": next_cursor, "total": page.total } });
     Ok(envelope_with_meta(StatusCode::OK, views, meta))
+}
+
+/// Accepts a changed tool's latest definition, exactly as reviewed: it
+/// becomes the pinned one. Owners and admins, or an API key; the Console may
+/// do it in Production too, since it decides what agents may rely on rather
+/// than acting on an account.
+async fn accept_tool_change(
+    State(state): State<AppState>,
+    caller: Caller,
+    headers: HeaderMap,
+    Path((ws, inst)): Path<(String, String)>,
+    body: Body,
+) -> Result<Response, Failure> {
+    let access = WorkspaceAccess::resolve(&state, caller, &headers, &ws).await?;
+    access.access.require(MemberRole::is_admin, "review tool changes")?;
+    let installation = find(&state, &access, &inst).await?;
+    let body = body.object()?;
+    let mut fields = Fields::default();
+    let required = |field: &str, fields: &mut Fields| {
+        body.string(field, fields).filter(|value| {
+            if value.is_empty() {
+                fields.invalid(field, "Required.");
+            }
+            !value.is_empty()
+        })
+    };
+    let name = required("name", &mut fields);
+    let latest_hash = required("latest_hash", &mut fields);
+    fields.finish()?;
+    let (Some(name), Some(latest_hash)) = (name, latest_hash) else {
+        return Err(ApiError::internal().into());
+    };
+    // A malformed hash matches no definition: `stale_definition`, once the
+    // tool is found and changed.
+    let accepted = match state
+        .tools
+        .accept_change(
+            access.access.organization_id,
+            access.workspace.id,
+            installation.id,
+            &name,
+            hash_from_hex(&latest_hash),
+        )
+        .await
+    {
+        Ok(accepted) => accepted,
+        Err(ToolError::NotChanged) => {
+            return Err(ApiError::new(409, "tool_not_changed", format!("{name} has no change to accept.")).into());
+        }
+        Err(ToolError::Stale) => {
+            return Err(ApiError::new(
+                409,
+                "stale_definition",
+                format!("{name} changed again since you reviewed it. Review its latest definition, then accept that."),
+            )
+            .into());
+        }
+        Err(error) => return Err(tool_failure(error)),
+    };
+    tracing::info!(
+        event = "installations.tool_change_accepted",
+        installation_id = %installation.id,
+        tool = %accepted.name,
+    );
+    Ok(envelope(StatusCode::OK, tool_view(accepted)))
 }
 
 /// How long after an accepted refresh the next one is refused.

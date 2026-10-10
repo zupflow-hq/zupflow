@@ -9,6 +9,7 @@
 //! - [`SqliteInstallationStore`]: installations and their sealed credentials.
 //! - [`SqliteJobQueue`]: the job queue, in the same database.
 //! - [`SqliteOrganizationStore`]: organizations, members and users.
+//! - [`SqliteToolPolicyStore`]: the organization's tool policy and its levels per catalog app.
 //! - [`SqliteToolRegistry`]: the tools apps' MCP servers list, pinned.
 //! - [`SqliteWorkspaceStore`]: workspaces, listed by keyset.
 //!
@@ -27,6 +28,7 @@ mod job_queue;
 mod organizations;
 #[cfg(test)]
 mod schema;
+mod tool_policy;
 mod tools;
 mod workspaces;
 
@@ -39,5 +41,6 @@ pub use idempotency::SqliteIdempotencyStore;
 pub use installations::SqliteInstallationStore;
 pub use job_queue::SqliteJobQueue;
 pub use organizations::SqliteOrganizationStore;
+pub use tool_policy::SqliteToolPolicyStore;
 pub use tools::SqliteToolRegistry;
 pub use workspaces::SqliteWorkspaceStore;

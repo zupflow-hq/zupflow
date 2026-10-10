@@ -1,4 +1,5 @@
 import type {
+  AcceptToolChangeInput,
   Agent,
   AgentGrant,
   AgentId,
@@ -7,6 +8,7 @@ import type {
   AppDefinition,
   AppId,
   AppInstallationRef,
+  AppToolLevel,
   AuditEvent,
   AuditListQuery,
   AuthorizeConnectResult,
@@ -48,14 +50,17 @@ import type {
   RunId,
   RunListQuery,
   SubmitConnectCredentialsInput,
+  ToolPolicy,
   UpdateAgentInput,
   UpdateAppInput,
+  UpdateAppToolLevelsInput,
   UpdateConfigurationInput,
   UpdateConnectSettingsInput,
   UpdateGrantInput,
   UpdateInstallationInput,
   UpdateMemberInput,
   UpdateOrganizationInput,
+  UpdateToolPolicyInput,
   UpdateWebhookEndpointInput,
   UpdateWorkspaceInput,
   UsageReport,
@@ -176,6 +181,17 @@ export function createClient(transport: Transport) {
       ) => getPage<AppInstallationRef>(`${org(organizationId)}/apps/${enc(appId)}/installations`, { ...query }),
     },
 
+    /** The organization's tool policy, and its levels for each catalog app's tools. */
+    toolPolicy: {
+      get: (organizationId: OrganizationId) => get<ToolPolicy>(`${org(organizationId)}/tool-policy`),
+      update: (organizationId: OrganizationId, input: UpdateToolPolicyInput) =>
+        send<ToolPolicy>("PUT", `${org(organizationId)}/tool-policy`, input),
+      levels: (organizationId: OrganizationId, appId: AppId, query: PageQuery = {}) =>
+        getPage<AppToolLevel>(`${org(organizationId)}/apps/${enc(appId)}/tool-levels`, { ...query }),
+      setLevels: (organizationId: OrganizationId, appId: AppId, input: UpdateAppToolLevelsInput) =>
+        send<AppToolLevel[]>("PATCH", `${org(organizationId)}/apps/${enc(appId)}/tool-levels`, input),
+    },
+
     workspaceApps: {
       list: (workspaceId: WorkspaceId) => get<AppDefinition[]>(`${ws(workspaceId)}/apps`),
       create: (workspaceId: WorkspaceId, input: CreateAppInput, options?: PostOptions) =>
@@ -206,6 +222,18 @@ export function createClient(transport: Transport) {
       /** Ask the app's MCP server for the installation's tools again; the listing arrives in the background. */
       refreshTools: (workspaceId: WorkspaceId, installationId: InstallationId, options?: PostOptions) =>
         post<Installation>(`${ws(workspaceId)}/installations/${enc(installationId)}/refresh-tools`, undefined, options),
+      /** Accept a changed tool's latest definition, named by the hash you reviewed: it becomes the pinned one. */
+      acceptToolChange: (
+        workspaceId: WorkspaceId,
+        installationId: InstallationId,
+        input: AcceptToolChangeInput,
+        options?: PostOptions,
+      ) =>
+        post<InstallationTool>(
+          `${ws(workspaceId)}/installations/${enc(installationId)}/accept-tool-change`,
+          input,
+          options,
+        ),
     },
 
     connectSessions: {

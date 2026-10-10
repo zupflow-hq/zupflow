@@ -5,7 +5,10 @@
 //!
 //! A grant names tools in its installation's registry: one that isn't there,
 //! or is gone, is refused with a field error, checked by the store in the
-//! transaction that writes the grant. The Console isn't kept out of
+//! transaction that writes the grant. A grant of a catalog app's
+//! installation is also held inside the organization's levels: a tool it
+//! denies is refused, and one it sets to approve must require approval. The
+//! Console isn't kept out of
 //! Production here: agents and grants are configuration, not acting on a
 //! customer's accounts, and the mock, the API's specification, allows them.
 
@@ -160,6 +163,18 @@ fn agent_failure(error: AgentError, installation: &str) -> Failure {
             "approval_outside_grant",
             "approval_required",
             format!("{name} requires approval but isn't granted."),
+        ),
+        AgentError::ToolDenied(name) => field_error(
+            422,
+            "tool_denied",
+            "tools",
+            format!("Your organization blocks {name}. Remove it from the grant."),
+        ),
+        AgentError::ApprovalRequiredByPolicy(name) => field_error(
+            422,
+            "approval_required_by_policy",
+            "approval_required",
+            format!("Your organization requires approval for {name}. Add it to approval required."),
         ),
         // The store has logged the cause.
         AgentError::Unavailable => unavailable(),

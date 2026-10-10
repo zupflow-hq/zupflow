@@ -387,6 +387,113 @@
           "workspace"
         ]
       },
+      "AppToolLevel": {
+        "type": "object",
+        "properties": {
+          "app_id": {
+            "$ref": "#/components/schemas/AppId"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "allow",
+              "approve",
+              "deny"
+            ]
+          },
+          "confirmed": {
+            "type": "boolean"
+          },
+          "destructive": {
+            "type": "boolean"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "updated_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/User"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "app_id",
+          "tool",
+          "level",
+          "confirmed",
+          "destructive",
+          "updated_at",
+          "updated_by"
+        ]
+      },
+      "AppToolsChangedWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "app.tools_changed"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "installation"
+              },
+              "id": {
+                "$ref": "#/components/schemas/InstallationId"
+              },
+              "app_id": {
+                "$ref": "#/components/schemas/AppId"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "connected"
+                ]
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "app_id",
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
+      },
       "AuditEvent": {
         "type": "object",
         "properties": {
@@ -1622,10 +1729,25 @@
           "pinned": {
             "$ref": "#/components/schemas/ToolText"
           },
+          "pinned_hash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
           "latest": {
             "anyOf": [
               {
                 "$ref": "#/components/schemas/ToolText"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "latest_hash": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
               },
               {
                 "type": "null"
@@ -1664,7 +1786,9 @@
           "effect",
           "status",
           "pinned",
+          "pinned_hash",
           "latest",
+          "latest_hash",
           "first_seen_at",
           "seen_at",
           "changed_at",
@@ -3258,6 +3382,54 @@
           "effect"
         ]
       },
+      "ToolPolicy": {
+        "type": "object",
+        "properties": {
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "manual"
+            ]
+          },
+          "new_tool_level": {
+            "type": "string",
+            "enum": [
+              "approve",
+              "deny"
+            ]
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updated_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/User"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "organization_id",
+          "mode",
+          "new_tool_level",
+          "updated_at",
+          "updated_by"
+        ]
+      },
       "ToolText": {
         "type": "object",
         "properties": {
@@ -3503,7 +3675,8 @@
                 "run.completed",
                 "run.failed",
                 "run.waiting_for_approval",
-                "run.cancelled"
+                "run.cancelled",
+                "app.tools_changed"
               ]
             }
           },
@@ -3572,6 +3745,9 @@
           },
           {
             "$ref": "#/components/schemas/RunCancelledWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/AppToolsChangedWebhookEvent"
           },
           {
             "$ref": "#/components/schemas/WebhookTestWebhookEvent"
@@ -5769,6 +5945,365 @@
         }
       }
     },
+    "/v1/organizations/{org}/tool-policy": {
+      "get": {
+        "operationId": "getToolPolicy",
+        "summary": "The organization's tool policy",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ToolPolicy"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "operationId": "updateToolPolicy",
+        "summary": "Set the organization's tool policy; owners and admins",
+        "security": [
+          {
+            "consoleSession": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ToolPolicy"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "manual"
+                    ]
+                  },
+                  "new_tool_level": {
+                    "type": "string",
+                    "enum": [
+                      "approve",
+                      "deny"
+                    ]
+                  }
+                },
+                "required": [
+                  "mode",
+                  "new_tool_level"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{org}/apps/{app}/tool-levels": {
+      "get": {
+        "operationId": "listAppToolLevels",
+        "summary": "The organization's levels for a catalog app's tools, a page at a time by name",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "app",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/AppId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Page size, 1 to 100 (default 25); values outside are clamped, and a non-integer means the default.",
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/AppToolLevel"
+                      }
+                    },
+                    "meta": {
+                      "$ref": "#/components/schemas/Meta"
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "updateAppToolLevels",
+        "summary": "Set levels for a catalog app's tools, by name; owners and admins",
+        "security": [
+          {
+            "consoleSession": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "app",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/AppId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/AppToolLevel"
+                      }
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "levels": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "tool": {
+                          "type": "string"
+                        },
+                        "level": {
+                          "type": "string",
+                          "enum": [
+                            "allow",
+                            "approve",
+                            "deny"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "tool",
+                        "level"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "levels"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/workspaces/{ws}/apps": {
       "get": {
         "operationId": "listWorkspaceApps",
@@ -6914,6 +7449,108 @@
           },
           "default": {
             "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{ws}/installations/{inst}/accept-tool-change": {
+      "post": {
+        "operationId": "acceptToolChange",
+        "summary": "Accept a changed tool's latest definition; owners and admins",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "inst",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/InstallationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/InstallationTool"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "latest_hash": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "latest_hash"
+                ]
+              }
+            }
           }
         }
       }
@@ -9342,7 +9979,8 @@
                         "run.completed",
                         "run.failed",
                         "run.waiting_for_approval",
-                        "run.cancelled"
+                        "run.cancelled",
+                        "app.tools_changed"
                       ]
                     }
                   }
@@ -9459,7 +10097,8 @@
                         "run.completed",
                         "run.failed",
                         "run.waiting_for_approval",
-                        "run.cancelled"
+                        "run.cancelled",
+                        "app.tools_changed"
                       ]
                     }
                   },
@@ -10199,6 +10838,74 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/RunCancelledWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "app.tools_changed": {
+      "post": {
+        "operationId": "webhook_app_tools_changed",
+        "summary": "`app.tools_changed`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "app.tools_changed"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppToolsChangedWebhookEvent"
               }
             }
           }

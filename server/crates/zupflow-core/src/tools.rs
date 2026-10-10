@@ -8,9 +8,9 @@
 //! is what calls use and what the model reads. A later listing whose
 //! definition hashes differently is kept beside it as the **latest**, marked
 //! changed and unreviewed, and the pinned one stays in force until someone
-//! reviews the change (milestone 4). A tool missing from a complete listing is
-//! **gone**. Nothing a server lists ever replaces a pinned definition on its
-//! own.
+//! accepts the change ([`ToolRegistry::accept_change`]). A tool missing
+//! from a complete listing is **gone**. Nothing a server lists ever replaces
+//! a pinned definition on its own.
 //!
 //! A definition is everything the model reads (name, title, description,
 //! input schema) and the annotations, as canonical JSON, hashed with SHA-256.
@@ -131,6 +131,15 @@ pub enum ToolError {
     /// [`MAX_NAME`], or a definition over [`MAX_DEFINITION_BYTES`].
     #[error("the listing can't be recorded")]
     InvalidListing,
+    /// The installation has no tool of that name.
+    #[error("tool not found")]
+    ToolNotFound,
+    /// The tool has no change to accept: it's current, or gone.
+    #[error("the tool has no change to accept")]
+    NotChanged,
+    /// The tool's latest definition isn't the one reviewed.
+    #[error("the tool changed again")]
+    Stale,
 }
 
 #[async_trait]
@@ -160,6 +169,22 @@ pub trait ToolRegistry: Send + Sync {
         after: Option<&str>,
         limit: u32,
     ) -> Result<ToolPage, ToolError>;
+
+    /// Accepts a changed tool's latest definition, in one transaction: it
+    /// becomes the pinned one and the tool is current again. In this order:
+    /// the installation (`NotFound`), the tool (`ToolNotFound`), a change to
+    /// accept (`NotChanged`: none, or the tool is gone), then the latest
+    /// definition's hash against `expected`, the hash reviewed (`Stale`;
+    /// `None`, for what can't be a hash, matches none). The tool's effect
+    /// stays as first seen.
+    async fn accept_change(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        installation_id: InstallationId,
+        name: &str,
+        expected: Option<[u8; 32]>,
+    ) -> Result<RegisteredTool, ToolError>;
 }
 
 /// Checks a listing against the limits every registry holds it to.

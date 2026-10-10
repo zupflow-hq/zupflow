@@ -12,7 +12,7 @@ use zupflow_core::ids::{InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{
     ListedTool, ListingChanges, MAX_GONE, MAX_PAGE, RegisteredTool, ToolError, ToolPage, ToolRegistry, ToolRevision,
-    validate_listing,
+    ToolStatus, validate_listing,
 };
 
 use crate::Database;
@@ -84,6 +84,20 @@ const SEEN: &str = "UPDATE installation_tools SET gone_at = NULL, seen_at = ? \
 const CHANGED: &str = "UPDATE installation_tools SET latest_definition = ?, latest_hash = ?, changed_at = ?, \
                        gone_at = NULL, seen_at = ? \
                        WHERE organization_id = ? AND workspace_id = ? AND installation_id = ? AND name = ?";
+/// One tool, by name: the scope, then the name.
+const FIND: &str = concat!(
+    "SELECT ",
+    columns!(),
+    " FROM installation_tools WHERE organization_id = ? AND workspace_id = ? AND installation_id = ? AND name = ?"
+);
+/// The latest definition pinned: the scope, then the name.
+const ACCEPT: &str = concat!(
+    "UPDATE installation_tools SET pinned_definition = latest_definition, pinned_hash = latest_hash, \
+     latest_definition = NULL, latest_hash = NULL, changed_at = NULL \
+     WHERE organization_id = ? AND workspace_id = ? AND installation_id = ? AND name = ? \
+     AND latest_definition IS NOT NULL AND latest_hash IS NOT NULL RETURNING ",
+    columns!()
+);
 const GONE: &str = "UPDATE installation_tools SET gone_at = ? \
                     WHERE organization_id = ? AND workspace_id = ? AND installation_id = ? AND name = ?";
 
@@ -302,6 +316,50 @@ impl ToolRegistry for SqliteToolRegistry {
             next_after,
             total: u64::try_from(total).map_err(read)?,
         })
+    }
+
+    async fn accept_change(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        installation_id: InstallationId,
+        name: &str,
+        expected: Option<[u8; 32]>,
+    ) -> Result<RegisteredTool, ToolError> {
+        let owner = Owner {
+            organization_id,
+            workspace_id,
+            installation_id,
+        };
+        let mut transaction = self
+            .database
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(failed("accept_change"))?;
+        if !installation_exists(&mut transaction, owner).await? {
+            return Err(ToolError::NotFound);
+        }
+        let row = bind_scope(sqlx::query(FIND), owner)
+            .bind(name)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(failed("accept_change"))?;
+        let tool = tool_from(&row.ok_or(ToolError::ToolNotFound)?)?;
+        if tool.status() != ToolStatus::Changed {
+            return Err(ToolError::NotChanged);
+        }
+        if expected.is_none() || tool.latest.as_ref().map(|latest| latest.hash) != expected {
+            return Err(ToolError::Stale);
+        }
+        let row = bind_scope(sqlx::query(ACCEPT), owner)
+            .bind(name)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(failed("accept_change"))?;
+        let accepted = tool_from(&row)?;
+        transaction.commit().await.map_err(failed("accept_change"))?;
+        Ok(accepted)
     }
 }
 

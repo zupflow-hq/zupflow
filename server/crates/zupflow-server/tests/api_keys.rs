@@ -410,7 +410,9 @@ async fn refuses_a_key_it_did_not_issue() {
     let server = Server::new().await;
     let org = server.organization("alice", "northwind").await;
     let (secret, _) = key(&server, "alice", &org, "sandbox").await;
-    let altered = format!("{}x", &secret[..secret.len() - 1]);
+    // The last character flipped to another, so it never equals the real key.
+    let last = if secret.ends_with('x') { 'y' } else { 'x' };
+    let altered = format!("{}{last}", &secret[..secret.len() - 1]);
     for forged in [
         altered.as_str(),
         "zf_test_",

@@ -46,9 +46,11 @@ Read `README.md` first.
   queues, events, compute. This repository ships only basic implementations
   (SQLite, in-memory, local files, local keys); no provider implementations,
   vendor configuration or credentials.
-- **Zupflow stands alone.** No client, partner or other product is named in
-  code, data, docs, commits or pull requests. Demo data uses fictional
-  organizations and `.example` domains.
+- **Zupflow stands alone.** No client, partner or customer organization is
+  named in code, data, docs, commits or pull requests; demo organizations are
+  fictional and use `.example` domains. Real AI model names and real
+  third-party services (a demo app catalog, say) may appear in demo data and
+  fixtures.
 - **Secrets are write-only.** Responses expose `set` and `last4`, never values.
   A newly created API key or signing secret is shown once from the creating
   response and never stored by the Console.

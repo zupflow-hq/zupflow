@@ -21,8 +21,10 @@ import {
   useGrants,
   useInstallations,
   useInstallationTools,
+  useToolPolicy,
   useUpdateGrant,
 } from "@/features/queries";
+import { changedToolCalls, useLevelsInForce } from "@/features/tool-policy/levels";
 import { toastError } from "@/lib/errors";
 import { cn } from "@/lib/utils";
 
@@ -134,7 +136,15 @@ function GrantCard({
   const [revoking, setRevoking] = useState(false);
   const create = useCreateGrant(workspace.id, agent.id);
   const update = useUpdateGrant(workspace.id, agent.id);
+  const policy = useToolPolicy(org.id);
   const remove = useDeleteGrant(workspace.id, agent.id);
+  // The organization's levels hold a catalog app's tools; a workspace app's are the grant's alone.
+  const levels = useLevelsInForce(
+    org,
+    installation.app.owner_scope === "organization" ? installation.app.id : undefined,
+  );
+  const blocked = (name: string) => levels.levelOf(name) === "deny";
+  const requiresApproval = (name: string) => levels.levelOf(name) === "approve";
 
   const initial = useMemo(() => ({ tools: grant?.tools ?? [], approval: grant?.approval_required ?? [] }), [grant]);
   const [selected, setSelected] = useState<string[]>(initial.tools);
@@ -158,7 +168,9 @@ function GrantCard({
 
   const toggleTool = (tool: InstallationTool, on: boolean) => {
     setSelected((s) => (on ? [...s, tool.name] : s.filter((t) => t !== tool.name)));
-    if (on && tool.effect === "destructive") setApproval((a) => [...new Set([...a, tool.name])]);
+    if (on && (tool.effect === "destructive" || requiresApproval(tool.name))) {
+      setApproval((a) => [...new Set([...a, tool.name])]);
+    }
     if (!on) setApproval((a) => a.filter((t) => t !== tool.name));
   };
 
@@ -170,13 +182,19 @@ function GrantCard({
       },
       onError: (e: unknown) => toastError(e, "Couldn't save access"),
     };
-    const input = { tools: toSave, approval_required: approval.filter((t) => toSave.includes(t)) };
+    const required = toSave.filter(requiresApproval);
+    const input = {
+      tools: toSave,
+      approval_required: [...new Set([...approval, ...required])].filter((t) => toSave.includes(t)),
+    };
     if (grant) update.mutate({ grantId: grant.id, ...input }, done);
     else create.mutate({ installation_id: installation.id, ...input }, done);
   };
 
   const pending = create.isPending || update.isPending;
   const mayChange = canChange(org);
+  const blockedGranted = toSave.filter(blocked);
+  const changedCalls = changedToolCalls(policy.data?.new_tool_level);
 
   return (
     <Panel className={cn(!open && "bg-card/60")}>
@@ -241,6 +259,24 @@ function GrantCard({
               </span>
             </p>
           ) : null}
+          {blockedGranted.length > 0 ? (
+            <p className="flex items-start gap-2 border-b bg-danger-soft/40 px-4 py-2 text-sm">
+              <AlertTriangleIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
+              <span className="min-w-0 break-words">
+                Your organization blocks {listed(blockedGranted.map(titleOf))}. Calls to{" "}
+                {blockedGranted.length === 1 ? "it" : "them"} are refused
+                {mayChange ? `; remove ${blockedGranted.length === 1 ? "it" : "them"} to save this grant.` : "."}
+              </span>
+            </p>
+          ) : null}
+          {levels.error ? (
+            <QueryError
+              error={levels.error}
+              onRetry={levels.retry}
+              what="your organization's tool permissions"
+              className="m-3"
+            />
+          ) : null}
           {registry.isError ? (
             <QueryError
               error={registry.error}
@@ -268,12 +304,14 @@ function GrantCard({
                 const checked = selected.includes(tool.name);
                 const id = `${installation.id}-${tool.name}`;
                 const title = tool.pinned.title ?? tool.name;
+                const isBlocked = blocked(tool.name);
+                const required = requiresApproval(tool.name);
                 return (
                   <li key={tool.name} className="flex items-center gap-3 px-4 py-2.5">
                     <Checkbox
                       id={id}
                       checked={checked}
-                      disabled={!mayChange}
+                      disabled={!mayChange || (isBlocked && !checked)}
                       onCheckedChange={(v) => toggleTool(tool, v === true)}
                     />
                     <Label
@@ -287,13 +325,21 @@ function GrantCard({
                         <span className="break-words font-medium">{title}</span>
                         <ToolEffectTag effect={tool.effect} />
                         {tool.status === "changed" ? <StatusPill tone="warning">Changed</StatusPill> : null}
+                        {isBlocked ? <StatusPill tone="danger">Blocked</StatusPill> : null}
                       </span>
                       {tool.pinned.description ? (
                         <span className="text-xs break-words text-muted-foreground">{tool.pinned.description}</span>
                       ) : null}
                       {tool.status === "changed" ? (
                         <span className="text-xs text-muted-foreground">
-                          Its definition changed. Calls use it as first listed until the change is reviewed.
+                          Its definition changed. Until the change is accepted, {changedCalls}.
+                        </span>
+                      ) : null}
+                      {isBlocked ? (
+                        <span className="text-xs text-muted-foreground">Your organization blocks this tool.</span>
+                      ) : required ? (
+                        <span className="text-xs text-muted-foreground">
+                          Your organization requires approval for this tool.
                         </span>
                       ) : null}
                     </Label>
@@ -307,8 +353,8 @@ function GrantCard({
                       <Switch
                         id={`${id}-approval`}
                         aria-label={`Require approval for ${title}`}
-                        disabled={!checked || !mayChange}
-                        checked={approval.includes(tool.name)}
+                        disabled={!checked || !mayChange || required}
+                        checked={approval.includes(tool.name) || (checked && required)}
                         onCheckedChange={(on) =>
                           setApproval((a) => (on ? [...a, tool.name] : a.filter((t) => t !== tool.name)))
                         }
@@ -345,7 +391,11 @@ function GrantCard({
               >
                 Cancel
               </Button>
-              <Button size="sm" disabled={pending || toSave.length === 0} onClick={save}>
+              <Button
+                size="sm"
+                disabled={pending || toSave.length === 0 || !levels.ready || blockedGranted.length > 0}
+                onClick={save}
+              >
                 {pending ? <Spinner /> : null}
                 {grant ? "Save access" : "Grant access"}
               </Button>

@@ -140,7 +140,8 @@ async fn list_tools(server: &Server, org: &str, ws: &str, installation: &str, na
 }
 
 /// A Sandbox workspace with an installation whose registry holds `search`
-/// as listed, `archive` changed since and `drop` gone.
+/// as listed, `archive` changed since and `drop` gone, each allowed by the
+/// organization.
 struct Setup {
     server: Server,
     org: String,
@@ -199,6 +200,24 @@ async fn setup() -> Setup {
         statuses,
         [("archive", "changed"), ("drop", "gone"), ("search", "current")]
     );
+    // The organization allows every tool, so the grant's own rules decide here.
+    let (status, body) = server
+        .send(
+            call(
+                "alice",
+                Method::PATCH,
+                format!("/v1/organizations/{org}/apps/{app}/tool-levels"),
+            )
+            .body(json!({
+                "levels": [
+                    { "tool": "search", "level": "allow" },
+                    { "tool": "archive", "level": "allow" },
+                    { "tool": "drop", "level": "allow" },
+                ],
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     Setup {
         server,
         org,

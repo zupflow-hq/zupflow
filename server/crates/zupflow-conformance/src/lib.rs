@@ -11,6 +11,7 @@
 pub mod agent_store;
 pub mod api_key_store;
 pub mod app_store;
+pub mod approval_policy;
 pub mod cache;
 pub mod connect_store;
 pub mod event_bus;
@@ -23,5 +24,6 @@ pub mod key_service;
 pub mod model_catalog;
 pub mod object_store;
 pub mod organization_store;
+pub mod tool_policy_store;
 pub mod tool_registry;
 pub mod workspace_store;

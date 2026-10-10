@@ -97,6 +97,8 @@ export async function snapshotOf(client: ZupflowClient, t: Tenant): Promise<stri
     workspaceApps,
     await Promise.all(workspaceApps.map((a) => client.workspaceApps.getConfiguration(w, a.id))),
     await Promise.all(ENVIRONMENTS.map((env) => client.connectSettings.get(t.org, env))),
+    await client.toolPolicy.get(t.org),
+    await Promise.all(orgApps.map((a) => client.toolPolicy.levels(t.org, a.id, { limit: 100 }))),
     await client.apiKeys.list(t.org),
     await client.webhooks.list(t.org),
     await client.audit.list(t.org, { limit: 100 }),
@@ -147,6 +149,10 @@ export function attempts(r: ZupflowClient, own: Tenant, victim: Tenant): [string
     ["[victim workspace] delete installation", () => r.installations.delete(w, v.installation.id)],
     ["[victim workspace] list installation tools", () => r.installations.tools(w, v.installation.id)],
     ["[victim workspace] refresh installation tools", () => r.installations.refreshTools(w, v.installation.id)],
+    [
+      "[victim workspace] accept tool change",
+      () => r.installations.acceptToolChange(w, v.installation.id, { name: "x", latest_hash: "0".repeat(64) }),
+    ],
     ["[victim workspace] list connect sessions", () => r.connectSessions.list(w)],
     ["[victim workspace] get connect session", () => r.connectSessions.get(w, v.session.id)],
     [
@@ -198,6 +204,13 @@ export function attempts(r: ZupflowClient, own: Tenant, victim: Tenant): [string
       "[victim org] set connect settings",
       () => r.connectSettings.update(v.org, "production", { return_urls: [], allowed_origins: [] }),
     ],
+    ["[victim org] tool policy", () => r.toolPolicy.get(v.org)],
+    ["[victim org] set tool policy", () => r.toolPolicy.update(v.org, { mode: "manual", new_tool_level: "deny" })],
+    ["[victim org] tool levels", () => r.toolPolicy.levels(v.org, v.orgApp.id)],
+    [
+      "[victim org] set tool levels",
+      () => r.toolPolicy.setLevels(v.org, v.orgApp.id, { levels: [{ tool: "x", level: "allow" }] }),
+    ],
     ["[victim org] list keys", () => r.apiKeys.list(v.org)],
     ["[victim org] create key", () => r.apiKeys.create(v.org, { name: "x", environment: "sandbox" })],
     ["[victim org] revoke key", () => r.apiKeys.revoke(v.org, v.key.id)],
@@ -221,6 +234,11 @@ export function attempts(r: ZupflowClient, own: Tenant, victim: Tenant): [string
       () => r.organizationApps.updateConfiguration(own.org, v.orgApp.id, "production", { mcp_server_url: null }),
     ],
     ["[own org] org app installations via own org", () => r.organizationApps.installations(own.org, v.orgApp.id)],
+    ["[own org] tool levels of victim app via own org", () => r.toolPolicy.levels(own.org, v.orgApp.id)],
+    [
+      "[own org] set tool levels of victim app via own org",
+      () => r.toolPolicy.setLevels(own.org, v.orgApp.id, { levels: [{ tool: "x", level: "allow" }] }),
+    ],
     ["[own org] member via own org", () => r.members.update(own.org, v.member.id, { role: "owner" })],
     ["[own org] remove member via own org", () => r.members.remove(own.org, v.member.id)],
     ["[own workspace] agent via own workspace", () => r.agents.get(own.workspace.id, v.agent.id)],
@@ -260,6 +278,14 @@ export function attempts(r: ZupflowClient, own: Tenant, victim: Tenant): [string
     ],
     ["[own workspace] delete victim installation", () => r.installations.delete(own.workspace.id, v.installation.id)],
     ["[own workspace] victim installation tools", () => r.installations.tools(own.workspace.id, v.installation.id)],
+    [
+      "[own workspace] accept victim tool change",
+      () =>
+        r.installations.acceptToolChange(own.workspace.id, v.installation.id, {
+          name: "x",
+          latest_hash: "0".repeat(64),
+        }),
+    ],
     // Through the attacker's Sandbox, so Production's read-only refusal can't answer first.
     [
       "[own workspace] refresh victim installation tools",

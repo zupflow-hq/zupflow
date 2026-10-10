@@ -41,13 +41,14 @@ use zupflow_core::ids::{
 use zupflow_core::installations::{InstallationStore, InstalledApp, TemplateSnapshot};
 use zupflow_core::organizations::{MemberRole, OrganizationStore, User};
 use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse, Refusal};
+use zupflow_core::policy::{ToolLevel, ToolPolicyStore};
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{ListedTool, ToolRegistry, ToolRevision};
 use zupflow_core::workspaces::{NewWorkspace, WorkspaceStore};
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{
     Database, SqliteAgentStore, SqliteApiKeyStore, SqliteAppStore, SqliteConnectStore, SqliteIdempotencyStore,
-    SqliteInstallationStore, SqliteOrganizationStore, SqliteToolRegistry, SqliteWorkspaceStore,
+    SqliteInstallationStore, SqliteOrganizationStore, SqliteToolPolicyStore, SqliteToolRegistry, SqliteWorkspaceStore,
 };
 
 /// The personas, with the address each signs in with: people's names, as in
@@ -145,6 +146,7 @@ async fn serve(path: &str) -> Result<(), String> {
         apps: Arc::new(SqliteAppStore::new(database.clone())),
         installations: Arc::new(SqliteInstallationStore::new(database.clone())),
         agents: Arc::new(SqliteAgentStore::new(database.clone())),
+        policies: Arc::new(zupflow_sqlite::SqliteToolPolicyStore::new(database.clone())),
         models: Arc::new(ConfiguredModels::parse(MODELS).map_err(|error| error.to_string())?),
         connect: Arc::new(SqliteConnectStore::new(database.clone())),
         jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
@@ -351,6 +353,22 @@ async fn reset(path: &str) -> Result<(), String> {
     // Connected installations, each with its credential sealed as Connect seals it.
     let installations = SqliteInstallationStore::new(database.clone());
     let tools = SqliteToolRegistry::new(database.clone());
+    // Levels suggested for a catalog app's tools as each listing names them, as discovery does.
+    let policies = SqliteToolPolicyStore::new(database.clone());
+    let suggest = |organization: OrganizationId, app: InstalledApp, listing: &[ListedTool]| {
+        let listed: Vec<_> = listing.iter().map(|tool| (tool.name.clone(), tool.effect)).collect();
+        let policies = &policies;
+        async move {
+            let InstalledApp::Catalog(app) = app else {
+                return Ok::<(), String>(());
+            };
+            policies
+                .suggest_levels(organization, app, &listed, Timestamp::now())
+                .await
+                .map(|_| ())
+                .map_err(|error| fail("levels")(&error))
+        }
+    };
     let mut installed: Vec<(OrganizationId, WorkspaceId, InstallationId, &str)> = Vec::new();
     for (organization, workspace, slug, label) in [
         (northwind.id, "acme", "google-workspace", "Marketing"),
@@ -402,8 +420,9 @@ async fn reset(path: &str) -> Result<(), String> {
         let listing: Vec<ListedTool> = found
             .tools
             .iter()
-            .map(|tool| {
-                fixture_tool(
+            .map(|tool| ListedTool {
+                effect: tool.effect,
+                ..fixture_tool(
                     &tool.name,
                     &tool.title,
                     &tool.description,
@@ -415,9 +434,11 @@ async fn reset(path: &str) -> Result<(), String> {
             .record_listing(organization, workspace, installation_id, &listing, Timestamp::now())
             .await
             .map_err(|error| fail("tools")(&error))?;
+        suggest(organization, app, &listing).await?;
     }
 
     // The Sandbox's installation's tools, as two later listings left them:
+    // (each listing suggests levels too, as discovery does)
     // one tool as first listed, one changed since, one gone.
     let (organization, workspace, installation_id, _) = installed
         .iter()
@@ -450,6 +471,61 @@ async fn reset(path: &str) -> Result<(), String> {
             .record_listing(organization, workspace, installation_id, &listing, at)
             .await
             .map_err(|error| fail("tools")(&error))?;
+        let linear = seeded
+            .iter()
+            .find(|(owner, seeded, _)| *owner == organization && *seeded == "linear")
+            .map(|(_, _, app)| *app)
+            .ok_or("app linear")?;
+        suggest(organization, linear, &listing).await?;
+    }
+
+    // The organizations' confirmed levels, as people set them: every tool
+    // `acme`'s grants hold stays inside them; `list_events` stays suggested.
+    for (organization, slug, writer, levels) in [
+        (
+            northwind.id,
+            "google-workspace",
+            owner.id,
+            &[
+                ("search_files", ToolLevel::Allow),
+                ("read_document", ToolLevel::Allow),
+                ("create_document", ToolLevel::Allow),
+                ("send_email", ToolLevel::Approve),
+                ("delete_file", ToolLevel::Deny),
+            ][..],
+        ),
+        (
+            northwind.id,
+            "linear",
+            owner.id,
+            &[
+                ("search_issues", ToolLevel::Allow),
+                ("create_issue", ToolLevel::Allow),
+                ("add_comment", ToolLevel::Allow),
+            ],
+        ),
+        (
+            larkspur.id,
+            "linear",
+            outsider.id,
+            &[("search_issues", ToolLevel::Allow), ("create_issue", ToolLevel::Allow)],
+        ),
+    ] {
+        let Some(InstalledApp::Catalog(app)) = seeded
+            .iter()
+            .find(|(owner, seeded, _)| *owner == organization && *seeded == slug)
+            .map(|(_, _, app)| *app)
+        else {
+            return Err(format!("catalog app {slug}"));
+        };
+        let levels: Vec<(String, ToolLevel)> = levels
+            .iter()
+            .map(|(tool, level)| ((*tool).to_owned(), *level))
+            .collect();
+        policies
+            .set_levels(organization, app, &levels, Some(writer), Timestamp::now())
+            .await
+            .map_err(|error| fail("levels")(&error))?;
     }
 
     // Agents, as the mock seeds them: in each workspace the suite expects
@@ -509,6 +585,35 @@ async fn reset(path: &str) -> Result<(), String> {
             )
             .await
             .map_err(|error| fail(name)(&error))?;
+        let names = |tools: &[&str]| tools.iter().map(|tool| (*tool).to_owned()).collect::<Vec<_>>();
+        if label == "Google" {
+            // Made before its levels were set: `list_events` is only
+            // suggested, so the store would refuse it now. Written as it
+            // stands, since tightening rewrites no grant.
+            let pool = SqlitePool::connect_with(SqliteConnectOptions::new().filename(path).foreign_keys(true))
+                .await
+                .map_err(|error| fail("connect")(&error))?;
+            let json = |tools: &[&str]| serde_json::to_string(&names(tools)).map_err(|error| fail(name)(&error));
+            let now = Timestamp::now().millis();
+            sqlx::query(
+                "INSERT INTO agent_grants (id, organization_id, workspace_id, agent_id, installation_id, tools, \
+                 approval_required, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(GrantId::generate().uuid())
+            .bind(organization.uuid())
+            .bind(workspace.uuid())
+            .bind(agent.id.uuid())
+            .bind(installation_id.uuid())
+            .bind(json(granted)?)
+            .bind(json(approval)?)
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .map_err(|error| fail(name)(&error))?;
+            pool.close().await;
+            continue;
+        }
         agents
             .create_grant(
                 organization,
@@ -517,8 +622,8 @@ async fn reset(path: &str) -> Result<(), String> {
                 GrantId::generate(),
                 installation_id,
                 &GrantTools {
-                    tools: granted.iter().map(|tool| (*tool).to_owned()).collect(),
-                    approval_required: approval.iter().map(|tool| (*tool).to_owned()).collect(),
+                    tools: names(granted),
+                    approval_required: names(approval),
                 },
             )
             .await

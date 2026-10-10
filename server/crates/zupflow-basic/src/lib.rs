@@ -3,6 +3,7 @@
 //! Each passes its trait's conformance suite.
 
 pub mod configured_models;
+pub mod configured_policy;
 pub mod in_process_events;
 #[cfg(unix)]
 pub mod local_files;

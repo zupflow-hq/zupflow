@@ -17,6 +17,8 @@ export const qk = {
   orgAppConfig: (orgId: string, appId: string, env: Environment) =>
     ["org", orgId, "apps", appId, "configuration", env] as const,
   orgAppInstallations: (orgId: string, appId: string) => ["org", orgId, "apps", appId, "installations"] as const,
+  toolPolicy: (orgId: string) => ["org", orgId, "tool-policy"] as const,
+  appToolLevels: (orgId: string, appId: string) => ["org", orgId, "apps", appId, "tool-levels"] as const,
   connectSettings: (orgId: string, env: Environment) => ["org", orgId, "connect-settings", env] as const,
   apiKeys: (orgId: string) => ["org", orgId, "api-keys"] as const,
   webhooks: (orgId: string) => ["org", orgId, "webhooks"] as const,

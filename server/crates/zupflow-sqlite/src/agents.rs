@@ -4,9 +4,11 @@
 //!
 //! A grant is written in an immediate transaction that first reads, in the
 //! same scope, the agent, the installation and the installation's registry
-//! (`installation_tools`), so a listing recorded meanwhile can't put a gone
-//! tool into a grant. Deleting an agent or an installation deletes its
-//! grants through the cascading keys, in that one statement.
+//! (`installation_tools`) and the organization's levels (`tool_policies`,
+//! `app_tool_levels`), so neither a listing recorded meanwhile nor a level
+//! tightened meanwhile can slip into a grant. Deleting an agent or an
+//! installation deletes its grants through the cascading keys, in that one
+//! statement.
 
 use std::collections::HashMap;
 
@@ -15,8 +17,10 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, Sqlite, Transaction};
 use zupflow_core::agents::{
     Agent, AgentChanges, AgentError, AgentStatus, AgentStore, Grant, GrantTools, NewAgent, approval_outside,
+    levels_refusal,
 };
-use zupflow_core::ids::{AgentId, GrantId, InstallationId, OrganizationId, WorkspaceId};
+use zupflow_core::ids::{AgentId, AppId, GrantId, InstallationId, OrganizationId, WorkspaceId};
+use zupflow_core::policy::{AppToolLevel, GrantLevels, NewToolLevel, PolicySettings, ToolLevel};
 use zupflow_core::time::Timestamp;
 
 use crate::Database;
@@ -72,6 +76,15 @@ const INSTALLATION_EXISTS: &str =
 /// The installation's registry: each tool's name and whether it's gone.
 const REGISTRY: &str = "SELECT name, gone_at IS NOT NULL AS gone FROM installation_tools \
                         WHERE organization_id = ? AND workspace_id = ? AND installation_id = ?";
+
+/// The installation's catalog app; NULL for a workspace app's.
+const CATALOG_APP: &str =
+    "SELECT catalog_app_id FROM installations WHERE organization_id = ? AND workspace_id = ? AND id = ?";
+/// The organization's level for new tools, when it saved a policy.
+const NEW_TOOL_LEVEL: &str = "SELECT new_tool_level FROM tool_policies WHERE organization_id = ?";
+/// The app's levels for the tools named: the organization, the app, then the names as a JSON array.
+const LEVELS: &str = "SELECT name, level, confirmed FROM app_tool_levels \
+                      WHERE organization_id = ? AND app_id = ? AND name IN (SELECT value FROM json_each(?))";
 
 macro_rules! grant_columns {
     () => {
@@ -157,7 +170,8 @@ async fn agent_exists(
 
 /// Holds `tools` to the installation's registry, inside the caller's
 /// transaction: each tool must be there and not gone, checked in the order
-/// given; then every approval must be granted.
+/// given; then every approval must be granted; then the grant must hold
+/// inside the organization's levels in force, read here too.
 async fn check_tools(
     transaction: &mut Transaction<'static, Sqlite>,
     organization_id: OrganizationId,
@@ -183,10 +197,66 @@ async fn check_tools(
             Some(false) => {}
         }
     }
-    match approval_outside(tools) {
-        Some(name) => Err(AgentError::ApprovalOutsideGrant(name.to_owned())),
+    if let Some(name) = approval_outside(tools) {
+        return Err(AgentError::ApprovalOutsideGrant(name.to_owned()));
+    }
+    let levels = levels_in_force(transaction, organization_id, workspace_id, installation_id, tools).await?;
+    match levels_refusal(tools, &levels) {
+        Some(refusal) => Err(refusal),
         None => Ok(()),
     }
+}
+
+/// The organization's levels in force for the grant's tools, inside the
+/// caller's transaction: those of the installation's catalog app, under the
+/// policy's level for new tools; none for a workspace app's installation.
+async fn levels_in_force(
+    transaction: &mut Transaction<'static, Sqlite>,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    installation_id: InstallationId,
+    tools: &GrantTools,
+) -> Result<GrantLevels, AgentError> {
+    let app: Option<uuid::Uuid> = sqlx::query_scalar(CATALOG_APP)
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(installation_id.uuid())
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(failed("levels_in_force"))?;
+    let Some(app) = app else {
+        return Ok(GrantLevels::none());
+    };
+    let new_tool_level: Option<String> = sqlx::query_scalar(NEW_TOOL_LEVEL)
+        .bind(organization_id.uuid())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(failed("levels_in_force"))?;
+    let new_tool_level = match new_tool_level {
+        None => PolicySettings::default().new_tool_level,
+        Some(level) => NewToolLevel::parse(&level).ok_or_else(|| read("an unknown level for new tools"))?,
+    };
+    let rows = sqlx::query(LEVELS)
+        .bind(organization_id.uuid())
+        .bind(app)
+        .bind(names_json(&tools.tools)?)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(failed("levels_in_force"))?;
+    let mut levels = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let level: String = row.try_get("level").map_err(read)?;
+        levels.push(AppToolLevel {
+            app_id: AppId::from_uuid(app),
+            tool: row.try_get("name").map_err(read)?,
+            level: ToolLevel::parse(&level).ok_or_else(|| read("an unknown tool level"))?,
+            confirmed: row.try_get("confirmed").map_err(read)?,
+            destructive: false,
+            updated_at: Timestamp::from_millis(0),
+            updated_by: None,
+        });
+    }
+    Ok(GrantLevels::in_force(&tools.tools, &levels, new_tool_level))
 }
 
 fn names_json(names: &[String]) -> Result<String, AgentError> {
@@ -512,7 +582,7 @@ mod tests {
             Box::pin(async move {
                 let pool = database.pool();
                 let org = tenant.organization_id.uuid();
-                let app = uuid::Uuid::now_v7();
+                let app = tenant.app.uuid();
                 sqlx::query("INSERT INTO organizations (id, name, slug, created_at) VALUES (?, 'Test', ?, 0)")
                     .bind(org)
                     .bind(format!("org-{}", org.simple()))
@@ -571,6 +641,7 @@ mod tests {
         zupflow_conformance::agent_store::run(
             Stores {
                 agents: &SqliteAgentStore::new(database.clone()),
+                policies: &crate::SqliteToolPolicyStore::new(database.clone()),
                 registry: &crate::SqliteToolRegistry::new(database.clone()),
                 installations: &crate::SqliteInstallationStore::new(database.clone()),
             },
@@ -592,6 +663,7 @@ mod tests {
         } = temporary().await;
         let tenant = Tenant {
             organization_id: OrganizationId::generate(),
+            app: AppId::generate(),
             workspace: WorkspaceId::generate(),
             installation: InstallationId::generate(),
             second_installation: InstallationId::generate(),

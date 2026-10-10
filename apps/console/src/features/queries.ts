@@ -4,6 +4,7 @@
  */
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  type AcceptToolChangeInput,
   type AgentId,
   type ApiKeyId,
   type AppId,
@@ -31,10 +32,12 @@ import {
   TERMINAL_RUN_STATUSES,
   type UpdateAgentInput,
   type UpdateAppInput,
+  type UpdateAppToolLevelsInput,
   type UpdateConfigurationInput,
   type UpdateConnectSettingsInput,
   type UpdateGrantInput,
   type UpdateOrganizationInput,
+  type UpdateToolPolicyInput,
   type UpdateWebhookEndpointInput,
   type UpdateWorkspaceInput,
   type WebhookEndpointId,
@@ -376,6 +379,16 @@ export function useRefreshInstallationTools(wsId: WorkspaceId, id: InstallationI
   });
 }
 
+/** Accepts a changed tool's reviewed definition; the installation's tools are read again either way. */
+export function useAcceptToolChange(wsId: WorkspaceId, id: InstallationId) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: AcceptToolChangeInput) => api.installations.acceptToolChange(wsId, id, input),
+    // Refused because the definition changed again: read it again, so the new one is what's reviewed.
+    onSettled: () => qc.invalidateQueries({ queryKey: qk.installationTools(wsId, id) }),
+  });
+}
+
 export function useDisconnectInstallation(wsId: WorkspaceId) {
   const qc = useQueryClient();
   return useMutation({
@@ -512,6 +525,41 @@ export function useDeleteGrant(wsId: WorkspaceId, agentId: AgentId) {
   return useMutation({
     mutationFn: (grantId: GrantId) => api.grants.delete(wsId, agentId, grantId),
     onSuccess: invalidate,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Tool policy
+
+export function useToolPolicy(orgId: OrganizationId) {
+  return useQuery({ queryKey: qk.toolPolicy(orgId), queryFn: () => api.toolPolicy.get(orgId) });
+}
+
+export function useUpdateToolPolicy(orgId: OrganizationId) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: UpdateToolPolicyInput) => api.toolPolicy.update(orgId, input),
+    onSuccess: (policy) => qc.setQueryData(qk.toolPolicy(orgId), policy),
+  });
+}
+
+/** The organization's levels for a catalog app's tools, a page at a time, by name. */
+export function useAppToolLevels(orgId: OrganizationId, appId: AppId | undefined) {
+  return useInfiniteQuery({
+    queryKey: qk.appToolLevels(orgId, appId ?? ""),
+    queryFn: ({ pageParam }) =>
+      api.toolPolicy.levels(orgId, required(appId), { cursor: pageParam ?? undefined, limit: 100 }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.pagination.next_cursor,
+    enabled: !!appId,
+  });
+}
+
+export function useSetAppToolLevels(orgId: OrganizationId, appId: AppId) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: UpdateAppToolLevelsInput) => api.toolPolicy.setLevels(orgId, appId, input),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.appToolLevels(orgId, appId) }),
   });
 }
 

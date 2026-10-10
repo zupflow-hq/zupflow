@@ -115,6 +115,21 @@ same workspace, and only tools that installation's registry holds and doesn't
 hold as gone (`422 unknown_tool`, `422 tool_gone`); a tool that goes later
 stays in the grant, refused when called.
 
+Tool permissions (decision 0040) are served too: the organization's tool
+policy (`manual` mode, and the level for tools nobody has confirmed a level
+for, `approve` or `deny`) and its level per catalog app and tool name
+(`allow`, `approve`, `deny`). Every member and the organization's API keys
+read them; owners and admins change them from the Console. Discovery suggests
+a level from each new tool's hints (read-only: `allow`, otherwise `approve`;
+destructive flagged), unconfirmed; only a confirmed level is in force. A grant
+of a catalog app's installation is held inside the levels in force
+(`422 tool_denied`, `422 approval_required_by_policy`); tightening a level
+rewrites no grant. Owners, admins and API keys accept a changed tool's latest
+definition, exactly as reviewed (`409 stale_definition` otherwise), which pins
+it. `ConfiguredPolicy` in `zupflow-basic` is the built-in `ApprovalPolicy`
+that will decide each call once the run engine exists; it fails closed,
+requiring approval when its configuration can't be read.
+
 The models are the deployment's to list, in `ZUPFLOW_MODELS`: a JSON array
 of `{"id", "name", "provider", "description"}` objects in the order to offer
 them (`description` optional; IDs of letters, digits and `. - _ : / @`, each

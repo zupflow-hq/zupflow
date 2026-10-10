@@ -2,13 +2,27 @@ import type { Installation, InstallationTool, Organization, ToolText, Workspace 
 import { RefreshCwIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { QueryError, RelativeTime, RowsSkeleton } from "@/components/app/misc";
+import { JsonBlock, QueryError, RelativeTime, RowsSkeleton } from "@/components/app/misc";
 import { Panel, SectionHeader } from "@/components/app/page";
 import { StatusPill, ToolEffectTag } from "@/components/app/status";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
-import { canChange } from "@/features/context";
-import { useInstallationTools, useRefreshInstallationTools } from "@/features/queries";
+import { canAdminister, canChange } from "@/features/context";
+import {
+  useAcceptToolChange,
+  useInstallationTools,
+  useRefreshInstallationTools,
+  useToolPolicy,
+} from "@/features/queries";
+import { changedToolCalls } from "@/features/tool-policy/levels";
 import { errorMessage, isApiError, toastError } from "@/lib/errors";
 import { cn } from "@/lib/utils";
 
@@ -33,6 +47,9 @@ export function InstallationTools({
   const mayRefresh = canChange(org) && workspace.environment === "sandbox" && connected;
   const items = tools.data?.pages.flatMap((page) => page.items) ?? [];
   const changed = items.filter((t) => t.status === "changed").length;
+  const [reviewing, setReviewing] = useState<InstallationTool | null>(null);
+  const mayReview = canAdminister(org);
+  const policy = useToolPolicy(org.id);
 
   return (
     <section>
@@ -40,7 +57,7 @@ export function InstallationTools({
         title="Tools"
         description={
           changed > 0
-            ? `${changed} ${changed === 1 ? "tool's definition" : "tools' definitions"} changed. Review comes with agent permissions.`
+            ? `${changed} ${changed === 1 ? "tool's definition" : "tools' definitions"} changed. Until a change is accepted, ${changedToolCalls(policy.data?.new_tool_level)}.`
             : `What ${installation.app.name} lists to this account, as first listed.`
         }
         actions={
@@ -101,11 +118,17 @@ export function InstallationTools({
         ) : (
           <ul className="divide-y">
             {items.map((tool) => (
-              <ToolRow key={tool.name} tool={tool} />
+              <ToolRow key={tool.name} tool={tool} onReview={mayReview ? () => setReviewing(tool) : null} />
             ))}
           </ul>
         )}
       </Panel>
+      <ReviewChangeDialog
+        workspace={workspace}
+        installation={installation}
+        tool={reviewing}
+        onClose={() => setReviewing(null)}
+      />
       {tools.hasNextPage ? (
         <div className="mt-4 flex justify-center">
           <Button variant="outline" onClick={() => tools.fetchNextPage()} disabled={tools.isFetchingNextPage}>
@@ -142,7 +165,7 @@ function useRest(ms: number): [boolean, () => void] {
   return [resting, rest];
 }
 
-function ToolRow({ tool }: { tool: InstallationTool }) {
+function ToolRow({ tool, onReview }: { tool: InstallationTool; onReview: (() => void) | null }) {
   const gone = tool.status === "gone";
   return (
     <li className="px-4 py-3">
@@ -168,7 +191,7 @@ function ToolRow({ tool }: { tool: InstallationTool }) {
           Not listed since <RelativeTime iso={tool.gone_at} />.
         </p>
       ) : tool.status === "changed" && tool.latest ? (
-        <ChangedDefinition pinned={tool.pinned} latest={tool.latest} changedAt={tool.changed_at} />
+        <ChangedDefinition pinned={tool.pinned} latest={tool.latest} changedAt={tool.changed_at} onReview={onReview} />
       ) : null}
     </li>
   );
@@ -194,10 +217,12 @@ function ChangedDefinition({
   pinned,
   latest,
   changedAt,
+  onReview,
 }: {
   pinned: ToolText;
   latest: ToolText;
   changedAt: string | null;
+  onReview: (() => void) | null;
 }) {
   const hidden = hiddenChanges(pinned, latest);
   const textChanged = pinned.title !== latest.title || pinned.description !== latest.description;
@@ -225,6 +250,121 @@ function ChangedDefinition({
           </dd>
         </div>
       </dl>
+      {onReview ? (
+        <Button variant="outline" size="sm" className="mt-3 bg-card" onClick={onReview}>
+          Review change
+        </Button>
+      ) : (
+        <p className="mt-2 text-xs text-muted-foreground">Owners and admins review changes.</p>
+      )}
+    </div>
+  );
+}
+
+/** Each part of a definition, pinned and new, for a side-by-side review. */
+const PARTS: { label: string; of: (text: ToolText) => unknown }[] = [
+  { label: "Title", of: (t) => t.title },
+  { label: "Description", of: (t) => t.description },
+  { label: "Inputs", of: (t) => t.input_schema },
+  { label: "Outputs", of: (t) => t.output_schema },
+  { label: "Hints", of: (t) => t.annotations },
+];
+
+/**
+ * The whole pinned and new definitions, part by part, with the parts that
+ * differ marked. Accepting pins exactly the definition shown: if the app
+ * changed it again meanwhile, the server refuses and the new one is shown.
+ */
+function ReviewChangeDialog({
+  workspace,
+  installation,
+  tool,
+  onClose,
+}: {
+  workspace: Workspace;
+  installation: Installation;
+  tool: InstallationTool | null;
+  onClose: () => void;
+}) {
+  const accept = useAcceptToolChange(workspace.id, installation.id);
+  const latest = tool?.latest ?? null;
+  return (
+    <Dialog open={tool !== null} onOpenChange={(open) => (open ? null : onClose())}>
+      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>Review change to {tool?.name}</DialogTitle>
+          <DialogDescription>
+            Calls use the pinned definition until you accept the new one. Accept only if the new one asks for nothing
+            you wouldn't allow.
+          </DialogDescription>
+        </DialogHeader>
+        {tool && latest ? (
+          <div className="space-y-4">
+            {PARTS.map(({ label, of }) => {
+              const [before, after] = [of(tool.pinned), of(latest)];
+              const changed = !same(before, after);
+              return (
+                <div key={label} className="min-w-0">
+                  <p className="mb-1.5 flex items-center gap-2 text-xs font-medium text-muted-foreground">
+                    {label}
+                    {changed ? <StatusPill tone="warning">Changed</StatusPill> : <span>· Same</span>}
+                  </p>
+                  {changed ? (
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <PartValue caption="Pinned" value={before} />
+                      <PartValue caption="New" value={after} />
+                    </div>
+                  ) : (
+                    <PartValue caption={null} value={before} />
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            Keep pinned
+          </Button>
+          <Button
+            disabled={accept.isPending || !tool?.latest_hash}
+            onClick={() => {
+              if (!tool?.latest_hash) return;
+              accept.mutate(
+                { name: tool.name, latest_hash: tool.latest_hash },
+                {
+                  onSuccess: () => {
+                    toast.success(`Accepted the change to ${tool.name}`);
+                    onClose();
+                  },
+                  onError: (e) => {
+                    if (isApiError(e, "stale_definition", "tool_not_changed")) onClose();
+                    toastError(e, "Couldn't accept the change");
+                  },
+                },
+              );
+            }}
+          >
+            {accept.isPending ? <Spinner /> : null}
+            Accept change
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function PartValue({ caption, value }: { caption: string | null; value: unknown }) {
+  return (
+    <div className="min-w-0">
+      {caption ? <p className="mb-1 text-xs text-muted-foreground">{caption}</p> : null}
+      {value === null || value === undefined ? (
+        <p className="text-sm text-muted-foreground">None</p>
+      ) : typeof value === "string" ? (
+        <p className="rounded-lg border bg-muted/30 p-2 text-sm break-words">{value}</p>
+      ) : (
+        <JsonBlock value={value} />
+      )}
     </div>
   );
 }

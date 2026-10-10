@@ -62,6 +62,7 @@ import {
   toOrganization,
   toRun,
   toRunEvent,
+  toUser,
   toWorkspace,
   type WorkspaceAccess,
   withExpiry,
@@ -69,10 +70,19 @@ import {
 } from "./http";
 import { hashReference, isId, newId, newReference } from "./ids";
 import type { AgentRow, AppRow, ConfigurationRow, ConnectSessionRow, GrantRow, InstallationRow, RunRow } from "./model";
+import { levelInForce, levelRowsOf, levelsInput, policyRowOf, setLevels, toAppToolLevel, toToolPolicy } from "./policy";
 import { hash, token } from "./random";
 import { cancelRun, enqueueRun, planRun } from "./runner";
-import { configurationOf, inWorkspace, runEventsKey, timelineOf } from "./scope";
-import { claimRefresh, compareNames, discoverTools, forgetTools, toInstallationTool, toolsOf } from "./tools";
+import { appIn, configurationOf, inWorkspace, runEventsKey, timelineOf } from "./scope";
+import {
+  acceptChange,
+  claimRefresh,
+  compareNames,
+  discoverTools,
+  forgetTools,
+  toInstallationTool,
+  toolsOf,
+} from "./tools";
 
 const MODELS: ModelOption[] = [
   {
@@ -1087,6 +1097,82 @@ export function createHandlers(apiBase: string) {
       }),
     ),
 
+    // --- Tool policy --------------------------------------------------------------
+    http.get(
+      u("/v1/organizations/:org/tool-policy"),
+      route(({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        return ok(toToolPolicy(db(), access.org.id, toUser));
+      }),
+    ),
+
+    http.put(
+      u("/v1/organizations/:org/tool-policy"),
+      route(async ({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        requireRole(access, ADMINS, "change the tool policy");
+        const input = await body(
+          request,
+          z.object({
+            mode: z.enum(["manual"], "Choose manual."),
+            new_tool_level: z.enum(["approve", "deny"], "Choose approve or deny."),
+          }),
+        );
+        const now = new Date().toISOString();
+        const row = policyRowOf(db(), access.org.id);
+        if (row) {
+          row.mode = input.mode;
+          row.new_tool_level = input.new_tool_level;
+          row.updated_at = now;
+          row.updated_by_user_id = access.user.id;
+        } else {
+          db().tool_policies.push({
+            organization_id: access.org.id,
+            ...input,
+            updated_at: now,
+            updated_by_user_id: access.user.id,
+          });
+        }
+        audit(access, "tool_policy.updated", { type: "tool_policy", id: null, name: "Tool policy" });
+        return ok(toToolPolicy(db(), access.org.id, toUser));
+      }),
+    ),
+
+    http.get(
+      u("/v1/organizations/:org/apps/:app/tool-levels"),
+      route(({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        const app = findOrgApp(access, idParam(params, "app"));
+        const url = new URL(request.url);
+        const limit = clampedInt(url, "limit", 25, 100);
+        const cursor = url.searchParams.get("cursor");
+        const after = cursor ? toolCursorName(cursor) : null;
+        const all = levelRowsOf(db(), access.org.id, app.id).sort((a, b) => compareNames(a.tool, b.tool));
+        const rest = after === null ? all : all.filter((l) => compareNames(l.tool, after) > 0);
+        const page = rest.slice(0, limit);
+        const last = page.at(-1);
+        const next = rest.length > limit && last ? encodeToolCursor(last.tool) : null;
+        return ok(
+          page.map((l) => toAppToolLevel(l, toUser)),
+          { meta: { pagination: { next_cursor: next, total: all.length } } },
+        );
+      }),
+    ),
+
+    http.patch(
+      u("/v1/organizations/:org/apps/:app/tool-levels"),
+      route(async ({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        requireRole(access, ADMINS, "set tool levels");
+        const app = findOrgApp(access, idParam(params, "app"));
+        const input = await body(request, z.object({ levels: z.unknown() }));
+        const levels = levelsInput(input.levels);
+        const rows = setLevels(db(), access.org.id, app.id, levels, access.user.id, new Date().toISOString());
+        audit(access, "app.tool_levels_updated", { type: "app", id: app.id, name: app.name });
+        return ok(rows.sort((a, b) => compareNames(a.tool, b.tool)).map((l) => toAppToolLevel(l, toUser)));
+      }),
+    ),
+
     http.get(
       u("/v1/organizations/:org/apps/:app/environments/:env/configuration"),
       route(({ request, params }) => {
@@ -1356,6 +1442,39 @@ export function createHandlers(apiBase: string) {
         // The backend queues discovery and answers at once; the mock lists the app's tools right away.
         discoverTools(db(), row, new Date().toISOString());
         return ok(toInstallation(row));
+      }),
+    ),
+
+    http.post(
+      u("/v1/workspaces/:ws/installations/:inst/accept-tool-change"),
+      route(async ({ request, params }) => {
+        const access = workspaceAccess(request, param(params, "ws"));
+        requireRole(access, ADMINS, "review tool changes");
+        const row = findInstallation(access, idParam(params, "inst"));
+        const input = await body(
+          request,
+          z.object({ name: z.string().min(1, "Required."), latest_hash: z.string().min(1, "Required.") }),
+        );
+        const accepted = acceptChange(db(), row, input.name, input.latest_hash);
+        if (accepted === "not_found") throw notFound("Tool");
+        if (accepted === "not_changed") {
+          throw new ApiFailure(409, "tool_not_changed", `${input.name} has no change to accept.`);
+        }
+        if (accepted === "stale") {
+          throw new ApiFailure(
+            409,
+            "stale_definition",
+            `${input.name} changed again since you reviewed it. Review its latest definition, then accept that.`,
+          );
+        }
+        const app = appInScope(row);
+        audit(
+          access,
+          "installation.tool_change_accepted",
+          { type: "installation", id: row.id, name: `${app?.name ?? "App"} · ${row.label} · ${input.name}` },
+          { workspace: access.workspace },
+        );
+        return ok(toInstallationTool(accepted));
       }),
     ),
 
@@ -2345,5 +2464,18 @@ function validateTools(
   if (outside) {
     const message = `${outside} requires approval but isn't granted.`;
     throw new ApiFailure(422, "approval_outside_grant", message, { approval_required: message });
+  }
+  // Held inside the organization's levels for a catalog app's tools; a workspace app's have none.
+  const app = appIn(db().apps, installation);
+  if (!app) return;
+  const denied = tools.find((t) => levelInForce(db(), app, t) === "deny");
+  if (denied) {
+    const message = `Your organization blocks ${denied}. Remove it from the grant.`;
+    throw new ApiFailure(422, "tool_denied", message, { tools: message });
+  }
+  const unapproved = tools.find((t) => levelInForce(db(), app, t) === "approve" && !approvalRequired.includes(t));
+  if (unapproved) {
+    const message = `Your organization requires approval for ${unapproved}. Add it to approval required.`;
+    throw new ApiFailure(422, "approval_required_by_policy", message, { approval_required: message });
   }
 }

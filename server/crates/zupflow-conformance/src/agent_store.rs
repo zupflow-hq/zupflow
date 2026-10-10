@@ -2,13 +2,15 @@
 //! organization and workspace; a grant only of an installation of the same
 //! workspace, at most one per agent and installation, naming only tools its
 //! installation's registry holds and doesn't hold as gone, with approvals
-//! inside it; a grant left as it is when a tool later goes; an agent's grants
-//! deleted with it, and an installation's with the installation.
+//! inside it, and held inside the organization's levels as they are when
+//! it's written; a grant left as it is when a tool later goes; an agent's
+//! grants deleted with it, and an installation's with the installation.
 //!
 //! `prepare` makes a [`Tenant`] exist: its organization, two workspaces, two
 //! installations in the first and one in the second, all of one app. The
-//! suite records registry listings through `registry` and deletes an
-//! installation through `installations`, the stores that own them.
+//! suite records registry listings through `registry`, sets levels through
+//! `policies` and deletes an installation through `installations`, the
+//! stores that own them.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -16,14 +18,17 @@ use std::sync::Arc;
 
 use zupflow_core::agents::{Agent, AgentChanges, AgentError, AgentStatus, AgentStore, GrantTools, NewAgent};
 use zupflow_core::apps::ToolEffect;
-use zupflow_core::ids::{AgentId, GrantId, InstallationId, OrganizationId, WorkspaceId};
+use zupflow_core::ids::{AgentId, AppId, GrantId, InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::InstallationStore;
+use zupflow_core::policy::{ApprovalMode, NewToolLevel, PolicySettings, ToolLevel, ToolPolicyStore};
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{ListedTool, ToolRegistry, ToolRevision};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Tenant {
     pub organization_id: OrganizationId,
+    /// The catalog app every installation is of.
+    pub app: AppId,
     pub workspace: WorkspaceId,
     pub installation: InstallationId,
     /// Another installation of the same workspace, with a registry of its own.
@@ -38,6 +43,7 @@ pub type Prepare = Arc<dyn Fn(Tenant) -> Pin<Box<dyn Future<Output = ()> + Send>
 /// The stores the suite drives.
 pub struct Stores<'a> {
     pub agents: &'a dyn AgentStore,
+    pub policies: &'a dyn ToolPolicyStore,
     pub registry: &'a dyn ToolRegistry,
     pub installations: &'a dyn InstallationStore,
 }
@@ -45,6 +51,7 @@ pub struct Stores<'a> {
 async fn tenant(prepare: &Prepare) -> Tenant {
     let tenant = Tenant {
         organization_id: OrganizationId::generate(),
+        app: AppId::generate(),
         workspace: WorkspaceId::generate(),
         installation: InstallationId::generate(),
         second_installation: InstallationId::generate(),
@@ -108,6 +115,17 @@ async fn registry_of(stores: &Stores<'_>, t: &Tenant, workspace: WorkspaceId, in
         )
         .await
         .unwrap();
+    // The organization allows them, so only the registry's rules decide.
+    set_levels(
+        stores,
+        t,
+        &[
+            ("current", ToolLevel::Allow),
+            ("changed", ToolLevel::Allow),
+            ("gone", ToolLevel::Allow),
+        ],
+    )
+    .await;
 }
 
 async fn create(stores: &Stores<'_>, t: &Tenant, name: &str) -> Agent {
@@ -122,6 +140,8 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     creates_reads_changes_and_deletes_agents(&stores, &prepare).await;
     keeps_agents_and_grants_to_their_scope(&stores, &prepare).await;
     grants_only_what_the_registry_holds(&stores, &prepare).await;
+    holds_grants_inside_the_organization_levels(&stores, &prepare).await;
+    reads_the_levels_when_it_writes_the_grant(&stores, &prepare).await;
     keeps_one_grant_per_agent_and_installation(&stores, &prepare).await;
     keeps_one_grant_when_two_are_made_at_once(&stores, &prepare).await;
     changes_and_deletes_only_the_grant_named(&stores, &prepare).await;
@@ -548,6 +568,227 @@ async fn grants_only_what_the_registry_holds(stores: &Stores<'_>, prepare: &Prep
         Err(AgentError::GrantNotFound)
     );
     assert_eq!(store.list_grants(org, ws, agent.id).await.unwrap().len(), 1);
+}
+
+/// Sets the organization's levels for the tenant's app, confirmed.
+async fn set_levels(stores: &Stores<'_>, t: &Tenant, levels: &[(&str, ToolLevel)]) {
+    let levels: Vec<(String, ToolLevel)> = levels
+        .iter()
+        .map(|(tool, level)| ((*tool).to_owned(), *level))
+        .collect();
+    stores
+        .policies
+        .set_levels(t.organization_id, t.app, &levels, None, Timestamp::now())
+        .await
+        .unwrap();
+}
+
+async fn holds_grants_inside_the_organization_levels(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.workspace);
+    let store = stores.agents;
+    registry_of(stores, &t, ws, t.installation).await;
+    set_levels(
+        stores,
+        &t,
+        &[("current", ToolLevel::Deny), ("changed", ToolLevel::Approve)],
+    )
+    .await;
+    let agent = create(stores, &t, "Held").await;
+    let attempt = |tools: GrantTools| async move {
+        store
+            .create_grant(org, ws, agent.id, GrantId::generate(), t.installation, &tools)
+            .await
+    };
+    for (tools, refusal) in [
+        (
+            grant_of(&["changed", "current"], &["changed"]),
+            AgentError::ToolDenied("current".to_owned()),
+        ),
+        (
+            grant_of(&["changed"], &[]),
+            AgentError::ApprovalRequiredByPolicy("changed".to_owned()),
+        ),
+        // A denied tool comes before a missing approval, whatever the order given.
+        (
+            grant_of(&["changed", "current"], &[]),
+            AgentError::ToolDenied("current".to_owned()),
+        ),
+        // The registry's rules and the grant's own come first.
+        (
+            grant_of(&["missing", "current"], &[]),
+            AgentError::UnknownTool("missing".to_owned()),
+        ),
+        (
+            grant_of(&["current", "gone"], &[]),
+            AgentError::ToolGone("gone".to_owned()),
+        ),
+        (
+            grant_of(&["current"], &["changed"]),
+            AgentError::ApprovalOutsideGrant("changed".to_owned()),
+        ),
+    ] {
+        let what = format!("{tools:?}");
+        assert_eq!(attempt(tools).await, Err(refusal), "{what}");
+    }
+    assert_eq!(
+        store.list_grants(org, ws, agent.id).await.unwrap(),
+        [],
+        "a grant outside the levels leaves nothing"
+    );
+
+    let held = grant_of(&["changed"], &["changed"]);
+    let grant = attempt(held.clone()).await.unwrap();
+    assert_eq!(
+        (grant.tools.clone(), grant.approval_required.clone()),
+        (held.tools, held.approval_required)
+    );
+    // The levels come before one grant per agent and installation.
+    assert_eq!(
+        attempt(grant_of(&["current"], &[])).await,
+        Err(AgentError::ToolDenied("current".to_owned()))
+    );
+    assert_eq!(
+        attempt(grant_of(&["changed"], &["changed"])).await,
+        Err(AgentError::GrantExists)
+    );
+    // An update is held to them too, and a refused one changes nothing.
+    for (tools, refusal) in [
+        (
+            grant_of(&["changed", "current"], &["changed", "current"]),
+            AgentError::ToolDenied("current".to_owned()),
+        ),
+        (
+            grant_of(&["changed"], &[]),
+            AgentError::ApprovalRequiredByPolicy("changed".to_owned()),
+        ),
+    ] {
+        assert_eq!(
+            store.update_grant(org, ws, agent.id, grant.id, &tools).await,
+            Err(refusal)
+        );
+    }
+    assert_eq!(store.list_grants(org, ws, agent.id).await.unwrap(), [grant]);
+
+    // Unconfirmed, a tool takes the policy's level for new tools: approve by default.
+    let other = create(stores, &t, "Other").await;
+    let other_attempt = |tools: GrantTools| async move {
+        store
+            .create_grant(org, ws, other.id, GrantId::generate(), t.second_installation, &tools)
+            .await
+    };
+    stores
+        .registry
+        .record_listing(org, ws, t.second_installation, &[listed("fresh", 1)], Timestamp::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        other_attempt(grant_of(&["fresh"], &[])).await,
+        Err(AgentError::ApprovalRequiredByPolicy("fresh".to_owned()))
+    );
+    stores
+        .policies
+        .save_policy(
+            org,
+            PolicySettings {
+                mode: ApprovalMode::Manual,
+                new_tool_level: NewToolLevel::Deny,
+            },
+            None,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        other_attempt(grant_of(&["fresh"], &["fresh"])).await,
+        Err(AgentError::ToolDenied("fresh".to_owned()))
+    );
+}
+
+/// The store reads the levels in the transaction that writes the grant, not
+/// a snapshot taken before it: a level that tightens after a caller would
+/// have read it still refuses the grant.
+async fn reads_the_levels_when_it_writes_the_grant(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.workspace);
+    let store = stores.agents;
+    registry_of(stores, &t, ws, t.installation).await;
+    let agent = create(stores, &t, "Raced").await;
+    // A caller reads `current` and `changed` as allowed, then they tighten.
+    let found = stores
+        .policies
+        .find_levels(org, t.app, &["current".to_owned(), "changed".to_owned()])
+        .await
+        .unwrap();
+    assert!(
+        found
+            .iter()
+            .all(|level| level.confirmed && level.level == ToolLevel::Allow)
+    );
+    set_levels(
+        stores,
+        &t,
+        &[("current", ToolLevel::Deny), ("changed", ToolLevel::Approve)],
+    )
+    .await;
+    assert_eq!(
+        store
+            .create_grant(
+                org,
+                ws,
+                agent.id,
+                GrantId::generate(),
+                t.installation,
+                &grant_of(&["current"], &[])
+            )
+            .await,
+        Err(AgentError::ToolDenied("current".to_owned()))
+    );
+    assert_eq!(
+        store
+            .create_grant(
+                org,
+                ws,
+                agent.id,
+                GrantId::generate(),
+                t.installation,
+                &grant_of(&["changed"], &[])
+            )
+            .await,
+        Err(AgentError::ApprovalRequiredByPolicy("changed".to_owned()))
+    );
+    // And an update, after the grant was made under the looser levels.
+    set_levels(stores, &t, &[("changed", ToolLevel::Allow)]).await;
+    let grant = store
+        .create_grant(
+            org,
+            ws,
+            agent.id,
+            GrantId::generate(),
+            t.installation,
+            &grant_of(&["changed"], &[]),
+        )
+        .await
+        .unwrap();
+    set_levels(stores, &t, &[("changed", ToolLevel::Approve)]).await;
+    assert_eq!(
+        store
+            .update_grant(org, ws, agent.id, grant.id, &grant_of(&["changed"], &[]))
+            .await,
+        Err(AgentError::ApprovalRequiredByPolicy("changed".to_owned()))
+    );
+    set_levels(stores, &t, &[("changed", ToolLevel::Deny)]).await;
+    assert_eq!(
+        store
+            .update_grant(org, ws, agent.id, grant.id, &grant_of(&["changed"], &["changed"]))
+            .await,
+        Err(AgentError::ToolDenied("changed".to_owned()))
+    );
+    assert_eq!(
+        store.list_grants(org, ws, agent.id).await.unwrap(),
+        [grant],
+        "rewritten by no tightening"
+    );
 }
 
 async fn keeps_one_grant_per_agent_and_installation(stores: &Stores<'_>, prepare: &Prepare) {

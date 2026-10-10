@@ -12,6 +12,7 @@ import { InputGroup, InputGroupAddon, InputGroupInput, InputGroupText } from "@/
 import { Spinner } from "@/components/ui/spinner";
 import { canAdminister, useDocumentTitle, useOrg } from "@/features/context";
 import { useUpdateOrganization } from "@/features/queries";
+import { ToolPolicySettings } from "@/features/tool-policy/policy-settings";
 import { applyFieldErrors, toastError } from "@/lib/errors";
 import { shortDate } from "@/lib/format";
 
@@ -108,6 +109,7 @@ function OrgSettingsPage() {
             </Form>
           </Panel>
         </section>
+        <ToolPolicySettings org={org} />
         <section>
           <SectionHeader title="Identifiers" />
           <Panel>

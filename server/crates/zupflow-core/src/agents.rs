@@ -10,6 +10,13 @@
 //! meanwhile can't slip a gone tool in. A grant already holding a tool that
 //! later goes isn't rewritten: the run engine refuses the call.
 //!
+//! A grant is held inside the organization's levels ([`crate::policy`]): a
+//! tool the organization denies is refused, and `approval_required` must
+//! name every tool it sets to approve. The store reads the levels in the
+//! transaction that writes the grant, so a level tightened meanwhile can't be
+//! slipped past. A grant isn't rewritten when a level tightens later: the run
+//! engine holds the call to it.
+//!
 //! Deleting an agent deletes its grants, and deleting an installation
 //! deletes the grants of it, each as one change. Every [`AgentStore`] method
 //! takes the organization, then the workspace.
@@ -17,6 +24,7 @@
 use async_trait::async_trait;
 
 use crate::ids::{AgentId, GrantId, InstallationId, OrganizationId, WorkspaceId};
+use crate::policy::{GrantLevels, LevelRefusal, level_refusal};
 use crate::time::Timestamp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -126,6 +134,12 @@ pub enum AgentError {
     /// A tool requiring approval that isn't granted: the first, in the order given.
     #[error("{0} requires approval but isn't granted")]
     ApprovalOutsideGrant(String),
+    /// A tool the organization denies: the first, in the order given.
+    #[error("the organization denies {0}")]
+    ToolDenied(String),
+    /// A tool the organization sets to approve that doesn't require approval: the first, in the order given.
+    #[error("the organization requires approval for {0}")]
+    ApprovalRequiredByPolicy(String),
 }
 
 #[async_trait]
@@ -182,8 +196,11 @@ pub trait AgentStore: Send + Sync {
     /// one transaction, and in this order: the agent (`AgentNotFound`), the
     /// installation (`InstallationNotFound`), each tool against the
     /// installation's registry (`UnknownTool`, `ToolGone`), the approvals
-    /// (`ApprovalOutsideGrant`), then one grant per agent and installation
-    /// (`GrantExists`).
+    /// (`ApprovalOutsideGrant`), the organization's levels in force for a
+    /// catalog app's tools, read in the same transaction ([`levels_refusal`]:
+    /// `ToolDenied`, `ApprovalRequiredByPolicy`), then one grant per agent
+    /// and installation (`GrantExists`). A workspace app's tools have no
+    /// organization level.
     async fn create_grant(
         &self,
         organization_id: OrganizationId,
@@ -229,4 +246,15 @@ pub fn approval_outside(tools: &GrantTools) -> Option<&str> {
         .iter()
         .find(|name| !tools.tools.contains(name))
         .map(String::as_str)
+}
+
+/// The organization's levels a grant breaks, as the store's error: every
+/// store checks it after the registry's rules, with `levels` read in its
+/// transaction ([`GrantLevels::in_force`]; [`GrantLevels::none`] for a
+/// workspace app).
+pub fn levels_refusal(tools: &GrantTools, levels: &GrantLevels) -> Option<AgentError> {
+    level_refusal(&tools.tools, &tools.approval_required, levels).map(|refusal| match refusal {
+        LevelRefusal::Denied(tool) => AgentError::ToolDenied(tool),
+        LevelRefusal::ApprovalRequired(tool) => AgentError::ApprovalRequiredByPolicy(tool),
+    })
 }

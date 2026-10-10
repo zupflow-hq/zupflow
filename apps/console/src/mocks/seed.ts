@@ -11,6 +11,7 @@ import type {
   Environment,
   IdKind,
   OrganizationId,
+  ToolLevel,
   User,
   UserId,
   WebhookEndpoint,
@@ -30,12 +31,13 @@ import type {
   RunRow,
   WorkspaceRow,
 } from "./model";
+import { setLevels, suggestLevels } from "./policy";
 import { mulberry32, type Rng, uuid } from "./random";
 import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 import { appIn, timelineOf } from "./scope";
 import { listedFrom, recordListing } from "./tools";
 
-export const DB_SCHEMA = 17;
+export const DB_SCHEMA = 18;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -456,6 +458,8 @@ export function seed(nowMs: number = Date.now()): Db {
     installations,
     installation_tools: [],
     tool_refreshes: [],
+    tool_policies: [],
+    app_tool_levels: [],
     connect_sessions: [],
     agents,
     grants,
@@ -632,7 +636,77 @@ export function seed(nowMs: number = Date.now()): Db {
 
   seedLarkspur(db, nowMs);
   seedTools(db, nowMs, sandboxLinear);
+  seedLevels(db, nowMs, { google, linear, stripe, github }, jordan.id);
   return db;
+}
+
+/**
+ * The organizations' levels for their catalog apps' tools: suggested for
+ * every tool an installation listed, then set by a person for most of
+ * Northwind's, so the grants seeded above hold inside them. `list_events`,
+ * Notion's tools and the gone `export_roadmap` stay suggested only, and
+ * Google Workspace's `delete_file` is denied: the Sandbox grant that still
+ * holds it shows that tightening a level doesn't rewrite a grant.
+ */
+function seedLevels(
+  db: Db,
+  nowMs: number,
+  apps: { google: AppRow; linear: AppRow; stripe: AppRow; github: AppRow },
+  confirmedBy: UserId,
+) {
+  for (const tool of db.installation_tools) {
+    const app = appIn(db.apps, { ...tool, app_id: installationOf(db, tool).app_id });
+    if (app?.owner_workspace_id !== null || !app) continue;
+    suggestLevels(db, tool.organization_id, app.id, [tool], tool.first_seen_at);
+  }
+  const at = new Date(nowMs - 9 * DAY).toISOString();
+  const confirm = (app: AppRow, levels: Record<string, ToolLevel>) =>
+    setLevels(
+      db,
+      app.organization_id,
+      app.id,
+      Object.entries(levels).map(([tool, level]) => ({ tool, level })),
+      confirmedBy,
+      at,
+    );
+  confirm(apps.google, {
+    search_files: "allow",
+    read_document: "allow",
+    create_document: "allow",
+    send_email: "approve",
+    delete_file: "deny",
+  });
+  confirm(apps.linear, { search_issues: "allow", create_issue: "allow", add_comment: "allow" });
+  confirm(apps.stripe, { list_invoices: "allow", get_customer: "allow", refund_payment: "approve" });
+  confirm(apps.github, { search_code: "allow", list_pull_requests: "allow", create_issue: "approve" });
+
+  // Larkspur holds its grant inside its levels too.
+  const larkspur = db.organizations.find((o) => o.slug === "larkspur");
+  const owner = db.memberships.find((m) => m.organization_id === larkspur?.id && m.role === "owner");
+  const larkspurLinear = db.apps.find((a) => a.organization_id === larkspur?.id && a.slug === "linear");
+  if (!owner || !larkspurLinear) throw new Error("Larkspur's seed is missing");
+  setLevels(
+    db,
+    larkspurLinear.organization_id,
+    larkspurLinear.id,
+    [
+      { tool: "search_issues", level: "allow" },
+      { tool: "create_issue", level: "allow" },
+    ],
+    owner.user_id,
+    at,
+  );
+}
+
+function installationOf(db: Db, tool: Db["installation_tools"][number]) {
+  const installation = db.installations.find(
+    (i) =>
+      i.organization_id === tool.organization_id &&
+      i.workspace_id === tool.workspace_id &&
+      i.id === tool.installation_id,
+  );
+  if (!installation) throw new Error("A seeded tool's installation is missing");
+  return installation;
 }
 
 /**

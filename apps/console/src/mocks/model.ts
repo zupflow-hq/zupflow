@@ -25,6 +25,7 @@ import type {
   MemberId,
   MemberRole,
   MemberStatus,
+  NewToolLevel,
   OrganizationId,
   RunError,
   RunEvent,
@@ -35,6 +36,7 @@ import type {
   ToolCallId,
   ToolDefinition,
   ToolEffect,
+  ToolLevel,
   ToolText,
   User,
   UserId,
@@ -138,6 +140,35 @@ export interface InstallationToolRow {
   seen_at: string;
   changed_at: string | null;
   gone_at: string | null;
+}
+
+/**
+ * The organization's tool policy (decision 0040), one per organization once
+ * saved; an organization without one reads the defaults.
+ */
+export interface ToolPolicyRow {
+  organization_id: OrganizationId;
+  mode: "manual";
+  new_tool_level: NewToolLevel;
+  updated_at: string;
+  updated_by_user_id: UserId | null;
+}
+
+/**
+ * The organization's level for one tool of one of its catalog apps. Natural
+ * key (organization_id, app_id, tool). Suggested from a tool's hints when an
+ * installation first lists it (`confirmed: false`); in force only once a
+ * person sets it.
+ */
+export interface AppToolLevelRow {
+  organization_id: OrganizationId;
+  app_id: AppId;
+  tool: string;
+  level: ToolLevel;
+  confirmed: boolean;
+  destructive: boolean;
+  updated_at: string;
+  updated_by_user_id: UserId | null;
 }
 
 /** An accepted refresh of an installation's tools: another is refused until `until`. */
@@ -280,6 +311,10 @@ export interface Db {
   installation_tools: InstallationToolRow[];
   /** When each installation's tools may next be refreshed, under the installation's full scope. */
   tool_refreshes: ToolRefreshRow[];
+  /** Each organization's saved tool policy. */
+  tool_policies: ToolPolicyRow[];
+  /** Each organization's levels for its catalog apps' tools. */
+  app_tool_levels: AppToolLevelRow[];
   connect_sessions: ConnectSessionRow[];
   agents: AgentRow[];
   grants: GrantRow[];

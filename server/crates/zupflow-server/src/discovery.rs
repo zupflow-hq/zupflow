@@ -6,6 +6,10 @@
 //! reference, never its credential, and the worker reads everything again in
 //! the job's own scope. Delivery is at least once, and recording a listing is
 //! idempotent. A connect never waits for, or fails because of, discovery.
+//!
+//! For a catalog app's installation, each tool listed that the organization
+//! has no level for yet gets one suggested from its hints, unconfirmed
+//! (decision 0040); a level already there is never changed.
 
 use std::time::Duration;
 
@@ -15,9 +19,10 @@ use zupflow_core::ids::{InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::{InstallationStatus, InstalledApp};
 use zupflow_core::jobs::{Job, JobOptions};
 use zupflow_core::keys::{self, EncryptionContext};
+use zupflow_core::policy::PolicyError;
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
-use zupflow_core::tools::ToolError;
+use zupflow_core::tools::{ListedTool, ToolError};
 use zupflow_mcp::{McpCredential, McpError};
 
 use crate::auth::AppState;
@@ -237,7 +242,7 @@ pub async fn discover(
                 gone = changes.gone.len(),
                 returned = changes.returned.len(),
             );
-            Outcome::Done
+            suggest_levels(state, organization_id, installation.app, &listed).await
         }
         Err(ToolError::Unavailable) => Outcome::Retry("store_unavailable"),
         Err(error) => {
@@ -303,6 +308,38 @@ pub async fn run_worker(state: AppState) {
     loop {
         if !work_once(&state).await {
             tokio::time::sleep(IDLE).await;
+        }
+    }
+}
+
+/// Suggests a level for each listed tool of a catalog app the organization
+/// has none for. Retried with the job when the store is unavailable: the
+/// listing is recorded again, unchanged, and the suggestions made.
+async fn suggest_levels(
+    state: &AppState,
+    organization_id: OrganizationId,
+    app: InstalledApp,
+    listed: &[ListedTool],
+) -> Outcome {
+    let InstalledApp::Catalog(app_id) = app else {
+        return Outcome::Done;
+    };
+    let tools: Vec<_> = listed.iter().map(|tool| (tool.name.clone(), tool.effect)).collect();
+    match state
+        .policies
+        .suggest_levels(organization_id, app_id, &tools, Timestamp::now())
+        .await
+    {
+        Ok(suggested) => {
+            if suggested > 0 {
+                tracing::info!(event = "discovery.levels_suggested", %organization_id, %app_id, suggested);
+            }
+            Outcome::Done
+        }
+        Err(PolicyError::Unavailable) => Outcome::Retry("store_unavailable"),
+        Err(error) => {
+            tracing::warn!(event = "discovery.levels_not_suggested", %organization_id, %app_id, %error);
+            Outcome::Done
         }
     }
 }

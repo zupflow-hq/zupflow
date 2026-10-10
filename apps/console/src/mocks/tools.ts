@@ -13,6 +13,7 @@
  */
 import type { InstallationTool, ToolDefinition, ToolEffect, ToolText } from "@zupflow/sdk";
 import type { Db, InstallationRow, InstallationToolRow } from "./model";
+import { suggestLevels } from "./policy";
 import { appIn, sameWorkspace } from "./scope";
 
 /** One tool of a listing, as the MCP client would hand it over. */
@@ -59,8 +60,39 @@ export function compareNames(a: string, b: string): number {
   return x.length - y.length;
 }
 
+/** JSON with every object's keys sorted, so equal definitions read the same. */
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => compareNames(a, b));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/**
+ * A definition's fingerprint: 64 hex digits, stable for equal definitions.
+ * The backend's is the SHA-256 of its canonical JSON; the mock's is eight
+ * FNV-1a rounds, which is enough to tell definitions apart in a demo.
+ */
+export function fingerprint(text: ToolText): string {
+  const json = canonical(text);
+  let out = "";
+  for (let round = 0; round < 8; round++) {
+    let h = (2166136261 ^ Math.imul(round + 1, 0x9e3779b1)) >>> 0;
+    for (let i = 0; i < json.length; i++) {
+      h ^= json.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    out += (h >>> 0).toString(16).padStart(8, "0");
+  }
+  return out;
+}
+
 /** Whether two definitions say the same, as the backend compares their hashes. */
-const same = (a: ToolText, b: ToolText) => JSON.stringify(a) === JSON.stringify(b);
+const same = (a: ToolText, b: ToolText) => canonical(a) === canonical(b);
 
 /** Rows of exactly this installation, matched on its full scope. */
 const ofInstallation = (installation: InstallationScope) => (row: InstallationToolRow) =>
@@ -121,7 +153,31 @@ export function discoverTools(db: Db, installation: InstallationRow, now: string
   if (installation.status !== "connected" || !installation.connection) return;
   const app = appIn(db.apps, installation);
   if (!app) return;
-  recordListing(db, installation, app.tools.map(listedFrom), now);
+  const listed = app.tools.map(listedFrom);
+  recordListing(db, installation, listed, now);
+  // As the backend's worker does after recording: suggest a level for each tool the organization has none for.
+  if (app.owner_workspace_id === null) suggestLevels(db, installation.organization_id, app.id, listed, now);
+}
+
+/**
+ * Accepts a changed tool's latest definition, which must be the one the
+ * reviewer saw (`latestHash`): it becomes the pinned one. Answers the tool, or
+ * why not.
+ */
+export function acceptChange(
+  db: Db,
+  installation: InstallationScope,
+  name: string,
+  latestHash: string,
+): InstallationToolRow | "not_found" | "not_changed" | "stale" {
+  const tool = toolsOf(db, installation).find((t) => t.name === name);
+  if (!tool) return "not_found";
+  if (tool.gone_at !== null || tool.latest === null) return "not_changed";
+  if (fingerprint(tool.latest) !== latestHash) return "stale";
+  tool.pinned = tool.latest;
+  tool.latest = null;
+  tool.changed_at = null;
+  return tool;
 }
 
 /** Removes the installation's tools, with the installation. */
@@ -139,7 +195,9 @@ export function toInstallationTool(row: InstallationToolRow): InstallationTool {
     effect: row.effect,
     status: row.gone_at !== null ? "gone" : row.latest !== null ? "changed" : "current",
     pinned: row.pinned,
+    pinned_hash: fingerprint(row.pinned),
     latest: row.latest,
+    latest_hash: row.latest ? fingerprint(row.latest) : null,
     first_seen_at: row.first_seen_at,
     seen_at: row.seen_at,
     changed_at: row.changed_at,

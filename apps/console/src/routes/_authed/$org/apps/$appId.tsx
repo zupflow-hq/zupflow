@@ -31,12 +31,13 @@ import {
   useUpdateOrgApp,
   useUpdateOrgAppConfiguration,
 } from "@/features/queries";
+import { AppToolLevels } from "@/features/tool-policy/app-tool-levels";
 import { useDetailCrumb } from "@/lib/crumbs";
 import { applyFieldErrors, toastError } from "@/lib/errors";
 import { idParam } from "@/lib/route-ids";
 import { cn } from "@/lib/utils";
 
-const TABS = ["overview", "configuration", "installations"] as const;
+const TABS = ["overview", "permissions", "configuration", "installations"] as const;
 type Tab = (typeof TABS)[number];
 
 export const Route = createFileRoute("/_authed/$org/apps/$appId")({
@@ -100,6 +101,7 @@ function AppPage() {
       >
         <LineTabsList>
           <LineTabsTrigger value="overview">Overview</LineTabsTrigger>
+          <LineTabsTrigger value="permissions">Permissions</LineTabsTrigger>
           <LineTabsTrigger value="configuration">
             {ENVIRONMENT_LABEL[environment]} configuration
             <span
@@ -120,6 +122,9 @@ function AppPage() {
 
         <TabsContent value="overview">
           {app.data ? <OverviewTab org={org} app={app.data} /> : <RowsSkeleton rows={4} />}
+        </TabsContent>
+        <TabsContent value="permissions">
+          {app.data ? <AppToolLevels org={org} app={app.data} /> : <RowsSkeleton rows={4} />}
         </TabsContent>
         <TabsContent value="configuration">
           {app.data ? <EnvironmentTab key={environment} org={org} app={app.data} environment={environment} /> : null}

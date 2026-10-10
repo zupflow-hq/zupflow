@@ -543,6 +543,9 @@ export type ToolText = z.infer<typeof ToolText>;
  * `changed`. A tool the server stopped listing is `gone`; an installation keeps
  * at most 500 gone tools, dropping those gone longest.
  */
+/** A definition's fingerprint: 64 lowercase hex digits (the backend's is its SHA-256). */
+const definitionHash = z.string().regex(/^[0-9a-f]{64}$/);
+
 export const InstallationTool = named(
   "InstallationTool",
   z.object({
@@ -550,7 +553,11 @@ export const InstallationTool = named(
     effect: ToolEffect,
     status: InstallationToolStatus,
     pinned: ToolText,
+    /** Identifies the pinned definition. */
+    pinned_hash: definitionHash,
     latest: ToolText.nullable(),
+    /** Identifies the latest definition: send it back to accept exactly the change you reviewed. */
+    latest_hash: definitionHash.nullable(),
     first_seen_at: instant,
     seen_at: instant,
     changed_at: instant.nullable(),
@@ -565,6 +572,16 @@ export const AppInstallationRef = named(
   z.object({ installation: Installation, workspace: WorkspaceRef }),
 );
 export type AppInstallationRef = z.infer<typeof AppInstallationRef>;
+
+/**
+ * Accepts a changed tool's latest definition: it becomes the pinned one, and
+ * the tool is current again. `latest_hash` must be the latest definition's
+ * (`409 stale_definition` otherwise, when it changed again since you read it);
+ * a tool that isn't changed answers `409 tool_not_changed`, one the
+ * installation doesn't have `404`.
+ */
+export const AcceptToolChangeInput = z.object({ name: z.string(), latest_hash: z.string() });
+export type AcceptToolChangeInput = z.infer<typeof AcceptToolChangeInput>;
 
 export const UpdateInstallationInput = z.object({ label: z.string() });
 export type UpdateInstallationInput = z.infer<typeof UpdateInstallationInput>;
@@ -690,6 +707,14 @@ export const UpdateAgentInput = z.object({
 });
 export type UpdateAgentInput = z.infer<typeof UpdateAgentInput>;
 
+/**
+ * Held inside the organization's policy for a catalog app's tools: a tool it
+ * denies can't be granted (`422 tool_denied`, `fields.tools`), and every
+ * granted tool it sets to `approve` must be in `approval_required`
+ * (`422 approval_required_by_policy`, `fields.approval_required`). A tool
+ * without a confirmed level takes the policy's `new_tool_level`. A workspace
+ * app's tools have no organization level: the grant alone decides.
+ */
 export const CreateGrantInput = z.object({
   installation_id: idSchema("installation"),
   tools: z.array(z.string()),
@@ -704,6 +729,84 @@ export const ModelOption = named(
   z.object({ id: z.string(), name: z.string(), provider: z.string(), description: z.string() }),
 );
 export type ModelOption = z.infer<typeof ModelOption>;
+
+// ---------------------------------------------------------------------------
+// Tool permissions (decision 0040)
+
+/**
+ * What the organization lets a tool do: `allow` runs it, `approve` pauses the
+ * run until your product decides, `deny` keeps it out of every grant.
+ */
+export const ToolLevel = z.enum(["allow", "approve", "deny"]);
+export type ToolLevel = z.infer<typeof ToolLevel>;
+/** Who decides a call that needs approval. Only `manual` so far: a person, in your product. */
+export const ApprovalMode = z.enum(["manual"]);
+export type ApprovalMode = z.infer<typeof ApprovalMode>;
+/** The level of a tool nobody has set one for: `approve` or `deny`, never `allow`. */
+export const NewToolLevel = z.enum(["approve", "deny"]);
+export type NewToolLevel = z.infer<typeof NewToolLevel>;
+
+/**
+ * The organization's tool policy: one for the whole organization, both
+ * environments. Until someone saves it, it reads as `manual` with new tools
+ * at `approve`, and `updated_at` null.
+ */
+export const ToolPolicy = named(
+  "ToolPolicy",
+  z.object({
+    organization_id: idSchema("organization"),
+    mode: ApprovalMode,
+    /**
+     * The level of a tool whose level nobody has confirmed (new, or only
+     * suggested from its hints), and of a changed tool until its change is
+     * accepted.
+     */
+    new_tool_level: NewToolLevel,
+    updated_at: instant.nullable(),
+    /** The member who last saved it; null before that, or when they're gone. */
+    updated_by: User.nullable(),
+  }),
+);
+export type ToolPolicy = z.infer<typeof ToolPolicy>;
+
+export const UpdateToolPolicyInput = z.object({ mode: ApprovalMode, new_tool_level: NewToolLevel });
+export type UpdateToolPolicyInput = z.infer<typeof UpdateToolPolicyInput>;
+
+/**
+ * The organization's level for one tool of a catalog app, by name. A tool an
+ * installation lists for the first time gets a suggested level from its hints
+ * (read-only: `allow`, otherwise `approve`; `destructive` flagged), not
+ * `confirmed`: hints never decide alone, so until a person sets it, the
+ * policy's `new_tool_level` applies instead.
+ */
+export const AppToolLevel = named(
+  "AppToolLevel",
+  z.object({
+    app_id: idSchema("app"),
+    tool: z.string(),
+    level: ToolLevel,
+    /** Set by a person. Only a confirmed level is in force. */
+    confirmed: z.boolean(),
+    /** The tool's hints said it may destroy data. A hint, shown to help decide. */
+    destructive: z.boolean(),
+    updated_at: instant,
+    /** Who confirmed it; null while suggested, or when they're gone. */
+    updated_by: User.nullable(),
+  }),
+);
+export type AppToolLevel = z.infer<typeof AppToolLevel>;
+
+/**
+ * Sets levels by tool name, each confirmed: 1 to 100, names 1 to 128
+ * characters, each once. A name no installation has listed yet can be set
+ * ahead of it. Grants already holding a tool are not rewritten when its level
+ * tightens: a call the level denies is refused when it's made, and one it
+ * sets to `approve` waits for approval.
+ */
+export const UpdateAppToolLevelsInput = z.object({
+  levels: z.array(z.object({ tool: z.string(), level: ToolLevel })),
+});
+export type UpdateAppToolLevelsInput = z.infer<typeof UpdateAppToolLevelsInput>;
 
 // ---------------------------------------------------------------------------
 // Runs
@@ -879,8 +982,13 @@ export const WEBHOOK_EVENT_TYPES = [
   "run.failed",
   "run.waiting_for_approval",
   "run.cancelled",
+  "app.tools_changed",
 ] as const;
-/** The event types an endpoint can subscribe to. `webhook.test` is sent only by the test button. */
+/**
+ * The event types an endpoint can subscribe to. `webhook.test` is sent only
+ * by the test button. `app.tools_changed` is reserved: an endpoint can
+ * subscribe to it, but it isn't delivered yet.
+ */
 export const WebhookEventType = z.enum(WEBHOOK_EVENT_TYPES);
 export type WebhookEventType = z.infer<typeof WebhookEventType>;
 
@@ -963,6 +1071,13 @@ export const WebhookEvent = named(
       WebhookEventWorkspace,
     ),
     webhookEvent("run.cancelled", runData(RunStatus.extract(["cancelled"])), WebhookEventWorkspace),
+    // A connected installation's app listed a tool with a new definition: review it before calls use it.
+    // Reserved: its shape is fixed here, but nothing delivers it yet.
+    webhookEvent(
+      "app.tools_changed",
+      installationData(InstallationStatus.extract(["connected"])),
+      WebhookEventWorkspace,
+    ),
     // The test button's event belongs to no workspace.
     webhookEvent(
       "webhook.test",
