@@ -155,18 +155,48 @@ pub(crate) fn listed_environment(access: &Access, query: &ListQuery) -> Result<O
 /// A list's page size: 1 to 100, default 25; out of range is clamped, not an
 /// integer is the default.
 pub(crate) fn page_limit(query: &ListQuery) -> u32 {
-    let limit = query
-        .limit
-        .as_deref()
-        .and_then(|value| {
-            if value.trim().is_empty() {
-                Some(0)
-            } else {
-                value.trim().parse::<i64>().ok()
-            }
-        })
-        .map_or(25, |limit| limit.clamp(1, 100));
-    u32::try_from(limit).unwrap_or(25)
+    u32::try_from(clamped_int(query.limit.as_deref(), 25, 100)).unwrap_or(25)
+}
+
+/// A whole-number query parameter read as the mock's `clampedInt` reads it,
+/// with JavaScript's `Number`: missing is `fallback`; empty is 0; `5.0` and
+/// `1e2` are integers and `0x10` is 16; anything that isn't an integer
+/// (`1.5`, `abc`, `Infinity`) is `fallback`. An integer is clamped to `1..=max`.
+pub(crate) fn clamped_int(value: Option<&str>, fallback: i64, max: i64) -> i64 {
+    let Some(value) = value else { return fallback };
+    let value = value.trim();
+    let number = if value.is_empty() {
+        Some(0.0)
+    } else if let Some((radix, digits)) = [("0x", 16), ("0X", 16), ("0o", 8), ("0O", 8), ("0b", 2), ("0B", 2)]
+        .into_iter()
+        .find_map(|(prefix, radix)| value.strip_prefix(prefix).map(|digits| (radix, digits)))
+    {
+        if digits.is_empty() || !digits.chars().all(|digit| digit.is_digit(radix)) {
+            None
+        } else {
+            // Exact enough: anything past `max` is clamped.
+            Some(
+                digits
+                    .chars()
+                    .filter_map(|digit| digit.to_digit(radix))
+                    .fold(0.0, |total, digit| total * f64::from(radix) + f64::from(digit)),
+            )
+        }
+    } else if value
+        .chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '.' | 'e' | 'E'))
+    {
+        // JavaScript's decimal literal; Rust's parser also takes `inf` and
+        // `nan`, which this leaves out, as `Number` does.
+        value.parse::<f64>().ok()
+    } else {
+        None
+    };
+    match number {
+        #[allow(clippy::cast_possible_truncation)]
+        Some(number) if number.is_finite() && number.fract() == 0.0 => number.clamp(1.0, max as f64) as i64,
+        _ => fallback,
+    }
 }
 
 /// A key asked for its other environment.
@@ -361,4 +391,35 @@ async fn delete_workspace(
             error => workspace_unavailable(error),
         })?;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamped_int;
+
+    #[test]
+    fn reads_whole_numbers_as_javascripts_number_does() {
+        for (value, read) in [
+            (None, 14),
+            (Some(""), 1),
+            (Some(" 7 "), 7),
+            (Some("5.0"), 5),
+            (Some("1e1"), 10),
+            (Some("1e20"), 90),
+            (Some("0x10"), 16),
+            (Some("0b11"), 3),
+            (Some("0"), 1),
+            (Some("-3"), 1),
+            (Some("1.5"), 14),
+            (Some("seven"), 14),
+            (Some("Infinity"), 14),
+            (Some("inf"), 14),
+            (Some("NaN"), 14),
+            (Some("0x"), 14),
+            (Some("-0x10"), 14),
+            (Some("1e"), 14),
+        ] {
+            assert_eq!(clamped_int(value, 14, 90), read, "{value:?}");
+        }
+    }
 }

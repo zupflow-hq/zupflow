@@ -22,6 +22,7 @@
 //! - [`runs`]: runs, their timelines and tool calls, and their store.
 //! - [`time`]: instants as stored and as the API writes them.
 //! - [`tools`]: the tools apps' MCP servers list, pinned, and their registry.
+//! - [`webhooks`]: webhook endpoints, their signed events and their store.
 //! - [`workspaces`]: workspaces and their store.
 
 pub mod agents;
@@ -46,6 +47,7 @@ pub mod scope;
 pub mod storage;
 pub mod time;
 pub mod tools;
+pub mod webhooks;
 pub mod workspaces;
 
 /// Typed IDs make scope mistakes fail to compile. Swapping the organization

@@ -5,9 +5,9 @@
 //! that scope back with the job. Claiming is the one operation that starts
 //! without a scope: a worker takes the next job of any organization, which is
 //! why [`JobQueue::claim_next`] is named and documented as cross-tenant.
-//! Everything after it (completing, retrying, burying, extending) names the
-//! job's scope again, and an adapter matches it exactly, so a job ID and lease
-//! used from any other scope reach nothing.
+//! Everything after it (completing, retrying, postponing, burying,
+//! extending) names the job's scope again, and an adapter matches it exactly,
+//! so a job ID and lease used from any other scope reach nothing.
 //!
 //! **Leases.** A claim holds the job for a lease. A worker that crashes or
 //! stalls loses it when the lease runs out, and the job is claimed again as its
@@ -175,6 +175,12 @@ pub trait JobQueue: Send + Sync {
         after: Duration,
         reason: &Name,
     ) -> Result<Retry, JobError>;
+
+    /// Releases a job to be claimed again after `after` without using up an
+    /// attempt: for a handler that didn't get to try, because something it
+    /// waits its turn for was busy. A job only ever postponed is never
+    /// finished, so postpone only for a wait that ends.
+    async fn postpone(&self, scope: &Scope, id: JobId, lease: &LeaseToken, after: Duration) -> Result<(), JobError>;
 
     /// Gives up on a job now, keeping `reason` (a short code, never a message
     /// that could hold a secret).

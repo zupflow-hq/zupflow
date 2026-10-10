@@ -29,4 +29,5 @@ pub mod outbound_http;
 pub mod run_store;
 pub mod tool_policy_store;
 pub mod tool_registry;
+pub mod webhook_store;
 pub mod workspace_store;

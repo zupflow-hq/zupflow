@@ -59,7 +59,7 @@ impl fmt::Debug for NewSecret {
 }
 
 /// `n` random base62 characters, by rejection sampling so each is uniform.
-fn random_base62(n: usize) -> Result<String, ApiKeyError> {
+pub(crate) fn random_base62(n: usize) -> Result<String, ApiKeyError> {
     let mut out = String::with_capacity(n);
     let mut buffer = [0u8; 64];
     while out.len() < n {

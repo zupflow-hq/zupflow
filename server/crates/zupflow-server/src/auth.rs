@@ -72,6 +72,8 @@ pub struct AppState {
     pub approvals: Arc<dyn zupflow_core::policy::ApprovalPolicy>,
     /// Announces run events to listeners in this process.
     pub events: Arc<dyn zupflow_core::events::EventBus>,
+    /// Webhook endpoints, their events and deliveries (decision 0017).
+    pub webhooks: Arc<dyn zupflow_core::webhooks::WebhookStore>,
 }
 
 /// A store failure the caller can do nothing about: the database is a

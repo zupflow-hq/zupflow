@@ -12,6 +12,7 @@
 //! - [`SqliteRunStore`]: runs, their timelines and their tool calls.
 //! - [`SqliteToolPolicyStore`]: the organization's tool policy and its levels per catalog app.
 //! - [`SqliteToolRegistry`]: the tools apps' MCP servers list, pinned.
+//! - [`SqliteWebhookStore`]: webhook endpoints, their events and deliveries.
 //! - [`SqliteWorkspaceStore`]: workspaces, listed by keyset.
 //!
 //! Migrations are in `migrations/`, applied in order at open and never edited
@@ -32,6 +33,7 @@ mod runs;
 mod schema;
 mod tool_policy;
 mod tools;
+mod webhooks;
 mod workspaces;
 
 pub use agents::SqliteAgentStore;
@@ -46,4 +48,5 @@ pub use organizations::SqliteOrganizationStore;
 pub use runs::SqliteRunStore;
 pub use tool_policy::SqliteToolPolicyStore;
 pub use tools::SqliteToolRegistry;
+pub use webhooks::SqliteWebhookStore;
 pub use workspaces::SqliteWorkspaceStore;

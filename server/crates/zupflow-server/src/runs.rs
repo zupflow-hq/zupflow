@@ -1,5 +1,6 @@
 //! Runs (milestone 4), at `/v1/workspaces/{ws}/agents/{agent}/runs`,
-//! `/v1/workspaces/{ws}/runs…` and `/v1/organizations/{org}/runs`. Console
+//! `/v1/workspaces/{ws}/runs…` and `/v1/organizations/{org}/runs`, and the
+//! usage they add up to, at `/v1/organizations/{org}/usage`. Console
 //! members and API keys both read, start and cancel them; starting or
 //! cancelling needs a developer or stricter. The Console doesn't start runs
 //! in Production: the customer's product does that through the API.
@@ -26,6 +27,7 @@ use zupflow_core::organizations::MemberRole;
 use zupflow_core::runs::{
     ApprovalDecision, CallOutcome, Failure as RunFailure, MAX_INPUT, NewRun, NewRunEvent, OrganizationRun,
     OrganizationRunFilter, Page, Run, RunError, RunEvent, RunEventType, RunFilter, RunStatus, RunTrigger, RunUsage,
+    day_of,
 };
 use zupflow_core::time::Timestamp;
 
@@ -33,11 +35,12 @@ use crate::auth::{Access, Actor, AppState, Caller, WorkspaceAccess};
 use crate::http::{Failure, envelope, envelope_with_meta};
 use crate::input::{Body, Fields};
 use crate::run_engine;
-use crate::workspaces::{environment_mismatch, invalid_cursor};
+use crate::workspaces::{clamped_int, environment_mismatch, invalid_cursor};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/organizations/{org}/runs", get(list_organization_runs))
+        .route("/v1/organizations/{org}/usage", get(get_usage))
         .route("/v1/workspaces/{ws}/agents/{agent}/runs", post(start_run))
         .route("/v1/workspaces/{ws}/runs", get(list_runs))
         .route("/v1/workspaces/{ws}/runs/{run}", get(get_run))
@@ -232,12 +235,8 @@ fn listed_status(query: &BTreeMap<String, String>) -> Result<Option<RunStatus>, 
 
 /// 1 to 100, 25 by default; a value that isn't an integer means the default.
 fn page_limit(query: &BTreeMap<String, String>) -> u32 {
-    query
-        .get("limit")
-        .and_then(|value| value.trim().parse::<i64>().ok())
-        .map_or(25, |limit| limit.clamp(1, i64::from(zupflow_core::runs::MAX_PAGE)))
-        .try_into()
-        .unwrap_or(25)
+    let max = i64::from(zupflow_core::runs::MAX_PAGE);
+    u32::try_from(clamped_int(query.get("limit").map(String::as_str), 25, max)).unwrap_or(25)
 }
 
 fn cursor(query: &BTreeMap<String, String>) -> Option<&str> {
@@ -339,6 +338,95 @@ async fn list_organization_runs(
         .await
         .map_err(run_failure)?;
     Ok(paginated(page, organization_run_view))
+}
+
+/// The contract's `UsageDay`.
+#[derive(Serialize, Default, Clone, Copy)]
+struct UsageCounts {
+    runs: u64,
+    failed_runs: u64,
+    tool_calls: u64,
+}
+
+#[derive(Serialize)]
+struct UsageDayView {
+    date: String,
+    #[serde(flatten)]
+    counts: UsageCounts,
+}
+
+/// The contract's `UsageReport`.
+#[derive(Serialize)]
+struct UsageReport {
+    environment: Environment,
+    days: Vec<UsageDayView>,
+    totals: UsageCounts,
+}
+
+/// The most days a report covers, and how many it covers by default.
+const MAX_USAGE_DAYS: i64 = 90;
+const USAGE_DAYS: i64 = 14;
+
+/// Runs, failed runs and tool calls per UTC day in one environment: the last
+/// `days` days, today included, each listed even when it had no runs. Every
+/// member reads it; an API key, its own environment's only.
+async fn get_usage(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(org): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, Failure> {
+    let access = Access::organization(&state, caller, &org).await?;
+    let query = query(raw.as_deref())?;
+    let Some(environment) = query.get("environment").and_then(|value| Environment::parse(value)) else {
+        return Err(Failure(ApiError {
+            fields: Some(BTreeMap::from([("environment".to_owned(), "Required.".to_owned())])),
+            ..ApiError::new(400, "validation_failed", "Choose an environment.")
+        }));
+    };
+    if access.environment().is_some_and(|own| own != environment) {
+        return Err(environment_mismatch());
+    }
+    let days = clamped_int(query.get("days").map(String::as_str), USAGE_DAYS, MAX_USAGE_DAYS);
+    let today = day_of(Timestamp::now());
+    let first = today - (days - 1);
+    let counted = state
+        .runs
+        .usage(
+            access.organization_id,
+            environment,
+            Timestamp::from_millis(first * 86_400_000),
+        )
+        .await
+        .map_err(run_failure)?;
+    let mut totals = UsageCounts::default();
+    let mut list = Vec::new();
+    for day in first..=today {
+        let counts = counted
+            .iter()
+            .find(|counted| counted.day == day)
+            .map_or_else(UsageCounts::default, |counted| UsageCounts {
+                runs: counted.runs,
+                failed_runs: counted.failed_runs,
+                tool_calls: counted.tool_calls,
+            });
+        totals.runs += counts.runs;
+        totals.failed_runs += counts.failed_runs;
+        totals.tool_calls += counts.tool_calls;
+        let date = Timestamp::from_millis(day * 86_400_000).to_string();
+        list.push(UsageDayView {
+            date: date[..10].to_owned(),
+            counts,
+        });
+    }
+    Ok(envelope(
+        StatusCode::OK,
+        UsageReport {
+            environment,
+            days: list,
+            totals,
+        },
+    ))
 }
 
 async fn get_run(

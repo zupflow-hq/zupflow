@@ -143,6 +143,7 @@ async fn main() -> ExitCode {
         api_key_hasher: Arc::new(ApiKeyHasher::new(secret_key)),
         idempotency: Arc::new(SqliteIdempotencyStore::new(database.clone())),
         fingerprinter: Arc::new(Fingerprinter::new(secret_key)),
+        webhooks: Arc::new(zupflow_sqlite::SqliteWebhookStore::new(database.clone())),
     };
 
     let listener = match TcpListener::bind(config.listen).await {
@@ -156,11 +157,13 @@ async fn main() -> ExitCode {
     // Background work, in the same process; stopped with the server.
     let worker = tokio::spawn(zupflow_server::discovery::run_worker(state.clone()));
     let runner = tokio::spawn(zupflow_server::run_engine::run_worker(state.clone()));
+    let deliverer = tokio::spawn(zupflow_server::webhook_delivery::run_workers(state.clone()));
     let served = axum::serve(listener, zupflow_server::app(state, guard))
         .with_graceful_shutdown(shutdown())
         .await;
     worker.abort();
     runner.abort();
+    deliverer.abort();
     if let Err(error) = served {
         tracing::error!(event = "server.failed", %error);
         return ExitCode::FAILURE;

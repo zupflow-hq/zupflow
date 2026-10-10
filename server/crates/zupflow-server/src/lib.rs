@@ -24,6 +24,8 @@ pub mod organizations;
 pub mod run_engine;
 pub mod runs;
 pub mod tool_policy;
+pub mod webhook_delivery;
+pub mod webhooks;
 pub mod workspaces;
 
 use axum::Router;
@@ -36,7 +38,7 @@ pub use guard::RequestGuard;
 /// The contract's operations this server serves so far, by `operationId`. The
 /// shared contract suite skips, by name, any case that needs another one; a
 /// test holds this list equal to the routes the router actually answers.
-pub const SERVED_OPERATIONS: [&str; 68] = [
+pub const SERVED_OPERATIONS: [&str; 74] = [
     "getViewer",
     "createOrganization",
     "getOrganization",
@@ -105,6 +107,12 @@ pub const SERVED_OPERATIONS: [&str; 68] = [
     "listRunEvents",
     "cancelRun",
     "resolveApproval",
+    "getUsage",
+    "listWebhooks",
+    "createWebhook",
+    "updateWebhook",
+    "deleteWebhook",
+    "testWebhook",
 ];
 
 /// The whole HTTP surface. Every response under `/v1` is the envelope; the
@@ -124,6 +132,7 @@ pub fn app(state: AppState, guard: RequestGuard) -> Router {
         .merge(agents::routes())
         .merge(tool_policy::routes())
         .merge(runs::routes())
+        .merge(webhooks::routes())
         // Matched routes only, after routing, so the middleware knows the route's template.
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

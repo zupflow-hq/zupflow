@@ -37,21 +37,23 @@ use zupflow_core::environment::Environment;
 use zupflow_core::idempotency::Fingerprinter;
 use zupflow_core::identity::{Identity, IdentityError, Profile, VerifiedIdentity};
 use zupflow_core::ids::{
-    AgentId, ApiKeyId, AppId, ConnectSessionId, GrantId, InstallationId, OrganizationId, WorkspaceId,
+    AgentId, ApiKeyId, AppId, ConnectSessionId, GrantId, InstallationId, OrganizationId, WebhookEndpointId, WorkspaceId,
 };
 use zupflow_core::installations::{InstallationStore, InstalledApp, TemplateSnapshot};
+use zupflow_core::keys::{EncryptionContext, seal};
 use zupflow_core::organizations::{MemberRole, OrganizationStore, User};
 use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse, Refusal};
 use zupflow_core::policy::{ToolLevel, ToolPolicyStore};
 use zupflow_core::runs::CallTarget;
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{ListedTool, ToolRegistry, ToolRevision};
+use zupflow_core::webhooks::{NewEndpoint, SECRET_VERSION, WebhookEventType, WebhookStore, new_signing_secret};
 use zupflow_core::workspaces::{NewWorkspace, WorkspaceStore};
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{
     Database, SqliteAgentStore, SqliteApiKeyStore, SqliteAppStore, SqliteConnectStore, SqliteIdempotencyStore,
     SqliteInstallationStore, SqliteOrganizationStore, SqliteRunStore, SqliteToolPolicyStore, SqliteToolRegistry,
-    SqliteWorkspaceStore,
+    SqliteWebhookStore, SqliteWorkspaceStore,
 };
 
 /// The personas, with the address each signs in with: people's names, as in
@@ -166,6 +168,7 @@ async fn serve(path: &str) -> Result<(), String> {
         public_url: format!("http://localhost:{port}"),
         api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
         api_key_hasher: Arc::new(ApiKeyHasher::new(secret)),
+        webhooks: Arc::new(zupflow_sqlite::SqliteWebhookStore::new(database.clone())),
         idempotency: Arc::new(SqliteIdempotencyStore::new(database)),
         fingerprinter: Arc::new(Fingerprinter::new(secret)),
     };
@@ -760,6 +763,50 @@ async fn reset(path: &str) -> Result<(), String> {
             )
             .await
             .map_err(|error| fail("session")(&error))?;
+    }
+
+    // A webhook endpoint in each organization, its secret sealed as the API
+    // seals it. The contract server sends nothing anywhere: its outbound path
+    // is `FixtureProviders`.
+    let webhooks = SqliteWebhookStore::new(database.clone());
+    for (organization, environment, url) in [
+        (
+            northwind.id,
+            Environment::Production,
+            "https://hooks.northwind.example/zupflow",
+        ),
+        (
+            larkspur.id,
+            Environment::Sandbox,
+            "https://hooks.larkspur.example/zupflow",
+        ),
+    ] {
+        let endpoint_id = WebhookEndpointId::generate();
+        let secret = new_signing_secret(environment).ok_or("signing secret")?;
+        let context = EncryptionContext::webhook_signing_secret(organization, environment, endpoint_id, SECRET_VERSION);
+        let sealed = seal(&sealing, &context, secret.as_bytes())
+            .await
+            .map_err(|error| fail("seal")(&error))?;
+        webhooks
+            .create_endpoint(
+                organization,
+                endpoint_id,
+                &NewEndpoint {
+                    environment,
+                    url: url.to_owned(),
+                    description: "Run notifications".to_owned(),
+                    events: vec![
+                        WebhookEventType::RunCompleted,
+                        WebhookEventType::RunFailed,
+                        WebhookEventType::RunWaitingForApproval,
+                    ],
+                    secret: sealed,
+                    secret_last4: secret[secret.len() - 4..].to_owned(),
+                },
+                Timestamp::now(),
+            )
+            .await
+            .map_err(|error| fail("webhook")(&error))?;
     }
 
     let secret = database

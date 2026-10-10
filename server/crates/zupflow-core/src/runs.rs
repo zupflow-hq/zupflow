@@ -18,6 +18,11 @@
 //!    transaction.
 //! 6. **Finished**: completed with the model's last text, failed, or cancelled.
 //!
+//! Every step that appends an event a webhook names (`run.completed`,
+//! `run.failed`, `run.cancelled`, and `approval.requested` as
+//! `run.waiting_for_approval`) queues its announcement
+//! ([`crate::webhooks::Announcement`]) in the same transaction: the outbox.
+//!
 //! Every method takes the organization, then the workspace, and reaches
 //! nothing outside them. A run outlives its agent: deleting an agent keeps
 //! its runs, named "Deleted agent".
@@ -487,6 +492,22 @@ pub struct AgentActivity {
     pub last_run_at: Option<Timestamp>,
 }
 
+/// Runs started on one UTC day, as usage counts them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageDay {
+    /// Days since 1970-01-01.
+    pub day: i64,
+    pub runs: u64,
+    pub failed_runs: u64,
+    /// Calls sent to an app's server, as each run counted them.
+    pub tool_calls: u64,
+}
+
+/// The day an instant falls on, in days since 1970-01-01, UTC.
+pub fn day_of(at: Timestamp) -> i64 {
+    at.millis().div_euclid(86_400_000)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RunError {
     #[error("the store is unavailable")]
@@ -571,6 +592,16 @@ pub trait RunStore: Send + Sync {
         workspace_id: WorkspaceId,
         since: Timestamp,
     ) -> Result<Vec<AgentActivity>, RunError>;
+
+    /// The organization's runs in workspaces of `environment` created at or
+    /// after `since`, counted per UTC day, in order; a day without runs is
+    /// left out.
+    async fn usage(
+        &self,
+        organization_id: OrganizationId,
+        environment: Environment,
+        since: Timestamp,
+    ) -> Result<Vec<UsageDay>, RunError>;
 
     /// The run with its turns and calls. `None` when it isn't here.
     async fn find_progress(

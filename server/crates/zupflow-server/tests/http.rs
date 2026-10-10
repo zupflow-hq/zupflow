@@ -82,6 +82,7 @@ impl Server {
             outbound: Arc::new(zupflow_outbound::SafeHttpClient::new().unwrap()),
             public_url: "http://localhost:8080".to_owned(),
             api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
+            webhooks: Arc::new(zupflow_sqlite::SqliteWebhookStore::new(database.clone())),
             idempotency: Arc::new(zupflow_sqlite::SqliteIdempotencyStore::new(database)),
             fingerprinter: Arc::new(zupflow_core::idempotency::Fingerprinter::new([7; 32])),
             api_key_hasher: Arc::new(zupflow_core::api_keys::ApiKeyHasher::new([7; 32])),

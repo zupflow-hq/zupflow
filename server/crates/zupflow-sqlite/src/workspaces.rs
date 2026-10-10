@@ -22,6 +22,9 @@ use zupflow_core::workspaces::{
 
 use crate::Database;
 
+/// The window `runs_last_24h` counts.
+const RUNS_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+
 pub struct SqliteWorkspaceStore {
     database: Database,
 }
@@ -288,21 +291,23 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
     ) -> Result<WorkspaceStats, WorkspaceError> {
-        let (agents, installations): (i64, i64) = sqlx::query_as(
+        let since = Timestamp::now().millis() - RUNS_WINDOW_MS;
+        let (agents, installations, runs): (i64, i64, i64) = sqlx::query_as(
             "SELECT (SELECT count(*) FROM agents WHERE organization_id = ?1 AND workspace_id = ?2), \
-             (SELECT count(*) FROM installations WHERE organization_id = ?1 AND workspace_id = ?2)",
+             (SELECT count(*) FROM installations WHERE organization_id = ?1 AND workspace_id = ?2), \
+             (SELECT count(*) FROM runs WHERE organization_id = ?1 AND workspace_id = ?2 AND created_at >= ?3)",
         )
         .bind(organization_id.uuid())
         .bind(workspace_id.uuid())
+        .bind(since)
         .fetch_one(self.database.pool())
         .await
         .map_err(failed("load_stats"))?;
         let count = |n: i64| u64::try_from(n).map_err(|_| WorkspaceError::Unavailable);
-        // Runs arrive with their table; until then a workspace has none.
         Ok(WorkspaceStats {
             agents: count(agents)?,
             installations: count(installations)?,
-            ..WorkspaceStats::default()
+            runs_last_24h: count(runs)?,
         })
     }
 }

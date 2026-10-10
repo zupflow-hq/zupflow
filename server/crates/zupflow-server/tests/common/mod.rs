@@ -51,6 +51,23 @@ pub struct Sent {
     pub credential: Option<(String, String)>,
 }
 
+/// One request as it was sent: its URL, headers and body.
+#[derive(Debug, Clone)]
+pub struct Recorded {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Recorded {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
 /// Stands in for every provider: records what it's sent and answers what
 /// the test chose, `200` until told otherwise, or what it scripted for a URL.
 pub struct Providers {
@@ -70,6 +87,8 @@ pub struct Providers {
     /// The HTTP status MCP servers answer `tools/call` with; `200` answers
     /// the call's result.
     pub tool_status: Mutex<u16>,
+    /// Every request, with its headers, in order.
+    pub requests: Mutex<Vec<Recorded>>,
 }
 
 impl Providers {
@@ -113,6 +132,17 @@ impl Providers {
         self.bodies.lock().unwrap().clone()
     }
 
+    /// The requests sent to `url`, in order.
+    pub fn requests_to(&self, url: &str) -> Vec<Recorded> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.url == url)
+            .cloned()
+            .collect()
+    }
+
     pub fn sent(&self) -> Vec<Sent> {
         self.sent.lock().unwrap().clone()
     }
@@ -121,6 +151,11 @@ impl Providers {
 #[async_trait]
 impl OutboundHttp for Providers {
     async fn send(&self, request: OutboundRequest, _: Limits) -> Result<OutboundResponse, OutboundError> {
+        self.requests.lock().unwrap().push(Recorded {
+            url: request.url.clone(),
+            headers: request.headers.clone(),
+            body: request.body.clone().unwrap_or_default(),
+        });
         self.bodies.lock().unwrap().push((
             request.url.clone(),
             request
@@ -294,6 +329,7 @@ impl Server {
             challenges: Mutex::new(Vec::new()),
             tool_calls: Mutex::new(Vec::new()),
             tool_status: Mutex::new(200),
+            requests: Mutex::new(Vec::new()),
         });
         let state = AppState {
             identity,
@@ -320,6 +356,7 @@ impl Server {
             outbound: providers.clone(),
             public_url: "http://localhost:8080".to_owned(),
             api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
+            webhooks: Arc::new(zupflow_sqlite::SqliteWebhookStore::new(database.clone())),
             idempotency: Arc::new(zupflow_sqlite::SqliteIdempotencyStore::new(database)),
             fingerprinter: Arc::new(zupflow_core::idempotency::Fingerprinter::new([7; 32])),
             api_key_hasher: Arc::new(zupflow_core::api_keys::ApiKeyHasher::new([7; 32])),

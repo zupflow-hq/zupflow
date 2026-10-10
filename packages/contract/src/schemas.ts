@@ -997,8 +997,9 @@ export const WEBHOOK_EVENT_TYPES = [
 ] as const;
 /**
  * The event types an endpoint can subscribe to. `webhook.test` is sent only
- * by the test button. `app.tools_changed` is reserved: an endpoint can
- * subscribe to it, but it isn't delivered yet.
+ * by the test button. `app.tools_changed` is sent when a listing of a
+ * connected installation's tools changes one or more of them, once per
+ * listing.
  */
 export const WebhookEventType = z.enum(WEBHOOK_EVENT_TYPES);
 export type WebhookEventType = z.infer<typeof WebhookEventType>;
@@ -1083,7 +1084,6 @@ export const WebhookEvent = named(
     ),
     webhookEvent("run.cancelled", runData(RunStatus.extract(["cancelled"])), WebhookEventWorkspace),
     // A connected installation's app listed a tool with a new definition: review it before calls use it.
-    // Reserved: its shape is fixed here, but nothing delivers it yet.
     webhookEvent(
       "app.tools_changed",
       installationData(InstallationStatus.extract(["connected"])),
@@ -1119,6 +1119,13 @@ export const WebhookEventEnvelope = named(
 );
 export type WebhookEventEnvelope = z.infer<typeof WebhookEventEnvelope>;
 
+/**
+ * An endpoint's last answer: its HTTP status, or `0` when none came back (a
+ * timeout, a network error, a refused destination). Only the endpoint's own
+ * answers count: when Zupflow can't send (its store or key service is down),
+ * the test button answers `503 unavailable`, like any route whose store is
+ * down, and nothing is recorded against the endpoint.
+ */
 export const WebhookDelivery = named(
   "WebhookDelivery",
   z.object({ status_code: z.number().int(), delivered_at: instant }),

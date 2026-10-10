@@ -2321,7 +2321,8 @@ export function createHandlers(apiBase: string) {
           environment: input.environment,
           url: input.url,
           description: input.description,
-          events: input.events,
+          // Each type once, in the order first asked for.
+          events: [...new Set(input.events)],
           enabled: true,
           signing_secret_last4: secret.slice(-4),
           created_at: new Date().toISOString(),
@@ -2356,7 +2357,9 @@ export function createHandlers(apiBase: string) {
             enabled: z.boolean().optional(),
           }),
         );
-        if (input.url) assertPublicHttps(input.url, "url");
+        // An empty URL is refused like any other that isn't one, never saved.
+        if (input.url !== undefined) assertPublicHttps(input.url, "url");
+        if (input.events) input.events = [...new Set(input.events)];
         Object.assign(endpoint, Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined)));
         return ok(endpoint);
       }),

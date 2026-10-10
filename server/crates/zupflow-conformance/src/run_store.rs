@@ -6,7 +6,9 @@
 //! worker, a retried job) moves nothing; a call begun at most once; an
 //! approval resolved only while the run waits on exactly that call, queueing
 //! the run again; events numbered from 1 without gaps; and a run that
-//! outlives its agent.
+//! outlives its agent. A step that appends an event a webhook names queues
+//! its announcement with it, and usage counts runs per UTC day in one
+//! environment.
 //!
 //! `prepare` makes a [`Tenant`] exist: its organization and two workspaces,
 //! the first in Sandbox, the second in Production. The suite makes agents
@@ -26,10 +28,11 @@ use zupflow_core::models::TokenUsage;
 use zupflow_core::runs::{
     ApprovalDecision, CallOutcome, CallState, CallTarget, Ending, Failure, NewRun, NewRunEvent, NewToolCall, NewTurn,
     OrganizationRunFilter, QueuedJob, RecordedDecision, RunError, RunEventType, RunFilter, RunStatus, RunStore,
-    RunTrigger,
+    RunTrigger, UsageDay,
 };
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
+use zupflow_core::webhooks::{ANNOUNCE, Announcement, Subject, WebhookEventType};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Tenant {
@@ -205,6 +208,8 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     decides_a_call_again_before_sending(&stores, a, agent_a).await;
     finds_runs_whose_job_died(&stores, a, agent_a).await;
     keeps_runs_of_a_deleted_agent(&stores, a).await;
+    announces_what_webhooks_name(&stores, a, agent_a).await;
+    counts_usage_per_day(&stores, a, b, agent_a, agent_sibling, agent_b).await;
 }
 
 async fn creates_runs_only_of_the_workspaces_agents(
@@ -1210,4 +1215,171 @@ async fn finds_runs_whose_job_died(stores: &Stores<'_>, a: Tenant, agent_a: Agen
         .await
         .unwrap();
     assert!(!abandoned().await.contains(&(org, ws, id)), "a finished run isn't");
+}
+
+/// Claims every queued announcement, answering each with its job's scope.
+async fn announcements(stores: &Stores<'_>) -> Vec<(Scope, Announcement)> {
+    let kind = Name::new(ANNOUNCE).unwrap();
+    let mut claimed = Vec::new();
+    while let Some(job) = stores
+        .jobs
+        .claim_next(std::slice::from_ref(&kind), Duration::from_secs(60))
+        .await
+        .unwrap()
+    {
+        stores.jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+        claimed.push((
+            job.scope,
+            Announcement::parse(&job.payload).expect("an announcement reads back"),
+        ));
+    }
+    claimed
+}
+
+/// The outbox: a step that appends an event a webhook names queues its
+/// announcement in the same change, in the run's workspace; no other event does.
+async fn announces_what_webhooks_name(stores: &Stores<'_>, a: Tenant, agent_a: AgentId) {
+    let org = a.organization_id;
+    let ws = a.workspace;
+    announcements(stores).await;
+    let now = Timestamp::now();
+    let cancelled = create(stores, org, ws, agent_a, "Announce me", now).await;
+    assert!(announcements(stores).await.is_empty(), "a queued run announces nothing");
+    stores
+        .runs
+        .cancel_run(
+            org,
+            ws,
+            cancelled,
+            &[NewRunEvent::new(
+                RunEventType::RunCancelled,
+                json!({ "cancelled_by": "Someone" }),
+            )],
+            now,
+        )
+        .await
+        .unwrap();
+    let announced = announcements(stores).await;
+    assert_eq!(announced.len(), 1, "cancelling announces once");
+    let (scope, announcement) = announced[0];
+    assert_eq!(scope, Scope::Workspace(org, ws), "in the run's workspace");
+    assert_eq!(
+        (announcement.kind, announcement.subject, announcement.created_at),
+        (WebhookEventType::RunCancelled, Subject::Run(cancelled), now)
+    );
+
+    let completed = create(stores, org, ws, agent_a, "Finish me", now).await;
+    stores
+        .runs
+        .start_run(org, ws, completed, &[event(RunEventType::RunStarted)], now)
+        .await
+        .unwrap();
+    assert!(announcements(stores).await.is_empty(), "starting announces nothing");
+    stores
+        .runs
+        .finish_run(
+            org,
+            ws,
+            completed,
+            0,
+            &Ending::Completed {
+                output: "Done.".to_owned(),
+            },
+            &[event(RunEventType::MessageAssistant), event(RunEventType::RunCompleted)],
+            now,
+        )
+        .await
+        .unwrap();
+    let announced: Vec<_> = announcements(stores)
+        .await
+        .into_iter()
+        .map(|(_, announcement)| (announcement.kind, announcement.subject))
+        .collect();
+    assert_eq!(
+        announced,
+        vec![(WebhookEventType::RunCompleted, Subject::Run(completed))],
+        "finishing announces the run's end, not its message"
+    );
+    claim_all(stores).await;
+}
+
+/// Usage counts an organization's runs in one environment's workspaces, per
+/// UTC day, and nothing of another organization or environment.
+async fn counts_usage_per_day(
+    stores: &Stores<'_>,
+    a: Tenant,
+    b: Tenant,
+    agent_a: AgentId,
+    agent_sibling: AgentId,
+    agent_b: AgentId,
+) {
+    let org = a.organization_id;
+    // Days long past, so no other run of the suite lands on them.
+    let day = 1_000_i64;
+    let at = |day: i64, hour: i64| Timestamp::from_millis(day * 86_400_000 + hour * 3_600_000);
+    for hour in [0, 23] {
+        create(stores, org, a.workspace, agent_a, "Sandbox", at(day, hour)).await;
+    }
+    let failed = create(stores, org, a.workspace, agent_a, "Failed", at(day + 2, 5)).await;
+    stores
+        .runs
+        .finish_run(
+            org,
+            a.workspace,
+            failed,
+            0,
+            &Ending::Failed(Failure::new("model_unavailable", "No model.")),
+            &[],
+            at(day + 2, 6),
+        )
+        .await
+        .unwrap();
+    create(stores, org, a.sibling, agent_sibling, "Production", at(day, 1)).await;
+    create(stores, b.organization_id, b.workspace, agent_b, "Theirs", at(day, 1)).await;
+    claim_all(stores).await;
+
+    let usage = stores.runs.usage(org, Environment::Sandbox, at(day, 0)).await.unwrap();
+    let early: Vec<_> = usage.iter().filter(|counted| counted.day <= day + 2).copied().collect();
+    assert_eq!(
+        early,
+        vec![
+            UsageDay {
+                day,
+                runs: 2,
+                failed_runs: 0,
+                tool_calls: 0
+            },
+            UsageDay {
+                day: day + 2,
+                runs: 1,
+                failed_runs: 1,
+                tool_calls: 0
+            },
+        ],
+        "runs per UTC day, in order, of the environment's workspaces only; a day without runs left out"
+    );
+    let later = stores
+        .runs
+        .usage(org, Environment::Sandbox, at(day + 1, 0))
+        .await
+        .unwrap();
+    assert!(later.iter().all(|counted| counted.day > day), "nothing before `since`");
+    let production = stores
+        .runs
+        .usage(org, Environment::Production, at(day, 0))
+        .await
+        .unwrap();
+    assert_eq!(
+        production.first().map(|counted| (counted.day, counted.runs)),
+        Some((day, 1))
+    );
+    let theirs = stores
+        .runs
+        .usage(b.organization_id, Environment::Sandbox, at(day, 0))
+        .await
+        .unwrap();
+    assert_eq!(
+        theirs.first().map(|counted| (counted.day, counted.runs)),
+        Some((day, 1))
+    );
 }

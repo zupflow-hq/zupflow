@@ -57,6 +57,10 @@ const TABLES: &[(&str, Scoping)] = &[
     ("runs", Scoping::Workspace),
     ("run_events", Scoping::Workspace),
     ("run_tool_calls", Scoping::Workspace),
+    // An event names its workspace, except the test button's, which has none.
+    ("webhook_endpoints", Scoping::Organization),
+    ("webhook_events", Scoping::Organization),
+    ("webhook_deliveries", Scoping::Organization),
 ];
 
 struct Column {

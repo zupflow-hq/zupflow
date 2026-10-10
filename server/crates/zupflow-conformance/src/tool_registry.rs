@@ -3,7 +3,9 @@
 //! pinned, a changed one held beside it unreviewed, a missing one gone; a
 //! listing that breaks the limits recorded not at all; read a page at a
 //! time, by name; gone tools kept up to a bound; a change accepted only as
-//! reviewed, and only in its own installation.
+//! reviewed, and only in its own installation; a listing that changes a
+//! tool announcing `app.tools_changed` with it, in the installation's
+//! workspace, and no other listing announcing anything.
 //!
 //! `prepare` makes a [`Tenant`] exist: its organization, two workspaces, and
 //! an installation of one app in each.
@@ -12,13 +14,18 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use std::time::Duration;
 use zupflow_core::apps::ToolEffect;
 use zupflow_core::ids::{InstallationId, OrganizationId, WorkspaceId};
+
+use zupflow_core::jobs::JobQueue;
+use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{
     ListedTool, ListingChanges, MAX_GONE, MAX_PAGE, MAX_TOOLS, RegisteredTool, ToolError, ToolRegistry, ToolRevision,
     ToolStatus,
 };
+use zupflow_core::webhooks::{ANNOUNCE, Announcement, Subject, WebhookEventType};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Tenant {
@@ -112,7 +119,9 @@ fn strings(names: &[&str]) -> Vec<String> {
     names.iter().map(|name| (*name).to_owned()).collect()
 }
 
-pub async fn run(registry: &dyn ToolRegistry, prepare: Prepare) {
+/// `jobs` is the queue the registry queues its announcements in.
+pub async fn run(registry: &dyn ToolRegistry, jobs: &dyn JobQueue, prepare: Prepare) {
+    announces_changed_tools(registry, jobs, &prepare).await;
     keeps_tools_per_installation(registry, &prepare).await;
     pins_the_first_definition_and_holds_changes(registry, &prepare).await;
     marks_missing_tools_gone_until_listed_again(registry, &prepare).await;
@@ -576,5 +585,106 @@ async fn accepts_exactly_the_change_reviewed(registry: &dyn ToolRegistry, prepar
             ("current", ToolStatus::Current),
             ("gone", ToolStatus::Gone)
         ]
+    );
+}
+
+/// The outbox: a listing that changes a tool queues its announcement in the
+/// same change; adding, keeping, losing or listing a tool again doesn't.
+async fn announces_changed_tools(registry: &dyn ToolRegistry, jobs: &dyn JobQueue, prepare: &Prepare) {
+    let kind = Name::new(ANNOUNCE).unwrap();
+    let announced = || async {
+        let mut claimed = Vec::new();
+        while let Some(job) = jobs
+            .claim_next(std::slice::from_ref(&kind), Duration::from_secs(60))
+            .await
+            .unwrap()
+        {
+            jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+            claimed.push((
+                job.scope,
+                Announcement::parse(&job.payload).expect("an announcement reads back"),
+            ));
+        }
+        claimed
+    };
+    announced().await;
+    let a = tenant(prepare).await;
+    let at = a.at();
+    let now = Timestamp::now();
+    record(
+        registry,
+        at,
+        &[
+            listed("search", 1, ToolEffect::Read),
+            listed("send", 1, ToolEffect::Write),
+        ],
+        now,
+    )
+    .await
+    .unwrap();
+    record(registry, at, &[listed("search", 1, ToolEffect::Read)], now)
+        .await
+        .unwrap();
+    record(
+        registry,
+        at,
+        &[
+            listed("search", 1, ToolEffect::Read),
+            listed("send", 1, ToolEffect::Write),
+        ],
+        now,
+    )
+    .await
+    .unwrap();
+    assert!(
+        announced().await.is_empty(),
+        "adding, losing and listing a tool again announce nothing"
+    );
+
+    record(
+        registry,
+        at,
+        &[
+            listed("search", 2, ToolEffect::Read),
+            listed("send", 2, ToolEffect::Write),
+        ],
+        now,
+    )
+    .await
+    .unwrap();
+    let claimed = announced().await;
+    assert_eq!(
+        claimed.len(),
+        1,
+        "one announcement for the listing, however many tools changed"
+    );
+    let (scope, announcement) = claimed[0];
+    assert_eq!(
+        scope,
+        Scope::Workspace(a.organization_id, a.workspace),
+        "in the installation's workspace"
+    );
+    assert_eq!(
+        (announcement.kind, announcement.subject, announcement.created_at),
+        (
+            WebhookEventType::AppToolsChanged,
+            Subject::Installation(a.installation),
+            now
+        )
+    );
+    record(
+        registry,
+        at,
+        &[
+            listed("search", 2, ToolEffect::Read),
+            listed("send", 2, ToolEffect::Write),
+        ],
+        now,
+    )
+    .await
+    .unwrap();
+    assert!(
+        announced().await.is_empty(),
+        "the same change listed again isn't announced again"
     );
 }

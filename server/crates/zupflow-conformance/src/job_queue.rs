@@ -1,6 +1,6 @@
 //! The `JobQueue` suite: a job is claimed by one worker at a time, in its own
-//! scope, and finished, retried or buried only by the lease that holds it,
-//! named with that scope. Nothing reaches a job from another scope, with
+//! scope, and finished, retried, postponed or buried only by the lease that
+//! holds it, named with that scope. Nothing reaches a job from another scope, with
 //! another lease, or after its lease was lost.
 //!
 //! Every test uses kinds of its own, so the cross-tenant claim of one test
@@ -83,6 +83,7 @@ pub async fn run(queue: &dyn JobQueue, prepare: Prepare) {
     refuses_a_lease_that_ran_out_before_anyone_reclaimed(queue, &prepare).await;
     keeps_a_lease_that_was_extended(queue, &prepare).await;
     retries_until_the_attempts_run_out(queue, &prepare).await;
+    postpones_without_using_an_attempt(queue, &prepare).await;
     buries_on_request(queue, &prepare).await;
     lets_a_job_die_when_its_last_lease_runs_out(queue, &prepare).await;
     refuses_a_lease_named_with_another_scope(queue, &prepare).await;
@@ -386,6 +387,50 @@ async fn retries_until_the_attempts_run_out(queue: &dyn JobQueue, prepare: &Prep
     assert!(claim(queue, &kind).await.is_none(), "a dead job isn't claimed");
 }
 
+async fn postpones_without_using_an_attempt(queue: &dyn JobQueue, prepare: &Prepare) {
+    let fixture = Fixture::new(prepare).await;
+    let kind = fresh_kind("postpone");
+    let reason = name("provider_unavailable");
+    let options = JobOptions {
+        max_attempts: 1,
+        ..JobOptions::default()
+    };
+    queue
+        .enqueue(&fixture.workspace(), &kind, vec![], options)
+        .await
+        .unwrap();
+    let first = claim(queue, &kind).await.unwrap();
+    assert_eq!(first.attempt, 1);
+    queue
+        .postpone(&first.scope, first.id, &first.lease, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(claim(queue, &kind).await.is_none(), "not before the delay");
+    assert_eq!(
+        queue.complete(&first.scope, first.id, &first.lease).await,
+        Err(JobError::LeaseLost),
+        "a postponed job's lease reaches nothing"
+    );
+    assert_eq!(
+        queue
+            .postpone(&first.scope, first.id, &first.lease, Duration::ZERO)
+            .await,
+        Err(JobError::LeaseLost),
+        "nor postpones it again"
+    );
+    tokio::time::sleep(PAST_LEASE).await;
+    let again = claim(queue, &kind).await.expect("postponed, not dead");
+    assert_eq!(again.attempt, 1, "the same attempt as before");
+    assert_eq!(
+        queue
+            .retry(&again.scope, again.id, &again.lease, Duration::ZERO, &reason)
+            .await,
+        Ok(Retry::Exhausted),
+        "its one attempt is still its last"
+    );
+    assert!(claim(queue, &kind).await.is_none());
+}
+
 async fn buries_on_request(queue: &dyn JobQueue, prepare: &Prepare) {
     let fixture = Fixture::new(prepare).await;
     let kind = fresh_kind("bury");
@@ -474,6 +519,11 @@ async fn refuses_every_other_scope(queue: &dyn JobQueue, own: Scope, scopes: &[S
             "bury {own:?} from {scope:?}"
         );
         assert_eq!(
+            queue.postpone(scope, job.id, &job.lease, Duration::ZERO).await,
+            Err(JobError::LeaseLost),
+            "postpone {own:?} from {scope:?}"
+        );
+        assert_eq!(
             queue.complete(scope, job.id, &job.lease).await,
             Err(JobError::LeaseLost),
             "complete {own:?} from {scope:?}"
@@ -500,6 +550,11 @@ async fn refuses_every_other_scope(queue: &dyn JobQueue, own: Scope, scopes: &[S
         queue.bury(&own, other_id, &job.lease, &reason).await,
         Err(JobError::LeaseLost),
         "bury another job's ID"
+    );
+    assert_eq!(
+        queue.postpone(&own, other_id, &job.lease, Duration::ZERO).await,
+        Err(JobError::LeaseLost),
+        "postpone another job's ID"
     );
     assert_eq!(
         queue.extend(&own, other_id, &job.lease, LONG).await,

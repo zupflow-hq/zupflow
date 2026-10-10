@@ -7,7 +7,8 @@
 //! it, writes, and appends the step's events after the run's last sequence,
 //! so two workers holding the same run (a lease that ran out) can't both take
 //! a step: the second finds the run moved on. A run's job is queued in the
-//! transaction that needs it, through the queue's own table.
+//! transaction that needs it, through the queue's own table, and so is the
+//! announcement of every event a webhook names (the outbox, decision 0017).
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -24,10 +25,11 @@ use zupflow_core::jobs::JobId;
 use zupflow_core::runs::{
     AgentActivity, ApprovalDecision, CallOutcome, CallState, CallTarget, Ending, Failure, NewRun, NewRunEvent, NewTurn,
     OrganizationRun, OrganizationRunFilter, Page, QueuedJob, RecordedDecision, Run, RunError, RunEvent, RunEventType,
-    RunFilter, RunProgress, RunStatus, RunStore, RunToolCall, RunTrigger, RunTurn, RunUsage,
+    RunFilter, RunProgress, RunStatus, RunStore, RunToolCall, RunTrigger, RunTurn, RunUsage, UsageDay,
 };
 use zupflow_core::scope::Scope;
 use zupflow_core::time::Timestamp;
+use zupflow_core::webhooks::Announcement;
 
 use crate::Database;
 use crate::job_queue::insert_job;
@@ -363,6 +365,13 @@ async fn append(
         .execute(&mut **transaction)
         .await
         .map_err(failed("append"))?;
+        // The outbox: a webhook this event causes is announced with it.
+        if let Some(announcement) = Announcement::of_run_event(run_id, event.kind, now) {
+            let Some(job) = announcement.job() else {
+                return Err(RunError::Unavailable);
+            };
+            queue(transaction, &Scope::Workspace(organization_id, workspace_id), &job).await?;
+        }
         appended.push(RunEvent {
             id,
             organization_id,
@@ -692,6 +701,38 @@ impl RunStore for SqliteRunStore {
                     agent_id: AgentId::from_uuid(row.try_get("agent_id").map_err(read)?),
                     runs_since: count(row, "runs_since")?,
                     last_run_at: millis_opt(row, "last_run_at")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn usage(
+        &self,
+        organization_id: OrganizationId,
+        environment: Environment,
+        since: Timestamp,
+    ) -> Result<Vec<UsageDay>, RunError> {
+        let rows = sqlx::query(
+            "SELECT r.created_at / 86400000 AS day, count(*) AS runs, sum(r.status = 'failed') AS failed_runs, \
+             sum(r.tool_calls) AS tool_calls FROM runs r \
+             JOIN workspaces w ON w.organization_id = r.organization_id AND w.id = r.workspace_id \
+             WHERE r.organization_id = ? AND w.organization_id = ? AND w.environment = ? AND r.created_at >= ? \
+             GROUP BY day ORDER BY day",
+        )
+        .bind(organization_id.uuid())
+        .bind(organization_id.uuid())
+        .bind(environment.as_str())
+        .bind(since.millis().max(0))
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(failed("usage"))?;
+        rows.iter()
+            .map(|row| {
+                Ok(UsageDay {
+                    day: row.try_get("day").map_err(read)?,
+                    runs: count(row, "runs")?,
+                    failed_runs: count(row, "failed_runs")?,
+                    tool_calls: count(row, "tool_calls")?,
                 })
             })
             .collect()

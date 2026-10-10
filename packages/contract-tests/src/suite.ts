@@ -1088,6 +1088,19 @@ export function contractSuite(target: Target) {
         expect(JSON.stringify(await usage())).toBe(before);
       });
 
+      it("reads days as a whole number, clamped to 1 through 90", async () => {
+        const days = async (value: string | number) =>
+          (await owner.organizations.usage(fx.organization, "sandbox", value as number)).days.length;
+        expect(await days(7)).toBe(7);
+        // Whole numbers however they're written; anything else means the default.
+        expect(await days("5.0")).toBe(5);
+        expect(await days("1e20")).toBe(90);
+        expect(await days(0)).toBe(1);
+        expect(await days(-3)).toBe(1);
+        expect(await days("1.5")).toBe(14);
+        expect(await days("seven")).toBe(14);
+      });
+
       it("lists runs across workspaces of one environment only", async () => {
         const runs = await owner.organizationRuns.list(fx.organization, { environment: "sandbox", limit: 100 });
         expect(runs.items.length).toBeGreaterThan(0);
@@ -2207,6 +2220,53 @@ export function contractSuite(target: Target) {
           owner.webhooks.update(fx.organization, created.endpoint.id, { events: ["webhook.test"] }),
         );
         expect([update.status, update.code]).toEqual([400, "validation_failed"]);
+      });
+
+      it("keeps each event type once", async () => {
+        const created = await owner.webhooks.create(fx.organization, {
+          environment: "sandbox",
+          url: "https://hooks.northwind.example/twice",
+          description: "",
+          events: ["run.completed", "run.failed", "run.completed"],
+        });
+        expect(created.endpoint.events).toEqual(["run.completed", "run.failed"]);
+        const updated = await owner.webhooks.update(fx.organization, created.endpoint.id, {
+          events: ["run.failed", "run.failed"],
+        });
+        expect(updated.events).toEqual(["run.failed"]);
+      });
+
+      it("takes public HTTPS URLs only, and never saves an empty one", async () => {
+        const insecure = await failure(
+          owner.webhooks.create(fx.organization, {
+            environment: "sandbox",
+            url: "http://hooks.northwind.example/plain",
+            description: "",
+            events: ["run.completed"],
+          }),
+        );
+        expect([insecure.status, insecure.code, Object.keys(insecure.fields ?? {})]).toEqual([
+          422,
+          "insecure_url",
+          ["url"],
+        ]);
+        const hook = must((await owner.webhooks.list(fx.organization))[0], "webhook");
+        const empty = await failure(owner.webhooks.update(fx.organization, hook.id, { url: "" }));
+        expect([empty.status, empty.code, Object.keys(empty.fields ?? {})]).toEqual([
+          400,
+          "validation_failed",
+          ["url"],
+        ]);
+        const after = (await owner.webhooks.list(fx.organization)).find((h) => h.id === hook.id);
+        expect(after?.url).toBe(hook.url);
+      });
+
+      it("keeps the test button's answer as the endpoint's last delivery", async () => {
+        const hook = must((await owner.webhooks.list(fx.organization))[0], "webhook");
+        const delivery = await owner.webhooks.sendTest(fx.organization, hook.id);
+        const after = (await owner.webhooks.list(fx.organization)).find((h) => h.id === hook.id);
+        expect(after?.last_delivery).toEqual(delivery);
+        expect(after?.signing_secret_last4).toBe(hook.signing_secret_last4);
       });
     });
   });

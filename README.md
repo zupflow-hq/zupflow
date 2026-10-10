@@ -21,8 +21,8 @@ packages/
 server/           The Rust backend — a Cargo workspace
   crates/zupflow-core/        Shared types and the external-resource traits: typed IDs, API errors, scopes,
                               KeyService, Cache, ObjectStore, EventBus, JobQueue, Identity,
-                              ModelCatalog, the organizations, workspaces, API key, app, installation, tool
-                              and agent stores
+                              ModelCatalog, the organizations, workspaces, API key, app, installation, tool,
+                              agent, run and webhook stores
   crates/zupflow-basic/       The basic implementations: local keys, an in-memory cache, local files,
                               an in-process event bus, local sign-in, the configured model catalog
   crates/zupflow-sqlite/      The basic database: SQLite, its migrations, the stores, the job queue
@@ -163,6 +163,53 @@ back to the model. A run no job takes forward any more (its last job died)
 is failed `run_unavailable` by the worker's periodic sweep.
 Each event is announced on the in-process event bus, to the workspace and to
 its environment.
+
+Usage is served too: runs, failed runs and tool calls per UTC day in one
+environment (`?environment=`, required; `days` 1 to 90, 14 by default), every
+day listed; an API key reads its own environment's only. A workspace's
+`runs_last_24h` counts the runs started in it in the last 24 hours.
+
+Webhook endpoints are served (decision 0017): every member and the
+organization's API keys list them; owners, admins and API keys add, change,
+delete and test them, a key only in its own environment (another
+environment's endpoint is `404`, adding one there `422
+environment_mismatch`). URLs are public HTTPS, checked when saved and again,
+after DNS, at every delivery. Each endpoint's signing secret
+(`whsec_test_…`, `whsec_live_…`) is sealed under its own
+`webhook_signing_secret` context and shown once, in the creating response;
+responses show its last four characters. The test button sends a real, signed
+`webhook.test` event and answers the endpoint's status (`0` when nothing came
+back), kept as the endpoint's `last_delivery`.
+
+Events are written with the change that causes them: the run store queues an
+announcement in the transaction that appends `run.completed`, `run.failed`,
+`run.cancelled` or `approval.requested` (sent as `run.waiting_for_approval`),
+and the tool registry in the one where a listing changes a tool
+(`app.tools_changed`). A worker in the same process records each event once,
+lean (type, IDs, environment, the workspace's `external_id`, the object's
+status; never content), with a delivery for every enabled endpoint of the
+event's organization and environment that subscribes to its type. Each
+delivery is signed (`Zupflow-Signature: t=…,v1=…`, HMAC-SHA256 over
+`"<t>.<raw body>"`, with `Zupflow-Event-Id`, `Zupflow-Event-Type` and
+`Zupflow-Delivery-Attempt`) and sent through the safe outbound path; any
+`2xx` within 10 seconds is success, anything else is tried again about 1
+minute, 5 minutes, 30 minutes, 2, 6, 12 and 24 hours later (with jitter):
+eight attempts, at least once, unordered, the same event ID every time. An
+endpoint that has failed every attempt for three days is disabled; enabling
+it again doesn't replay what it missed.
+
+Limits, per server process: one loop records events, so a slow endpoint never
+holds one up, and eight more send deliveries, so at most eight are in flight
+at once. An endpoint has at most one delivery in flight across every worker
+(a hold on its row, released after the attempt or 30 seconds); a delivery that
+finds its endpoint busy waits about five seconds without using an attempt.
+Only the endpoint's own answers are attempts: when Zupflow can't send (a store
+or the key service is down), the job backs off from 5 seconds, doubling to an
+hour, and the test button answers `503 unavailable`. A delivery's job allows
+twelve such claims beyond its eight attempts; one that runs out settles its
+delivery as failed, leaving the endpoint's record alone. An announcement is
+claimed up to 30 times, about 20 hours of backing off, and is then buried and
+logged as lost.
 
 Once an installation connects, a background worker in the same process lists
 its app's tools from the app's MCP server (Streamable HTTP, through the safe

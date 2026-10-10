@@ -252,6 +252,32 @@ impl JobQueue for SqliteJobQueue {
         }
     }
 
+    async fn postpone(&self, scope: &Scope, id: JobId, lease: &LeaseToken, after: Duration) -> Result<(), JobError> {
+        let scope = columns(scope);
+        let now = millis(SystemTime::now());
+        // The claim's attempt is given back: the next claim is the same attempt.
+        let postponed = sqlx::query(
+            "UPDATE jobs SET state = 'queued', attempts = attempts - 1, run_at = ?, reason = NULL, \
+               lease_token = NULL, lease_expires_at = NULL \
+             WHERE organization_id = ? AND workspace_id IS ? AND environment IS ? AND id = ? \
+               AND state = 'running' AND lease_token = ? AND lease_expires_at > ?",
+        )
+        .bind(now.saturating_add(duration_millis(after)))
+        .bind(scope.organization_id)
+        .bind(scope.workspace_id)
+        .bind(scope.environment)
+        .bind(id.uuid())
+        .bind(lease.as_bytes().to_vec())
+        .bind(now)
+        .execute(self.database.pool())
+        .await
+        .map_err(failed("postpone"))?;
+        if postponed.rows_affected() == 0 {
+            return Err(JobError::LeaseLost);
+        }
+        Ok(())
+    }
+
     async fn bury(&self, scope: &Scope, id: JobId, lease: &LeaseToken, reason: &Name) -> Result<(), JobError> {
         let scope = columns(scope);
         let buried = sqlx::query(

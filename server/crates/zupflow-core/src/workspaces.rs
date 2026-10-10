@@ -122,6 +122,8 @@ pub trait WorkspaceStore: Send + Sync {
         workspace_id: WorkspaceId,
     ) -> Result<(), WorkspaceError>;
 
+    /// What the workspace holds: its agents, its installations and the
+    /// runs started in it in the last 24 hours.
     async fn load_stats(
         &self,
         organization_id: OrganizationId,

@@ -1,6 +1,7 @@
 //! [`SqliteToolRegistry`]: the tool registry, each installation's tools in
 //! `installation_tools`. Every statement repeats the full scope: the
-//! organization, the workspace and the installation.
+//! organization, the workspace and the installation. A listing that changes
+//! a tool queues its `app.tools_changed` announcement in its own transaction.
 
 use async_trait::async_trait;
 use sqlx::Row;
@@ -9,13 +10,16 @@ use sqlx::{Sqlite, Transaction};
 use uuid::Uuid;
 use zupflow_core::apps::ToolEffect;
 use zupflow_core::ids::{InstallationId, OrganizationId, WorkspaceId};
+use zupflow_core::scope::Scope;
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{
     ListedTool, ListingChanges, MAX_GONE, MAX_PAGE, RegisteredTool, ToolError, ToolPage, ToolRegistry, ToolRevision,
     ToolStatus, validate_listing,
 };
+use zupflow_core::webhooks::Announcement;
 
 use crate::Database;
+use crate::job_queue::insert_job;
 
 pub struct SqliteToolRegistry {
     database: Database,
@@ -262,6 +266,24 @@ impl ToolRegistry for SqliteToolRegistry {
             .execute(&mut *transaction)
             .await
             .map_err(failed("record_listing"))?;
+        // The outbox: a changed tool is announced with the listing that changed it.
+        if !changes.changed.is_empty() {
+            let Some(job) = Announcement::tools_changed(installation_id, now).job() else {
+                return Err(ToolError::Unavailable);
+            };
+            insert_job(
+                &mut *transaction,
+                &Scope::Workspace(organization_id, workspace_id),
+                &job.kind,
+                job.payload,
+                job.options,
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(event = "tools.announcement_not_queued", %error);
+                ToolError::Unavailable
+            })?;
+        }
         transaction.commit().await.map_err(failed("record_listing"))?;
         for names in [
             &mut changes.added,
@@ -446,7 +468,12 @@ mod tests {
             database,
             directory: _directory,
         } = temporary().await;
-        zupflow_conformance::tool_registry::run(&SqliteToolRegistry::new(database.clone()), prepare(database)).await;
+        zupflow_conformance::tool_registry::run(
+            &SqliteToolRegistry::new(database.clone()),
+            &crate::SqliteJobQueue::new(database.clone()),
+            prepare(database),
+        )
+        .await;
     }
 
     /// An installation's tools go with it, and so do a workspace's, while a

@@ -510,6 +510,9 @@ impl JobQueue for RefusingQueue {
     async fn retry(&self, _: &Scope, _: JobId, _: &LeaseToken, _: Duration, _: &Name) -> Result<Retry, JobError> {
         Err(JobError::Unavailable)
     }
+    async fn postpone(&self, _: &Scope, _: JobId, _: &LeaseToken, _: Duration) -> Result<(), JobError> {
+        Err(JobError::Unavailable)
+    }
     async fn bury(&self, _: &Scope, _: JobId, _: &LeaseToken, _: &Name) -> Result<(), JobError> {
         Err(JobError::Unavailable)
     }
