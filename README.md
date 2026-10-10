@@ -21,9 +21,10 @@ packages/
 server/           The Rust backend — a Cargo workspace
   crates/zupflow-core/        Shared types and the external-resource traits: typed IDs, API errors, scopes,
                               KeyService, Cache, ObjectStore, EventBus, JobQueue, Identity,
-                              the organizations, workspaces, API key, app, installation and tool stores
+                              ModelCatalog, the organizations, workspaces, API key, app, installation, tool
+                              and agent stores
   crates/zupflow-basic/       The basic implementations: local keys, an in-memory cache, local files,
-                              an in-process event bus, local sign-in
+                              an in-process event bus, local sign-in, the configured model catalog
   crates/zupflow-sqlite/      The basic database: SQLite, its migrations, the stores, the job queue
   crates/zupflow-oidc/        Console sign-in through any OpenID Connect provider
   crates/zupflow-outbound/    The safe outbound HTTP path: public HTTPS only, no redirects, bounded
@@ -108,7 +109,17 @@ path. An OAuth app's consent starts from the hosted page with a single-use
 (HTTP Basic), identifies the account at the app's `identity_url`, seals the
 tokens for the installation and sends the browser back to the hosted page;
 every other path answers the API's `404` envelope, and an unsupported method
-on a served path the `405` one.
+on a served path the `405` one. It also serves the models an agent can use,
+and agents and their grants: a grant names tools of one installation of the
+same workspace, and only tools that installation's registry holds and doesn't
+hold as gone (`422 unknown_tool`, `422 tool_gone`); a tool that goes later
+stays in the grant, refused when called.
+
+The models are the deployment's to list, in `ZUPFLOW_MODELS`: a JSON array
+of `{"id", "name", "provider", "description"}` objects in the order to offer
+them (`description` optional; IDs of letters, digits and `. - _ : / @`, each
+once; any other field refused). Unset, or `[]`, offers none, and creating an
+agent is refused until one is listed. Nothing calls a model yet.
 
 Once an installation connects, a background worker in the same process lists
 its app's tools from the app's MCP server (Streamable HTTP, through the safe

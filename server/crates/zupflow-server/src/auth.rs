@@ -39,6 +39,10 @@ pub struct AppState {
     pub workspaces: Arc<dyn WorkspaceStore>,
     pub apps: Arc<dyn AppStore>,
     pub installations: Arc<dyn InstallationStore>,
+    /// Agents and their grants, held to the tool registry (decision 0040).
+    pub agents: Arc<dyn zupflow_core::agents::AgentStore>,
+    /// The models agents can use.
+    pub models: Arc<dyn zupflow_core::models::ModelCatalog>,
     pub connect: Arc<dyn ConnectStore>,
     /// Seals the secrets Zupflow holds (decision 0033).
     pub keys: Arc<dyn KeyService>,

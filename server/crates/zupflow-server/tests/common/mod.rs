@@ -17,6 +17,12 @@ use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundReques
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{Database, SqliteApiKeyStore, SqliteOrganizationStore, SqliteWorkspaceStore};
 
+/// The models a test server offers, as `ZUPFLOW_MODELS` would list them.
+pub const MODELS: &str = r#"[
+    {"id":"model-a","name":"Model A","provider":"Example","description":"The default."},
+    {"id":"model-b","name":"Model B","provider":"Example"}
+]"#;
+
 pub struct TestIdentity;
 
 #[async_trait]
@@ -263,6 +269,8 @@ impl Server {
             workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
             apps: Arc::new(zupflow_sqlite::SqliteAppStore::new(database.clone())),
             installations: Arc::new(zupflow_sqlite::SqliteInstallationStore::new(database.clone())),
+            agents: Arc::new(zupflow_sqlite::SqliteAgentStore::new(database.clone())),
+            models: Arc::new(zupflow_basic::configured_models::ConfiguredModels::parse(MODELS).unwrap()),
             connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
             jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
             tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),

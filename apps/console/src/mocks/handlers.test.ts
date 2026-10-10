@@ -1902,6 +1902,102 @@ describe("installation tools", () => {
     expect(changedAt).not.toBeNull();
   });
 
+  it("leaves a grant alone when its tool goes, and refuses to grant the gone tool again", async () => {
+    const { qa, installation } = await connectEcho();
+    const models = await owner.models.list();
+    const agent = await owner.agents.create(qa.id, {
+      name: "Echo probe",
+      description: "",
+      model: must(models[0]).id,
+      instructions: "",
+    });
+    const grant = await owner.grants.create(qa.id, agent.id, {
+      installation_id: installation.id,
+      tools: ["echo", "echo_write"],
+      approval_required: ["echo_write"],
+    });
+    // The server stops listing echo_write.
+    const echoApp = app("echo-server");
+    echoApp.tools = echoApp.tools.filter((t) => t.name !== "echo_write");
+    await owner.installations.refreshTools(qa.id, installation.id);
+    const tools = await allTools(qa.id, installation.id);
+    expect(must(tools.find((t) => t.name === "echo_write")).status).toBe("gone");
+    // The grant isn't rewritten: the run engine refuses the gone tool when it's called.
+    expect(await owner.grants.list(qa.id, agent.id)).toEqual([grant]);
+    const kept = await failure(
+      owner.grants.update(qa.id, agent.id, grant.id, {
+        tools: ["echo", "echo_write"],
+        approval_required: ["echo_write"],
+      }),
+    );
+    expect([kept.status, kept.code, kept.fields]).toEqual([422, "tool_gone", { tools: expect.any(String) }]);
+    const trimmed = await owner.grants.update(qa.id, agent.id, grant.id, { tools: ["echo"], approval_required: [] });
+    expect(trimmed.tools).toEqual(["echo"]);
+  });
+
+  it("checks grants against the installation's own registry, not its app's definitions", async () => {
+    const { qa, installation } = await connectEcho();
+    const agent = await owner.agents.create(qa.id, {
+      name: "Registry only",
+      description: "",
+      model: must((await owner.models.list())[0]).id,
+      instructions: "",
+    });
+    // The app defines a tool its server hasn't listed to this account yet: it isn't grantable.
+    app("echo-server").tools.push({
+      name: "echo_later",
+      title: "Later",
+      description: "Not listed yet.",
+      effect: "read",
+    });
+    const unlisted = await failure(
+      owner.grants.create(qa.id, agent.id, {
+        installation_id: installation.id,
+        tools: ["echo_later"],
+        approval_required: [],
+      }),
+    );
+    expect(unlisted.code).toBe("unknown_tool");
+    // Another installation's registry doesn't count either: a row labelled with this installation's
+    // ID in another workspace is ignored.
+    const mine = must(db().installation_tools.find((t) => t.installation_id === installation.id));
+    db().installation_tools.push({ ...structuredClone(mine), name: "stray", workspace_id: ws("acme-sandbox").id });
+    const stray = await failure(
+      owner.grants.create(qa.id, agent.id, {
+        installation_id: installation.id,
+        tools: ["stray"],
+        approval_required: [],
+      }),
+    );
+    expect(stray.code).toBe("unknown_tool");
+    await owner.installations.refreshTools(qa.id, installation.id);
+    const granted = await owner.grants.create(qa.id, agent.id, {
+      installation_id: installation.id,
+      tools: ["echo_later"],
+      approval_required: [],
+    });
+    expect(granted.tools).toEqual(["echo_later"]);
+  });
+
+  it("seeds only grants of tools their installation's registry holds, none gone", () => {
+    const d = db();
+    expect(d.grants.length).toBeGreaterThan(0);
+    for (const grant of d.grants) {
+      const registry = d.installation_tools.filter(
+        (t) =>
+          t.organization_id === grant.organization_id &&
+          t.workspace_id === grant.workspace_id &&
+          t.installation_id === grant.installation_id,
+      );
+      for (const name of grant.tools) {
+        const tool = registry.find((t) => t.name === name);
+        expect(tool, `${grant.id} grants ${name}`).toBeDefined();
+        expect(tool?.gone_at, `${grant.id} grants ${name}, which is gone`).toBeNull();
+      }
+      expect(grant.approval_required.every((name) => grant.tools.includes(name))).toBe(true);
+    }
+  });
+
   it("seeds a Sandbox installation with a changed tool and a gone one", async () => {
     const sandbox = ws("acme-sandbox");
     const installation = must(

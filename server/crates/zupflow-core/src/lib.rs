@@ -1,5 +1,6 @@
 //! Types every part of the Zupflow backend shares.
 //!
+//! - [`agents`]: agents and their grants of installations' tools, and their store.
 //! - [`api_keys`]: API keys, their hashing and their store.
 //! - [`apps`]: catalog apps and workspace apps, and their store.
 //! - [`connect`]: Connect settings and sessions, and their store.
@@ -14,12 +15,14 @@
 //! - [`idempotency`]: idempotency keys for `POST`, and their store.
 //! - [`identity`]: Console sign-in, the [`identity::Identity`] trait.
 //! - [`installations`]: connected accounts, their sealed credentials and their store.
+//! - [`models`]: the models agents can use, the [`models::ModelCatalog`] trait.
 //! - [`outbound`]: the one path every outbound call takes, and which addresses are public.
 //! - [`organizations`]: organizations, members and users, and their store.
 //! - [`time`]: instants as stored and as the API writes them.
 //! - [`tools`]: the tools apps' MCP servers list, pinned, and their registry.
 //! - [`workspaces`]: workspaces and their store.
 
+pub mod agents;
 pub mod api_keys;
 pub mod apps;
 pub mod connect;
@@ -32,6 +35,7 @@ pub mod ids;
 pub mod installations;
 pub mod jobs;
 pub mod keys;
+pub mod models;
 pub mod organizations;
 pub mod outbound;
 pub mod scope;

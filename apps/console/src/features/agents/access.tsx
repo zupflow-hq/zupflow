@@ -1,12 +1,12 @@
 import { Link } from "@tanstack/react-router";
-import type { Agent, AgentGrant, Installation, Organization, ToolDefinition, Workspace } from "@zupflow/sdk";
+import type { Agent, AgentGrant, Installation, InstallationTool, Organization, Workspace } from "@zupflow/sdk";
 import { AlertTriangleIcon, PlugIcon, ShieldIcon } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { ConfirmDialog } from "@/components/app/confirm-dialog";
 import { AppIcon, QueryError, RowsSkeleton } from "@/components/app/misc";
 import { Panel } from "@/components/app/page";
-import { InstallationStatusPill, ToolEffectTag } from "@/components/app/status";
+import { InstallationStatusPill, StatusPill, ToolEffectTag } from "@/components/app/status";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
@@ -20,20 +20,15 @@ import {
   useDeleteGrant,
   useGrants,
   useInstallations,
-  useOrgApp,
+  useInstallationTools,
   useUpdateGrant,
-  useWorkspaceApp,
 } from "@/features/queries";
 import { toastError } from "@/lib/errors";
 import { cn } from "@/lib/utils";
 
-/** Tools of an installation's app, from whichever scope owns the app. */
-function useInstallationTools(org: Organization, workspace: Workspace, installation: Installation) {
-  const isOrgApp = installation.app.owner_scope === "organization";
-  const orgApp = useOrgApp(org.id, isOrgApp ? installation.app.id : undefined);
-  const wsApp = useWorkspaceApp(workspace.id, isOrgApp ? undefined : installation.app.id);
-  const query = isOrgApp ? orgApp : wsApp;
-  return { tools: query.data?.tools, error: query.error, isPending: query.isPending, refetch: query.refetch };
+/** "a", "a and b", "a, b and c". */
+function listed(names: string[]): string {
+  return names.length <= 1 ? (names[0] ?? "") : `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
 }
 
 export function AgentAccess({ org, workspace, agent }: { org: Organization; workspace: Workspace; agent: Agent }) {
@@ -129,7 +124,12 @@ function GrantCard({
   installation: Installation;
   grant: AgentGrant | undefined;
 }) {
-  const { tools, error, isPending, refetch } = useInstallationTools(org, workspace, installation);
+  // The installation's own registry, a page at a time: what its app listed to this account.
+  const registry = useInstallationTools(workspace.id, installation.id);
+  const items = registry.data?.pages.flatMap((page) => page.items) ?? [];
+  // A gone tool is never offered. One the grant still holds is refused when called, and saving drops it.
+  const offered = items.filter((t) => t.status !== "gone");
+  const gone = new Set(items.filter((t) => t.status === "gone").map((t) => t.name));
   const [editing, setEditing] = useState(false);
   const [revoking, setRevoking] = useState(false);
   const create = useCreateGrant(workspace.id, agent.id);
@@ -144,14 +144,19 @@ function GrantCard({
     setApproval(initial.approval);
   }, [initial]);
 
+  const goneGranted = selected.filter((t) => gone.has(t));
+  const titleOf = (name: string) => items.find((t) => t.name === name)?.pinned.title ?? name;
+  const granted = grant ? grant.tools.filter((t) => !gone.has(t)).length : 0;
+  const toSave = selected.filter((t) => !gone.has(t));
   const open = Boolean(grant) || editing;
   const dirty =
+    goneGranted.length > 0 ||
     selected.length !== initial.tools.length ||
     selected.some((t) => !initial.tools.includes(t)) ||
     approval.length !== initial.approval.length ||
     approval.some((t) => !initial.approval.includes(t));
 
-  const toggleTool = (tool: ToolDefinition, on: boolean) => {
+  const toggleTool = (tool: InstallationTool, on: boolean) => {
     setSelected((s) => (on ? [...s, tool.name] : s.filter((t) => t !== tool.name)));
     if (on && tool.effect === "destructive") setApproval((a) => [...new Set([...a, tool.name])]);
     if (!on) setApproval((a) => a.filter((t) => t !== tool.name));
@@ -165,8 +170,9 @@ function GrantCard({
       },
       onError: (e: unknown) => toastError(e, "Couldn't save access"),
     };
-    if (grant) update.mutate({ grantId: grant.id, tools: selected, approval_required: approval }, done);
-    else create.mutate({ installation_id: installation.id, tools: selected, approval_required: approval }, done);
+    const input = { tools: toSave, approval_required: approval.filter((t) => toSave.includes(t)) };
+    if (grant) update.mutate({ grantId: grant.id, ...input }, done);
+    else create.mutate({ installation_id: installation.id, ...input }, done);
   };
 
   const pending = create.isPending || update.isPending;
@@ -191,7 +197,9 @@ function GrantCard({
         {grant ? (
           <>
             <span className="tabular text-sm text-muted-foreground">
-              {grant.tools.length} of {tools?.length ?? "…"} tools
+              {registry.data && !registry.hasNextPage
+                ? `${granted} of ${offered.length} tools`
+                : `${granted} ${granted === 1 ? "tool" : "tools"}`}
             </span>
             {mayChange ? (
               <Button
@@ -219,18 +227,47 @@ function GrantCard({
               Calls through this installation fail until it is reconnected.
             </p>
           ) : null}
-          {error ? (
-            <QueryError error={error} onRetry={() => refetch()} what="this app's tools" className="m-3" />
-          ) : isPending || !tools ? (
+          {goneGranted.length > 0 ? (
+            <p className="flex items-start gap-2 border-b bg-warning-soft/40 px-4 py-2 text-sm">
+              <AlertTriangleIcon className="mt-0.5 size-4 shrink-0 text-warning" />
+              <span className="min-w-0 break-words">
+                {installation.app.name} no longer offers {listed(goneGranted.map(titleOf))}. Calls to{" "}
+                {goneGranted.length === 1 ? "it" : "them"} are refused
+                {!mayChange
+                  ? "."
+                  : toSave.length > 0
+                    ? `, and saving removes ${goneGranted.length === 1 ? "it" : "them"} from this grant.`
+                    : ". Nothing else is granted here, so revoke access instead."}
+              </span>
+            </p>
+          ) : null}
+          {registry.isError ? (
+            <QueryError
+              error={registry.error}
+              onRetry={() => registry.refetch()}
+              what="this installation's tools"
+              className="m-3"
+            />
+          ) : registry.isPending ? (
             <div className="space-y-3 p-4">
               <Skeleton className="h-4 w-2/3" />
               <Skeleton className="h-4 w-1/2" />
             </div>
+          ) : offered.length === 0 && !registry.hasNextPage ? (
+            <div className="p-6 text-center text-sm">
+              <p className="font-medium">No tools to grant yet</p>
+              <p className="mt-1 text-muted-foreground">
+                {installation.status === "connected"
+                  ? `Tools appear here once ${installation.app.name} lists them to this account.`
+                  : "Tools are listed once an account is connected."}
+              </p>
+            </div>
           ) : (
             <ul className="divide-y">
-              {tools.map((tool) => {
+              {offered.map((tool) => {
                 const checked = selected.includes(tool.name);
                 const id = `${installation.id}-${tool.name}`;
+                const title = tool.pinned.title ?? tool.name;
                 return (
                   <li key={tool.name} className="flex items-center gap-3 px-4 py-2.5">
                     <Checkbox
@@ -246,11 +283,19 @@ function GrantCard({
                         mayChange && "cursor-pointer",
                       )}
                     >
-                      <span className="flex flex-wrap items-center gap-2">
-                        <span className="font-medium">{tool.title}</span>
+                      <span className="flex min-w-0 flex-wrap items-center gap-2">
+                        <span className="break-words font-medium">{title}</span>
                         <ToolEffectTag effect={tool.effect} />
+                        {tool.status === "changed" ? <StatusPill tone="warning">Changed</StatusPill> : null}
                       </span>
-                      <span className="text-xs text-muted-foreground">{tool.description}</span>
+                      {tool.pinned.description ? (
+                        <span className="text-xs break-words text-muted-foreground">{tool.pinned.description}</span>
+                      ) : null}
+                      {tool.status === "changed" ? (
+                        <span className="text-xs text-muted-foreground">
+                          Its definition changed. Calls use it as first listed until the change is reviewed.
+                        </span>
+                      ) : null}
                     </Label>
                     <div className={cn("flex shrink-0 items-center gap-2", !checked && "opacity-40")}>
                       <Label
@@ -261,7 +306,7 @@ function GrantCard({
                       </Label>
                       <Switch
                         id={`${id}-approval`}
-                        aria-label={`Require approval for ${tool.title}`}
+                        aria-label={`Require approval for ${title}`}
                         disabled={!checked || !mayChange}
                         checked={approval.includes(tool.name)}
                         onCheckedChange={(on) =>
@@ -274,7 +319,20 @@ function GrantCard({
               })}
             </ul>
           )}
-          {dirty || (editing && !grant) ? (
+          {registry.hasNextPage ? (
+            <div className="flex justify-center border-t px-4 py-3">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => registry.fetchNextPage()}
+                disabled={registry.isFetchingNextPage}
+              >
+                {registry.isFetchingNextPage ? <Spinner /> : null}
+                Show more tools
+              </Button>
+            </div>
+          ) : null}
+          {mayChange && (dirty || (editing && !grant)) ? (
             <div className="flex items-center justify-end gap-2 border-t px-4 py-3">
               <Button
                 variant="ghost"
@@ -287,7 +345,7 @@ function GrantCard({
               >
                 Cancel
               </Button>
-              <Button size="sm" disabled={pending || selected.length === 0} onClick={save}>
+              <Button size="sm" disabled={pending || toSave.length === 0} onClick={save}>
                 {pending ? <Spinner /> : null}
                 {grant ? "Save access" : "Grant access"}
               </Button>

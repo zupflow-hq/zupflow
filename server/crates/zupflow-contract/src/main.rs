@@ -26,14 +26,18 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
+use zupflow_basic::configured_models::ConfiguredModels;
 use zupflow_basic::local_keys::LocalKeyService;
+use zupflow_core::agents::{AgentStore, GrantTools, NewAgent};
 use zupflow_core::api_keys::{ApiKeyHasher, ApiKeyStore, NewApiKey, NewSecret};
 use zupflow_core::apps::AppStore;
 use zupflow_core::connect::{ConnectIntent, ConnectStore, NewConnectSession, Reference};
 use zupflow_core::environment::Environment;
 use zupflow_core::idempotency::Fingerprinter;
 use zupflow_core::identity::{Identity, IdentityError, Profile, VerifiedIdentity};
-use zupflow_core::ids::{ApiKeyId, AppId, ConnectSessionId, InstallationId, OrganizationId, WorkspaceId};
+use zupflow_core::ids::{
+    AgentId, ApiKeyId, AppId, ConnectSessionId, GrantId, InstallationId, OrganizationId, WorkspaceId,
+};
 use zupflow_core::installations::{InstallationStore, InstalledApp, TemplateSnapshot};
 use zupflow_core::organizations::{MemberRole, OrganizationStore, User};
 use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse, Refusal};
@@ -42,8 +46,8 @@ use zupflow_core::tools::{ListedTool, ToolRegistry, ToolRevision};
 use zupflow_core::workspaces::{NewWorkspace, WorkspaceStore};
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{
-    Database, SqliteApiKeyStore, SqliteAppStore, SqliteConnectStore, SqliteIdempotencyStore, SqliteInstallationStore,
-    SqliteOrganizationStore, SqliteToolRegistry, SqliteWorkspaceStore,
+    Database, SqliteAgentStore, SqliteApiKeyStore, SqliteAppStore, SqliteConnectStore, SqliteIdempotencyStore,
+    SqliteInstallationStore, SqliteOrganizationStore, SqliteToolRegistry, SqliteWorkspaceStore,
 };
 
 /// The personas, with the address each signs in with: people's names, as in
@@ -55,6 +59,14 @@ const PERSONAS: [(&str, &str); 4] = [
     ("viewer", "sam@northwind.example"),
     ("outsider", "riley@larkspur.example"),
 ];
+
+/// The models the server offers, as `ZUPFLOW_MODELS` lists them. Fictional:
+/// the suite takes whichever model the server lists first.
+const MODELS: &str = r#"[
+    {"id":"model-balanced","name":"Balanced","provider":"Example","description":"Balanced default for tool-heavy work."},
+    {"id":"model-capable","name":"Capable","provider":"Example","description":"Most capable. Long, multi-step tasks."},
+    {"id":"model-fast","name":"Fast","provider":"Example","description":"Fast and inexpensive. Simple lookups."}
+]"#;
 
 /// Signs in `Bearer contract:{persona}` as that persona; anything else is 401.
 struct PersonaIdentity;
@@ -132,6 +144,8 @@ async fn serve(path: &str) -> Result<(), String> {
         workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
         apps: Arc::new(SqliteAppStore::new(database.clone())),
         installations: Arc::new(SqliteInstallationStore::new(database.clone())),
+        agents: Arc::new(SqliteAgentStore::new(database.clone())),
+        models: Arc::new(ConfiguredModels::parse(MODELS).map_err(|error| error.to_string())?),
         connect: Arc::new(SqliteConnectStore::new(database.clone())),
         jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
         tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),
@@ -336,6 +350,7 @@ async fn reset(path: &str) -> Result<(), String> {
 
     // Connected installations, each with its credential sealed as Connect seals it.
     let installations = SqliteInstallationStore::new(database.clone());
+    let tools = SqliteToolRegistry::new(database.clone());
     let mut installed: Vec<(OrganizationId, WorkspaceId, InstallationId, &str)> = Vec::new();
     for (organization, workspace, slug, label) in [
         (northwind.id, "acme", "google-workspace", "Marketing"),
@@ -379,16 +394,36 @@ async fn reset(path: &str) -> Result<(), String> {
             .await
             .map_err(|error| fail(label)(&error))?;
         installed.push((organization, workspace, installation_id, label));
+        // Discovered as connected: the app's own tools, each as first listed.
+        // The Sandbox's Engineering has listings of its own, below.
+        if label == "Engineering" {
+            continue;
+        }
+        let listing: Vec<ListedTool> = found
+            .tools
+            .iter()
+            .map(|tool| {
+                fixture_tool(
+                    &tool.name,
+                    &tool.title,
+                    &tool.description,
+                    tool.effect == zupflow_core::apps::ToolEffect::Read,
+                )
+            })
+            .collect();
+        tools
+            .record_listing(organization, workspace, installation_id, &listing, Timestamp::now())
+            .await
+            .map_err(|error| fail("tools")(&error))?;
     }
 
-    // Tools discovered for the Sandbox's installation, as two listings left
-    // them: one tool as first listed, one changed since, one gone.
+    // The Sandbox's installation's tools, as two later listings left them:
+    // one tool as first listed, one changed since, one gone.
     let (organization, workspace, installation_id, _) = installed
         .iter()
         .find(|(_, _, _, label)| *label == "Engineering")
         .copied()
         .ok_or("installation Engineering")?;
-    let tools = SqliteToolRegistry::new(database.clone());
     for (listing, at) in [
         (
             vec![
@@ -416,6 +451,106 @@ async fn reset(path: &str) -> Result<(), String> {
             .await
             .map_err(|error| fail("tools")(&error))?;
     }
+
+    // Agents, as the mock seeds them: in each workspace the suite expects
+    // one, an active agent granted tools of its installation; in `acme`, a
+    // paused one with none too.
+    let agents = SqliteAgentStore::new(database.clone());
+    let installation_of = |label: &str| {
+        installed
+            .iter()
+            .find(|(_, _, _, installed)| *installed == label)
+            .copied()
+            .ok_or_else(|| format!("installation {label}"))
+    };
+    for (label, name, model, granted, approval) in [
+        (
+            "Marketing",
+            "Publishing assistant",
+            "model-balanced",
+            &["search_files", "read_document", "create_document"][..],
+            &[][..],
+        ),
+        (
+            "Google",
+            "Ops assistant",
+            "model-balanced",
+            &["list_events", "search_files", "read_document", "send_email"],
+            &["send_email"],
+        ),
+        (
+            "Engineering",
+            "Product scribe",
+            "model-balanced",
+            &["search_issues", "create_issue"],
+            &[],
+        ),
+        (
+            "Echo",
+            "Echo bot",
+            "model-fast",
+            &["echo", "echo_write"],
+            &["echo_write"],
+        ),
+        ("Harbor", "Harbor assistant", "model-balanced", &["search_issues"], &[]),
+    ] {
+        let (organization, workspace, installation_id, _) = installation_of(label)?;
+        let agent = agents
+            .create_agent(
+                organization,
+                workspace,
+                AgentId::generate(),
+                &NewAgent {
+                    name: name.to_owned(),
+                    description: format!("{name}, for the contract suite."),
+                    model: model.to_owned(),
+                    instructions: "Be brief.".to_owned(),
+                },
+            )
+            .await
+            .map_err(|error| fail(name)(&error))?;
+        agents
+            .create_grant(
+                organization,
+                workspace,
+                agent.id,
+                GrantId::generate(),
+                installation_id,
+                &GrantTools {
+                    tools: granted.iter().map(|tool| (*tool).to_owned()).collect(),
+                    approval_required: approval.iter().map(|tool| (*tool).to_owned()).collect(),
+                },
+            )
+            .await
+            .map_err(|error| fail(name)(&error))?;
+    }
+    let (organization, workspace) = workspace_id("acme").map(|(workspace, _)| (northwind.id, workspace))?;
+    let paused = agents
+        .create_agent(
+            organization,
+            workspace,
+            AgentId::generate(),
+            &NewAgent {
+                name: "Support concierge".to_owned(),
+                description: "Not granted any installations yet.".to_owned(),
+                model: "model-fast".to_owned(),
+                instructions: "Answer support questions briefly.".to_owned(),
+            },
+        )
+        .await
+        .map_err(|error| fail("paused agent")(&error))?;
+    agents
+        .update_agent(
+            organization,
+            workspace,
+            paused.id,
+            &zupflow_core::agents::AgentChanges {
+                status: Some(zupflow_core::agents::AgentStatus::Paused),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| fail("paused agent")(&error))?;
 
     // Connect settings: Northwind's Sandbox allows the suite's return URL,
     // Larkspur's doesn't. And a session in each workspace the suite expects one.

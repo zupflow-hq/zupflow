@@ -5,6 +5,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use zupflow_basic::configured_models::ConfiguredModels;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// `ZUPFLOW_LISTEN`: where to listen. Defaults to loopback only.
@@ -28,6 +30,10 @@ pub struct Config {
     /// server at, like `https://zupflow.example`; OAuth redirect URIs are
     /// built on it (decision 0033). Defaults to `http://localhost:{port}`.
     pub public_url: String,
+    /// `ZUPFLOW_MODELS`: the models agents can use, a JSON array like
+    /// `[{"id":"model-a","name":"Model A","provider":"Example","description":"…"}]`
+    /// (see `ConfiguredModels`). Unset offers none, so no agent can be created.
+    pub models: ConfiguredModels,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +73,8 @@ pub enum ConfigError {
     InvalidOrigins,
     #[error("ZUPFLOW_PUBLIC_URL must be an origin like https://zupflow.example, with no path")]
     InvalidPublicUrl,
+    #[error("ZUPFLOW_MODELS {0}")]
+    InvalidModels(zupflow_basic::configured_models::ModelsConfigError),
     #[error("ZUPFLOW_IDENTITY must be `local` or `oidc`")]
     UnknownIdentity,
     #[error("ZUPFLOW_IDENTITY=oidc needs {name}")]
@@ -145,6 +153,10 @@ impl Config {
             Some(value) => public_origin(value.trim()).ok_or(ConfigError::InvalidPublicUrl)?,
             None => format!("http://localhost:{}", listen.port()),
         };
+        let models = match set("ZUPFLOW_MODELS")? {
+            Some(value) => ConfiguredModels::parse(&value).map_err(ConfigError::InvalidModels)?,
+            None => ConfiguredModels::none(),
+        };
         Ok(Self {
             listen,
             log,
@@ -153,6 +165,7 @@ impl Config {
             secret_key,
             allowed_origins,
             public_url,
+            models,
         })
     }
 
@@ -321,6 +334,34 @@ mod tests {
         ));
         let unknown = Config::from_vars(|name| Ok((name == "ZUPFLOW_IDENTITY").then(|| "none".to_owned())));
         assert!(matches!(unknown, Err(ConfigError::UnknownIdentity)));
+    }
+
+    #[test]
+    fn offers_the_models_it_is_given_and_stops_on_a_mistyped_list() {
+        let models = |value: &'static str| {
+            Config::from_vars(move |name| Ok((name == "ZUPFLOW_MODELS").then(|| value.to_owned())))
+        };
+        assert_eq!(
+            Config::from_vars(|_| Ok(None)).expect("defaults").models,
+            ConfiguredModels::none(),
+            "none unless configured"
+        );
+        assert_eq!(models("[]").expect("an empty list").models, ConfiguredModels::none());
+        assert_eq!(
+            models(r#"[{"id":"model-a","name":"Model A","provider":"Example"}]"#)
+                .expect("a model")
+                .models,
+            ConfiguredModels::parse(r#"[{"id":"model-a","name":"Model A","provider":"Example","description":""}]"#)
+                .expect("the same model")
+        );
+        for bad in [
+            "model-a",
+            r#"[{"id":"model-a"}]"#,
+            r#"{"id":"model-a","name":"A","provider":"P"}"#,
+        ] {
+            assert!(matches!(models(bad), Err(ConfigError::InvalidModels(_))), "{bad}");
+        }
+        assert!(matches!(models(""), Err(ConfigError::Empty { name: "ZUPFLOW_MODELS" })));
     }
 
     #[test]

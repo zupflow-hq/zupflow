@@ -4,6 +4,7 @@
 //! configuration, logging, the adapters and the listener. Tests drive [`app`]
 //! directly.
 
+pub mod agents;
 pub mod api_keys;
 pub mod app_configurations;
 pub mod apps;
@@ -31,7 +32,7 @@ pub use guard::RequestGuard;
 /// The contract's operations this server serves so far, by `operationId`. The
 /// shared contract suite skips, by name, any case that needs another one; a
 /// test holds this list equal to the routes the router actually answers.
-pub const SERVED_OPERATIONS: [&str; 46] = [
+pub const SERVED_OPERATIONS: [&str; 56] = [
     "getViewer",
     "createOrganization",
     "getOrganization",
@@ -78,6 +79,16 @@ pub const SERVED_OPERATIONS: [&str; 46] = [
     "cancelConnect",
     "submitConnectCredentials",
     "authorizeConnect",
+    "listModels",
+    "listAgents",
+    "createAgent",
+    "getAgent",
+    "updateAgent",
+    "deleteAgent",
+    "listGrants",
+    "createGrant",
+    "updateGrant",
+    "deleteGrant",
 ];
 
 /// The whole HTTP surface. Every response under `/v1` is the envelope; the
@@ -94,6 +105,7 @@ pub fn app(state: AppState, guard: RequestGuard) -> Router {
         .merge(app_configurations::routes())
         .merge(installations::routes())
         .merge(connect::routes())
+        .merge(agents::routes())
         // Matched routes only, after routing, so the middleware knows the route's template.
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

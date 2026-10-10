@@ -2,6 +2,7 @@
 //! real and supported, not test doubles: a single-node Zupflow runs on them.
 //! Each passes its trait's conformance suite.
 
+pub mod configured_models;
 pub mod in_process_events;
 #[cfg(unix)]
 pub mod local_files;

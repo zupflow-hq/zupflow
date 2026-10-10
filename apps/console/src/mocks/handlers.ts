@@ -2316,6 +2316,12 @@ export function createHandlers(apiBase: string) {
   ];
 }
 
+/**
+ * A grant names tools in its installation's registry (decision 0040): a tool
+ * that isn't there, or is gone, is refused; a changed one can be granted, and
+ * calls get its pinned definition. Grants already holding a tool that later
+ * goes aren't rewritten: calls to it are refused when they're made.
+ */
 function validateTools(
   access: WorkspaceAccess,
   installation: InstallationRow,
@@ -2323,14 +2329,21 @@ function validateTools(
   approvalRequired: string[],
 ) {
   if (!inWorkspace(installation, access.workspace)) throw notFound("Installation");
-  const app = appInScope(installation);
-  const known = new Set(app?.tools.map((t) => t.name));
-  const unknown = tools.find((t) => !known.has(t));
-  if (unknown) {
-    throw new ApiFailure(422, "unknown_tool", `${unknown} isn't a tool of ${app?.name ?? "this app"}.`);
+  const registry = new Map(toolsOf(db(), installation).map((t) => [t.name, t]));
+  for (const name of tools) {
+    const tool = registry.get(name);
+    if (!tool) {
+      const message = `${name} isn't a tool of ${installation.label}. Refresh its tools if the app added it.`;
+      throw new ApiFailure(422, "unknown_tool", message, { tools: message });
+    }
+    if (tool.gone_at !== null) {
+      const message = `${name} is no longer offered by ${installation.label}. Remove it from the grant.`;
+      throw new ApiFailure(422, "tool_gone", message, { tools: message });
+    }
   }
   const outside = approvalRequired.find((t) => !tools.includes(t));
   if (outside) {
-    throw new ApiFailure(422, "approval_outside_grant", `${outside} requires approval but isn't granted.`);
+    const message = `${outside} requires approval but isn't granted.`;
+    throw new ApiFailure(422, "approval_outside_grant", message, { approval_required: message });
   }
 }

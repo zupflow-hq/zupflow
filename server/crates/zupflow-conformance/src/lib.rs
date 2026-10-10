@@ -8,6 +8,7 @@
 // A suite reports a broken rule by panicking, like any assertion.
 #![allow(clippy::unwrap_used, clippy::panic)]
 
+pub mod agent_store;
 pub mod api_key_store;
 pub mod app_store;
 pub mod cache;
@@ -19,6 +20,7 @@ mod imitations;
 pub mod installation_store;
 pub mod job_queue;
 pub mod key_service;
+pub mod model_catalog;
 pub mod object_store;
 pub mod organization_store;
 pub mod tool_registry;

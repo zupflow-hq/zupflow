@@ -1,6 +1,7 @@
 //! Zupflow's basic database: SQLite, embedded, in one file.
 //!
 //! - [`Database`]: opens the file, sets it up and applies the migrations.
+//! - [`SqliteAgentStore`]: agents and their grants, held to the tool registry.
 //! - [`SqliteApiKeyStore`]: API keys, by keyed hash.
 //! - [`SqliteAppStore`]: catalog apps and workspace apps.
 //! - [`SqliteConnectStore`]: Connect settings and sessions.
@@ -15,6 +16,7 @@
 //! once merged: a change is a new migration. The schema test in `schema.rs`
 //! holds every table to the tenant-isolation rules.
 
+mod agents;
 mod api_keys;
 mod apps;
 mod connect;
@@ -28,6 +30,7 @@ mod schema;
 mod tools;
 mod workspaces;
 
+pub use agents::SqliteAgentStore;
 pub use api_keys::SqliteApiKeyStore;
 pub use apps::SqliteAppStore;
 pub use connect::SqliteConnectStore;

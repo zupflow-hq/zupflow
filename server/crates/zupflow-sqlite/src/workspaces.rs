@@ -288,16 +288,20 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
     ) -> Result<WorkspaceStats, WorkspaceError> {
-        let installations: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM installations WHERE organization_id = ? AND workspace_id = ?")
-                .bind(organization_id.uuid())
-                .bind(workspace_id.uuid())
-                .fetch_one(self.database.pool())
-                .await
-                .map_err(failed("load_stats"))?;
-        // Agents and runs arrive with their tables; until then a workspace has none.
+        let (agents, installations): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM agents WHERE organization_id = ?1 AND workspace_id = ?2), \
+             (SELECT count(*) FROM installations WHERE organization_id = ?1 AND workspace_id = ?2)",
+        )
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .fetch_one(self.database.pool())
+        .await
+        .map_err(failed("load_stats"))?;
+        let count = |n: i64| u64::try_from(n).map_err(|_| WorkspaceError::Unavailable);
+        // Runs arrive with their table; until then a workspace has none.
         Ok(WorkspaceStats {
-            installations: u64::try_from(installations).map_err(|_| WorkspaceError::Unavailable)?,
+            agents: count(agents)?,
+            installations: count(installations)?,
             ..WorkspaceStats::default()
         })
     }

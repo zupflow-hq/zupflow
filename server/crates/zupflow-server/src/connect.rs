@@ -1027,7 +1027,13 @@ async fn submit_credentials(
     crate::discovery::enqueue(&state, session.organization_id, session.workspace_id, installation.id)
         .await
         .ok();
-    let installation = installation_view(&app, installation);
+    // The installation is connected already: a count that can't be read
+    // doesn't fail the answer (the store has logged why).
+    let grants =
+        crate::installations::grant_count(&state, session.organization_id, session.workspace_id, installation.id)
+            .await
+            .unwrap_or_default();
+    let installation = installation_view(&app, installation, grants);
     Ok(envelope(
         StatusCode::OK,
         ConnectResultView {

@@ -249,11 +249,8 @@ export function contractSuite(target: Target) {
         await owner.connect.submitCredentials(referenceOf(tokenSession), { values: { token: "abc" } });
         await owner.connect.authorize(referenceOf(await session(fx.apps.googleWorkspace, sandbox.id)));
 
-        // The rest of the API.
+        // Models, agents and their grants.
         await owner.models.list();
-        await owner.organizations.usage(org, "production");
-
-        // Agents, grants and runs.
         const agent = must(
           (await owner.agents.list(acme.id)).find((a) => a.status === "active"),
           "active agent in acme",
@@ -279,6 +276,9 @@ export function contractSuite(target: Target) {
         });
         await owner.grants.delete(acme.id, newAgent.id, newGrant.id);
         await owner.agents.delete(acme.id, newAgent.id);
+
+        // The rest of the API.
+        await owner.organizations.usage(org, "production");
         await owner.organizationRuns.list(org, { environment: "production" });
         const run = must((await owner.runs.list(acme.id)).items[0], "run in acme");
         await owner.runs.get(acme.id, run.id);
@@ -1090,7 +1090,7 @@ export function contractSuite(target: Target) {
         expect(error.status).toBe(404);
       });
 
-      it("rejects tools the app doesn't have and approvals outside the grant", async () => {
+      it("rejects tools the installation doesn't list and approvals outside the grant", async () => {
         const qa = fx.workspaces.qaPlayground.id;
         const agent = await owner.agents.create(qa, {
           name: "Probe",
@@ -1109,7 +1109,11 @@ export function contractSuite(target: Target) {
             approval_required: [],
           }),
         );
-        expect(unknown.code).toBe("unknown_tool");
+        expect([unknown.status, unknown.code, Object.keys(unknown.fields ?? {})]).toEqual([
+          422,
+          "unknown_tool",
+          ["tools"],
+        ]);
         const outside = await failure(
           owner.grants.create(qa, agent.id, {
             installation_id: installation.id,
@@ -1117,7 +1121,208 @@ export function contractSuite(target: Target) {
             approval_required: ["echo_write"],
           }),
         );
-        expect(outside.code).toBe("approval_outside_grant");
+        expect([outside.status, outside.code, Object.keys(outside.fields ?? {})]).toEqual([
+          422,
+          "approval_outside_grant",
+          ["approval_required"],
+        ]);
+        expect(await owner.grants.list(qa, agent.id)).toEqual([]);
+      });
+
+      it("grants what the installation's registry holds: a changed tool, never a gone one", async () => {
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const installation = must(
+          (await owner.installations.list(sandbox)).find(
+            (i) => i.status === "connected" && i.app.id === fx.apps.linear,
+          ),
+          "connected installation of linear in acme-sandbox",
+        );
+        const tools = (await owner.installations.tools(sandbox, installation.id, { limit: 100 })).items;
+        const current = must(
+          tools.find((t) => t.status === "current"),
+          "current tool",
+        ).name;
+        const changed = must(
+          tools.find((t) => t.status === "changed"),
+          "changed tool",
+        ).name;
+        const gone = must(
+          tools.find((t) => t.status === "gone"),
+          "gone tool",
+        ).name;
+        const developer = as("developer");
+        const agent = await developer.agents.create(sandbox, {
+          name: "Registry probe",
+          description: "",
+          model: await anyModel(),
+          instructions: "",
+        });
+        const goneGrant = await failure(
+          developer.grants.create(sandbox, agent.id, {
+            installation_id: installation.id,
+            tools: [current, gone],
+            approval_required: [],
+          }),
+        );
+        expect([goneGrant.status, goneGrant.code, Object.keys(goneGrant.fields ?? {})]).toEqual([
+          422,
+          "tool_gone",
+          ["tools"],
+        ]);
+
+        const grant = await developer.grants.create(sandbox, agent.id, {
+          installation_id: installation.id,
+          tools: [current, changed],
+          approval_required: [changed],
+        });
+        expect([grant.agent_id, grant.installation_id, grant.tools, grant.approval_required]).toEqual([
+          agent.id,
+          installation.id,
+          [current, changed],
+          [changed],
+        ]);
+        // One grant per agent and installation.
+        const twice = await failure(
+          developer.grants.create(sandbox, agent.id, {
+            installation_id: installation.id,
+            tools: [current],
+            approval_required: [],
+          }),
+        );
+        expect([twice.status, twice.code]).toEqual([409, "grant_exists"]);
+        // Changing it is held to the same rules, and a refused change changes nothing.
+        const refused = [
+          await failure(
+            developer.grants.update(sandbox, agent.id, grant.id, { tools: [current, gone], approval_required: [] }),
+          ),
+          await failure(
+            developer.grants.update(sandbox, agent.id, grant.id, { tools: ["not_listed"], approval_required: [] }),
+          ),
+          await failure(
+            developer.grants.update(sandbox, agent.id, grant.id, { tools: [current], approval_required: [changed] }),
+          ),
+        ];
+        expect(refused.map((e) => `${e.status} ${e.code}`)).toEqual([
+          "422 tool_gone",
+          "422 unknown_tool",
+          "422 approval_outside_grant",
+        ]);
+        expect(await developer.grants.list(sandbox, agent.id)).toEqual([grant]);
+        const updated = await developer.grants.update(sandbox, agent.id, grant.id, {
+          tools: [changed],
+          approval_required: [],
+        });
+        expect([updated.id, updated.tools, updated.approval_required]).toEqual([grant.id, [changed], []]);
+        expect((await developer.agents.get(sandbox, agent.id)).grant_count).toBe(1);
+      });
+
+      it("takes an agent's grants with the agent, and an installation's with the installation", async () => {
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const linear = must(
+          (await owner.installations.list(sandbox)).find(
+            (i) => i.status === "connected" && i.app.id === fx.apps.linear,
+          ),
+          "connected installation of linear in acme-sandbox",
+        );
+        const current = must(
+          (await owner.installations.tools(sandbox, linear.id, { limit: 100 })).items.find(
+            (t) => t.status === "current",
+          ),
+          "current tool",
+        ).name;
+        const model = await anyModel();
+        const agent = await owner.agents.create(sandbox, {
+          name: "Short-lived",
+          description: "",
+          model,
+          instructions: "",
+        });
+        await owner.grants.create(sandbox, agent.id, {
+          installation_id: linear.id,
+          tools: [current],
+          approval_required: [],
+        });
+        expect((await owner.installations.get(sandbox, linear.id)).grant_count).toBe(linear.grant_count + 1);
+        await owner.agents.delete(sandbox, agent.id);
+        expect((await owner.installations.get(sandbox, linear.id)).grant_count).toBe(linear.grant_count);
+        const deleted = await failure(owner.grants.list(sandbox, agent.id));
+        expect(`${deleted.status} ${deleted.code}`).toBe("404 not_found");
+
+        const qa = fx.workspaces.qaPlayground.id;
+        const echo = must(
+          (await owner.installations.list(qa)).find((i) => i.status === "connected" && i.app.id === fx.apps.echoServer),
+          "connected installation of echo-server in qa-playground",
+        );
+        const kept = await owner.agents.create(qa, { name: "Kept", description: "", model, instructions: "" });
+        await owner.grants.create(qa, kept.id, { installation_id: echo.id, tools: ["echo"], approval_required: [] });
+        expect((await owner.agents.get(qa, kept.id)).grant_count).toBe(1);
+        await owner.installations.delete(qa, echo.id);
+        expect(await owner.grants.list(qa, kept.id)).toEqual([]);
+        expect((await owner.agents.get(qa, kept.id)).grant_count).toBe(0);
+      });
+
+      it("keeps agents and grants to their own workspace and organization", async () => {
+        const acme = fx.workspaces.acme.id;
+        const beta = (await workspaceBySlug("beta-labs")).id;
+        const agent = must(
+          (await owner.agents.list(acme)).find((a) => a.grant_count > 0),
+          "agent with a grant in acme",
+        );
+        const grant = must((await owner.grants.list(acme, agent.id))[0], "grant in acme");
+        const outsider = as("outsider");
+        const posing = naming("outsider", () => fx.organization);
+        const change = { tools: grant.tools, approval_required: [] };
+        const attempts: [string, () => Promise<unknown>][] = [
+          ["sibling workspace", () => owner.agents.get(beta, agent.id)],
+          ["sibling workspace", () => owner.agents.update(beta, agent.id, { status: "paused" })],
+          ["sibling workspace", () => owner.agents.delete(beta, agent.id)],
+          ["sibling workspace", () => owner.grants.list(beta, agent.id)],
+          ["sibling workspace", () => owner.grants.update(beta, agent.id, grant.id, change)],
+          ["sibling workspace", () => owner.grants.delete(beta, agent.id, grant.id)],
+          ["other organization", () => outsider.agents.get(acme, agent.id)],
+          ["other organization", () => outsider.agents.list(acme)],
+          ["other organization", () => outsider.grants.list(acme, agent.id)],
+          ["other organization", () => outsider.grants.delete(acme, agent.id, grant.id)],
+          ["non-member naming it", () => posing.agents.get(acme, agent.id)],
+          ["non-member naming it", () => posing.grants.update(acme, agent.id, grant.id, change)],
+          ["non-member naming it", () => posing.agents.delete(acme, agent.id)],
+        ];
+        for (const [what, attempt] of attempts) {
+          const error = await failure(attempt());
+          expect(`${error.status} ${error.code}`, what).toBe("404 not_found");
+        }
+        expect(await owner.agents.get(acme, agent.id)).toEqual(agent);
+        expect(await owner.grants.list(acme, agent.id)).toContainEqual(grant);
+      });
+
+      it("creates and changes agents only with a model the server offers", async () => {
+        const qa = fx.workspaces.qaPlayground.id;
+        const models = await owner.models.list();
+        expect(models.length).toBeGreaterThan(0);
+        const input = { name: "  Modelled  ", description: "", model: "not-a-model", instructions: "" };
+        const refused = await failure(owner.agents.create(qa, input));
+        expect([refused.status, refused.code, Object.keys(refused.fields ?? {})]).toEqual([
+          400,
+          "validation_failed",
+          ["model"],
+        ]);
+        const agent = await owner.agents.create(qa, { ...input, model: must(models[0], "model").id });
+        expect([agent.name, agent.status, agent.grant_count, agent.runs_last_24h, agent.last_run_at]).toEqual([
+          "Modelled",
+          "active",
+          0,
+          0,
+          null,
+        ]);
+        const change = await failure(owner.agents.update(qa, agent.id, { model: "not-a-model" }));
+        expect([change.status, change.code, Object.keys(change.fields ?? {})]).toEqual([
+          400,
+          "validation_failed",
+          ["model"],
+        ]);
+        const paused = await owner.agents.update(qa, agent.id, { status: "paused" });
+        expect([paused.status, paused.model, paused.name]).toEqual(["paused", agent.model, "Modelled"]);
+        expect((await owner.agents.list(qa)).find((a) => a.id === agent.id)).toEqual(paused);
       });
 
       it("does not read another workspace's run through this workspace's path", async () => {

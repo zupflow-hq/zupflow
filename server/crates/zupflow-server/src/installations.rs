@@ -113,8 +113,52 @@ pub(crate) fn installation_app_view(app: &App, installed: InstalledApp) -> Insta
 }
 
 /// The apps an installation may be of: the organization's catalog and the
-/// workspace's own, by ID.
-struct Apps(HashMap<AppId, App>);
+/// workspace's own, by ID; and how many grants each installation has.
+struct Apps {
+    apps: HashMap<AppId, App>,
+    grants: HashMap<(WorkspaceId, InstallationId), u64>,
+}
+
+/// How many grants each of the workspace's installations has.
+async fn grants_in(
+    state: &AppState,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    grants: &mut HashMap<(WorkspaceId, InstallationId), u64>,
+) -> Result<(), Failure> {
+    let counts = state
+        .agents
+        .count_grants_by_installation(organization_id, workspace_id)
+        .await
+        .map_err(|_| unavailable_store())?;
+    grants.extend(
+        counts
+            .into_iter()
+            .map(|(installation, count)| ((workspace_id, installation), count)),
+    );
+    Ok(())
+}
+
+/// How many grants one installation has.
+pub(crate) async fn grant_count(
+    state: &AppState,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    installation_id: InstallationId,
+) -> Result<u64, Failure> {
+    let mut grants = HashMap::new();
+    grants_in(state, organization_id, workspace_id, &mut grants).await?;
+    Ok(grants.get(&(workspace_id, installation_id)).copied().unwrap_or(0))
+}
+
+fn unavailable_store() -> Failure {
+    ApiError::new(
+        503,
+        "unavailable",
+        "The service is unavailable right now. Try again shortly.",
+    )
+    .into()
+}
 
 impl Apps {
     async fn of(
@@ -140,22 +184,31 @@ impl Apps {
                 apps.insert(app.id, app);
             }
         }
-        Ok(Self(apps))
+        let mut grants = HashMap::new();
+        if let Some(workspace_id) = workspace_id {
+            grants_in(state, organization_id, workspace_id, &mut grants).await?;
+        }
+        Ok(Self { apps, grants })
     }
 
     /// The installation as the contract shows it. Its app is always there:
     /// the database refuses to drop an app out from under an installation.
     fn view(&self, installation: Installation) -> Result<InstallationView, Failure> {
-        let app = self.0.get(&installation.app.id()).ok_or_else(|| {
+        let app = self.apps.get(&installation.app.id()).ok_or_else(|| {
             tracing::error!(event = "installations.app_missing", installation_id = %installation.id);
             Failure(ApiError::internal())
         })?;
-        Ok(installation_view(app, installation))
+        let grants = self
+            .grants
+            .get(&(installation.workspace_id, installation.id))
+            .copied()
+            .unwrap_or(0);
+        Ok(installation_view(app, installation, grants))
     }
 }
 
-/// An installation of `app` as the contract shows it.
-pub(crate) fn installation_view(app: &App, installation: Installation) -> InstallationView {
+/// An installation of `app`, with `grant_count` grants, as the contract shows it.
+pub(crate) fn installation_view(app: &App, installation: Installation, grant_count: u64) -> InstallationView {
     InstallationView {
         id: installation.id,
         workspace_id: installation.workspace_id,
@@ -164,8 +217,7 @@ pub(crate) fn installation_view(app: &App, installation: Installation) -> Instal
         status: installation.status,
         configuration_version: installation.configuration_version,
         connection: installation.connection,
-        // Grants arrive with agents.
-        grant_count: 0,
+        grant_count,
         created_at: installation.created_at,
         updated_at: installation.updated_at,
     }
@@ -575,8 +627,19 @@ async fn list_app_installations(
         )
         .await
         .map_err(installation_failure)?;
-    // A catalog app's installations are all of this one app.
-    let apps = Apps(HashMap::from([(app.id, app)]));
+    // A catalog app's installations are all of this one app; their grants
+    // are counted per workspace, once for each workspace on the page.
+    let mut grants = HashMap::new();
+    let mut workspaces: Vec<WorkspaceId> = page.items.iter().map(|item| item.installation.workspace_id).collect();
+    workspaces.sort_unstable();
+    workspaces.dedup();
+    for workspace_id in workspaces {
+        grants_in(&state, access.organization_id, workspace_id, &mut grants).await?;
+    }
+    let apps = Apps {
+        apps: HashMap::from([(app.id, app)]),
+        grants,
+    };
     let items = page
         .items
         .into_iter()
