@@ -18,6 +18,7 @@ import {
   type ModelOption,
   type OrganizationId,
   RUN_STATUSES,
+  type SignInSettings,
   TERMINAL_RUN_STATUSES,
   type UsageReport,
   WEBHOOK_EVENT_TYPES,
@@ -104,6 +105,13 @@ const MODELS: ModelOption[] = [
     description: "Fast and inexpensive. Simple lookups.",
   },
 ];
+
+/** What the mock says about sign-in: a fictional provider, never one it reaches. */
+export const MOCK_SIGN_IN: SignInSettings = {
+  mode: "oidc",
+  issuer: "https://sign-in.zupflow.example",
+  client_id: "zupflow-console",
+};
 
 const slug = z.string().regex(SLUG_PATTERN, "Use 1–40 lowercase letters, numbers and hyphens.");
 const environment = z.enum(ENVIRONMENTS, "Choose Sandbox or Production.");
@@ -639,6 +647,14 @@ export function createHandlers(apiBase: string) {
 
   return [
     // --- Identity ---------------------------------------------------------
+    // Public: no credential, public values only. The mock's simulated sign-in
+    // stands in for an OpenID Connect provider, so it answers `oidc`; the
+    // Console on the mock signs in through the simulation instead.
+    http.get(
+      u("/v1/sign-in-settings"),
+      route(() => ok(MOCK_SIGN_IN)),
+    ),
+
     http.get(
       u("/v1/me"),
       route(({ request }) => {

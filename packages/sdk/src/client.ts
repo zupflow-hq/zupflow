@@ -49,6 +49,7 @@ import type {
   RunEvent,
   RunId,
   RunListQuery,
+  SignInSettings,
   SubmitConnectCredentialsInput,
   ToolPolicy,
   UpdateAgentInput,
@@ -113,6 +114,11 @@ export function createClient(transport: Transport) {
   const ws = (workspaceId: WorkspaceId) => `/v1/workspaces/${enc(workspaceId)}`;
 
   return {
+    /** How the Console signs in to this API. Needs no credential. */
+    signIn: {
+      settings: () => get<SignInSettings>("/v1/sign-in-settings"),
+    },
+
     me: {
       get: () => get<Viewer>("/v1/me"),
     },

@@ -1,80 +1,91 @@
 /**
- * The Console's session boundary.
+ * The Console's session boundary: every page asks this module whether
+ * someone is signed in, and every request gets its credential from it.
  *
- * Today it is backed by the mock identity provider. When the backend lands
- * this module delegates to the Console's auth adapter: in `oidc` mode
- * `getToken` returns a fresh token from the provider for every request; in
- * `local` mode there is none. Nothing is ever written to browser storage.
+ * `startSession` picks the auth adapter before the app renders. Against a
+ * real API it asks the API how to sign in (`GET /v1/sign-in-settings`):
+ * `local` signs nobody in (the server is the built-in owner), `oidc` signs in
+ * at the provider and sends its ID token. The mock's simulated sign-in loads
+ * only in development and test builds, or a build made with
+ * `VITE_ZUPFLOW_MOCK=1`: `__ZUPFLOW_MOCK__` is a build-time constant, so a
+ * production build drops the mock entirely (`scripts/check-build.mjs` holds
+ * it to that).
  */
-import { setTokenSource } from "@/lib/api";
-import { db, persist } from "@/mocks/db";
-import { MOCK_SESSION_KEY } from "@/mocks/http";
-import { newId } from "@/mocks/ids";
-import { DEMO_USER_ID } from "@/mocks/seed";
+import { ZupflowApiError, ZupflowNetworkError } from "@zupflow/sdk";
+import { api, setTokenSource } from "@/lib/api";
+import { config } from "@/lib/env";
+import type { AuthAdapter, SessionControls } from "./adapter";
+import { createOidcAdapter } from "./oidc-adapter";
 
 type Listener = () => void;
 const listeners = new Set<Listener>();
 
-function read(): string | null {
-  try {
-    return localStorage.getItem(MOCK_SESSION_KEY);
-  } catch {
-    return null;
-  }
-}
-
-let userId: string | null = read();
-
-function write(value: string | null) {
-  userId = value;
-  try {
-    if (value) localStorage.setItem(MOCK_SESSION_KEY, value);
-    else localStorage.removeItem(MOCK_SESSION_KEY);
-  } catch {
-    // Private mode: the session lasts for this tab only.
-  }
+function notify() {
   for (const listener of listeners) listener();
 }
 
-setTokenSource(async () => (userId ? `mock_${userId}` : null));
+/** Before `startSession` finishes, nobody is signed in and nothing is sent. */
+let adapter: AuthAdapter = unavailable(config.apiUrl, "The Console hasn't started yet.");
+
+setTokenSource(() => adapter.token());
+
+function unavailable(apiUrl: string, reason: string): AuthAdapter {
+  return {
+    controls: { mode: "unavailable", apiUrl, reason },
+    isSignedIn: () => false,
+    token: async () => null,
+    signOut: () => {},
+  };
+}
+
+const local: AuthAdapter = {
+  controls: { mode: "local" },
+  // The server signs every Console request in as its built-in owner.
+  isSignedIn: () => true,
+  token: async () => null,
+  signOut: () => {},
+};
+
+function unreachable(error: unknown): string {
+  const origin = window.location.origin;
+  if (error instanceof ZupflowNetworkError) {
+    return `The API didn't answer. Check that the server is running at this address, and that it allows this Console: ZUPFLOW_CONSOLE_ORIGIN=${origin}.`;
+  }
+  if (error instanceof ZupflowApiError && error.code === "origin_not_allowed") {
+    return `The API refuses requests from this Console. Set ZUPFLOW_CONSOLE_ORIGIN=${origin} on the server and restart it.`;
+  }
+  if (error instanceof ZupflowApiError) {
+    return `The API answered ${error.status} (${error.code}) when asked how to sign in. Check that this address is a Zupflow API.`;
+  }
+  return "The API's answer couldn't be read. Check that this address is a Zupflow API.";
+}
+
+/** Picks the adapter. Resolves once the Console knows how to sign in, or that it can't reach the API. */
+export async function startSession(): Promise<void> {
+  if (__ZUPFLOW_MOCK__ && config.mockApi) {
+    const { createMockAdapter } = await import("./mock-adapter");
+    adapter = await createMockAdapter(notify);
+    return;
+  }
+  try {
+    const settings = await api.signIn.settings();
+    adapter = settings.mode === "local" ? local : createOidcAdapter(settings, notify);
+  } catch (error) {
+    adapter = unavailable(config.apiUrl, unreachable(error));
+  }
+}
 
 export const session = {
-  isSignedIn: () => userId !== null,
-  userId: () => userId,
+  /** What the sign-in screens can do with the adapter in use. */
+  controls: (): SessionControls => adapter.controls,
+  isSignedIn: () => adapter.isSignedIn(),
+  /** Whether signing out means anything: with `local`, nobody signs in. */
+  canSignOut: () => adapter.controls.mode !== "local",
   subscribe(listener: Listener) {
     listeners.add(listener);
     return () => listeners.delete(listener);
   },
-  signInAsDemo() {
-    write(DEMO_USER_ID);
-  },
-  /** Mock sign-up: a brand new identity with no organizations yet. */
-  signUp(input: { name: string; email: string }) {
-    const existing = db().users.find((u) => u.email === input.email.toLowerCase());
-    if (existing) {
-      // Signing up with an invited address accepts the invitations.
-      const now = new Date().toISOString();
-      for (const m of db().memberships) {
-        if (m.user_id === existing.id && m.status === "invited") {
-          m.status = "active";
-          m.joined_at = now;
-        }
-      }
-      persist();
-      write(existing.id);
-      return;
-    }
-    const user = {
-      id: newId("user"),
-      name: input.name.trim(),
-      email: input.email.trim().toLowerCase(),
-      avatar_url: null,
-    };
-    db().users.push(user);
-    persist();
-    write(user.id);
-  },
   signOut() {
-    write(null);
+    adapter.signOut();
   },
 };

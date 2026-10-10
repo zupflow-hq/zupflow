@@ -54,7 +54,7 @@ fn knows_every_post_route_an_api_key_cannot_call() {
 
 /// `SERVED_OPERATIONS` is exactly what the router answers: asked without a
 /// credential, a served route answers 401 (or, for hosted Connect, its own
-/// 404) and any other contract route the API's 404 or 405, so the list can't claim a route that isn't there or miss
+/// 404, and for a public route, 200) and any other contract route the API's 404 or 405, so the list can't claim a route that isn't there or miss
 /// one that is.
 #[tokio::test]
 async fn serves_exactly_the_operations_it_lists() {
@@ -89,8 +89,13 @@ async fn serves_exactly_the_operations_it_lists() {
                 .as_str()
                 .unwrap_or_default()
                 .to_owned();
+            let public = operation["x-zupflow-callers"] == serde_json::json!(["public"]);
             match status {
                 401 => {
+                    answered.insert(id);
+                }
+                // A public route needs no credential at all: it answers.
+                200 if public => {
                     answered.insert(id);
                 }
                 // Hosted Connect needs no credential: its route answers that

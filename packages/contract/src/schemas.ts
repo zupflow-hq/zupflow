@@ -96,6 +96,33 @@ export const ConnectSessionStatus = z.enum(["pending", "completed", "expired", "
 export type ConnectSessionStatus = z.infer<typeof ConnectSessionStatus>;
 
 // ---------------------------------------------------------------------------
+// Console sign-in (decision 0020)
+
+/** `local`: no sign-in. Every Console request is the server's one built-in owner. */
+export const LocalSignIn = named("LocalSignIn", z.object({ mode: z.literal("local") }));
+export type LocalSignIn = z.infer<typeof LocalSignIn>;
+
+/**
+ * `oidc`: sign in at any OpenID Connect provider (authorization code with
+ * PKCE) and send its ID token as the bearer; the API verifies it.
+ */
+export const OidcSignIn = named(
+  "OidcSignIn",
+  z.object({
+    mode: z.literal("oidc"),
+    /** The provider's issuer: the `iss` of its ID tokens, and where its discovery document lives. */
+    issuer: z.url(),
+    /** The Console's client ID at the provider: the audience of the ID tokens the API accepts. */
+    client_id: z.string().min(1),
+  }),
+);
+export type OidcSignIn = z.infer<typeof OidcSignIn>;
+
+/** How the Console signs in to this API. Public values only: anyone may read them. */
+export const SignInSettings = named("SignInSettings", z.discriminatedUnion("mode", [LocalSignIn, OidcSignIn]));
+export type SignInSettings = z.infer<typeof SignInSettings>;
+
+// ---------------------------------------------------------------------------
 // Identity and organizations
 
 export const User = named(

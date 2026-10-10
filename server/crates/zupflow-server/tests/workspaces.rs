@@ -106,6 +106,7 @@ impl Server {
             keys: Arc::new(zupflow_basic::local_keys::LocalKeyService::from_server_secret(&[7; 32])),
             outbound: Arc::new(zupflow_outbound::SafeHttpClient::new().unwrap()),
             public_url: "http://localhost:8080".to_owned(),
+            sign_in: zupflow_server::sign_in::SignInSettings::Local,
             api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
             webhooks: Arc::new(zupflow_sqlite::SqliteWebhookStore::new(database.clone())),
             idempotency: Arc::new(zupflow_sqlite::SqliteIdempotencyStore::new(database)),

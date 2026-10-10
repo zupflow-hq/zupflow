@@ -162,6 +162,7 @@ export function contractSuite(target: Target) {
       expect(missed, "served operations with no checked success, or served after one that isn't").toEqual([]);
 
       async function everyOperation() {
+        await as(null).signIn.settings();
         await owner.me.get();
         await owner.organizations.create({ name: "Contract Co", slug: "contract-co" });
         await owner.organizations.get(org);
@@ -329,6 +330,30 @@ export function contractSuite(target: Target) {
     });
 
     describe("authentication and membership", () => {
+      it("tells anyone how the Console signs in, with public values only", async () => {
+        const forged = createClient(
+          createHttpTransport({
+            baseUrl: target.baseUrl,
+            getToken: async () => "not-a-token-this-server-issued",
+            getOrganization: () => null,
+            fetch: servedFetch,
+            retries: 0,
+          }),
+        );
+        const settings = await as(null).signIn.settings();
+        // The same answer signed out, signed in, and with a token the server never issued:
+        // it depends on the deployment, never on the caller.
+        expect(await as("owner").signIn.settings()).toEqual(settings);
+        expect(await as("outsider").signIn.settings()).toEqual(settings);
+        expect(await forged.signIn.settings()).toEqual(settings);
+        if (settings.mode === "oidc") {
+          const issuer = new URL(settings.issuer);
+          const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(issuer.hostname);
+          expect(issuer.protocol === "https:" || (loopback && issuer.protocol === "http:"), settings.issuer).toBe(true);
+          expect(settings.client_id.trim()).not.toBe("");
+        }
+      });
+
       it("answers 401 without a credential", async () => {
         const error = await failure(as(null).me.get());
         expect(error.status).toBe(401);

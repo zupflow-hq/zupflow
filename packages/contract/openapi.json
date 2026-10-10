@@ -1800,6 +1800,18 @@
         "format": "date-time",
         "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
       },
+      "LocalSignIn": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "const": "local"
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      },
       "McpOAuthAuthTemplate": {
         "type": "object",
         "properties": {
@@ -2020,6 +2032,28 @@
           "available_scopes",
           "pkce",
           "identity_url"
+        ]
+      },
+      "OidcSignIn": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "const": "oidc"
+          },
+          "issuer": {
+            "type": "string",
+            "format": "uri"
+          },
+          "client_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "mode",
+          "issuer",
+          "client_id"
         ]
       },
       "Organization": {
@@ -3245,6 +3279,16 @@
         "type": "string",
         "pattern": "^ses_[0-9A-Za-z]{22}$"
       },
+      "SignInSettings": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/LocalSignIn"
+          },
+          {
+            "$ref": "#/components/schemas/OidcSignIn"
+          }
+        ]
+      },
       "TokenAuthTemplate": {
         "type": "object",
         "properties": {
@@ -3978,6 +4022,57 @@
     }
   },
   "paths": {
+    "/v1/sign-in-settings": {
+      "get": {
+        "operationId": "getSignInSettings",
+        "summary": "How the Console signs in: `local`, or `oidc` with the issuer and client ID",
+        "security": [
+          {}
+        ],
+        "x-zupflow-callers": [
+          "public"
+        ],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/SignInSettings"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/v1/me": {
       "get": {
         "operationId": "getViewer",

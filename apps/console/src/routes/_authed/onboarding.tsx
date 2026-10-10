@@ -55,11 +55,11 @@ function OnboardingPage() {
           <Button asChild variant="ghost" size="sm">
             <Link to="/">Cancel</Link>
           </Button>
-        ) : (
+        ) : session.canSignOut() ? (
           <Button variant="ghost" size="sm" onClick={() => session.signOut()} asChild>
             <Link to="/sign-in">Sign out</Link>
           </Button>
-        )}
+        ) : null}
       </div>
 
       <div className="mx-auto mt-16 grid max-w-4xl gap-14 lg:mt-24 lg:grid-cols-[1fr_300px]">

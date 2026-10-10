@@ -48,9 +48,52 @@ to explore the seeded Northwind organization (a fictional product that embeds
 Zupflow), or **Create a new account** to walk through onboarding from an empty
 organization.
 
-With no `VITE_ZUPFLOW_API_URL` set, every request is served by the mock API in
-`apps/console/src/mocks` through a service worker. Data is kept in this
-browser's localStorage; **Reset demo data** in the user menu reseeds it.
+With no `VITE_ZUPFLOW_API_URL` set, `pnpm dev` serves every request from the
+mock API in `apps/console/src/mocks` through a service worker. Data is kept in
+this browser's localStorage; **Reset demo data** in the user menu reseeds it.
+
+The mock exists only in the dev server and tests. A build (`pnpm build`, in
+any `--mode`) leaves it out, service worker included, and calls the API at
+`VITE_ZUPFLOW_API_URL` (by default `/api` on the Console's own origin);
+`scripts/check-build.mjs` fails the build if any of the mock is left in. A
+preview build that runs on the mock must say so twice: `VITE_ZUPFLOW_MOCK=1
+pnpm --filter @zupflow/console build --allow-mock`.
+
+Every build carries a Content-Security-Policy in `index.html`: scripts only
+from the Console's own files (no inline script), requests only to itself,
+`VITE_ZUPFLOW_API_URL`'s origin and `VITE_ZUPFLOW_OIDC_ORIGINS` (the sign-in
+provider's issuer, and its token endpoint's origin if different; set it at
+build time for `oidc`, or sign-in is blocked), no plugins, no `<base>`, forms
+to itself only. `check-build.mjs` checks it is there. A meta tag can't forbid
+framing, so whatever serves the Console must also send `Content-Security-Policy:
+frame-ancestors 'none'` and `X-Frame-Options: DENY`, as the dev and preview
+servers do.
+
+### The Console against the backend
+
+Start the backend (below), then point the Console at it and tell the backend
+where the Console is served from:
+
+```bash
+ZUPFLOW_CONSOLE_ORIGIN=http://localhost:5180 pnpm --filter @zupflow/server dev
+VITE_ZUPFLOW_API_URL=http://localhost:8080 pnpm dev
+```
+
+The Console asks the API how to sign in (`GET /v1/sign-in-settings`). With
+`local` nobody signs in: the Console is the server's built-in owner, and says
+so in the user menu. With `oidc` it signs in at the provider with the
+authorization code flow and PKCE, at the redirect URI
+`{Console origin}/sign-in/callback`, and sends the provider's ID token, which
+the API verifies. The provider's client for the Console must be a public one
+(no secret) that allows that redirect URI and answers its token endpoint
+cross-origin. The ID token is kept in the tab's `sessionStorage` until it
+expires, and a refresh token, if the provider issues one, in memory only;
+signing out forgets both but doesn't end the provider's own session. A reload
+or a new tab drops the refresh token, so that session lasts until its ID token
+expires. Script running on the Console's origin could read the ID token from
+`sessionStorage`; the CSP is what keeps foreign script off it. The
+alternatives, memory only (sign in again on every reload) or a backend session
+cookie, trade that for convenience or a server-side session.
 
 ### The backend
 
@@ -79,9 +122,16 @@ For a team, `ZUPFLOW_IDENTITY=oidc` signs the Console in through any OpenID
 Connect provider: set `ZUPFLOW_OIDC_ISSUER` (the `iss` of its tokens) and
 `ZUPFLOW_OIDC_AUDIENCE` (the Console's client ID), and optionally
 `ZUPFLOW_OIDC_JWKS_URL` to skip discovery. The server then verifies the
-provider's ID token as the bearer and may listen on any address. The
-open-source Console doesn't sign in with OIDC yet, and the server has no CORS
-yet: both arrive when the Console switches from the mock to the backend.
+provider's ID token as the bearer and may listen on any address.
+`GET /v1/sign-in-settings`, which needs no credential, tells the Console the
+mode, and for `oidc` the issuer and client ID.
+
+`ZUPFLOW_CONSOLE_ORIGIN` is the origin the Console is served from when it
+isn't the API's own (like `http://localhost:5180`). The guard admits it, and
+the server answers CORS for it and for no other origin: its preflights, and
+every answer it receives, errors included. CORS never allows credentials; the
+Console sends its token itself. Unset, no origin gets CORS. Like every
+`ZUPFLOW_*` setting, an invalid value (not exactly one origin) stops startup.
 
 The server's own secret, `ZUPFLOW_SECRET_KEY` (32 bytes, base64:
 `openssl rand -base64 32`), keys what must not be guessable from the database:
@@ -97,7 +147,7 @@ client secret.
 `{ZUPFLOW_PUBLIC_URL}/connect/oauth/callback`, one per deployment, registered
 once per OAuth client.
 
-So far it serves `/health`, `/ready`, `/v1/me`, organizations, members,
+So far it serves `/health`, `/ready`, `/v1/sign-in-settings`, `/v1/me`, organizations, members,
 workspaces, API keys, catalog and workspace apps with their client
 configurations, the apps available to a workspace, installations (read,
 renamed, disconnected and deleted), and Connect's settings and sessions with
@@ -231,6 +281,12 @@ the reference fixture into a throwaway database, serves it on loopback and
 points the suite at it. Cases that need an operation the backend doesn't serve
 yet are skipped, each naming the operation. CI runs it after `pnpm check`.
 
+To click through the Console on the same fixture, serve it for the Console's
+origin: `zupflow-contract-server serve <database> --console
+http://localhost:5181` answers CORS for that origin and signs a request
+without a token in as the owner, as `local` does; then run the Console with
+`PORT=5181 VITE_ZUPFLOW_API_URL=http://127.0.0.1:<port>`, the port it prints.
+
 ## Checks
 
 ```bash
@@ -282,9 +338,10 @@ database stay in `handlers.test.ts`.
 
 Two pieces exist only because there is no backend yet, and are labelled as such:
 
-- **Sign-in** is simulated in `src/features/auth/session.ts`, the seam where a
-  real build will plug in an auth adapter: `local` (no sign-in; the server
-  must listen on loopback only) or `oidc` (any OpenID Connect provider).
+- **Sign-in** is simulated by the mock's auth adapter
+  (`src/features/auth/mock-adapter.ts`), which `src/features/auth/session.ts`
+  loads only in builds with the mock. Against an API, the session uses the
+  `local` or `oidc` adapter the API names.
 - **OAuth consent** in the mock sends the browser to
   `/connect/:reference/simulated-consent` instead of a real provider; the
   backend sends it to the app's `authorize_url`.

@@ -4,6 +4,9 @@
 //!
 //! ```text
 //! zupflow-contract-server serve <database>          the API, personas signed in by token; prints `listening <port>`
+//! zupflow-contract-server serve <database> --console <origin>
+//!                                                   the same, for a Console served from <origin>: CORS for it,
+//!                                                   and a request without a token is the owner, as with `local`
 //! zupflow-contract-server reset <database>          restore the reference fixture
 //! zupflow-contract-server operations                the operations the API serves, comma-separated
 //! ```
@@ -49,6 +52,7 @@ use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{ListedTool, ToolRegistry, ToolRevision};
 use zupflow_core::webhooks::{NewEndpoint, SECRET_VERSION, WebhookEventType, WebhookStore, new_signing_secret};
 use zupflow_core::workspaces::{NewWorkspace, WorkspaceStore};
+use zupflow_server::sign_in::SignInSettings;
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{
     Database, SqliteAgentStore, SqliteApiKeyStore, SqliteAppStore, SqliteConnectStore, SqliteIdempotencyStore,
@@ -74,8 +78,12 @@ const MODELS: &str = r#"[
     {"id":"model-fast","name":"Fast","provider":"Example","description":"Fast and inexpensive. Simple lookups."}
 ]"#;
 
-/// Signs in `Bearer contract:{persona}` as that persona; anything else is 401.
-struct PersonaIdentity;
+/// Signs in `Bearer contract:{persona}` as that persona; anything else is
+/// 401, except that with `signed_out_as_owner` (a browser run, where the
+/// Console signs in as with `local`) no token at all is the owner.
+struct PersonaIdentity {
+    signed_out_as_owner: bool,
+}
 
 fn persona(name: &str) -> Option<VerifiedIdentity> {
     let (name, email) = PERSONAS.into_iter().find(|(persona, _)| *persona == name)?;
@@ -96,10 +104,13 @@ fn persona(name: &str) -> Option<VerifiedIdentity> {
 #[async_trait]
 impl Identity for PersonaIdentity {
     async fn verify(&self, bearer: Option<&str>) -> Result<VerifiedIdentity, IdentityError> {
-        bearer
-            .and_then(|token| token.strip_prefix("contract:"))
-            .and_then(persona)
-            .ok_or(IdentityError::Unauthenticated)
+        match bearer {
+            None if self.signed_out_as_owner => persona("owner"),
+            bearer => bearer
+                .and_then(|token| token.strip_prefix("contract:"))
+                .and_then(persona),
+        }
+        .ok_or(IdentityError::Unauthenticated)
     }
 }
 
@@ -134,7 +145,7 @@ async fn open(path: &str) -> Result<Database, String> {
 
 /// Serves on a loopback port the system picks, announced on stdout as
 /// `listening <port>`, so a runner never tests whatever else holds a port.
-async fn serve(path: &str) -> Result<(), String> {
+async fn serve(path: &str, console: Option<&str>) -> Result<(), String> {
     let database = open(path).await?;
     let secret = database
         .instance_secret("secret_key")
@@ -145,7 +156,9 @@ async fn serve(path: &str) -> Result<(), String> {
         .map_err(|error| format!("can't listen on loopback: {error}"))?;
     let port = listener.local_addr().map_err(|error| error.to_string())?.port();
     let state = AppState {
-        identity: Arc::new(PersonaIdentity),
+        identity: Arc::new(PersonaIdentity {
+            signed_out_as_owner: console.is_some(),
+        }),
         organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
         workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
         apps: Arc::new(SqliteAppStore::new(database.clone())),
@@ -166,6 +179,16 @@ async fn serve(path: &str) -> Result<(), String> {
         keys: Arc::new(LocalKeyService::from_server_secret(&secret)),
         outbound: Arc::new(FixtureProviders),
         public_url: format!("http://localhost:{port}"),
+        // The suite's personas are verified identities from a provider of
+        // their own, so it says `oidc`, naming a fictional one; a browser
+        // run signs in as with `local`.
+        sign_in: match console {
+            Some(_) => SignInSettings::Local,
+            None => SignInSettings::Oidc {
+                issuer: "https://sign-in.contract.example".to_owned(),
+                client_id: "contract".to_owned(),
+            },
+        },
         api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
         api_key_hasher: Arc::new(ApiKeyHasher::new(secret)),
         webhooks: Arc::new(zupflow_sqlite::SqliteWebhookStore::new(database.clone())),
@@ -178,7 +201,11 @@ async fn serve(path: &str) -> Result<(), String> {
     }
     // Every persona's token is public, as `local`'s owner is: the same guard
     // keeps a rebound name or another site out.
-    axum::serve(listener, zupflow_server::app(state, RequestGuard::local(port, &[])))
+    let guard = match console {
+        Some(origin) => RequestGuard::local(port, &[]).with_console(origin),
+        None => RequestGuard::local(port, &[]),
+    };
+    axum::serve(listener, zupflow_server::app(state, guard))
         .await
         .map_err(|error| error.to_string())
 }
@@ -859,7 +886,8 @@ async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
-        ["serve", database] => serve(database).await,
+        ["serve", database] => serve(database, None).await,
+        ["serve", database, "--console", origin] => serve(database, Some(origin)).await,
         ["reset", database] => reset(database).await,
         ["operations"] => {
             #[allow(clippy::print_stdout)]
@@ -868,7 +896,10 @@ async fn main() -> ExitCode {
             }
             Ok(())
         }
-        _ => Err("usage: zupflow-contract-server serve <database> | reset <database> | operations".to_owned()),
+        _ => Err(
+            "usage: zupflow-contract-server serve <database> [--console <origin>] | reset <database> | operations"
+                .to_owned(),
+        ),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

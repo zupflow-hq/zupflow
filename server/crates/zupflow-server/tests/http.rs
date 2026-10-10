@@ -81,6 +81,7 @@ impl Server {
             keys: Arc::new(zupflow_basic::local_keys::LocalKeyService::from_server_secret(&[7; 32])),
             outbound: Arc::new(zupflow_outbound::SafeHttpClient::new().unwrap()),
             public_url: "http://localhost:8080".to_owned(),
+            sign_in: zupflow_server::sign_in::SignInSettings::Local,
             api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
             webhooks: Arc::new(zupflow_sqlite::SqliteWebhookStore::new(database.clone())),
             idempotency: Arc::new(zupflow_sqlite::SqliteIdempotencyStore::new(database)),
@@ -118,6 +119,18 @@ impl Server {
 
     /// A raw request with exactly these headers, for the guard's checks.
     async fn raw(&self, method: Method, uri: &str, headers: &[(&str, &str)], body: &str) -> (StatusCode, Value) {
+        let (status, _, json) = self.exchange(method, uri, headers, body).await;
+        (status, json)
+    }
+
+    /// A raw request, answered with the response's headers too.
+    async fn exchange(
+        &self,
+        method: Method,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
         let mut request = Request::builder().method(method).uri(uri);
         for (name, value) in headers {
             request = request.header(*name, *value);
@@ -129,13 +142,14 @@ impl Server {
             .await
             .unwrap();
         let status = response.status();
+        let headers = response.headers().clone();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json = if bytes.is_empty() {
             Value::Null
         } else {
             serde_json::from_slice(&bytes).unwrap()
         };
-        (status, json)
+        (status, headers, json)
     }
 
     async fn get(&self, user: &str, uri: &str) -> (StatusCode, Value) {
@@ -708,6 +722,162 @@ async fn refuses_what_a_browser_was_tricked_into_sending() {
     }
     let (_, me_now) = server.raw(Method::GET, "/v1/me", &me("localhost:8080", None), "").await;
     assert_eq!(me_now["data"]["organizations"], json!([]));
+}
+
+/// CORS answers the Console's origin, and no other: its preflights pass and
+/// it may read every answer, errors included; an origin the guard admits
+/// for other reasons gets no CORS header, and a foreign one is refused.
+#[tokio::test]
+async fn answers_cors_for_the_console_origin_only() {
+    let console = "http://localhost:5180";
+    let guard = RequestGuard::local(8080, &["http://localhost:5173".to_owned()]).with_console("http://LOCALHOST:5180/");
+    let server = Server::with_guard(guard).await;
+    let header = |headers: &axum::http::HeaderMap, name: &str| {
+        headers
+            .get_all(name)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let preflight = |origin: &'static str| {
+        vec![
+            ("Host", "localhost:8080"),
+            ("Origin", origin),
+            ("Access-Control-Request-Method", "POST"),
+            (
+                "Access-Control-Request-Headers",
+                "authorization, content-type, idempotency-key, zupflow-organization",
+            ),
+        ]
+    };
+
+    // The Console's preflight, for any path: every method and header it sends, no credentials.
+    for path in ["/v1/organizations", "/v1/workspaces/ws_x/agents", "/v1/me"] {
+        let (status, headers, body) = server.exchange(Method::OPTIONS, path, &preflight(console), "").await;
+        assert_eq!((status, &body), (StatusCode::NO_CONTENT, &Value::Null), "{path}");
+        assert_eq!(header(&headers, "access-control-allow-origin"), console);
+        for method in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
+            assert!(
+                header(&headers, "access-control-allow-methods").contains(method),
+                "{method}"
+            );
+        }
+        for name in [
+            "authorization",
+            "content-type",
+            "idempotency-key",
+            "zupflow-organization",
+        ] {
+            assert!(
+                header(&headers, "access-control-allow-headers").contains(name),
+                "{name}"
+            );
+        }
+        assert!(header(&headers, "vary").contains("Origin"));
+        assert!(!headers.contains_key("access-control-allow-credentials"));
+    }
+
+    // Its requests, answered or refused, carry the header, so the Console reads the envelope either way.
+    let signed_in = [
+        ("Host", "localhost:8080"),
+        ("Origin", console),
+        ("Authorization", "Bearer test:alice"),
+    ];
+    let (status, headers, _) = server.exchange(Method::GET, "/v1/me", &signed_in, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(header(&headers, "access-control-allow-origin"), console);
+    assert!(header(&headers, "vary").contains("Origin"));
+    let (status, headers, body) = server
+        .exchange(
+            Method::GET,
+            "/v1/me",
+            &[("Host", "localhost:8080"), ("Origin", console)],
+            "",
+        )
+        .await;
+    assert_eq!((status, code(&body)), (StatusCode::UNAUTHORIZED, "unauthenticated"));
+    assert_eq!(header(&headers, "access-control-allow-origin"), console);
+
+    // Another allowed origin is admitted, but gets no CORS: no preflight passes for it, and nothing says it may read.
+    let (status, headers, _) = server
+        .exchange(Method::OPTIONS, "/v1/me", &preflight("http://localhost:5173"), "")
+        .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert!(!headers.contains_key("access-control-allow-origin"));
+    let (status, headers, _) = server
+        .exchange(
+            Method::GET,
+            "/v1/me",
+            &[
+                ("Host", "localhost:8080"),
+                ("Origin", "http://localhost:5173"),
+                ("Authorization", "Bearer test:alice"),
+            ],
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("access-control-allow-origin"));
+
+    // A foreign origin is refused before anything, preflight or not, with nothing that lets it read.
+    for origin in ["https://attacker.example", "null", "http://localhost:5181"] {
+        let (status, headers, body) = server.exchange(Method::OPTIONS, "/v1/me", &preflight(origin), "").await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::FORBIDDEN, "origin_not_allowed"),
+            "{origin}"
+        );
+        assert!(!headers.contains_key("access-control-allow-origin"), "{origin}");
+    }
+
+    // A request with no Origin isn't a browser's cross-origin one: no CORS header.
+    let (status, headers, _) = server
+        .exchange(
+            Method::GET,
+            "/v1/me",
+            &[("Host", "localhost:8080"), ("Authorization", "Bearer test:alice")],
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("access-control-allow-origin"));
+
+    // Without a Console origin, no origin gets CORS, even an allowed one.
+    let server = Server::with_guard(RequestGuard::local(8080, &[console.to_owned()])).await;
+    let (status, headers, _) = server
+        .exchange(Method::OPTIONS, "/v1/me", &preflight(console), "")
+        .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert!(!headers.contains_key("access-control-allow-origin"));
+    assert!(!headers.contains_key("vary"));
+}
+
+/// The sign-in settings are the deployment's, for anyone: no credential is
+/// needed, and none changes the answer.
+#[tokio::test]
+async fn tells_anyone_how_the_console_signs_in() {
+    let server = Server::new().await;
+    for user in [None, Some("alice"), Some("")] {
+        let (status, body) = server.call(user, Method::GET, "/v1/sign-in-settings", None).await;
+        assert_eq!(
+            (status, body),
+            (
+                StatusCode::OK,
+                json!({ "data": { "mode": "local" }, "meta": null, "error": null })
+            ),
+            "{user:?}"
+        );
+    }
+    let (status, body) = server
+        .raw(
+            Method::GET,
+            "/v1/sign-in-settings",
+            &[("Authorization", "Bearer not-a-token")],
+            "",
+        )
+        .await;
+    assert_eq!((status, &body["data"]["mode"]), (StatusCode::OK, &json!("local")));
 }
 
 #[tokio::test]

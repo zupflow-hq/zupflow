@@ -5,9 +5,8 @@ import { createRouter, RouterProvider } from "@tanstack/react-router";
 import { type Viewer, ZupflowApiError } from "@zupflow/sdk";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { session } from "@/features/auth/session";
+import { session, startSession } from "@/features/auth/session";
 import { setOrganizationSource } from "@/lib/api";
-import { config } from "@/lib/env";
 import { canonicalizeEnvironmentUrl, environmentRewrite } from "@/lib/environment-url";
 import { qk } from "@/lib/query-keys";
 import { ThemeProvider } from "@/lib/theme";
@@ -16,10 +15,12 @@ import { routeTree } from "./routeTree.gen";
 const queryClient = new QueryClient({
   queryCache: new QueryCache({
     onError: (error) => {
-      // An expired or missing session sends the person back to sign in.
-      if (error instanceof ZupflowApiError && error.status === 401 && session.isSignedIn()) {
+      // An expired or missing session sends the person back to sign in, then
+      // back here. (With `local` there's no session to lose.)
+      if (error instanceof ZupflowApiError && error.status === 401 && session.canSignOut()) {
+        const here = router.latestLocation.href;
         session.signOut();
-        void router.navigate({ to: "/sign-in" });
+        void router.navigate({ to: "/sign-in", search: { redirect: here.startsWith("/sign-in") ? undefined : here } });
       }
     },
   }),
@@ -63,10 +64,8 @@ session.subscribe(() => {
 });
 
 async function start() {
-  if (config.mockApi) {
-    const { startMockApi } = await import("@/mocks/browser");
-    await startMockApi(config.apiUrl);
-  }
+  // Knows how to sign in (or that the API can't be reached) before the first route loads.
+  await startSession();
   const root = document.getElementById("root");
   if (!root) throw new Error("Missing #root");
   createRoot(root).render(

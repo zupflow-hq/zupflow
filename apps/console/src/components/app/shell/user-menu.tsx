@@ -1,4 +1,3 @@
-import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { ChevronsUpDownIcon, DatabaseZapIcon, LogOutIcon, MonitorIcon, MoonIcon, SunIcon } from "lucide-react";
 import { toast } from "sonner";
@@ -16,7 +15,6 @@ import {
 import { SidebarMenu, SidebarMenuButton, SidebarMenuItem } from "@/components/ui/sidebar";
 import { session } from "@/features/auth/session";
 import { useViewerUser } from "@/features/context";
-import { config } from "@/lib/env";
 import { type ThemePreference, useTheme } from "@/lib/theme";
 
 export function initials(name: string) {
@@ -34,7 +32,7 @@ export function UserMenu() {
   const user = useViewerUser();
   const { preference, setPreference } = useTheme();
   const navigate = useNavigate();
-  const queryClient = useQueryClient();
+  const controls = session.controls();
 
   return (
     <SidebarMenu>
@@ -68,35 +66,38 @@ export function UserMenu() {
               </DropdownMenuRadioItem>
             </DropdownMenuRadioGroup>
             <DropdownMenuSeparator />
-            {config.mockApi ? (
-              <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
-                Mock API · data stays in this browser
-              </DropdownMenuLabel>
+            {controls.mode === "mock" ? (
+              <>
+                <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
+                  Mock API · data stays in this browser
+                </DropdownMenuLabel>
+                <DropdownMenuItem
+                  onSelect={async () => {
+                    controls.resetDemoData();
+                    await navigate({ to: "/" });
+                    toast.success("Demo data reset");
+                  }}
+                >
+                  <DatabaseZapIcon />
+                  Reset demo data
+                </DropdownMenuItem>
+              </>
             ) : null}
-            {config.mockApi ? (
+            {controls.mode === "local" ? (
+              <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
+                Local mode · no sign-in on this server
+              </DropdownMenuLabel>
+            ) : (
               <DropdownMenuItem
-                onSelect={async () => {
-                  const { resetDb } = await import("@/mocks/db");
-                  resetDb();
-                  queryClient.clear();
-                  session.signInAsDemo();
-                  await navigate({ to: "/" });
-                  toast.success("Demo data reset");
+                onSelect={() => {
+                  session.signOut();
+                  void navigate({ to: "/sign-in" });
                 }}
               >
-                <DatabaseZapIcon />
-                Reset demo data
+                <LogOutIcon />
+                Sign out
               </DropdownMenuItem>
-            ) : null}
-            <DropdownMenuItem
-              onSelect={() => {
-                session.signOut();
-                void navigate({ to: "/sign-in" });
-              }}
-            >
-              <LogOutIcon />
-              Sign out
-            </DropdownMenuItem>
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
       </SidebarMenuItem>

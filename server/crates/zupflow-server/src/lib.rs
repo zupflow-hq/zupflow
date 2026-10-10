@@ -23,6 +23,7 @@ pub mod mcp_access;
 pub mod organizations;
 pub mod run_engine;
 pub mod runs;
+pub mod sign_in;
 pub mod tool_policy;
 pub mod webhook_delivery;
 pub mod webhooks;
@@ -38,7 +39,8 @@ pub use guard::RequestGuard;
 /// The contract's operations this server serves so far, by `operationId`. The
 /// shared contract suite skips, by name, any case that needs another one; a
 /// test holds this list equal to the routes the router actually answers.
-pub const SERVED_OPERATIONS: [&str; 74] = [
+pub const SERVED_OPERATIONS: [&str; 75] = [
+    "getSignInSettings",
     "getViewer",
     "createOrganization",
     "getOrganization",
@@ -122,6 +124,7 @@ pub fn app(state: AppState, guard: RequestGuard) -> Router {
     Router::new()
         .route("/health", get(http::health))
         .route("/ready", get(http::ready))
+        .merge(sign_in::routes())
         .merge(organizations::routes())
         .merge(api_keys::routes())
         .merge(workspaces::routes())

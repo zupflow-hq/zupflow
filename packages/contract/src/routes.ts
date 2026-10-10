@@ -11,9 +11,10 @@ export type Method = "get" | "post" | "put" | "patch" | "delete";
 
 /**
  * Who may call a route: a Console member's session, an organization's API
- * key, or hosted Connect, authorized by a session's reference alone.
+ * key, hosted Connect, authorized by a session's reference alone, or anyone
+ * (`public`: no credential, and an answer that holds only public values).
  */
-export type Caller = "console" | "api_key" | "connect";
+export type Caller = "console" | "api_key" | "connect" | "public";
 
 export interface Route {
   operationId: string;
@@ -44,6 +45,7 @@ const reference = z
 const both: Caller[] = ["console", "api_key"];
 const consoleOnly: Caller[] = ["console"];
 const connect: Caller[] = ["connect"];
+const anyone: Caller[] = ["public"];
 
 const ok = (data: z.ZodType, extra: Partial<Route["response"]> = {}) => ({ status: 200 as const, data, ...extra });
 const created = (data: z.ZodType) => ({ status: 201 as const, data });
@@ -51,6 +53,15 @@ const noContent = { status: 204 as const };
 
 export const routes: readonly Route[] = [
   // Identity
+  {
+    operationId: "getSignInSettings",
+    method: "get",
+    path: "/v1/sign-in-settings",
+    summary: "How the Console signs in: `local`, or `oidc` with the issuer and client ID",
+    callers: anyone,
+    params: {},
+    response: ok(s.SignInSettings),
+  },
   {
     operationId: "getViewer",
     method: "get",

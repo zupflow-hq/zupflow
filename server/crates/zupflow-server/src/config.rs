@@ -26,6 +26,11 @@ pub struct Config {
     /// `ZUPFLOW_ALLOWED_ORIGINS`: comma-separated origins a browser may call
     /// the API from, like `http://localhost:5173`. Empty by default.
     pub allowed_origins: Vec<String>,
+    /// `ZUPFLOW_CONSOLE_ORIGIN`: the origin the Console is served from, like
+    /// `https://console.zupflow.example`, when it isn't this server's. The
+    /// guard admits it and CORS answers it, and no other origin. Unset, no
+    /// origin gets CORS: the Console must be served from the API's own origin.
+    pub console_origin: Option<String>,
     /// `ZUPFLOW_PUBLIC_URL`: the origin providers and browsers reach this
     /// server at, like `https://zupflow.example`; OAuth redirect URIs are
     /// built on it (decision 0033). Defaults to `http://localhost:{port}`.
@@ -86,6 +91,8 @@ pub enum ConfigError {
     InvalidOrigins,
     #[error("ZUPFLOW_PUBLIC_URL must be an origin like https://zupflow.example, with no path")]
     InvalidPublicUrl,
+    #[error("ZUPFLOW_CONSOLE_ORIGIN must be one origin like https://console.zupflow.example, with no path")]
+    InvalidConsoleOrigin,
     #[error("ZUPFLOW_MODELS {0}")]
     InvalidModels(zupflow_basic::configured_models::ModelsConfigError),
     #[error("ZUPFLOW_MODEL_PROVIDER must be `scripted`, or unset for none")]
@@ -168,6 +175,9 @@ impl Config {
             Some(value) => public_origin(value.trim()).ok_or(ConfigError::InvalidPublicUrl)?,
             None => format!("http://localhost:{}", listen.port()),
         };
+        let console_origin = set("ZUPFLOW_CONSOLE_ORIGIN")?
+            .map(|value| public_origin(value.trim()).ok_or(ConfigError::InvalidConsoleOrigin))
+            .transpose()?;
         let models = match set("ZUPFLOW_MODELS")? {
             Some(value) => ConfiguredModels::parse(&value).map_err(ConfigError::InvalidModels)?,
             None => ConfiguredModels::none(),
@@ -184,6 +194,7 @@ impl Config {
             identity,
             secret_key,
             allowed_origins,
+            console_origin,
             public_url,
             models,
             model_provider,
@@ -267,6 +278,48 @@ mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn takes_one_console_origin_and_stops_on_anything_else() {
+        let console = |value: &'static str| {
+            Config::from_vars(move |name| Ok((name == "ZUPFLOW_CONSOLE_ORIGIN").then(|| value.to_owned())))
+        };
+        assert_eq!(Config::from_vars(|_| Ok(None)).expect("defaults").console_origin, None);
+        assert_eq!(
+            console("https://Console.Zupflow.example/")
+                .expect("an origin")
+                .console_origin
+                .as_deref(),
+            Some("https://console.zupflow.example")
+        );
+        assert_eq!(
+            console("http://localhost:5180")
+                .expect("an origin")
+                .console_origin
+                .as_deref(),
+            Some("http://localhost:5180")
+        );
+        for invalid in [
+            "*",
+            "null",
+            "console.zupflow.example",
+            "https://console.zupflow.example/app",
+            "https://a.example,https://b.example",
+            "https://user@console.zupflow.example",
+            "file:///console",
+        ] {
+            assert!(
+                matches!(console(invalid), Err(ConfigError::InvalidConsoleOrigin)),
+                "{invalid}"
+            );
+        }
+        assert!(matches!(
+            console(""),
+            Err(ConfigError::Empty {
+                name: "ZUPFLOW_CONSOLE_ORIGIN"
+            })
+        ));
     }
 
     #[test]

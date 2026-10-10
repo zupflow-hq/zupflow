@@ -12,6 +12,7 @@ use zupflow_core::identity::Identity;
 use zupflow_core::models::{ModelCatalog, ModelProvider};
 use zupflow_oidc::{OidcConfig, OidcIdentity};
 use zupflow_server::config::{Config, IdentityMode, ModelProviderMode};
+use zupflow_server::sign_in::SignInSettings;
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{
     Database, SqliteApiKeyStore, SqliteIdempotencyStore, SqliteOrganizationStore, SqliteWorkspaceStore,
@@ -70,6 +71,20 @@ async fn main() -> ExitCode {
     let guard = match config.identity {
         IdentityMode::Local => RequestGuard::local(config.listen.port(), &config.allowed_origins),
         IdentityMode::Oidc { .. } => RequestGuard::with_origins(&config.allowed_origins),
+    };
+    let guard = match &config.console_origin {
+        Some(origin) => {
+            tracing::info!(event = "server.console_origin", origin = %origin);
+            guard.with_console(origin)
+        }
+        None => guard,
+    };
+    let sign_in = match &config.identity {
+        IdentityMode::Local => SignInSettings::Local,
+        IdentityMode::Oidc { issuer, audience, .. } => SignInSettings::Oidc {
+            issuer: issuer.clone(),
+            client_id: audience.clone(),
+        },
     };
     let secret_key = match config.secret_key {
         Some(key) => key,
@@ -139,6 +154,7 @@ async fn main() -> ExitCode {
         )),
         outbound: Arc::new(outbound),
         public_url: config.public_url.clone(),
+        sign_in,
         api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
         api_key_hasher: Arc::new(ApiKeyHasher::new(secret_key)),
         idempotency: Arc::new(SqliteIdempotencyStore::new(database.clone())),

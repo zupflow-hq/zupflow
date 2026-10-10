@@ -1,179 +1,97 @@
-import { zodResolver } from "@hookform/resolvers/zod";
-import { createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
-import { ArrowRightIcon } from "lucide-react";
-import { useState } from "react";
-import { useForm } from "react-hook-form";
+import { createFileRoute, redirect } from "@tanstack/react-router";
+import { ArrowRightIcon, RotateCwIcon, ServerCrashIcon } from "lucide-react";
+import { lazy, Suspense, useState } from "react";
 import { z } from "zod";
-import { ZupflowLogo, ZupflowMark } from "@/components/brand/logo";
 import { Button } from "@/components/ui/button";
-import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
-import { Input } from "@/components/ui/input";
-import { Separator } from "@/components/ui/separator";
+import { Spinner } from "@/components/ui/spinner";
+import type { OidcControls, UnavailableControls } from "@/features/auth/adapter";
 import { session } from "@/features/auth/session";
+import { providerName, SignInHeading, SignInLayout, SignInSkeleton } from "@/features/auth/sign-in-layout";
+import { safeReturnPath, signInFailureMessage } from "@/lib/oidc";
 
 export const Route = createFileRoute("/sign-in")({
   validateSearch: z.object({ redirect: z.string().optional() }),
   beforeLoad: () => {
+    // With `local` nobody signs in: the server is the built-in owner.
     if (session.isSignedIn()) throw redirect({ to: "/" });
   },
   component: SignInPage,
 });
 
-const signUpSchema = z.object({
-  name: z.string().trim().min(1, "Enter your name."),
-  email: z.string().trim().email("Enter a valid email address."),
-});
+/** The mock's simulated sign-in, in builds that have the mock only. */
+const MockSignIn = __ZUPFLOW_MOCK__ ? lazy(() => import("@/features/auth/mock-sign-in")) : null;
 
 function SignInPage() {
-  const navigate = useNavigate();
   const { redirect: target } = Route.useSearch();
-  const [mode, setMode] = useState<"sign-in" | "sign-up">("sign-in");
-  const form = useForm<z.infer<typeof signUpSchema>>({
-    resolver: zodResolver(signUpSchema),
-    defaultValues: { name: "", email: "" },
-  });
+  const controls = session.controls();
+  switch (controls.mode) {
+    case "mock":
+      return MockSignIn ? (
+        <Suspense fallback={<SignInSkeleton />}>
+          <MockSignIn controls={controls} target={target} />
+        </Suspense>
+      ) : null;
+    case "oidc":
+      return <OidcSignIn controls={controls} target={target} />;
+    case "unavailable":
+      return <ApiUnavailable controls={controls} />;
+    case "local":
+      // Never shown: `local` is always signed in.
+      return null;
+  }
+}
 
-  const proceed = () => {
-    // Only follow same-origin, in-app redirects.
-    if (target?.startsWith("/") && !target.startsWith("//")) {
-      void navigate({ href: target });
-    } else {
-      void navigate({ to: "/" });
-    }
-  };
-
+function OidcSignIn({ controls, target }: { controls: OidcControls; target: string | undefined }) {
+  const [state, setState] = useState<{ pending: boolean; error: string | null }>({ pending: false, error: null });
+  const provider = providerName(controls.issuer);
   return (
-    <main className="grid min-h-svh lg:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)]">
-      <section className="flex flex-col px-4 py-8 sm:px-10">
-        <ZupflowLogo className="text-[22px]" />
-        <div className="mx-auto flex w-full max-w-[360px] flex-1 flex-col justify-center py-12">
-          <h1 className="text-2xl font-semibold tracking-[-0.02em]">
-            {mode === "sign-in" ? "Sign in to the Console" : "Create your account"}
-          </h1>
-          <p className="mt-1.5 text-sm text-muted-foreground">
-            {mode === "sign-in"
-              ? "Manage workspaces, apps and agents for your product."
-              : "You'll name your organization next."}
-          </p>
-
-          {mode === "sign-in" ? (
-            <div className="mt-8 space-y-3">
-              <Button
-                className="h-11 w-full justify-between"
-                onClick={() => {
-                  session.signInAsDemo();
-                  proceed();
-                }}
-              >
-                <span className="flex items-center gap-2.5">
-                  <span className="grid size-6 place-items-center rounded-full bg-primary-foreground/15 text-[11px] font-semibold">
-                    JL
-                  </span>
-                  Continue as Jordan Lee
-                </span>
-                <ArrowRightIcon />
-              </Button>
-              <p className="text-center text-xs text-muted-foreground">
-                Owner of the <span className="font-medium text-foreground">Northwind</span> demo organization
-              </p>
-              <div className="flex items-center gap-3 py-3">
-                <Separator className="flex-1" />
-                <span className="text-xs text-muted-foreground">or</span>
-                <Separator className="flex-1" />
-              </div>
-              <Button variant="outline" className="h-11 w-full" onClick={() => setMode("sign-up")}>
-                Create a new account
-              </Button>
-            </div>
-          ) : (
-            <Form {...form}>
-              <form
-                className="mt-8 space-y-4"
-                onSubmit={form.handleSubmit((values) => {
-                  session.signUp(values);
-                  void navigate({ to: "/onboarding" });
-                })}
-              >
-                <FormField
-                  control={form.control}
-                  name="name"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Name</FormLabel>
-                      <FormControl>
-                        <Input autoComplete="name" autoFocus {...field} />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-                <FormField
-                  control={form.control}
-                  name="email"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Work email</FormLabel>
-                      <FormControl>
-                        <Input type="email" autoComplete="email" {...field} />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-                <Button type="submit" className="h-11 w-full">
-                  Create account
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  className="w-full text-muted-foreground"
-                  onClick={() => setMode("sign-in")}
-                >
-                  I already have an account
-                </Button>
-              </form>
-            </Form>
-          )}
-        </div>
-        <p className="text-xs text-muted-foreground">Preview build: accounts are simulated in this browser.</p>
-      </section>
-
-      <aside className="relative hidden overflow-hidden bg-[#10191D] text-white lg:flex lg:flex-col lg:justify-between lg:p-12">
-        <ZupflowMark
-          className="pointer-events-none absolute -right-24 -bottom-24 size-[520px] opacity-[0.07]"
-          loop="#35C8F5"
-        />
-        <p className="font-mono text-[11px] tracking-[0.14em] text-white/50 uppercase">
-          Personal agents, inside your product
+    <SignInLayout footer={`Sign-in is handled by ${provider}.`}>
+      <SignInHeading
+        title="Sign in to the Console"
+        description="Manage workspaces, apps and agents for your product."
+      />
+      <div className="mt-8 space-y-3">
+        <Button
+          className="h-11 w-full justify-between"
+          disabled={state.pending}
+          onClick={async () => {
+            setState({ pending: true, error: null });
+            try {
+              await controls.signIn(safeReturnPath(target));
+            } catch (error) {
+              setState({ pending: false, error: signInFailureMessage(error) });
+            }
+          }}
+        >
+          Continue with single sign-on
+          {state.pending ? <Spinner /> : <ArrowRightIcon />}
+        </Button>
+        <p className="text-center text-xs text-muted-foreground">
+          You'll sign in at <span className="font-medium break-all text-foreground">{provider}</span>
         </p>
-        <div className="relative max-w-md space-y-6">
-          <p className="text-[28px] leading-[1.15] font-semibold tracking-[-0.02em] text-balance">
-            Give each customer an isolated workspace, their own connected accounts, and agents that only touch what you
-            grant.
+        {state.error ? (
+          <p role="alert" className="text-sm text-destructive">
+            {state.error}
           </p>
-          <ol className="space-y-2.5 font-mono text-[12.5px] text-white/70">
-            {[
-              ["POST", "/v1/organizations/{org}/workspaces"],
-              ["POST", "/v1/workspaces/{ws}/connect-sessions"],
-              ["POST", "/v1/workspaces/{ws}/agents/{agent}/grants"],
-              ["POST", "/v1/workspaces/{ws}/agents/{agent}/runs"],
-            ].map(([method, path]) => (
-              <li key={path} className="flex gap-3">
-                <span className="w-10 text-[#35C8F5]">{method}</span>
-                <span className="truncate">{path}</span>
-              </li>
-            ))}
-          </ol>
-        </div>
-        <div className="flex gap-2">
-          <span className="chamfer bg-[#35C8F5]/15 px-2 py-0.5 font-mono text-[10.5px] tracking-[0.08em] text-[#6FD8F8] uppercase">
-            Production
-          </span>
-          <span className="chamfer bg-[#E8AA3C]/15 px-2 py-0.5 font-mono text-[10.5px] tracking-[0.08em] text-[#F0C26E] uppercase">
-            Sandbox
-          </span>
-        </div>
-      </aside>
-    </main>
+        ) : null}
+      </div>
+    </SignInLayout>
+  );
+}
+
+function ApiUnavailable({ controls }: { controls: UnavailableControls }) {
+  return (
+    <SignInLayout>
+      <ServerCrashIcon className="mb-4 size-6 text-muted-foreground" aria-hidden />
+      <SignInHeading title="Can't reach the Zupflow API" description={controls.reason} />
+      <p className="mt-6 text-xs text-muted-foreground">The Console looked for it at</p>
+      <code className="mt-1 block rounded-md border bg-muted/50 px-3 py-2 font-mono text-xs break-all">
+        {controls.apiUrl}
+      </code>
+      <Button className="mt-6 h-11 w-full" variant="outline" onClick={() => window.location.reload()}>
+        <RotateCwIcon />
+        Try again
+      </Button>
+    </SignInLayout>
   );
 }

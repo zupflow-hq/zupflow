@@ -86,6 +86,10 @@ async fn setup() -> Setup {
         keys: Arc::new(zupflow_basic::local_keys::LocalKeyService::from_server_secret(&[7; 32])),
         outbound: Arc::new(zupflow_outbound::SafeHttpClient::new().unwrap()),
         public_url: "http://localhost:8080".to_owned(),
+        sign_in: zupflow_server::sign_in::SignInSettings::Oidc {
+            issuer: issuer.clone(),
+            client_id: "console".to_owned(),
+        },
         api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
         webhooks: Arc::new(zupflow_sqlite::SqliteWebhookStore::new(database.clone())),
         idempotency: Arc::new(zupflow_sqlite::SqliteIdempotencyStore::new(database)),
@@ -176,6 +180,26 @@ async fn signs_in_with_a_verified_id_token() {
         (status, &body["error"]["code"]),
         (StatusCode::UNAUTHORIZED, &json!("email_in_use")),
         "another identity can't take over the user"
+    );
+}
+
+/// The Console learns the issuer and its client ID, before anyone signs in.
+#[tokio::test]
+async fn tells_the_console_where_to_sign_in() {
+    let setup = setup().await;
+    let request = Request::builder()
+        .uri("/v1/sign-in-settings")
+        .header("Host", "zupflow.people.example")
+        .header("Origin", "https://console.people.example")
+        .body(Body::empty())
+        .unwrap();
+    let response = setup.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["data"],
+        json!({ "mode": "oidc", "issuer": setup.issuer, "client_id": "console" })
     );
 }
 

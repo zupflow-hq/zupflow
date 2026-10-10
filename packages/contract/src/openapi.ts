@@ -6,7 +6,7 @@
 import { z } from "zod";
 import { IDEMPOTENCY_HEADER } from "./idempotency";
 import { registry } from "./registry";
-import { routes } from "./routes";
+import { type Caller, routes } from "./routes";
 import { WebhookEvent } from "./schemas";
 import {
   WEBHOOK_ATTEMPT_HEADER,
@@ -104,10 +104,11 @@ function parameters(route: (typeof routes)[number]) {
   return [...path, ...query, ...idempotency];
 }
 
-const SECURITY: Record<string, Record<string, string[]>> = {
+const SECURITY: Record<Caller, Record<string, string[]>> = {
   console: { consoleSession: [] },
   api_key: { apiKey: [] },
   connect: {},
+  public: {},
 };
 
 /** Console calls to a workspace route also name its organization (decision 0023); API keys carry their own. */

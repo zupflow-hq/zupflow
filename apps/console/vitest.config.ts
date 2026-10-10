@@ -2,6 +2,8 @@ import path from "node:path";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  // Tests run with the mock API, as development does.
+  define: { __ZUPFLOW_MOCK__: "true" },
   resolve: {
     alias: {
       "@": path.resolve(import.meta.dirname, "src"),

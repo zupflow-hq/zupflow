@@ -74,6 +74,9 @@ pub struct AppState {
     pub events: Arc<dyn zupflow_core::events::EventBus>,
     /// Webhook endpoints, their events and deliveries (decision 0017).
     pub webhooks: Arc<dyn zupflow_core::webhooks::WebhookStore>,
+    /// How the Console signs in, as `GET /v1/sign-in-settings` tells it:
+    /// the same mode `identity` verifies.
+    pub sign_in: crate::sign_in::SignInSettings,
 }
 
 /// A store failure the caller can do nothing about: the database is a

@@ -14,6 +14,7 @@ import { Route as AuthedRouteImport } from "./routes/_authed"
 import { Route as SignInRouteImport } from "./routes/sign-in"
 import { Route as AuthedOrgRouteImport } from "./routes/_authed/$org"
 import { Route as AuthedOnboardingRouteImport } from "./routes/_authed/onboarding"
+import { Route as SignInCallbackRouteImport } from "./routes/sign-in_.callback"
 import { Route as AuthedOrgIndexRouteImport } from "./routes/_authed/$org/index"
 import { Route as AuthedOrgApiKeysRouteImport } from "./routes/_authed/$org/api-keys"
 import { Route as AuthedOrgAppsRouteImport } from "./routes/_authed/$org/apps"
@@ -68,6 +69,11 @@ const AuthedOnboardingRoute = AuthedOnboardingRouteImport.update({
   id: "/onboarding",
   path: "/onboarding",
   getParentRoute: () => AuthedRoute,
+} as any)
+const SignInCallbackRoute = SignInCallbackRouteImport.update({
+  id: "/sign-in_/callback",
+  path: "/sign-in/callback",
+  getParentRoute: () => rootRouteImport,
 } as any)
 const AuthedOrgIndexRoute = AuthedOrgIndexRouteImport.update({
   id: "/",
@@ -231,6 +237,7 @@ export interface FileRoutesByFullPath {
   "/sign-in": typeof SignInRoute
   "/$org": typeof AuthedOrgRouteWithChildren
   "/onboarding": typeof AuthedOnboardingRoute
+  "/sign-in/callback": typeof SignInCallbackRoute
   "/$org/api-keys": typeof AuthedOrgApiKeysRoute
   "/$org/apps": typeof AuthedOrgAppsRouteWithChildren
   "/$org/audit-log": typeof AuthedOrgAuditLogRoute
@@ -266,6 +273,7 @@ export interface FileRoutesByTo {
   "/": typeof IndexRoute
   "/sign-in": typeof SignInRoute
   "/onboarding": typeof AuthedOnboardingRoute
+  "/sign-in/callback": typeof SignInCallbackRoute
   "/$org/api-keys": typeof AuthedOrgApiKeysRoute
   "/$org/audit-log": typeof AuthedOrgAuditLogRoute
   "/$org/connect": typeof AuthedOrgConnectRoute
@@ -298,6 +306,7 @@ export interface FileRoutesById {
   "/sign-in": typeof SignInRoute
   "/_authed/$org": typeof AuthedOrgRouteWithChildren
   "/_authed/onboarding": typeof AuthedOnboardingRoute
+  "/sign-in_/callback": typeof SignInCallbackRoute
   "/_authed/$org/api-keys": typeof AuthedOrgApiKeysRoute
   "/_authed/$org/apps": typeof AuthedOrgAppsRouteWithChildren
   "/_authed/$org/audit-log": typeof AuthedOrgAuditLogRoute
@@ -336,6 +345,7 @@ export interface FileRouteTypes {
     | "/sign-in"
     | "/$org"
     | "/onboarding"
+    | "/sign-in/callback"
     | "/$org/api-keys"
     | "/$org/apps"
     | "/$org/audit-log"
@@ -371,6 +381,7 @@ export interface FileRouteTypes {
     | "/"
     | "/sign-in"
     | "/onboarding"
+    | "/sign-in/callback"
     | "/$org/api-keys"
     | "/$org/audit-log"
     | "/$org/connect"
@@ -402,6 +413,7 @@ export interface FileRouteTypes {
     | "/sign-in"
     | "/_authed/$org"
     | "/_authed/onboarding"
+    | "/sign-in_/callback"
     | "/_authed/$org/api-keys"
     | "/_authed/$org/apps"
     | "/_authed/$org/audit-log"
@@ -438,6 +450,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AuthedRoute: typeof AuthedRouteWithChildren
   SignInRoute: typeof SignInRoute
+  SignInCallbackRoute: typeof SignInCallbackRoute
   ConnectReferenceSimulatedConsentRoute: typeof ConnectReferenceSimulatedConsentRoute
   ConnectReferenceIndexRoute: typeof ConnectReferenceIndexRoute
 }
@@ -478,6 +491,13 @@ declare module "@tanstack/react-router" {
       fullPath: "/onboarding"
       preLoaderRoute: typeof AuthedOnboardingRouteImport
       parentRoute: typeof AuthedRoute
+    }
+    "/sign-in_/callback": {
+      id: "/sign-in_/callback"
+      path: "/sign-in/callback"
+      fullPath: "/sign-in/callback"
+      preLoaderRoute: typeof SignInCallbackRouteImport
+      parentRoute: typeof rootRouteImport
     }
     "/_authed/$org/": {
       id: "/_authed/$org/"
@@ -835,6 +855,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AuthedRoute: AuthedRouteWithChildren,
   SignInRoute: SignInRoute,
+  SignInCallbackRoute: SignInCallbackRoute,
   ConnectReferenceSimulatedConsentRoute: ConnectReferenceSimulatedConsentRoute,
   ConnectReferenceIndexRoute: ConnectReferenceIndexRoute,
 }
