@@ -7,6 +7,11 @@
 //! zupflow-contract-server serve <database> --console <origin>
 //!                                                   the same, for a Console served from <origin>: CORS for it,
 //!                                                   and a request without a token is the owner, as with `local`
+//! zupflow-contract-server serve <database> --local-app <host>:<port>=<certificate.pem> [...]
+//!                                                   live: outbound calls reach the named local apps (and
+//!                                                   nothing else), the scripted model answers runs, and
+//!                                                   the background workers run, as in `zupflow`; only
+//!                                                   when built with the `local-apps` feature
 //! zupflow-contract-server reset <database>          restore the reference fixture
 //! zupflow-contract-server operations                the operations the API serves, comma-separated
 //! ```
@@ -14,6 +19,16 @@
 //! A persona's token is `contract:{persona}`: `owner`, `developer` and
 //! `viewer` belong to `northwind`, `outsider` owns `larkspur`. `reset` runs
 //! beside a serving process, against the same database file.
+//!
+//! `--local-app` is how a fake app served on this machine, such as Taskboard
+//! (`zupflow-taskboard`), is reached for an end-to-end run or a click-through:
+//! its name must be under the reserved `.example` domain, it's pinned to
+//! loopback and its port, and only the certificates given are trusted
+//! (`SafeHttpClient::for_local_apps`, development only, behind this crate's
+//! opt-in `local-apps` feature, which nothing turns on by default). Without
+//! it, nothing
+//! leaves the machine: the fixture's providers answer from memory, no model
+//! answers runs, and no background work runs.
 
 mod fixture_apps;
 mod fixture_runs;
@@ -146,9 +161,102 @@ async fn open(path: &str) -> Result<Database, String> {
         .map_err(|error| format!("can't open {path}: {error}"))
 }
 
+/// How `serve` runs: for a Console at an origin, and live with local apps.
+#[derive(Default)]
+struct Serving {
+    console: Option<String>,
+    #[cfg(feature = "local-apps")]
+    local_apps: Vec<zupflow_outbound::LocalApp>,
+}
+
+impl Serving {
+    /// Live: calls leave the process, for the local apps named alone.
+    #[cfg(feature = "local-apps")]
+    fn live(&self) -> bool {
+        !self.local_apps.is_empty()
+    }
+
+    /// Never live without the `local-apps` feature.
+    #[cfg(not(feature = "local-apps"))]
+    fn live(&self) -> bool {
+        false
+    }
+
+    /// The outbound path: the local apps when live, the fixture's providers
+    /// otherwise.
+    fn outbound(&self) -> Result<Arc<dyn OutboundHttp>, String> {
+        #[cfg(feature = "local-apps")]
+        if self.live() {
+            let client = zupflow_outbound::SafeHttpClient::for_local_apps(&self.local_apps)
+                .map_err(|error| error.to_string())?;
+            let apps: Vec<String> = self
+                .local_apps
+                .iter()
+                .map(|app| format!("{}:{}", app.host, app.port))
+                .collect();
+            eprintln!(
+                "development only: outbound calls reach {} at 127.0.0.1, and nothing else",
+                apps.join(", ")
+            );
+            return Ok(Arc::new(client));
+        }
+        Ok(Arc::new(FixtureProviders))
+    }
+}
+
+/// `--local-app <host>:<port>=<certificate.pem>`.
+#[cfg(feature = "local-apps")]
+fn local_app(value: &str) -> Result<zupflow_outbound::LocalApp, String> {
+    const USAGE: &str = "--local-app takes <host>:<port>=<certificate.pem>";
+    let (address, certificate) = value.split_once('=').ok_or(USAGE)?;
+    let (host, port) = address.rsplit_once(':').ok_or(USAGE)?;
+    let port = port.parse::<u16>().ok().filter(|port| *port != 0).ok_or(USAGE)?;
+    let certificate_pem = std::fs::read(certificate).map_err(|error| format!("can't read {certificate}: {error}"))?;
+    Ok(zupflow_outbound::LocalApp {
+        host: host.to_owned(),
+        port,
+        certificate_pem,
+    })
+}
+
+/// `serve`'s options after the database.
+fn serving(options: &[&str]) -> Result<Serving, String> {
+    let mut serving = Serving::default();
+    let mut options = options.iter();
+    while let Some(option) = options.next() {
+        let value = options.next().ok_or_else(|| format!("{option} needs a value"))?;
+        match *option {
+            "--console" if serving.console.is_none() => serving.console = Some((*value).to_owned()),
+            #[cfg(feature = "local-apps")]
+            "--local-app" => serving.local_apps.push(local_app(value)?),
+            #[cfg(not(feature = "local-apps"))]
+            "--local-app" => {
+                return Err("--local-app needs a build with the `local-apps` feature (development only)".to_owned());
+            }
+            _ => return Err(format!("unknown option {option}")),
+        }
+    }
+    Ok(serving)
+}
+
 /// Serves on a loopback port the system picks, announced on stdout as
 /// `listening <port>`, so a runner never tests whatever else holds a port.
-async fn serve(path: &str, console: Option<&str>) -> Result<(), String> {
+async fn serve(path: &str, serving: Serving) -> Result<(), String> {
+    let console = serving.console.as_deref();
+    let live = serving.live();
+    let outbound = serving.outbound()?;
+    let models = ConfiguredModels::parse(MODELS).map_err(|error| error.to_string())?;
+    let provider: Arc<dyn zupflow_core::models::ModelProvider> = if live {
+        let served: Vec<String> = zupflow_core::models::ModelCatalog::list_models(&models)
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        Arc::new(zupflow_basic::scripted_model::ScriptedModel::serving(served))
+    } else {
+        Arc::new(zupflow_basic::no_model::NoModelProvider)
+    };
     let database = open(path).await?;
     let secret = database
         .instance_secret("secret_key")
@@ -170,18 +278,18 @@ async fn serve(path: &str, console: Option<&str>) -> Result<(), String> {
         agents: Arc::new(SqliteAgentStore::new(database.clone())),
         policies: Arc::new(zupflow_sqlite::SqliteToolPolicyStore::new(database.clone())),
         runs: Arc::new(zupflow_sqlite::SqliteRunStore::new(database.clone())),
-        provider: Arc::new(zupflow_basic::no_model::NoModelProvider),
+        provider,
         approvals: Arc::new(zupflow_basic::configured_policy::ConfiguredPolicy::new(Arc::new(
             zupflow_sqlite::SqliteToolPolicyStore::new(database.clone()),
         ))),
         events: Arc::new(zupflow_basic::in_process_events::InProcessEventBus::default()),
-        models: Arc::new(ConfiguredModels::parse(MODELS).map_err(|error| error.to_string())?),
+        models: Arc::new(models),
         connect: Arc::new(SqliteConnectStore::new(database.clone())),
         jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
         tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),
         cache: Arc::new(zupflow_basic::memory_cache::MemoryCache::default()),
         keys: Arc::new(LocalKeyService::from_server_secret(&secret)),
-        outbound: Arc::new(FixtureProviders),
+        outbound,
         public_url: public_url.clone(),
         // The suite's personas are verified identities from a provider of
         // their own, so it says `oidc`, naming a fictional one; a browser
@@ -211,9 +319,23 @@ async fn serve(path: &str, console: Option<&str>) -> Result<(), String> {
         None => RequestGuard::local(port, &[]),
     }
     .with_public_url(&public_url);
-    axum::serve(listener, zupflow_server::app(state, guard))
+    // Live, the background work runs in the same process, as in `zupflow`.
+    let workers = if live {
+        vec![
+            tokio::spawn(zupflow_server::discovery::run_worker(state.clone())),
+            tokio::spawn(zupflow_server::run_engine::run_worker(state.clone())),
+            tokio::spawn(zupflow_server::webhook_delivery::run_workers(state.clone())),
+        ]
+    } else {
+        Vec::new()
+    };
+    let served = axum::serve(listener, zupflow_server::app(state, guard))
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string());
+    for worker in workers {
+        worker.abort();
+    }
+    served
 }
 
 /// Restores the reference fixture: everything the API serves so far, as the
@@ -1076,8 +1198,10 @@ async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
-        ["serve", database] => serve(database, None).await,
-        ["serve", database, "--console", origin] => serve(database, Some(origin)).await,
+        ["serve", database, options @ ..] => match serving(options) {
+            Ok(serving) => serve(database, serving).await,
+            Err(error) => Err(error),
+        },
         ["reset", database] => reset(database).await,
         ["operations"] => {
             #[allow(clippy::print_stdout)]
@@ -1087,7 +1211,7 @@ async fn main() -> ExitCode {
             Ok(())
         }
         _ => Err(
-            "usage: zupflow-contract-server serve <database> [--console <origin>] | reset <database> | operations"
+            "usage: zupflow-contract-server serve <database> [--console <origin>] [--local-app <host>=<certificate.pem>]... | reset <database> | operations"
                 .to_owned(),
         ),
     };

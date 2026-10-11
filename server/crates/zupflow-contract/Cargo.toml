@@ -14,6 +14,21 @@ workspace = true
 name = "zupflow-contract-server"
 path = "src/main.rs"
 
+[features]
+# Development only, and opt-in: `serve --local-app`, reaching a fake app
+# served on this machine (Taskboard). Never on by default, so no other build
+# of the workspace gets `zupflow-outbound/local-apps` through this crate; the
+# checks and `scripts/taskboard-dev.sh` name it.
+local-apps = ["zupflow-outbound/local-apps"]
+
+[[test]]
+name = "local_apps"
+required-features = ["local-apps"]
+
+[[test]]
+name = "taskboard_end_to_end"
+required-features = ["local-apps"]
+
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
@@ -24,5 +39,11 @@ tokio.workspace = true
 zupflow-basic.workspace = true
 zupflow-core.workspace = true
 zupflow-mcp.workspace = true
+zupflow-outbound.workspace = true
 zupflow-server = { path = "../zupflow-server" }
 zupflow-sqlite.workspace = true
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "form", "json"] }
+url = "2"
+zupflow-taskboard = { path = "../zupflow-taskboard" }

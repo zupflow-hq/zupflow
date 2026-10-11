@@ -2,6 +2,20 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# What a plain `cargo build` (and `cargo build --release`) builds: everything
+# but the development-only crates, the contract server and Taskboard, which
+# refuse to build for release. The checks name `--workspace`, so they still
+# build and test those. A new product crate is added here too.
+default-members = [
+    "crates/zupflow-basic",
+    "crates/zupflow-conformance",
+    "crates/zupflow-core",
+    "crates/zupflow-mcp",
+    "crates/zupflow-oidc",
+    "crates/zupflow-outbound",
+    "crates/zupflow-server",
+    "crates/zupflow-sqlite",
+]
 
 [workspace.package]
 edition = "2024"

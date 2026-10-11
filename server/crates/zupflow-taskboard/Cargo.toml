@@ -1,0 +1,33 @@
+[package]
+name = "zupflow-taskboard"
+description = "Development only: Taskboard, a fake MCP app with its own OAuth, served on this machine for end-to-end tests and local click-throughs. Never built into a release or deployed."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "taskboard"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+hyper = "1"
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-rustls = { version = "0.26", default-features = false }
+url = "2"
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "form", "json"] }

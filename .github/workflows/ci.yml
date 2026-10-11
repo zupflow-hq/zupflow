@@ -27,6 +27,33 @@ jobs:
         with:
           workspaces: server
       - run: pnpm install --frozen-lockfile
+      # The development-only `local-apps` feature (reaching a fake app on
+      # loopback) is opt-in: neither the product's tree, a plain build nor
+      # any workspace crate by default may ever turn it on.
+      - name: No development-only features in the product
+        working-directory: server
+        run: |
+          for tree in "-p zupflow-server" "" "--workspace -i zupflow-outbound"; do
+            if cargo tree $tree --locked -e features | grep -F local-apps; then
+              echo "cargo tree $tree has the development-only local-apps feature" >&2
+              exit 1
+            fi
+          done
       - run: pnpm check
       # The shared contract suite against the backend, on a fixture of its own.
       - run: pnpm contract:backend
+
+  # The product builds for release, without the development-only crates. A
+  # job of its own: next to the debug build it runs the runner out of disk.
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+          key: release
+      - run: cargo build --release --locked -p zupflow-server
+        working-directory: server

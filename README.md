@@ -30,6 +30,7 @@ server/           The Rust backend — a Cargo workspace
   crates/zupflow-outbound/    The safe outbound HTTP path: public HTTPS only, no redirects, bounded
   crates/zupflow-mcp/         A minimal MCP client: lists a server's tools through the safe path
   crates/zupflow-contract/    Development only: the server and fixture the contract suite runs against
+  crates/zupflow-taskboard/   Development only: Taskboard, a fake MCP app with its own OAuth, for end-to-end runs
   crates/zupflow-conformance/ The suites every implementation of a trait must pass
   crates/zupflow-server/      The API server (`zupflow` binary), on axum
 ```
@@ -342,6 +343,71 @@ origin: `zupflow-contract-server serve <database> --console
 http://localhost:5181` answers CORS for that origin and signs a request
 without a token in as the owner, as `local` does; then run the Console with
 `PORT=5181 VITE_ZUPFLOW_API_URL=http://127.0.0.1:<port>`, the port it prints.
+
+### Taskboard: a fake MCP app, end to end
+
+Taskboard (`server/crates/zupflow-taskboard`, development only) is a fake MCP
+app with its own OAuth, built to what an `mcp_oauth` app's sign-in expects
+(decision 0039) and strict about it: protected-resource and authorization
+server metadata, dynamic registration of public clients, the authorization
+code flow with PKCE (`S256`) and a consent page that allows or denies, a
+required `state`, `resource` naming its MCP endpoint, single-use codes,
+expiring access tokens and rotating refresh tokens (a reused one revokes its
+family). Its MCP endpoint (Streamable HTTP) wants a live bearer token and a
+session, and serves three tools, one per hint of decision 0040: `list_tasks`
+(read-only), `create_task` (writes) and `delete_task` (destructive). Each
+registered client has its own board, in memory; the account is a fictional
+Robin Park.
+
+It runs on loopback under the reserved name `taskboard.example`, with a
+certificate made at start for that name alone. The safe outbound path never
+reaches loopback, so the contract server reaches it only when built for it
+and told to. Built with its opt-in `local-apps` feature (`cargo build -p
+zupflow-contract --features zupflow-contract/local-apps`),
+`zupflow-contract-server serve <database> --local-app
+taskboard.example:<port>=<certificate.pem>` builds its outbound client with
+`SafeHttpClient::for_local_apps` (`zupflow-outbound`'s `local-apps`
+feature), which pins each named app to `127.0.0.1` and its port without
+asking DNS, trusts only the certificates given, still speaks HTTPS alone and
+reaches nothing else. Only names under `.example` are accepted, so a local
+app can never stand in for a real host. Nothing turns the feature on by
+default, and CI fails if `zupflow-server`'s dependency tree ever has it; the
+`zupflow` binary never builds that client. A plain `cargo build` (or
+`cargo build --release`) in `server/` leaves the development-only crates out
+(`default-members`). With `--local-app`, the contract server also answers
+runs with the scripted model and runs the background workers, as `zupflow`
+does.
+
+`pnpm check` runs it end to end (`zupflow-contract/tests/taskboard_end_to_end.rs`,
+which needs `--features zupflow-contract/local-apps`, as the check passes): it starts Taskboard and the contract server, adds
+Taskboard as a catalog app in Sandbox, connects it through hosted Connect
+(denied once, then allowed; a tampered or replayed callback is refused and
+exchanges nothing), waits for its tools, grants an agent the tools
+its levels allow, and runs it: `list_tasks` runs with the installation's
+token, `create_task` waits for an approval from an API key, a denied
+`delete_task` is never sent, and an expired or revoked token fails the run
+with `installation_reconnect_required`, which a reconnect fixes.
+
+To click through it yourself:
+
+```bash
+scripts/taskboard-dev.sh
+```
+
+It serves Taskboard (on port 7443, `TASKBOARD_PORT`) and the contract server
+for a Console at `http://localhost:5181` (`CONSOLE_ORIGIN`), with Taskboard
+already in Northwind's catalog and ready in Sandbox, and prints the command to
+start the Console. Your browser must reach `taskboard.example` at `127.0.0.1`
+and accept its certificate: the script prints a Chromium command that does
+both for a profile of its own (add `--no-proxy-server` if your browser goes
+through a proxy), or add `127.0.0.1 taskboard.example` to `/etc/hosts` and
+accept the certificate warning once. Then, in a Sandbox workspace, **Add
+installation**, choose Taskboard, and allow access on Taskboard's page. Runs
+are answered by the scripted model: `call create_task {"title":"Hello"}` calls
+a tool. Taskboard's home page expires or revokes every token, to see what an
+installation does then. Taskboard keeps nothing across restarts: a client the
+backend registered with an earlier run is unknown to it, so start from a
+fresh database (the script does).
 
 ## Checks
 

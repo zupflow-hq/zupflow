@@ -15,6 +15,17 @@
 //! - **Failures by kind,** never by the other side's words.
 //! - **The credential** is set after every other header, and every exact
 //!   occurrence of it is scrubbed from the body and header values returned.
+//!
+//! Development only, behind the `local-apps` feature, off by default and
+//! turned on only by the development contract server's own opt-in feature
+//! (CI fails if `zupflow-server`'s tree ever has it):
+//! [`SafeHttpClient::for_local_apps`] builds a client that reaches a few apps
+//! served on this machine, such as the fake Taskboard app the end-to-end
+//! test signs in to, and nothing else. Each is named under the reserved
+//! `.example` domain, which never resolves on the internet, is pinned to
+//! loopback and one port without asking DNS, and is trusted only through the
+//! certificates given. Every other rule above still holds. The `zupflow`
+//! binary never builds one.
 
 use std::error::Error as _;
 use std::net::{IpAddr, SocketAddr};
@@ -51,15 +62,44 @@ impl std::fmt::Display for Unresolvable {
 
 impl std::error::Error for Unresolvable {}
 
+// A second guard behind the feature itself: a release build with it is a mistake.
+#[cfg(all(feature = "local-apps", not(debug_assertions)))]
+compile_error!("the `local-apps` feature is for development only and is never built for release");
+
 /// Which destinations are allowed. Production allows public HTTPS only; the
 /// tests below also reach plain HTTP on loopback, which nothing else can ask for.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Policy {
     loopback_for_tests: bool,
+    /// Development only: the `.example` names served on this machine, each
+    /// with its port. When set, these are reached at loopback, and nothing
+    /// else is reached.
+    #[cfg(feature = "local-apps")]
+    local_apps: Option<std::sync::Arc<[(String, u16)]>>,
 }
 
 impl Policy {
-    fn allows(self, ip: IpAddr) -> bool {
+    fn production() -> Self {
+        Self {
+            loopback_for_tests: false,
+            #[cfg(feature = "local-apps")]
+            local_apps: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn loopback_for_tests() -> Self {
+        let mut policy = Self::production();
+        policy.loopback_for_tests = true;
+        policy
+    }
+
+    fn allows(&self, ip: IpAddr) -> bool {
+        // A client for local apps reaches them by name only.
+        #[cfg(feature = "local-apps")]
+        if self.local_apps.is_some() {
+            return false;
+        }
         is_public(ip) || (self.loopback_for_tests && ip.is_loopback())
     }
 }
@@ -67,7 +107,7 @@ impl Policy {
 /// Whether a name may be called: only if every address it resolves to is
 /// allowed. One bad address refuses the name: a host that resolves to both
 /// public and private addresses is an attempt, not an accident.
-fn all_allowed(policy: Policy, addresses: &[SocketAddr]) -> bool {
+fn all_allowed(policy: &Policy, addresses: &[SocketAddr]) -> bool {
     addresses.iter().all(|address| policy.allows(address.ip()))
 }
 
@@ -83,9 +123,20 @@ struct CheckedResolver {
 
 impl Resolve for CheckedResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        let policy = self.policy;
+        let policy = self.policy.clone();
         let host = name.as_str().to_owned();
         Box::pin(async move {
+            // Development only: a local app is pinned to loopback, without
+            // asking DNS; any other name is refused.
+            #[cfg(feature = "local-apps")]
+            if let Some(apps) = &policy.local_apps {
+                if apps.iter().any(|(app, _)| app.eq_ignore_ascii_case(&host)) {
+                    let loopback = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+                    return Ok(Box::new(std::iter::once(loopback)) as Addrs);
+                }
+                tracing::warn!(event = "outbound.not_a_local_app", host = %host);
+                return Err(Box::new(NotPublic) as Box<dyn std::error::Error + Send + Sync>);
+            }
             let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
                 .await
                 .map_err(|_| Box::new(Unresolvable) as Box<dyn std::error::Error + Send + Sync>)?
@@ -93,7 +144,7 @@ impl Resolve for CheckedResolver {
             if addresses.is_empty() {
                 return Err(Box::new(Unresolvable) as Box<dyn std::error::Error + Send + Sync>);
             }
-            if !all_allowed(policy, &addresses) {
+            if !all_allowed(&policy, &addresses) {
                 tracing::warn!(event = "outbound.not_public", host = %host);
                 return Err(Box::new(NotPublic) as Box<dyn std::error::Error + Send + Sync>);
             }
@@ -109,19 +160,63 @@ pub struct SafeHttpClient {
 
 impl SafeHttpClient {
     pub fn new() -> Result<Self, ClientError> {
-        Self::with_policy(Policy {
-            loopback_for_tests: false,
-        })
+        Self::with_policy(Policy::production())
     }
 
     fn with_policy(policy: Policy) -> Result<Self, ClientError> {
-        let client = Client::builder()
+        let client = Self::builder(&policy).build().map_err(|_| ClientError)?;
+        Ok(Self { client, policy })
+    }
+
+    fn builder(policy: &Policy) -> reqwest::ClientBuilder {
+        Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .https_only(!policy.loopback_for_tests)
-            .dns_resolver(CheckedResolver { policy })
+            .dns_resolver(CheckedResolver { policy: policy.clone() })
+    }
+
+    /// Development only: a client that reaches `apps`, served on this
+    /// machine, and nothing else. Each app's name must be under the reserved
+    /// `.example` domain; it's pinned to `127.0.0.1` and its port, trusted
+    /// only through the certificates given, and still reached over HTTPS
+    /// alone.
+    #[cfg(feature = "local-apps")]
+    pub fn for_local_apps(apps: &[LocalApp]) -> Result<Self, LocalAppError> {
+        if apps.is_empty() {
+            return Err(LocalAppError::NoApps);
+        }
+        let mut hosts = Vec::new();
+        let mut certificates = Vec::new();
+        for app in apps {
+            if !reserved_example_name(&app.host) {
+                return Err(LocalAppError::NotReserved(app.host.clone()));
+            }
+            certificates.push(
+                reqwest::Certificate::from_pem(&app.certificate_pem)
+                    .map_err(|_| LocalAppError::InvalidCertificate(app.host.clone()))?,
+            );
+            hosts.push((app.host.clone(), app.port));
+        }
+        tracing::warn!(
+            event = "outbound.local_apps",
+            hosts = ?hosts,
+            "Development only: outbound calls reach these local apps and nothing else"
+        );
+        let policy = Policy {
+            local_apps: Some(hosts.into()),
+            ..Policy::production()
+        };
+        let client = Self::builder(&policy)
+            // Only these certificates are trusted, never the system's roots.
+            // They share one root store, so each is a root for every local
+            // app; hostname verification still holds each to the names it
+            // was issued for (Taskboard's names only itself), and the names
+            // are pinned to loopback, so no app answers for another or for
+            // anything outside this machine.
+            .tls_certs_only(certificates)
             .build()
-            .map_err(|_| ClientError)?;
+            .map_err(|_| LocalAppError::Client)?;
         Ok(Self { client, policy })
     }
 
@@ -140,11 +235,82 @@ impl SafeHttpClient {
         };
         // A literal address is never resolved, so it's checked here.
         let literal = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>();
-        match literal {
-            Ok(ip) if !self.policy.allows(ip) => Err(OutboundError::Refused(Refusal::NotPublic)),
-            _ => Ok(url),
+        if let Ok(ip) = literal
+            && !self.policy.allows(ip)
+        {
+            return Err(OutboundError::Refused(Refusal::NotPublic));
+        }
+        // Development only: a local app is reached at its own port alone.
+        #[cfg(feature = "local-apps")]
+        if let Some(apps) = &self.policy.local_apps
+            && !apps
+                .iter()
+                .any(|(app, port)| app.eq_ignore_ascii_case(host) && url.port_or_known_default() == Some(*port))
+        {
+            return Err(OutboundError::Refused(Refusal::NotPublic));
+        }
+        Ok(url)
+    }
+}
+
+/// Development only: an app served on this machine, by the name it's reached
+/// at (under `.example`), the loopback port it listens on, and the PEM
+/// certificate it serves.
+#[cfg(feature = "local-apps")]
+#[derive(Debug, Clone)]
+pub struct LocalApp {
+    pub host: String,
+    pub port: u16,
+    pub certificate_pem: Vec<u8>,
+}
+
+/// Why a client for local apps wasn't built.
+#[cfg(feature = "local-apps")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalAppError {
+    NoApps,
+    /// Not a lowercase name under the reserved `.example` domain.
+    NotReserved(String),
+    InvalidCertificate(String),
+    Client,
+}
+
+#[cfg(feature = "local-apps")]
+impl std::fmt::Display for LocalAppError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoApps => f.write_str("no local apps named"),
+            Self::NotReserved(host) => write!(
+                f,
+                "{host} isn't a lowercase name under .example: a local app must use the reserved domain, so it can never stand in for a real host"
+            ),
+            Self::InvalidCertificate(host) => write!(f, "the certificate for {host} isn't PEM"),
+            Self::Client => f.write_str("can't build the HTTP client"),
         }
     }
+}
+
+#[cfg(feature = "local-apps")]
+impl std::error::Error for LocalAppError {}
+
+/// A DNS name of at least two labels ending in `.example` (RFC 2606), which
+/// never resolves on the internet: lowercase letters, digits and inner hyphens.
+#[cfg(any(feature = "local-apps", test))]
+fn reserved_example_name(host: &str) -> bool {
+    let Some(rest) = host.strip_suffix(".example") else {
+        return false;
+    };
+    !rest.is_empty()
+        && host.len() <= 253
+        && rest.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
 }
 
 /// The client couldn't be built (no TLS roots, say).
@@ -350,20 +516,18 @@ mod tests {
 
     #[test]
     fn refuses_a_name_with_any_address_that_isnt_public() {
-        let production = Policy {
-            loopback_for_tests: false,
-        };
+        let production = Policy::production();
         let address = |text: &str| -> SocketAddr { text.parse().unwrap() };
         assert!(all_allowed(
-            production,
+            &production,
             &[address("8.8.8.8:443"), address("1.1.1.1:443")]
         ));
         assert!(
-            !all_allowed(production, &[address("8.8.8.8:443"), address("10.0.0.1:443")]),
+            !all_allowed(&production, &[address("8.8.8.8:443"), address("10.0.0.1:443")]),
             "mixed"
         );
         assert!(
-            !all_allowed(production, &[address("[::1]:443"), address("8.8.8.8:443")]),
+            !all_allowed(&production, &[address("[::1]:443"), address("8.8.8.8:443")]),
             "mixed, private first"
         );
     }
@@ -457,10 +621,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         tokio::spawn(async move { axum::serve(listener, app).await });
-        let client = SafeHttpClient::with_policy(Policy {
-            loopback_for_tests: true,
-        })
-        .unwrap();
+        let client = SafeHttpClient::with_policy(Policy::loopback_for_tests()).unwrap();
         (client, base, seen)
     }
 
@@ -547,10 +708,30 @@ mod tests {
     #[tokio::test]
     async fn passes_the_conformance_suite() {
         zupflow_conformance::outbound_http::refusals(&SafeHttpClient::new().unwrap()).await;
-        let loopback = SafeHttpClient::with_policy(Policy {
-            loopback_for_tests: true,
-        })
-        .unwrap();
+        let loopback = SafeHttpClient::with_policy(Policy::loopback_for_tests()).unwrap();
         zupflow_conformance::outbound_http::answers(&loopback).await;
+    }
+
+    #[test]
+    fn local_apps_must_use_the_reserved_example_domain() {
+        for (host, reserved) in [
+            ("taskboard.example", true),
+            ("a.b-c.example", true),
+            ("example", false),
+            (".example", false),
+            ("taskboard.example.com", false),
+            ("taskboard.com", false),
+            ("localhost", false),
+            ("taskboard.localhost", false),
+            ("Taskboard.example", false),
+            ("-x.example", false),
+            ("x..example", false),
+            ("x_y.example", false),
+            ("taskboard.example.", false),
+            (format!("{}example", "a.".repeat(123)).as_str(), true),
+            (format!("{}example", "a.".repeat(124)).as_str(), false),
+        ] {
+            assert_eq!(reserved_example_name(host), reserved, "{host}");
+        }
     }
 }

@@ -10,6 +10,14 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Development only: `SafeHttpClient::for_local_apps`, for the contract server
+# to reach a local fake app (Taskboard). Off by default; only
+# `zupflow-contract`'s own opt-in `local-apps` feature turns it on, and CI
+# fails if `zupflow-server`'s tree has it. Also refuses to build without
+# debug assertions.
+local-apps = []
+
 [dependencies]
 async-trait.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
