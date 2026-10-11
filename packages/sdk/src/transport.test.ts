@@ -12,6 +12,24 @@ function fakeFetch(status: number, body: unknown, seen: Request[] = []): typeof 
 }
 
 describe("createHttpTransport", () => {
+  it("rolls the named endpoint's secret without a body and preserves the caller's idempotency key", async () => {
+    const seen: Request[] = [];
+    const rolled = { endpoint: { id: "we_endpoint" }, signing_secret: "whsec_test_new" };
+    const client = createClient(
+      createHttpTransport({
+        baseUrl: "https://api.zupflow.example",
+        getToken: async () => null,
+        fetch: fakeFetch(200, { data: rolled, meta: null, error: null }, seen),
+      }),
+    );
+    expect(await client.webhooks.rollSecret("org_a b", "we_c/d", { idempotencyKey: "roll-once" })).toEqual(rolled);
+    const request = seen[0];
+    expect(request?.url).toBe("https://api.zupflow.example/v1/organizations/org_a%20b/webhooks/we_c%2Fd/roll-secret");
+    expect(request?.method).toBe("POST");
+    expect(request?.headers.get(IDEMPOTENCY_HEADER)).toBe("roll-once");
+    expect(await request?.text()).toBe("");
+  });
+
   it("resends the named delivery without a replacement event and preserves the caller's idempotency key", async () => {
     const seen: Request[] = [];
     const queued = { id: "whd_new", state: "pending", attempts: 0, event_id: "evt_original" };

@@ -312,6 +312,7 @@ actions! {
     WebhookUpdated => "webhook.updated",
     WebhookDeleted => "webhook.deleted",
     WebhookDeliveryResent => "webhook.delivery_resent",
+    WebhookSecretRolled => "webhook.secret_rolled",
     /// A decision on a call a run waited for, recorded by an API key.
     ApprovalResolved => "approval.resolved",
     RunCancelled => "run.cancelled",

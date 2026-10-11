@@ -191,6 +191,11 @@ async fn history_keeps_snapshot_attribution_and_refuses_corrupt_event_envelopes(
             "contradictory {key}"
         );
         assert_eq!(
+            store.find_delivery(org, delivery).await.unwrap_err(),
+            WebhookError::Unavailable,
+            "a worker cannot sign contradictory {key}"
+        );
+        assert_eq!(
             store
                 .list_deliveries(org, hook, Environment::Sandbox, &DeliveryFilter::default(), None, 25)
                 .await
@@ -226,6 +231,17 @@ async fn history_keeps_snapshot_attribution_and_refuses_corrupt_event_envelopes(
         .unwrap();
     assert_eq!(hidden.total, 0);
     assert!(hidden.items.is_empty());
+    assert!(store.find_delivery(org, delivery).await.unwrap().is_none());
+    sqlx::query("UPDATE webhook_endpoints SET environment = 'production' WHERE organization_id = ? AND id = ?")
+        .bind(org.uuid())
+        .bind(hook.uuid())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert!(
+        store.find_delivery(org, delivery).await.unwrap().is_none(),
+        "matching endpoint and event still cannot reach a workspace from another environment"
+    );
 }
 
 #[tokio::test]

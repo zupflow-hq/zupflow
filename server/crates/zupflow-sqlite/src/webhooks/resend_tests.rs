@@ -9,7 +9,7 @@ use zupflow_core::webhooks::event_body;
 use super::*;
 use crate::schema::{Temporary, TemporaryDirectory, temporary};
 
-async fn manager(database: &Database, org: OrganizationId) -> (MemberId, ApiKeyId) {
+pub(super) async fn manager(database: &Database, org: OrganizationId) -> (MemberId, ApiKeyId) {
     let user = UserId::generate();
     let member = MemberId::generate();
     let key = ApiKeyId::generate();

@@ -30,9 +30,10 @@ use crate::http::Failure;
 
 /// Routes whose response shows a secret once, as the contract marks them
 /// (`x-zupflow-shows-secret-once`); a test holds the two lists equal.
-pub const SHOWS_SECRET_ONCE: [&str; 4] = [
+pub const SHOWS_SECRET_ONCE: [&str; 5] = [
     "/v1/organizations/{org}/api-keys",
     "/v1/organizations/{org}/webhooks",
+    "/v1/organizations/{org}/webhooks/{hook}/roll-secret",
     "/v1/workspaces/{ws}/connect-sessions",
     "/v1/connect/sessions/{reference}/authorize",
 ];

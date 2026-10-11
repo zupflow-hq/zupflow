@@ -27,7 +27,7 @@ import {
   WebhookDeliveryErrorClass,
   type WebhookDeliveryId,
   type WebhookDeliverySummary,
-  type WebhookEndpoint,
+  WebhookEndpoint,
   type WebhookEndpointId,
   WebhookEvent,
   type WorkspaceId,
@@ -720,6 +720,14 @@ function findWebhook(organizationId: OrganizationId, endpointId: WebhookEndpoint
   const endpoint = db().webhooks.find((row) => row.organization_id === organizationId && row.id === endpointId);
   if (!endpoint) throw notFound("Webhook endpoint");
   return endpoint;
+}
+
+function toWebhookEndpoint(endpoint: WebhookEndpoint): WebhookEndpoint {
+  const expires = endpoint.previous_signing_secret_expires_at;
+  return WebhookEndpoint.parse({
+    ...endpoint,
+    previous_signing_secret_expires_at: expires !== null && Date.parse(expires) > Date.now() ? expires : null,
+  });
 }
 
 /** Joins an outbox event only within the endpoint's organization and environment. */
@@ -2618,7 +2626,11 @@ export function createHandlers(apiBase: string) {
       u("/v1/organizations/:org/webhooks"),
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
-        return ok(db().webhooks.filter((w) => w.organization_id === access.org.id));
+        return ok(
+          db()
+            .webhooks.filter((w) => w.organization_id === access.org.id)
+            .map(toWebhookEndpoint),
+        );
       }),
     ),
 
@@ -2648,6 +2660,7 @@ export function createHandlers(apiBase: string) {
           events: [...new Set(input.events)],
           enabled: true,
           signing_secret_last4: secret.slice(-4),
+          previous_signing_secret_expires_at: null,
           created_at: new Date().toISOString(),
           last_delivery: null,
         };
@@ -2658,7 +2671,7 @@ export function createHandlers(apiBase: string) {
           { type: "webhook", id: endpoint.id, name: auditUrl(endpoint.url) },
           { environment: endpoint.environment },
         );
-        return created({ endpoint, signing_secret: secret });
+        return created({ endpoint: toWebhookEndpoint(endpoint), signing_secret: secret });
       }),
     ),
 
@@ -2690,7 +2703,39 @@ export function createHandlers(apiBase: string) {
           { type: "webhook", id: endpoint.id, name: auditUrl(endpoint.url) },
           { environment: endpoint.environment },
         );
-        return ok(endpoint);
+        return ok(toWebhookEndpoint(endpoint));
+      }),
+    ),
+
+    http.post(
+      u("/v1/organizations/:org/webhooks/:hook/roll-secret"),
+      route(({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        requireRole(access, ADMINS, "roll webhook signing secrets");
+        const endpoint = findWebhook(access.org.id, idParam(params, "hook"));
+        const now = Date.now();
+        if (
+          endpoint.previous_signing_secret_expires_at !== null &&
+          Date.parse(endpoint.previous_signing_secret_expires_at) > now
+        ) {
+          throw new ApiFailure(
+            409,
+            "rotation_in_progress",
+            "The previous signing secret is still valid. Wait until its 24-hour overlap ends before rolling again.",
+          );
+        }
+        // No await between checking and updating: concurrent rolls have one winner.
+        // The mock keeps only public metadata, never either signing secret.
+        const secret = webhookSecret(endpoint.environment);
+        endpoint.signing_secret_last4 = secret.slice(-4);
+        endpoint.previous_signing_secret_expires_at = new Date(now + 24 * 60 * MINUTE).toISOString();
+        audit(
+          access,
+          "webhook.secret_rolled",
+          { type: "webhook", id: endpoint.id, name: auditUrl(endpoint.url) },
+          { environment: endpoint.environment },
+        );
+        return ok({ endpoint: toWebhookEndpoint(endpoint), signing_secret: secret });
       }),
     ),
 

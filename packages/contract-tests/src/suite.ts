@@ -352,6 +352,7 @@ export function contractSuite(target: Target) {
         await owner.webhooks.delivery(org, hook.endpoint.id, delivery.id);
         await owner.webhooks.deliveryAttempts(org, hook.endpoint.id, delivery.id);
         await owner.webhooks.resendDelivery(org, hook.endpoint.id, delivery.id);
+        await owner.webhooks.rollSecret(org, hook.endpoint.id);
         await owner.webhooks.delete(org, hook.endpoint.id);
         await owner.audit.list(org);
         await owner.workspaces.delete(workspace.id);
@@ -2615,6 +2616,7 @@ export function contractSuite(target: Target) {
               }),
           ],
           ["updateWebhook", () => c.webhooks.update(t.org, t.hook.id, { enabled: false })],
+          ["rollWebhookSecret", () => c.webhooks.rollSecret(t.org, t.hook.id)],
           ["deleteWebhook", () => c.webhooks.delete(t.org, t.hook.id)],
           ["testWebhook", () => c.webhooks.sendTest(t.org, t.hook.id)],
           [
@@ -2680,6 +2682,7 @@ export function contractSuite(target: Target) {
           "updateConnectSettings",
           "createWebhook",
           "updateWebhook",
+          "rollWebhookSecret",
           "deleteWebhook",
           "testWebhook",
           "resendWebhookDelivery",
@@ -3001,6 +3004,214 @@ export function contractSuite(target: Target) {
           (await owner.webhooks.list(fx.organization)).find((endpoint) => endpoint.environment === environment),
           `${environment} webhook`,
         );
+
+      it("rolls each environment's secret without changing endpoint identity or delivery history", async () => {
+        for (const environment of ["sandbox", "production"] as const) {
+          const endpoint = await endpointIn(environment);
+          expect(endpoint.previous_signing_secret_expires_at).toBeNull();
+          const endpoints = await owner.webhooks.list(fx.organization);
+          const history = await owner.webhooks.deliveries(fx.organization, endpoint.id);
+          const details = await Promise.all(
+            history.items.map((row) => owner.webhooks.delivery(fx.organization, endpoint.id, row.id)),
+          );
+          const attempts = await Promise.all(
+            history.items.map((row) => owner.webhooks.deliveryAttempts(fx.organization, endpoint.id, row.id)),
+          );
+          const workspaces = [...new Set(history.items.flatMap((row) => (row.workspace ? [row.workspace.id] : [])))];
+          expect(workspaces).toHaveLength(2);
+          const scoped = await Promise.all(
+            workspaces.map((workspace_id) => owner.webhooks.deliveries(fx.organization, endpoint.id, { workspace_id })),
+          );
+          const before = Date.now();
+          const rolled = await owner.webhooks.rollSecret(fx.organization, endpoint.id);
+          const after = Date.now();
+          const expires = Date.parse(must(rolled.endpoint.previous_signing_secret_expires_at, "overlap deadline"));
+          expect(expires).toBeGreaterThanOrEqual(before + 24 * 60 * 60_000);
+          expect(expires).toBeLessThanOrEqual(after + 24 * 60 * 60_000);
+          expect(rolled.signing_secret).toMatch(new RegExp(`^whsec_${environment === "sandbox" ? "test" : "live"}_`));
+          expect(rolled.endpoint).toEqual({
+            ...endpoint,
+            signing_secret_last4: rolled.signing_secret.slice(-4),
+            previous_signing_secret_expires_at: rolled.endpoint.previous_signing_secret_expires_at,
+          });
+          expect(await owner.webhooks.list(fx.organization)).toEqual(
+            endpoints.map((row) => (row.id === endpoint.id ? rolled.endpoint : row)),
+          );
+          expect(await owner.webhooks.deliveries(fx.organization, endpoint.id)).toEqual(history);
+          expect(
+            await Promise.all(
+              history.items.map((row) => owner.webhooks.delivery(fx.organization, endpoint.id, row.id)),
+            ),
+          ).toEqual(details);
+          expect(
+            await Promise.all(
+              history.items.map((row) => owner.webhooks.deliveryAttempts(fx.organization, endpoint.id, row.id)),
+            ),
+          ).toEqual(attempts);
+          expect(
+            await Promise.all(
+              workspaces.map((workspace_id) =>
+                owner.webhooks.deliveries(fx.organization, endpoint.id, { workspace_id }),
+              ),
+            ),
+          ).toEqual(scoped);
+          const events = (await owner.audit.list(fx.organization, { limit: 100 })).items.filter(
+            (row) => row.action === "webhook.secret_rolled" && row.target.id === endpoint.id,
+          );
+          expect(events).toHaveLength(1);
+          expect(events[0]).toMatchObject({
+            organization_id: fx.organization,
+            workspace_id: null,
+            workspace: null,
+            environment,
+            actor: { type: "user", id: (await owner.me.get()).user.id },
+            target: { type: "webhook", id: endpoint.id, name: endpoint.url },
+          });
+        }
+      });
+
+      it("shows a rolled secret once and never echoes either secret through reads or updates", async () => {
+        const created = await owner.webhooks.create(fx.organization, {
+          environment: "sandbox",
+          url: "https://hooks.northwind.example/rotation?token=private-query#private-fragment",
+          description: "Rotate while disabled",
+          events: ["run.completed"],
+        });
+        expect(created.endpoint.previous_signing_secret_expires_at).toBeNull();
+        const endpoint = await owner.webhooks.update(fx.organization, created.endpoint.id, { enabled: false });
+        const options = { idempotencyKey: "roll-secret-once" };
+        const rolled = await owner.webhooks.rollSecret(fx.organization, endpoint.id, options);
+        expect(rolled.signing_secret).not.toBe(created.signing_secret);
+        expect(rolled.endpoint).toEqual({
+          ...endpoint,
+          signing_secret_last4: rolled.signing_secret.slice(-4),
+          previous_signing_secret_expires_at: expect.any(String),
+        });
+        const audit = await owner.audit.list(fx.organization, { limit: 100 });
+        expect(await failure(owner.webhooks.rollSecret(fx.organization, endpoint.id, options))).toMatchObject({
+          status: 409,
+          code: "idempotency_key_completed",
+        });
+        for (const idempotencyKey of ["roll-secret-again", "roll-secret-yet-again"]) {
+          expect(
+            await failure(owner.webhooks.rollSecret(fx.organization, endpoint.id, { idempotencyKey })),
+          ).toMatchObject({
+            status: 409,
+            code: "rotation_in_progress",
+          });
+        }
+        const other = await endpointIn("production");
+        expect(await failure(owner.webhooks.rollSecret(fx.organization, other.id, options))).toMatchObject({
+          status: 422,
+          code: "idempotency_key_reused",
+        });
+        expect(await owner.audit.list(fx.organization, { limit: 100 })).toEqual(audit);
+        const event = must(
+          audit.items.find((row) => row.action === "webhook.secret_rolled"),
+          "rotation audit",
+        );
+        expect(event).toMatchObject({
+          target: { type: "webhook", id: endpoint.id, name: "https://hooks.northwind.example/rotation" },
+          workspace_id: null,
+          environment: "sandbox",
+        });
+        expect(JSON.stringify(event)).not.toContain("private-query");
+        expect(JSON.stringify(event)).not.toContain("private-fragment");
+        const updated = await owner.webhooks.update(fx.organization, endpoint.id, { description: "Still disabled" });
+        expect(updated).toEqual({ ...rolled.endpoint, description: "Still disabled" });
+        const endpoints = await owner.webhooks.list(fx.organization);
+        expect(endpoints.find((row) => row.id === endpoint.id)).toEqual(updated);
+        expect(endpoints.find((row) => row.id === other.id)).toEqual(other);
+        const exposed = JSON.stringify({
+          endpoints,
+          updated,
+          audit,
+          history: await owner.webhooks.deliveries(fx.organization, endpoint.id),
+        });
+        for (const secret of [created.signing_secret, rolled.signing_secret]) expect(exposed).not.toContain(secret);
+      });
+
+      it("serializes concurrent secret rolls per endpoint with one audit event", async () => {
+        for (const environment of ["sandbox", "production"] as const) {
+          const endpoint = await endpointIn(environment);
+          const results = await Promise.allSettled([
+            owner.webhooks.rollSecret(fx.organization, endpoint.id, { idempotencyKey: `rotate-${environment}-a` }),
+            owner.webhooks.rollSecret(fx.organization, endpoint.id, { idempotencyKey: `rotate-${environment}-b` }),
+          ]);
+          expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+          const winner = must(
+            results.find((result) => result.status === "fulfilled"),
+            "winning rotation",
+          ).value;
+          expect(
+            must(
+              results.find((result) => result.status === "rejected"),
+              "losing rotation",
+            ).reason,
+          ).toMatchObject({
+            status: 409,
+            code: "rotation_in_progress",
+          });
+          expect(await endpointIn(environment)).toEqual(winner.endpoint);
+          expect(
+            (await owner.audit.list(fx.organization, { limit: 100 })).items.filter(
+              (row) => row.action === "webhook.secret_rolled" && row.target.id === endpoint.id,
+            ),
+          ).toHaveLength(1);
+        }
+      });
+
+      it("keeps secret rotation inside the owning organization and permits admins in both environments", async () => {
+        const mine = await endpointIn("production");
+        const outsider = as("outsider");
+        const other = must((await outsider.webhooks.list(fx.otherOrganization))[0], "foreign endpoint");
+        const before = await owner.webhooks.list(fx.organization);
+        const otherBefore = await outsider.webhooks.list(fx.otherOrganization);
+        const audit = await owner.audit.list(fx.organization, { limit: 100 });
+        const otherAudit = await outsider.audit.list(fx.otherOrganization, { limit: 100 });
+        for (const [client, org, hook] of [
+          [owner, fx.otherOrganization, other.id],
+          [owner, fx.organization, other.id],
+          [outsider, fx.organization, mine.id],
+          [outsider, fx.otherOrganization, mine.id],
+          [owner, fx.organization, "we_missing"],
+        ] as const) {
+          expect(await failure(client.webhooks.rollSecret(org, hook))).toMatchObject({
+            status: 404,
+            code: "not_found",
+          });
+        }
+        expect(await failure(as(null).webhooks.rollSecret(fx.organization, mine.id))).toMatchObject({
+          status: 401,
+          code: "unauthenticated",
+        });
+        expect(await owner.webhooks.list(fx.organization)).toEqual(before);
+        expect(await outsider.webhooks.list(fx.otherOrganization)).toEqual(otherBefore);
+        expect(await owner.audit.list(fx.organization, { limit: 100 })).toEqual(audit);
+        expect(await outsider.audit.list(fx.otherOrganization, { limit: 100 })).toEqual(otherAudit);
+        const person = (await as("developer").me.get()).user;
+        const member = must(
+          (await owner.members.list(fx.organization)).find((row) => row.user.id === person.id),
+          "developer member",
+        );
+        await owner.members.update(fx.organization, member.id, { role: "admin" });
+        for (const environment of ["sandbox", "production"] as const) {
+          const endpoint = await endpointIn(environment);
+          const rolled = await as("developer").webhooks.rollSecret(fx.organization, endpoint.id);
+          expect(rolled.endpoint.id).toBe(endpoint.id);
+          const event = must(
+            (await owner.audit.list(fx.organization)).items.find(
+              (row) => row.action === "webhook.secret_rolled" && row.target.id === endpoint.id,
+            ),
+            "admin rotation audit",
+          );
+          expect(event).toMatchObject({
+            actor: { type: "user", id: person.id, name: person.name },
+            environment,
+            workspace_id: null,
+          });
+        }
+      });
 
       it("resends each terminal outcome with a fresh delivery and the exact original event", async () => {
         for (const environment of ["sandbox", "production"] as const) {
@@ -3473,7 +3684,7 @@ export function contractSuite(target: Target) {
         });
       });
 
-      it("keeps an API key's delivery history and resends inside its organization and environment", async () => {
+      it("keeps an API key's webhook history, resends and secret rotations inside its organization and environment", async () => {
         const production = await endpointIn("production");
         const sandbox = await endpointIn("sandbox");
         const endpoints = { production, sandbox };
@@ -3511,6 +3722,15 @@ export function contractSuite(target: Target) {
             status: 404,
             code: "not_found",
           });
+          const otherBefore = await endpointIn(other.environment);
+          expect(await failure(client.webhooks.rollSecret(fx.organization, other.id))).toMatchObject({
+            status: 404,
+            code: "not_found",
+          });
+          expect(await failure(client.webhooks.rollSecret(fx.otherOrganization, endpoint.id))).toMatchObject({
+            status: 404,
+            code: "not_found",
+          });
           expect(await failure(client.webhooks.deliveries(fx.otherOrganization, endpoint.id))).toMatchObject({
             status: 404,
             code: "not_found",
@@ -3544,6 +3764,35 @@ export function contractSuite(target: Target) {
             actor: { type: "api_key", id: key.key.id, name: key.key.name },
             workspace_id: terminal.workspace?.id,
             environment,
+          });
+          const history = await client.webhooks.deliveries(fx.organization, endpoint.id);
+          const options = { idempotencyKey: "roll-with-key" };
+          const rolled = await client.webhooks.rollSecret(fx.organization, endpoint.id, options);
+          expect(rolled.endpoint).toEqual({
+            ...endpoint,
+            signing_secret_last4: rolled.signing_secret.slice(-4),
+            previous_signing_secret_expires_at: expect.any(String),
+          });
+          expect(await failure(client.webhooks.rollSecret(fx.organization, endpoint.id, options))).toMatchObject({
+            status: 409,
+            code: "idempotency_key_completed",
+          });
+          expect(await failure(client.webhooks.rollSecret(fx.organization, endpoint.id))).toMatchObject({
+            status: 409,
+            code: "rotation_in_progress",
+          });
+          expect(await client.webhooks.list(fx.organization)).toEqual([rolled.endpoint]);
+          expect(await endpointIn(other.environment)).toEqual(otherBefore);
+          expect(await client.webhooks.deliveries(fx.organization, endpoint.id)).toEqual(history);
+          const rotations = (await owner.audit.list(fx.organization, { limit: 100 })).items.filter(
+            (row) => row.action === "webhook.secret_rolled" && row.target.id === endpoint.id,
+          );
+          expect(rotations).toHaveLength(1);
+          expect(rotations[0]).toMatchObject({
+            actor: { type: "api_key", id: key.key.id, name: key.key.name },
+            workspace_id: null,
+            environment,
+            target: { type: "webhook", id: endpoint.id, name: endpoint.url },
           });
         }
       });

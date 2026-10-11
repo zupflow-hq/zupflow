@@ -833,6 +833,17 @@ export const routes: readonly Route[] = [
     response: ok(s.WebhookEndpoint),
   },
   {
+    operationId: "rollWebhookSecret",
+    method: "post",
+    path: "/v1/organizations/{org}/webhooks/{hook}/roll-secret",
+    summary:
+      "Roll an endpoint's signing secret, returning the new secret once. Owners, admins and an API key for the endpoint's environment may roll, including disabled endpoints and Production. The previous secret remains valid for 24 hours; deliveries carry signatures for both secrets over the same timestamp and body until then. previous_signing_secret_expires_at is null at or after the deadline. A second roll during overlap is `409 rotation_in_progress`, even with a fresh idempotency key. Replaying a successful key is `409 idempotency_key_completed` and never returns the secret again. A missing or foreign endpoint is `404`. Records webhook.secret_rolled against the existing webhook endpoint, with no workspace and the endpoint's environment.",
+    callers: both,
+    params: { ...org, hook: idSchema("webhook_endpoint") },
+    response: ok(s.CreatedWebhookEndpoint),
+    showsSecretOnce: true,
+  },
+  {
     operationId: "deleteWebhook",
     method: "delete",
     path: "/v1/organizations/{org}/webhooks/{hook}",

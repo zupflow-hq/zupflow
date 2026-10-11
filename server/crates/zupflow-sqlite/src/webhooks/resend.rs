@@ -1,7 +1,6 @@
 //! A resend is a new delivery of the existing immutable event. Eligibility,
 //! the delivery, its job and its audit event belong to one transaction.
 
-use sqlx::SqliteConnection;
 use zupflow_core::audit::AuditPlace;
 
 use super::*;
@@ -11,35 +10,6 @@ fn store_error(error: WebhookError) -> ResendError {
         WebhookError::NotFound => ResendError::NotFound,
         WebhookError::Unavailable | WebhookError::InvalidCursor => ResendError::Unavailable,
     }
-}
-
-async fn require_manager(
-    connection: &mut SqliteConnection,
-    organization_id: OrganizationId,
-    environment: Environment,
-    manager: WebhookManager,
-) -> Result<(), ResendError> {
-    let query = match manager {
-        WebhookManager::Member(member) => sqlx::query(
-            "SELECT 1 FROM members WHERE organization_id = ? AND id = ? \
-             AND status = 'active' AND role IN ('owner', 'admin')",
-        )
-        .bind(organization_id.uuid())
-        .bind(member.uuid()),
-        WebhookManager::ApiKey(key) => sqlx::query(
-            "SELECT 1 FROM api_keys WHERE organization_id = ? AND id = ? \
-             AND environment = ? AND revoked_at IS NULL",
-        )
-        .bind(organization_id.uuid())
-        .bind(key.uuid())
-        .bind(environment.as_str()),
-    };
-    let allowed = query
-        .fetch_optional(connection)
-        .await
-        .map_err(failed("resend_authorization"))
-        .map_err(store_error)?;
-    allowed.map(|_| ()).ok_or(ResendError::NotAllowed)
 }
 
 pub(super) async fn resend_delivery(
@@ -52,7 +22,12 @@ pub(super) async fn resend_delivery(
     audit: &Audit<'_, DeliverySummary>,
 ) -> Result<DeliverySummary, ResendError> {
     let mut transaction = store.immediate("resend_delivery").await.map_err(store_error)?;
-    require_manager(&mut transaction, organization_id, environment, manager).await?;
+    if !manager_allowed(&mut transaction, organization_id, environment, manager)
+        .await
+        .map_err(store_error)?
+    {
+        return Err(ResendError::NotAllowed);
+    }
     let source = history::detail(&mut transaction, organization_id, endpoint_id, environment, delivery_id)
         .await
         .map_err(store_error)?

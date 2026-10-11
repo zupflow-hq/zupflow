@@ -44,7 +44,7 @@ export function SecretRevealDialog({
         </div>
         <p className="flex gap-2 rounded-lg bg-warning-soft/70 p-3 text-sm">
           <TriangleAlertIcon className="mt-0.5 size-4 shrink-0 text-warning" />
-          Store it in your secret manager now. Zupflow keeps only a hash and can't show it again.
+          Store it in your secret manager now. Zupflow won't show it again.
         </p>
         <DialogFooter>
           <Button onClick={onClose}>I've stored it</Button>

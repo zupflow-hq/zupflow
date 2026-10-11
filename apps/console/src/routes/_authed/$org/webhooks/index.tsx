@@ -1,7 +1,7 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { type Environment, type OrganizationId, WEBHOOK_EVENT_TYPES, type WebhookEndpoint } from "@zupflow/sdk";
-import { EllipsisIcon, PencilIcon, PlusIcon, SendIcon, Trash2Icon, WebhookIcon } from "lucide-react";
+import { PlusIcon, WebhookIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
@@ -22,13 +22,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
@@ -37,7 +30,8 @@ import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { canAdminister, useDocumentTitle, useOrg } from "@/features/context";
 import { useEnvironment } from "@/features/environment";
-import { useCreateWebhook, useDeleteWebhook, useTestWebhook, useUpdateWebhook, useWebhooks } from "@/features/queries";
+import { useCreateWebhook, useDeleteWebhook, useUpdateWebhook, useWebhooks } from "@/features/queries";
+import { WebhookEndpointActions, WebhookSecretOverlap } from "@/features/webhooks/endpoint-actions";
 import { applyFieldErrors, toastError } from "@/lib/errors";
 
 export const Route = createFileRoute("/_authed/$org/webhooks/")({
@@ -49,7 +43,6 @@ function WebhooksPage() {
   useDocumentTitle("Webhooks", org.name);
   const hooks = useWebhooks(org.id);
   const update = useUpdateWebhook(org.id);
-  const test = useTestWebhook(org.id);
   const remove = useDeleteWebhook(org.id);
   const admin = canAdminister(org);
   const [editing, setEditing] = useState<WebhookEndpoint | "new" | null>(null);
@@ -73,8 +66,12 @@ function WebhooksPage() {
         }
       />
       {hooks.isError ? (
-        <QueryError error={hooks.error} onRetry={() => hooks.refetch()} what="webhook endpoints" />
-      ) : endpoints?.length === 0 ? (
+        <div className="mb-4">
+          <QueryError error={hooks.error} onRetry={() => hooks.refetch()} what="webhook endpoints" />
+        </div>
+      ) : null}
+      {/* A failed refresh must not unmount an endpoint's one-time secret reveal. */}
+      {hooks.isError && !hooks.data ? null : endpoints?.length === 0 ? (
         <Panel>
           <Empty>
             <EmptyHeader>
@@ -115,6 +112,7 @@ function WebhooksPage() {
                       {h.events.length === 1 ? "event" : "events"} · secret ending{" "}
                       <code className="text-xs">{h.signing_secret_last4}</code>
                     </p>
+                    <WebhookSecretOverlap endpoint={h} />
                   </div>
                   <div className="flex flex-wrap items-center gap-3">
                     {h.last_delivery ? (
@@ -152,48 +150,12 @@ function WebhooksPage() {
                         )
                       }
                     />
-                    {/* Sending a test delivery is part of managing endpoints, like editing them: admins only. */}
-                    {admin ? (
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <Button variant="ghost" size="icon-sm" aria-label="Endpoint actions">
-                            <EllipsisIcon />
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="end">
-                          <DropdownMenuItem
-                            onSelect={() =>
-                              test.mutate(h.id, {
-                                onSuccess: (d) =>
-                                  d.status_code >= 200 && d.status_code < 300
-                                    ? toast.success(`Test event delivered (${d.status_code})`)
-                                    : toast.error(
-                                        d.status_code
-                                          ? `Your endpoint answered ${d.status_code}`
-                                          : "No response from your endpoint",
-                                        {
-                                          description: "Open delivery history for the result and failure details.",
-                                        },
-                                      ),
-                                onError: (e) => toastError(e),
-                              })
-                            }
-                          >
-                            <SendIcon />
-                            Send test event
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onSelect={() => setEditing(h)}>
-                            <PencilIcon />
-                            Edit
-                          </DropdownMenuItem>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem variant="destructive" onSelect={() => setDeleting(h)}>
-                            <Trash2Icon />
-                            Delete
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    ) : null}
+                    <WebhookEndpointActions
+                      org={org}
+                      endpoint={h}
+                      onEdit={() => setEditing(h)}
+                      onDelete={() => setDeleting(h)}
+                    />
                   </div>
                 </li>
               ))}

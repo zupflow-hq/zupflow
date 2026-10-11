@@ -1308,6 +1308,8 @@ export const WebhookEndpoint = named(
     events: z.array(WebhookEventType),
     enabled: z.boolean(),
     signing_secret_last4: z.string(),
+    /** The old secret's 24-hour overlap deadline; null once it is no longer active. */
+    previous_signing_secret_expires_at: instant.nullable(),
     created_at: instant,
     last_delivery: WebhookDelivery.nullable(),
   }),

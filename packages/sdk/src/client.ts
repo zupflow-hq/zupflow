@@ -384,6 +384,12 @@ export function createClient(transport: Transport) {
         post<CreatedWebhookEndpoint>(`${org(organizationId)}/webhooks`, input, options),
       update: (organizationId: OrganizationId, endpointId: WebhookEndpointId, input: UpdateWebhookEndpointInput) =>
         send<WebhookEndpoint>("PATCH", `${org(organizationId)}/webhooks/${enc(endpointId)}`, input),
+      rollSecret: (organizationId: OrganizationId, endpointId: WebhookEndpointId, options?: PostOptions) =>
+        post<CreatedWebhookEndpoint>(
+          `${org(organizationId)}/webhooks/${enc(endpointId)}/roll-secret`,
+          undefined,
+          options,
+        ),
       delete: (organizationId: OrganizationId, endpointId: WebhookEndpointId) =>
         send<void>("DELETE", `${org(organizationId)}/webhooks/${enc(endpointId)}`),
       sendTest: (organizationId: OrganizationId, endpointId: WebhookEndpointId, options?: PostOptions) =>

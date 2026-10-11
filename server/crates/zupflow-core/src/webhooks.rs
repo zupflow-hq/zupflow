@@ -140,6 +140,7 @@ pub struct WebhookEndpoint {
     pub events: Vec<WebhookEventType>,
     pub enabled: bool,
     pub signing_secret_last4: String,
+    pub previous_signing_secret_expires_at: Option<Timestamp>,
     pub created_at: Timestamp,
     pub last_delivery: Option<LastDelivery>,
 }
@@ -156,8 +157,16 @@ pub struct NewEndpoint {
     pub secret_last4: String,
 }
 
-/// The version every endpoint's secret is sealed at: there's no rotation yet.
+/// The initial version; every rotation seals the next one.
 pub const SECRET_VERSION: u32 = 1;
+
+/// A roll keeps exactly one previous secret for this long.
+pub const SECRET_OVERLAP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Expiry is exclusive, at the stored millisecond precision.
+pub fn active_secret_expiry(expires_at: Option<Timestamp>, now: Timestamp) -> Option<Timestamp> {
+    expires_at.filter(|expiry| now < *expiry)
+}
 
 /// What an update changes; `None` leaves it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -169,11 +178,34 @@ pub struct EndpointChanges {
 }
 
 /// An endpoint's signing secret, as stored: opened only by the code that signs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SigningSecret {
-    pub environment: Environment,
     pub version: u32,
     pub sealed: Sealed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviousSigningSecret {
+    pub secret: SigningSecret,
+    pub expires_at: Timestamp,
+}
+
+/// One atomic, environment-scoped snapshot. Expired previous secrets are
+/// omitted, and their keys are never required for signing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningSecrets {
+    pub current: SigningSecret,
+    pub previous: Option<PreviousSigningSecret>,
+}
+
+/// The replacement is sealed at `expected_version + 1` before entering the
+/// store. `at` comes from the trusted clock after sealing, never a request.
+#[derive(Debug, Clone)]
+pub struct SecretRotation {
+    pub expected_version: u32,
+    pub sealed: Sealed,
+    pub last4: String,
+    pub at: Timestamp,
 }
 
 /// An event as it's stored and sent. `body` is the exact JSON every attempt
@@ -307,6 +339,7 @@ pub struct DeliveryFilter {
 pub struct PendingDelivery {
     pub id: WebhookDeliveryId,
     pub organization_id: OrganizationId,
+    pub environment: Environment,
     pub endpoint_id: WebhookEndpointId,
     pub event_id: WebhookEventId,
     pub kind: String,
@@ -384,6 +417,18 @@ pub enum ResendError {
     NotSubscribed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RotationError {
+    #[error("the store is unavailable")]
+    Unavailable,
+    #[error("not found")]
+    NotFound,
+    #[error("the caller can no longer manage this endpoint")]
+    NotAllowed,
+    #[error("another signing secret rotation is in progress")]
+    InProgress,
+}
+
 #[async_trait]
 pub trait WebhookStore: Send + Sync {
     /// The organization's endpoints, oldest first; only `environment`'s when given.
@@ -428,12 +473,29 @@ pub trait WebhookStore: Send + Sync {
         audit: &Audit<'_, WebhookEndpoint>,
     ) -> Result<(), WebhookError>;
 
-    /// The endpoint's sealed signing secret, for the code that signs.
-    async fn signing_secret(
+    /// The endpoint's sealed secrets, for the code that signs, in one
+    /// snapshot. The previous secret is present only when `now < expiry`.
+    async fn signing_secrets(
         &self,
         organization_id: OrganizationId,
         endpoint_id: WebhookEndpointId,
-    ) -> Result<Option<SigningSecret>, WebhookError>;
+        environment: Environment,
+        now: Timestamp,
+    ) -> Result<Option<SigningSecrets>, WebhookError>;
+
+    /// Rechecks current management authority, endpoint scope, expected
+    /// version and overlap in the transaction that saves both versions and
+    /// the audit. Disabled endpoints may rotate. An active previous secret
+    /// or a lost version comparison is `InProgress`; nothing changes.
+    async fn roll_secret(
+        &self,
+        organization_id: OrganizationId,
+        endpoint_id: WebhookEndpointId,
+        environment: Environment,
+        manager: WebhookManager,
+        rotation: &SecretRotation,
+        audit: &Audit<'_, WebhookEndpoint>,
+    ) -> Result<WebhookEndpoint, RotationError>;
 
     /// Records the event, once: in one transaction, the event and, for each
     /// enabled endpoint of its organization and environment subscribed to
@@ -725,13 +787,26 @@ pub fn delivery_of(payload: &[u8]) -> Option<WebhookDeliveryId> {
 /// The `Zupflow-Signature` header's value: `t=<unix seconds>,v1=<lowercase
 /// hex HMAC-SHA256 of "<t>.<body>" under the secret>`.
 pub fn signature(secret: &[u8], unix_seconds: i64, body: &[u8]) -> String {
+    signatures(secret, None, unix_seconds, body)
+}
+
+/// Both candidates cover exactly one timestamp and the same raw bytes.
+pub fn signatures(current: &[u8], previous: Option<&[u8]>, unix_seconds: i64, body: &[u8]) -> String {
+    let mut header = format!("t={unix_seconds},v1={}", digest(current, unix_seconds, body));
+    if let Some(previous) = previous {
+        header.push_str(",v1=");
+        header.push_str(&digest(previous, unix_seconds, body));
+    }
+    header
+}
+
+fn digest(secret: &[u8], unix_seconds: i64, body: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC takes a key of any length");
     mac.update(unix_seconds.to_string().as_bytes());
     mac.update(b".");
     mac.update(body);
     let digest = mac.finalize().into_bytes();
-    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!("t={unix_seconds},v1={hex}")
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// A new signing secret: `whsec_{live|test}_` and 32 random base62
@@ -772,6 +847,26 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn overlap_expires_at_the_exact_millisecond() {
+        let expiry = Timestamp::from_millis(1_700_000_000_123);
+        assert_eq!(
+            active_secret_expiry(Some(expiry), Timestamp::from_millis(expiry.millis() - 1)),
+            Some(expiry)
+        );
+        assert_eq!(active_secret_expiry(Some(expiry), expiry), None);
+        assert_eq!(
+            active_secret_expiry(Some(expiry), Timestamp::from_millis(expiry.millis() + 1)),
+            None
+        );
+        let body = b" {\n\"escaped\":\"\\u0061\"} ";
+        let header = signatures(b"current", Some(b"previous"), 1_700_000_000, body);
+        let first = signature(b"current", 1_700_000_000, body);
+        let second = signature(b"previous", 1_700_000_000, body);
+        assert_eq!(header, format!("{first},{}", second.split_once(',').unwrap().1));
+        assert_eq!(header.matches("t=").count(), 1);
+    }
 
     #[test]
     fn names_every_type_as_the_contract_does() {

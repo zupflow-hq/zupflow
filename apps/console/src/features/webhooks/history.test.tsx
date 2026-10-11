@@ -53,6 +53,7 @@ const endpoint: WebhookEndpoint = {
   events: ["run.completed"],
   enabled: true,
   signing_secret_last4: "1234",
+  previous_signing_secret_expires_at: null,
   created_at: at,
   last_delivery: null,
 };

@@ -6,15 +6,18 @@
 
 mod history;
 mod resend;
+mod rotation;
 
 #[cfg(test)]
 mod history_tests;
 #[cfg(test)]
 mod resend_tests;
+#[cfg(test)]
+mod rotation_tests;
 
 use async_trait::async_trait;
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 use zupflow_core::audit::Audit;
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{OrganizationId, WebhookDeliveryId, WebhookEndpointId, WebhookEventId};
@@ -24,9 +27,10 @@ use zupflow_core::scope::Scope;
 use zupflow_core::time::Timestamp;
 use zupflow_core::webhooks::{
     Attempt, DISABLE_AFTER, DeliveryDetail, DeliveryFilter, DeliveryState, DeliverySummary, EndpointChanges,
-    LastDelivery, NewEndpoint, NewWebhookEvent, PendingDelivery, RecordedAttempt, ResendError, SECRET_VERSION,
-    SigningSecret, TEST_EVENT, WebhookEndpoint, WebhookError, WebhookEventType, WebhookManager, WebhookStore,
-    delivery_job, safe_delivery_error,
+    LastDelivery, NewEndpoint, NewWebhookEvent, PendingDelivery, PreviousSigningSecret, RecordedAttempt, ResendError,
+    RotationError, SECRET_OVERLAP, SECRET_VERSION, SecretRotation, SigningSecret, SigningSecrets, TEST_EVENT,
+    WebhookEndpoint, WebhookError, WebhookEventType, WebhookManager, WebhookStore, active_secret_expiry, delivery_job,
+    safe_delivery_error,
 };
 use zupflow_core::workspaces::Page;
 
@@ -64,11 +68,39 @@ fn read(error: impl std::fmt::Display) -> WebhookError {
     WebhookError::Unavailable
 }
 
+async fn manager_allowed(
+    connection: &mut SqliteConnection,
+    organization_id: OrganizationId,
+    environment: Environment,
+    manager: WebhookManager,
+) -> Result<bool, WebhookError> {
+    let query = match manager {
+        WebhookManager::Member(member) => sqlx::query(
+            "SELECT 1 FROM members WHERE organization_id = ? AND id = ? \
+             AND status = 'active' AND role IN ('owner', 'admin')",
+        )
+        .bind(organization_id.uuid())
+        .bind(member.uuid()),
+        WebhookManager::ApiKey(key) => sqlx::query(
+            "SELECT 1 FROM api_keys WHERE organization_id = ? AND id = ? \
+             AND environment = ? AND revoked_at IS NULL",
+        )
+        .bind(organization_id.uuid())
+        .bind(key.uuid())
+        .bind(environment.as_str()),
+    };
+    Ok(query
+        .fetch_optional(connection)
+        .await
+        .map_err(failed("management_authorization"))?
+        .is_some())
+}
+
 /// An endpoint's columns. A macro, so queries stay static strings.
 macro_rules! select_endpoint {
     () => {
         "SELECT id, organization_id, environment, url, description, events, enabled, secret_last4, created_at, \
-         last_status_code, last_delivered_at FROM webhook_endpoints"
+         last_status_code, last_delivered_at, previous_secret_expires_at FROM webhook_endpoints"
     };
 }
 
@@ -105,9 +137,34 @@ fn endpoint_from(row: &SqliteRow) -> Result<WebhookEndpoint, WebhookError> {
         events: events_from(&events)?,
         enabled: row.try_get::<i64, _>("enabled").map_err(read)? == 1,
         signing_secret_last4: row.try_get("secret_last4").map_err(read)?,
+        previous_signing_secret_expires_at: active_secret_expiry(
+            row.try_get::<Option<i64>, _>("previous_secret_expires_at")
+                .map_err(read)?
+                .map(Timestamp::from_millis),
+            Timestamp::now(),
+        ),
         created_at: Timestamp::from_millis(row.try_get("created_at").map_err(read)?),
         last_delivery,
     })
+}
+
+async fn endpoint_in_environment(
+    connection: &mut SqliteConnection,
+    organization_id: OrganizationId,
+    endpoint_id: WebhookEndpointId,
+    environment: Environment,
+) -> Result<Option<WebhookEndpoint>, WebhookError> {
+    let row = sqlx::query(concat!(
+        select_endpoint!(),
+        " WHERE organization_id = ? AND id = ? AND environment = ?"
+    ))
+    .bind(organization_id.uuid())
+    .bind(endpoint_id.uuid())
+    .bind(environment.as_str())
+    .fetch_optional(connection)
+    .await
+    .map_err(failed("find_endpoint_in_environment"))?;
+    row.as_ref().map(endpoint_from).transpose()
 }
 
 async fn insert_event(
@@ -317,35 +374,35 @@ impl WebhookStore for SqliteWebhookStore {
         Ok(())
     }
 
-    async fn signing_secret(
+    async fn signing_secrets(
         &self,
         organization_id: OrganizationId,
         endpoint_id: WebhookEndpointId,
-    ) -> Result<Option<SigningSecret>, WebhookError> {
-        let row = sqlx::query(
-            "SELECT environment, secret_version, secret_key_id, secret_wrapped_key, secret_nonce, secret_ciphertext \
-             FROM webhook_endpoints WHERE organization_id = ? AND id = ?",
+        environment: Environment,
+        now: Timestamp,
+    ) -> Result<Option<SigningSecrets>, WebhookError> {
+        rotation::signing_secrets(&self.database, organization_id, endpoint_id, environment, now).await
+    }
+
+    async fn roll_secret(
+        &self,
+        organization_id: OrganizationId,
+        endpoint_id: WebhookEndpointId,
+        environment: Environment,
+        manager: WebhookManager,
+        rotation: &SecretRotation,
+        audit: &Audit<'_, WebhookEndpoint>,
+    ) -> Result<WebhookEndpoint, RotationError> {
+        rotation::roll_secret(
+            self,
+            organization_id,
+            endpoint_id,
+            environment,
+            manager,
+            rotation,
+            audit,
         )
-        .bind(organization_id.uuid())
-        .bind(endpoint_id.uuid())
-        .fetch_optional(self.database.pool())
         .await
-        .map_err(failed("signing_secret"))?;
-        let Some(row) = row else { return Ok(None) };
-        let environment: String = row.try_get("environment").map_err(read)?;
-        let nonce: Vec<u8> = row.try_get("secret_nonce").map_err(read)?;
-        Ok(Some(SigningSecret {
-            environment: Environment::parse(&environment).ok_or_else(|| read("an unknown environment"))?,
-            version: u32::try_from(row.try_get::<i64, _>("secret_version").map_err(read)?).map_err(read)?,
-            sealed: Sealed {
-                wrapped_key: WrappedKey {
-                    key_id: row.try_get("secret_key_id").map_err(read)?,
-                    bytes: row.try_get("secret_wrapped_key").map_err(read)?,
-                },
-                nonce: nonce.try_into().map_err(|_| read("a nonce of the wrong length"))?,
-                ciphertext: row.try_get("secret_ciphertext").map_err(read)?,
-            },
-        }))
     }
 
     async fn record_event(
@@ -492,22 +549,28 @@ impl WebhookStore for SqliteWebhookStore {
         delivery_id: WebhookDeliveryId,
     ) -> Result<Option<PendingDelivery>, WebhookError> {
         let row = sqlx::query(
-            "SELECT d.id, d.endpoint_id, d.event_id, d.state, d.attempts, d.next_attempt_at, e.type, e.body, p.url, p.enabled, \
-             p.events FROM webhook_deliveries d \
+            "SELECT d.id, d.organization_id, d.endpoint_id, d.event_id, d.state, d.attempts, d.next_attempt_at, \
+             d.last_status_code, d.last_error, d.last_attempt_at, d.created_at, e.workspace_id, \
+             e.created_at AS event_created_at, e.environment, e.type, e.body, p.url, p.enabled, p.events FROM webhook_deliveries d \
              JOIN webhook_events e ON e.organization_id = d.organization_id AND e.id = d.event_id \
-             JOIN webhook_endpoints p ON p.organization_id = d.organization_id AND p.id = d.endpoint_id \
-             WHERE d.organization_id = ? AND e.organization_id = ? AND p.organization_id = ? AND d.id = ?",
+             JOIN webhook_endpoints p ON p.organization_id = d.organization_id AND p.id = d.endpoint_id AND p.environment = e.environment \
+             LEFT JOIN workspaces w ON w.organization_id = e.organization_id AND w.id = e.workspace_id AND w.environment = e.environment \
+             WHERE d.organization_id = ? AND e.organization_id = ? AND p.organization_id = ? AND d.id = ? \
+             AND (e.workspace_id IS NULL OR (w.organization_id = ? AND w.id = e.workspace_id AND w.environment = p.environment))",
         )
         .bind(organization_id.uuid())
         .bind(organization_id.uuid())
         .bind(organization_id.uuid())
         .bind(delivery_id.uuid())
+        .bind(organization_id.uuid())
         .fetch_optional(self.database.pool())
         .await
         .map_err(failed("find_delivery"))?;
         let Some(row) = row else { return Ok(None) };
-        let kind: String = row.try_get("type").map_err(read)?;
-        let state: String = row.try_get("state").map_err(read)?;
+        // Sign only the same validated event that the history API exposes.
+        // Keep its stored bytes below; validation must not reserialize them.
+        let (summary, _) = history::summary(&row)?;
+        let kind = summary.event_type;
         let events: String = row.try_get("events").map_err(read)?;
         let subscribed = kind == TEST_EVENT
             || WebhookEventType::parse(&kind).is_some_and(|kind| {
@@ -518,16 +581,14 @@ impl WebhookStore for SqliteWebhookStore {
         Ok(Some(PendingDelivery {
             id: WebhookDeliveryId::from_uuid(row.try_get("id").map_err(read)?),
             organization_id,
+            environment: summary.environment,
             endpoint_id: WebhookEndpointId::from_uuid(row.try_get("endpoint_id").map_err(read)?),
             event_id: WebhookEventId::from_uuid(row.try_get("event_id").map_err(read)?),
             kind,
             body: row.try_get("body").map_err(read)?,
-            state: DeliveryState::parse(&state).ok_or_else(|| read("an unknown delivery state"))?,
-            attempts: u32::try_from(row.try_get::<i64, _>("attempts").map_err(read)?).map_err(read)?,
-            next_attempt_at: row
-                .try_get::<Option<i64>, _>("next_attempt_at")
-                .map_err(read)?
-                .map(Timestamp::from_millis),
+            state: summary.state,
+            attempts: summary.attempts,
+            next_attempt_at: summary.next_attempt_at,
             url: row.try_get("url").map_err(read)?,
             enabled: row.try_get::<i64, _>("enabled").map_err(read)? == 1,
             subscribed,

@@ -17,6 +17,9 @@ use zupflow_core::webhooks::{DELIVERY_ATTEMPTS, signature};
 use zupflow_server::{discovery, run_engine, webhook_delivery};
 
 const MCP: &str = "https://tools.example/mcp";
+
+#[path = "webhooks/rotation.rs"]
+mod rotation;
 const HOOK: &str = "https://hooks.example/sandbox";
 const PRODUCTION_HOOK: &str = "https://hooks.example/production";
 const THEIR_HOOK: &str = "https://hooks.example/theirs";

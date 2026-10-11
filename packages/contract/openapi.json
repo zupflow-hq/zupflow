@@ -4182,6 +4182,16 @@
           "signing_secret_last4": {
             "type": "string"
           },
+          "previous_signing_secret_expires_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "created_at": {
             "$ref": "#/components/schemas/Instant"
           },
@@ -4205,6 +4215,7 @@
           "events",
           "enabled",
           "signing_secret_last4",
+          "previous_signing_secret_expires_at",
           "created_at",
           "last_delivery"
         ]
@@ -10875,6 +10886,86 @@
             "$ref": "#/components/responses/Error"
           }
         }
+      }
+    },
+    "/v1/organizations/{org}/webhooks/{hook}/roll-secret": {
+      "post": {
+        "operationId": "rollWebhookSecret",
+        "summary": "Roll an endpoint's signing secret, returning the new secret once. Owners, admins and an API key for the endpoint's environment may roll, including disabled endpoints and Production. The previous secret remains valid for 24 hours; deliveries carry signatures for both secrets over the same timestamp and body until then. previous_signing_secret_expires_at is null at or after the deadline. A second roll during overlap is `409 rotation_in_progress`, even with a fresh idempotency key. Replaying a successful key is `409 idempotency_key_completed` and never returns the secret again. A missing or foreign endpoint is `404`. Records webhook.secret_rolled against the existing webhook endpoint, with no workspace and the endpoint's environment.",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "hook",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WebhookEndpointId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/CreatedWebhookEndpoint"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-zupflow-shows-secret-once": true
       }
     },
     "/v1/organizations/{org}/webhooks/{hook}/deliveries": {

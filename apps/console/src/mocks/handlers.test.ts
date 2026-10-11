@@ -32,7 +32,7 @@ import {
   ZupflowApiError,
 } from "@zupflow/sdk";
 import { setupServer } from "msw/node";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { signUp } from "./accounts";
 import { db, resetDb } from "./db";
 import { createHandlers, NO_SIGN_IN_HOST, OUTCOME_GRACE_MS, UNREACHABLE_HOST } from "./handlers";
@@ -147,6 +147,151 @@ afterEach(() => {
   expect(checker.takeViolations(), "responses that break the contract").toEqual([]);
 });
 beforeEach(() => resetDb());
+
+describe("webhook secret rotation", () => {
+  it.each(["sandbox", "production"] as const)(
+    "rolls only the named organization's %s endpoint despite a poisoned row ahead of it",
+    async (environment) => {
+      const organization = must(northwindId());
+      const endpoint = must(
+        db().webhooks.find((row) => row.organization_id === organization && row.environment === environment),
+      );
+      const otherOrganization = must(db().organizations.find((row) => row.slug === "larkspur")).id;
+      const poisoned = {
+        ...structuredClone(endpoint),
+        organization_id: otherOrganization,
+        previous_signing_secret_expires_at: new Date(Date.now() + 48 * 60 * 60_000).toISOString(),
+      };
+      db().webhooks.unshift(poisoned);
+      const unaffected = () => ({
+        endpoints: db().webhooks.filter((row) => row !== endpoint),
+        deliveries: db().webhook_deliveries,
+        events: db().webhook_events,
+        attempts: db().webhook_delivery_attempts,
+      });
+      const before = structuredClone(unaffected());
+      const original = structuredClone(endpoint);
+      const result = await owner.webhooks.rollSecret(organization, endpoint.id);
+      expect(result.endpoint).toEqual({
+        ...original,
+        signing_secret_last4: result.signing_secret.slice(-4),
+        previous_signing_secret_expires_at: expect.any(String),
+      });
+      expect(unaffected()).toEqual(before);
+      const event = must(db().audit.find((row) => row.action === "webhook.secret_rolled"));
+      expect(event).toMatchObject({
+        organization_id: organization,
+        workspace_id: null,
+        environment,
+        target: { type: "webhook", id: endpoint.id, name: endpoint.url },
+      });
+      expect(Object.keys(event).slice(0, 3)).toEqual(["id", "organization_id", "workspace_id"]);
+    },
+  );
+
+  it("stores neither secret, including in successful idempotency records, and cannot extend overlap with new keys", async () => {
+    const organization = must(northwindId());
+    const created = await owner.webhooks.create(organization, {
+      environment: "sandbox",
+      url: "https://hooks.northwind.example/rotation",
+      description: "Secret rotation",
+      events: ["run.completed"],
+    });
+    const options = { idempotencyKey: "rotate-once" };
+    const result = await owner.webhooks.rollSecret(organization, created.endpoint.id, options);
+    const row = must(db().idempotency_keys.find((item) => item.key === options.idempotencyKey));
+    expect(row).toMatchObject({
+      organization_id: organization,
+      workspace_id: null,
+      state: "completed",
+      status: 200,
+      body: null,
+    });
+    expect(Object.keys(must(db().webhooks.find((item) => item.id === created.endpoint.id))).slice(0, 2)).toEqual([
+      "id",
+      "organization_id",
+    ]);
+    expect(await failure(owner.webhooks.rollSecret(organization, created.endpoint.id, options))).toMatchObject({
+      status: 409,
+      code: "idempotency_key_completed",
+    });
+    for (const idempotencyKey of ["rotate-again", "rotate-yet-again"]) {
+      expect(
+        await failure(owner.webhooks.rollSecret(organization, created.endpoint.id, { idempotencyKey })),
+      ).toMatchObject({
+        status: 409,
+        code: "rotation_in_progress",
+      });
+    }
+    const updated = await owner.webhooks.update(organization, created.endpoint.id, { description: "Updated" });
+    expect(updated).toEqual({ ...result.endpoint, description: "Updated" });
+    expect(db().audit.filter((item) => item.action === "webhook.secret_rolled")).toHaveLength(1);
+    const exposed = JSON.stringify({
+      endpoints: await owner.webhooks.list(organization),
+      updated,
+      audit: await owner.audit.list(organization),
+      database: db(),
+      persisted: localStorage.getItem("zupflow.mock.db"),
+    });
+    for (const secret of [created.signing_secret, result.signing_secret]) expect(exposed).not.toContain(secret);
+  });
+
+  it("accepts only one concurrent rotation and records one audit event", async () => {
+    const organization = must(northwindId());
+    const endpoint = must(db().webhooks.find((row) => row.organization_id === organization));
+    const results = await Promise.allSettled([
+      owner.webhooks.rollSecret(organization, endpoint.id, { idempotencyKey: "rotate-a" }),
+      owner.webhooks.rollSecret(organization, endpoint.id, { idempotencyKey: "rotate-b" }),
+    ]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    const rejected = must(results.find((result) => result.status === "rejected"));
+    expect(rejected.reason).toMatchObject({ status: 409, code: "rotation_in_progress" });
+    expect(db().audit.filter((row) => row.action === "webhook.secret_rolled")).toHaveLength(1);
+  });
+
+  it("ends overlap at the exact expiry boundary and permits a fresh rotation then", async () => {
+    const organization = must(northwindId());
+    const endpoint = must(db().webhooks.find((row) => row.organization_id === organization));
+    const start = Date.parse("2030-01-02T03:04:05.000Z");
+    const expires = start + 24 * 60 * 60_000;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(start);
+      const rolled = await owner.webhooks.rollSecret(organization, endpoint.id);
+      expect(rolled.endpoint.previous_signing_secret_expires_at).toBe(new Date(expires).toISOString());
+      vi.setSystemTime(expires - 1);
+      expect((await owner.webhooks.list(organization)).find((row) => row.id === endpoint.id)).toEqual(rolled.endpoint);
+      expect((await owner.webhooks.update(organization, endpoint.id, {})).previous_signing_secret_expires_at).toBe(
+        rolled.endpoint.previous_signing_secret_expires_at,
+      );
+      expect(await failure(owner.webhooks.rollSecret(organization, endpoint.id))).toMatchObject({
+        status: 409,
+        code: "rotation_in_progress",
+      });
+      vi.setSystemTime(expires);
+      expect((await owner.webhooks.list(organization)).find((row) => row.id === endpoint.id)).toEqual({
+        ...rolled.endpoint,
+        previous_signing_secret_expires_at: null,
+      });
+      expect(
+        (await owner.webhooks.update(organization, endpoint.id, {})).previous_signing_secret_expires_at,
+      ).toBeNull();
+      const again = await owner.webhooks.rollSecret(organization, endpoint.id);
+      expect(again.endpoint.previous_signing_secret_expires_at).toBe(
+        new Date(expires + 24 * 60 * 60_000).toISOString(),
+      );
+      expect(again.endpoint.signing_secret_last4).toBe(again.signing_secret.slice(-4));
+      expect(again.signing_secret).not.toBe(rolled.signing_secret);
+      expect(await failure(owner.webhooks.rollSecret(organization, endpoint.id))).toMatchObject({
+        status: 409,
+        code: "rotation_in_progress",
+      });
+      expect(db().audit.filter((row) => row.action === "webhook.secret_rolled")).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("webhook delivery history isolation", () => {
   const fixture = () => {

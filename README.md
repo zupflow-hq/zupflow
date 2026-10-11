@@ -322,6 +322,20 @@ and events the endpoint no longer subscribes to answer `409`. Test events need
 no subscription. An `Idempotency-Key` replays the same response; each newly
 created resend records one `webhook.delivery_resent` audit event.
 
+The same managers can rotate an endpoint's signing secret with
+`POST /v1/organizations/{org}/webhooks/{hook}/roll-secret`, including in
+Production. Its `200` response contains `{ endpoint, signing_secret }`; save
+the new secret when it appears. The endpoint's public
+`previous_signing_secret_expires_at` gives the end of the 24-hour overlap,
+or `null` when no previous secret is active. Until that deadline, deliveries
+carry two `v1` signatures over the same timestamp and raw body, so a receiver
+can move to the new secret without dropping deliveries. Afterwards only the
+new secret signs. Another roll during overlap returns `409
+rotation_in_progress`; a repeated successful `Idempotency-Key` returns `409
+idempotency_key_completed` and never reveals the secret again. Rotation
+preserves event IDs and delivery history and records one
+`webhook.secret_rolled` audit event.
+
 Limits, per server process: one loop records events, so a slow endpoint never
 holds one up, and eight more send deliveries, so at most eight are in flight
 at once. An endpoint has at most one delivery in flight across every worker
@@ -474,6 +488,12 @@ receiver recovers, then scoped run events, verifying identical event bytes and
 valid signatures, fresh delivery attempts, unchanged source history and one
 audit event under idempotent replay. Test-event resends exercise the real job
 queue even though test events cannot be subscribed to.
+A rotation journey races two HTTP rolls, checks the secret is returned only
+once and the overlap deadline stays fixed, then verifies both signatures on
+test deliveries and queued resends of events from sibling workspaces. It
+also checks that another organization's endpoint and the other environment
+keep their own secrets and history. Exact expiry is covered by controlled
+clock tests; the HTTP journey needs no long wait or clock-control route.
 
 To click through it yourself:
 

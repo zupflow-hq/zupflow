@@ -39,7 +39,7 @@ import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 import { appIn, timelineOf } from "./scope";
 import { listedFrom, recordListing } from "./tools";
 
-export const DB_SCHEMA = 20;
+export const DB_SCHEMA = 21;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -570,6 +570,7 @@ export function seed(nowMs: number = Date.now()): Db {
       ],
       enabled: true,
       signing_secret_last4: "fA2p",
+      previous_signing_secret_expires_at: null,
       created_at: ago(30 * DAY),
       last_delivery: { status_code: 200, delivered_at: ago(3 * MINUTE) },
     },
@@ -582,6 +583,7 @@ export function seed(nowMs: number = Date.now()): Db {
       events: ["connect_session.completed", "connect_session.failed", "run.completed", "run.failed"],
       enabled: true,
       signing_secret_last4: "Lr0d",
+      previous_signing_secret_expires_at: null,
       created_at: ago(29 * DAY),
       last_delivery: { status_code: 503, delivered_at: ago(2 * HOUR) },
     },
@@ -1092,6 +1094,7 @@ function seedLarkspur(db: Db, nowMs: number) {
     events: ["run.completed", "run.failed"],
     enabled: true,
     signing_secret_last4: "Hb7c",
+    previous_signing_secret_expires_at: null,
     created_at: ago(18 * DAY),
     last_delivery: { status_code: 200, delivered_at: ago(4 * HOUR) },
   });

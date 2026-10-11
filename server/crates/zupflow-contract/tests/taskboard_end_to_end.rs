@@ -15,6 +15,8 @@
 //! clears it, forgotten clients register again, and callback issuers are checked.
 //! A second journey verifies signed webhook history and resends against
 //! Taskboard's receiver across organizations, workspaces and environments.
+//! A third rolls a signing secret over HTTP and verifies both signatures
+//! during overlap, without changing event identity or neighboring scopes.
 //!
 //! The browser is a headless HTTP client following each redirect by hand and
 //! answering the consent page's form, so every hop can be checked.
@@ -33,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
+use zupflow_core::time::Timestamp;
 use zupflow_core::webhooks::signature;
 use zupflow_taskboard::{Options, Running, WebhookRequest};
 
@@ -1072,23 +1075,37 @@ async fn history_hook(stack: &Stack, who: &str, org: &str, environment: &str) ->
             })),
         )
         .await;
-    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(status, StatusCode::CREATED);
     (
         id(&data(&created)["endpoint"]),
         data(&created)["signing_secret"].as_str().unwrap().to_owned(),
     )
 }
 
-fn verify_webhook(request: &WebhookRequest, secret: &str) -> Value {
+fn verify_webhook(request: &WebhookRequest, secrets: &[&str]) -> Value {
     let header = request.signature.as_deref().unwrap();
-    let time: i64 = header
-        .strip_prefix("t=")
-        .and_then(|rest| rest.split(',').next())
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert_eq!(header, signature(secret.as_bytes(), time, &request.body));
-    assert!((time - zupflow_core::time::Timestamp::now().millis() / 1000).abs() < 60);
+    let mut parts = header.split(',');
+    let time: i64 = parts.next().unwrap().strip_prefix("t=").unwrap().parse().unwrap();
+    let mut actual: Vec<_> = parts
+        .map(|part| {
+            assert!(part.starts_with("v1="), "only one timestamp, followed by v1 signatures");
+            part.to_owned()
+        })
+        .collect();
+    let mut expected: Vec<_> = secrets
+        .iter()
+        .map(|secret| {
+            signature(secret.as_bytes(), time, &request.body)
+                .split_once(',')
+                .unwrap()
+                .1
+                .to_owned()
+        })
+        .collect();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(actual, expected, "every secret signs the same timestamp and raw body");
+    assert!((time - Timestamp::now().millis() / 1000).abs() < 60);
     let event: Value = serde_json::from_slice(&request.body).unwrap();
     assert_eq!(request.event_id.as_deref(), event["id"].as_str());
     assert_eq!(request.event_type.as_deref(), event["type"].as_str());
@@ -1104,9 +1121,9 @@ async fn check_history(
     hook: &str,
     summary: &Value,
     request: &WebhookRequest,
-    secret: &str,
+    secrets: &[&str],
 ) {
-    let event = verify_webhook(request, secret);
+    let event = verify_webhook(request, secrets);
     let path = format!("/v1/organizations/{org}/webhooks/{hook}/deliveries/{}", id(summary));
     let (status, detail) = stack.api(who, Method::GET, &path, None, None).await;
     assert_eq!(status, StatusCode::OK, "{detail}");
@@ -1136,7 +1153,9 @@ async fn check_history(
     );
     for response in [&detail, &attempts] {
         let serialized = response.to_string();
-        assert!(!serialized.contains(secret), "history never reveals a signing secret");
+        for secret in secrets {
+            assert!(!serialized.contains(*secret), "history never reveals a signing secret");
+        }
         assert!(
             !serialized.contains(request.signature.as_deref().unwrap()),
             "history never stores signing headers"
@@ -1152,7 +1171,7 @@ async fn resend_history(
     hook: &str,
     source: &Value,
     original: &WebhookRequest,
-    secret: &str,
+    secrets: &[&str],
 ) -> Value {
     let path = format!("/v1/organizations/{org}/webhooks/{hook}/deliveries");
     let source_path = format!("{path}/{}", id(source));
@@ -1223,7 +1242,7 @@ async fn resend_history(
     );
     assert_eq!(resent.event_id, original.event_id);
     assert_eq!(resent.event_type, original.event_type);
-    check_history(stack, who, org, hook, &completed, resent, secret).await;
+    check_history(stack, who, org, hook, &completed, resent, secrets).await;
 
     // Replay after the worker finishes still returns the original pending
     // response, with no new delivery, attempt or audit event.
@@ -1431,11 +1450,11 @@ async fn webhook_history_matches_deliveries_and_keeps_their_scope() {
             .into_iter()
             .find(|request| request.event_id.as_deref() == summary["event_id"].as_str())
             .unwrap();
-        check_history(&stack, OWNER, org, &sandbox, summary, &request, &sandbox_secret).await;
+        check_history(&stack, OWNER, org, &sandbox, summary, &request, &[&sandbox_secret]).await;
         if failed {
             // The recovered receiver accepts a queued test event even
             // though the endpoint subscribes only to run.completed.
-            resend_history(&stack, OWNER, org, &sandbox, summary, &request, &sandbox_secret).await;
+            resend_history(&stack, OWNER, org, &sandbox, summary, &request, &[&sandbox_secret]).await;
         }
     }
 
@@ -1479,14 +1498,14 @@ async fn webhook_history_matches_deliveries_and_keeps_their_scope() {
             .into_iter()
             .find(|request| request.event_id.as_deref() == summary["event_id"].as_str())
             .unwrap();
-        let event = verify_webhook(&request, secret);
+        let event = verify_webhook(&request, &[secret]);
         assert_eq!(event["data"]["id"], run);
         assert!(
             !String::from_utf8_lossy(&request.body).contains("A private message"),
             "the event has no run content"
         );
-        check_history(&stack, who, organization, hook, &summary, &request, secret).await;
-        let resent = resend_history(&stack, who, organization, hook, &summary, &request, secret).await;
+        check_history(&stack, who, organization, hook, &summary, &request, &[secret]).await;
+        let resent = resend_history(&stack, who, organization, hook, &summary, &request, &[secret]).await;
         journeys.push((organization.to_owned(), hook.to_owned(), ws, resent));
     }
 
@@ -1565,4 +1584,366 @@ async fn webhook_history_matches_deliveries_and_keeps_their_scope() {
             );
         }
     }
+}
+
+async fn public_hook(stack: &Stack, org: &str, hook: &str, who: &str, environment: &str) -> Value {
+    let (status, response) = stack
+        .api(
+            who,
+            Method::GET,
+            &format!("/v1/organizations/{org}/webhooks?environment={environment}"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !response.to_string().contains("whsec_"),
+        "reads never reveal signing secrets"
+    );
+    data(&response)
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|endpoint| endpoint["id"] == hook)
+        .unwrap()
+        .clone()
+}
+
+async fn roll_secret(stack: &Stack, org: &str, hook: &str, who: &str, key: &str) -> (StatusCode, Value) {
+    let response = stack
+        .http
+        .post(format!(
+            "{}/v1/organizations/{org}/webhooks/{hook}/roll-secret",
+            stack.base
+        ))
+        .bearer_auth(who)
+        .header("Idempotency-Key", key)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, response.json().await.unwrap())
+}
+
+#[tokio::test]
+async fn webhook_secret_rotation_keeps_overlap_history_and_scope() {
+    let stack = Stack::start().await;
+    let board = &stack.taskboard.taskboard;
+    let mut organizations = Vec::new();
+    for (who, slug) in [(OWNER, "northwind"), ("contract:outsider", "larkspur")] {
+        let (status, me) = stack.api(who, Method::GET, "/v1/me", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        organizations.push(
+            data(&me)["organizations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|organization| organization["slug"] == slug)
+                .map(id)
+                .unwrap(),
+        );
+    }
+    let org = organizations[0].as_str();
+    let other_org = organizations[1].as_str();
+    let (sandbox, old_secret) = history_hook(&stack, OWNER, org, "sandbox").await;
+    let (production, production_secret) = history_hook(&stack, OWNER, org, "production").await;
+    let (other, other_secret) = history_hook(&stack, "contract:outsider", other_org, "sandbox").await;
+    let endpoints = [
+        (OWNER, org, "sandbox", sandbox.as_str(), old_secret.as_str()),
+        (
+            OWNER,
+            org,
+            "production",
+            production.as_str(),
+            production_secret.as_str(),
+        ),
+        (
+            "contract:outsider",
+            other_org,
+            "sandbox",
+            other.as_str(),
+            other_secret.as_str(),
+        ),
+    ];
+    let mut keys = Vec::new();
+    for environment in ["sandbox", "production"] {
+        let (status, created) = stack
+            .api(
+                OWNER,
+                Method::POST,
+                &format!("/v1/organizations/{org}/api-keys"),
+                None,
+                Some(json!({ "name": "Rotation journey", "environment": environment })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        keys.push(data(&created)["secret"].as_str().unwrap().to_owned());
+    }
+
+    // Every source has reached a terminal state before rotation: subsequent
+    // differences cannot come from an earlier worker finishing its delivery.
+    let mut sources = Vec::new();
+    let mut history_snapshots = Vec::new();
+    for (who, organization, slug, environment, hook, secret) in [
+        (
+            OWNER,
+            org,
+            "rotation-first",
+            "sandbox",
+            sandbox.as_str(),
+            old_secret.as_str(),
+        ),
+        (
+            OWNER,
+            org,
+            "rotation-second",
+            "sandbox",
+            sandbox.as_str(),
+            old_secret.as_str(),
+        ),
+        (
+            OWNER,
+            org,
+            "rotation-live",
+            "production",
+            production.as_str(),
+            production_secret.as_str(),
+        ),
+        (
+            "contract:outsider",
+            other_org,
+            "rotation-other",
+            "sandbox",
+            other.as_str(),
+            other_secret.as_str(),
+        ),
+    ] {
+        let (ws, run) = history_run(&stack, who, organization, slug, environment).await;
+        let path = format!("/v1/organizations/{organization}/webhooks/{hook}/deliveries");
+        let filtered_path = format!("{path}?workspace_id={ws}");
+        let summary = eventually("the delivery before rotation", || async {
+            let (status, page) = stack.api(who, Method::GET, &filtered_path, None, None).await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            let rows = data(&page).as_array().unwrap();
+            assert!(rows.len() <= 1, "only this workspace's event");
+            rows.first().filter(|row| row["state"] == "succeeded").cloned()
+        })
+        .await;
+        let request = board
+            .webhook_requests()
+            .into_iter()
+            .find(|request| request.event_id.as_deref() == summary["event_id"].as_str())
+            .unwrap();
+        let event = verify_webhook(&request, &[secret]);
+        assert_eq!(event["data"]["id"], run);
+        assert_eq!(summary["workspace"], json!({ "id": ws, "external_id": slug }));
+        assert_eq!(summary["environment"], environment);
+        check_history(&stack, who, organization, hook, &summary, &request, &[secret]).await;
+        for path in [
+            filtered_path,
+            format!("{path}/{}", id(&summary)),
+            format!("{path}/{}/attempts", id(&summary)),
+        ] {
+            let (status, response) = stack.api(who, Method::GET, &path, None, None).await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            history_snapshots.push((who, hook, path, response));
+        }
+        sources.push((who, organization, hook, summary, request));
+    }
+    let mut endpoint_snapshots = Vec::new();
+    for (who, organization, environment, hook, _) in endpoints {
+        let endpoint = public_hook(&stack, organization, hook, who, environment).await;
+        assert_eq!(endpoint.get("previous_signing_secret_expires_at"), Some(&Value::Null));
+        endpoint_snapshots.push(endpoint);
+    }
+    let requests_before = board.webhook_requests();
+
+    for (index, (who, organization, hook)) in [
+        (OWNER, other_org, other.as_str()),
+        ("contract:outsider", org, sandbox.as_str()),
+        (OWNER, org, other.as_str()),
+        (keys[0].as_str(), org, production.as_str()),
+        (keys[1].as_str(), org, sandbox.as_str()),
+        (keys[0].as_str(), other_org, other.as_str()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (status, refused) = roll_secret(&stack, organization, hook, who, &format!("refused-roll-{index}")).await;
+        assert!(!refused.to_string().contains("whsec_"));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(code(&refused), "not_found");
+        assert!(data(&refused).is_null());
+    }
+
+    // Independent idempotency keys compete for the one previous-secret slot.
+    // The outcome is fixed even if the server handles the requests serially.
+    let started = Timestamp::now().millis();
+    let (first, second) = tokio::join!(
+        roll_secret(&stack, org, &sandbox, OWNER, "rotation-first"),
+        roll_secret(&stack, org, &sandbox, OWNER, "rotation-second"),
+    );
+    let finished = Timestamp::now().millis();
+    let mut winner = None;
+    for (key, (status, response)) in [("rotation-first", first), ("rotation-second", second)] {
+        if status == StatusCode::OK {
+            assert!(winner.is_none(), "only one concurrent rotation succeeds");
+            winner = Some((key, response));
+        } else {
+            assert!(!response.to_string().contains("whsec_"));
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(code(&response), "rotation_in_progress");
+            assert!(data(&response).is_null());
+        }
+    }
+    let (winning_key, rolled) = winner.expect("one rotation succeeds");
+    assert_eq!(rolled["meta"], Value::Null);
+    assert_eq!(rolled["error"], Value::Null);
+    assert_eq!(data(&rolled).as_object().unwrap().len(), 2);
+    let new_secret = data(&rolled)["signing_secret"].as_str().unwrap().to_owned();
+    assert!(new_secret.starts_with("whsec_test_"));
+    assert!(new_secret != old_secret, "rotation issues a different signing secret");
+    assert!(
+        !rolled.to_string().contains(&old_secret),
+        "the previous secret is never returned"
+    );
+    let endpoint = &data(&rolled)["endpoint"];
+    assert!(!endpoint.to_string().contains("whsec_"));
+    assert_eq!(endpoint["id"], sandbox);
+    assert_eq!(endpoint["signing_secret_last4"], &new_secret[new_secret.len() - 4..]);
+    let expires_at = endpoint["previous_signing_secret_expires_at"].as_str().unwrap();
+    let overlap_ms = 24 * 60 * 60 * 1000;
+    let earliest = Timestamp::from_millis(started + overlap_ms).to_string();
+    let latest = Timestamp::from_millis(finished + overlap_ms).to_string();
+    assert!(
+        expires_at >= earliest.as_str() && expires_at <= latest.as_str(),
+        "one 24-hour overlap"
+    );
+
+    for (key, expected_code) in [
+        (winning_key, "idempotency_key_completed"),
+        ("rotation-again", "rotation_in_progress"),
+    ] {
+        let (status, response) = roll_secret(&stack, org, &sandbox, OWNER, key).await;
+        assert!(
+            !response.to_string().contains("whsec_"),
+            "a retry cannot reveal a secret"
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(code(&response), expected_code);
+        assert!(data(&response).is_null());
+    }
+    assert_eq!(board.webhook_requests(), requests_before, "rotation sends no event");
+    for (who, _, path, before) in &history_snapshots {
+        let (status, after) = stack.api(who, Method::GET, path, None, None).await;
+        assert_eq!(status, StatusCode::OK, "{after}");
+        assert_eq!(
+            &after, before,
+            "rotation leaves every event, delivery and attempt unchanged"
+        );
+    }
+    for ((who, organization, environment, hook, _), before) in endpoints.into_iter().zip(&endpoint_snapshots) {
+        let after = public_hook(&stack, organization, hook, who, environment).await;
+        let mut expected = before.clone();
+        if hook == sandbox {
+            expected["signing_secret_last4"] = endpoint["signing_secret_last4"].clone();
+            expected["previous_signing_secret_expires_at"] = endpoint["previous_signing_secret_expires_at"].clone();
+        }
+        assert_eq!(
+            after, expected,
+            "only the selected endpoint's public signing metadata changes"
+        );
+    }
+
+    // Old events retain their exact bytes when delivered through the job queue
+    // again. Both sibling workspaces use this endpoint's bounded pair of keys.
+    let active_secrets = [old_secret.as_str(), new_secret.as_str()];
+    for (who, organization, hook, source, original) in &sources {
+        if *hook == sandbox {
+            resend_history(&stack, who, organization, hook, source, original, &active_secrets).await;
+        }
+    }
+    // The synchronous test path uses the same pair. Neighboring scopes still
+    // produce exactly one signature, made with their own original secret.
+    for (who, organization, environment, hook, secret) in endpoints {
+        let secrets = if hook == sandbox {
+            active_secrets.to_vec()
+        } else {
+            vec![secret]
+        };
+        let count = board.webhook_requests().len();
+        let (status, sent) = stack
+            .api(
+                who,
+                Method::POST,
+                &format!("/v1/organizations/{organization}/webhooks/{hook}/test"),
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{sent}");
+        assert_eq!(data(&sent)["status_code"], 204);
+        let requests = board.webhook_requests();
+        assert_eq!(requests.len(), count + 1);
+        let request = requests.last().unwrap();
+        let event = verify_webhook(request, &secrets);
+        assert_eq!(event["organization_id"], organization);
+        assert_eq!(event["environment"], environment);
+        assert_eq!(event["workspace"], Value::Null);
+        assert_eq!(event["data"]["id"], hook);
+        let (status, page) = stack
+            .api(
+                who,
+                Method::GET,
+                &format!("/v1/organizations/{organization}/webhooks/{hook}/deliveries?event_type=webhook.test"),
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(data(&page).as_array().unwrap().len(), 1);
+        check_history(&stack, who, organization, hook, &data(&page)[0], request, &secrets).await;
+    }
+    for (who, hook, path, before) in &history_snapshots {
+        if *hook != sandbox {
+            let (status, after) = stack.api(who, Method::GET, path, None, None).await;
+            assert_eq!(status, StatusCode::OK, "{after}");
+            assert_eq!(&after, before, "neighboring run histories remain untouched");
+        }
+    }
+    let visible = public_hook(&stack, org, &sandbox, OWNER, "sandbox").await;
+    assert_eq!(
+        visible["previous_signing_secret_expires_at"], expires_at,
+        "the overlap was never extended"
+    );
+    let (status, audit) = stack
+        .api(
+            OWNER,
+            Method::GET,
+            &format!("/v1/organizations/{org}/audit-events?limit=100"),
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        !audit.to_string().contains("whsec_"),
+        "audit records contain no signing material"
+    );
+    assert_eq!(status, StatusCode::OK);
+    let rolls: Vec<_> = data(&audit)
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| record["action"] == "webhook.secret_rolled" && record["target"]["id"] == sandbox)
+        .collect();
+    assert_eq!(
+        rolls.len(),
+        1,
+        "conflicting requests and idempotent replay add no rotation audit"
+    );
+    assert_eq!(rolls[0]["organization_id"], org);
+    assert_eq!(rolls[0]["environment"], "sandbox");
+    assert_eq!(rolls[0]["workspace_id"], Value::Null);
+    assert_eq!(rolls[0]["workspace"], Value::Null);
 }

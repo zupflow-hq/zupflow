@@ -13,6 +13,7 @@ import {
   type CreateApiKeyInput,
   type CreateAppInput,
   type CreateConnectSessionInput,
+  type CreatedWebhookEndpoint,
   type CreateGrantInput,
   type CreateOrganizationInput,
   type CreateRunInput,
@@ -43,6 +44,7 @@ import {
   type UpdateWorkspaceInput,
   type WebhookDeliveryId,
   type WebhookDeliveryListQuery,
+  type WebhookEndpoint,
   type WebhookEndpointId,
   type WorkspaceId,
   type WorkspaceListQuery,
@@ -705,7 +707,19 @@ export function useRevokeApiKey(orgId: OrganizationId) {
 }
 
 export function useWebhooks(orgId: OrganizationId) {
-  return useQuery({ queryKey: qk.webhooks(orgId), queryFn: () => api.webhooks.list(orgId) });
+  return useQuery({
+    queryKey: qk.webhooks(orgId),
+    queryFn: () => api.webhooks.list(orgId),
+    refetchInterval: (query) => {
+      const next = Math.min(
+        ...(query.state.data ?? []).flatMap((endpoint) =>
+          endpoint.previous_signing_secret_expires_at ? [Date.parse(endpoint.previous_signing_secret_expires_at)] : [],
+        ),
+      );
+      // Let the server retire the overlap, including after a sleeping tab wakes.
+      return Number.isFinite(next) ? Math.max(1_000, next - Date.now()) : false;
+    },
+  });
 }
 
 export function useWebhookDeliveries(
@@ -783,6 +797,33 @@ export function useUpdateWebhook(orgId: OrganizationId) {
     mutationFn: ({ id, ...input }: UpdateWebhookEndpointInput & { id: WebhookEndpointId }) =>
       api.webhooks.update(orgId, id, input),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.webhooks(orgId) }),
+  });
+}
+
+export function useRollWebhookSecret(orgId: OrganizationId, onReveal: (created: CreatedWebhookEndpoint) => void) {
+  const qc = useQueryClient();
+  return useMutation({
+    gcTime: 0,
+    mutationFn: async (id: WebhookEndpointId) => {
+      const created = await api.webhooks.rollSecret(orgId, id);
+      qc.setQueryData<WebhookEndpoint[]>(qk.webhooks(orgId), (endpoints) =>
+        endpoints?.map((endpoint) =>
+          endpoint.organization_id === orgId &&
+          endpoint.id === created.endpoint.id &&
+          endpoint.environment === created.endpoint.environment
+            ? created.endpoint
+            : endpoint,
+        ),
+      );
+      // Deliver the secret to the open dialog only; mutation data holds metadata.
+      onReveal(created);
+      return created.endpoint;
+    },
+    onSettled: () => {
+      // A lost response may follow a committed roll. Refresh even on a conflict.
+      void qc.invalidateQueries({ queryKey: qk.webhooks(orgId), exact: true });
+      void qc.invalidateQueries({ queryKey: qk.audit(orgId) });
+    },
   });
 }
 

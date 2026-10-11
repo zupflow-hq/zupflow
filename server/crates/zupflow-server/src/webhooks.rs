@@ -27,8 +27,8 @@ use zupflow_core::organizations::MemberRole;
 use zupflow_core::time::Timestamp;
 use zupflow_core::webhooks::{
     Attempt, DEFAULT_DELIVERY_PAGE, DeliveryFilter, DeliveryState, DeliverySummary, EndpointChanges, LastDelivery,
-    MAX_DELIVERY_PAGE, NewEndpoint, NewWebhookEvent, ResendError, SECRET_VERSION, TEST_EVENT, WebhookEndpoint,
-    WebhookError, WebhookEventType, WebhookManager, event_body, new_signing_secret,
+    MAX_DELIVERY_PAGE, NewEndpoint, NewWebhookEvent, ResendError, RotationError, SECRET_VERSION, SecretRotation,
+    TEST_EVENT, WebhookEndpoint, WebhookError, WebhookEventType, WebhookManager, event_body, new_signing_secret,
 };
 
 use crate::app_configurations::check_public_https;
@@ -50,6 +50,7 @@ pub fn routes() -> Router<AppState> {
             patch(update_webhook).delete(delete_webhook),
         )
         .route("/v1/organizations/{org}/webhooks/{hook}/test", post(test_webhook))
+        .route("/v1/organizations/{org}/webhooks/{hook}/roll-secret", post(roll_secret))
         .route(
             "/v1/organizations/{org}/webhooks/{hook}/deliveries",
             get(list_deliveries),
@@ -362,6 +363,89 @@ struct CreatedWebhookEndpoint<'a> {
     signing_secret: &'a str,
 }
 
+fn rotation_error(error: RotationError) -> Failure {
+    match error {
+        RotationError::Unavailable => unavailable(WebhookError::Unavailable),
+        RotationError::NotFound => not_found(),
+        RotationError::NotAllowed => ApiError::forbidden("You can no longer roll webhook signing secrets.").into(),
+        RotationError::InProgress => ApiError::new(
+            409,
+            "rotation_in_progress",
+            "A signing secret was already rolled. Wait until its 24-hour overlap ends before rolling again.",
+        )
+        .into(),
+    }
+}
+
+async fn roll_secret(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path((org, hook)): Path<(String, String)>,
+) -> Result<Response, Failure> {
+    let access = Access::organization(&state, caller, &org).await?;
+    access.require(MemberRole::is_admin, "roll webhook signing secrets")?;
+    let endpoint = find(&state, &access, &hook).await?;
+    let organization_id = access.organization_id;
+    let environment = endpoint.environment;
+    let secrets = state
+        .webhooks
+        .signing_secrets(organization_id, endpoint.id, environment, Timestamp::now())
+        .await
+        .map_err(unavailable)?
+        .ok_or_else(not_found)?;
+    if secrets.previous.is_some() {
+        return Err(rotation_error(RotationError::InProgress));
+    }
+    let version = secrets
+        .current
+        .version
+        .checked_add(1)
+        .ok_or_else(|| unavailable(WebhookError::Unavailable))?;
+    let secret = new_signing_secret(environment).ok_or_else(|| unavailable(WebhookError::Unavailable))?;
+    let context = EncryptionContext::webhook_signing_secret(organization_id, environment, endpoint.id, version);
+    let sealed = seal(state.keys.as_ref(), &context, secret.as_bytes())
+        .await
+        .map_err(|error| {
+            tracing::error!(event = "webhooks.seal_failed", %organization_id, %error);
+            unavailable(WebhookError::Unavailable)
+        })?;
+    let manager = match &access.actor {
+        Actor::Member(member) => WebhookManager::Member(member.member.id),
+        Actor::ApiKey(key) => WebhookManager::ApiKey(key.id),
+    };
+    let endpoint = state
+        .webhooks
+        .roll_secret(
+            organization_id,
+            endpoint.id,
+            environment,
+            manager,
+            &SecretRotation {
+                expected_version: secrets.current.version,
+                sealed,
+                last4: secret[secret.len() - 4..].to_owned(),
+                at: Timestamp::now(),
+            },
+            &|endpoint| {
+                AuditEntry::new(
+                    access.audit_actor(),
+                    AuditAction::WebhookSecretRolled,
+                    webhook_target(endpoint),
+                    AuditPlace::Environment(endpoint.environment),
+                )
+            },
+        )
+        .await
+        .map_err(rotation_error)?;
+    Ok(envelope(
+        StatusCode::OK,
+        CreatedWebhookEndpoint {
+            endpoint,
+            signing_secret: &secret,
+        },
+    ))
+}
+
 async fn create_webhook(
     State(state): State<AppState>,
     caller: Caller,
@@ -567,6 +651,7 @@ async fn test_webhook(
         &state,
         organization_id,
         endpoint.id,
+        endpoint.environment,
         &endpoint.url,
         event_id,
         TEST_EVENT,

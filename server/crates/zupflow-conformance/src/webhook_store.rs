@@ -15,6 +15,7 @@
 //! The suite claims delivery jobs through `jobs`.
 
 mod resend;
+mod rotation;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -123,15 +124,29 @@ async fn endpoint(
     id
 }
 
-fn event(environment: Environment, workspace: Option<WorkspaceId>, kind: &str) -> NewWebhookEvent {
+fn event(
+    organization_id: OrganizationId,
+    environment: Environment,
+    workspace: Option<WorkspaceId>,
+    kind: &str,
+) -> NewWebhookEvent {
     let id = WebhookEventId::generate();
+    let created_at = Timestamp::now();
     NewWebhookEvent {
         id,
         environment,
         workspace_id: workspace,
         kind: kind.to_owned(),
-        body: format!("{{\"id\":\"{id}\",\"type\":\"{kind}\"}}"),
-        created_at: Timestamp::now(),
+        body: event_body(
+            id,
+            kind,
+            created_at,
+            environment,
+            organization_id,
+            workspace.map(|id| (id, None)),
+            serde_json::json!({}),
+        ),
+        created_at,
     }
 }
 
@@ -195,6 +210,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     holds_an_endpoint_for_one_delivery_at_a_time(&stores, a, b).await;
     reads_history_in_its_endpoint_environment_and_workspace(&stores, a, b).await;
     resend::run(&stores, tenant(&prepare).await, tenant(&prepare).await).await;
+    rotation::run(&stores, tenant(&prepare).await, tenant(&prepare).await).await;
 }
 
 async fn keeps_endpoints_in_their_organization(stores: &Stores<'_>, a: Tenant, b: Tenant) {
@@ -250,12 +266,27 @@ async fn keeps_endpoints_in_their_organization(stores: &Stores<'_>, a: Tenant, b
         "another organization's isn't found"
     );
     assert!(
-        stores.webhooks.signing_secret(org, theirs).await.unwrap().is_none(),
+        stores
+            .webhooks
+            .signing_secrets(org, theirs, Environment::Sandbox, Timestamp::now())
+            .await
+            .unwrap()
+            .is_none(),
         "nor is its secret"
     );
-    let secret = stores.webhooks.signing_secret(org, first).await.unwrap().unwrap();
-    assert_eq!(secret.sealed, sealed(1), "the sealed secret reads back exactly");
-    assert_eq!((secret.environment, secret.version), (Environment::Sandbox, 1));
+    let secrets = stores
+        .webhooks
+        .signing_secrets(org, first, Environment::Sandbox, Timestamp::now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        secrets.current.sealed,
+        sealed(1),
+        "the sealed secret reads back exactly"
+    );
+    assert_eq!(secrets.current.version, 1);
+    assert!(secrets.previous.is_none());
 
     let changes = EndpointChanges {
         enabled: Some(false),
@@ -368,7 +399,7 @@ async fn records_each_event_once_for_its_subscribers(stores: &Stores<'_>, a: Ten
     let production = endpoint(stores, org, Environment::Production, &completed, 13, now).await;
     let theirs = endpoint(stores, b.organization_id, Environment::Sandbox, &completed, 14, now).await;
 
-    let recorded = event(Environment::Sandbox, Some(a.sandbox), "run.completed");
+    let recorded = event(org, Environment::Sandbox, Some(a.sandbox), "run.completed");
     let deliveries = stores.webhooks.record_event(org, &recorded).await.unwrap();
     assert_eq!(
         deliveries.len(),
@@ -425,11 +456,11 @@ async fn records_each_event_once_for_its_subscribers(stores: &Stores<'_>, a: Ten
     // An event is its workspace's environment's, in its own organization.
     for (wrong, why) in [
         (
-            event(Environment::Production, Some(a.sandbox), "run.completed"),
+            event(org, Environment::Production, Some(a.sandbox), "run.completed"),
             "a Sandbox workspace's event can't be recorded as Production's",
         ),
         (
-            event(Environment::Sandbox, Some(b.sandbox), "run.completed"),
+            event(org, Environment::Sandbox, Some(b.sandbox), "run.completed"),
             "another organization's workspace can't be named",
         ),
     ] {
@@ -444,7 +475,7 @@ async fn records_each_event_once_for_its_subscribers(stores: &Stores<'_>, a: Ten
         "and nothing is queued for it"
     );
 
-    let production_event = event(Environment::Production, Some(a.production), "run.completed");
+    let production_event = event(org, Environment::Production, Some(a.production), "run.completed");
     let delivered = stores.webhooks.record_event(org, &production_event).await.unwrap();
     assert_eq!(delivered.len(), 1);
     let found = stores.webhooks.find_delivery(org, delivered[0]).await.unwrap().unwrap();
@@ -522,7 +553,7 @@ async fn records_attempts_on_pending_deliveries(stores: &Stores<'_>, a: Tenant, 
         Timestamp::now(),
     )
     .await;
-    let recorded = event(Environment::Sandbox, Some(a.sandbox), "run.cancelled");
+    let recorded = event(org, Environment::Sandbox, Some(a.sandbox), "run.cancelled");
     let delivery = stores.webhooks.record_event(org, &recorded).await.unwrap()[0];
     let at = Timestamp::now();
 
@@ -577,7 +608,7 @@ async fn records_attempts_on_pending_deliveries(stores: &Stores<'_>, a: Tenant, 
     );
 
     // No answer at all is recorded as `0`.
-    let again = event(Environment::Sandbox, Some(a.sandbox), "run.cancelled");
+    let again = event(org, Environment::Sandbox, Some(a.sandbox), "run.cancelled");
     let delivery = stores.webhooks.record_event(org, &again).await.unwrap()[0];
     let unanswered = Attempt {
         number: 1,
@@ -624,7 +655,7 @@ async fn disables_an_endpoint_failing_for_days(stores: &Stores<'_>, a: Tenant) {
     let start = Timestamp::now().millis();
     let window = i64::try_from(DISABLE_AFTER.as_millis()).unwrap();
     let fail_at = |offset: i64| async move {
-        let recorded = event(Environment::Sandbox, Some(a.sandbox), "run.failed");
+        let recorded = event(org, Environment::Sandbox, Some(a.sandbox), "run.failed");
         let delivery = stores.webhooks.record_event(org, &recorded).await.unwrap()[0];
         stores
             .webhooks
@@ -658,7 +689,7 @@ async fn disables_an_endpoint_failing_for_days(stores: &Stores<'_>, a: Tenant) {
     assert!(enabled().await, "enabling it again forgets how long it was failing");
 
     // A success clears it too.
-    let recorded = event(Environment::Sandbox, Some(a.sandbox), "run.failed");
+    let recorded = event(org, Environment::Sandbox, Some(a.sandbox), "run.failed");
     let delivery = stores.webhooks.record_event(org, &recorded).await.unwrap()[0];
     stores
         .webhooks
@@ -671,7 +702,7 @@ async fn disables_an_endpoint_failing_for_days(stores: &Stores<'_>, a: Tenant) {
     // So does the test button's success; its failure starts no count.
     fail_at(3 * window).await;
     let test = |offset: i64, attempt: fn(u32, Timestamp) -> Attempt| async move {
-        let test = event(Environment::Sandbox, None, TEST_EVENT);
+        let test = event(org, Environment::Sandbox, None, TEST_EVENT);
         stores
             .webhooks
             .record_test(org, hook, &test, &attempt(1, Timestamp::from_millis(start + offset)))
@@ -702,7 +733,7 @@ async fn records_the_test_buttons_event(stores: &Stores<'_>, a: Tenant, b: Tenan
     )
     .await;
     let at = Timestamp::now();
-    let test = event(Environment::Production, None, TEST_EVENT);
+    let test = event(org, Environment::Production, None, TEST_EVENT);
     let attempt = success(1, at);
     assert_eq!(
         stores
@@ -750,7 +781,7 @@ async fn deletes_deliveries_with_their_endpoint(stores: &Stores<'_>, a: Tenant) 
         Timestamp::now(),
     )
     .await;
-    let recorded = event(Environment::Sandbox, Some(a.sandbox), "run.completed");
+    let recorded = event(org, Environment::Sandbox, Some(a.sandbox), "run.completed");
     let delivery = stores.webhooks.record_event(org, &recorded).await.unwrap()[0];
     stores.webhooks.delete_endpoint(org, hook, &by_suite).await.unwrap();
     assert!(
@@ -771,7 +802,7 @@ async fn abandons_a_delivery_without_charging_its_endpoint(stores: &Stores<'_>, 
         Timestamp::now(),
     )
     .await;
-    let recorded = event(Environment::Sandbox, Some(a.sandbox), "run.completed");
+    let recorded = event(org, Environment::Sandbox, Some(a.sandbox), "run.completed");
     let delivery = stores.webhooks.record_event(org, &recorded).await.unwrap()[0];
     assert_eq!(
         stores
@@ -1235,7 +1266,7 @@ async fn reads_history_in_its_endpoint_environment_and_workspace(stores: &Stores
             .items
             .is_empty()
     );
-    let mut test = event(Environment::Production, None, TEST_EVENT);
+    let mut test = event(org, Environment::Production, None, TEST_EVENT);
     assert_eq!(
         stores
             .webhooks

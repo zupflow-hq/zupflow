@@ -136,7 +136,7 @@ fn delivery_position(position: Value) -> Result<(i64, WebhookDeliveryId), Webhoo
     ))
 }
 
-fn summary(row: &SqliteRow) -> Result<(DeliverySummary, Value), WebhookError> {
+pub(super) fn summary(row: &SqliteRow) -> Result<(DeliverySummary, Value), WebhookError> {
     let event_id = WebhookEventId::from_uuid(row.try_get("event_id").map_err(read)?);
     let organization_id = OrganizationId::from_uuid(row.try_get("organization_id").map_err(read)?);
     let environment: String = row.try_get("environment").map_err(read)?;

@@ -31,21 +31,25 @@
 //!
 //! [`WebhookStore::record_event`]: zupflow_core::webhooks::WebhookStore::record_event
 
+#[cfg(test)]
+mod signing_tests;
+
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use zupflow_core::environment::Environment;
 use zupflow_core::ids::{OrganizationId, WebhookDeliveryId, WebhookEndpointId, WebhookEventId, WorkspaceId};
 use zupflow_core::installations::InstallationStatus;
 use zupflow_core::jobs::{Job, JobError, Retry};
-use zupflow_core::keys::{EncryptionContext, open};
+use zupflow_core::keys::{EncryptionContext, KeyService, open};
 use zupflow_core::outbound::{Limits, Method, OutboundError, OutboundRequest};
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
 use zupflow_core::webhooks::{
     ANNOUNCE, ANNOUNCE_ATTEMPTS, Announcement, Attempt, DELIVER, DELIVERY_ATTEMPTS, DELIVERY_JOB_ATTEMPTS,
-    DeliveryState, NewWebhookEvent, PendingDelivery, RETRY_AFTER, Subject, WebhookError, WebhookEventType, delivery_of,
-    event_body, signature,
+    DeliveryState, NewWebhookEvent, PendingDelivery, RETRY_AFTER, Subject, WebhookError, WebhookEventType,
+    WebhookStore, delivery_of, event_body, signatures,
 };
 
 use crate::auth::AppState;
@@ -128,30 +132,14 @@ pub async fn send(
     state: &AppState,
     organization_id: OrganizationId,
     endpoint_id: WebhookEndpointId,
+    environment: Environment,
     url: &str,
     event_id: WebhookEventId,
     kind: &str,
     body: &str,
     attempt: u32,
 ) -> Result<Sent, Unsent> {
-    let secret = match state.webhooks.signing_secret(organization_id, endpoint_id).await {
-        Ok(Some(secret)) => secret,
-        Ok(None) => return Err(Unsent::EndpointGone),
-        Err(_) => return Err(Unsent::StoreUnavailable),
-    };
-    let context =
-        EncryptionContext::webhook_signing_secret(organization_id, secret.environment, endpoint_id, secret.version);
-    let header = match open(state.keys.as_ref(), &context, &secret.sealed).await {
-        Ok(opened) => signature(
-            opened.expose(),
-            Timestamp::now().millis().div_euclid(1000),
-            body.as_bytes(),
-        ),
-        Err(error) => {
-            tracing::error!(event = "webhooks.secret_unavailable", %organization_id, %endpoint_id, %error);
-            return Err(Unsent::SecretUnavailable);
-        }
-    };
+    let header = signed_header(state, organization_id, endpoint_id, environment, body).await?;
     let request = OutboundRequest {
         method: Method::Post,
         url: url.to_owned(),
@@ -192,6 +180,87 @@ pub async fn send(
     };
     sent.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     Ok(sent)
+}
+
+async fn signed_header(
+    state: &AppState,
+    organization_id: OrganizationId,
+    endpoint_id: WebhookEndpointId,
+    environment: Environment,
+    body: &str,
+) -> Result<String, Unsent> {
+    signature_header(
+        state.webhooks.as_ref(),
+        state.keys.as_ref(),
+        organization_id,
+        endpoint_id,
+        environment,
+        body,
+        Timestamp::now,
+    )
+    .await
+}
+
+async fn signature_header(
+    webhooks: &dyn WebhookStore,
+    keys: &dyn KeyService,
+    organization_id: OrganizationId,
+    endpoint_id: WebhookEndpointId,
+    environment: Environment,
+    body: &str,
+    clock: impl Fn() -> Timestamp,
+) -> Result<String, Unsent> {
+    let read = || async {
+        webhooks
+            .signing_secrets(organization_id, endpoint_id, environment, clock())
+            .await
+            .map_err(|_| Unsent::StoreUnavailable)?
+            .ok_or(Unsent::EndpointGone)
+    };
+    // A roll may finish while a key service is opening the old snapshot.
+    // Reload once before any HTTP; an unstable store never sends stale keys.
+    for _ in 0..2 {
+        let secrets = read().await?;
+        let context = EncryptionContext::webhook_signing_secret(
+            organization_id,
+            environment,
+            endpoint_id,
+            secrets.current.version,
+        );
+        let current = open(keys, &context, &secrets.current.sealed).await;
+        let previous = match &secrets.previous {
+            Some(previous) if clock() < previous.expires_at => {
+                let context = EncryptionContext::webhook_signing_secret(
+                    organization_id,
+                    environment,
+                    endpoint_id,
+                    previous.secret.version,
+                );
+                Some(open(keys, &context, &previous.secret.sealed).await)
+            }
+            _ => None,
+        };
+        if read().await?.current.version != secrets.current.version {
+            continue;
+        }
+        let now = clock();
+        let unavailable = |error| {
+            tracing::error!(event = "webhooks.secret_unavailable", %organization_id, %endpoint_id, %error);
+            Unsent::SecretUnavailable
+        };
+        let current = current.map_err(unavailable)?;
+        let previous = match secrets.previous {
+            Some(old) if now < old.expires_at => Some(previous.ok_or(Unsent::SecretUnavailable)?.map_err(unavailable)?),
+            _ => None,
+        };
+        return Ok(signatures(
+            current.expose(),
+            previous.as_ref().map(|secret| secret.expose()),
+            now.millis().div_euclid(1000),
+            body.as_bytes(),
+        ));
+    }
+    Err(Unsent::StoreUnavailable)
 }
 
 /// How long after failed attempt `attempt` (from 1) the next one comes:
@@ -527,6 +596,7 @@ async fn attempt(
         state,
         organization_id,
         delivery.endpoint_id,
+        delivery.environment,
         &delivery.url,
         delivery.event_id,
         &delivery.kind,
