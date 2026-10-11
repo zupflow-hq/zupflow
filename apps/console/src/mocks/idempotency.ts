@@ -21,6 +21,7 @@ import {
   type Route,
 } from "@zupflow/contract";
 import { HttpResponse } from "msw";
+import { keyedDigest } from "./credentials";
 import { db, persist } from "./db";
 import { ApiFailure, authenticate, findSessionByReferenceCrossTenant, orgAccess, workspaceAccess } from "./http";
 import type { IdempotencyRow } from "./model";
@@ -44,13 +45,21 @@ async function scopeOf(route: Route, request: Request, params: Params): Promise<
     return {
       organization_id: access.org.id,
       workspace_id: access.workspace.id,
-      caller: `member:${access.user.id}|${access.workspace.environment}`,
+      caller:
+        access.kind === "api_key"
+          ? `api_key:${access.key.id}|${access.key.environment}`
+          : `member:${access.user.id}|${access.workspace.environment}`,
     };
   }
   const organization = param("org");
   if (route.path.startsWith("/v1/organizations/{org}") && organization !== undefined) {
     const access = orgAccess(request, organization);
-    return { organization_id: access.org.id, workspace_id: null, caller: `member:${access.user.id}|-` };
+    return {
+      organization_id: access.org.id,
+      workspace_id: null,
+      caller:
+        access.kind === "api_key" ? `api_key:${access.key.id}|${access.key.environment}` : `member:${access.user.id}|-`,
+    };
   }
   const reference = param("reference");
   if (route.path.startsWith("/v1/connect/sessions/{reference}") && reference !== undefined) {
@@ -71,19 +80,6 @@ async function scopeOf(route: Route, request: Request, params: Params): Promise<
     return { organization_id: null, workspace_id: null, caller: `member:${authenticate(request).id}|-` };
   }
   throw new Error(`No idempotency scope for ${route.operationId}`);
-}
-
-/** HMAC-SHA-256 under the server key: a stored fingerprint can't be used to guess a body back. */
-async function keyedDigest(text: string): Promise<string> {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(db().idempotency_fingerprint_key),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(text));
-  return Array.from(new Uint8Array(mac), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function replay(row: IdempotencyRow): Response {
@@ -123,7 +119,7 @@ export async function idempotently(request: Request, params: Params, handle: () 
   }
   // Only the route's template is stored in the clear: a hosted Connect path carries its reference, so the
   // actual path goes into the keyed digest with the query and the body.
-  const fingerprint = `POST ${route.path} ${await keyedDigest(`${path}${url.search}\n${await request.clone().text()}`)}`;
+  const fingerprint = `POST ${route.path} ${await keyedDigest("idempotency", `${path}${url.search}\n${await request.clone().text()}`)}`;
 
   // From here to the insert there is no await, so two requests can't both start.
   const now = Date.now();

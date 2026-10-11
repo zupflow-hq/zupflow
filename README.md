@@ -647,7 +647,20 @@ backend runs the same suite by setting `ZUPFLOW_CONTRACT_URL` (see
 `packages/contract-tests/src/remote.test.ts`). Cases that need the mock's
 database stay in `handlers.test.ts`.
 
-Two pieces exist only because there is no backend yet, and are labelled as such:
+API keys created through the mock authenticate in their own organization and
+environment, including Production Connect sessions, runs and approval decisions.
+Their secrets appear only in the creating response; the local mock stores an
+HMAC under its instance key, plus public display metadata. Historical seeded
+keys are display records with no usable secret. The shared suite creates fresh
+keys through the API and exercises the same authentication, isolation,
+revocation, idempotency and approval cases against both servers.
+
+The reference fixture has a pending approval in each environment; Sandbox's is
+the `qa-playground` Echo bot waiting on `echo_write`. Approving or denying it
+through an API key resumes the mock's existing simulated execution. The Console
+continues to observe approvals.
+
+The mock keeps two local-development simulations, labelled as such in the UI:
 
 - **Sign-in** is simulated by the mock's auth adapter
   (`src/features/auth/mock-adapter.ts`), which `src/features/auth/session.ts`

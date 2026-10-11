@@ -34,6 +34,7 @@ import {
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { signUp } from "./accounts";
+import * as credentials from "./credentials";
 import { db, resetDb } from "./db";
 import { createHandlers, NO_SIGN_IN_HOST, OUTCOME_GRACE_MS, UNREACHABLE_HOST } from "./handlers";
 import { announceLifecycle, grantorAllows, setLatency, withdrawUngrantable, withExpiry } from "./http";
@@ -742,8 +743,140 @@ contractSuite({
       outsider: () => userByEmail("rowan@larkspur.example"),
     }[persona]()}`,
   reset: async () => resetDb(),
-  // The mock has no API keys: Console sessions only.
-  apiKeys: false,
+});
+
+describe("API-key creation authority changes", () => {
+  function pauseApiKeyHash() {
+    let resume = () => {};
+    let notify = () => {};
+    const released = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      notify = resolve;
+    });
+    const digest = credentials.keyedDigest;
+    let paused = false;
+    const spy = vi.spyOn(credentials, "keyedDigest").mockImplementation(async (domain, value) => {
+      if (domain === "api_key" && !paused) {
+        paused = true;
+        notify();
+        await released;
+      }
+      return digest(domain, value);
+    });
+    return { entered, release: () => resume(), restore: () => spy.mockRestore() };
+  }
+
+  it.each([
+    { label: "Sandbox developer demotion", environment: "sandbox", initial: "developer", next: "viewer", status: 403 },
+    { label: "Production admin demotion", environment: "production", initial: "admin", next: "developer", status: 403 },
+    { label: "Sandbox member removal", environment: "sandbox", initial: "developer", next: null, status: 404 },
+    { label: "Production member removal", environment: "production", initial: "admin", next: null, status: 404 },
+    {
+      label: "Sandbox demotion retaining permission",
+      environment: "sandbox",
+      initial: "admin",
+      next: "developer",
+      status: 201,
+    },
+  ] as const)("rechecks $label after hashing", async ({ environment, initial, next, status }) => {
+    const organization = must(northwindId());
+    const userId = userByEmail("sam@northwind.example");
+    const member = must(db().memberships.find((m) => m.organization_id === organization && m.user_id === userId));
+    await owner.members.update(organization, member.id, { role: initial });
+    const workspace = must(
+      db().workspaces.find((w) => w.organization_id === organization && w.environment === environment),
+    );
+    const keysBefore = structuredClone(db().api_keys);
+    const auditBefore = db().audit.filter((event) => event.action === "api_key.created").length;
+    const barrier = pauseApiKeyHash();
+    const pending = clientFor(userId)
+      .apiKeys.create(organization, { name: "Authority check", environment })
+      .then(
+        (created) => ({ status: 201, code: null, created }),
+        (error: unknown) => {
+          if (!(error instanceof ZupflowApiError)) throw error;
+          return { status: error.status, code: error.code, created: null };
+        },
+      );
+    let result: Awaited<typeof pending>;
+    try {
+      await Promise.race([
+        barrier.entered,
+        pending.then(() => {
+          throw new Error("Key creation finished before the hashing barrier");
+        }),
+      ]);
+      if (next === null) await owner.members.remove(organization, member.id);
+      else await owner.members.update(organization, member.id, { role: next });
+    } finally {
+      barrier.release();
+      result = await pending.finally(barrier.restore);
+    }
+    let usable = false;
+    if (result.created) {
+      const { secret } = result.created;
+      const keyClient = createClient(createHttpTransport({ baseUrl: API, getToken: async () => secret }));
+      usable = (await keyClient.workspaces.get(workspace.id)).id === workspace.id;
+    }
+    expect({ status: result.status, code: result.code, usable }).toEqual({
+      status,
+      code: status === 201 ? null : status === 403 ? "forbidden" : "not_found",
+      usable: status === 201,
+    });
+    expect(db().api_keys.filter((key) => key.id !== result.created?.key.id)).toEqual(keysBefore);
+    expect(db().api_keys).toHaveLength(keysBefore.length + (status === 201 ? 1 : 0));
+    expect(db().audit.filter((event) => event.action === "api_key.created")).toHaveLength(
+      auditBefore + (status === 201 ? 1 : 0),
+    );
+  });
+});
+
+describe("API-key storage", () => {
+  it("stores only a domain-separated hash and never persists a created secret", async () => {
+    const owner = clientFor(DEMO_USER_ID);
+    const organization = must(northwindId(), "Northwind");
+    const created = await owner.apiKeys.create(
+      organization,
+      { name: "Storage check", environment: "sandbox" },
+      { idempotencyKey: "key-storage" },
+    );
+    const row = must(db().api_keys.find((key) => key.organization_id === organization && key.id === created.key.id));
+    expect(row.secret_hash === (await credentials.keyedDigest("api_key", created.secret))).toBe(true);
+    expect(row.secret_hash === (await credentials.keyedDigest("idempotency", created.secret))).toBe(false);
+    expect(JSON.stringify(db()).includes(created.secret)).toBe(false);
+    expect(localStorage.getItem("zupflow.mock.db")?.includes(created.secret)).toBe(false);
+    const saved = must(
+      db().idempotency_keys.find((entry) => entry.organization_id === organization && entry.key === "key-storage"),
+    );
+    expect(saved.state).toBe("completed");
+    expect(saved.body === null).toBe(true);
+    const keyed = createClient(createHttpTransport({ baseUrl: API, getToken: async () => created.secret }));
+    await keyed.models.list();
+    const used = row.last_used_at;
+    expect(used).not.toBeNull();
+    await keyed.models.list();
+    expect(row.last_used_at).toBe(used);
+    row.last_used_at = new Date(Date.now() - 60_000).toISOString();
+    const previous = row.last_used_at;
+    await keyed.models.list();
+    expect(Date.parse(must(row.last_used_at))).toBeGreaterThan(Date.parse(previous));
+    // Revocation remains authoritative even though the stored hash still matches.
+    await owner.apiKeys.revoke(organization, row.id);
+    expect(await failure(keyed.models.list())).toMatchObject({ status: 401, code: "unauthenticated" });
+  });
+
+  it("never treats historical key display metadata as a usable credential", async () => {
+    const organization = must(northwindId());
+    const historical = must(
+      db().api_keys.find((key) => key.organization_id === organization && key.revoked_at === null),
+    );
+    expect(historical.secret_hash).toBeNull();
+    const guessed = `${historical.prefix}${"0".repeat(36)}${historical.last4}`;
+    const client = createClient(createHttpTransport({ baseUrl: API, getToken: async () => guessed }));
+    expect(await failure(client.models.list())).toMatchObject({ status: 401, code: "unauthenticated" });
+  });
 });
 
 describe("the contract", () => {
@@ -935,7 +1068,7 @@ describe("idempotency store", () => {
     expect(row.organization_id).toBe(northwindId());
     expect(row.caller).toBe(`member:${DEMO_USER_ID}|-`);
     expect(row.body).toBeNull();
-    expect(JSON.stringify(db().idempotency_keys)).not.toContain(created.secret);
+    expect(JSON.stringify(db().idempotency_keys).includes(created.secret)).toBe(false);
     await owner.agents.create(qa(), input, { idempotencyKey: "store-env" });
     expect(rowFor("store-env").caller).toBe(`member:${DEMO_USER_ID}|sandbox`);
   });
@@ -1440,6 +1573,32 @@ describe("identifiers", () => {
     const shape = (nowMs: number) =>
       seed(nowMs).runs.map((r) => [r.status, ...r.plan.map((s) => (s.kind === "tool_call" ? s.call.tool : s.kind))]);
     expect(shape(Date.UTC(2026, 9, 3, 12))).toEqual(shape(Date.UTC(2026, 11, 24, 7, 13)));
+  });
+
+  it("keeps each pending fixture call distinct from every other call", () => {
+    const database = db();
+    const pending = database.runs.filter((run) => run.status === "waiting_for_approval");
+    const environments = pending.map(
+      (run) =>
+        must(
+          database.workspaces.find(
+            (workspace) => workspace.organization_id === run.organization_id && workspace.id === run.workspace_id,
+          ),
+        ).environment,
+    );
+    expect(new Set(environments)).toEqual(new Set(["sandbox", "production"]));
+    const callIds = database.runs.flatMap((run) => [
+      ...timelineOf(database, run).flatMap((event) => (event.type === "tool_call.started" ? [event.data.call_id] : [])),
+      ...run.plan.flatMap((step) => (step.kind === "tool_call" ? [step.call.call_id] : [])),
+    ]);
+    expect(new Set(callIds).size).toBe(callIds.length);
+    for (const run of pending) {
+      const requested = must(timelineOf(database, run).find((event) => event.type === "approval.requested"));
+      if (requested.type !== "approval.requested") throw new Error("Expected a pending approval");
+      expect(
+        run.plan.filter((step) => step.kind === "tool_call" && step.call.call_id === requested.data.call_id),
+      ).toHaveLength(1);
+    }
   });
 
   it("registers each prefix once", () => {

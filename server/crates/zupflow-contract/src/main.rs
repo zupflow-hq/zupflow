@@ -976,7 +976,9 @@ async fn reset(path: &str) -> Result<(), String> {
 
     // Runs, as the run engine leaves them: a finished one for the agent of
     // `acme`, `beta-labs`, `acme-sandbox`, `qa-playground` and `harbor`, and in `beta-labs` one
-    // waiting for approval of `send_email`. None is queued or running, so
+    // waiting for approval of `send_email`; `qa-playground` also waits for
+    // `echo_write`, giving the shared suite a fixed pending call in each environment.
+    // None is queued or running, so
     // nothing moves on its own (the contract server runs no worker).
     let runs = SqliteRunStore::new(database.clone());
     for (label, tool, waiting) in [
@@ -985,6 +987,7 @@ async fn reset(path: &str) -> Result<(), String> {
         ("Google", "send_email", true),
         ("Engineering", "list_tasks", false),
         ("Echo", "echo", false),
+        ("Echo", "echo_write", true),
         ("Harbor", "list_tasks", false),
     ] {
         let (_, organization, workspace, installation_id, agent_id, model) = seeded_agents

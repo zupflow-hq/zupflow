@@ -1,8 +1,8 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { createFileRoute } from "@tanstack/react-router";
-import type { ApiKey, Environment, OrganizationId } from "@zupflow/sdk";
+import type { ApiKey, Environment, Organization, OrganizationId } from "@zupflow/sdk";
 import { KeyRoundIcon, PlusIcon } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
 import { z } from "zod";
@@ -39,14 +39,34 @@ export const Route = createFileRoute("/_authed/$org/api-keys")({
 function ApiKeysPage() {
   const org = useOrg();
   useDocumentTitle("API keys", org.name);
+  const environment = useEnvironment();
+  // Sandbox keys are for developers too; Production keys are admins'. Viewers manage none.
+  const mayManage = canChange(org) && (environment === "sandbox" || canAdminister(org));
+  // Navigation or loss of permission discards every open dialog and its secret.
+  return (
+    <ApiKeysContent
+      key={`${org.id}:${environment}:${mayManage}`}
+      org={org}
+      environment={environment}
+      mayManage={mayManage}
+    />
+  );
+}
+
+function ApiKeysContent({
+  org,
+  environment,
+  mayManage,
+}: {
+  org: Organization;
+  environment: Environment;
+  mayManage: boolean;
+}) {
   const keys = useApiKeys(org.id);
   const revoke = useRevokeApiKey(org.id);
   const [creating, setCreating] = useState(false);
   const [secret, setSecret] = useState<{ value: string; key: ApiKey } | null>(null);
   const [revoking, setRevoking] = useState<ApiKey | null>(null);
-  const environment = useEnvironment();
-  // Sandbox keys are for developers too; Production keys are admins'. Viewers manage none.
-  const mayManage = canChange(org) && (environment === "sandbox" || canAdminister(org));
 
   return (
     <PageContainer>
@@ -73,18 +93,19 @@ function ApiKeysPage() {
         />
       )}
 
-      <CreateKeyDialog
-        orgId={org.id}
-        environment={environment}
-        open={creating}
-        onOpenChange={setCreating}
-        onCreated={(value, key) => {
-          setCreating(false);
-          setSecret({ value, key });
-        }}
-      />
+      {creating ? (
+        <CreateKeyDialog
+          orgId={org.id}
+          environment={environment}
+          onOpenChange={setCreating}
+          onCreated={(value, key) => {
+            setCreating(false);
+            setSecret({ value, key });
+          }}
+        />
+      ) : null}
       <SecretRevealDialog
-        title={secret ? `${secret.key.name} created` : ""}
+        title={secret ? <span className="block pr-4 break-all">{secret.key.name} created</span> : ""}
         description={
           secret ? (
             <span className="inline-flex flex-wrap items-center gap-1.5">
@@ -99,7 +120,7 @@ function ApiKeysPage() {
       <ConfirmDialog
         open={revoking !== null}
         onOpenChange={(o) => !o && setRevoking(null)}
-        title={`Revoke ${revoking?.name}?`}
+        title={<span className="break-all">Revoke {revoking?.name}?</span>}
         description={<p>Requests using this key start failing with 401 right away. This can't be undone.</p>}
         actionLabel="Revoke key"
         pending={revoke.isPending}
@@ -160,8 +181,10 @@ function KeySection({
             <TableBody>
               {keys.map((k) => (
                 <TableRow key={k.id} className={cn("hover:bg-transparent", k.revoked_at && "text-muted-foreground")}>
-                  <TableCell className="py-3 pl-4">
-                    <p className="font-medium">{k.name}</p>
+                  <TableCell className="w-full max-w-0 py-3 pl-4">
+                    <p className="truncate font-medium" title={k.name}>
+                      {k.name}
+                    </p>
                     <code className={cn("text-[11.5px] sm:hidden", k.revoked_at && "line-through")}>
                       {k.prefix}…{k.last4}
                     </code>
@@ -209,27 +232,21 @@ const keySchema = z.object({
 function CreateKeyDialog({
   orgId,
   environment,
-  open,
   onOpenChange,
   onCreated,
 }: {
   orgId: OrganizationId;
   environment: Environment;
-  open: boolean;
   onOpenChange: (open: boolean) => void;
   onCreated: (secret: string, key: ApiKey) => void;
 }) {
-  const create = useCreateApiKey(orgId);
+  const create = useCreateApiKey(orgId, ({ key, secret }) => onCreated(secret, key));
   const form = useForm<z.infer<typeof keySchema>>({
     resolver: zodResolver(keySchema),
     defaultValues: { name: "" },
   });
-  useEffect(() => {
-    if (!open) form.reset();
-  }, [open, form]);
-
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>Create {ENVIRONMENT_LABEL[environment]} key</DialogTitle>
@@ -243,7 +260,6 @@ function CreateKeyDialog({
               create.mutate(
                 { ...values, environment },
                 {
-                  onSuccess: ({ key, secret }) => onCreated(secret, key),
                   onError: (e) => {
                     if (!applyFieldErrors(form, e)) toastError(e, "Couldn't create the key");
                   },

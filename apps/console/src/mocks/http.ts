@@ -3,6 +3,7 @@
  * authentication, authorization and the row → wire mappers.
  */
 
+import { matchRoute } from "@zupflow/contract";
 import type {
   Agent,
   AgentGrant,
@@ -38,6 +39,7 @@ import {
 } from "@zupflow/sdk";
 import { delay, HttpResponse } from "msw";
 import type { z } from "zod";
+import { keyedDigest } from "./credentials";
 import { db, persist } from "./db";
 import { isPublicHost } from "./destinations";
 import { idempotently } from "./idempotency";
@@ -137,6 +139,13 @@ export function route<A extends ResolverArgs>(fn: (args: A) => Promise<Response>
       }
     };
     try {
+      const path = new URL(args.request.url).pathname;
+      const contract = matchRoute(args.request.method, path.slice(Math.max(0, path.indexOf("/v1/"))));
+      if (contract?.callers.some((kind) => kind === "console" || kind === "api_key")) {
+        const caller = await authenticateCaller(args.request);
+        // Like Rust's ConsoleUser extractor: before path IDs, bodies and idempotency.
+        if (caller.kind === "api_key" && !contract.callers.includes("api_key")) throw consoleOnly();
+      }
       return await idempotently(args.request, args.params, handle);
     } catch (error) {
       return failureFor(error);
@@ -166,32 +175,91 @@ export async function body<T extends z.ZodType>(request: Request, schema: T): Pr
 // ---------------------------------------------------------------------------
 // Authentication and authorization
 
-export function authenticate(request: Request): User {
+type Caller = { kind: "console"; user: User } | { kind: "api_key"; key: ApiKeyRow };
+
+// WebCrypto is asynchronous. Resolve once at the HTTP boundary, before the
+// synchronous access helpers and the single idempotency wrapper use the caller.
+const callers = new WeakMap<Request, Caller>();
+
+export const consoleOnly = () =>
+  new ApiFailure(403, "console_only", "This route is for Console sessions; an API key can't call it.");
+
+function consoleCaller(request: Request): Caller & { kind: "console" } {
   const header = request.headers.get("Authorization") ?? "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   const user = token?.startsWith("mock_") ? db().users.find((u) => u.id === token.slice(5)) : undefined;
   if (!user) throw new ApiFailure(401, "unauthenticated", "Sign in to continue.");
-  return user;
+  return { kind: "console", user };
 }
 
-export interface OrgAccess {
+/**
+ * The one cross-tenant API-key lookup: the credential establishes organization
+ * and environment. Revoked and unknown hashes never become Console sessions.
+ */
+async function findActiveApiKeyByHashCrossTenant(secretHash: string): Promise<ApiKeyRow> {
+  const key = db().api_keys.find((row) => row.secret_hash === secretHash && row.revoked_at === null);
+  if (!key) throw new ApiFailure(401, "unauthenticated", "Sign in to continue.");
+  const now = Date.now();
+  if (key.last_used_at === null || Date.parse(key.last_used_at) <= now - 60_000) {
+    key.last_used_at = new Date(now).toISOString();
+    persist();
+  }
+  return key;
+}
+
+async function authenticateCaller(request: Request): Promise<Caller> {
+  const header = request.headers.get("Authorization") ?? "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  const resolved: Caller = token?.startsWith("zf_")
+    ? { kind: "api_key", key: await findActiveApiKeyByHashCrossTenant(await keyedDigest("api_key", token)) }
+    : consoleCaller(request);
+  callers.set(request, resolved);
+  return resolved;
+}
+
+/** The resolved credential; unwrapped Console-only helpers can still authenticate a member. */
+export function callerOf(request: Request): Caller {
+  return callers.get(request) ?? consoleCaller(request);
+}
+
+/** Console-only identity, never the person who happened to create an API key. */
+export function authenticate(request: Request): User {
+  const caller = callerOf(request);
+  if (caller.kind === "api_key") throw consoleOnly();
+  return caller.user;
+}
+
+export interface ConsoleOrgAccess {
+  kind: "console";
   user: User;
   org: OrganizationRow;
   membership: MembershipRow;
 }
 
-/**
- * The credential is checked first (401), then the organization: a malformed
- * ID, a missing organization and one the caller isn't a member of all answer
- * the same 404.
- */
-export function orgAccess(request: Request, organizationParam: string): OrgAccess {
-  const user = authenticate(request);
-  return membershipIn(user, organizationParam, "Organization");
+export type OrgAccess = ConsoleOrgAccess | { kind: "api_key"; key: ApiKeyRow; org: OrganizationRow };
+
+/** Console-only organization routes keep their member's identity and role. */
+export function consoleOrgAccess(request: Request, organizationParam: string): ConsoleOrgAccess {
+  return membershipIn(authenticate(request), organizationParam, "Organization");
 }
 
-/** The caller's active membership in the named organization, or a 404 that says nothing about why. */
-function membershipIn(user: User, organizationParam: string, notFoundLabel: string): OrgAccess {
+/** Credential first, then the organization explicitly named by the route. */
+export function orgAccess(request: Request, organizationParam: string): OrgAccess {
+  const caller = callerOf(request);
+  return caller.kind === "console"
+    ? membershipIn(caller.user, organizationParam, "Organization")
+    : keyIn(caller.key, organizationParam, "Organization");
+}
+
+function keyIn(key: ApiKeyRow, organizationParam: string, label: string): OrgAccess {
+  if (key.organization_id !== organizationParam) throw notFound(label);
+  const org = db().organizations.find((row) => row.id === key.organization_id);
+  if (!org) throw notFound(label);
+  return { kind: "api_key", key, org };
+}
+
+/** The caller's active membership in the named organization, or an indistinguishable 404. */
+function membershipIn(user: User, organizationParam: string, notFoundLabel: string): ConsoleOrgAccess {
   if (!isId("organization", organizationParam)) throw notFound(notFoundLabel);
   const organizationId: OrganizationId = organizationParam;
   const membership = db().memberships.find(
@@ -200,36 +268,53 @@ function membershipIn(user: User, organizationParam: string, notFoundLabel: stri
   const org = db().organizations.find((o) => o.id === organizationId);
   if (!membership || !org) throw notFound(notFoundLabel);
   membership.last_active_at = new Date().toISOString();
-  return { user, org, membership };
+  return { kind: "console", user, org, membership };
 }
 
-export interface WorkspaceAccess extends OrgAccess {
-  workspace: WorkspaceRow;
+export type WorkspaceAccess = OrgAccess & { workspace: WorkspaceRow };
+
+export function keyEnvironment(access: OrgAccess): Environment | undefined {
+  return access.kind === "api_key" ? access.key.environment : undefined;
+}
+
+/** Explicit other-environment requests refuse; omitted filters inherit a key's environment. */
+export function requireEnvironment(access: OrgAccess, environment: string | null | undefined) {
+  const own = keyEnvironment(access);
+  if (own && environment && own !== environment) {
+    throw new ApiFailure(422, "environment_mismatch", "This API key can't act in that environment.");
+  }
+  return environment || own;
 }
 
 /**
- * Workspace routes establish the organization first, from the request, never
- * from the workspace row: 401 for the credential, then the organization the
- * session names (`Zupflow-Organization`) and the caller's membership in it,
- * then the workspace within that organization. A malformed, missing or
- * foreign workspace and a foreign organization all answer the same 404.
+ * Establish organization from the credential/header before finding a workspace.
+ * A key needs no header, but a supplied one must name its own organization.
+ * Another organization or environment is always the same workspace 404.
  */
 export function workspaceAccess(request: Request, workspaceParam: string): WorkspaceAccess {
-  const user = authenticate(request);
-  const organizationParam = request.headers.get(ORGANIZATION_HEADER);
-  if (!organizationParam) {
-    throw new ApiFailure(
-      400,
-      "organization_required",
-      `Name the organization this request acts in with the ${ORGANIZATION_HEADER} header.`,
-    );
+  const caller = callerOf(request);
+  const named = request.headers.get(ORGANIZATION_HEADER);
+  let access: OrgAccess;
+  if (caller.kind === "api_key") {
+    access = keyIn(caller.key, named === null ? caller.key.organization_id : named.trim(), "Workspace");
+  } else {
+    if (!named?.trim()) {
+      throw new ApiFailure(
+        400,
+        "organization_required",
+        `Name the organization this request acts in with the ${ORGANIZATION_HEADER} header.`,
+      );
+    }
+    access = membershipIn(caller.user, named, "Workspace");
   }
-  const { org, membership } = membershipIn(user, organizationParam, "Workspace");
   if (!isId("workspace", workspaceParam)) throw notFound("Workspace");
   const workspaceId: WorkspaceId = workspaceParam;
-  const workspace = db().workspaces.find((w) => w.organization_id === org.id && w.id === workspaceId);
+  const own = keyEnvironment(access);
+  const workspace = db().workspaces.find(
+    (w) => w.organization_id === access.org.id && w.id === workspaceId && (!own || w.environment === own),
+  );
   if (!workspace) throw notFound("Workspace");
-  return { user, org, membership, workspace };
+  return { ...access, workspace };
 }
 
 /**
@@ -342,6 +427,7 @@ export function announceSession(
 }
 
 export function requireRole(access: OrgAccess, roles: MemberRole[], action: string) {
+  if (access.kind === "api_key") return;
   if (!roles.includes(access.membership.role)) {
     throw new ApiFailure(
       403,
@@ -366,7 +452,10 @@ export function audit(
     organization_id: access.org.id,
     workspace_id: scope.workspace?.id ?? null,
     environment: scope.environment ?? scope.workspace?.environment ?? null,
-    actor: { type: "user", id: access.user.id, name: access.user.name },
+    actor:
+      access.kind === "api_key"
+        ? { type: "api_key", id: access.key.id, name: access.key.name }
+        : { type: "user", id: access.user.id, name: access.user.name },
     action,
     target,
     created_at: new Date().toISOString(),
@@ -615,7 +704,7 @@ export function toConfiguration(c: ConfigurationRow, app: AppRow): ClientConfigu
   };
 }
 
-export function toApp(app: AppRow): AppDefinition {
+export function toApp(app: AppRow, visibleEnvironment?: Environment): AppDefinition {
   const d = db();
   // Installations count only where the app can be installed: its organization's workspaces, or its own workspace.
   const appWorkspaces = new Set(
@@ -623,6 +712,7 @@ export function toApp(app: AppRow): AppDefinition {
       .filter(
         (w) =>
           w.organization_id === app.organization_id &&
+          (!visibleEnvironment || w.environment === visibleEnvironment) &&
           (app.owner_workspace_id === null || w.id === app.owner_workspace_id),
       )
       .map((w) => w.id),
@@ -632,7 +722,9 @@ export function toApp(app: AppRow): AppDefinition {
         d.workspaces.find((w) => w.organization_id === app.organization_id && w.id === app.owner_workspace_id)
           ?.environment ?? "sandbox",
       ]
-    : ["sandbox", "production"];
+    : visibleEnvironment
+      ? [visibleEnvironment]
+      : ["sandbox", "production"];
   return {
     id: app.id,
     organization_id: app.organization_id,

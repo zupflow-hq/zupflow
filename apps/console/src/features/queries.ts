@@ -13,6 +13,7 @@ import {
   type CreateApiKeyInput,
   type CreateAppInput,
   type CreateConnectSessionInput,
+  type CreatedApiKey,
   type CreatedWebhookEndpoint,
   type CreateGrantInput,
   type CreateOrganizationInput,
@@ -687,10 +688,24 @@ export function useApiKeys(orgId: OrganizationId) {
   return useQuery({ queryKey: qk.apiKeys(orgId), queryFn: () => api.apiKeys.list(orgId) });
 }
 
-export function useCreateApiKey(orgId: OrganizationId) {
+export function useCreateApiKey(orgId: OrganizationId, onReveal: (created: CreatedApiKey) => void) {
   const qc = useQueryClient();
+  const active = useRef(true);
+  useEffect(() => {
+    active.current = true;
+    return () => {
+      active.current = false;
+    };
+  }, []);
   return useMutation({
-    mutationFn: (input: CreateApiKeyInput) => api.apiKeys.create(orgId, input),
+    gcTime: 0,
+    mutationFn: async (input: CreateApiKeyInput) => {
+      const created = await api.apiKeys.create(orgId, input);
+      // A closed or replaced form must not reveal a late response. Only public
+      // metadata enters the mutation cache; the open form receives the secret.
+      if (active.current) onReveal(created);
+      return created.key;
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.apiKeys(orgId) });
       qc.invalidateQueries({ queryKey: qk.viewer });

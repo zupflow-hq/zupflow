@@ -32,12 +32,6 @@ export interface Target {
    * never sends that request.
    */
   operations?: readonly string[];
-  /**
-   * Whether the server accepts the API keys it issues as credentials; it
-   * does when omitted. On one that doesn't (the mock has no API keys), a case
-   * that needs a key is skipped.
-   */
-  apiKeys?: boolean;
 }
 
 /**
@@ -51,8 +45,10 @@ export interface Target {
  *   installation, a Connect session and a workspace app of its own (`acme`'s
  *   is `acme-publishing`; `beta-labs` has none at reset, and the suite makes
  *   one). In `acme-sandbox`: an active agent and an installation. Somewhere
- *   in the organization: a run waiting for approval.
- * - At least one API key, webhook endpoint and catalog app.
+ *   in the organization: a run waiting for approval in each environment; the
+ *   Sandbox one belongs to `qa-playground` and waits on `echo_write`.
+ * - At least one API key, webhook endpoint and catalog app. Fixture keys are
+ *   metadata only: tests create fresh credentials through the Console API.
  * - A webhook endpoint in each environment with frozen delivery history:
  *   pending (two attempts), succeeded (two), failed (eight), skipped (none),
  *   and a succeeded `webhook.test` (one, without a workspace), all with complete
@@ -70,7 +66,7 @@ export interface Target {
  * - A workspace app `echo-server` owned by `qa-playground`, with token auth
  *   through one input named `token`. Its provider accepts any token and
  *   rejects one containing `invalid`. Its tools include `echo`, which needs
- *   no approval, and not `echo_write`; `qa-playground` has a connected
+ *   no approval, and `echo_write`, which does; `qa-playground` has a connected
  *   installation of it.
  * - At least one model in `GET /v1/models`.
  * - The default tool policy (never saved: `manual`, new tools at `approve`)

@@ -20,7 +20,7 @@ export function SecretRevealDialog({
   secret,
   onClose,
 }: {
-  title: string;
+  title: React.ReactNode;
   description: React.ReactNode;
   secret: string | null;
   onClose: () => void;

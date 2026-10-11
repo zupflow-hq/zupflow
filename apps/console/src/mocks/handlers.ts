@@ -18,6 +18,7 @@ import {
   type ModelOption,
   type OrganizationId,
   RemoveMemberQuery,
+  ResolveApprovalInput,
   RUN_STATUSES,
   type SignInSettings,
   TERMINAL_RUN_STATUSES,
@@ -36,6 +37,7 @@ import { HttpResponse, http } from "msw";
 import { z } from "zod";
 import { checkedAuthTemplate, sameOrigin } from "./auth-templates";
 import { defaultToolsFor } from "./catalog";
+import { keyedDigest, newApiKeySecret } from "./credentials";
 import { cancelScheduledRun, db, resetDb, scheduleRun } from "./db";
 import {
   ADMINS,
@@ -47,19 +49,24 @@ import {
   audit,
   authenticate,
   body,
+  callerOf,
   configurationStatus,
+  consoleOnly,
+  consoleOrgAccess,
   created,
   DEVELOPERS,
   findSessionByReferenceCrossTenant,
   grantorAllows,
   invitationsOf,
   isExpiredInvitation,
+  keyEnvironment,
   noContent,
   notFound,
   type OrgAccess,
   ok,
   orgAccess,
   RESERVED_ORG_SLUGS,
+  requireEnvironment,
   requireRole,
   route,
   SLUG_PATTERN,
@@ -98,7 +105,7 @@ import type {
 } from "./model";
 import { levelInForce, levelRowsOf, levelsInput, policyRowOf, setLevels, toAppToolLevel, toToolPolicy } from "./policy";
 import { hash, token } from "./random";
-import { cancelRun, enqueueRun, planRun, runTarget } from "./runner";
+import { cancelRun, enqueueRun, planRun, resolveApproval, runTarget } from "./runner";
 import { appIn, configurationOf, inWorkspace, runEventsKey, timelineOf } from "./scope";
 import {
   acceptChange,
@@ -278,18 +285,17 @@ function availableApps(access: WorkspaceAccess): AvailableApp[] {
     .flatMap((app) => {
       const config = configurationOf(db().configurations, app, workspace.environment);
       if (!config || configurationStatus(config) !== "ready") return [];
-      return [{ app: toApp(app), configuration: toConfigurationSummary(config) }];
+      return [{ app: toApp(app, keyEnvironment(access)), configuration: toConfigurationSummary(config) }];
     });
 }
 
 /**
  * In Production the Console observes; it never acts on a live customer's
  * accounts. Starting runs and Connect sessions there is for the customer's
- * backend, with an API key. The mock has no API keys, so every caller is a
- * Console session.
+ * backend, with an API key.
  */
 function assertConsoleMayAct(access: WorkspaceAccess, action: string) {
-  if (access.workspace.environment === "production") {
+  if (access.kind === "console" && access.workspace.environment === "production") {
     throw new ApiFailure(
       403,
       "console_read_only_in_production",
@@ -381,7 +387,7 @@ function applyConfiguration(
   if (input.oauth_scopes) row.oauth_scopes = input.oauth_scopes;
   row.version += 1;
   row.updated_at = now;
-  row.updated_by_user_id = access.user.id;
+  row.updated_by_user_id = access.kind === "console" ? access.user.id : null;
   app.updated_at = now;
 }
 
@@ -756,8 +762,11 @@ function paginate<T>(items: T[], cursor: string | null, limit: number) {
   return { page, meta: { pagination: { next_cursor: next, total: items.length } } };
 }
 
-function findWebhook(organizationId: OrganizationId, endpointId: WebhookEndpointId) {
-  const endpoint = db().webhooks.find((row) => row.organization_id === organizationId && row.id === endpointId);
+function findWebhook(access: OrgAccess, endpointId: WebhookEndpointId) {
+  const own = keyEnvironment(access);
+  const endpoint = db().webhooks.find(
+    (row) => row.organization_id === access.org.id && row.id === endpointId && (!own || row.environment === own),
+  );
   if (!endpoint) throw notFound("Webhook endpoint");
   return endpoint;
 }
@@ -929,7 +938,7 @@ export function createHandlers(apiBase: string) {
         invitation.status = "active";
         invitation.joined_at = now;
         invitation.last_active_at = now;
-        audit({ user, org, membership: invitation }, "member.joined", {
+        audit({ kind: "console", user, org, membership: invitation }, "member.joined", {
           type: "member",
           id: invitation.id,
           name: user.email,
@@ -946,7 +955,7 @@ export function createHandlers(apiBase: string) {
         // Expired or not, declining withdraws it.
         const d = db();
         d.memberships = d.memberships.filter((m) => m !== invitation);
-        audit({ user, org, membership: invitation }, "member.declined", {
+        audit({ kind: "console", user, org, membership: invitation }, "member.declined", {
           type: "member",
           id: invitation.id,
           name: user.email,
@@ -958,7 +967,7 @@ export function createHandlers(apiBase: string) {
     http.get(
       u("/v1/models"),
       route(({ request }) => {
-        authenticate(request);
+        callerOf(request);
         return ok(MODELS);
       }),
     ),
@@ -1001,7 +1010,7 @@ export function createHandlers(apiBase: string) {
             updated_at: null,
           });
         }
-        audit({ user, org, membership }, "organization.created", {
+        audit({ kind: "console", user, org, membership }, "organization.created", {
           type: "organization",
           id: org.id,
           name: org.name,
@@ -1013,7 +1022,7 @@ export function createHandlers(apiBase: string) {
     http.get(
       u("/v1/organizations/:org"),
       route(({ request, params }) => {
-        const access = orgAccess(request, param(params, "org"));
+        const access = consoleOrgAccess(request, param(params, "org"));
         return ok(toOrganization(access.org, access.membership));
       }),
     ),
@@ -1021,7 +1030,7 @@ export function createHandlers(apiBase: string) {
     http.patch(
       u("/v1/organizations/:org"),
       route(async ({ request, params }) => {
-        const access = orgAccess(request, param(params, "org"));
+        const access = consoleOrgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "change organization settings");
         const input = await body(request, z.object({ name: name().optional(), slug: slug.optional() }));
         if (input.slug && input.slug !== access.org.slug) {
@@ -1050,6 +1059,7 @@ export function createHandlers(apiBase: string) {
             environment: "Required.",
           });
         }
+        requireEnvironment(access, env.data);
         const days = clampedInt(url, "days", 14, 90);
         const workspaceIds = new Set(
           db()
@@ -1089,7 +1099,7 @@ export function createHandlers(apiBase: string) {
     http.get(
       u("/v1/organizations/:org/members"),
       route(({ request, params }) => {
-        const access = orgAccess(request, param(params, "org"));
+        const access = consoleOrgAccess(request, param(params, "org"));
         return ok(
           db()
             .memberships.filter((m) => m.organization_id === access.org.id)
@@ -1101,7 +1111,7 @@ export function createHandlers(apiBase: string) {
     http.post(
       u("/v1/organizations/:org/members"),
       route(async ({ request, params }) => {
-        const access = orgAccess(request, param(params, "org"));
+        const access = consoleOrgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "invite members");
         const input = await body(
           request,
@@ -1159,7 +1169,7 @@ export function createHandlers(apiBase: string) {
     http.patch(
       u("/v1/organizations/:org/members/:member"),
       route(async ({ request, params }) => {
-        const access = orgAccess(request, param(params, "org"));
+        const access = consoleOrgAccess(request, param(params, "org"));
         requireRole(access, ["owner"], "change roles");
         const input = await body(request, z.object({ role: MemberRole }));
         const member = db().memberships.find(
@@ -1188,7 +1198,7 @@ export function createHandlers(apiBase: string) {
     http.delete(
       u("/v1/organizations/:org/members/:member"),
       route(({ request, params }) => {
-        const access = orgAccess(request, param(params, "org"));
+        const access = consoleOrgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "remove members");
         const d = db();
         const member = d.memberships.find(
@@ -1230,10 +1240,11 @@ export function createHandlers(apiBase: string) {
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
         const url = new URL(request.url);
-        const env = url.searchParams.get("environment");
+        let env = url.searchParams.get("environment");
         if (env && !environment.safeParse(env).success) {
           throw new ApiFailure(400, "validation_failed", "Unknown environment.", { environment: "Unknown." });
         }
+        env = requireEnvironment(access, env) ?? null;
         const q = (url.searchParams.get("q") ?? "").trim().toLowerCase();
         const sort = url.searchParams.get("sort") === "activity" ? "activity" : "name";
         const limit = clampedInt(url, "limit", 25, 100);
@@ -1274,6 +1285,7 @@ export function createHandlers(apiBase: string) {
             external_id: z.string().trim().max(120).nullable(),
           }),
         );
+        requireEnvironment(access, input.environment);
         if (db().workspaces.some((w) => w.organization_id === access.org.id && w.slug === input.slug)) {
           throw new ApiFailure(409, "slug_taken", "Another workspace uses that slug.", {
             slug: "Already used in this organization.",
@@ -1419,7 +1431,7 @@ export function createHandlers(apiBase: string) {
           db()
             .apps.filter((a) => a.organization_id === access.org.id && a.owner_workspace_id === null)
             .sort((a, b) => a.name.localeCompare(b.name))
-            .map(toApp),
+            .map((app) => toApp(app, keyEnvironment(access))),
         );
       }),
     ),
@@ -1433,7 +1445,7 @@ export function createHandlers(apiBase: string) {
         for (const env of ENVIRONMENTS)
           configurationFor({ organization_id: access.org.id, workspace_id: null }, app, env);
         audit(access, "app.created", { type: "app", id: app.id, name: app.name });
-        return created(toApp(app));
+        return created(toApp(app, keyEnvironment(access)));
       }),
     ),
 
@@ -1441,7 +1453,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/organizations/:org/apps/:app"),
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
-        return ok(toApp(findOrgApp(access, idParam(params, "app"))));
+        return ok(toApp(findOrgApp(access, idParam(params, "app")), keyEnvironment(access)));
       }),
     ),
 
@@ -1451,9 +1463,18 @@ export function createHandlers(apiBase: string) {
         const access = orgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "edit apps");
         const app = findOrgApp(access, idParam(params, "app"));
+        if (access.kind === "api_key") {
+          const raw: unknown = await request
+            .clone()
+            .json()
+            .catch(() => null);
+          if (raw !== null && typeof raw === "object" && !Array.isArray(raw) && Object.hasOwn(raw, "auth")) {
+            throw consoleOnly();
+          }
+        }
         applyAppUpdate(app, await body(request, appUpdateInput));
         audit(access, "app.updated", { type: "app", id: app.id, name: app.name });
-        return ok(toApp(app));
+        return ok(toApp(app, keyEnvironment(access)));
       }),
     ),
 
@@ -1469,7 +1490,7 @@ export function createHandlers(apiBase: string) {
     http.put(
       u("/v1/organizations/:org/tool-policy"),
       route(async ({ request, params }) => {
-        const access = orgAccess(request, param(params, "org"));
+        const access = consoleOrgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "change the tool policy");
         const input = await body(
           request,
@@ -1522,7 +1543,7 @@ export function createHandlers(apiBase: string) {
     http.patch(
       u("/v1/organizations/:org/apps/:app/tool-levels"),
       route(async ({ request, params }) => {
-        const access = orgAccess(request, param(params, "org"));
+        const access = consoleOrgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "set tool levels");
         const app = findOrgApp(access, idParam(params, "app"));
         const input = await body(request, z.object({ levels: z.unknown() }));
@@ -1540,6 +1561,7 @@ export function createHandlers(apiBase: string) {
         const app = findOrgApp(access, idParam(params, "app"));
         const env = environment.safeParse(param(params, "env"));
         if (!env.success) throw notFound("Environment");
+        requireEnvironment(access, env.data);
         return ok(
           toConfiguration(
             configurationFor({ organization_id: access.org.id, workspace_id: null }, app, env.data, "read"),
@@ -1557,6 +1579,7 @@ export function createHandlers(apiBase: string) {
         const app = findOrgApp(access, idParam(params, "app"));
         const env = environment.safeParse(param(params, "env"));
         if (!env.success) throw notFound("Environment");
+        requireEnvironment(access, env.data);
         const row = configurationFor({ organization_id: access.org.id, workspace_id: null }, app, env.data);
         applyConfiguration(access, app, row, await body(request, configurationInput));
         audit(
@@ -1575,10 +1598,11 @@ export function createHandlers(apiBase: string) {
         const access = orgAccess(request, param(params, "org"));
         const app = findOrgApp(access, idParam(params, "app"));
         const url = new URL(request.url);
-        const env = url.searchParams.get("environment");
+        let env = url.searchParams.get("environment");
         if (env && !environment.safeParse(env).success) {
           throw new ApiFailure(400, "validation_failed", "Unknown environment.", { environment: "Unknown." });
         }
+        env = requireEnvironment(access, env) ?? null;
         const limit = clampedInt(url, "limit", 25, 100);
         const refs: AppInstallationRef[] = db()
           .installations.filter((i) => i.organization_id === access.org.id && i.app_id === app.id)
@@ -1608,7 +1632,7 @@ export function createHandlers(apiBase: string) {
           db()
             .apps.filter((a) => a.organization_id === access.org.id && a.owner_workspace_id === access.workspace.id)
             .sort((a, b) => a.name.localeCompare(b.name))
-            .map(toApp),
+            .map((app) => toApp(app, keyEnvironment(access))),
         );
       }),
     ),
@@ -1625,7 +1649,7 @@ export function createHandlers(apiBase: string) {
           access.workspace.environment,
         );
         audit(access, "app.created", { type: "app", id: app.id, name: app.name }, { workspace: access.workspace });
-        return created(toApp(app));
+        return created(toApp(app, keyEnvironment(access)));
       }),
     ),
 
@@ -1633,7 +1657,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/workspaces/:ws/apps/:app"),
       route(({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        return ok(toApp(findWorkspaceApp(access, idParam(params, "app"))));
+        return ok(toApp(findWorkspaceApp(access, idParam(params, "app")), keyEnvironment(access)));
       }),
     ),
 
@@ -1645,7 +1669,7 @@ export function createHandlers(apiBase: string) {
         const app = findWorkspaceApp(access, idParam(params, "app"));
         applyAppUpdate(app, await body(request, appUpdateInput));
         audit(access, "app.updated", { type: "app", id: app.id, name: app.name }, { workspace: access.workspace });
-        return ok(toApp(app));
+        return ok(toApp(app, keyEnvironment(access)));
       }),
     ),
 
@@ -2373,7 +2397,7 @@ export function createHandlers(apiBase: string) {
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
         const url = new URL(request.url);
-        const env = url.searchParams.get("environment");
+        let env = url.searchParams.get("environment");
         const workspaceId = url.searchParams.get("workspace_id");
         const status = url.searchParams.get("status");
         if (status && !(RUN_STATUSES as readonly string[]).includes(status)) {
@@ -2384,6 +2408,7 @@ export function createHandlers(apiBase: string) {
             environment: "Unknown environment.",
           });
         }
+        env = requireEnvironment(access, env) ?? null;
         const workspaces = new Map(
           db()
             .workspaces.filter(
@@ -2442,7 +2467,7 @@ export function createHandlers(apiBase: string) {
           workspace_id: access.workspace.id,
           agent_id: agent.id,
           session_id: newId("session"),
-          trigger: "console",
+          trigger: access.kind === "api_key" ? "api" : "console",
           status: "queued",
           input: input.input,
           output: null,
@@ -2493,26 +2518,52 @@ export function createHandlers(apiBase: string) {
           throw new ApiFailure(409, "run_finished", "This run already finished.");
         }
         cancelScheduledRun(run);
-        cancelRun(db(), run, access.user.name, new Date().toISOString());
+        cancelRun(db(), run, access.kind === "api_key" ? access.key.name : access.user.name, new Date().toISOString());
         audit(access, "run.cancelled", runTarget(db(), run), { workspace: access.workspace });
         return ok(toRun(run));
       }),
     ),
 
-    // Approvals are decided in the customer's product, however it wants, and
-    // recorded by its backend with an API key. A Console session
-    // only observes them. The mock has no API keys, so every caller here is a
-    // Console session and is refused; waiting runs stay paused until cancelled.
+    // The customer's backend records its decision with an API key; the Console observes.
     http.post(
       u("/v1/workspaces/:ws/runs/:run/approvals"),
-      route(({ request, params }) => {
+      route(async ({ request, params }) => {
         const access = workspaceAccess(request, param(params, "ws"));
-        findRun(access, idParam(params, "run"));
-        throw new ApiFailure(
-          403,
-          "approval_requires_api_key",
-          "Approvals come from your backend with an API key, once your product has the decision.",
+        const run = findRun(access, idParam(params, "run"));
+        if (access.kind === "console") {
+          throw new ApiFailure(
+            403,
+            "approval_requires_api_key",
+            "Approvals come from your backend with an API key, once your product has the decision.",
+          );
+        }
+        const input = await body(request, ResolveApprovalInput);
+        const events = timelineOf(db(), run);
+        const pending = [...events].reverse().find((event) => event.type === "approval.requested");
+        if (
+          run.status !== "waiting_for_approval" ||
+          pending?.type !== "approval.requested" ||
+          pending.data.call_id !== input.call_id ||
+          events.some((event) => event.type === "approval.resolved" && event.data.call_id === input.call_id)
+        ) {
+          throw new ApiFailure(
+            409,
+            "not_waiting",
+            "This run isn't waiting for a decision on that call. Read the run's events for the call it waits for.",
+          );
+        }
+        // No await between the pending check and transition: concurrent decisions have one winner.
+        resolveApproval(
+          db(),
+          run,
+          input.call_id,
+          input.decision,
+          access.key.id,
+          new Date().toISOString(),
+          input.reason,
         );
+        scheduleRun(run);
+        return ok(toRun(run));
       }),
     ),
 
@@ -2523,6 +2574,7 @@ export function createHandlers(apiBase: string) {
         const access = orgAccess(request, param(params, "org"));
         const env = environment.safeParse(param(params, "env"));
         if (!env.success) throw notFound("Environment");
+        requireEnvironment(access, env.data);
         // A read changes nothing: until the first write, the settings are the empty defaults.
         const row = db().connect_settings.find(
           (c) => c.organization_id === access.org.id && c.environment === env.data,
@@ -2545,6 +2597,7 @@ export function createHandlers(apiBase: string) {
         requireRole(access, ADMINS, "change Connect settings");
         const env = environment.safeParse(param(params, "env"));
         if (!env.success) throw notFound("Environment");
+        requireEnvironment(access, env.data);
         const input = await body(
           request,
           z.object({ return_urls: z.array(z.string()).max(20), allowed_origins: z.array(z.string()).max(20) }),
@@ -2619,7 +2672,7 @@ export function createHandlers(apiBase: string) {
     http.get(
       u("/v1/organizations/:org/api-keys"),
       route(({ request, params }) => {
-        const access = orgAccess(request, param(params, "org"));
+        const access = consoleOrgAccess(request, param(params, "org"));
         return ok(
           db()
             .api_keys.filter((k) => k.organization_id === access.org.id)
@@ -2632,21 +2685,27 @@ export function createHandlers(apiBase: string) {
     http.post(
       u("/v1/organizations/:org/api-keys"),
       route(async ({ request, params }) => {
-        const access = orgAccess(request, param(params, "org"));
+        let access = consoleOrgAccess(request, param(params, "org"));
         requireRole(access, DEVELOPERS, "create API keys");
         const input = await body(request, z.object({ name: name(), environment }));
         if (input.environment === "production") requireRole(access, ADMINS, "create Production keys");
-        const live = input.environment === "production";
-        const selector = token(4);
-        const secretPart = token(40);
-        const secret = `zf_${live ? "live" : "test"}_${selector}${secretPart}`;
+        const { prefix, secret, last4 } = newApiKeySecret(input.environment);
+        const secretHash = await keyedDigest("api_key", secret);
+        // Membership may change while hashing; authorize the synchronous write with current access.
+        access = consoleOrgAccess(request, param(params, "org"));
+        requireRole(
+          access,
+          input.environment === "production" ? ADMINS : DEVELOPERS,
+          input.environment === "production" ? "create Production keys" : "create API keys",
+        );
         const row = {
           id: newId("api_key"),
           organization_id: access.org.id,
           environment: input.environment,
           name: input.name,
-          prefix: `zf_${live ? "live" : "test"}_${selector}`,
-          last4: secret.slice(-4),
+          prefix,
+          last4,
+          secret_hash: secretHash,
           created_by_user_id: access.user.id,
           created_at: new Date().toISOString(),
           last_used_at: null,
@@ -2666,7 +2725,7 @@ export function createHandlers(apiBase: string) {
     http.post(
       u("/v1/organizations/:org/api-keys/:key/revoke"),
       route(({ request, params }) => {
-        const access = orgAccess(request, param(params, "org"));
+        const access = consoleOrgAccess(request, param(params, "org"));
         requireRole(access, DEVELOPERS, "revoke API keys");
         const row = db().api_keys.find((k) => k.organization_id === access.org.id && k.id === idParam(params, "key"));
         if (!row) throw notFound("API key");
@@ -2690,7 +2749,11 @@ export function createHandlers(apiBase: string) {
         const access = orgAccess(request, param(params, "org"));
         return ok(
           db()
-            .webhooks.filter((w) => w.organization_id === access.org.id)
+            .webhooks.filter(
+              (w) =>
+                w.organization_id === access.org.id &&
+                (!keyEnvironment(access) || w.environment === keyEnvironment(access)),
+            )
             .map(toWebhookEndpoint),
         );
       }),
@@ -2710,6 +2773,7 @@ export function createHandlers(apiBase: string) {
             events: z.array(z.enum(WEBHOOK_EVENT_TYPES)).min(1, "Choose at least one event."),
           }),
         );
+        requireEnvironment(access, input.environment);
         assertPublicHttps(input.url, "url");
         const secret = webhookSecret(input.environment);
         const endpoint: WebhookEndpoint = {
@@ -2742,10 +2806,7 @@ export function createHandlers(apiBase: string) {
       route(async ({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "edit webhook endpoints");
-        const endpoint = db().webhooks.find(
-          (w) => w.organization_id === access.org.id && w.id === idParam(params, "hook"),
-        );
-        if (!endpoint) throw notFound("Webhook endpoint");
+        const endpoint = findWebhook(access, idParam(params, "hook"));
         const input = await body(
           request,
           z.object({
@@ -2774,7 +2835,7 @@ export function createHandlers(apiBase: string) {
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "roll webhook signing secrets");
-        const endpoint = findWebhook(access.org.id, idParam(params, "hook"));
+        const endpoint = findWebhook(access, idParam(params, "hook"));
         const now = Date.now();
         if (
           endpoint.previous_signing_secret_expires_at !== null &&
@@ -2807,10 +2868,7 @@ export function createHandlers(apiBase: string) {
         const access = orgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "delete webhook endpoints");
         const d = db();
-        const endpoint = d.webhooks.find(
-          (w) => w.organization_id === access.org.id && w.id === idParam(params, "hook"),
-        );
-        if (!endpoint) throw notFound("Webhook endpoint");
+        const endpoint = findWebhook(access, idParam(params, "hook"));
         d.webhooks = d.webhooks.filter((w) => w !== endpoint);
         d.webhook_deliveries = d.webhook_deliveries.filter(
           (row) => !(row.organization_id === access.org.id && row.endpoint_id === endpoint.id),
@@ -2832,7 +2890,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/organizations/:org/webhooks/:hook/deliveries"),
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
-        const endpoint = findWebhook(access.org.id, idParam(params, "hook"));
+        const endpoint = findWebhook(access, idParam(params, "hook"));
         const url = new URL(request.url);
         const workspaceId = url.searchParams.get("workspace_id");
         const state = url.searchParams.get("state");
@@ -2888,7 +2946,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/organizations/:org/webhooks/:hook/deliveries/:delivery"),
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
-        const endpoint = findWebhook(access.org.id, idParam(params, "hook"));
+        const endpoint = findWebhook(access, idParam(params, "hook"));
         const { row, event } = findWebhookDelivery(access.org.id, endpoint, idParam(params, "delivery"));
         const attempts = webhookAttempts(access.org.id, endpoint.id, row.id);
         return ok({
@@ -2904,7 +2962,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/organizations/:org/webhooks/:hook/deliveries/:delivery/attempts"),
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
-        const endpoint = findWebhook(access.org.id, idParam(params, "hook"));
+        const endpoint = findWebhook(access, idParam(params, "hook"));
         const { row } = findWebhookDelivery(access.org.id, endpoint, idParam(params, "delivery"));
         const url = new URL(request.url);
         const scope = JSON.stringify([access.org.id, endpoint.id, endpoint.environment, row.id]);
@@ -2930,7 +2988,7 @@ export function createHandlers(apiBase: string) {
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "resend webhook deliveries");
-        const endpoint = findWebhook(access.org.id, idParam(params, "hook"));
+        const endpoint = findWebhook(access, idParam(params, "hook"));
         const { row, event } = findWebhookDelivery(access.org.id, endpoint, idParam(params, "delivery"));
         if (row.state === "pending") {
           throw new ApiFailure(
@@ -2983,10 +3041,7 @@ export function createHandlers(apiBase: string) {
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "send test events");
-        const endpoint = db().webhooks.find(
-          (w) => w.organization_id === access.org.id && w.id === idParam(params, "hook"),
-        );
-        if (!endpoint) throw notFound("Webhook endpoint");
+        const endpoint = findWebhook(access, idParam(params, "hook"));
         const delivery = {
           status_code: endpoint.url.includes("staging") ? 503 : 200,
           delivered_at: new Date().toISOString(),
@@ -3041,7 +3096,7 @@ export function createHandlers(apiBase: string) {
     http.get(
       u("/v1/organizations/:org/audit-events"),
       route(({ request, params }) => {
-        const access = orgAccess(request, param(params, "org"));
+        const access = consoleOrgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "read the audit log");
         const url = new URL(request.url);
         const workspaceId = url.searchParams.get("workspace_id");

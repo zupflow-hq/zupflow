@@ -55,14 +55,6 @@ function uuidOf(id: string): string {
 }
 
 /**
- * Operations the suite can't drive to a success yet, with the reason. A target
- * that fails one of these is not excused: only the coverage check skips them.
- */
-export const NOT_YET_COVERED: Record<string, string> = {
-  resolveApproval: "Approvals come only from an API key, and the suite has no API-key credential yet.",
-};
-
-/**
  * A case of the suite. One that needs an operation the target doesn't serve
  * is skipped, naming the operation; it never fails or passes for it.
  */
@@ -118,20 +110,28 @@ export function contractSuite(target: Target) {
         (await owner.workspaces.list(fx.organization, { q: slug, limit: 100 })).items.find((w) => w.slug === slug),
         `workspace ${slug}`,
       );
-    /** A client acting with an API key's secret, in the reference organization. */
-    const withKey = (secret: string): ZupflowClient => {
-      if (target.apiKeys === false) throw new NotServed("API-key credentials");
+    /** An API key needs no organization header; a supplied one must match its organization. */
+    const withKey = (secret: string, organization: OrganizationId | null = null): ZupflowClient => {
       return createClient(
         createHttpTransport({
           baseUrl: target.baseUrl,
           getToken: async () => secret,
-          getOrganization: () => fx?.organization ?? null,
+          getOrganization: () => organization,
           fetch: servedFetch,
           retries: 0,
         }),
       );
     };
     const owner = as("owner");
+    /** A fixed pending call in each environment, read only through the public API. */
+    const waitingApproval = async (environment: "sandbox" | "production") => {
+      const page = await owner.organizationRuns.list(fx.organization, { environment, status: "waiting_for_approval" });
+      const run = must(page.items[0], `${environment} run waiting for approval`);
+      const events = await owner.runs.events(run.workspace_id, run.id);
+      const requested = [...events].reverse().find((event) => event.type === "approval.requested");
+      const callId = must(requested?.type === "approval.requested" ? requested.data.call_id : null, "pending call");
+      return { run, callId, events };
+    };
     const northwind = () => loadTenant(owner, fx.organization, "acme", "acme-sandbox");
     /** `beta-labs`, given a workspace app of its own first: the fixture has none there. */
     const betaLabs = async () => {
@@ -174,9 +174,7 @@ export function contractSuite(target: Target) {
       } catch (error) {
         if (!notServedIn(error)) throw error;
       }
-      const missed = routes
-        .map((r) => r.operationId)
-        .filter((id) => serves(id) && !checker.succeeded.has(id) && !(id in NOT_YET_COVERED));
+      const missed = routes.map((r) => r.operationId).filter((id) => serves(id) && !checker.succeeded.has(id));
       expect(missed, "served operations with no checked success, or served after one that isn't").toEqual([]);
 
       async function everyOperation() {
@@ -216,6 +214,12 @@ export function contractSuite(target: Target) {
         await owner.apiKeys.list(org);
         const key = await owner.apiKeys.create(org, { name: "Contract", environment: "sandbox" });
         await owner.apiKeys.revoke(org, key.key.id);
+        const approver = await owner.apiKeys.create(org, { name: "Contract approver", environment: "production" });
+        const pending = await waitingApproval("production");
+        await withKey(approver.secret).runs.resolveApproval(pending.run.workspace_id, pending.run.id, {
+          call_id: pending.callId,
+          decision: "denied",
+        });
 
         // Apps, at both levels, including OAuth apps that have no endpoints yet.
         const oauthApp = { kind: "mcp", description: "", auth_type: "oauth2" } as const;
@@ -2431,6 +2435,440 @@ export function contractSuite(target: Target) {
       });
     });
 
+    describe("API-key authentication", () => {
+      it("shows each environment's secret once, records use and refuses revoked or forged credentials", async () => {
+        for (const environment of ["sandbox", "production"] as const) {
+          const input = { name: `  Backend ${environment}  `, environment };
+          const options = { idempotencyKey: `create-key-${environment}` };
+          const created = await owner.apiKeys.create(fx.organization, input, options);
+          const { key, secret } = created;
+          const label = environment === "sandbox" ? "test" : "live";
+          expect(new RegExp(`^zf_${label}_[0-9A-Za-z]{44}$`).test(secret)).toBe(true);
+          expect(key).toMatchObject({
+            organization_id: fx.organization,
+            environment,
+            name: `Backend ${environment}`,
+            prefix: secret.slice(0, 12),
+            last4: secret.slice(-4),
+            last_used_at: null,
+            revoked_at: null,
+          });
+          expect(await failure(owner.apiKeys.create(fx.organization, input, options))).toMatchObject({
+            status: 409,
+            code: "idempotency_key_completed",
+          });
+          const listed = (await owner.apiKeys.list(fx.organization)).filter((row) => row.id === key.id);
+          expect(listed).toEqual([key]);
+          expect(JSON.stringify(listed).includes(secret)).toBe(false);
+          expect(JSON.stringify(listed).includes("secret_hash")).toBe(false);
+          await withKey(secret).models.list();
+          const used = must(
+            (await owner.apiKeys.list(fx.organization)).find((row) => row.id === key.id),
+            "used key",
+          );
+          expect(used.last_used_at).not.toBeNull();
+          const revoked = await owner.apiKeys.revoke(fx.organization, key.id);
+          expect(revoked.revoked_at).not.toBeNull();
+          expect(JSON.stringify(revoked).includes(secret)).toBe(false);
+          expect(await failure(owner.apiKeys.revoke(fx.organization, key.id))).toMatchObject({
+            status: 409,
+            code: "already_revoked",
+          });
+          const changed = `${secret.slice(0, -1)}${secret.endsWith("x") ? "y" : "x"}`;
+          for (const bearer of [secret, changed, `zf_${label}_`]) {
+            const client = withKey(bearer);
+            for (const attempt of [
+              () => client.models.list(),
+              () => client.me.get(),
+              () => client.workspaces.list(fx.organization),
+            ]) {
+              expect(await failure(attempt())).toMatchObject({ status: 401, code: "unauthenticated" });
+            }
+          }
+        }
+      });
+
+      it("binds keys to their organization and environment, including absent and conflicting headers", async () => {
+        const outsider = as("outsider");
+        for (const [console, organization, foreignOrganization] of [
+          [owner, fx.organization, fx.otherOrganization],
+          [outsider, fx.otherOrganization, fx.organization],
+        ] as const) {
+          const foreignConsole = organization === fx.organization ? outsider : owner;
+          const foreign = must(
+            (await foreignConsole.workspaces.list(foreignOrganization)).items[0],
+            "foreign workspace",
+          );
+          const foreignBefore = await foreignConsole.workspaces.get(foreign.id);
+          for (const environment of ["sandbox", "production"] as const) {
+            const created = await console.apiKeys.create(organization, { name: "Scoped backend", environment });
+            const client = withKey(created.secret);
+            const otherEnvironment = environment === "sandbox" ? "production" : "sandbox";
+            const ownPage = await console.workspaces.list(organization, { environment, limit: 100 });
+            const own = must(ownPage.items[0], "own environment workspace");
+            const other = must(
+              (await console.workspaces.list(organization, { environment: otherEnvironment })).items[0],
+              "other environment workspace",
+            );
+            const before = await console.workspaces.get(other.id);
+            expect(
+              (await client.workspaces.list(organization, { limit: 100 })).items.map((row) => row.id).sort(),
+            ).toEqual(ownPage.items.map((row) => row.id).sort());
+            expect((await client.workspaces.get(own.id)).id).toBe(own.id);
+            expect((await withKey(created.secret, organization).workspaces.get(own.id)).id).toBe(own.id);
+            for (const attempt of [
+              () => client.workspaces.list(foreignOrganization),
+              () => client.workspaces.get(foreign.id),
+              () => client.workspaces.update(foreign.id, { name: "Unreachable" }),
+              () => client.workspaces.delete(foreign.id),
+              () => withKey(created.secret, foreignOrganization).workspaces.get(own.id),
+              () => withKey(created.secret, foreignOrganization).workspaces.get(foreign.id),
+              () => client.workspaces.get(other.id),
+              () => client.workspaces.update(other.id, { name: "Unreachable" }),
+              () => client.workspaces.delete(other.id),
+            ])
+              expect(await failure(attempt())).toMatchObject({ status: 404, code: "not_found" });
+            for (const header of [" ", "org_invalid"]) {
+              const response = await servedFetch(`${target.baseUrl}/v1/workspaces/${own.id}`, {
+                headers: { Authorization: `Bearer ${created.secret}`, "Zupflow-Organization": header },
+              });
+              expect(response.status).toBe(404);
+              expect(await response.json()).toMatchObject({ error: { code: "not_found" } });
+            }
+            expect(await console.workspaces.get(other.id)).toEqual(before);
+            expect(await foreignConsole.workspaces.get(foreign.id)).toEqual(foreignBefore);
+            for (const attempt of [
+              () => client.workspaces.list(organization, { environment: other.environment }),
+              () =>
+                client.workspaces.create(organization, {
+                  name: "Other environment",
+                  slug: `other-${environment}`,
+                  environment: other.environment,
+                  external_id: null,
+                }),
+            ])
+              expect(await failure(attempt())).toMatchObject({ status: 422, code: "environment_mismatch" });
+            expect(
+              (await console.workspaces.list(organization, { environment, limit: 100 })).items
+                .map((row) => row.id)
+                .sort(),
+            ).toEqual(ownPage.items.map((row) => row.id).sort());
+            expect((await console.workspaces.list(organization, { q: `other-${environment}` })).items).toEqual([]);
+          }
+        }
+      });
+
+      it("keeps child resources scoped to their workspace for API callers too", async () => {
+        for (const environment of ["sandbox", "production"] as const) {
+          const key = await owner.apiKeys.create(fx.organization, { name: "Workspace scope", environment });
+          const client = withKey(key.secret);
+          const first = environment === "sandbox" ? fx.workspaces.acmeSandbox : fx.workspaces.acme;
+          const second = environment === "sandbox" ? fx.workspaces.qaPlayground : await workspaceBySlug("beta-labs");
+          const agent = must((await owner.agents.list(first.id))[0], "first workspace agent");
+          const agentsBefore = await owner.agents.list(first.id);
+          for (const attempt of [
+            () => client.agents.get(second.id, agent.id),
+            () => client.agents.update(second.id, agent.id, { name: "Foreign path" }),
+            () => client.agents.delete(second.id, agent.id),
+            () => client.grants.list(second.id, agent.id),
+          ])
+            expect(await failure(attempt())).toMatchObject({ status: 404, code: "not_found" });
+          expect(await owner.agents.list(first.id)).toEqual(agentsBefore);
+          expect((await client.agents.get(first.id, agent.id)).id).toBe(agent.id);
+        }
+      });
+
+      it("authenticates a key as the organization's backend after its creator loses membership", async () => {
+        const developer = as("developer");
+        const creator = (await developer.me.get()).user;
+        const member = must(
+          (await owner.members.list(fx.organization)).find((row) => row.user.id === creator.id),
+          "key creator's membership",
+        );
+        const key = await developer.apiKeys.create(fx.organization, {
+          name: "Independent backend",
+          environment: "sandbox",
+        });
+        await owner.members.remove(fx.organization, member.id);
+        expect(await failure(developer.workspaces.get(fx.workspaces.qaPlayground.id))).toMatchObject({
+          status: 404,
+          code: "not_found",
+        });
+        const workspace = await withKey(key.secret).workspaces.create(fx.organization, {
+          name: "Backend workspace",
+          slug: "independent-backend",
+          environment: "sandbox",
+          external_id: null,
+        });
+        expect(workspace.organization_id).toBe(fx.organization);
+        expect((await owner.audit.list(fx.organization, { workspace_id: workspace.id })).items).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              action: "workspace.created",
+              actor: { type: "api_key", id: key.key.id, name: "Independent backend" },
+            }),
+          ]),
+        );
+      });
+
+      it("filters organization views and refuses another environment's configuration", async () => {
+        for (const environment of ["sandbox", "production"] as const) {
+          const key = await owner.apiKeys.create(fx.organization, { name: "Environment views", environment });
+          const client = withKey(key.secret);
+          const other = environment === "sandbox" ? "production" : "sandbox";
+          const appId = fx.apps.googleWorkspace;
+          const app = await client.organizationApps.get(fx.organization, appId);
+          expect(app.configurations.map((row) => row.environment)).toEqual([environment]);
+          const installations = await owner.organizationApps.installations(fx.organization, appId, {
+            environment,
+            limit: 100,
+          });
+          expect(app.installation_count).toBe(installations.pagination.total);
+          expect(await client.organizationApps.installations(fx.organization, appId, { limit: 100 })).toEqual(
+            installations,
+          );
+          for (const listed of await client.organizationApps.list(fx.organization)) {
+            expect(listed.configurations.map((row) => row.environment)).toEqual([environment]);
+          }
+          const before = await owner.organizationApps.getConfiguration(fx.organization, appId, other);
+          for (const attempt of [
+            () => client.organizationApps.getConfiguration(fx.organization, appId, other),
+            () =>
+              client.organizationApps.updateConfiguration(fx.organization, appId, other, {
+                oauth_client_id: "unreachable",
+              }),
+            () => client.organizationApps.installations(fx.organization, appId, { environment: other }),
+            () => client.organizationRuns.list(fx.organization, { environment: other }),
+            () => client.organizations.usage(fx.organization, other),
+            () => client.connectSettings.get(fx.organization, other),
+            () => client.connectSettings.update(fx.organization, other, { return_urls: [], allowed_origins: [] }),
+            () =>
+              client.webhooks.create(fx.organization, {
+                environment: other,
+                url: "https://hooks.northwind.example/unreachable",
+                description: "",
+                events: ["run.completed"],
+              }),
+          ])
+            expect(await failure(attempt())).toMatchObject({ status: 422, code: "environment_mismatch" });
+          expect(await owner.organizationApps.getConfiguration(fx.organization, appId, other)).toEqual(before);
+          expect(
+            (await client.organizationRuns.list(fx.organization, { limit: 100 })).items.every(
+              (run) => run.workspace.environment === environment,
+            ),
+          ).toBe(true);
+          expect(await client.organizations.usage(fx.organization, environment)).toEqual(
+            await owner.organizations.usage(fx.organization, environment),
+          );
+          expect(await client.connectSettings.get(fx.organization, environment)).toEqual(
+            await owner.connectSettings.get(fx.organization, environment),
+          );
+          expect(
+            (await client.webhooks.list(fx.organization)).every((endpoint) => endpoint.environment === environment),
+          ).toBe(true);
+          const ownWorkspace = environment === "sandbox" ? fx.workspaces.acmeSandbox : fx.workspaces.acme;
+          for (const available of await client.workspaceApps.available(ownWorkspace.id)) {
+            expect(available.app.configurations.map((row) => row.environment)).toEqual([environment]);
+          }
+          expect(
+            await failure(client.organizationApps.update(fx.organization, appId, { auth: app.auth })),
+          ).toMatchObject({
+            status: 403,
+            code: "console_only",
+          });
+          expect(await owner.organizationApps.get(fx.organization, appId)).toMatchObject({ auth: app.auth });
+        }
+      });
+
+      it("lets keys configure their workspace apps, start Connect and run in either environment", async () => {
+        for (const environment of ["sandbox", "production"] as const) {
+          const key = await owner.apiKeys.create(fx.organization, { name: "Backend actions", environment });
+          const client = withKey(key.secret);
+          const workspace = await client.workspaces.create(fx.organization, {
+            name: `Backend ${environment}`,
+            slug: `backend-${environment}`,
+            environment,
+            external_id: null,
+          });
+          const app = await client.workspaceApps.create(workspace.id, {
+            kind: "mcp",
+            name: "Backend tools",
+            slug: "backend-tools",
+            description: "",
+            auth_type: "token",
+          });
+          const updated = await client.workspaceApps.update(workspace.id, app.id, { auth: app.auth });
+          expect(updated.auth).toEqual(app.auth);
+          const configuration = await client.workspaceApps.updateConfiguration(workspace.id, app.id, {
+            mcp_server_url: "https://tools.northwind.example/mcp",
+          });
+          expect(configuration.updated_by).toBeNull();
+          const session = await client.connectSessions.create(workspace.id, {
+            app_id: app.id,
+            intent: "create",
+            label: "Backend",
+            installation_id: null,
+            return_url: null,
+          });
+          expect(session).toMatchObject({ workspace_id: workspace.id, environment, status: "pending" });
+          await client.connect.cancel(referenceOf(session));
+          const agent = await client.agents.create(workspace.id, {
+            name: "Backend agent",
+            description: "",
+            instructions: "",
+            model: await anyModel(),
+          });
+          const run = await client.runs.create(workspace.id, agent.id, { input: "Hello" });
+          expect(run).toMatchObject({ workspace_id: workspace.id, trigger: "api" });
+          await client.runs.cancel(workspace.id, run.id);
+          const cancelled = (await client.runs.events(workspace.id, run.id)).find(
+            (event) => event.type === "run.cancelled",
+          );
+          expect(cancelled).toMatchObject({ data: { cancelled_by: "Backend actions" } });
+          const events = (await owner.audit.list(fx.organization, { workspace_id: workspace.id })).items;
+          expect(events.some((event) => event.action === "app_configuration.updated")).toBe(true);
+          for (const event of events.filter((row) => row.actor.type !== "system")) {
+            expect(event.actor).toEqual({ type: "api_key", id: key.key.id, name: "Backend actions" });
+          }
+        }
+      });
+
+      it("refuses valid keys on every Console-only route before IDs, bodies or idempotency", async () => {
+        const key = await owner.apiKeys.create(fx.organization, { name: "Caller type", environment: "sandbox" });
+        for (const route of routes.filter((route) => route.callers.length === 1 && route.callers[0] === "console")) {
+          if (!serves(route.operationId)) continue;
+          const path = route.path.replace(/\{[^}]+\}/g, "missing");
+          const response = await servedFetch(`${target.baseUrl}${path}`, {
+            method: route.method.toUpperCase(),
+            headers: { Authorization: `Bearer ${key.secret}`, "Idempotency-Key": "x".repeat(256) },
+            ...(route.method === "get" ? {} : { body: "not json" }),
+          });
+          expect(response.status, route.operationId).toBe(403);
+          expect(await response.json(), route.operationId).toMatchObject({ error: { code: "console_only" } });
+        }
+      });
+
+      it("scopes idempotency to a key and reauthenticates before returning saved answers", async () => {
+        const first = await owner.apiKeys.create(fx.organization, { name: "First backend", environment: "sandbox" });
+        const second = await owner.apiKeys.create(fx.organization, { name: "Second backend", environment: "sandbox" });
+        const a = withKey(first.secret);
+        const b = withKey(second.secret);
+        const workspace = fx.workspaces.qaPlayground.id;
+        const input = { name: "Same request", description: "", instructions: "", model: await anyModel() };
+        const options = { idempotencyKey: "shared-by-credentials" };
+        const own = await a.agents.create(workspace, input, options);
+        expect(await a.agents.create(workspace, input, options)).toEqual(own);
+        const theirs = await b.agents.create(workspace, input, options);
+        expect(theirs.id).not.toBe(own.id);
+        const console = await owner.agents.create(workspace, input, options);
+        expect(new Set([own.id, theirs.id, console.id]).size).toBe(3);
+        await owner.apiKeys.revoke(fx.organization, first.key.id);
+        expect(await failure(a.agents.create(workspace, input, options))).toMatchObject({
+          status: 401,
+          code: "unauthenticated",
+        });
+        expect(await b.agents.create(workspace, input, options)).toEqual(theirs);
+        expect((await owner.agents.list(workspace)).filter((agent) => agent.name === input.name)).toHaveLength(3);
+      });
+
+      it("records one winner when two keys decide the same pending call concurrently", async () => {
+        const { run, callId } = await waitingApproval("sandbox");
+        const first = await owner.apiKeys.create(fx.organization, { name: "First approver", environment: "sandbox" });
+        const second = await owner.apiKeys.create(fx.organization, { name: "Second approver", environment: "sandbox" });
+        const attempts = await Promise.allSettled([
+          withKey(first.secret).runs.resolveApproval(run.workspace_id, run.id, {
+            call_id: callId,
+            decision: "approved",
+          }),
+          withKey(second.secret).runs.resolveApproval(run.workspace_id, run.id, {
+            call_id: callId,
+            decision: "denied",
+          }),
+        ]);
+        expect(attempts.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(1);
+        const loser = must(
+          attempts.find((attempt) => attempt.status === "rejected"),
+          "refused second decision",
+        );
+        expect(loser.status === "rejected" ? loser.reason : null).toMatchObject({ status: 409, code: "not_waiting" });
+        const decisions = (await owner.runs.events(run.workspace_id, run.id)).filter(
+          (event) => event.type === "approval.resolved",
+        );
+        expect(decisions).toHaveLength(1);
+        const audits = (await owner.audit.list(fx.organization, { workspace_id: run.workspace_id })).items.filter(
+          (event) => event.action === "approval.resolved" && event.target.id === run.id,
+        );
+        expect(audits).toHaveLength(1);
+      });
+
+      for (const environment of ["sandbox", "production"] as const) {
+        for (const decision of ["approved", "denied"] as const) {
+          it(`records a ${decision} approval in ${environment} only for a key in that organization and environment`, async () => {
+            const { run, callId, events } = await waitingApproval(environment);
+            const otherEnvironment = environment === "sandbox" ? "production" : "sandbox";
+            const own = await owner.apiKeys.create(fx.organization, { name: "Approver", environment });
+            const wrong = await owner.apiKeys.create(fx.organization, {
+              name: "Other environment",
+              environment: otherEnvironment,
+            });
+            const foreign = await as("outsider").apiKeys.create(fx.otherOrganization, {
+              name: "Other organization",
+              environment,
+            });
+            const input = { call_id: callId, decision, reason: "  The product recorded this decision.  " };
+            for (const secret of [wrong.secret, foreign.secret]) {
+              expect(
+                await failure(withKey(secret).runs.resolveApproval(run.workspace_id, run.id, input)),
+              ).toMatchObject({
+                status: 404,
+                code: "not_found",
+              });
+            }
+            expect(await owner.runs.events(run.workspace_id, run.id)).toEqual(events);
+            const client = withKey(own.secret);
+            const sibling = must(
+              (await owner.workspaces.list(fx.organization, { environment })).items.find(
+                (workspace) => workspace.id !== run.workspace_id,
+              ),
+              "sibling workspace",
+            );
+            expect(await failure(client.runs.resolveApproval(sibling.id, run.id, input))).toMatchObject({
+              status: 404,
+              code: "not_found",
+            });
+            const anotherCall = (await waitingApproval(otherEnvironment)).callId;
+            expect(
+              await failure(client.runs.resolveApproval(run.workspace_id, run.id, { ...input, call_id: anotherCall })),
+            ).toMatchObject({
+              status: 409,
+              code: "not_waiting",
+            });
+            const options = { idempotencyKey: "approval-once" };
+            const resolved = await client.runs.resolveApproval(run.workspace_id, run.id, input, options);
+            expect(resolved.status).toBe("running");
+            expect(await client.runs.resolveApproval(run.workspace_id, run.id, input, options)).toEqual(resolved);
+            expect(await failure(client.runs.resolveApproval(run.workspace_id, run.id, input))).toMatchObject({
+              status: 409,
+              code: "not_waiting",
+            });
+            const decisions = (await owner.runs.events(run.workspace_id, run.id)).filter(
+              (event) => event.type === "approval.resolved",
+            );
+            expect(decisions).toHaveLength(1);
+            expect(decisions[0]).toMatchObject({ data: { call_id: callId, decision, api_key_id: own.key.id } });
+            const audit = (await owner.audit.list(fx.organization, { workspace_id: run.workspace_id })).items.filter(
+              (event) => event.action === "approval.resolved" && event.target.id === run.id,
+            );
+            expect(audit).toHaveLength(1);
+            expect(audit[0]).toMatchObject({
+              environment,
+              actor: { type: "api_key", id: own.key.id, name: "Approver" },
+            });
+          });
+        }
+      }
+    });
+
     describe("idempotency", () => {
       const agentInput = async (name: string) => ({
         name,
@@ -2485,7 +2923,7 @@ export function contractSuite(target: Target) {
         const created = await owner.apiKeys.create(fx.organization, input, { idempotencyKey: "suite-secret" });
         const error = await failure(owner.apiKeys.create(fx.organization, input, { idempotencyKey: "suite-secret" }));
         expect([error.status, error.code]).toEqual([409, "idempotency_key_completed"]);
-        expect(JSON.stringify(error)).not.toContain(created.secret);
+        expect(JSON.stringify(error).includes(created.secret)).toBe(false);
         expect((await owner.apiKeys.list(fx.organization)).filter((k) => k.name === name)).toHaveLength(1);
       });
 

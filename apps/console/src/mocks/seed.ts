@@ -39,7 +39,7 @@ import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 import { appIn, timelineOf } from "./scope";
 import { listedFrom, recordListing } from "./tools";
 
-export const DB_SCHEMA = 22;
+export const DB_SCHEMA = 23;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -497,6 +497,7 @@ export function seed(nowMs: number = Date.now()): Db {
         organization_id: org.id,
         environment: "sandbox",
         name: "Local development",
+        secret_hash: null,
         prefix: "zf_test_4hTq",
         last4: "w2Ka",
         created_by_user_id: jordan.id,
@@ -509,6 +510,7 @@ export function seed(nowMs: number = Date.now()): Db {
         organization_id: org.id,
         environment: "sandbox",
         name: "CI",
+        secret_hash: null,
         prefix: "zf_test_Pm7c",
         last4: "9QxE",
         created_by_user_id: sam.id,
@@ -521,6 +523,7 @@ export function seed(nowMs: number = Date.now()): Db {
         organization_id: org.id,
         environment: "production",
         name: "Northwind API",
+        secret_hash: null,
         prefix: "zf_live_9KcB",
         last4: "h3Ld",
         created_by_user_id: jordan.id,
@@ -533,6 +536,7 @@ export function seed(nowMs: number = Date.now()): Db {
         organization_id: org.id,
         environment: "production",
         name: "Old worker key",
+        secret_hash: null,
         prefix: "zf_live_2vRs",
         last4: "Ty8n",
         created_by_user_id: priya.id,
@@ -548,9 +552,7 @@ export function seed(nowMs: number = Date.now()): Db {
     audit: [] as Db["audit"],
     idempotency_keys: [],
     // Secure randomness, not the seed's: this key is a secret.
-    idempotency_fingerprint_key: Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) =>
-      b.toString(16).padStart(2, "0"),
-    ).join(""),
+    secret_key: Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join(""),
   };
 
   db.webhooks.push(
@@ -596,7 +598,7 @@ export function seed(nowMs: number = Date.now()): Db {
     { agent: betaOps, count: 30, prompts: OPS_PROMPTS },
     { agent: sandboxPublisher, count: 24, prompts: PUBLISHING_PROMPTS },
     { agent: sandboxPm, count: 14, prompts: PM_PROMPTS },
-    { agent: echoBot, count: 12, prompts: ["ping", "hello from QA", "approval check", "write test"] },
+    { agent: echoBot, count: 12, prompts: ["ping", "hello from QA", "approval check", "write test"], waiting: true },
   ]);
 
   // Billing broke a few hours ago; earlier runs used it while it worked.
@@ -1080,6 +1082,7 @@ function seedLarkspur(db: Db, nowMs: number) {
     organization_id: org.id,
     environment: "production",
     name: "Larkspur production",
+    secret_hash: null,
     prefix: "zf_live_8kLm",
     last4: "Tq3v",
     created_by_user_id: rowan.id,
@@ -1364,7 +1367,9 @@ function seedRuns(db: Db, rng: Rng, nowMs: number, specs: RunSeed[]) {
       };
       if (leaveWaiting) run.input = "Publish the autumn release notes";
       // Plan from the seed's randomness, not the run's ID: IDs carry the clock, and the demo must not change with it.
-      run.plan = planRun(db, run, rng);
+      // Pending examples skip simulated model failure, while still consuming
+      // seed randomness so every planned call keeps its own ID.
+      run.plan = planRun(db, run, leaveWaiting ? () => 0.05 + rng() * 0.95 : rng);
       db.runs.push(run);
       enqueueRun(db, run);
 
