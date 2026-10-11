@@ -4,7 +4,7 @@
 # Console through hosted Connect and run an agent with its tools.
 #
 # Builds both, restores the reference fixture into a throwaway database,
-# adds Taskboard to Northwind's catalog (ready in Sandbox), and serves the API
+# adds Taskboard live to Northwind's catalog (ready in Sandbox), and serves the API
 # for a Console at $CONSOLE_ORIGIN (default http://localhost:5181) until you
 # press Ctrl-C. Nothing leaves the machine: the backend reaches
 # taskboard.example at 127.0.0.1 and nothing else.
@@ -59,7 +59,7 @@ json() {
 }
 org=$(call GET /v1/me | json 'v.data.organizations.find((o) => o.slug === "northwind").id')
 app=$(call POST "/v1/organizations/$org/apps" \
-  '{"kind":"mcp","name":"Taskboard","slug":"taskboard","description":"A fake task app for development.","auth_type":"mcp_oauth"}' |
+  '{"kind":"mcp","name":"Taskboard live","slug":"taskboard-live","description":"A fake task app for development.","auth_type":"mcp_oauth"}' |
   json 'v.data.id')
 call PATCH "/v1/organizations/$org/apps/$app" "{\"auth\":{\"type\":\"mcp_oauth\",\"scopes\":[{\"name\":\"tasks:read\",\"description\":\"See tasks\"},{\"name\":\"tasks:write\",\"description\":\"Change tasks\"}],\"identity_url\":\"$taskboard/me\"}}" >/dev/null
 call PUT "/v1/organizations/$org/apps/$app/environments/sandbox/configuration" \
@@ -74,7 +74,9 @@ fi
 cat <<EOF
 
 Taskboard  $taskboard   (its home page expires or revokes tokens)
-API        $api   (Northwind, with Taskboard ready in Sandbox)
+API        $api   (Northwind, with Taskboard live ready in Sandbox)
+
+Choose Taskboard live when connecting; Taskboard is the static reference fixture.
 
 Start the Console against it, in another terminal:
 

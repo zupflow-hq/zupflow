@@ -84,6 +84,48 @@ const googleWorkspace: CatalogEntry = {
   ],
 };
 
+/** Static reference fixture; live Taskboard journeys use MCP OAuth on a separate app. */
+const taskboard: CatalogEntry = {
+  slug: "taskboard",
+  name: "Taskboard",
+  description: "Tasks on the connected board, for development and testing.",
+  icon: { glyph: "T", color: "#0E7490" },
+  mcp_server_url: "https://taskboard.example/mcp",
+  // Configured OAuth keeps the incomplete-Production fixture meaningful.
+  auth: {
+    type: "oauth2",
+    authorize_url: "https://taskboard.example/authorize",
+    token_url: "https://taskboard.example/token",
+    issuer: "https://taskboard.example",
+    pkce: true,
+    identity_url: "https://taskboard.example/me",
+    available_scopes: [
+      { name: "tasks:read", description: "See the tasks on your board" },
+      { name: "tasks:write", description: "Create and delete tasks on your board" },
+    ],
+  },
+  tools: [
+    {
+      name: "list_tasks",
+      title: "List tasks",
+      description: "Lists the tasks on the board, oldest first. Optionally only open or done ones.",
+      effect: "read",
+    },
+    {
+      name: "create_task",
+      title: "Create a task",
+      description: "Adds an open task to the board.",
+      effect: "write",
+    },
+    {
+      name: "delete_task",
+      title: "Delete a task",
+      description: "Deletes a task from the board for good.",
+      effect: "destructive",
+    },
+  ],
+};
+
 const linear: CatalogEntry = {
   slug: "linear",
   name: "Linear",
@@ -341,6 +383,7 @@ const echoServer: CatalogEntry = {
 
 export const CATALOG = {
   googleWorkspace,
+  taskboard,
   linear,
   notion,
   stripe,
@@ -411,6 +454,18 @@ export function sampleToolCall(tool: string, input: string): Sample {
         arguments: { customer: "cus_Q…" },
         result: { id: "cus_Q…", subscriptions: 2, delinquent: false },
       };
+    case "list_tasks":
+      return {
+        arguments: { status: "open" },
+        result: { tasks: [{ id: "TB-1", title: "Onboarding checklist polish", notes: null, status: "open" }] },
+      };
+    case "create_task":
+      return {
+        arguments: { title: topic },
+        result: { task: { id: "TB-2", title: topic, notes: null, status: "open" } },
+      };
+    case "delete_task":
+      return { arguments: { id: "TB-1" }, result: { deleted: "TB-1" } };
     case "search_issues":
       return {
         arguments: { query: topic, state: "started" },

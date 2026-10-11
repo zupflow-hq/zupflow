@@ -3088,8 +3088,13 @@ describe("installation tools", () => {
     );
     const tools = await allTools(sandbox.id, installation.id);
     const statuses = Object.fromEntries(tools.map((t) => [t.name, t.status]));
-    expect(statuses).toMatchObject({ create_issue: "changed", export_roadmap: "gone", search_issues: "current" });
-    const changed = must(tools.find((t) => t.name === "create_issue"));
+    expect(statuses).toEqual({
+      create_task: "changed",
+      delete_task: "changed",
+      export_tasks: "gone",
+      list_tasks: "current",
+    });
+    const changed = must(tools.find((t) => t.name === "create_task"));
     expect(changed.latest?.description).not.toBe(changed.pinned.description);
     // Refreshing lists what the app says now: the change stays unreviewed, the gone tool stays gone.
     await owner.installations.refreshTools(sandbox.id, installation.id);
@@ -3165,15 +3170,16 @@ describe("installation tools", () => {
   it("shows everything a definition hashes: its schemas and hints", async () => {
     const sandbox = ws("acme-sandbox");
     const installation = must(db().installations.find((i) => i.workspace_id === sandbox.id && i.label === "Product"));
-    const comment = must((await allTools(sandbox.id, installation.id)).find((t) => t.name === "add_comment"));
-    expect(comment.status).toBe("changed");
-    expect([comment.pinned.description, comment.pinned.input_schema]).toEqual([
-      comment.latest?.description,
-      comment.latest?.input_schema,
+    const deletion = must((await allTools(sandbox.id, installation.id)).find((t) => t.name === "delete_task"));
+    expect(deletion.status).toBe("changed");
+    expect(deletion.effect).toBe("destructive");
+    expect([deletion.pinned.description, deletion.pinned.input_schema]).toEqual([
+      deletion.latest?.description,
+      deletion.latest?.input_schema,
     ]);
-    expect(comment.pinned.annotations).toEqual({ readOnlyHint: false });
-    expect(comment.latest?.annotations).toEqual({ readOnlyHint: false, destructiveHint: false });
-    expect(comment.latest?.output_schema).toBeNull();
+    expect(deletion.pinned.annotations).toEqual({ readOnlyHint: false });
+    expect(deletion.latest?.annotations).toEqual({ readOnlyHint: false, destructiveHint: true });
+    expect(deletion.latest?.output_schema).toBeNull();
   });
 
   it("refuses a second refresh of one installation within a minute, and keeps the pacing to it", async () => {
@@ -3227,10 +3233,10 @@ describe("installation tools", () => {
 describe("tool policy", () => {
   const northwind = () => must(northwindId());
   const larkspur = () => must(db().organizations.find((o) => o.slug === "larkspur")?.id);
-  const sandboxLinear = () =>
+  const sandboxTaskboard = () =>
     must(
       db().installations.find(
-        (i) => i.workspace_id === ws("acme-sandbox").id && i.app_id === app("linear").id && i.status === "connected",
+        (i) => i.workspace_id === ws("acme-sandbox").id && i.app_id === app("taskboard").id && i.status === "connected",
       ),
     );
   const probe = async (workspaceId: WorkspaceId) =>
@@ -3242,26 +3248,31 @@ describe("tool policy", () => {
     });
 
   it("suggests a level for each tool a catalog app's installation lists first, and never changes one", async () => {
-    const linear = app("linear");
+    const taskboard = app("taskboard");
     const sandbox = ws("acme-sandbox");
-    linear.tools.push(
-      { name: "list_cycles", title: "List cycles", description: "List a team's cycles.", effect: "read" },
-      { name: "delete_issue", title: "Delete issue", description: "Delete an issue.", effect: "destructive" },
+    taskboard.tools.push(
+      { name: "list_boards", title: "List boards", description: "List the available boards.", effect: "read" },
+      {
+        name: "clear_board",
+        title: "Clear board",
+        description: "Delete every task from a board.",
+        effect: "destructive",
+      },
     );
-    // A person already set create_issue; the listing describes it as destructive now.
-    const createIssue = must(linear.tools.find((t) => t.name === "create_issue"));
-    createIssue.effect = "destructive";
-    await owner.installations.refreshTools(sandbox.id, sandboxLinear().id);
-    const levels = (await owner.toolPolicy.levels(northwind(), linear.id, { limit: 100 })).items;
+    // A person already set create_task; the listing describes it as destructive now.
+    const createTask = must(taskboard.tools.find((t) => t.name === "create_task"));
+    createTask.effect = "destructive";
+    await owner.installations.refreshTools(sandbox.id, sandboxTaskboard().id);
+    const levels = (await owner.toolPolicy.levels(northwind(), taskboard.id, { limit: 100 })).items;
     const of = (tool: string) => {
       const level = must(levels.find((l) => l.tool === tool));
       return [level.level, level.confirmed, level.destructive, level.updated_by];
     };
-    expect(of("list_cycles")).toEqual(["allow", false, false, null]);
-    expect(of("delete_issue")).toEqual(["approve", false, true, null]);
-    expect(of("create_issue").slice(0, 2)).toEqual(["allow", true]);
-    // Larkspur's levels for its own Linear are its own.
-    expect(db().app_tool_levels.some((l) => l.organization_id === larkspur() && l.tool === "list_cycles")).toBe(false);
+    expect(of("list_boards")).toEqual(["allow", false, false, null]);
+    expect(of("clear_board")).toEqual(["approve", false, true, null]);
+    expect(of("create_task").slice(0, 2)).toEqual(["allow", true]);
+    // Larkspur's levels for its own Taskboard are its own.
+    expect(db().app_tool_levels.some((l) => l.organization_id === larkspur() && l.tool === "list_boards")).toBe(false);
   });
 
   it("suggests no level for a workspace app's tools", async () => {
@@ -3293,12 +3304,12 @@ describe("tool policy", () => {
   });
 
   it("ignores a level labelled with another organization, in reads and grants", async () => {
-    const linear = app("linear");
+    const taskboard = app("taskboard");
     // Larkspur's label on Northwind's app: it must decide nothing for Northwind.
     db().app_tool_levels.push({
       organization_id: larkspur(),
-      app_id: linear.id,
-      tool: "search_issues",
+      app_id: taskboard.id,
+      tool: "list_tasks",
       level: "deny",
       confirmed: true,
       destructive: false,
@@ -3312,22 +3323,22 @@ describe("tool policy", () => {
       updated_at: new Date().toISOString(),
       updated_by_user_id: null,
     });
-    const levels = (await owner.toolPolicy.levels(northwind(), linear.id, { limit: 100 })).items;
-    expect(levels.filter((l) => l.tool === "search_issues").map((l) => l.level)).toEqual(["allow"]);
+    const levels = (await owner.toolPolicy.levels(northwind(), taskboard.id, { limit: 100 })).items;
+    expect(levels.filter((l) => l.tool === "list_tasks").map((l) => l.level)).toEqual(["allow"]);
     expect((await owner.toolPolicy.get(northwind())).new_tool_level).toBe("approve");
     const sandbox = ws("acme-sandbox");
     const agent = await probe(sandbox.id);
     const grant = await owner.grants.create(sandbox.id, agent.id, {
-      installation_id: sandboxLinear().id,
-      tools: ["search_issues"],
+      installation_id: sandboxTaskboard().id,
+      tools: ["list_tasks"],
       approval_required: [],
     });
-    expect(grant.tools).toEqual(["search_issues"]);
+    expect(grant.tools).toEqual(["list_tasks"]);
   });
 
   it("accepts a change only of a tool in the installation's own scope", async () => {
     const sandbox = ws("acme-sandbox");
-    const installation = sandboxLinear();
+    const installation = sandboxTaskboard();
     const changed = must(
       db().installation_tools.find((t) => t.installation_id === installation.id && t.latest !== null),
     );
@@ -3346,8 +3357,8 @@ describe("tool policy", () => {
 
   it("records who changed the policy and the levels in the audit log", async () => {
     await owner.toolPolicy.update(northwind(), { mode: "manual", new_tool_level: "deny" });
-    await owner.toolPolicy.setLevels(northwind(), app("linear").id, {
-      levels: [{ tool: "add_comment", level: "approve" }],
+    await owner.toolPolicy.setLevels(northwind(), app("taskboard").id, {
+      levels: [{ tool: "delete_task", level: "approve" }],
     });
     const actions = db()
       .audit.filter((e) => e.organization_id === northwind())

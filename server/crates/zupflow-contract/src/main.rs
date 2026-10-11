@@ -52,7 +52,7 @@ use zupflow_basic::configured_models::ConfiguredModels;
 use zupflow_basic::local_keys::LocalKeyService;
 use zupflow_core::agents::{Agent, AgentStore, Grant, GrantTools, NewAgent};
 use zupflow_core::api_keys::{ApiKey, ApiKeyHasher, ApiKeyStore, NewApiKey, NewSecret};
-use zupflow_core::apps::{App, AppStore, Configuration};
+use zupflow_core::apps::{App, AppStore, Configuration, ToolEffect};
 use zupflow_core::audit::{AuditAction, AuditActor, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::connect::{ConnectIntent, ConnectSettings, ConnectStore, NewConnectSession, Reference};
 use zupflow_core::environment::Environment;
@@ -536,19 +536,19 @@ async fn reset(path: &str) -> Result<(), String> {
         ),
         (
             northwind.id,
-            fixture_apps::linear()?,
-            Some(ready("https://mcp.linear.example/mcp", true)),
+            fixture_apps::taskboard()?,
+            Some(ready("https://taskboard.example/mcp", true)),
             // Incomplete in Production: a server, no client.
             Some(fixture_apps::Ready {
-                mcp_server_url: "https://mcp.linear.example/mcp".to_owned(),
+                mcp_server_url: "https://taskboard.example/mcp".to_owned(),
                 oauth: false,
             }),
         ),
         (northwind.id, fixture_apps::notion()?, None, None),
         (
             larkspur.id,
-            fixture_apps::linear()?,
-            Some(ready("https://mcp.linear.example/mcp", true)),
+            fixture_apps::taskboard()?,
+            Some(ready("https://taskboard.example/mcp", true)),
             None,
         ),
     ] {
@@ -648,9 +648,9 @@ async fn reset(path: &str) -> Result<(), String> {
     for (organization, workspace, slug, label) in [
         (northwind.id, "acme", "google-workspace", "Marketing"),
         (northwind.id, "beta-labs", "google-workspace", "Google"),
-        (northwind.id, "acme-sandbox", "linear", "Engineering"),
+        (northwind.id, "acme-sandbox", "taskboard", "Engineering"),
         (northwind.id, "qa-playground", "echo-server", "Echo"),
-        (larkspur.id, "harbor", "linear", "Harbor"),
+        (larkspur.id, "harbor", "taskboard", "Harbor"),
     ] {
         let (workspace, environment) = workspace_id(workspace)?;
         let app = seeded
@@ -695,15 +695,7 @@ async fn reset(path: &str) -> Result<(), String> {
         let listing: Vec<ListedTool> = found
             .tools
             .iter()
-            .map(|tool| ListedTool {
-                effect: tool.effect,
-                ..fixture_tool(
-                    &tool.name,
-                    &tool.title,
-                    &tool.description,
-                    tool.effect == zupflow_core::apps::ToolEffect::Read,
-                )
-            })
+            .map(|tool| fixture_tool(&tool.name, &tool.title, &tool.description, tool.effect))
             .collect();
         tools
             .record_listing(organization, workspace, installation_id, &listing, Timestamp::now())
@@ -712,50 +704,57 @@ async fn reset(path: &str) -> Result<(), String> {
         suggest(organization, app, &listing).await?;
     }
 
-    // The Sandbox's installation's tools, as two later listings left them:
-    // (each listing suggests levels too, as discovery does)
-    // one tool as first listed, one changed since, one gone.
+    // The Sandbox's Taskboard history matches the mock: one current tool,
+    // a description change, a hints-only change, and a synthetic gone tool.
+    // Each listing suggests levels too, as discovery does.
     let (organization, workspace, installation_id, _) = installed
         .iter()
         .find(|(_, _, _, label)| *label == "Engineering")
         .copied()
         .ok_or("installation Engineering")?;
+    let current: Vec<ListedTool> = fixture_apps::taskboard()?
+        .tools
+        .iter()
+        .map(|tool| fixture_tool(&tool.name, &tool.title, &tool.description, tool.effect))
+        .collect();
+    let mut older = current.clone();
+    for tool in &mut older {
+        let mut definition: Value =
+            serde_json::from_str(&tool.revision.definition).map_err(|error| error.to_string())?;
+        match tool.name.as_str() {
+            "create_task" => definition["description"] = json!("Adds a task."),
+            "delete_task" => definition["annotations"] = json!({ "readOnlyHint": false }),
+            _ => continue,
+        }
+        tool.revision = fixture_revision(&definition);
+    }
+    // A synthetic historical tombstone exercises absence; Taskboard serves no export_tasks tool.
+    older.push(fixture_tool(
+        "export_tasks",
+        "Export tasks",
+        "Download the board's tasks as a CSV file.",
+        ToolEffect::Read,
+    ));
+    let taskboard = seeded
+        .iter()
+        .find(|(owner, seeded, _)| *owner == organization && *seeded == "taskboard")
+        .map(|(_, _, app)| *app)
+        .ok_or("app taskboard")?;
     for (listing, at) in [
-        (
-            vec![
-                fixture_tool("search_issues", "Search issues", "Find issues by text.", true),
-                fixture_tool("create_issue", "Create an issue", "Open an issue in a team.", false),
-                fixture_tool("archive_issue", "Archive an issue", "Archive one issue.", false),
-            ],
-            Timestamp::from_millis(Timestamp::now().millis() - 86_400_000),
-        ),
-        (
-            vec![
-                fixture_tool("search_issues", "Search issues", "Find issues by text.", true),
-                fixture_tool(
-                    "create_issue",
-                    "Create an issue",
-                    "Open an issue in a team, assigned to anyone.",
-                    false,
-                ),
-            ],
-            Timestamp::now(),
-        ),
+        (older, Timestamp::from_millis(Timestamp::now().millis() - 86_400_000)),
+        (current, Timestamp::now()),
     ] {
         tools
             .record_listing(organization, workspace, installation_id, &listing, at)
             .await
             .map_err(|error| fail("tools")(&error))?;
-        let linear = seeded
-            .iter()
-            .find(|(owner, seeded, _)| *owner == organization && *seeded == "linear")
-            .map(|(_, _, app)| *app)
-            .ok_or("app linear")?;
-        suggest(organization, linear, &listing).await?;
+        suggest(organization, taskboard, &listing).await?;
     }
 
     // The organizations' confirmed levels, as people set them: every tool
     // `acme`'s grants hold stays inside them; `list_events` stays suggested.
+    // Taskboard's confirmed levels exercise policy independently of hints;
+    // no seeded grant includes its destructive delete_task tool.
     for (organization, slug, writer, levels) in [
         (
             northwind.id,
@@ -771,19 +770,19 @@ async fn reset(path: &str) -> Result<(), String> {
         ),
         (
             northwind.id,
-            "linear",
+            "taskboard",
             owner.id,
             &[
-                ("search_issues", ToolLevel::Allow),
-                ("create_issue", ToolLevel::Allow),
-                ("add_comment", ToolLevel::Allow),
+                ("list_tasks", ToolLevel::Allow),
+                ("create_task", ToolLevel::Allow),
+                ("delete_task", ToolLevel::Allow),
             ],
         ),
         (
             larkspur.id,
-            "linear",
+            "taskboard",
             outsider.id,
-            &[("search_issues", ToolLevel::Allow), ("create_issue", ToolLevel::Allow)],
+            &[("list_tasks", ToolLevel::Allow), ("create_task", ToolLevel::Allow)],
         ),
     ] {
         let Some(InstalledApp::Catalog(app)) = seeded
@@ -847,7 +846,7 @@ async fn reset(path: &str) -> Result<(), String> {
             "Engineering",
             "Product scribe",
             "model-balanced",
-            &["search_issues", "create_issue"],
+            &["list_tasks", "create_task"],
             &[],
         ),
         (
@@ -857,7 +856,7 @@ async fn reset(path: &str) -> Result<(), String> {
             &["echo", "echo_write"],
             &["echo_write"],
         ),
-        ("Harbor", "Harbor assistant", "model-balanced", &["search_issues"], &[]),
+        ("Harbor", "Harbor assistant", "model-balanced", &["list_tasks"], &[]),
     ] {
         let (organization, workspace, installation_id, _) = installation_of(label)?;
         let agent = agents
@@ -984,9 +983,9 @@ async fn reset(path: &str) -> Result<(), String> {
         ("Marketing", "search_files", false),
         ("Google", "search_files", false),
         ("Google", "send_email", true),
-        ("Engineering", "search_issues", false),
+        ("Engineering", "list_tasks", false),
         ("Echo", "echo", false),
-        ("Harbor", "search_issues", false),
+        ("Harbor", "list_tasks", false),
     ] {
         let (_, organization, workspace, installation_id, agent_id, model) = seeded_agents
             .iter()
@@ -1051,7 +1050,7 @@ async fn reset(path: &str) -> Result<(), String> {
     for (organization, workspace, slug) in [
         (northwind.id, "acme", "google-workspace"),
         (northwind.id, "beta-labs", "google-workspace"),
-        (larkspur.id, "harbor", "linear"),
+        (larkspur.id, "harbor", "taskboard"),
     ] {
         let (workspace, environment) = workspace_id(workspace)?;
         let app = seeded
@@ -1206,25 +1205,28 @@ fn by_fixture(action: AuditAction, target: AuditTarget, place: AuditPlace) -> Au
 }
 
 /// A tool as the MCP client records it: canonical JSON and its SHA-256.
-fn fixture_tool(name: &str, title: &str, description: &str, read_only: bool) -> ListedTool {
+fn fixture_tool(name: &str, title: &str, description: &str, effect: ToolEffect) -> ListedTool {
     let definition: Value = json!({
         "name": name,
         "title": title,
         "description": description,
         "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } } },
-        "annotations": { "readOnlyHint": read_only, "destructiveHint": false },
+        "annotations": {
+            "readOnlyHint": effect == ToolEffect::Read,
+            "destructiveHint": effect == ToolEffect::Destructive,
+        },
     });
-    let definition = zupflow_mcp::canonical(&definition);
-    let hash = Sha256::digest(definition.as_bytes()).into();
     ListedTool {
         name: name.to_owned(),
-        revision: ToolRevision { definition, hash },
-        effect: if read_only {
-            zupflow_core::apps::ToolEffect::Read
-        } else {
-            zupflow_core::apps::ToolEffect::Write
-        },
+        revision: fixture_revision(&definition),
+        effect,
     }
+}
+
+fn fixture_revision(definition: &Value) -> ToolRevision {
+    let definition = zupflow_mcp::canonical(definition);
+    let hash = Sha256::digest(definition.as_bytes()).into();
+    ToolRevision { definition, hash }
 }
 
 /// Moves only this pending fixture session's deadline into the past. The

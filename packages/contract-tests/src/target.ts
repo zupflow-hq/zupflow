@@ -60,9 +60,13 @@ export interface Target {
  *   `acme` and `beta-labs` in Production, `acme-sandbox` and `qa-playground` in
  *   Sandbox. Pending rows have a next retry; terminal rows do not. No worker
  *   advances these fixture deliveries while the suite runs.
- * - Catalog apps `google-workspace` (OAuth, ready in Sandbox), `linear`
- *   (ready in Sandbox, incomplete in Production) and `notion` (configured in
- *   neither environment).
+ * - Catalog apps `google-workspace` (OAuth, ready in Sandbox), `taskboard`
+ *   (configured OAuth, ready in Sandbox, incomplete in Production) and `notion`
+ *   (configured in neither environment). The static Taskboard URLs use
+ *   `https://taskboard.example`; live MCP OAuth journeys create `taskboard-live`.
+ * - `acme-sandbox`'s Taskboard registry has `list_tasks` current,
+ *   `create_task` with changed text, and `delete_task` with changed hints.
+ *   Synthetic historical `export_tasks` is gone; it is not a tool Taskboard serves.
  * - A workspace app `echo-server` owned by `qa-playground`, with token auth
  *   through one input named `token`. Its provider accepts any token and
  *   rejects one containing `invalid`. Its tools include `echo`, which needs
@@ -73,10 +77,11 @@ export interface Target {
  *   and levels for its catalog apps' tools: in `google-workspace`, confirmed
  *   `allow` for `search_files`, `read_document` and `create_document`,
  *   `approve` for `send_email` and `deny` for `delete_file`, and
- *   `list_events` only suggested (`allow`, unconfirmed); in `linear`,
- *   confirmed `allow` for `search_issues`, `create_issue` and, where listed,
- *   `add_comment`. `acme`'s grants hold inside them (a grant elsewhere may
- *   not: tightening a level rewrites no grant), and `acme` has an installation
+ *   `list_events` only suggested (`allow`, unconfirmed); in `taskboard`,
+ *   confirmed `allow` for `list_tasks`, `create_task` and, in Northwind,
+ *   `delete_task`. No seeded grant includes `delete_task`; live journeys separately
+ *   prove rejection of denied destructive calls. `acme`'s grants hold inside them
+ *   (a grant elsewhere may not: tightening a level rewrites no grant), and `acme` has an installation
  *   of `google-workspace` that lists all six of its tools.
  * - Runs in Sandbox as well as Production, at least one of them in
  *   `acme-sandbox`. At reset no run is queued or running; each is finished
@@ -88,7 +93,7 @@ export interface Target {
  * Organization `larkspur`, owned by the outsider, with workspaces `harbor`
  * (Production) and `harbor-sandbox` (Sandbox). In `harbor`: an agent with a
  * grant and a finished run, an installation, a Connect session and a workspace
- * app of its own; in the organization: a catalog app `linear`, ready in Sandbox,
+ * app of its own; in the organization: a catalog app `taskboard`, ready in Sandbox,
  * an API key, a webhook endpoint and Sandbox Connect settings that do not
  * allow Northwind's return URL, and an invitation for the viewer, sent more
  * than `INVITATION_TTL_DAYS` ago: expired. Each organization's real IDs are

@@ -8,7 +8,7 @@ export interface Fixture {
   otherOrganization: OrganizationId;
   workspaces: { acme: Workspace; acmeSandbox: Workspace; qaPlayground: Workspace };
   /** Throws, when read, whatever kept the apps from loading (a server that doesn't serve apps yet). */
-  apps: { googleWorkspace: AppId; linear: AppId; notion: AppId; echoServer: AppId };
+  apps: { googleWorkspace: AppId; taskboard: AppId; notion: AppId; echoServer: AppId };
 }
 
 export function must<T>(value: T | null | undefined, what: string): T {
@@ -61,7 +61,7 @@ export async function loadFixture(
       ).id;
     return {
       googleWorkspace: app(catalog, "google-workspace"),
-      linear: app(catalog, "linear"),
+      taskboard: app(catalog, "taskboard"),
       notion: app(catalog, "notion"),
       echoServer: app(own, "echo-server"),
     };

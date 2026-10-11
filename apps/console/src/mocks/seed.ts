@@ -39,7 +39,7 @@ import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 import { appIn, timelineOf } from "./scope";
 import { listedFrom, recordListing } from "./tools";
 
-export const DB_SCHEMA = 21;
+export const DB_SCHEMA = 22;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -205,9 +205,9 @@ export function seed(nowMs: number = Date.now()): Db {
   configure(google, "sandbox", "ready", null, jordan, 38 * DAY);
   configure(google, "production", "ready", null, jordan, 35 * DAY);
 
-  const linear = addApp(CATALOG.linear, null, 30 * DAY);
-  configure(linear, "sandbox", "ready", null, priya, 29 * DAY);
-  configure(linear, "production", "incomplete", null, priya, 6 * DAY);
+  const taskboard = addApp(CATALOG.taskboard, null, 30 * DAY);
+  configure(taskboard, "sandbox", "ready", null, priya, 29 * DAY);
+  configure(taskboard, "production", "incomplete", null, priya, 6 * DAY);
 
   const stripe = addApp(CATALOG.stripe, null, 26 * DAY);
   configure(stripe, "sandbox", "ready", null, priya, 26 * DAY);
@@ -306,9 +306,9 @@ export function seed(nowMs: number = Date.now()): Db {
     { name: "Acme Test", email: "test-marketing@acme.example" },
     35 * DAY,
   );
-  const sandboxLinear = install(
+  const sandboxTaskboard = install(
     acmeSandbox,
-    linear,
+    taskboard,
     "Product",
     { name: "Acme Product (test)", email: "pm-test@acme.example" },
     28 * DAY,
@@ -435,12 +435,12 @@ export function seed(nowMs: number = Date.now()): Db {
   const sandboxPm = agent(
     acmeSandbox,
     "Product scribe",
-    "Turns meeting notes into Linear issues.",
-    "Turn notes into well-scoped Linear issues. Ask before creating more than three.",
+    "Turns meeting notes into Taskboard tasks.",
+    "Turn notes into well-scoped Taskboard tasks. Ask before creating more than three.",
     "claude-sonnet-5-5",
     27 * DAY,
   );
-  grant(sandboxPm, sandboxLinear, ["search_issues", "create_issue"]);
+  grant(sandboxPm, sandboxTaskboard, ["list_tasks", "create_task"]);
 
   const echoBot = agent(
     qa,
@@ -607,7 +607,7 @@ export function seed(nowMs: number = Date.now()): Db {
     { ws: acme, installation: acmeMarketing, app: google },
     { ws: acme, installation: acmeEng, app: github },
     { ws: beta, installation: betaGoogle, app: google },
-    { ws: acmeSandbox, installation: sandboxLinear, app: linear },
+    { ws: acmeSandbox, installation: sandboxTaskboard, app: taskboard },
   ]);
   db.connect_sessions.push({
     id: id("connect_session", nowMs - 5 * HOUR),
@@ -637,7 +637,7 @@ export function seed(nowMs: number = Date.now()): Db {
     { acme, beta, acmeSandbox, qa },
     {
       google,
-      linear,
+      taskboard,
       stripe,
       notion,
       publishing,
@@ -648,8 +648,8 @@ export function seed(nowMs: number = Date.now()): Db {
 
   seedLarkspur(db, nowMs);
   seedFernhill(db, nowMs);
-  seedTools(db, nowMs, sandboxLinear);
-  seedLevels(db, nowMs, { google, linear, stripe, github }, jordan.id);
+  seedTools(db, nowMs, sandboxTaskboard);
+  seedLevels(db, nowMs, { google, taskboard, stripe, github }, jordan.id);
   seedWebhookHistory(db, nowMs);
   // Seeded runs record their approvals as they're decided: newest first, like the log.
   db.audit.sort((a, b) => b.created_at.localeCompare(a.created_at));
@@ -746,14 +746,14 @@ function seedWebhookHistory(db: Db, nowMs: number) {
  * The organizations' levels for their catalog apps' tools: suggested for
  * every tool an installation listed, then set by a person for most of
  * Northwind's, so the grants seeded above hold inside them. `list_events`,
- * Notion's tools and the gone `export_roadmap` stay suggested only, and
+ * Notion's tools and the gone `export_tasks` stay suggested only, and
  * Google Workspace's `delete_file` is denied: the Sandbox grant that still
  * holds it shows that tightening a level doesn't rewrite a grant.
  */
 function seedLevels(
   db: Db,
   nowMs: number,
-  apps: { google: AppRow; linear: AppRow; stripe: AppRow; github: AppRow },
+  apps: { google: AppRow; taskboard: AppRow; stripe: AppRow; github: AppRow },
   confirmedBy: UserId,
 ) {
   for (const tool of db.installation_tools) {
@@ -778,22 +778,23 @@ function seedLevels(
     send_email: "approve",
     delete_file: "deny",
   });
-  confirm(apps.linear, { search_issues: "allow", create_issue: "allow", add_comment: "allow" });
+  // These confirmed levels exercise policy independently of hints; delete_task is never seeded in a grant.
+  confirm(apps.taskboard, { list_tasks: "allow", create_task: "allow", delete_task: "allow" });
   confirm(apps.stripe, { list_invoices: "allow", get_customer: "allow", refund_payment: "approve" });
   confirm(apps.github, { search_code: "allow", list_pull_requests: "allow", create_issue: "approve" });
 
   // Larkspur holds its grant inside its levels too.
   const larkspur = db.organizations.find((o) => o.slug === "larkspur");
   const owner = db.memberships.find((m) => m.organization_id === larkspur?.id && m.role === "owner");
-  const larkspurLinear = db.apps.find((a) => a.organization_id === larkspur?.id && a.slug === "linear");
-  if (!owner || !larkspurLinear) throw new Error("Larkspur's seed is missing");
+  const larkspurTaskboard = db.apps.find((a) => a.organization_id === larkspur?.id && a.slug === "taskboard");
+  if (!owner || !larkspurTaskboard) throw new Error("Larkspur's seed is missing");
   setLevels(
     db,
-    larkspurLinear.organization_id,
-    larkspurLinear.id,
+    larkspurTaskboard.organization_id,
+    larkspurTaskboard.id,
     [
-      { tool: "search_issues", level: "allow" },
-      { tool: "create_issue", level: "allow" },
+      { tool: "list_tasks", level: "allow" },
+      { tool: "create_task", level: "allow" },
     ],
     owner.user_id,
     at,
@@ -824,20 +825,21 @@ function seedTools(db: Db, nowMs: number, reviewed: InstallationRow) {
     if (!installation.connection || !app) continue;
     const listed = app.tools.map(listedFrom);
     if (installation === reviewed) {
-      // `create_issue` said less then; `add_comment` changed only its hints since.
+      // `create_task` said less then; `delete_task` changed only its hints since.
       const older = listed.map((tool) =>
-        tool.name === "create_issue"
-          ? { ...tool, text: { ...tool.text, description: "Open an issue." } }
-          : tool.name === "add_comment"
+        tool.name === "create_task"
+          ? { ...tool, text: { ...tool.text, description: "Adds a task." } }
+          : tool.name === "delete_task"
             ? { ...tool, text: { ...tool.text, annotations: { readOnlyHint: false } } }
             : tool,
       );
+      // Synthetic historical tombstone for the gone-tool scenario, not a tool Taskboard serves.
       older.push({
-        name: "export_roadmap",
+        name: "export_tasks",
         effect: "read",
         text: {
-          title: "Export roadmap",
-          description: "Download a team's roadmap as a CSV file.",
+          title: "Export tasks",
+          description: "Download the board's tasks as a CSV file.",
           input_schema: { type: "object" },
           output_schema: null,
           annotations: { readOnlyHint: true },
@@ -981,7 +983,7 @@ function seedLarkspur(db: Db, nowMs: number) {
   };
   db.workspaces.push(harbor, harborSandbox);
 
-  const entry = CATALOG.linear;
+  const entry = CATALOG.taskboard;
   const app: AppRow = {
     id: id("app", 18 * DAY),
     organization_id: org.id,
@@ -1053,9 +1055,9 @@ function seedLarkspur(db: Db, nowMs: number) {
     organization_id: org.id,
     workspace_id: harbor.id,
     name: "Triage assistant",
-    description: "Files and tidies issues.",
+    description: "Creates and summarizes board tasks.",
     model: "claude-sonnet-5-5",
-    instructions: "Keep issues short and labelled.",
+    instructions: "Keep task titles short and notes clear.",
     status: "active",
     created_at: ago(16 * DAY),
     updated_at: ago(16 * DAY),
@@ -1163,7 +1165,7 @@ function seedLarkspur(db: Db, nowMs: number) {
   });
 
   seedRuns(db, rng, nowMs, [
-    { agent, count: 3, prompts: ["File the bug from this morning's standup", "Close duplicates in the triage queue"] },
+    { agent, count: 3, prompts: ["Create a task from this morning's standup", "List the open tasks on the board"] },
   ]);
 }
 
@@ -1314,9 +1316,9 @@ const OPS_PROMPTS = [
   "Summarize the hiring plan doc",
 ];
 const PM_PROMPTS = [
-  "Turn these meeting notes into issues",
-  "Create an issue for the onboarding copy changes",
-  "What's in progress for the PRD team?",
+  "Turn these meeting notes into tasks",
+  "Create a task for the onboarding copy changes",
+  "What's open on the board?",
 ];
 
 interface RunSeed {
@@ -1448,7 +1450,7 @@ function seedAudit(
   ws: { acme: WorkspaceRow; beta: WorkspaceRow; acmeSandbox: WorkspaceRow; qa: WorkspaceRow },
   refs: {
     google: AppRow;
-    linear: AppRow;
+    taskboard: AppRow;
     stripe: AppRow;
     notion: AppRow;
     publishing: AppRow;
@@ -1499,7 +1501,7 @@ function seedAudit(
     null,
     "production",
   );
-  add(30 * DAY, user(people.priya), "app.created", app(refs.linear));
+  add(30 * DAY, user(people.priya), "app.created", app(refs.taskboard));
   add(27 * DAY, user(people.priya), "workspace.created", wsT(ws.beta), ws.beta);
   add(26 * DAY, user(people.priya), "app.created", app(refs.stripe));
   add(22 * DAY, user(people.sam), "app.created", app(refs.publishing), ws.acme);
@@ -1512,7 +1514,7 @@ function seedAudit(
     "production",
   );
   add(12 * DAY, user(people.sam), "workspace.created", wsT(ws.qa), ws.qa);
-  add(6 * DAY, user(people.priya), "app_configuration.updated", app(refs.linear), null, "production");
+  add(6 * DAY, user(people.priya), "app_configuration.updated", app(refs.taskboard), null, "production");
   add(
     5 * DAY,
     user(people.jordan),

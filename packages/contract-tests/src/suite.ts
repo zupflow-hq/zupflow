@@ -251,8 +251,8 @@ export function contractSuite(target: Target) {
         await owner.installations.tools(sandbox.id, connected.id);
         await owner.installations.refreshTools(sandbox.id, connected.id);
         const reviewed = must(
-          (await owner.installations.list(sandbox.id)).find((i) => i.app.id === fx.apps.linear),
-          "installation of linear in acme-sandbox",
+          (await owner.installations.list(sandbox.id)).find((i) => i.app.id === fx.apps.taskboard),
+          "installation of taskboard in acme-sandbox",
         );
         const changed = must(
           (await owner.installations.tools(sandbox.id, reviewed.id, { limit: 100 })).items.find(
@@ -789,7 +789,7 @@ export function contractSuite(target: Target) {
 
       it("refuses an unknown environment filter on an app's installations", async () => {
         const error = await failure(
-          owner.organizationApps.installations(fx.organization, fx.apps.linear, {
+          owner.organizationApps.installations(fx.organization, fx.apps.taskboard, {
             // @ts-expect-error: the contract only accepts sandbox or production
             environment: "staging",
           }),
@@ -811,8 +811,8 @@ export function contractSuite(target: Target) {
       it("offers only apps ready in the workspace's own environment, with no fallback", async () => {
         const prod = await owner.workspaceApps.available(fx.workspaces.acme.id);
         const sandbox = await owner.workspaceApps.available(fx.workspaces.acmeSandbox.id);
-        expect(prod.some((a) => a.app.id === fx.apps.linear)).toBe(false);
-        expect(sandbox.some((a) => a.app.id === fx.apps.linear)).toBe(true);
+        expect(prod.some((a) => a.app.id === fx.apps.taskboard)).toBe(false);
+        expect(sandbox.some((a) => a.app.id === fx.apps.taskboard)).toBe(true);
 
         const error = await failure(
           owner.connectSessions.create(fx.workspaces.acmeSandbox.id, {
@@ -1522,13 +1522,13 @@ export function contractSuite(target: Target) {
           "Northwind Sandbox return URL",
         );
         const harborSandbox = (await larkspur()).sandbox.id;
-        const linear = must(
-          (await r.organizationApps.list(other)).find((a) => a.slug === "linear"),
-          "Larkspur's linear app",
+        const taskboard = must(
+          (await r.organizationApps.list(other)).find((a) => a.slug === "taskboard"),
+          "Larkspur's taskboard app",
         );
         const refused = await failure(
           r.connectSessions.create(harborSandbox, {
-            app_id: linear.id,
+            app_id: taskboard.id,
             intent: "create",
             label: "x",
             installation_id: null,
@@ -1662,9 +1662,9 @@ export function contractSuite(target: Target) {
         const sandbox = fx.workspaces.acmeSandbox.id;
         const installation = must(
           (await owner.installations.list(sandbox)).find(
-            (i) => i.status === "connected" && i.app.id === fx.apps.linear,
+            (i) => i.status === "connected" && i.app.id === fx.apps.taskboard,
           ),
-          "connected installation of linear in acme-sandbox",
+          "connected installation of taskboard in acme-sandbox",
         );
         const tools = (await owner.installations.tools(sandbox, installation.id, { limit: 100 })).items;
         const current = must(
@@ -1747,14 +1747,14 @@ export function contractSuite(target: Target) {
 
       it("takes an agent's grants with the agent, and an installation's with the installation", async () => {
         const sandbox = fx.workspaces.acmeSandbox.id;
-        const linear = must(
+        const taskboard = must(
           (await owner.installations.list(sandbox)).find(
-            (i) => i.status === "connected" && i.app.id === fx.apps.linear,
+            (i) => i.status === "connected" && i.app.id === fx.apps.taskboard,
           ),
-          "connected installation of linear in acme-sandbox",
+          "connected installation of taskboard in acme-sandbox",
         );
         const current = must(
-          (await owner.installations.tools(sandbox, linear.id, { limit: 100 })).items.find(
+          (await owner.installations.tools(sandbox, taskboard.id, { limit: 100 })).items.find(
             (t) => t.status === "current",
           ),
           "current tool",
@@ -1767,13 +1767,13 @@ export function contractSuite(target: Target) {
           instructions: "",
         });
         await owner.grants.create(sandbox, agent.id, {
-          installation_id: linear.id,
+          installation_id: taskboard.id,
           tools: [current],
           approval_required: [],
         });
-        expect((await owner.installations.get(sandbox, linear.id)).grant_count).toBe(linear.grant_count + 1);
+        expect((await owner.installations.get(sandbox, taskboard.id)).grant_count).toBe(taskboard.grant_count + 1);
         await owner.agents.delete(sandbox, agent.id);
-        expect((await owner.installations.get(sandbox, linear.id)).grant_count).toBe(linear.grant_count);
+        expect((await owner.installations.get(sandbox, taskboard.id)).grant_count).toBe(taskboard.grant_count);
         const deleted = await failure(owner.grants.list(sandbox, agent.id));
         expect(`${deleted.status} ${deleted.code}`).toBe("404 not_found");
 
@@ -1917,9 +1917,9 @@ export function contractSuite(target: Target) {
       const sandboxInstallation = async () =>
         must(
           (await owner.installations.list(fx.workspaces.acmeSandbox.id)).find(
-            (i) => i.status === "connected" && i.app.id === fx.apps.linear,
+            (i) => i.status === "connected" && i.app.id === fx.apps.taskboard,
           ),
-          "connected installation of linear in acme-sandbox",
+          "connected installation of taskboard in acme-sandbox",
         );
 
       it("lists an installation's tools by name, to every member", async () => {
@@ -1931,6 +1931,12 @@ export function contractSuite(target: Target) {
         expect(page.pagination).toEqual({ next_cursor: null, total: tools.length });
         const names = tools.map((t) => t.name);
         expect(names).toEqual([...names].sort());
+        expect(Object.fromEntries(tools.map((tool) => [tool.name, [tool.status, tool.effect]]))).toEqual({
+          create_task: ["changed", "write"],
+          delete_task: ["changed", "destructive"],
+          export_tasks: ["gone", "read"],
+          list_tasks: ["current", "read"],
+        });
         // What a tool's status says matches what it holds.
         for (const tool of tools) {
           const held = { latest: tool.latest !== null, changed: tool.changed_at !== null, gone: tool.gone_at !== null };
@@ -2216,9 +2222,9 @@ export function contractSuite(target: Target) {
         const sandbox = fx.workspaces.acmeSandbox.id;
         const installation = must(
           (await owner.installations.list(sandbox)).find(
-            (i) => i.status === "connected" && i.app.id === fx.apps.linear,
+            (i) => i.status === "connected" && i.app.id === fx.apps.taskboard,
           ),
-          "connected installation of linear in acme-sandbox",
+          "connected installation of taskboard in acme-sandbox",
         );
         const tools = (await owner.installations.tools(sandbox, installation.id, { limit: 100 })).items;
         const changed = must(
@@ -2518,6 +2524,24 @@ export function contractSuite(target: Target) {
         expect(inB.id).not.toBe(inA.id);
         expect((await owner.agents.list(b)).filter((x) => x.name === "Per workspace")).toHaveLength(1);
         expect((await owner.agents.list(a)).filter((x) => x.name === "Per workspace")).toHaveLength(1);
+        await owner.workspaces.delete(a);
+        expect(await owner.agents.create(b, input, { idempotencyKey: "suite-per-workspace" })).toEqual(inB);
+        expect((await owner.agents.list(b)).filter((x) => x.name === "Per workspace")).toHaveLength(1);
+      });
+
+      it("keeps an organization-scoped saved response after its workspace is deleted", async () => {
+        const input = {
+          name: "Saved workspace",
+          slug: "saved-workspace",
+          environment: "sandbox",
+          external_id: null,
+        } as const;
+        const options = { idempotencyKey: "suite-deleted-workspace" };
+        const created = await owner.workspaces.create(fx.organization, input, options);
+        await owner.workspaces.delete(created.id);
+        expect(await owner.workspaces.create(fx.organization, input, options)).toEqual(created);
+        expect(await failure(owner.workspaces.get(created.id))).toMatchObject({ status: 404, code: "not_found" });
+        expect((await owner.workspaces.list(fx.organization, { q: input.slug })).items).toEqual([]);
       });
 
       it("never shows a Connect authorization twice", async () => {

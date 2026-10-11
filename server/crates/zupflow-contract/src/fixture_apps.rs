@@ -124,28 +124,34 @@ pub fn google_workspace() -> Result<NewApp, String> {
     }))
 }
 
-pub fn linear() -> Result<NewApp, String> {
+/// Static configured-OAuth fixture; live journeys create a separate MCP OAuth app.
+pub fn taskboard() -> Result<NewApp, String> {
     app(json!({
-        "name": "Linear",
-        "slug": "linear",
-        "description": "Issues, projects and cycles in the connected Linear workspace.",
-        "icon": ["L", "#5E6AD2"],
+        "name": "Taskboard",
+        "slug": "taskboard",
+        "description": "Tasks on the connected board, for development and testing.",
+        "icon": ["T", "#0E7490"],
         "auth": {
             "type": "oauth2",
-            "authorize_url": "https://linear.app/oauth/authorize",
-            "token_url": "https://api.linear.app/oauth/token",
+            "authorize_url": "https://taskboard.example/authorize",
+            "token_url": "https://taskboard.example/token",
+            "issuer": "https://taskboard.example",
             "pkce": true,
-            "identity_url": "https://api.linear.app/graphql",
+            "identity_url": "https://taskboard.example/me",
             "available_scopes": [
-                scope("read", "Read issues, projects and teams"),
-                scope("issues:create", "Create issues"),
-                scope("comments:create", "Comment on issues"),
+                scope("tasks:read", "See the tasks on your board"),
+                scope("tasks:write", "Create and delete tasks on your board"),
             ],
         },
         "tools": [
-            tool("search_issues", "Search issues", "Find issues by text, team or state.", "read"),
-            tool("create_issue", "Create issue", "Open an issue in a team.", "write"),
-            tool("add_comment", "Comment on issue", "Add a comment to an issue.", "write"),
+            tool(
+                "list_tasks",
+                "List tasks",
+                "Lists the tasks on the board, oldest first. Optionally only open or done ones.",
+                "read",
+            ),
+            tool("create_task", "Create a task", "Adds an open task to the board.", "write"),
+            tool("delete_task", "Delete a task", "Deletes a task from the board for good.", "destructive"),
         ],
     }))
 }

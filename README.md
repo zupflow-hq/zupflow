@@ -429,6 +429,15 @@ The fixture has two fictional organizations, sibling workspaces, both
 environments and owner, developer, viewer and outsider personas. IDs and
 secrets are fresh; tests find the same logical scenarios by slug. No provider
 account or deployed service is needed.
+
+The reference task app is **Taskboard** (`taskboard`), with a static configured
+`oauth2` template under `https://taskboard.example`. It is ready in Sandbox and
+deliberately incomplete in Northwind's Production environment. Its Sandbox
+registry includes a current `list_tasks`, changed text for `create_task`,
+changed hints for `delete_task`, and a synthetic historical `export_tasks`
+marked gone. These static records use sample credentials and tool schemas;
+live Taskboard journeys create a separate `mcp_oauth` app, `taskboard-live`.
+
 Webhook fixtures include pending, succeeded, failed and skipped deliveries,
 plus a test event, with frozen attempt histories for repeatable filters and
 pagination checks. They queue no work, so starting workers cannot advance
@@ -525,14 +534,14 @@ CARGO_INCREMENTAL=0 scripts/taskboard-dev.sh
 
 It serves Taskboard (on port 7443, `TASKBOARD_PORT`) and the contract server
 for a Console at `http://localhost:5181` (`CONSOLE_ORIGIN`), with Taskboard
-already in Northwind's catalog and ready in Sandbox, and prints the command to
-start the Console. Your browser must reach `taskboard.example` at `127.0.0.1`
-and accept its certificate: the script prints a Chromium command that does
+already in Northwind's catalog as **Taskboard live** (`taskboard-live`), ready in
+Sandbox, and prints the command to start the Console. Your browser must reach
+`taskboard.example` at `127.0.0.1` and accept its certificate: the script prints a Chromium command that does
 both for a profile of its own (add `--no-proxy-server` if your browser goes
 through a proxy), or add `127.0.0.1 taskboard.example` to `/etc/hosts` and
 accept the certificate warning once. Then, in a Sandbox workspace, **Add
-installation**, choose Taskboard, and allow access on Taskboard's page. Runs
-are answered by the scripted model: `call create_task {"title":"Hello"}` calls
+installation**, choose **Taskboard live**, and allow access on Taskboard's page.
+Runs are answered by the scripted model: `call create_task {"title":"Hello"}` calls
 a tool. Taskboard's home page expires or revokes every token, to see what an
 installation does then. Taskboard keeps nothing across restarts: a client the
 backend registered with an earlier run is unknown to it. When refreshing
