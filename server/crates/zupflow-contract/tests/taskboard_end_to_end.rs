@@ -1063,6 +1063,10 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
 
 /// An endpoint of this journey, separate from the frozen reference history.
 async fn history_hook(stack: &Stack, who: &str, org: &str, environment: &str) -> (String, String) {
+    subscribed_hook(stack, who, org, environment, &["run.completed"]).await
+}
+
+async fn subscribed_hook(stack: &Stack, who: &str, org: &str, environment: &str, events: &[&str]) -> (String, String) {
     let (status, created) = stack
         .api(
             who,
@@ -1071,7 +1075,7 @@ async fn history_hook(stack: &Stack, who: &str, org: &str, environment: &str) ->
             None,
             Some(json!({
                 "url": format!("{}/webhooks", stack.taskboard.taskboard.base_url()),
-                "environment": environment, "events": ["run.completed"], "description": "History journey",
+                "environment": environment, "events": events, "description": "History journey",
             })),
         )
         .await;
@@ -1258,7 +1262,10 @@ async fn resend_history(
         .await;
     assert_eq!(status, StatusCode::OK, "{page}");
     let rows = data(&page).as_array().unwrap();
-    assert!(rows.iter().all(|row| row["workspace"] == source["workspace"]));
+    assert!(
+        rows.iter()
+            .all(|row| row["workspace"]["id"] == source["workspace"]["id"])
+    );
     let same_event: Vec<_> = rows
         .iter()
         .filter(|row| row["event_id"] == source["event_id"])
@@ -1946,4 +1953,209 @@ async fn webhook_secret_rotation_keeps_overlap_history_and_scope() {
     assert_eq!(rolls[0]["environment"], "sandbox");
     assert_eq!(rolls[0]["workspace_id"], Value::Null);
     assert_eq!(rolls[0]["workspace"], Value::Null);
+}
+
+#[tokio::test]
+async fn connect_lifecycle_delivers_signed_immutable_outcomes() {
+    let stack = Stack::start().await;
+    let t = tenant(&stack).await;
+    let board = stack.taskboard.taskboard.clone();
+    let kinds = [
+        "installation.connected",
+        "installation.disconnected",
+        "connect_session.completed",
+        "connect_session.failed",
+    ];
+    let (hook, secret) = subscribed_hook(&stack, OWNER, &t.org, "sandbox", &kinds).await;
+    let (production, _) = subscribed_hook(&stack, OWNER, &t.org, "production", &kinds).await;
+    let (_, me) = stack.api("contract:outsider", Method::GET, "/v1/me", None, None).await;
+    let other_org = id(&data(&me)["organizations"][0]);
+    let (foreign, _) = subscribed_hook(&stack, "contract:outsider", &other_org, "sandbox", &kinds).await;
+    let (status, body) = stack
+        .api(
+            OWNER,
+            Method::PATCH,
+            &format!("/v1/workspaces/{}", t.ws),
+            Some(&t.org),
+            Some(json!({ "external_id": "original-tenant" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cancelled = t.session(&stack, None).await;
+    let (status, cancelled_body) = stack
+        .api(
+            "",
+            Method::POST,
+            &format!("/v1/connect/sessions/{cancelled}/cancel"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{cancelled_body}");
+    let (status, _) = stack
+        .api(
+            "",
+            Method::POST,
+            &format!("/v1/connect/sessions/{cancelled}/cancel"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let denied = t.session(&stack, None).await;
+    let page = t.consent_page(&stack, &denied).await;
+    let denied_body = t.answer(&stack, &denied, &page, "deny").await;
+    assert_eq!(denied_body["failure_code"], "consent_denied");
+    let reference = t.session(&stack, None).await;
+    let page = t.consent_page(&stack, &reference).await;
+    let callback = t.decide_consent(&stack, &page, "approve").await;
+    let completed = t.follow(&stack, &reference, &callback).await;
+    let installation = completed["installation_id"].as_str().unwrap();
+    assert_eq!(completed["status"], "completed");
+    let (status, _, _) = stack.browse(Method::GET, &callback, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a callback replay emits nothing");
+    let reconnect = t.session(&stack, Some(installation)).await;
+    let page = t.consent_page(&stack, &reconnect).await;
+    let renewed = t.answer(&stack, &reconnect, &page, "approve").await;
+    assert_eq!(renewed["installation_id"], installation);
+    for _ in 0..2 {
+        let (status, body) = stack
+            .api(
+                OWNER,
+                Method::POST,
+                &format!("/v1/workspaces/{}/installations/{installation}/disconnect", t.ws),
+                Some(&t.org),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = stack
+        .api(
+            OWNER,
+            Method::PATCH,
+            &format!("/v1/workspaces/{}", t.ws),
+            Some(&t.org),
+            Some(json!({ "external_id": "renamed-tenant" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = stack
+        .api(
+            OWNER,
+            Method::DELETE,
+            &format!("/v1/workspaces/{}/installations/{installation}", t.ws),
+            Some(&t.org),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let path = format!(
+        "/v1/organizations/{}/webhooks/{hook}/deliveries?workspace_id={}&limit=100",
+        t.org, t.ws
+    );
+    let history = eventually("all lifecycle events to reach the signed receiver", || async {
+        let (status, body) = stack.api(OWNER, Method::GET, &path, None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = data(&body).as_array().unwrap();
+        (rows.len() == 8 && rows.iter().all(|row| row["state"] == "succeeded")).then(|| rows.clone())
+    })
+    .await;
+    let requests = board.webhook_requests();
+    let mut actual = Vec::new();
+    for summary in &history {
+        let request = requests
+            .iter()
+            .find(|request| request.event_id.as_deref() == summary["event_id"].as_str())
+            .unwrap();
+        let event = verify_webhook(request, &[&secret]);
+        assert_eq!(event["organization_id"], t.org);
+        assert_eq!(event["environment"], "sandbox");
+        assert_eq!(event["workspace"]["id"], t.ws);
+        check_history(&stack, OWNER, &t.org, &hook, summary, request, &[&secret]).await;
+        actual.push(event);
+    }
+    assert_eq!(
+        actual
+            .iter()
+            .filter(|event| event["type"] == "installation.connected")
+            .count(),
+        2
+    );
+    assert_eq!(
+        actual
+            .iter()
+            .filter(|event| event["type"] == "installation.disconnected")
+            .count(),
+        2
+    );
+    for session in [&completed, &renewed] {
+        let event = actual
+            .iter()
+            .find(|event| event["data"]["id"] == session["id"])
+            .unwrap();
+        assert_eq!(
+            event["data"],
+            json!({ "object": "connect_session", "id": session["id"], "status": "completed", "installation_id": installation, "failure_code": null })
+        );
+    }
+    for (session, status, failure) in [
+        (data(&cancelled_body), "cancelled", Value::Null),
+        (&denied_body, "failed", json!("consent_denied")),
+    ] {
+        let event = actual
+            .iter()
+            .find(|event| event["data"]["id"] == session["id"])
+            .unwrap();
+        assert_eq!(
+            event["data"],
+            json!({ "object": "connect_session", "id": session["id"], "status": status, "installation_id": null, "failure_code": failure })
+        );
+    }
+    assert_eq!(
+        actual
+            .iter()
+            .filter(|event| event["workspace"]["external_id"] == "original-tenant")
+            .count(),
+        7
+    );
+    assert_eq!(
+        actual
+            .iter()
+            .filter(|event| event["workspace"]["external_id"] == "renamed-tenant")
+            .count(),
+        1
+    );
+    let exposed = serde_json::to_string(&actual).unwrap();
+    for private in [&reference, &reconnect, &cancelled, &denied, &secret] {
+        assert!(!exposed.contains(private));
+    }
+    assert!(!exposed.contains("Robin"));
+    for (who, org, endpoint) in [
+        (OWNER, t.org.as_str(), production.as_str()),
+        ("contract:outsider", other_org.as_str(), foreign.as_str()),
+    ] {
+        let (_, body) = stack
+            .api(
+                who,
+                Method::GET,
+                &format!("/v1/organizations/{org}/webhooks/{endpoint}/deliveries"),
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            data(&body).as_array().unwrap().is_empty(),
+            "other scopes receive none of these events: {body}"
+        );
+    }
+    let original = history
+        .iter()
+        .find(|row| row["event_type"] == "installation.connected")
+        .unwrap();
+    let request = requests
+        .iter()
+        .find(|request| request.event_id.as_deref() == original["event_id"].as_str())
+        .unwrap();
+    resend_history(&stack, OWNER, &t.org, &hook, original, request, &[&secret]).await;
 }

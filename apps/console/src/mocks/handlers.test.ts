@@ -36,7 +36,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { signUp } from "./accounts";
 import { db, resetDb } from "./db";
 import { createHandlers, NO_SIGN_IN_HOST, OUTCOME_GRACE_MS, UNREACHABLE_HOST } from "./handlers";
-import { grantorAllows, setLatency, withdrawUngrantable } from "./http";
+import { announceLifecycle, grantorAllows, setLatency, withdrawUngrantable, withExpiry } from "./http";
 import { hashReference, isId, newId, newReference, uuidOf } from "./ids";
 import type { IdempotencyRow, MembershipRow } from "./model";
 import { mulberry32 } from "./random";
@@ -147,6 +147,132 @@ afterEach(() => {
   expect(checker.takeViolations(), "responses that break the contract").toEqual([]);
 });
 beforeEach(() => resetDb());
+
+describe("Connect lifecycle snapshots", () => {
+  it("refuses a foreign workspace and keeps lifecycle snapshots and deliveries in scope", () => {
+    const workspace = ws("qa-playground");
+    const foreign = ws("harbor-sandbox");
+    const event = {
+      type: "connect_session.failed" as const,
+      data: {
+        object: "connect_session" as const,
+        id: newId("connect_session"),
+        status: "cancelled" as const,
+        installation_id: null,
+        failure_code: null,
+      },
+    };
+    const at = new Date().toISOString();
+    const foreignEndpoint = {
+      ...structuredClone(must(db().webhooks.find((endpoint) => endpoint.organization_id === foreign.organization_id))),
+      id: newId("webhook_endpoint"),
+      environment: workspace.environment,
+      events: [event.type],
+      enabled: true,
+    };
+    db().webhooks.push(foreignEndpoint);
+    const before = structuredClone({ events: db().webhook_events, deliveries: db().webhook_deliveries });
+    expect(() => announceLifecycle(workspace.organization_id, foreign.id, event, at)).toThrow();
+    expect({ events: db().webhook_events, deliveries: db().webhook_deliveries }).toEqual(before);
+    db().workspaces.unshift({
+      ...structuredClone(workspace),
+      organization_id: foreign.organization_id,
+      environment: "production",
+      external_id: "foreign-snapshot",
+    });
+    announceLifecycle(workspace.organization_id, workspace.id, event, at);
+    expect(db().webhook_events.at(-1)?.body).toMatchObject({
+      organization_id: workspace.organization_id,
+      environment: workspace.environment,
+      workspace: { id: workspace.id, external_id: workspace.external_id },
+      created_at: at,
+      ...event,
+    });
+    expect(db().webhook_deliveries.filter((delivery) => delivery.endpoint_id === foreignEndpoint.id)).toEqual(
+      before.deliveries.filter((delivery) => delivery.endpoint_id === foreignEndpoint.id),
+    );
+  });
+
+  it.each(["organization", "workspace"] as const)(
+    "refuses a poisoned %s before expiring or emitting",
+    async (scope) => {
+      const workspace = ws("qa-playground");
+      const session = await owner.connectSessions.create(workspace.id, {
+        app_id: app("echo-server").id,
+        intent: "create",
+        label: "Poisoned expiry",
+        installation_id: null,
+        return_url: null,
+      });
+      const row = must(db().connect_sessions.find((item) => item.id === session.id));
+      const poisoned = {
+        ...structuredClone(row),
+        expires_at: new Date(Date.now() - 1).toISOString(),
+        ...(scope === "organization"
+          ? { organization_id: must(db().organizations.find((item) => item.slug === "larkspur")).id }
+          : { workspace_id: ws("acme-sandbox").id }),
+      };
+      db().connect_sessions.unshift(poisoned);
+      const snapshot = () => ({
+        sessions: db().connect_sessions,
+        events: db().webhook_events,
+        deliveries: db().webhook_deliveries,
+      });
+      const before = structuredClone(snapshot());
+      expect(() => withExpiry(workspace.organization_id, workspace.id, poisoned)).toThrow();
+      expect(snapshot()).toEqual(before);
+      expect(poisoned.status).toBe("pending");
+    },
+  );
+
+  it("expires at the exact boundary once with no installation result", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const session = await owner.connectSessions.create(ws("qa-playground").id, {
+        app_id: app("echo-server").id,
+        intent: "create",
+        label: "Expired",
+        installation_id: null,
+        return_url: null,
+      });
+      const row = must(db().connect_sessions.find((item) => item.id === session.id));
+      vi.setSystemTime(Date.parse(row.expires_at) - 1);
+      expect(withExpiry(row.organization_id, row.workspace_id, row).status).toBe("pending");
+      vi.setSystemTime(Date.parse(row.expires_at));
+      expect(withExpiry(row.organization_id, row.workspace_id, row).status).toBe("expired");
+      withExpiry(row.organization_id, row.workspace_id, row);
+      const events = db().webhook_events.filter((event) => event.body.data.id === session.id);
+      expect(events).toHaveLength(1);
+      expect(events[0]?.body).toMatchObject({
+        type: "connect_session.failed",
+        created_at: row.expires_at,
+        data: { status: "expired", installation_id: null, failure_code: null },
+      });
+      expect((await failure(owner.connect.cancel(referenceOf(session)))).code).toBe("session_not_pending");
+      expect(db().webhook_events.filter((event) => event.body.data.id === session.id)).toEqual(events);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("records only one terminal result when credentials race cancellation", async () => {
+    const session = await owner.connectSessions.create(ws("qa-playground").id, {
+      app_id: app("echo-server").id,
+      intent: "create",
+      label: "Race",
+      installation_id: null,
+      return_url: null,
+    });
+    await Promise.allSettled([
+      owner.connect.submitCredentials(referenceOf(session), { values: { token: "race-private-token" } }),
+      owner.connect.cancel(referenceOf(session)),
+    ]);
+    const events = db().webhook_events.filter((event) => event.body.data.id === session.id);
+    expect(events).toHaveLength(1);
+    const row = must(db().connect_sessions.find((item) => item.id === session.id));
+    expect(events[0]?.body.data).toMatchObject({ status: row.status });
+  });
+});
 
 describe("webhook secret rotation", () => {
   it.each(["sandbox", "production"] as const)(

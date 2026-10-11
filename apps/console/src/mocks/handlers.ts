@@ -40,6 +40,8 @@ import { cancelScheduledRun, db, resetDb, scheduleRun } from "./db";
 import {
   ADMINS,
   ApiFailure,
+  announceLifecycle,
+  announceSession,
   appInScope,
   assertPublicHttps,
   audit,
@@ -545,13 +547,21 @@ function sessionScope(session: ConnectSessionRow) {
  * identity URL the configuration has moved the server away from is refused
  * first, before anything would be sent.
  */
-function startSignIn(session: ConnectSessionRow, app: AppRow) {
+function startSignIn(
+  organizationId: OrganizationId,
+  workspaceId: WorkspaceId,
+  session: ConnectSessionRow,
+  app: AppRow,
+) {
+  assertTransitionScope(organizationId, workspaceId, session, app);
+  assertSessionPending(withExpiry(organizationId, workspaceId, session));
   if (app.auth.type !== "mcp_oauth") return;
   const server = configurationOf(db().configurations, app, session.environment)?.mcp_server_url;
   if (!server) return;
   if (app.auth.identity_url && !sameOrigin(app.auth.identity_url, server)) {
     session.status = "failed";
     session.failure_code = "identity_off_server";
+    announceSession(organizationId, workspaceId, session, new Date().toISOString());
     throw new ApiFailure(
       422,
       "identity_off_server",
@@ -561,11 +571,13 @@ function startSignIn(session: ConnectSessionRow, app: AppRow) {
   if (new URL(server).hostname === UNREACHABLE_HOST) {
     session.status = "failed";
     session.failure_code = "provider_unavailable";
+    announceSession(organizationId, workspaceId, session, new Date().toISOString());
     throw new ApiFailure(502, "provider_unavailable", `${app.name}'s server couldn't be reached. Start again shortly.`);
   }
   if (new URL(server).hostname === NO_SIGN_IN_HOST) {
     session.status = "failed";
     session.failure_code = "discovery_failed";
+    announceSession(organizationId, workspaceId, session, new Date().toISOString());
     throw new ApiFailure(
       502,
       "discovery_failed",
@@ -593,11 +605,28 @@ function assertStillEligible(session: ConnectSessionRow): AppRow {
   return app;
 }
 
+function assertTransitionScope(
+  organizationId: OrganizationId,
+  workspaceId: WorkspaceId,
+  session: ConnectSessionRow,
+  app: AppRow,
+) {
+  if (session.organization_id !== organizationId || session.workspace_id !== workspaceId)
+    throw notFound("Connect session");
+  if (appInScope({ organization_id: organizationId, workspace_id: workspaceId, app_id: session.app_id }) !== app)
+    throw notFound("App");
+}
+
 function completeSession(
+  organizationId: OrganizationId,
+  workspaceId: WorkspaceId,
   session: ConnectSessionRow,
   app: AppRow,
   account: ReturnType<typeof accountFor>,
 ): ConnectResult {
+  assertTransitionScope(organizationId, workspaceId, session, app);
+  assertSessionPending(withExpiry(organizationId, workspaceId, session));
+  assertStillEligible(session);
   const now = new Date().toISOString();
   const d = db();
   const config = configurationOf(d.configurations, app, session.environment);
@@ -610,6 +639,7 @@ function completeSession(
     if (previous && previous !== account.external_id) {
       session.status = "failed";
       session.failure_code = "account_mismatch";
+      announceSession(organizationId, workspaceId, session, new Date().toISOString());
       throw new ApiFailure(
         409,
         "account_mismatch",
@@ -630,8 +660,8 @@ function completeSession(
   } else {
     installation = {
       id: newId("installation"),
-      organization_id: session.organization_id,
-      workspace_id: session.workspace_id,
+      organization_id: organizationId,
+      workspace_id: workspaceId,
       app_id: app.id,
       label: session.label,
       status: "connected",
@@ -652,12 +682,22 @@ function completeSession(
 
   session.status = "completed";
   session.completed_at = now;
+  announceLifecycle(
+    organizationId,
+    workspaceId,
+    {
+      type: "installation.connected",
+      data: { object: "installation", id: installation.id, app_id: installation.app_id, status: "connected" },
+    },
+    now,
+  );
+  announceSession(organizationId, workspaceId, session, now);
   // The backend queues discovery; the mock lists the app's tools at once.
   discoverTools(d, installation, now);
   d.audit.unshift({
     id: newId("audit_event"),
-    organization_id: session.organization_id,
-    workspace_id: session.workspace_id,
+    organization_id: organizationId,
+    workspace_id: workspaceId,
     environment: session.environment,
     actor: { type: "system", id: null, name: "Connect" },
     action: session.intent === "reconnect" ? "installation.reconnected" : "installation.connected",
@@ -1714,8 +1754,18 @@ export function createHandlers(apiBase: string) {
         const access = workspaceAccess(request, param(params, "ws"));
         requireRole(access, DEVELOPERS, "disconnect installations");
         const row = findInstallation(access, idParam(params, "inst"));
+        if (row.status === "disconnected") return ok(toInstallation(row));
         row.status = "disconnected";
         row.updated_at = new Date().toISOString();
+        announceLifecycle(
+          access.org.id,
+          access.workspace.id,
+          {
+            type: "installation.disconnected",
+            data: { object: "installation", id: row.id, app_id: row.app_id, status: "disconnected" },
+          },
+          row.updated_at,
+        );
         const app = appInScope(row);
         audit(
           access,
@@ -1815,6 +1865,15 @@ export function createHandlers(apiBase: string) {
         const d = db();
         d.grants = d.grants.filter((g) => !(inWorkspace(g, access.workspace) && g.installation_id === row.id));
         d.installations = d.installations.filter((i) => i !== row);
+        announceLifecycle(
+          access.org.id,
+          access.workspace.id,
+          {
+            type: "installation.disconnected",
+            data: { object: "installation", id: row.id, app_id: row.app_id, status: "disconnected" },
+          },
+          new Date().toISOString(),
+        );
         forgetTools(d, row);
         const app = appInScope(row);
         audit(
@@ -1835,7 +1894,7 @@ export function createHandlers(apiBase: string) {
         return ok(
           db()
             .connect_sessions.filter((s) => inWorkspace(s, access.workspace))
-            .map((s) => toConnectSession(withExpiry(s))),
+            .map((s) => toConnectSession(withExpiry(access.org.id, access.workspace.id, s))),
         );
       }),
     ),
@@ -1848,7 +1907,7 @@ export function createHandlers(apiBase: string) {
           (s) => inWorkspace(s, access.workspace) && s.id === idParam(params, "session"),
         );
         if (!session) throw notFound("Connect session");
-        return ok(toConnectSession(withExpiry(session)));
+        return ok(toConnectSession(withExpiry(access.org.id, access.workspace.id, session)));
       }),
     ),
 
@@ -1959,6 +2018,7 @@ export function createHandlers(apiBase: string) {
         const session = await findSessionByReferenceCrossTenant(param(params, "reference"));
         assertSessionPending(session);
         session.status = "cancelled";
+        announceSession(session.organization_id, session.workspace_id, session, new Date().toISOString());
         return ok(toConnectSession(session));
       }),
     ),
@@ -2006,7 +2066,7 @@ export function createHandlers(apiBase: string) {
         const seedValue = previous?.connection?.account.external_id ?? first;
         const account =
           previous?.connection?.account ?? accountFor(app, seedValue, `${app.name} account ••${first.slice(-4)}`, null);
-        return ok(completeSession(session, app, account));
+        return ok(completeSession(session.organization_id, session.workspace_id, session, app, account));
       }),
     ),
 
@@ -2019,7 +2079,7 @@ export function createHandlers(apiBase: string) {
         if (app.auth.type === "token") {
           throw new ApiFailure(422, "wrong_auth_type", `${app.name} connects with a token.`);
         }
-        if (app.auth.type === "mcp_oauth") startSignIn(session, app);
+        if (app.auth.type === "mcp_oauth") startSignIn(session.organization_id, session.workspace_id, session, app);
         if (app.auth.type === "oauth2" && (!app.auth.authorize_url || !app.auth.token_url)) {
           throw new ApiFailure(
             422,
@@ -2045,9 +2105,11 @@ export function createHandlers(apiBase: string) {
           request,
           z.object({ decision: z.enum(["approved", "denied"]), email: z.string().email().nullable() }),
         );
+        assertSessionPending(withExpiry(session.organization_id, session.workspace_id, session));
         if (input.decision === "denied" || !input.email) {
           session.status = "failed";
           session.failure_code = "consent_denied";
+          announceSession(session.organization_id, session.workspace_id, session, new Date().toISOString());
           throw new ApiFailure(422, "consent_denied", "Access was not granted. Nothing was connected.");
         }
         if (app.auth.type === "mcp_oauth" && !app.auth.identity_url) {
@@ -2057,10 +2119,10 @@ export function createHandlers(apiBase: string) {
           const account =
             previous?.connection?.account ??
             accountFor(app, `${session.id}:${input.email}`, `${app.name} account`, null);
-          return ok(completeSession(session, app, account));
+          return ok(completeSession(session.organization_id, session.workspace_id, session, app, account));
         }
         const account = accountFor(app, input.email, input.email.split("@")[0] ?? input.email, input.email);
-        return ok(completeSession(session, app, account));
+        return ok(completeSession(session.organization_id, session.workspace_id, session, app, account));
       }),
     ),
 

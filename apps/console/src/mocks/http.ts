@@ -34,6 +34,7 @@ import {
   INVITATION_LIST_LIMIT,
   INVITATION_TTL_DAYS,
   ORGANIZATION_HEADER,
+  WebhookEvent,
 } from "@zupflow/sdk";
 import { delay, HttpResponse } from "msw";
 import type { z } from "zod";
@@ -243,15 +244,101 @@ export async function findSessionByReferenceCrossTenant(reference: string): Prom
     ? db().connect_sessions.find((s) => s.reference_hash !== null && s.reference_hash === referenceHash)
     : undefined;
   if (!session) throw notFound("Connect session");
-  return withExpiry(session);
+  return withExpiry(session.organization_id, session.workspace_id, session);
 }
 
 /** A pending session past its expiry is expired, whoever reads it. */
-export function withExpiry(session: ConnectSessionRow): ConnectSessionRow {
-  if (session.status === "pending" && Date.parse(session.expires_at) < Date.now()) {
+export function withExpiry(
+  organizationId: OrganizationId,
+  workspaceId: WorkspaceId,
+  session: ConnectSessionRow,
+): ConnectSessionRow {
+  if (session.organization_id !== organizationId || session.workspace_id !== workspaceId)
+    throw notFound("Connect session");
+  if (session.status === "pending" && Date.parse(session.expires_at) <= Date.now()) {
     session.status = "expired";
+    announceSession(organizationId, workspaceId, session, session.expires_at);
+    persist();
   }
   return session;
+}
+
+/** The mock records each lean snapshot synchronously with its transition. */
+export function announceLifecycle(
+  organizationId: OrganizationId,
+  workspaceId: WorkspaceId,
+  event: Pick<WebhookEvent, "type" | "data">,
+  at: string,
+) {
+  const d = db();
+  const workspace = d.workspaces.find((w) => w.organization_id === organizationId && w.id === workspaceId);
+  if (!workspace) throw notFound("Workspace");
+  const id = newId("webhook_event");
+  // The caller supplies only the event-specific fields, never the envelope.
+  const snapshot = WebhookEvent.parse({
+    ...event,
+    id,
+    organization_id: organizationId,
+    environment: workspace.environment,
+    created_at: at,
+    workspace: { id: workspaceId, external_id: workspace.external_id },
+  });
+  d.webhook_events.push({
+    id,
+    organization_id: organizationId,
+    workspace_id: workspaceId,
+    environment: workspace.environment,
+    body: snapshot,
+  });
+  for (const endpoint of d.webhooks) {
+    if (
+      endpoint.organization_id !== organizationId ||
+      endpoint.environment !== workspace.environment ||
+      !endpoint.enabled ||
+      snapshot.type === "webhook.test" ||
+      !endpoint.events.includes(snapshot.type)
+    )
+      continue;
+    d.webhook_deliveries.push({
+      id: newId("webhook_delivery"),
+      organization_id: organizationId,
+      endpoint_id: endpoint.id,
+      event_id: id,
+      state: "pending",
+      attempts: 0,
+      last_status_code: null,
+      last_error: null,
+      last_attempt_at: null,
+      next_attempt_at: at,
+      created_at: at,
+    });
+  }
+}
+
+export function announceSession(
+  organizationId: OrganizationId,
+  workspaceId: WorkspaceId,
+  session: ConnectSessionRow,
+  at: string,
+) {
+  if (session.organization_id !== organizationId || session.workspace_id !== workspaceId)
+    throw notFound("Connect session");
+  if (session.status === "pending") return;
+  announceLifecycle(
+    organizationId,
+    workspaceId,
+    {
+      type: session.status === "completed" ? "connect_session.completed" : "connect_session.failed",
+      data: {
+        object: "connect_session",
+        id: session.id,
+        status: session.status,
+        installation_id: session.status === "completed" ? session.installation_id : null,
+        failure_code: session.failure_code,
+      },
+    },
+    at,
+  );
 }
 
 export function requireRole(access: OrgAccess, roles: MemberRole[], action: string) {

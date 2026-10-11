@@ -727,6 +727,19 @@ async fn defer(state: &AppState, organization_id: OrganizationId, delivery: &Pen
 /// more, until the process stops; aborting the handle stops them all.
 pub async fn run_workers(state: AppState) {
     let mut workers = tokio::task::JoinSet::new();
+    let expirer = state.clone();
+    workers.spawn(async move {
+        loop {
+            if let Err(error) = expirer
+                .connect
+                .expire_sessions_cross_tenant(Timestamp::now(), 100)
+                .await
+            {
+                tracing::warn!(event = "connect.expiry_failed", %error);
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
     let announcer = state.clone();
     workers.spawn(async move {
         loop {

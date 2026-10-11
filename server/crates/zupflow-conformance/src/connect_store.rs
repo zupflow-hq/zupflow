@@ -10,6 +10,8 @@
 //! Production workspace, a catalog app, the Sandbox workspace's own app, and
 //! an installation of the catalog app in the Sandbox workspace.
 
+pub mod lifecycle;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -30,6 +32,7 @@ use crate::audit_store::{by_suite, by_suite_in};
 pub struct Tenant {
     pub organization_id: OrganizationId,
     pub sandbox: WorkspaceId,
+    pub sibling: WorkspaceId,
     pub production: WorkspaceId,
     pub catalog_app: AppId,
     pub own_app: AppId,
@@ -39,10 +42,11 @@ pub struct Tenant {
 
 pub type Prepare = Arc<dyn Fn(Tenant) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-async fn tenant(prepare: &Prepare) -> Tenant {
+pub(super) async fn tenant(prepare: &Prepare) -> Tenant {
     let tenant = Tenant {
         organization_id: OrganizationId::generate(),
         sandbox: WorkspaceId::generate(),
+        sibling: WorkspaceId::generate(),
         production: WorkspaceId::generate(),
         catalog_app: AppId::generate(),
         own_app: AppId::generate(),
@@ -52,7 +56,7 @@ async fn tenant(prepare: &Prepare) -> Tenant {
     tenant
 }
 
-fn new(app: InstalledApp, reference: &Reference) -> NewConnectSession {
+pub(super) fn new(app: InstalledApp, reference: &Reference) -> NewConnectSession {
     NewConnectSession {
         environment: Environment::Sandbox,
         app,
@@ -66,7 +70,7 @@ fn new(app: InstalledApp, reference: &Reference) -> NewConnectSession {
     }
 }
 
-async fn start(store: &dyn ConnectStore, t: &Tenant, now: Timestamp) -> (ConnectSession, Reference) {
+pub(super) async fn start(store: &dyn ConnectStore, t: &Tenant, now: Timestamp) -> (ConnectSession, Reference) {
     let reference = Reference::generate().unwrap();
     let session = store
         .create_session(
@@ -502,7 +506,7 @@ async fn refuses_a_workspace_of_another_organization(store: &dyn ConnectStore, p
     );
 }
 
-fn completion(installation_id: InstallationId, version: u32) -> Completion {
+pub(super) fn completion(installation_id: InstallationId, version: u32) -> Completion {
     Completion {
         installation_id,
         configuration_version: 3,

@@ -288,14 +288,30 @@ responses show its last four characters. The test button sends a real, signed
 `webhook.test` event and answers the endpoint's status (`0` when nothing came
 back), kept as the endpoint's `last_delivery`.
 
-Events are written with the change that causes them: the run store queues an
-announcement in the transaction that appends `run.completed`, `run.failed`,
-`run.cancelled` or `approval.requested` (sent as `run.waiting_for_approval`),
-and the tool registry in the one where a listing changes a tool
-(`app.tools_changed`). A worker in the same process records each event once,
-lean (type, IDs, environment, the workspace's `external_id`, the object's
-status; never content), with a delivery for every enabled endpoint of the
-event's organization and environment that subscribes to its type. Each
+Connect outcomes and installation lifecycle events are recorded with their
+state changes, as immutable lean bodies and queued deliveries in the same
+transaction. A successful new connection or reconnect emits
+`installation.connected` and `connect_session.completed`; cancellation,
+expiry and terminal failure emit `connect_session.failed`. Failed reconnects
+have no result `installation_id`. Disconnecting emits
+`installation.disconnected` once; repeating it changes nothing and records no
+second audit. Deleting an installation emits its own disconnected event,
+including when it was already disconnected. Credential failures likewise
+record `installation.reconnect_required` with their transition.
+
+A background sweep persists at most 100 expired pending sessions each second,
+using their expiry instant for the event time. Concurrent completions,
+cancellations and sweeps cannot finish a session twice. Lifecycle events keep
+the original status, app, workspace external ID and event ID even after a
+reconnect, a workspace edit or installation deletion. Credentials, account
+details, session references and provider responses never enter an event.
+
+Run and tool events use announcements queued in their transition's transaction:
+`run.completed`, `run.failed`, `run.cancelled`, `approval.requested` (sent as
+`run.waiting_for_approval`) and `app.tools_changed`. A worker records each event
+once, with a delivery for every enabled endpoint of its organization and
+environment that subscribes to its type. Events are lean: type, IDs,
+environment, the workspace's `external_id` and the object's status. Each
 delivery is signed (`Zupflow-Signature: t=…,v1=…`, HMAC-SHA256 over
 `"<t>.<raw body>"`, with `Zupflow-Event-Id`, `Zupflow-Event-Type` and
 `Zupflow-Delivery-Attempt`) and sent through the safe outbound path; any
@@ -493,7 +509,12 @@ once and the overlap deadline stays fixed, then verifies both signatures on
 test deliveries and queued resends of events from sibling workspaces. It
 also checks that another organization's endpoint and the other environment
 keep their own secrets and history. Exact expiry is covered by controlled
-clock tests; the HTTP journey needs no long wait or clock-control route.
+clock tests; the HTTP journey needs no long wait or clock-control route. A
+lifecycle journey checks successful and denied OAuth, cancellation,
+reconnect, repeated disconnect and deletion against actual signed requests,
+then resends an unchanged connected event after deleting the installation.
+Store tests cover transaction rollback, races, immutable snapshots and
+exact session expiry without a clock-control HTTP route.
 
 To click through it yourself:
 

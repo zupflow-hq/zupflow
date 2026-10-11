@@ -17,6 +17,7 @@ use zupflow_core::ids::{AppId, ConnectSessionId, InstallationId, OrganizationId,
 use zupflow_core::installations::{Installation, InstallationError, InstalledApp, NewInstallation};
 use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::time::Timestamp;
+use zupflow_core::webhooks::WebhookEventType;
 
 use crate::Database;
 use crate::installations::{Renewal, insert_connected, reconnect};
@@ -103,6 +104,35 @@ async fn forget_authorization(
         .await
         .map_err(failed("forget_authorization"))?;
     Ok(())
+}
+
+/// A terminal session exposes a result installation only after completion.
+async fn record_outcome(
+    transaction: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    session: &ConnectSession,
+    at: Timestamp,
+) -> Result<(), ConnectError> {
+    let completed = session.status == ConnectSessionStatus::Completed;
+    crate::webhooks::record_lifecycle(
+        transaction,
+        organization_id,
+        workspace_id,
+        if completed {
+            WebhookEventType::ConnectSessionCompleted
+        } else {
+            WebhookEventType::ConnectSessionFailed
+        },
+        serde_json::json!({
+            "object": "connect_session", "id": session.id, "status": session.status,
+            "installation_id": if completed { session.installation_id } else { None },
+            "failure_code": session.failure_code,
+        }),
+        at,
+    )
+    .await
+    .map_err(|_| ConnectError::Unavailable)
 }
 
 /// An installation write that failed inside a completion: the store has logged it.
@@ -406,6 +436,18 @@ impl ConnectStore for SqliteConnectStore {
         .map_err(failed("complete_session"))?;
         let session = session_from(&row.ok_or(ConnectError::NotPending)?)?;
         forget_authorization(&mut transaction, organization_id, workspace_id, session_id).await?;
+        crate::webhooks::record_lifecycle(
+            &mut transaction,
+            organization_id,
+            workspace_id,
+            WebhookEventType::InstallationConnected,
+            serde_json::json!({ "object": "installation", "id": installation.id,
+                "app_id": installation.app.id(), "status": "connected" }),
+            now,
+        )
+        .await
+        .map_err(|_| ConnectError::Unavailable)?;
+        record_outcome(&mut transaction, organization_id, workspace_id, &session, now).await?;
         let completed = (session, installation);
         crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&completed))
             .await
@@ -578,8 +620,63 @@ impl ConnectStore for SqliteConnectStore {
         };
         let session = session_from(&row)?;
         forget_authorization(&mut transaction, organization_id, workspace_id, session_id).await?;
+        record_outcome(&mut transaction, organization_id, workspace_id, &session, now).await?;
         transaction.commit().await.map_err(failed("fail_session"))?;
         Ok(session)
+    }
+
+    async fn expire_sessions_cross_tenant(&self, now: Timestamp, limit: u32) -> Result<usize, ConnectError> {
+        let mut transaction = self
+            .database
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(failed("expire_sessions"))?;
+        // The only cross-tenant scan: bounded, due pending rows only. Every
+        // write below repeats the scope this scan attributes to the session.
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM connect_sessions WHERE status = 'pending' AND expires_at <= ? ORDER BY expires_at, id LIMIT ?"
+        ))
+        .bind(now.millis())
+        .bind(limit.clamp(1, 100))
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(failed("expire_sessions"))?;
+        let mut expired = 0;
+        for row in rows {
+            let session = session_from(&row)?;
+            let organization_id = session.organization_id;
+            let workspace_id = session.workspace_id;
+            let row = sqlx::query(concat!(
+                "UPDATE connect_sessions SET status = 'expired' WHERE organization_id = ? AND workspace_id = ? \
+                 AND id = ? AND status = 'pending' AND expires_at <= ? RETURNING ",
+                columns!()
+            ))
+            .bind(organization_id.uuid())
+            .bind(workspace_id.uuid())
+            .bind(session.id.uuid())
+            .bind(now.millis())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(failed("expire_sessions"))?;
+            if let Some(row) = row {
+                let session = session_from(&row)?;
+                // Expiry preserves the sealed authorization until session retention is settled.
+                record_outcome(
+                    &mut transaction,
+                    organization_id,
+                    workspace_id,
+                    &session,
+                    session.expires_at,
+                )
+                .await?;
+                expired += 1;
+            }
+        }
+        transaction.commit().await.map_err(failed("expire_sessions"))?;
+        Ok(expired)
     }
 
     async fn cancel_session(
@@ -617,6 +714,7 @@ impl ConnectStore for SqliteConnectStore {
         };
         let session = session_from(&row)?;
         forget_authorization(&mut transaction, organization_id, workspace_id, session_id).await?;
+        record_outcome(&mut transaction, organization_id, workspace_id, &session, now).await?;
         transaction.commit().await.map_err(failed("cancel_session"))?;
         Ok(session)
     }
@@ -647,7 +745,11 @@ mod tests {
                     .execute(pool)
                     .await
                     .unwrap();
-                for (workspace, environment) in [(tenant.sandbox, "sandbox"), (tenant.production, "production")] {
+                for (workspace, environment) in [
+                    (tenant.sandbox, "sandbox"),
+                    (tenant.sibling, "sandbox"),
+                    (tenant.production, "production"),
+                ] {
                     sqlx::query(
                         "INSERT INTO workspaces (id, organization_id, environment, name, slug, created_at) \
                          VALUES (?, ?, ?, 'W', ?, 0)",
@@ -703,6 +805,354 @@ mod tests {
             database,
             directory: _directory,
         } = temporary().await;
-        zupflow_conformance::connect_store::run(&SqliteConnectStore::new(database.clone()), prepare(database)).await;
+        zupflow_conformance::connect_store::run(&SqliteConnectStore::new(database.clone()), prepare(database.clone()))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_conforms() {
+        let Temporary {
+            database,
+            directory: _directory,
+        } = temporary().await;
+        zupflow_conformance::connect_store::lifecycle::run(
+            &SqliteConnectStore::new(database.clone()),
+            &crate::SqliteInstallationStore::new(database.clone()),
+            &crate::SqliteWebhookStore::new(database.clone()),
+            &crate::SqliteAuditStore::new(database.clone()),
+            &crate::SqliteJobQueue::new(database.clone()),
+            prepare(database),
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn lifecycle_rolls_back_if_event_or_delivery_job_cannot_be_written() {
+        use zupflow_conformance::audit_store::{by_suite, by_suite_in};
+        use zupflow_core::installations::InstallationStore;
+        use zupflow_core::webhooks::{NewEndpoint, WebhookEventType, WebhookStore};
+        let Temporary {
+            database,
+            directory: _directory,
+        } = temporary().await;
+        let t = Tenant {
+            organization_id: OrganizationId::generate(),
+            sandbox: WorkspaceId::generate(),
+            sibling: WorkspaceId::generate(),
+            production: WorkspaceId::generate(),
+            catalog_app: AppId::generate(),
+            own_app: AppId::generate(),
+            installation: InstallationId::generate(),
+        };
+        prepare(database.clone())(t).await;
+        let store = SqliteConnectStore::new(database.clone());
+        let installations = crate::SqliteInstallationStore::new(database.clone());
+        let credential = zupflow_core::installations::NewCredential {
+            version: 1,
+            sealed: Sealed {
+                wrapped_key: WrappedKey {
+                    key_id: "test".to_owned(),
+                    bytes: vec![1; 40],
+                },
+                nonce: [1; 12],
+                ciphertext: vec![1; 16],
+            },
+        };
+        crate::SqliteWebhookStore::new(database.clone())
+            .create_endpoint(
+                t.organization_id,
+                zupflow_core::ids::WebhookEndpointId::generate(),
+                &NewEndpoint {
+                    environment: Environment::Sandbox,
+                    url: "https://hooks.example/atomic".to_owned(),
+                    description: String::new(),
+                    events: vec![
+                        WebhookEventType::InstallationConnected,
+                        WebhookEventType::InstallationDisconnected,
+                        WebhookEventType::InstallationReconnectRequired,
+                        WebhookEventType::ConnectSessionCompleted,
+                        WebhookEventType::ConnectSessionFailed,
+                    ],
+                    secret: credential.sealed.clone(),
+                    secret_last4: "last".to_owned(),
+                },
+                Timestamp::now(),
+                &by_suite,
+            )
+            .await
+            .unwrap();
+        let now = Timestamp::now();
+        let input = NewConnectSession {
+            environment: Environment::Sandbox,
+            app: InstalledApp::Catalog(t.catalog_app),
+            configuration_version: 1,
+            intent: ConnectIntent::Create,
+            installation_id: None,
+            label: "Private label".to_owned(),
+            return_url: None,
+            requested_scopes: vec![],
+            reference_hash: zupflow_core::connect::Reference::generate().unwrap().hash(),
+        };
+        let session = store
+            .create_session(t.organization_id, t.sandbox, ConnectSessionId::generate(), &input, now)
+            .await
+            .unwrap();
+        let completion = Completion {
+            installation_id: InstallationId::generate(),
+            configuration_version: 1,
+            account: zupflow_core::installations::ConnectedAccount {
+                external_id: "private-account".to_owned(),
+                display_name: "Private name".to_owned(),
+                email: None,
+            },
+            granted_scopes: vec![],
+            expires_at: None,
+            credential,
+            snapshot: zupflow_conformance::installation_store::snapshot(1),
+        };
+        let completion_audit = |_: &(ConnectSession, Installation)| by_suite_in(t.sandbox);
+        let installation_audit = |_: &Installation| by_suite_in(t.sandbox);
+        for trigger in [
+            "CREATE TRIGGER IF NOT EXISTS refuse_lifecycle BEFORE INSERT ON webhook_events BEGIN SELECT RAISE(ABORT, 'unavailable'); END",
+            "CREATE TRIGGER IF NOT EXISTS refuse_lifecycle BEFORE INSERT ON jobs BEGIN SELECT RAISE(ABORT, 'unavailable'); END",
+        ] {
+            sqlx::query(trigger)
+                .persistent(false)
+                .execute(database.pool())
+                .await
+                .unwrap();
+            let definition: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'refuse_lifecycle'",
+            )
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+            assert_eq!(definition, trigger.replace("IF NOT EXISTS ", ""));
+            assert_eq!(
+                store
+                    .complete_session(
+                        t.organization_id,
+                        t.sandbox,
+                        session.id,
+                        &completion,
+                        now,
+                        &completion_audit
+                    )
+                    .await,
+                Err(ConnectError::Unavailable)
+            );
+            assert_eq!(
+                store
+                    .cancel_session(t.organization_id, t.sandbox, session.id, now)
+                    .await,
+                Err(ConnectError::Unavailable)
+            );
+            assert_eq!(
+                store
+                    .fail_session(t.organization_id, t.sandbox, session.id, "consent_denied", now)
+                    .await,
+                Err(ConnectError::Unavailable)
+            );
+            assert_eq!(
+                store.expire_sessions_cross_tenant(session.expires_at, 100).await,
+                Err(ConnectError::Unavailable)
+            );
+            assert_eq!(
+                store
+                    .find_session(t.organization_id, t.sandbox, session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                ConnectSessionStatus::Pending
+            );
+            assert!(
+                installations
+                    .find_installation(t.organization_id, t.sandbox, completion.installation_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM webhook_events WHERE organization_id = ? AND workspace_id = ?",
+            )
+            .bind(t.organization_id.uuid())
+            .bind(t.sandbox.uuid())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+            assert_eq!(count, 0);
+            let audits: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE organization_id = ? AND workspace_id = ?")
+                    .bind(t.organization_id.uuid())
+                    .bind(t.sandbox.uuid())
+                    .fetch_one(database.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(audits, 0);
+            sqlx::query("DROP TRIGGER IF EXISTS refuse_lifecycle")
+                .persistent(false)
+                .execute(database.pool())
+                .await
+                .unwrap();
+        }
+        store
+            .complete_session(
+                t.organization_id,
+                t.sandbox,
+                session.id,
+                &completion,
+                now,
+                &completion_audit,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER IF NOT EXISTS refuse_lifecycle BEFORE INSERT ON jobs BEGIN SELECT RAISE(ABORT, 'unavailable'); END",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            installations
+                .disconnect_installation(
+                    t.organization_id,
+                    t.sandbox,
+                    completion.installation_id,
+                    &installation_audit
+                )
+                .await,
+            Err(InstallationError::Unavailable)
+        );
+        assert_eq!(
+            installations
+                .delete_installation(
+                    t.organization_id,
+                    t.sandbox,
+                    completion.installation_id,
+                    &installation_audit
+                )
+                .await,
+            Err(InstallationError::Unavailable)
+        );
+        assert_eq!(
+            installations
+                .require_reconnect(
+                    t.organization_id,
+                    t.sandbox,
+                    completion.installation_id,
+                    1,
+                    now,
+                    &installation_audit
+                )
+                .await,
+            Err(InstallationError::Unavailable)
+        );
+        assert_eq!(
+            installations
+                .find_installation(t.organization_id, t.sandbox, completion.installation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            zupflow_core::installations::InstallationStatus::Connected
+        );
+        assert!(
+            installations
+                .find_credential(t.organization_id, t.sandbox, completion.installation_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        sqlx::query("DROP TRIGGER IF EXISTS refuse_lifecycle")
+            .execute(database.pool())
+            .await
+            .unwrap();
+        installations
+            .require_reconnect(
+                t.organization_id,
+                t.sandbox,
+                completion.installation_id,
+                1,
+                now,
+                &installation_audit,
+            )
+            .await
+            .unwrap();
+        let snapshots: Vec<(Vec<u8>, String)> = sqlx::query_as(
+            "SELECT id, body FROM webhook_events WHERE organization_id = ? AND workspace_id = ? ORDER BY id",
+        )
+        .bind(t.organization_id.uuid())
+        .bind(t.sandbox.uuid())
+        .fetch_all(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(snapshots.len(), 3);
+        sqlx::query("UPDATE workspaces SET external_id = 'changed' WHERE organization_id = ? AND id = ?")
+            .bind(t.organization_id.uuid())
+            .bind(t.sandbox.uuid())
+            .execute(database.pool())
+            .await
+            .unwrap();
+        let reconnect = store
+            .create_session(
+                t.organization_id,
+                t.sandbox,
+                ConnectSessionId::generate(),
+                &NewConnectSession {
+                    intent: ConnectIntent::Reconnect,
+                    installation_id: Some(completion.installation_id),
+                    reference_hash: zupflow_core::connect::Reference::generate().unwrap().hash(),
+                    ..input
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        let mut next = completion.clone();
+        next.credential.version = 2;
+        store
+            .complete_session(
+                t.organization_id,
+                t.sandbox,
+                reconnect.id,
+                &next,
+                now,
+                &completion_audit,
+            )
+            .await
+            .unwrap();
+        installations
+            .delete_installation(
+                t.organization_id,
+                t.sandbox,
+                completion.installation_id,
+                &installation_audit,
+            )
+            .await
+            .unwrap();
+        for (id, body) in snapshots {
+            let saved: String = sqlx::query_scalar(
+                "SELECT body FROM webhook_events WHERE organization_id = ? AND workspace_id = ? AND id = ?",
+            )
+            .bind(t.organization_id.uuid())
+            .bind(t.sandbox.uuid())
+            .bind(id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                saved, body,
+                "reconnect, workspace edits and deletion cannot rewrite queued events"
+            );
+            let body: serde_json::Value = serde_json::from_str(&saved).unwrap();
+            assert_eq!(body["workspace"]["external_id"], serde_json::Value::Null);
+            if body["type"] == "installation.reconnect_required" {
+                assert_eq!(
+                    body["data"],
+                    serde_json::json!({ "object": "installation", "id": completion.installation_id,
+                    "app_id": t.catalog_app, "status": "reconnect_required" })
+                );
+            }
+        }
     }
 }

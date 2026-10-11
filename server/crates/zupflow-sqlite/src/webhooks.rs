@@ -227,6 +227,126 @@ async fn insert_attempt(
     Ok(())
 }
 
+/// Records the immutable event, its scoped deliveries and their jobs inside
+/// the transition's transaction. A failed enqueue rolls the transition back.
+pub(crate) async fn record_event(
+    transaction: &mut Transaction<'static, Sqlite>,
+    organization_id: OrganizationId,
+    event: &NewWebhookEvent,
+) -> Result<Vec<WebhookDeliveryId>, WebhookError> {
+    if let Some(workspace_id) = event.workspace_id {
+        // An event is its workspace's environment's, never the other one's.
+        let here = sqlx::query("SELECT 1 FROM workspaces WHERE organization_id = ? AND id = ? AND environment = ?")
+            .bind(organization_id.uuid())
+            .bind(workspace_id.uuid())
+            .bind(event.environment.as_str())
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(failed("record_event"))?;
+        if here.is_none() {
+            return Err(WebhookError::NotFound);
+        }
+    }
+    if !insert_event(transaction, organization_id, event).await? {
+        // Recorded before, with its deliveries.
+        return Ok(Vec::new());
+    }
+    let endpoints = sqlx::query(
+        "SELECT id, events FROM webhook_endpoints WHERE organization_id = ? AND environment = ? AND enabled = 1 \
+             ORDER BY created_at, id",
+    )
+    .bind(organization_id.uuid())
+    .bind(event.environment.as_str())
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(failed("record_event"))?;
+    let kind = WebhookEventType::parse(&event.kind);
+    let mut deliveries = Vec::new();
+    for row in &endpoints {
+        let events: String = row.try_get("events").map_err(read)?;
+        if kind.is_none_or(|kind| !events_from(&events).is_ok_and(|events| events.contains(&kind))) {
+            continue;
+        }
+        let endpoint_id = WebhookEndpointId::from_uuid(row.try_get("id").map_err(read)?);
+        let delivery_id = WebhookDeliveryId::generate();
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (id, organization_id, endpoint_id, event_id, state, attempts, \
+                 next_attempt_at, created_at) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)",
+        )
+        .bind(delivery_id.uuid())
+        .bind(organization_id.uuid())
+        .bind(endpoint_id.uuid())
+        .bind(event.id.uuid())
+        .bind(Timestamp::now().millis())
+        .bind(Timestamp::now().millis())
+        .execute(&mut **transaction)
+        .await
+        .map_err(failed("record_event"))?;
+        let Some(job) = delivery_job(delivery_id) else {
+            return Err(WebhookError::Unavailable);
+        };
+        insert_job(
+            &mut **transaction,
+            &Scope::Organization(organization_id),
+            &job.kind,
+            job.payload,
+            job.options,
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(event = "webhooks.job_not_queued", %error);
+            WebhookError::Unavailable
+        })?;
+        deliveries.push(delivery_id);
+    }
+
+    Ok(deliveries)
+}
+
+/// Captures only routing fields while the workspace and transition are locked.
+pub(crate) async fn record_lifecycle(
+    transaction: &mut Transaction<'static, Sqlite>,
+    organization_id: OrganizationId,
+    workspace_id: zupflow_core::ids::WorkspaceId,
+    kind: WebhookEventType,
+    data: serde_json::Value,
+    at: Timestamp,
+) -> Result<(), WebhookError> {
+    let row = sqlx::query("SELECT environment, external_id FROM workspaces WHERE organization_id = ? AND id = ?")
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(failed("lifecycle_workspace"))?
+        .ok_or(WebhookError::NotFound)?;
+    let environment: String = row.try_get("environment").map_err(read)?;
+    let environment = Environment::parse(&environment).ok_or_else(|| read("an unknown environment"))?;
+    let external_id: Option<String> = row.try_get("external_id").map_err(read)?;
+    let id = WebhookEventId::generate();
+    record_event(
+        transaction,
+        organization_id,
+        &NewWebhookEvent {
+            id,
+            environment,
+            workspace_id: Some(workspace_id),
+            kind: kind.as_str().to_owned(),
+            body: zupflow_core::webhooks::event_body(
+                id,
+                kind.as_str(),
+                at,
+                environment,
+                organization_id,
+                Some((workspace_id, external_id.as_deref())),
+                data,
+            ),
+            created_at: at,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 #[async_trait]
 impl WebhookStore for SqliteWebhookStore {
     async fn list_endpoints(
@@ -411,72 +531,7 @@ impl WebhookStore for SqliteWebhookStore {
         event: &NewWebhookEvent,
     ) -> Result<Vec<WebhookDeliveryId>, WebhookError> {
         let mut transaction = self.immediate("record_event").await?;
-        if let Some(workspace_id) = event.workspace_id {
-            // An event is its workspace's environment's, never the other one's.
-            let here = sqlx::query("SELECT 1 FROM workspaces WHERE organization_id = ? AND id = ? AND environment = ?")
-                .bind(organization_id.uuid())
-                .bind(workspace_id.uuid())
-                .bind(event.environment.as_str())
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(failed("record_event"))?;
-            if here.is_none() {
-                return Err(WebhookError::NotFound);
-            }
-        }
-        if !insert_event(&mut transaction, organization_id, event).await? {
-            // Recorded before, with its deliveries.
-            transaction.commit().await.map_err(failed("record_event"))?;
-            return Ok(Vec::new());
-        }
-        let endpoints = sqlx::query(
-            "SELECT id, events FROM webhook_endpoints WHERE organization_id = ? AND environment = ? AND enabled = 1 \
-             ORDER BY created_at, id",
-        )
-        .bind(organization_id.uuid())
-        .bind(event.environment.as_str())
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(failed("record_event"))?;
-        let kind = WebhookEventType::parse(&event.kind);
-        let mut deliveries = Vec::new();
-        for row in &endpoints {
-            let events: String = row.try_get("events").map_err(read)?;
-            if kind.is_none_or(|kind| !events_from(&events).is_ok_and(|events| events.contains(&kind))) {
-                continue;
-            }
-            let endpoint_id = WebhookEndpointId::from_uuid(row.try_get("id").map_err(read)?);
-            let delivery_id = WebhookDeliveryId::generate();
-            sqlx::query(
-                "INSERT INTO webhook_deliveries (id, organization_id, endpoint_id, event_id, state, attempts, \
-                 next_attempt_at, created_at) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)",
-            )
-            .bind(delivery_id.uuid())
-            .bind(organization_id.uuid())
-            .bind(endpoint_id.uuid())
-            .bind(event.id.uuid())
-            .bind(Timestamp::now().millis())
-            .bind(Timestamp::now().millis())
-            .execute(&mut *transaction)
-            .await
-            .map_err(failed("record_event"))?;
-            let Some(job) = delivery_job(delivery_id) else {
-                return Err(WebhookError::Unavailable);
-            };
-            insert_job(
-                &mut *transaction,
-                &Scope::Organization(organization_id),
-                &job.kind,
-                job.payload,
-                job.options,
-            )
-            .await
-            .map_err(|error| {
-                tracing::error!(event = "webhooks.job_not_queued", %error);
-                WebhookError::Unavailable
-            })?;
-            deliveries.push(delivery_id);
-        }
+        let deliveries = record_event(&mut transaction, organization_id, event).await?;
         transaction.commit().await.map_err(failed("record_event"))?;
         Ok(deliveries)
     }

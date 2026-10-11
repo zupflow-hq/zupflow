@@ -307,7 +307,8 @@ pub trait ConnectStore: Send + Sync {
     /// `NotPending` when the session isn't pending or has expired at `now`,
     /// and `InstallationChanged` per [`ConnectError::InstallationChanged`];
     /// either way nothing is written. Records `audit` of the completed
-    /// session and its installation.
+    /// session and its installation. The immutable installation.connected and
+    /// connect_session.completed events and delivery jobs commit with them.
     async fn complete_session(
         &self,
         organization_id: OrganizationId,
@@ -344,7 +345,8 @@ pub trait ConnectStore: Send + Sync {
     ) -> Result<Option<(ConnectSession, Authorization)>, ConnectError>;
 
     /// Fails a pending, unexpired session with `failure_code` (at most 60
-    /// characters). `NotPending` otherwise.
+    /// characters). `NotPending` otherwise. Records the lean connect_session.failed
+    /// snapshot and delivery jobs atomically; retries announce no second transition.
     async fn fail_session(
         &self,
         organization_id: OrganizationId,
@@ -354,7 +356,15 @@ pub trait ConnectStore: Send + Sync {
         now: Timestamp,
     ) -> Result<ConnectSession, ConnectError>;
 
-    /// Cancels a pending, unexpired session. `NotPending` otherwise.
+    /// **Cross-tenant, by design:** a background sweep attributes at most
+    /// `limit.clamp(1, 100)` due pending sessions. Each scoped write rechecks
+    /// pending and expiry, records expired and its immutable failure event
+    /// atomically, using expires_at as the event instant. Repeating the sweep
+    /// records nothing twice. It never expires completed, failed or cancelled sessions.
+    async fn expire_sessions_cross_tenant(&self, now: Timestamp, limit: u32) -> Result<usize, ConnectError>;
+
+    /// Cancels a pending, unexpired session. `NotPending` otherwise. The
+    /// connect_session.failed snapshot and delivery jobs commit with it.
     async fn cancel_session(
         &self,
         organization_id: OrganizationId,

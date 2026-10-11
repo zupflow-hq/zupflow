@@ -210,7 +210,9 @@ pub trait InstallationStore: Send + Sync {
     ) -> Result<Installation, InstallationError>;
 
     /// Marks it disconnected and deletes its credential, as one: nothing can
-    /// use an account it no longer holds. Records `audit` of it, disconnected.
+    /// use an account it no longer holds. Records `audit`, an immutable
+    /// installation.disconnected event and delivery jobs in that transaction.
+    /// An already disconnected installation is returned unchanged, with no new audit or event.
     async fn disconnect_installation(
         &self,
         organization_id: OrganizationId,
@@ -219,7 +221,8 @@ pub trait InstallationStore: Send + Sync {
         audit: &Audit<'_, Installation>,
     ) -> Result<Installation, InstallationError>;
 
-    /// Deletes it and its credential, recording `audit` of it as it was.
+    /// Deletes it and its credential, recording `audit` of it as it was, and
+    /// an immutable installation.disconnected event with its delivery jobs.
     async fn delete_installation(
         &self,
         organization_id: OrganizationId,

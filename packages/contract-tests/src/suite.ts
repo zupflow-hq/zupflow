@@ -20,6 +20,7 @@ import {
   type WebhookDeliveryId,
   type WebhookDeliverySummary,
   type WebhookEndpoint,
+  type WebhookEventType,
   type WorkspaceId,
   ZupflowApiError,
   type ZupflowClient,
@@ -2267,6 +2268,97 @@ export function contractSuite(target: Target) {
           return_url: null,
           ...extra,
         });
+
+      it("records immutable Connect lifecycle events once, within the endpoint's scope", async () => {
+        const events = [
+          "installation.connected",
+          "installation.disconnected",
+          "connect_session.completed",
+          "connect_session.failed",
+        ] as const;
+        const makeEndpoint = (environment: "sandbox" | "production", subscribed: WebhookEventType[] = [...events]) =>
+          owner.webhooks.create(fx.organization, {
+            environment,
+            url: "https://hooks.northwind.example/lifecycle",
+            description: "Lifecycle",
+            events: subscribed,
+          });
+        const hook = (await makeEndpoint("sandbox")).endpoint;
+        const production = (await makeEndpoint("production")).endpoint;
+        const unsubscribed = (await makeEndpoint("sandbox", ["run.completed"])).endpoint;
+        const foreign = (
+          await as("outsider").webhooks.create(fx.otherOrganization, {
+            environment: "sandbox",
+            url: "https://hooks.larkspur.example/lifecycle",
+            description: "Other organization lifecycle",
+            events: [...events],
+          })
+        ).endpoint;
+        const originalWorkspace = await owner.workspaces.get(qa());
+        const session = await create();
+        const reference = referenceOf(session);
+        const input = { values: { token: "lifecycle-private-token" } };
+        const options = { idempotencyKey: "lifecycle-completion" };
+        const result = await owner.connect.submitCredentials(reference, input, options);
+        expect(await owner.connect.submitCredentials(reference, input, options)).toEqual(result);
+        expect((await failure(owner.connect.submitCredentials(reference, input))).code).toBe("session_not_pending");
+        await owner.installations.disconnect(qa(), result.installation.id);
+        await owner.installations.disconnect(qa(), result.installation.id);
+        const reconnect = await create({ intent: "reconnect", installation_id: result.installation.id });
+        await owner.connect.submitCredentials(referenceOf(reconnect), input);
+        const cancelled = await create({ intent: "reconnect", installation_id: result.installation.id });
+        await owner.connect.cancel(referenceOf(cancelled));
+        expect((await failure(owner.connect.cancel(referenceOf(cancelled)))).code).toBe("session_not_pending");
+        const before = await owner.webhooks.deliveries(fx.organization, hook.id, { limit: 100 });
+        expect(before.items).toHaveLength(6);
+        const snapshots = await Promise.all(
+          before.items.map((row) => owner.webhooks.delivery(fx.organization, hook.id, row.id)),
+        );
+        const completed = snapshots.filter((row) => row.event.type === "connect_session.completed");
+        expect(completed).toHaveLength(2);
+        for (const row of completed)
+          expect(row.event.data).toMatchObject({
+            status: "completed",
+            installation_id: result.installation.id,
+            failure_code: null,
+          });
+        expect(snapshots.find((row) => row.event.type === "connect_session.failed")?.event.data).toEqual({
+          object: "connect_session",
+          id: cancelled.id,
+          status: "cancelled",
+          installation_id: null,
+          failure_code: null,
+        });
+        await owner.workspaces.update(qa(), { external_id: "lifecycle-renamed" });
+        await owner.installations.delete(qa(), result.installation.id);
+        const after = await owner.webhooks.deliveries(fx.organization, hook.id, { limit: 100 });
+        expect(after.items).toHaveLength(7);
+        expect(new Set(after.items.map((row) => row.event_id)).size).toBe(7);
+        for (const row of snapshots) {
+          expect(await owner.webhooks.delivery(fx.organization, hook.id, row.id)).toEqual(row);
+          expect(row.event.workspace).toEqual({ id: qa(), external_id: originalWorkspace.external_id });
+          expect(row.event).toMatchObject({ organization_id: fx.organization, environment: "sandbox" });
+        }
+        const deletion = must(
+          after.items.find((row) => !before.items.some((old) => old.id === row.id)),
+          "deletion event",
+        );
+        expect((await owner.webhooks.delivery(fx.organization, hook.id, deletion.id)).event).toMatchObject({
+          type: "installation.disconnected",
+          workspace: { id: qa(), external_id: "lifecycle-renamed" },
+          data: { id: result.installation.id, app_id: fx.apps.echoServer, status: "disconnected" },
+        });
+        expect((await owner.webhooks.deliveries(fx.organization, production.id)).items).toEqual([]);
+        expect((await owner.webhooks.deliveries(fx.organization, unsubscribed.id)).items).toEqual([]);
+        expect((await as("outsider").webhooks.deliveries(fx.otherOrganization, foreign.id)).items).toEqual([]);
+        expect(
+          (await owner.webhooks.deliveries(fx.organization, hook.id, { workspace_id: fx.workspaces.acmeSandbox.id }))
+            .items,
+        ).toEqual([]);
+        expect((await failure(as("outsider").webhooks.deliveries(fx.organization, hook.id))).status).toBe(404);
+        expect(JSON.stringify(snapshots)).not.toContain(input.values.token);
+        expect(JSON.stringify(snapshots)).not.toContain(reference);
+      });
 
       it("refuses an installation on a create session, including another workspace's", async () => {
         const beta = await betaLabs();

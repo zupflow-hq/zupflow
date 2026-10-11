@@ -18,6 +18,7 @@ use zupflow_core::installations::{
 };
 use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::time::Timestamp;
+use zupflow_core::webhooks::WebhookEventType;
 use zupflow_core::workspaces::Page;
 
 use crate::Database;
@@ -474,6 +475,21 @@ impl InstallationStore for SqliteInstallationStore {
         audit: &Audit<'_, Installation>,
     ) -> Result<Installation, InstallationError> {
         let mut transaction = self.immediate().await?;
+        let previous = sqlx::query(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM installations i WHERE i.organization_id = ? AND i.workspace_id = ? AND i.id = ?"
+        ))
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(installation_id.uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(failed("disconnect_installation"))?;
+        let previous = installation_from(&previous.ok_or(InstallationError::NotFound)?)?;
+        if previous.status == InstallationStatus::Disconnected {
+            return Ok(previous);
+        }
         let row = sqlx::query(concat!(
             "UPDATE installations SET status = 'disconnected', refresh_started_at = NULL, updated_at = ? \
              WHERE organization_id = ? AND workspace_id = ? AND id = ? RETURNING ",
@@ -500,6 +516,17 @@ impl InstallationStore for SqliteInstallationStore {
         crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&installation))
             .await
             .map_err(failed("audit"))?;
+        crate::webhooks::record_lifecycle(
+            &mut transaction,
+            organization_id,
+            workspace_id,
+            WebhookEventType::InstallationDisconnected,
+            serde_json::json!({ "object": "installation", "id": installation.id,
+                "app_id": installation.app.id(), "status": "disconnected" }),
+            Timestamp::now(),
+        )
+        .await
+        .map_err(|_| InstallationError::Unavailable)?;
         transaction.commit().await.map_err(failed("disconnect_installation"))?;
         Ok(installation)
     }
@@ -527,6 +554,17 @@ impl InstallationStore for SqliteInstallationStore {
         crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&installation))
             .await
             .map_err(failed("audit"))?;
+        crate::webhooks::record_lifecycle(
+            &mut transaction,
+            organization_id,
+            workspace_id,
+            WebhookEventType::InstallationDisconnected,
+            serde_json::json!({ "object": "installation", "id": installation.id,
+                "app_id": installation.app.id(), "status": "disconnected" }),
+            Timestamp::now(),
+        )
+        .await
+        .map_err(|_| InstallationError::Unavailable)?;
         transaction.commit().await.map_err(failed("delete_installation"))?;
         Ok(())
     }
@@ -645,15 +683,14 @@ impl InstallationStore for SqliteInstallationStore {
         crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&installation))
             .await
             .map_err(failed("audit"))?;
-        let job = zupflow_core::webhooks::Announcement::reconnect_required(installation_id, now)
-            .job()
-            .ok_or(InstallationError::Unavailable)?;
-        crate::job_queue::insert_job(
-            &mut *transaction,
-            &zupflow_core::scope::Scope::Workspace(organization_id, workspace_id),
-            &job.kind,
-            job.payload,
-            job.options,
+        crate::webhooks::record_lifecycle(
+            &mut transaction,
+            organization_id,
+            workspace_id,
+            WebhookEventType::InstallationReconnectRequired,
+            serde_json::json!({ "object": "installation", "id": installation.id,
+                "app_id": installation.app.id(), "status": "reconnect_required" }),
+            now,
         )
         .await
         .map_err(|_| InstallationError::Unavailable)?;
@@ -839,6 +876,7 @@ mod tests {
             &SqliteInstallationStore::new(database.clone()),
             &crate::SqliteAuditStore::new(database.clone()),
             &crate::SqliteJobQueue::new(database.clone()),
+            &crate::SqliteWebhookStore::new(database.clone()),
             prepare(database),
         )
         .await;
@@ -903,7 +941,7 @@ mod tests {
                 AuditPlace::Workspace(tenant.sandbox),
             )
         };
-        sqlx::query("CREATE TRIGGER refuse_outbox BEFORE INSERT ON jobs BEGIN SELECT RAISE(ABORT, 'unavailable'); END")
+        sqlx::query("CREATE TRIGGER refuse_outbox BEFORE INSERT ON webhook_events BEGIN SELECT RAISE(ABORT, 'unavailable'); END")
             .execute(database.pool())
             .await
             .unwrap();
@@ -975,7 +1013,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(audit_count, 1);
-        let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
+        let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM webhook_events")
             .fetch_one(database.pool())
             .await
             .unwrap();

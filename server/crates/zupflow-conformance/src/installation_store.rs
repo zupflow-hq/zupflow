@@ -27,7 +27,7 @@ use zupflow_core::installations::{
 use zupflow_core::jobs::JobQueue;
 use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::scope::{Name, Scope};
-use zupflow_core::webhooks::{ANNOUNCE, Announcement, Subject, WebhookEventType};
+use zupflow_core::webhooks::{DELIVER, NewEndpoint, WebhookEventType, WebhookStore, delivery_of};
 
 use crate::audit_store::by_suite_in;
 
@@ -147,8 +147,14 @@ async fn install(
 
 /// `audit` and `jobs` read the effects written by the installation store.
 /// The queue is isolated to this suite, with no workers consuming it.
-pub async fn run(store: &dyn InstallationStore, audit: &dyn AuditStore, jobs: &dyn JobQueue, prepare: Prepare) {
-    serializes_refresh_and_guards_every_scope(store, audit, jobs, &prepare).await;
+pub async fn run(
+    store: &dyn InstallationStore,
+    audit: &dyn AuditStore,
+    jobs: &dyn JobQueue,
+    webhooks: &dyn WebhookStore,
+    prepare: Prepare,
+) {
+    serializes_refresh_and_guards_every_scope(store, audit, jobs, webhooks, &prepare).await;
     creates_and_finds_within_its_workspace(store, &prepare).await;
     refuses_an_app_the_workspace_cannot_install(store, &prepare).await;
     lists_its_own_workspace_newest_first(store, &prepare).await;
@@ -542,6 +548,7 @@ async fn serializes_refresh_and_guards_every_scope(
     store: &dyn InstallationStore,
     audit_store: &dyn AuditStore,
     jobs: &dyn JobQueue,
+    webhooks: &dyn WebhookStore,
     prepare: &Prepare,
 ) {
     use zupflow_core::{installations::RefreshClaim, time::Timestamp};
@@ -561,13 +568,37 @@ async fn serializes_refresh_and_guards_every_scope(
             AuditPlace::Workspace(a.sandbox),
         )
     };
+    webhooks
+        .create_endpoint(
+            a.organization_id,
+            zupflow_core::ids::WebhookEndpointId::generate(),
+            &NewEndpoint {
+                environment: Environment::Sandbox,
+                url: "https://hooks.example/refresh".to_owned(),
+                description: String::new(),
+                events: vec![WebhookEventType::InstallationReconnectRequired],
+                secret: credential(1).sealed,
+                secret_last4: "last".to_owned(),
+            },
+            now,
+            &crate::audit_store::by_suite,
+        )
+        .await
+        .unwrap();
     let events = |org| async move {
         audit_store
-            .list_audit_events(org, &AuditFilter::default(), None, 100)
+            .list_audit_events(
+                org,
+                &AuditFilter {
+                    workspace_id: Some(a.sandbox),
+                },
+                None,
+                100,
+            )
             .await
             .unwrap()
     };
-    let kind = Name::new(ANNOUNCE).unwrap();
+    let kind = Name::new(DELIVER).unwrap();
     let announced = || async {
         let mut claimed = Vec::new();
         while let Some(job) = jobs
@@ -578,7 +609,15 @@ async fn serializes_refresh_and_guards_every_scope(
             jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
             claimed.push((
                 job.scope,
-                Announcement::parse(&job.payload).expect("an announcement reads back"),
+                serde_json::from_str::<serde_json::Value>(
+                    &webhooks
+                        .find_delivery(a.organization_id, delivery_of(&job.payload).unwrap())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .body,
+                )
+                .unwrap(),
             ));
         }
         claimed
@@ -714,15 +753,14 @@ async fn serializes_refresh_and_guards_every_scope(
     assert_eq!(events(b.organization_id).await.total, 0);
     let claimed = announced().await;
     assert_eq!(claimed.len(), 1, "one outbox event for the committed transition");
-    let (scope, announcement) = claimed[0];
-    assert_eq!(scope, Scope::Workspace(a.organization_id, a.sandbox));
+    let (scope, announcement) = &claimed[0];
+    assert_eq!(*scope, Scope::Organization(a.organization_id));
+    assert_eq!(announcement["type"], "installation.reconnect_required");
+    assert_eq!(announcement["created_at"], serde_json::json!(now));
     assert_eq!(
-        (announcement.kind, announcement.subject, announcement.created_at),
-        (
-            WebhookEventType::InstallationReconnectRequired,
-            Subject::Installation(i.id),
-            now
-        )
+        announcement["data"],
+        serde_json::json!({ "object": "installation", "id": i.id,
+        "app_id": a.catalog_app, "status": "reconnect_required" })
     );
     assert_eq!(
         store
