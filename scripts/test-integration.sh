@@ -11,3 +11,4 @@ export CARGO_INCREMENTAL=0
 cd "$integration_root/server"
 cargo test --locked -p zupflow-contract --features zupflow-contract/local-apps \
   --test local_apps --test taskboard_end_to_end
+"$integration_root/scripts/connect-browser.sh"

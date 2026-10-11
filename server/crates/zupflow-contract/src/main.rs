@@ -13,6 +13,8 @@
 //!                                                   the background workers run, as in `zupflow`; only
 //!                                                   when built with the `local-apps` feature
 //! zupflow-contract-server reset <database>          restore the reference fixture
+//! zupflow-contract-server expire-connect <database> <organization> <workspace> <session>
+//!                                                   expire one pending session in that exact scope
 //! zupflow-contract-server operations                the operations the API serves, comma-separated
 //! ```
 //!
@@ -1225,6 +1227,60 @@ fn fixture_tool(name: &str, title: &str, description: &str, read_only: bool) -> 
     }
 }
 
+/// Moves only this pending fixture session's deadline into the past. The
+/// normal API and expiry worker still own its terminal transition and events.
+/// This command never accepts or returns a possession reference or OAuth state.
+async fn expire_connect(
+    pool: &SqlitePool,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    session_id: ConnectSessionId,
+) -> Result<(), String> {
+    let now = Timestamp::now().millis();
+    let changed = sqlx::query(
+        "UPDATE connect_sessions SET created_at = ?, expires_at = ? \
+         WHERE organization_id = ? AND workspace_id = ? AND id = ? \
+         AND status = 'pending' AND expires_at > ?",
+    )
+    .bind(now - zupflow_core::connect::SESSION_TTL_MS - 1)
+    .bind(now - 1)
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(session_id.uuid())
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(|_| "can't expire fixture session".to_owned())?;
+    if changed.rows_affected() != 1 {
+        return Err("no pending fixture session in that scope".to_owned());
+    }
+    Ok(())
+}
+
+async fn expire_connect_command(path: &str, organization: &str, workspace: &str, session: &str) -> Result<(), String> {
+    let organization_id = organization
+        .parse::<OrganizationId>()
+        .map_err(|_| "invalid organization ID".to_owned())?;
+    let workspace_id = workspace
+        .parse::<WorkspaceId>()
+        .map_err(|_| "invalid workspace ID".to_owned())?;
+    let session_id = session
+        .parse::<ConnectSessionId>()
+        .map_err(|_| "invalid Connect session ID".to_owned())?;
+    // Refuse a typo instead of creating or migrating another database.
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_secs(5));
+    let pool = SqlitePool::connect_with(options)
+        .await
+        .map_err(|_| "can't open existing fixture database".to_owned())?;
+    let result = expire_connect(&pool, organization_id, workspace_id, session_id).await;
+    pool.close().await;
+    result
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1235,6 +1291,9 @@ async fn main() -> ExitCode {
             Err(error) => Err(error),
         },
         ["reset", database] => reset(database).await,
+        ["expire-connect", database, organization, workspace, session] => {
+            expire_connect_command(database, organization, workspace, session).await
+        }
         ["operations"] => {
             #[allow(clippy::print_stdout)]
             {
@@ -1243,7 +1302,7 @@ async fn main() -> ExitCode {
             Ok(())
         }
         _ => Err(
-            "usage: zupflow-contract-server serve <database> [--console <origin>] [--local-app <host>=<certificate.pem>]... | reset <database> | operations"
+            "usage: zupflow-contract-server serve <database> [--console <origin>] [--local-app <host>=<certificate.pem>]... | reset <database> | expire-connect <database> <organization> <workspace> <session> | operations"
                 .to_owned(),
         ),
     };

@@ -415,7 +415,8 @@ the reference fixture into a throwaway database, serves it on loopback and
 points the suite at it. Cases that need an operation the backend doesn't serve
 yet are skipped, each naming the operation. CI runs it after `pnpm check`.
 
-For the shared suite and the complete Taskboard journeys in one command:
+For the shared suite, Taskboard journeys and hosted Connect browser tests in
+one command (install Chromium as described below first):
 
 ```bash
 pnpm test:integration
@@ -538,6 +539,55 @@ backend registered with an earlier run is unknown to it. When refreshing
 reports `invalid_client`, Zupflow forgets that registration and the next
 Connect registers again.
 
+### Hosted Connect browser tests
+
+```bash
+pnpm --filter @zupflow/contract-tests exec playwright install chromium
+pnpm test:browser
+# Run all journeys in one viewport and theme while developing:
+pnpm test:browser --project=mobile-dark
+```
+
+On Linux, use `playwright install --with-deps chromium` to install the browser's
+system dependencies too, as CI does. The suite builds the development binaries
+in `server/target` with incremental compilation disabled, then runs 19 journeys
+in Chromium at desktop (1280 × 800) and mobile (375 × 812) sizes, each in light
+and dark mode: 76 cases. It exercises the backend's hosted page and JavaScript,
+with a fresh SQLite fixture and browser context for every case. OAuth journeys
+also start a fresh Taskboard server, reached over HTTPS with its own pinned
+certificate; token verification uses the contract server's deterministic
+provider fixture. No deployed service or provider account is needed.
+
+Coverage includes token validation and retries, stale tabs, cancellation,
+unknown and expired links, OAuth consent and denial, callback replay, state and
+issuer tampering, expiry during consent, reconnecting the same installation,
+and organization, workspace and environment boundaries. It also checks popup
+messages, allowed and refused frames, return-URL allowlists, keyboard focus,
+layout width, theme, security headers, script errors and browser storage.
+Popup cancellation and denial use the page's Close window button. Those checks
+handle Playwright's target-closed click race while still requiring a close event
+and a responsive opener; unrelated click failures remain failures.
+The browser's scope is Chromium; these checks do not establish Firefox or
+Safari compatibility or compare pixel snapshots.
+
+Expiry uses the development-only command
+`zupflow-contract-server expire-connect <database> <organization> <workspace> <session>`.
+It moves one still-pending session's deadline into the past only when all three
+typed IDs match, leaving the normal API and expiry worker to record its outcome.
+The suite checks wrong scopes, malformed IDs and already-finished sessions.
+This adds no clock-control or reset HTTP endpoint.
+
+Connect references, OAuth state and codes can appear in browser diagnostics.
+Run this suite through `pnpm test:browser`: its reporter and output filter emit
+only fixed case names, outcomes and allowlisted failure-step labels. Script,
+security-policy and credential-leak checks have distinct labels. Traces, videos
+and screenshots are disabled;
+temporary profiles, databases and any automatically generated error context
+stay in an owner-only temporary directory that the runner removes on completion,
+failure or a handled interrupt. CI uploads no browser artifacts. Investigate a
+failure using fixed, source-controlled diagnostic labels rather than logging
+URLs, errors, request data or the DOM.
+
 ## Checks
 
 ```bash
@@ -546,7 +596,8 @@ pnpm test         # Vitest and cargo test
 pnpm format       # Apply Biome fixes
 ```
 
-CI runs `pnpm check` on every push and pull request.
+CI runs `pnpm check`, the shared backend contract suite and the hosted Connect
+browser suite on every push and pull request.
 
 ## How the Console is built
 

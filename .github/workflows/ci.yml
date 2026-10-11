@@ -45,6 +45,10 @@ jobs:
       - run: pnpm check
       # The shared contract suite against the backend, on a fixture of its own.
       - run: pnpm contract:backend
+      # Real hosted Connect JavaScript against disposable local fixtures.
+      # The runner emits only safe case names and statuses; no browser artifacts.
+      - run: pnpm --filter @zupflow/contract-tests exec playwright install --with-deps chromium
+      - run: pnpm test:browser
 
   # The product builds for release, without the development-only crates. A
   # job of its own: next to the debug build it runs the runner out of disk.
