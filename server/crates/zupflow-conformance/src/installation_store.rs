@@ -79,6 +79,7 @@ pub fn snapshot(app_version: u32) -> TemplateSnapshot {
         auth: AuthTemplate::OAuth2 {
             authorize_url: Some("https://accounts.example/authorize".to_owned()),
             token_url: Some("https://accounts.example/token".to_owned()),
+            issuer: Some("https://ACCOUNTS.example/".to_owned()),
             available_scopes: vec![OAuthScope {
                 name: "read".to_owned(),
                 description: "Read".to_owned(),

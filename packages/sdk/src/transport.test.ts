@@ -1,4 +1,4 @@
-import type { OrganizationId } from "@zupflow/contract";
+import type { AuthTemplate, OrganizationId } from "@zupflow/contract";
 import { IDEMPOTENCY_HEADER } from "@zupflow/contract/idempotency";
 import { describe, expect, it } from "vitest";
 import { createClient } from "./client";
@@ -12,6 +12,32 @@ function fakeFetch(status: number, body: unknown, seen: Request[] = []): typeof 
 }
 
 describe("createHttpTransport", () => {
+  it("preserves an OAuth issuer exactly when updating either app scope", async () => {
+    const seen: Request[] = [];
+    const auth: AuthTemplate = {
+      type: "oauth2",
+      authorize_url: "https://auth.provider.example/authorize",
+      token_url: "https://auth.provider.example/token",
+      issuer: "https://AUTH.provider.example/Tenant/",
+      identity_url: null,
+      available_scopes: [],
+      pkce: true,
+    };
+    const client = createClient(
+      createHttpTransport({
+        baseUrl: "https://api.zupflow.example",
+        getToken: async () => null,
+        fetch: fakeFetch(200, { data: { auth }, meta: null, error: null }, seen),
+      }),
+    );
+    for (const result of [
+      await client.organizationApps.update("org_1", "app_1", { auth }),
+      await client.workspaceApps.update("ws_1", "app_1", { auth }),
+    ])
+      expect(result.auth).toEqual(auth);
+    for (const request of seen) expect(await request.json()).toEqual({ auth });
+  });
+
   it("unwraps the envelope and sends a fresh bearer token", async () => {
     const seen: Request[] = [];
     let calls = 0;

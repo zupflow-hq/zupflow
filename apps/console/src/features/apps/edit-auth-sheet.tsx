@@ -36,6 +36,13 @@ const scopeList = z
 const oauthSchema = z.object({
   authorize_url: optionalUrl,
   token_url: optionalUrl,
+  // An issuer is an exact identifier; trimming it changes what was trusted.
+  issuer: z
+    .string()
+    .refine(
+      (value) => value === "" || (/^https:\/\/[^/]/i.test(value) && !/[\s\\?#]|\p{Cc}/u.test(value)),
+      "Use the exact https:// issuer without whitespace, a query or a fragment, or leave it blank.",
+    ),
   identity_url: optionalUrl,
   pkce: z.boolean(),
   scopes: scopeList,
@@ -82,6 +89,7 @@ const orNull = (value: string) => (value.trim() === "" ? null : value.trim());
 const OAUTH_FIELDS: Record<string, FieldPath<OAuthValues>> = {
   "auth.authorize_url": "authorize_url",
   "auth.token_url": "token_url",
+  "auth.issuer": "issuer",
   "auth.identity_url": "identity_url",
   "auth.pkce": "pkce",
   "auth.available_scopes": "scopes",
@@ -248,6 +256,7 @@ function OAuthForm({
   const defaults = (): OAuthValues => ({
     authorize_url: auth.authorize_url ?? "",
     token_url: auth.token_url ?? "",
+    issuer: auth.issuer ?? "",
     identity_url: auth.identity_url ?? "",
     pkce: auth.pkce,
     scopes: auth.available_scopes.map((scope) => ({ ...scope })),
@@ -269,6 +278,7 @@ function OAuthForm({
               type: "oauth2",
               authorize_url: orNull(values.authorize_url),
               token_url: orNull(values.token_url),
+              issuer: values.issuer === "" ? null : values.issuer,
               identity_url: orNull(values.identity_url),
               pkce: values.pkce,
               available_scopes: values.scopes,
@@ -289,6 +299,13 @@ function OAuthForm({
           placeholder="https://provider.example/oauth/authorize"
         />
         <UrlField form={form} name="token_url" label="Token URL" placeholder="https://provider.example/oauth/token" />
+        <UrlField
+          form={form}
+          name="issuer"
+          label="Issuer"
+          placeholder="https://provider.example"
+          description="Optional. Set the provider's exact issuer if it returns iss. Every sign-in response must then match, including errors. Letter case and trailing slashes matter."
+        />
         <UrlField
           form={form}
           name="identity_url"

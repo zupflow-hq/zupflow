@@ -871,12 +871,144 @@ export function contractSuite(target: Target) {
         it("sets an OAuth app's endpoints and raises its version", async () => {
           const app = await newOAuthApp("templated");
           const updated = await owner.organizationApps.update(fx.organization, app.id, { auth: oauthTemplate });
-          expect(updated.auth).toEqual({ ...oauthTemplate, authorize_url: "https://auth.provider.example/authorize" });
+          expect(updated.auth).toEqual({
+            ...oauthTemplate,
+            authorize_url: "https://auth.provider.example/authorize",
+            issuer: null,
+          });
           expect(updated.version).toBe(app.version + 1);
           expect((await owner.organizationApps.get(fx.organization, app.id)).auth).toEqual(updated.auth);
           // Renaming alone leaves the template and the version as they are.
           const renamed = await owner.organizationApps.update(fx.organization, app.id, { name: "Renamed" });
           expect([renamed.auth, renamed.version]).toEqual([updated.auth, updated.version]);
+        });
+
+        it("persists an exact configured issuer and clears it with null or an old template", async () => {
+          const app = await newOAuthApp("issuer");
+          for (const issuer of ["https://AUTH.provider.example/Tenant/", "https://auth.provider.example", null]) {
+            const updated = await owner.organizationApps.update(fx.organization, app.id, {
+              auth: { ...oauthTemplate, issuer },
+            });
+            expect(updated.auth.type === "oauth2" && updated.auth.issuer).toBe(issuer);
+            expect((await owner.organizationApps.get(fx.organization, app.id)).auth).toEqual(updated.auth);
+          }
+          const legacy = await owner.organizationApps.update(fx.organization, app.id, { auth: oauthTemplate });
+          expect(legacy.auth.type === "oauth2" && legacy.auth.issuer).toBeNull();
+        });
+
+        it("refuses unsafe or ambiguous configured issuers without changing the app", async () => {
+          const app = await newOAuthApp("issuer-validation");
+          for (const [issuer, status, code] of [
+            ["", 400, "validation_failed"],
+            ["not a URL", 400, "validation_failed"],
+            [" https://auth.provider.example", 400, "validation_failed"],
+            ["https://auth.provider.example ", 400, "validation_failed"],
+            ["https://auth.provider.example/\u0085tenant", 400, "validation_failed"],
+            ["https://auth.provider.example/\ufefftenant", 400, "validation_failed"],
+            ["https://auth.provider.example/\u0000tenant", 400, "validation_failed"],
+            ["https:////auth.provider.example", 400, "validation_failed"],
+            ["https://auth.provider.example/tenant?", 400, "validation_failed"],
+            ["https://auth.provider.example/tenant#", 400, "validation_failed"],
+            ["https://auth.provider.example?tenant=one", 400, "validation_failed"],
+            ["https://auth.provider.example#one", 400, "validation_failed"],
+            ["https://auth.provider.example\\tenant", 400, "validation_failed"],
+            ["https:/auth.provider.example", 400, "validation_failed"],
+            ["http://auth.provider.example", 422, "insecure_url"],
+            ["https://user:password@auth.provider.example", 400, "validation_failed"],
+            ["https://@auth.provider.example", 400, "validation_failed"],
+            ["https://localhost", 422, "destination_not_allowed"],
+            ["https://127.0.0.1", 422, "destination_not_allowed"],
+            ["https://[::1]", 422, "destination_not_allowed"],
+          ] as const) {
+            const error = await failure(
+              owner.organizationApps.update(fx.organization, app.id, {
+                name: "Must not change",
+                auth: { ...oauthTemplate, issuer },
+              }),
+            );
+            expect([error.status, error.code, Object.keys(error.fields ?? {})], issuer).toEqual([
+              status,
+              code,
+              ["auth.issuer"],
+            ]);
+          }
+          expect(await owner.organizationApps.get(fx.organization, app.id)).toEqual(app);
+        });
+
+        it("validates an issuer's shape before scope conflicts and URL policy", async () => {
+          const app = await newOAuthApp("issuer-validation-order");
+          await owner.organizationApps.update(fx.organization, app.id, { auth: oauthTemplate });
+          await owner.organizationApps.updateConfiguration(fx.organization, app.id, "sandbox", {
+            oauth_scopes: ["read"],
+          });
+          const before = await owner.organizationApps.get(fx.organization, app.id);
+          for (const issuer of [
+            "https://auth.provider.example?tenant=one",
+            "https://auth.provider.example#one",
+            "https://user:password@auth.provider.example",
+            "https://@auth.provider.example",
+            "https://[invalid",
+          ]) {
+            for (const available_scopes of [[], oauthTemplate.available_scopes]) {
+              const error = await failure(
+                owner.organizationApps.update(fx.organization, app.id, {
+                  auth: {
+                    ...oauthTemplate,
+                    issuer,
+                    available_scopes,
+                    authorize_url: "http://auth.provider.example/authorize",
+                  },
+                }),
+              );
+              expect([error.status, error.code, Object.keys(error.fields ?? {})], issuer).toEqual([
+                400,
+                "validation_failed",
+                ["auth.issuer"],
+              ]);
+            }
+          }
+          // HTTPS/public-host policy remains after conflicts in the decision order.
+          for (const issuer of ["http://auth.provider.example", "https://localhost"]) {
+            const error = await failure(
+              owner.organizationApps.update(fx.organization, app.id, {
+                auth: { ...oauthTemplate, issuer, available_scopes: [] },
+              }),
+            );
+            expect([error.status, error.code]).toEqual([409, "scope_in_use"]);
+          }
+          expect(await owner.organizationApps.get(fx.organization, app.id)).toEqual(before);
+        });
+
+        it("keeps configured issuers inside their organization and workspace", async () => {
+          const ws = fx.workspaces.qaPlayground.id;
+          const sibling = fx.workspaces.acmeSandbox.id;
+          const catalog = await newOAuthApp("issuer-catalog");
+          const own = await owner.workspaceApps.create(ws, {
+            kind: "mcp",
+            name: "Provider",
+            slug: "issuer-workspace",
+            description: "",
+            auth_type: "oauth2",
+          });
+          const auth = { ...oauthTemplate, issuer: "https://auth.provider.example/tenant" };
+          await owner.workspaceApps.update(ws, own.id, { auth });
+          const saved = await owner.workspaceApps.get(ws, own.id);
+          expect(saved.auth.type === "oauth2" && saved.auth.issuer).toBe(auth.issuer);
+          for (const request of [
+            () => as("outsider").organizationApps.update(fx.organization, catalog.id, { auth }),
+            () => naming("outsider", () => fx.organization).workspaceApps.update(ws, own.id, { auth }),
+            () => owner.workspaceApps.update(sibling, own.id, { auth: { ...auth, issuer: null } }),
+          ])
+            expect((await failure(request())).status).toBe(404);
+          for (const persona of ["viewer", "developer"] as const) {
+            expect(
+              (await failure(as(persona).organizationApps.update(fx.organization, catalog.id, { auth }))).status,
+            ).toBe(403);
+            expect((await failure(as(persona).workspaceApps.update(ws, own.id, { auth }))).status).toBe(403);
+          }
+          expect(await owner.workspaceApps.get(ws, own.id)).toEqual(saved);
+          expect(await owner.organizationApps.get(fx.organization, catalog.id)).toEqual(catalog);
+          expect((await owner.workspaceApps.list(sibling)).some((app) => app.id === own.id)).toBe(false);
         });
 
         it("sets a workspace app's token template", async () => {

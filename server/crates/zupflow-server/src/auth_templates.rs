@@ -55,6 +55,47 @@ fn url(raw: &Map<String, Value>, key: &str, fields: &mut Fields) -> Option<Optio
     }
 }
 
+/// Issuer identifiers compare exactly; never trim or normalize one.
+fn issuer(raw: &Map<String, Value>, fields: &mut Fields) -> Option<Option<String>> {
+    match raw.get("issuer") {
+        None | Some(Value::Null) => Some(None),
+        Some(Value::String(value))
+            if !value.is_empty()
+                && !value
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || c == '\u{feff}' || c == '\\')
+                && value.split_once("://").is_some_and(|(scheme, authority)| {
+                    let mut chars = scheme.chars();
+                    !authority.is_empty()
+                        && !authority.starts_with('/')
+                        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+                        && chars.all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
+                }) =>
+        {
+            if url::Url::parse(value).is_err() {
+                fields.invalid("auth.issuer", "Enter a full URL, including https://.");
+                return None;
+            }
+            let authority = value.split('/').nth(2).unwrap_or_default();
+            if value.contains(['?', '#']) || authority.contains('@') {
+                fields.invalid(
+                    "auth.issuer",
+                    "Use an issuer URL without credentials, a query or a fragment.",
+                );
+                return None;
+            }
+            Some(Some(value.clone()))
+        }
+        _ => {
+            fields.invalid(
+                "auth.issuer",
+                "Use a full issuer URL without whitespace, or null for none.",
+            );
+            None
+        }
+    }
+}
+
 /// A string up to `max` characters, or `null`; blank is `null`. `Err` when invalid.
 fn optional_text(value: Option<&Value>, max: usize) -> Result<Option<String>, ()> {
     match value {
@@ -469,13 +510,20 @@ pub fn checked_auth_template(
         let authorize_url = url(raw, "authorize_url", &mut fields);
         let token_url = url(raw, "token_url", &mut fields);
         let identity_url = url(raw, "identity_url", &mut fields);
+        let issuer = issuer(raw, &mut fields);
         let available_scopes = scopes(raw, "available_scopes", &mut fields);
         let pkce = raw.get("pkce").and_then(Value::as_bool);
         if pkce.is_none() {
             fields.invalid("auth.pkce", "Must be true or false.");
         }
-        let (Some(authorize_url), Some(token_url), Some(identity_url), Some(available_scopes), Some(pkce)) =
-            (authorize_url, token_url, identity_url, available_scopes, pkce)
+        let (
+            Some(authorize_url),
+            Some(token_url),
+            Some(identity_url),
+            Some(issuer),
+            Some(available_scopes),
+            Some(pkce),
+        ) = (authorize_url, token_url, identity_url, issuer, available_scopes, pkce)
         else {
             return Err(validation(fields));
         };
@@ -510,9 +558,13 @@ pub fn checked_auth_template(
                 check_public_https(value, &format!("auth.{key}"))?;
             }
         }
+        if let Some(issuer) = &issuer {
+            check_public_https(issuer, "auth.issuer")?;
+        }
         return Ok(AuthTemplate::OAuth2 {
             authorize_url,
             token_url,
+            issuer,
             available_scopes,
             pkce,
             identity_url,

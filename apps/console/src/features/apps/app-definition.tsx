@@ -150,6 +150,13 @@ export function AuthTemplatePanel({ app, onEdit }: { app: AppDefinition; onEdit?
                 <span className="text-muted-foreground">Not set</span>
               )}
             </Property>
+            <Property label="Issuer">
+              {auth.issuer ? (
+                <MonoValue value={auth.issuer} />
+              ) : (
+                <span className="text-muted-foreground">Not set; sign-in responses must omit iss</span>
+              )}
+            </Property>
             <Property label="Account identity">
               {auth.identity_url ? (
                 <MonoValue value={auth.identity_url} />

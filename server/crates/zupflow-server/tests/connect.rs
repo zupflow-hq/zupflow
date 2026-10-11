@@ -1518,3 +1518,124 @@ async fn refuses_a_supplied_issuer_without_a_trusted_configured_issuer() {
         .await;
     assert_eq!(body["data"]["failure_code"], "authorization_failed");
 }
+
+async fn set_issuer(server: &Server, org: &str, app: &str, issuer: Option<&str>) {
+    let path = format!("/v1/organizations/{org}/apps/{app}");
+    let (_, body) = server.send(call("alice", Method::GET, &path)).await;
+    let mut auth = body["data"]["auth"].clone();
+    auth["issuer"] = json!(issuer);
+    let (status, body) = server
+        .send(call("alice", Method::PATCH, &path).body(json!({ "auth": auth })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["auth"]["issuer"], json!(issuer));
+}
+
+fn callback_url(state: &str, issuer: Option<&str>, error: bool) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("state", state);
+    query.append_pair(
+        if error { "error" } else { "code" },
+        if error { "access_denied" } else { "c-1" },
+    );
+    if let Some(issuer) = issuer {
+        query.append_pair("iss", issuer);
+    }
+    format!("/connect/oauth/callback?{}", query.finish())
+}
+
+#[tokio::test]
+async fn configured_issuer_requires_an_exact_match_before_codes_or_errors() {
+    let server = Server::new().await;
+    let t = tenant(&server, "alice", "northwind").await;
+    let app = oauth_app(&server, &t.org).await;
+    const ISSUER: &str = "https://ACCOUNTS.example/Tenant/";
+    set_issuer(&server, &t.org, &app, Some(ISSUER)).await;
+    for error in [false, true] {
+        for issuer in [
+            None,
+            Some(""),
+            Some("https://foreign.example/Tenant/"),
+            Some("https://accounts.example/Tenant/"),
+            Some("https://ACCOUNTS.example/Tenant"),
+            Some(ISSUER),
+        ] {
+            let (_, created) = server
+                .send(start("alice", &t.org, &t.sandbox, session(&app, Value::Null)))
+                .await;
+            let reference = reference_of(&created["data"]);
+            let (_, consent) = authorize(&server, &reference).await;
+            let valid = issuer == Some(ISSUER);
+            if valid && !error {
+                server.providers.script(TOKEN, 200, tokens("at-issuer"));
+                server
+                    .providers
+                    .script(IDENTITY, 200, json!({ "sub": "person-1", "name": "Jordan" }));
+            }
+            let sent = server.providers.sent().len();
+            let (status, _, _) = server.visit(&callback_url(&consent["state"], issuer, error)).await;
+            assert_eq!(status, StatusCode::SEE_OTHER);
+            assert_eq!(
+                server.providers.sent().len() - sent,
+                if valid && !error { 2 } else { 0 },
+                "{issuer:?}, error={error}"
+            );
+            let result = hosted(&server, &reference).await;
+            if valid && !error {
+                assert_eq!(result["status"], "completed", "{result}");
+            } else {
+                assert_eq!(result["status"], "failed", "{result}");
+                assert_eq!(
+                    result["failure_code"],
+                    if valid {
+                        "consent_denied"
+                    } else {
+                        "authorization_failed"
+                    }
+                );
+                assert!(result["installation_id"].is_null());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn configured_issuer_stays_bound_to_the_authorization_attempt_after_template_edits() {
+    let server = Server::new().await;
+    let t = tenant(&server, "alice", "northwind").await;
+    let app = oauth_app(&server, &t.org).await;
+    let old = Some("https://accounts.example/old");
+    let new = Some("https://accounts.example/new");
+    for (before, after, returned, accepted) in [
+        (old, new, old, true),
+        (old, new, new, false),
+        (old, None, None, false),
+        (old, None, old, true),
+        (None, new, new, false),
+        (None, new, None, true),
+    ] {
+        set_issuer(&server, &t.org, &app, before).await;
+        let (_, created) = server
+            .send(start("alice", &t.org, &t.sandbox, session(&app, Value::Null)))
+            .await;
+        let reference = reference_of(&created["data"]);
+        let (_, consent) = authorize(&server, &reference).await;
+        set_issuer(&server, &t.org, &app, after).await;
+        if accepted {
+            server.providers.script(TOKEN, 200, tokens("at-bound"));
+            server
+                .providers
+                .script(IDENTITY, 200, json!({ "sub": "person-1", "name": "Jordan" }));
+        }
+        let sent = server.providers.sent().len();
+        let (status, _, _) = server.visit(&callback_url(&consent["state"], returned, false)).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(server.providers.sent().len() - sent, if accepted { 2 } else { 0 });
+        let result = hosted(&server, &reference).await;
+        assert_eq!(
+            result["status"],
+            if accepted { "completed" } else { "failed" },
+            "before={before:?}, after={after:?}, returned={returned:?}: {result}"
+        );
+    }
+}

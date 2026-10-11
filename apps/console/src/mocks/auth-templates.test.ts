@@ -1,5 +1,45 @@
+import type { AuthTemplate } from "@zupflow/sdk";
 import { describe, expect, it } from "vitest";
-import { validPattern } from "./auth-templates";
+import { checkedAuthTemplate, validPattern } from "./auth-templates";
+
+describe("configured OAuth issuer", () => {
+  const legacy: AuthTemplate = {
+    type: "oauth2",
+    authorize_url: null,
+    token_url: null,
+    identity_url: null,
+    pkce: true,
+    available_scopes: [],
+  };
+
+  it("keeps old templates compatible and preserves an issuer's exact spelling", () => {
+    expect(checkedAuthTemplate(legacy, legacy, [])).toEqual({ ...legacy, issuer: null });
+    const issuer = "https://AUTH.provider.example/Tenant/";
+    expect(checkedAuthTemplate(legacy, { ...legacy, issuer }, [])).toEqual({ ...legacy, issuer });
+  });
+
+  it("refuses ambiguous, private or non-HTTPS issuer identifiers", () => {
+    for (const issuer of [
+      "",
+      " https://auth.provider.example",
+      "https://auth.provider.example ",
+      "https://auth.provider.example?",
+      "https://auth.provider.example#",
+      "https://auth.provider.example/?tenant=x",
+      "https://auth.provider.example/#tenant",
+      "https://user:secret@auth.provider.example",
+      "https://@auth.provider.example",
+      "http://auth.provider.example",
+      "https://localhost",
+      "https://127.0.0.1",
+      "https://auth.provider.example\\tenant",
+      "https:/auth.provider.example",
+      42,
+    ]) {
+      expect(() => checkedAuthTemplate(legacy, { ...legacy, issuer }, []), String(issuer)).toThrow();
+    }
+  });
+});
 
 // The same table as the backend's `accepts_only_the_portable_grammar`.
 describe("validPattern", () => {

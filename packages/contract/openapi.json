@@ -2084,6 +2084,17 @@
               }
             ]
           },
+          "issuer": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uri"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "available_scopes": {
             "type": "array",
             "items": {

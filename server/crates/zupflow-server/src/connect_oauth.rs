@@ -63,6 +63,8 @@ struct Sealing<'a> {
     verifier: Option<&'a str>,
     /// For an `mcp_oauth` app: where the start signed in, and as whom.
     client: Option<&'a DiscoveredClient>,
+    /// A configured OAuth app's exact trusted issuer at authorization start.
+    issuer: Option<&'a str>,
 }
 
 /// [`Sealing`], opened.
@@ -72,6 +74,8 @@ struct Pending {
     verifier: Option<String>,
     #[serde(default)]
     client: Option<DiscoveredClient>,
+    #[serde(default)]
+    issuer: Option<String>,
 }
 
 /// What a start sends the browser to, and as which client.
@@ -81,6 +85,7 @@ struct Consent {
     pkce: bool,
     /// For an `mcp_oauth` app: its server, the `resource` both requests name.
     client: Option<DiscoveredClient>,
+    issuer: Option<String>,
 }
 
 /// A PKCE verifier: two references, 64 base62 characters (RFC 7636 asks for
@@ -135,6 +140,7 @@ pub async fn authorize(State(state): State<AppState>, Path(reference): Path<Stri
         AuthTemplate::OAuth2 {
             authorize_url,
             token_url,
+            issuer,
             pkce,
             ..
         } => {
@@ -151,6 +157,7 @@ pub async fn authorize(State(state): State<AppState>, Path(reference): Path<Stri
                 client_id: client_id.clone(),
                 pkce: *pkce,
                 client: None,
+                issuer: issuer.clone(),
             }
         }
         AuthTemplate::McpOAuth { .. } => match signed_in_consent(&state, &session, &app, &configuration).await {
@@ -171,6 +178,7 @@ pub async fn authorize(State(state): State<AppState>, Path(reference): Path<Stri
         reference: &reference,
         verifier: verifier.as_deref().map(String::as_str),
         client: consent.client.as_ref(),
+        issuer: consent.issuer.as_deref(),
     };
     let plaintext = Zeroizing::new(serde_json::to_vec(&sealing).map_err(|_| Failure(ApiError::internal()))?);
     let sealed = keys::seal(
@@ -355,6 +363,7 @@ async fn signed_in_consent(
         authorize_url: server.authorization_endpoint.clone(),
         client_id: registration.client_id.clone(),
         pkce: true,
+        issuer: None,
         client: Some(DiscoveredClient {
             issuer: server.issuer,
             response_iss_supported: server.response_iss_supported,
@@ -645,12 +654,16 @@ pub async fn callback(State(state): State<AppState>, RawQuery(query): RawQuery) 
 
     // RFC 9207: bind the response to the issuer before exchanging a code
     // or interpreting an error.
-    let issuer_valid = client
-        .as_ref()
-        .map_or(!params.contains_key("iss"), |client| match params.get("iss") {
+    let issuer_valid = match client.as_ref() {
+        Some(client) => match params.get("iss") {
             Some(issuer) => issuer == &client.issuer,
             None => !client.response_iss_supported,
-        });
+        },
+        None => match pending.issuer.as_ref() {
+            Some(expected) => params.get("iss") == Some(expected),
+            None => !params.contains_key("iss"),
+        },
+    };
     let outcome = if !issuer_valid {
         Err(Failed("authorization_failed"))
     } else {
@@ -1245,6 +1258,16 @@ async fn identify(state: &AppState, app: &App, url: &str, access_token: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opens_an_authorization_sealed_before_configured_issuers_existed() {
+        let pending = serde_json::from_value::<Pending>(serde_json::json!({
+            "reference": "old-reference", "verifier": "old-verifier", "client": null,
+        }))
+        .expect("a legacy sealed attempt stays readable");
+        assert!(pending.issuer.is_none());
+        assert!(pending.client.is_none());
+    }
 
     #[test]
     fn sends_the_browser_only_where_a_configured_authorization_url_could_go() {

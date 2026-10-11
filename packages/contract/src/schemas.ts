@@ -335,6 +335,13 @@ export const OAuthAuthTemplate = named(
     authorize_url: z.url().nullable(),
     /** `null` when not set. */
     token_url: z.url().nullable(),
+    /**
+     * Trusted authorization-server issuer, preserved exactly. When set, every
+     * callback must send the same `iss` (RFC 9207), including error responses.
+     * Omitted or null accepts legacy responses without `iss` only. Public
+     * HTTPS, with no credentials, query, fragment or whitespace.
+     */
+    issuer: z.url().nullable().optional(),
     /** Scopes offered to environment configurations. */
     available_scopes: z.array(OAuthScope),
     pkce: z.boolean(),

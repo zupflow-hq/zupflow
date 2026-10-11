@@ -337,11 +337,15 @@ reconnect before refresh, preserving which client the old token belongs to.
 
 OAuth callbacks check a discovered server's `iss` exactly, before exchanging
 a code or trusting an error; a server advertising RFC 9207 must send it.
-Configured `oauth2` templates currently have no trusted issuer field, so a
-callback supplying `iss` for those templates is refused. Providers returning
-`iss` need `mcp_oauth` discovery until configured issuers are supported. A bad
-or already-used `state` shows a generic HTML error with Connect's security
-headers and no session details.
+Configured `oauth2` templates accept an optional `issuer` in the API and the
+Console's authentication editor. Set the provider's exact public HTTPS issuer
+without credentials, a query or a fragment. Every callback must then contain
+that exact `iss`, including errors; letter case and trailing slashes matter.
+The issuer is sealed with the authorization attempt, so editing the template
+does not change what an in-progress sign-in trusts. Omitted or `null` keeps
+legacy providers working without `iss`, and refuses a callback that supplies
+it. A bad or already-used `state` shows a generic HTML error with Connect's
+security headers and no session details.
 
 Once an installation connects, a background worker in the same process lists
 its app's tools from the app's MCP server (Streamable HTTP, through the safe

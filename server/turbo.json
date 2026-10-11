@@ -6,6 +6,7 @@
       "outputs": []
     },
     "test": {
+      "dependsOn": ["$TURBO_EXTENDS$", "build"],
       "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/packages/contract/openapi.json"],
       "outputs": []
     },

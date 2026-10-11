@@ -36,9 +36,9 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { signUp } from "./accounts";
 import { db, resetDb } from "./db";
 import { createHandlers, NO_SIGN_IN_HOST, OUTCOME_GRACE_MS, UNREACHABLE_HOST } from "./handlers";
-import { setLatency } from "./http";
+import { grantorAllows, setLatency, withdrawUngrantable } from "./http";
 import { hashReference, isId, newId, newReference, uuidOf } from "./ids";
-import type { IdempotencyRow } from "./model";
+import type { IdempotencyRow, MembershipRow } from "./model";
 import { mulberry32 } from "./random";
 import { runEventsKey, timelineOf } from "./scope";
 import { DEMO_USER_ID, seed } from "./seed";
@@ -173,6 +173,58 @@ describe("the contract", () => {
     const contract = routes.map((route) => `${route.method} ${route.path}`);
     expect(served.filter((entry) => !MOCK_ONLY.includes(entry)).sort()).toEqual([...contract].sort());
   });
+});
+
+describe("configured OAuth issuer isolation", () => {
+  it.each(["organization", "workspace"] as const)(
+    "ignores foreign %s configurations when saving a configured issuer",
+    async (scope) => {
+      const workspace = ws("qa-playground");
+      const sibling = ws("acme-sandbox");
+      expect(sibling.environment).toBe(workspace.environment);
+      const input = {
+        kind: "mcp" as const,
+        name: "Issuer isolation",
+        slug: "issuer-isolation",
+        description: "",
+        auth_type: "oauth2" as const,
+      };
+      const created =
+        scope === "organization"
+          ? await owner.organizationApps.create(workspace.organization_id, input)
+          : await owner.workspaceApps.create(workspace.id, input);
+      if (created.auth.type !== "oauth2") throw new Error("Expected an OAuth app");
+      const own = must(
+        db().configurations.find(
+          (c) =>
+            c.organization_id === workspace.organization_id &&
+            c.workspace_id === (scope === "organization" ? null : workspace.id) &&
+            c.environment === workspace.environment &&
+            c.app_id === created.id,
+        ),
+        "the app's configuration",
+      );
+      // An app ID alone must not let a mislabelled row constrain its template.
+      const foreign = {
+        ...structuredClone(own),
+        organization_id:
+          scope === "organization"
+            ? must(db().organizations.find((o) => o.slug === "larkspur")?.id)
+            : own.organization_id,
+        workspace_id: scope === "workspace" ? sibling.id : own.workspace_id,
+        oauth_scopes: ["foreign:read"],
+      };
+      db().configurations.push(foreign);
+      const before = structuredClone(foreign);
+      const auth = { ...created.auth, issuer: "https://auth.provider.example/Tenant/" };
+      const updated =
+        scope === "organization"
+          ? await owner.organizationApps.update(workspace.organization_id, created.id, { auth })
+          : await owner.workspaceApps.update(workspace.id, created.id, { auth });
+      expect(updated.auth).toEqual(auth);
+      expect(foreign).toEqual(before);
+    },
+  );
 });
 
 describe("idempotency store", () => {
@@ -669,6 +721,67 @@ describe("approvals in the audit log", () => {
       action: "approval.resolved",
       target: { type: "run", id: run.id, name: agent.name },
     });
+  });
+
+  it("does not borrow another organization's workspace environment", async () => {
+    const run = must(
+      db().runs.find((r) => r.status === "waiting_for_approval"),
+      "waiting run",
+    );
+    const foreign = must(
+      db().workspaces.find((w) => w.organization_id !== run.organization_id),
+      "foreign workspace",
+    );
+    run.workspace_id = foreign.id;
+    const { resolveApproval } = await import("./runner");
+    resolveApproval(db(), run, newId("tool_call"), "approved", newId("api_key"), new Date().toISOString());
+    expect(must(db().audit[0], "event")).toMatchObject({
+      organization_id: run.organization_id,
+      workspace_id: foreign.id,
+      environment: null,
+    });
+  });
+
+  it("does not name an API key from another organization", async () => {
+    const run = must(
+      db().runs.find((r) => r.status === "waiting_for_approval"),
+      "waiting run",
+    );
+    const foreign = must(
+      db().api_keys.find((k) => k.organization_id !== run.organization_id),
+      "foreign key",
+    );
+    expect(foreign.name).not.toBe("API key");
+    const { resolveApproval } = await import("./runner");
+    resolveApproval(db(), run, newId("tool_call"), "approved", foreign.id, new Date().toISOString());
+    expect(must(db().audit[0], "event").actor).toEqual({ type: "api_key", id: foreign.id, name: "API key" });
+  });
+});
+
+describe("run audit targets", () => {
+  it("does not name an agent from a sibling workspace", async () => {
+    const run = must(db().runs[0], "run");
+    const sibling = must(
+      db().agents.find((a) => a.organization_id === run.organization_id && a.workspace_id !== run.workspace_id),
+      "sibling agent",
+    );
+    expect(sibling.name).not.toBe("Agent");
+    run.agent_id = sibling.id;
+    const { runTarget } = await import("./runner");
+    expect(runTarget(db(), run)).toEqual({ type: "run", id: run.id, name: "Agent" });
+  });
+
+  it("does not name an agent from another organization when its workspace matches", async () => {
+    const run = must(db().runs[0], "run");
+    const foreign = must(
+      db().agents.find((a) => a.organization_id !== run.organization_id),
+      "foreign agent",
+    );
+    expect(foreign.name).not.toBe("Agent");
+    run.agent_id = foreign.id;
+    run.workspace_id = foreign.workspace_id;
+    const { runTarget } = await import("./runner");
+    expect(runTarget(db(), run)).toEqual({ type: "run", id: run.id, name: "Agent" });
   });
 });
 
@@ -1900,6 +2013,44 @@ describe("two organizations", () => {
     const sent = await owner.members.invite(must(northwindId()), { email: "new@northwind.example", role: "viewer" });
     expect(must(db().memberships.find((m) => m.id === sent.id)).invited_by).toBe(DEMO_USER_ID);
   });
+
+  it("checks an invitation's grantor in the invitation's own organization", () => {
+    const org = must(northwindId());
+    const other = must(db().organizations.find((o) => o.slug === "larkspur"));
+    const grantor = must(db().memberships.find((m) => m.organization_id === org && m.user_id === DEMO_USER_ID));
+    expect([grantor.role, grantor.status]).toEqual(["owner", "active"]);
+    const invited = must(db().memberships.find((m) => m.organization_id === org && m.status === "invited"));
+    const local = {
+      ...structuredClone(grantor),
+      id: newId("member"),
+      organization_id: other.id,
+      role: "viewer" as const,
+    };
+    const invitation = {
+      ...structuredClone(invited),
+      id: newId("member"),
+      organization_id: other.id,
+      role: "developer" as const,
+      invited_by: grantor.user_id,
+    };
+    // The same person is an owner elsewhere, but cannot grant this invitation.
+    db().memberships = [grantor, local, invitation];
+    expect(grantorAllows(invitation)).toBe(false);
+  });
+
+  it.each(["viewer", null] as const)(
+    "withdraws invitations only in the affected organization when the grantor's role becomes %s",
+    (role) => {
+      const org = must(northwindId());
+      const other = must(db().organizations.find((o) => o.slug === "larkspur"));
+      const invited = must(db().memberships.find((m) => m.organization_id === org && m.status === "invited"));
+      const local: MembershipRow = { ...structuredClone(invited), id: newId("member"), invited_by: DEMO_USER_ID };
+      const foreign = { ...structuredClone(local), id: newId("member"), organization_id: other.id };
+      db().memberships = [local, foreign];
+      withdrawUngrantable(org, DEMO_USER_ID, role);
+      expect(db().memberships).toEqual([foreign]);
+    },
+  );
 
   it("withdraws what a member granted beyond what they can still grant", async () => {
     const org = must(northwindId());

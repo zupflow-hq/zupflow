@@ -65,7 +65,7 @@ async fn keeps_a_catalog_of_apps_in_both_environments() {
         created["auth"],
         json!({
             "type": "oauth2", "authorize_url": null, "token_url": null,
-            "available_scopes": [], "pkce": true, "identity_url": null,
+            "available_scopes": [], "pkce": true, "identity_url": null, "issuer": null,
         })
     );
     assert_eq!(created["tools"], json!([]));
@@ -648,7 +648,7 @@ async fn keeps_api_keys_off_a_shared_template() {
         .send(call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(app("tracker", "oauth2")))
         .await;
     let path = format!("/v1/organizations/{org}/apps/{}", id(&created["data"]));
-    let template = |token_url: &str, scopes: Value| json!({ "type": "oauth2", "authorize_url": null, "token_url": token_url, "identity_url": null, "available_scopes": scopes, "pkce": true });
+    let template = |token_url: &str, scopes: Value| json!({ "type": "oauth2", "authorize_url": null, "token_url": token_url, "issuer": "https://AUTH.provider.example/Tenant/", "identity_url": null, "available_scopes": scopes, "pkce": true });
     let owned = template(
         "https://auth.tracker.example/token",
         json!([{ "name": "secret:admin", "description": "" }]),
@@ -731,6 +731,7 @@ async fn keeps_api_keys_off_a_shared_template() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["auth"]["issuer"], "https://AUTH.provider.example/Tenant/");
 }
 
 /// Patterns Connect checks in the browser must mean the same here; trailing

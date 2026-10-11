@@ -319,6 +319,7 @@ fn oauth_template(scopes: &[&str]) -> AuthTemplate {
     AuthTemplate::OAuth2 {
         authorize_url: None,
         token_url: None,
+        issuer: None,
         available_scopes: scopes
             .iter()
             .map(|name| zupflow_core::apps::OAuthScope {
@@ -902,6 +903,7 @@ async fn updates_only_within_the_owner(store: &dyn AppStore, prepare: &Prepare) 
     let template = AuthTemplate::OAuth2 {
         authorize_url: Some("https://auth.example/authorize".to_owned()),
         token_url: Some("https://auth.example/token".to_owned()),
+        issuer: Some("https://AUTH.example/Tenant/".to_owned()),
         available_scopes: Vec::new(),
         pkce: false,
         identity_url: None,

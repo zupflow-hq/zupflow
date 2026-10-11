@@ -53,6 +53,33 @@ function url(raw: Raw, key: string, fields: Fields): string | null | undefined {
   return trimmed === "" ? null : trimmed;
 }
 
+/** Issuer identifiers compare exactly; never trim or normalize one. */
+function issuer(raw: Raw, fields: Fields): string | null {
+  const value = raw.issuer;
+  if (value === undefined || value === null) return null;
+  if (
+    typeof value !== "string" ||
+    value === "" ||
+    /[\s\\]|\p{Cc}/u.test(value) ||
+    !/^[a-z][a-z0-9+.-]*:\/\/[^/]/i.test(value)
+  ) {
+    fields["auth.issuer"] = "Use a full issuer URL without whitespace, or null for none.";
+    return null;
+  }
+  try {
+    new URL(value);
+  } catch {
+    fields["auth.issuer"] = "Enter a full URL, including https://.";
+    return null;
+  }
+  const authority = value.split("/")[2] ?? "";
+  if (value.includes("?") || value.includes("#") || authority.includes("@")) {
+    fields["auth.issuer"] = "Use an issuer URL without credentials, a query or a fragment.";
+    return null;
+  }
+  return value;
+}
+
 function text(raw: Raw, key: string, max: number, fields: Fields, field = `auth.${key}`): string | undefined {
   const value = raw[key];
   if (typeof value !== "string") {
@@ -374,6 +401,7 @@ export function checkedAuthTemplate(
     const authorize_url = url(raw, "authorize_url", fields);
     const token_url = url(raw, "token_url", fields);
     const identity_url = url(raw, "identity_url", fields);
+    const trustedIssuer = issuer(raw, fields);
     const available_scopes = scopes(raw, fields);
     if (typeof raw.pkce !== "boolean") fields["auth.pkce"] ??= "Must be true or false.";
     if (Object.keys(fields).length > 0) {
@@ -399,10 +427,12 @@ export function checkedAuthTemplate(
     ] as const) {
       if (value) assertPublicHttps(value, `auth.${key}`);
     }
+    if (trustedIssuer !== null) assertPublicHttps(trustedIssuer, "auth.issuer");
     return {
       type: "oauth2",
       authorize_url: authorize_url ?? null,
       token_url: token_url ?? null,
+      issuer: trustedIssuer,
       identity_url: identity_url ?? null,
       available_scopes: available_scopes ?? [],
       pkce: raw.pkce as boolean,

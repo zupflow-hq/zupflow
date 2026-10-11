@@ -80,6 +80,10 @@ pub enum AuthTemplate {
     OAuth2 {
         authorize_url: Option<String>,
         token_url: Option<String>,
+        /// Exact trusted RFC 9207 issuer. When present every callback must
+        /// supply it; old templates without this field remain compatible.
+        #[serde(default)]
+        issuer: Option<String>,
         available_scopes: Vec<OAuthScope>,
         pkce: bool,
         identity_url: Option<String>,
@@ -202,6 +206,7 @@ impl NewApp {
             AuthType::OAuth2 => AuthTemplate::OAuth2 {
                 authorize_url: None,
                 token_url: None,
+                issuer: None,
                 available_scopes: Vec::new(),
                 pkce: true,
                 identity_url: None,
@@ -709,6 +714,17 @@ mod tests {
             serde_json::json!({ "type": "mcp_oauth", "scopes": [], "identity_url": null })
         );
         assert_eq!(sign_in.auth.type_name(), "mcp_oauth");
+    }
+
+    #[test]
+    fn reads_stored_oauth_templates_without_an_issuer() {
+        let legacy = serde_json::json!({
+            "type": "oauth2", "authorize_url": "https://accounts.example/authorize",
+            "token_url": "https://accounts.example/token", "identity_url": null,
+            "available_scopes": [], "pkce": true,
+        });
+        let auth: AuthTemplate = serde_json::from_value(legacy).expect("old templates stay readable");
+        assert!(matches!(auth, AuthTemplate::OAuth2 { issuer: None, .. }));
     }
 
     /// The mock's FNV-1a over the slug picks the same tile color.
