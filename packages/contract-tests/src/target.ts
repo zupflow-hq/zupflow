@@ -53,6 +53,13 @@ export interface Target {
  *   one). In `acme-sandbox`: an active agent and an installation. Somewhere
  *   in the organization: a run waiting for approval.
  * - At least one API key, webhook endpoint and catalog app.
+ * - A webhook endpoint in each environment with frozen delivery history:
+ *   pending (two attempts), succeeded (two), failed (eight), skipped (none),
+ *   and a succeeded `webhook.test` (one, without a workspace), all with complete
+ *   recorded attempt history and durations. Run events belong alternately to
+ *   `acme` and `beta-labs` in Production, `acme-sandbox` and `qa-playground` in
+ *   Sandbox. Pending rows have a next retry; terminal rows do not. No worker
+ *   advances these fixture deliveries while the suite runs.
  * - Catalog apps `google-workspace` (OAuth, ready in Sandbox), `linear`
  *   (ready in Sandbox, incomplete in Production) and `notion` (configured in
  *   neither environment).
@@ -86,6 +93,8 @@ export interface Target {
  * allow Northwind's return URL, and an invitation for the viewer, sent more
  * than `INVITATION_TTL_DAYS` ago: expired. Each organization's real IDs are
  * aimed at the other.
+ * The Production webhook has the same five delivery scenarios, all non-test
+ * events belonging to `harbor`.
  *
  * Every Sandbox workspace the suite uses as one (`acme-sandbox`,
  * `qa-playground`, `harbor-sandbox`) offers at least one catalog app.

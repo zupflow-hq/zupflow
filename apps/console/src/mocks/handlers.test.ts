@@ -148,6 +148,227 @@ afterEach(() => {
 });
 beforeEach(() => resetDb());
 
+describe("webhook delivery history isolation", () => {
+  const fixture = () => {
+    const organization = must(northwindId());
+    const endpoint = must(
+      db().webhooks.find((row) => row.organization_id === organization && row.environment === "production"),
+    );
+    const delivery = must(
+      db().webhook_deliveries.find(
+        (row) => row.organization_id === organization && row.endpoint_id === endpoint.id && row.state === "pending",
+      ),
+    );
+    const event = must(
+      db().webhook_events.find((row) => row.organization_id === organization && row.id === delivery.event_id),
+    );
+    const otherOrganization = must(db().organizations.find((row) => row.slug === "larkspur")).id;
+    return { organization, endpoint, delivery, event, otherOrganization };
+  };
+
+  it("ignores poisoned delivery, event and attempt rows carrying another organization", async () => {
+    const { organization, endpoint, delivery, event, otherOrganization } = fixture();
+    const before = await owner.webhooks.delivery(organization, endpoint.id, delivery.id);
+    const attempts = await owner.webhooks.deliveryAttempts(organization, endpoint.id, delivery.id);
+    db().webhook_deliveries.unshift({ ...delivery, organization_id: otherOrganization, attempts: 900 });
+    db().webhook_events.unshift({
+      ...structuredClone(event),
+      organization_id: otherOrganization,
+      body: { ...event.body, created_at: "2000-01-01T00:00:00.000Z" },
+    });
+    const first = must(
+      db().webhook_delivery_attempts.find(
+        (row) => row.organization_id === organization && row.delivery_id === delivery.id,
+      ),
+    );
+    db().webhook_delivery_attempts.unshift({ ...first, organization_id: otherOrganization, status_code: 418 });
+    expect(await owner.webhooks.delivery(organization, endpoint.id, delivery.id)).toEqual(before);
+    expect(await owner.webhooks.deliveryAttempts(organization, endpoint.id, delivery.id)).toEqual(attempts);
+    expect(
+      (await owner.webhooks.deliveries(organization, endpoint.id)).items.filter((row) => row.id === delivery.id),
+    ).toHaveLength(1);
+  });
+
+  it("reads attempts only from the named endpoint and delivery", async () => {
+    const { organization, endpoint, delivery } = fixture();
+    const before = await owner.webhooks.deliveryAttempts(organization, endpoint.id, delivery.id);
+    const first = must(
+      db().webhook_delivery_attempts.find(
+        (row) => row.organization_id === organization && row.delivery_id === delivery.id,
+      ),
+    );
+    db().webhook_delivery_attempts.push({ ...first, endpoint_id: newId("webhook_endpoint"), status_code: 418 });
+    db().webhook_delivery_attempts.push({ ...first, delivery_id: newId("webhook_delivery"), status_code: 418 });
+    expect(await owner.webhooks.deliveryAttempts(organization, endpoint.id, delivery.id)).toEqual(before);
+  });
+
+  it.each(["organization", "environment", "body workspace", "body organization", "body environment"])(
+    "hides an event whose %s does not match its trusted scope",
+    async (mismatch) => {
+      const { organization, endpoint, delivery, event, otherOrganization } = fixture();
+      const foreign = ws("harbor");
+      const sibling = ws("beta-labs");
+      if (mismatch === "organization") {
+        event.workspace_id = foreign.id;
+        if (event.body.workspace) event.body.workspace.id = foreign.id;
+      } else if (mismatch === "environment") {
+        event.workspace_id = ws("acme-sandbox").id;
+        if (event.body.workspace) event.body.workspace.id = event.workspace_id;
+      } else if (mismatch === "body workspace") {
+        if (event.body.workspace) event.body.workspace.id = sibling.id;
+      } else if (mismatch === "body organization") event.body.organization_id = otherOrganization;
+      else event.body.environment = "sandbox";
+      const list = await owner.webhooks.deliveries(organization, endpoint.id);
+      expect(list.items.some((row) => row.id === delivery.id)).toBe(false);
+      expect(await failure(owner.webhooks.delivery(organization, endpoint.id, delivery.id))).toMatchObject({
+        status: 404,
+        code: "not_found",
+      });
+      expect(await failure(owner.webhooks.deliveryAttempts(organization, endpoint.id, delivery.id))).toMatchObject({
+        status: 404,
+        code: "not_found",
+      });
+    },
+  );
+
+  it("reports incomplete legacy attempt history without inventing records", async () => {
+    const { organization, endpoint, delivery } = fixture();
+    db().webhook_delivery_attempts = db().webhook_delivery_attempts.filter((row) => row.delivery_id !== delivery.id);
+    const detail = await owner.webhooks.delivery(organization, endpoint.id, delivery.id);
+    expect(detail.attempts).toBe(2);
+    expect(detail.attempt_history_complete).toBe(false);
+    expect((await owner.webhooks.deliveryAttempts(organization, endpoint.id, delivery.id)).items).toEqual([]);
+  });
+
+  it("never returns response text or unknown error strings from history", async () => {
+    const { organization, endpoint, delivery } = fixture();
+    Object.assign(delivery, {
+      last_error: "secret-from-an-internal-error",
+      response_body: "private response",
+      request_headers: { authorization: "private bearer" },
+    });
+    const attempt = must(
+      db().webhook_delivery_attempts.find(
+        (row) => row.organization_id === organization && row.delivery_id === delivery.id,
+      ),
+    );
+    Object.assign(attempt, { error_class: "secret-from-an-internal-error", response_body: "private response" });
+    const detail = await owner.webhooks.delivery(organization, endpoint.id, delivery.id);
+    const attempts = await owner.webhooks.deliveryAttempts(organization, endpoint.id, delivery.id);
+    expect(detail.last_error).toBe("failed");
+    expect(attempts.items[0]?.error_class).toBe("failed");
+    const serialized = JSON.stringify([detail, attempts]);
+    expect(serialized).not.toContain("private");
+    expect(serialized).not.toContain("secret-from");
+  });
+
+  it("uses the ASCII delivery ID as the stable tie-breaker and does not repeat rows after new arrivals", async () => {
+    const { organization, endpoint, delivery } = fixture();
+    const at = delivery.created_at;
+    const rows = db().webhook_deliveries.filter(
+      (row) => row.organization_id === organization && row.endpoint_id === endpoint.id,
+    );
+    for (const row of rows) row.created_at = at;
+    const expected = rows
+      .map((row) => row.id)
+      .sort()
+      .reverse();
+    const first = await owner.webhooks.deliveries(organization, endpoint.id, { limit: 2 });
+    expect(first.items.map((row) => row.id)).toEqual(expected.slice(0, 2));
+    await owner.webhooks.sendTest(organization, endpoint.id);
+    const second = await owner.webhooks.deliveries(organization, endpoint.id, {
+      limit: 100,
+      cursor: must(first.pagination.next_cursor),
+    });
+    expect(second.items.map((row) => row.id)).toEqual(expected.slice(2));
+  });
+
+  it("deleting an endpoint or workspace removes only its own delivery history", async () => {
+    const { organization, endpoint, otherOrganization } = fixture();
+    const productionDelivery = must(
+      db().webhook_deliveries.find((row) => row.organization_id === organization && row.endpoint_id === endpoint.id),
+    );
+    const productionAttempt = must(
+      db().webhook_delivery_attempts.find(
+        (row) => row.organization_id === organization && row.delivery_id === productionDelivery.id,
+      ),
+    );
+    db().webhook_deliveries.push({ ...productionDelivery, organization_id: otherOrganization });
+    db().webhook_delivery_attempts.push({ ...productionAttempt, organization_id: otherOrganization });
+    const deletedWorkspace = ws("acme-sandbox").id;
+    const sandboxEvent = must(
+      db().webhook_events.find((row) => row.organization_id === organization && row.workspace_id === deletedWorkspace),
+    );
+    const sandboxDelivery = must(
+      db().webhook_deliveries.find((row) => row.organization_id === organization && row.event_id === sandboxEvent.id),
+    );
+    const sandboxAttempt = must(
+      db().webhook_delivery_attempts.find(
+        (row) => row.organization_id === organization && row.delivery_id === sandboxDelivery.id,
+      ),
+    );
+    db().webhook_events.push({ ...structuredClone(sandboxEvent), organization_id: otherOrganization });
+    db().webhook_deliveries.push({ ...sandboxDelivery, organization_id: otherOrganization });
+    db().webhook_delivery_attempts.push({ ...sandboxAttempt, organization_id: otherOrganization });
+    const siblingEvent = must(
+      db().webhook_events.find(
+        (row) => row.organization_id === organization && row.workspace_id === ws("qa-playground").id,
+      ),
+    );
+    const siblingDelivery = must(
+      db().webhook_deliveries.find((row) => row.organization_id === organization && row.event_id === siblingEvent.id),
+    );
+    // Foreign rows must not contribute IDs to a local deletion cascade.
+    db().webhook_events.push({
+      ...structuredClone(siblingEvent),
+      organization_id: otherOrganization,
+      workspace_id: deletedWorkspace,
+    });
+    db().webhook_deliveries.push({
+      ...siblingDelivery,
+      organization_id: otherOrganization,
+      event_id: sandboxEvent.id,
+    });
+    const otherBefore = structuredClone({
+      deliveries: db().webhook_deliveries.filter((row) => row.organization_id === otherOrganization),
+      attempts: db().webhook_delivery_attempts.filter((row) => row.organization_id === otherOrganization),
+      events: db().webhook_events.filter((row) => row.organization_id === otherOrganization),
+    });
+    const sandbox = must(
+      db().webhooks.find((row) => row.organization_id === organization && row.environment === "sandbox"),
+    );
+    const sandboxBefore = await owner.webhooks.deliveries(organization, sandbox.id);
+    const siblingBefore = await owner.webhooks.delivery(organization, sandbox.id, siblingDelivery.id);
+    const siblingAttemptsBefore = await owner.webhooks.deliveryAttempts(organization, sandbox.id, siblingDelivery.id);
+    expect(siblingAttemptsBefore.items.length).toBeGreaterThan(0);
+    await owner.webhooks.delete(organization, endpoint.id);
+    expect(
+      db().webhook_deliveries.some((row) => row.organization_id === organization && row.endpoint_id === endpoint.id),
+    ).toBe(false);
+    expect(
+      db().webhook_delivery_attempts.some(
+        (row) => row.organization_id === organization && row.endpoint_id === endpoint.id,
+      ),
+    ).toBe(false);
+    expect(await owner.webhooks.deliveries(organization, sandbox.id)).toEqual(sandboxBefore);
+    await owner.workspaces.delete(deletedWorkspace);
+    const after = await owner.webhooks.deliveries(organization, sandbox.id);
+    expect(after.items).toEqual(sandboxBefore.items.filter((row) => row.workspace?.id !== deletedWorkspace));
+    expect(await owner.webhooks.delivery(organization, sandbox.id, siblingDelivery.id)).toEqual(siblingBefore);
+    expect(await owner.webhooks.deliveryAttempts(organization, sandbox.id, siblingDelivery.id)).toEqual(
+      siblingAttemptsBefore,
+    );
+    expect(
+      db().webhook_events.some((row) => row.organization_id === organization && row.workspace_id === deletedWorkspace),
+    ).toBe(false);
+    expect({
+      deliveries: db().webhook_deliveries.filter((row) => row.organization_id === otherOrganization),
+      attempts: db().webhook_delivery_attempts.filter((row) => row.organization_id === otherOrganization),
+      events: db().webhook_events.filter((row) => row.organization_id === otherOrganization),
+    }).toEqual(otherBefore);
+  });
+});
+
 /** The shared contract suite, against the mock: the same cases the backend must pass. */
 const userByEmail = (email: string) => must(db().users.find((u) => u.email === email)?.id, email);
 contractSuite({
@@ -998,6 +1219,9 @@ describe("two organizations", () => {
       mine(d.connect_settings),
       mine(d.api_keys),
       mine(d.webhooks),
+      mine(d.webhook_events),
+      mine(d.webhook_deliveries),
+      mine(d.webhook_delivery_attempts),
       mine(d.audit),
       mine(d.memberships).map(({ last_active_at: _seen, ...m }) => m),
       d.idempotency_keys.filter((r) => r.organization_id === org),
@@ -1294,6 +1518,10 @@ describe("two organizations", () => {
       auth_type: "token",
     });
     expect(db().configurations.some((c) => c.app_id === catalogApp.id)).toBe(true);
+    const endpoint = must(
+      db().webhooks.find((row) => row.organization_id === qa.organization_id && row.environment === qa.environment),
+    );
+    await owner.webhooks.sendTest(qa.organization_id, endpoint.id);
     const created = new Set<string>([session.id, installation.id, agent.id, grant.id, run.id]);
     const d = db();
     const tables = {
@@ -1315,7 +1543,13 @@ describe("two organizations", () => {
       expect(Object.keys(c).slice(0, 3), "configuration").toEqual(["organization_id", "workspace_id", "app_id"]);
     }
     // Organization-scoped rows that may name a workspace start with their organization.
-    for (const event of d.audit) expect(Object.keys(event).slice(0, 2), "audit").toEqual(["id", "organization_id"]);
+    for (const [name, rows] of Object.entries({
+      audit: d.audit,
+      webhook_events: d.webhook_events,
+      webhook_deliveries: d.webhook_deliveries,
+    })) {
+      for (const row of rows) expect(Object.keys(row).slice(0, 2), name).toEqual(["id", "organization_id"]);
+    }
     for (const [name, rows] of Object.entries(tables)) {
       expect(rows.length, name).toBeGreaterThan(0);
       for (const row of rows) {

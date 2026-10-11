@@ -30,6 +30,8 @@ import { Route as ConnectReferenceSimulatedConsentRouteImport } from "./routes/c
 import { Route as AuthedOrgAppsIndexRouteImport } from "./routes/_authed/$org/apps/index"
 import { Route as AuthedOrgAppsAppIdRouteImport } from "./routes/_authed/$org/apps/$appId"
 import { Route as AuthedOrgWWsRouteImport } from "./routes/_authed/$org/w/$ws"
+import { Route as AuthedOrgWebhooksIndexRouteImport } from "./routes/_authed/$org/webhooks/index"
+import { Route as AuthedOrgWebhooksHookIdRouteImport } from "./routes/_authed/$org/webhooks/$hookId"
 import { Route as AuthedOrgWWsIndexRouteImport } from "./routes/_authed/$org/w/$ws/index"
 import { Route as AuthedOrgWWsAgentsRouteImport } from "./routes/_authed/$org/w/$ws/agents"
 import { Route as AuthedOrgWWsAppsRouteImport } from "./routes/_authed/$org/w/$ws/apps"
@@ -151,6 +153,16 @@ const AuthedOrgWWsRoute = AuthedOrgWWsRouteImport.update({
   path: "/w/$ws",
   getParentRoute: () => AuthedOrgRoute,
 } as any)
+const AuthedOrgWebhooksIndexRoute = AuthedOrgWebhooksIndexRouteImport.update({
+  id: "/",
+  path: "/",
+  getParentRoute: () => AuthedOrgWebhooksRoute,
+} as any)
+const AuthedOrgWebhooksHookIdRoute = AuthedOrgWebhooksHookIdRouteImport.update({
+  id: "/$hookId",
+  path: "/$hookId",
+  getParentRoute: () => AuthedOrgWebhooksRoute,
+} as any)
 const AuthedOrgWWsIndexRoute = AuthedOrgWWsIndexRouteImport.update({
   id: "/",
   path: "/",
@@ -245,14 +257,16 @@ export interface FileRoutesByFullPath {
   "/$org/members": typeof AuthedOrgMembersRoute
   "/$org/runs": typeof AuthedOrgRunsRoute
   "/$org/settings": typeof AuthedOrgSettingsRoute
-  "/$org/webhooks": typeof AuthedOrgWebhooksRoute
+  "/$org/webhooks": typeof AuthedOrgWebhooksRouteWithChildren
   "/$org/workspaces": typeof AuthedOrgWorkspacesRoute
   "/connect/$reference/simulated-consent": typeof ConnectReferenceSimulatedConsentRoute
   "/$org/": typeof AuthedOrgIndexRoute
   "/connect/$reference/": typeof ConnectReferenceIndexRoute
   "/$org/apps/$appId": typeof AuthedOrgAppsAppIdRoute
   "/$org/w/$ws": typeof AuthedOrgWWsRouteWithChildren
+  "/$org/webhooks/$hookId": typeof AuthedOrgWebhooksHookIdRoute
   "/$org/apps/": typeof AuthedOrgAppsIndexRoute
+  "/$org/webhooks/": typeof AuthedOrgWebhooksIndexRoute
   "/$org/w/$ws/agents": typeof AuthedOrgWWsAgentsRouteWithChildren
   "/$org/w/$ws/apps": typeof AuthedOrgWWsAppsRouteWithChildren
   "/$org/w/$ws/connect-sessions": typeof AuthedOrgWWsConnectSessionsRoute
@@ -280,13 +294,14 @@ export interface FileRoutesByTo {
   "/$org/members": typeof AuthedOrgMembersRoute
   "/$org/runs": typeof AuthedOrgRunsRoute
   "/$org/settings": typeof AuthedOrgSettingsRoute
-  "/$org/webhooks": typeof AuthedOrgWebhooksRoute
   "/$org/workspaces": typeof AuthedOrgWorkspacesRoute
   "/connect/$reference/simulated-consent": typeof ConnectReferenceSimulatedConsentRoute
   "/$org": typeof AuthedOrgIndexRoute
   "/connect/$reference": typeof ConnectReferenceIndexRoute
   "/$org/apps/$appId": typeof AuthedOrgAppsAppIdRoute
+  "/$org/webhooks/$hookId": typeof AuthedOrgWebhooksHookIdRoute
   "/$org/apps": typeof AuthedOrgAppsIndexRoute
+  "/$org/webhooks": typeof AuthedOrgWebhooksIndexRoute
   "/$org/w/$ws/connect-sessions": typeof AuthedOrgWWsConnectSessionsRoute
   "/$org/w/$ws/settings": typeof AuthedOrgWWsSettingsRoute
   "/$org/w/$ws": typeof AuthedOrgWWsIndexRoute
@@ -314,14 +329,16 @@ export interface FileRoutesById {
   "/_authed/$org/members": typeof AuthedOrgMembersRoute
   "/_authed/$org/runs": typeof AuthedOrgRunsRoute
   "/_authed/$org/settings": typeof AuthedOrgSettingsRoute
-  "/_authed/$org/webhooks": typeof AuthedOrgWebhooksRoute
+  "/_authed/$org/webhooks": typeof AuthedOrgWebhooksRouteWithChildren
   "/_authed/$org/workspaces": typeof AuthedOrgWorkspacesRoute
   "/connect/$reference/simulated-consent": typeof ConnectReferenceSimulatedConsentRoute
   "/_authed/$org/": typeof AuthedOrgIndexRoute
   "/connect/$reference/": typeof ConnectReferenceIndexRoute
   "/_authed/$org/apps/$appId": typeof AuthedOrgAppsAppIdRoute
   "/_authed/$org/w/$ws": typeof AuthedOrgWWsRouteWithChildren
+  "/_authed/$org/webhooks/$hookId": typeof AuthedOrgWebhooksHookIdRoute
   "/_authed/$org/apps/": typeof AuthedOrgAppsIndexRoute
+  "/_authed/$org/webhooks/": typeof AuthedOrgWebhooksIndexRoute
   "/_authed/$org/w/$ws/agents": typeof AuthedOrgWWsAgentsRouteWithChildren
   "/_authed/$org/w/$ws/apps": typeof AuthedOrgWWsAppsRouteWithChildren
   "/_authed/$org/w/$ws/connect-sessions": typeof AuthedOrgWWsConnectSessionsRoute
@@ -360,7 +377,9 @@ export interface FileRouteTypes {
     | "/connect/$reference/"
     | "/$org/apps/$appId"
     | "/$org/w/$ws"
+    | "/$org/webhooks/$hookId"
     | "/$org/apps/"
+    | "/$org/webhooks/"
     | "/$org/w/$ws/agents"
     | "/$org/w/$ws/apps"
     | "/$org/w/$ws/connect-sessions"
@@ -388,13 +407,14 @@ export interface FileRouteTypes {
     | "/$org/members"
     | "/$org/runs"
     | "/$org/settings"
-    | "/$org/webhooks"
     | "/$org/workspaces"
     | "/connect/$reference/simulated-consent"
     | "/$org"
     | "/connect/$reference"
     | "/$org/apps/$appId"
+    | "/$org/webhooks/$hookId"
     | "/$org/apps"
+    | "/$org/webhooks"
     | "/$org/w/$ws/connect-sessions"
     | "/$org/w/$ws/settings"
     | "/$org/w/$ws"
@@ -428,7 +448,9 @@ export interface FileRouteTypes {
     | "/connect/$reference/"
     | "/_authed/$org/apps/$appId"
     | "/_authed/$org/w/$ws"
+    | "/_authed/$org/webhooks/$hookId"
     | "/_authed/$org/apps/"
+    | "/_authed/$org/webhooks/"
     | "/_authed/$org/w/$ws/agents"
     | "/_authed/$org/w/$ws/apps"
     | "/_authed/$org/w/$ws/connect-sessions"
@@ -604,6 +626,20 @@ declare module "@tanstack/react-router" {
       preLoaderRoute: typeof AuthedOrgWWsRouteImport
       parentRoute: typeof AuthedOrgRoute
     }
+    "/_authed/$org/webhooks/": {
+      id: "/_authed/$org/webhooks/"
+      path: "/"
+      fullPath: "/$org/webhooks/"
+      preLoaderRoute: typeof AuthedOrgWebhooksIndexRouteImport
+      parentRoute: typeof AuthedOrgWebhooksRoute
+    }
+    "/_authed/$org/webhooks/$hookId": {
+      id: "/_authed/$org/webhooks/$hookId"
+      path: "/$hookId"
+      fullPath: "/$org/webhooks/$hookId"
+      preLoaderRoute: typeof AuthedOrgWebhooksHookIdRouteImport
+      parentRoute: typeof AuthedOrgWebhooksRoute
+    }
     "/_authed/$org/w/$ws/": {
       id: "/_authed/$org/w/$ws/"
       path: "/"
@@ -726,6 +762,19 @@ const AuthedOrgAppsRouteWithChildren = AuthedOrgAppsRoute._addFileChildren(
   AuthedOrgAppsRouteChildren,
 )
 
+interface AuthedOrgWebhooksRouteChildren {
+  AuthedOrgWebhooksHookIdRoute: typeof AuthedOrgWebhooksHookIdRoute
+  AuthedOrgWebhooksIndexRoute: typeof AuthedOrgWebhooksIndexRoute
+}
+
+const AuthedOrgWebhooksRouteChildren: AuthedOrgWebhooksRouteChildren = {
+  AuthedOrgWebhooksHookIdRoute: AuthedOrgWebhooksHookIdRoute,
+  AuthedOrgWebhooksIndexRoute: AuthedOrgWebhooksIndexRoute,
+}
+
+const AuthedOrgWebhooksRouteWithChildren =
+  AuthedOrgWebhooksRoute._addFileChildren(AuthedOrgWebhooksRouteChildren)
+
 interface AuthedOrgWWsAgentsRouteChildren {
   AuthedOrgWWsAgentsAgentIdRoute: typeof AuthedOrgWWsAgentsAgentIdRoute
   AuthedOrgWWsAgentsIndexRoute: typeof AuthedOrgWWsAgentsIndexRoute
@@ -814,7 +863,7 @@ interface AuthedOrgRouteChildren {
   AuthedOrgMembersRoute: typeof AuthedOrgMembersRoute
   AuthedOrgRunsRoute: typeof AuthedOrgRunsRoute
   AuthedOrgSettingsRoute: typeof AuthedOrgSettingsRoute
-  AuthedOrgWebhooksRoute: typeof AuthedOrgWebhooksRoute
+  AuthedOrgWebhooksRoute: typeof AuthedOrgWebhooksRouteWithChildren
   AuthedOrgWorkspacesRoute: typeof AuthedOrgWorkspacesRoute
   AuthedOrgIndexRoute: typeof AuthedOrgIndexRoute
   AuthedOrgWWsRoute: typeof AuthedOrgWWsRouteWithChildren
@@ -828,7 +877,7 @@ const AuthedOrgRouteChildren: AuthedOrgRouteChildren = {
   AuthedOrgMembersRoute: AuthedOrgMembersRoute,
   AuthedOrgRunsRoute: AuthedOrgRunsRoute,
   AuthedOrgSettingsRoute: AuthedOrgSettingsRoute,
-  AuthedOrgWebhooksRoute: AuthedOrgWebhooksRoute,
+  AuthedOrgWebhooksRoute: AuthedOrgWebhooksRouteWithChildren,
   AuthedOrgWorkspacesRoute: AuthedOrgWorkspacesRoute,
   AuthedOrgIndexRoute: AuthedOrgIndexRoute,
   AuthedOrgWWsRoute: AuthedOrgWWsRouteWithChildren,

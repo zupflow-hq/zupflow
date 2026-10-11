@@ -3,8 +3,12 @@
 
 use std::sync::Arc;
 
-use axum::Router;
+use axum::body::{Body, Bytes};
+use axum::extract::{FromRequest, Request, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
@@ -13,7 +17,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
-use crate::{Options, Taskboard, mcp, oauth, pages};
+use crate::{Options, Taskboard, WebhookRequest, mcp, oauth, pages};
 
 /// Taskboard, serving. Dropping it stops it.
 pub struct Running {
@@ -87,16 +91,7 @@ fn router(taskboard: Taskboard) -> Router {
             "/.well-known/oauth-authorization-server",
             get(oauth::authorization_server),
         )
-        .route(
-            "/webhooks",
-            post(
-                |axum::extract::State(board): axum::extract::State<Taskboard>,
-                 axum::Json(body): axum::Json<serde_json::Value>| async move {
-                    board.state().webhooks.push(body);
-                    axum::http::StatusCode::NO_CONTENT
-                },
-            ),
-        )
+        .route("/webhooks", post(webhook))
         .route("/register", post(oauth::register))
         .route("/authorize", get(oauth::authorize).post(oauth::decide))
         .route("/token", post(oauth::token))
@@ -104,6 +99,42 @@ fn router(taskboard: Taskboard) -> Router {
         .route("/mcp", post(mcp::post).get(mcp::get).delete(mcp::delete))
         .fallback(oauth::not_found)
         .with_state(taskboard)
+}
+
+async fn webhook(State(board): State<Taskboard>, request: Request) -> Response {
+    let headers = request.headers().clone();
+    let body = match Bytes::from_request(request, &board).await {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    // Keep the exact bytes for signature checks while retaining Json's
+    // content-type and parse validation before recording a request.
+    let mut request = Request::new(Body::from(body.clone()));
+    *request.headers_mut() = headers.clone();
+    let Json(event) = match Json::<serde_json::Value>::from_request(request, &board).await {
+        Ok(event) => event,
+        Err(error) => return error.into_response(),
+    };
+    let header = |name| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    let mut state = board.state();
+    state.webhooks.push(event);
+    state.webhook_requests.push(WebhookRequest {
+        body: body.to_vec(),
+        signature: header("zupflow-signature"),
+        event_id: header("zupflow-event-id"),
+        event_type: header("zupflow-event-type"),
+        attempt: header("zupflow-delivery-attempt"),
+    });
+    state
+        .webhook_status
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .unwrap_or(StatusCode::NO_CONTENT)
+        .into_response()
 }
 
 /// Starts Taskboard on `127.0.0.1`, reached at `https://{host}:{port}`.

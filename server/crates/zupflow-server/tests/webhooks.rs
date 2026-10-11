@@ -380,6 +380,49 @@ async fn sends_a_signed_test_event_and_answers_what_came_back() {
     );
     // A test is no event anyone subscribes to: nothing is queued.
     assert!(!webhook_delivery::work_once(&server.state).await);
+
+    let history_path = format!("/v1/organizations/{org}/webhooks/{}/deliveries", id(&endpoint));
+    let (status, history) = server.send(call("alice", Method::GET, &history_path)).await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history["meta"]["pagination"]["total"], 3);
+    let timeout = &history["data"][0];
+    assert_eq!(timeout["state"], "failed");
+    assert_eq!(timeout["last_status_code"], Value::Null);
+    assert_eq!(timeout["last_error"], "timeout");
+    assert_eq!(timeout["next_attempt_at"], Value::Null);
+    assert_eq!(timeout["workspace"], Value::Null);
+    let (status, detail) = server
+        .send(call("alice", Method::GET, format!("{history_path}/{}", id(timeout))))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["data"]["attempt_history_complete"], true);
+    let sent = server.providers.requests_to(HOOK);
+    let last_sent = sent.last().unwrap();
+    let last_event: Value = serde_json::from_slice(&last_sent.body).unwrap();
+    assert_eq!(
+        detail["data"]["event"], last_event,
+        "the exact lean event that was sent"
+    );
+    let (status, attempts) = server
+        .send(call(
+            "alice",
+            Method::GET,
+            format!("{history_path}/{}/attempts", id(timeout)),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{attempts}");
+    assert_eq!(attempts["meta"]["pagination"]["total"], 1);
+    assert_eq!(attempts["data"][0]["number"], 1);
+    assert_eq!(attempts["data"][0]["error_class"], "timeout");
+    assert!(attempts["data"][0]["duration_ms"].as_u64().is_some());
+    for response in [&history, &detail, &attempts] {
+        assert!(!response.to_string().contains(&secret));
+        assert!(
+            !response
+                .to_string()
+                .contains(last_sent.header("Zupflow-Signature").unwrap())
+        );
+    }
 }
 
 /// Two organizations, each with Sandbox endpoints; Northwind also has a
@@ -536,7 +579,7 @@ async fn retries_a_failing_delivery_until_its_attempts_run_out() {
     let server = Server::new().await;
     let org = server.organization("alice", "northwind").await;
     let sandbox = server.workspace("alice", &org, "acme-sandbox", "sandbox").await;
-    hook(&server, "alice", &org, "sandbox", HOOK, json!(["run.completed"])).await;
+    let (endpoint, _) = hook(&server, "alice", &org, "sandbox", HOOK, json!(["run.completed"])).await;
     let ws = id(&sandbox).to_owned();
     let helper = agent(&server, "alice", &org, &ws).await;
     server.providers.script(HOOK, 500, json!({ "error": "down" }));
@@ -578,6 +621,30 @@ async fn retries_a_failing_delivery_until_its_attempts_run_out() {
         .await
         .unwrap();
     assert_eq!((state.as_str(), attempts), ("failed", 8));
+    let path = format!("/v1/organizations/{org}/webhooks/{}/deliveries", id(&endpoint));
+    let (status, history) = server.send(call("alice", Method::GET, &path)).await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    let delivery = id(&history["data"][0]);
+    let (_, detail) = server
+        .send(call("alice", Method::GET, format!("{path}/{delivery}")))
+        .await;
+    assert_eq!(detail["data"]["attempts"], 8);
+    assert_eq!(detail["data"]["attempt_history_complete"], true);
+    assert_eq!(detail["data"]["next_attempt_at"], Value::Null);
+    let (_, history_attempts) = server
+        .send(call("alice", Method::GET, format!("{path}/{delivery}/attempts")))
+        .await;
+    assert_eq!(history_attempts["meta"]["pagination"]["total"], 8);
+    for (index, attempt) in history_attempts["data"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(attempt["number"], index + 1);
+        assert_eq!(attempt["status_code"], 500);
+        assert_eq!(attempt["error_class"], "status");
+        assert!(attempt["duration_ms"].as_u64().is_some());
+    }
+    assert!(
+        !detail.to_string().contains("down"),
+        "receiver response bodies never enter history"
+    );
     sqlx::query("UPDATE jobs SET run_at = 0 WHERE kind = 'deliver_webhook'")
         .execute(&pool)
         .await
@@ -910,6 +977,57 @@ async fn due_in(pool: &sqlx::SqlitePool, kind: &str) -> (i64, i64) {
     (attempts, run_at - zupflow_core::time::Timestamp::now().millis())
 }
 
+/// A postponed delivery advertises its real queue time without inventing
+/// an outbound attempt.
+async fn check_retry_time(server: &Server, pool: &sqlx::SqlitePool, org: &str, endpoint: &str, attempts: u64) {
+    let organization_id = zupflow_core::ids::OrganizationId::parse(org).unwrap();
+    let endpoint_id = zupflow_core::ids::WebhookEndpointId::parse(endpoint).unwrap();
+    let next: i64 = sqlx::query_scalar(
+        "SELECT next_attempt_at FROM webhook_deliveries \
+         WHERE organization_id = ? AND endpoint_id = ? AND state = 'pending'",
+    )
+    .bind(organization_id.uuid())
+    .bind(endpoint_id.uuid())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let run_at: i64 = sqlx::query_scalar(
+        "SELECT run_at FROM jobs WHERE organization_id = ? AND kind = 'deliver_webhook' AND state = 'queued'",
+    )
+    .bind(organization_id.uuid())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!((run_at - next).abs() < 1_000, "history follows the scheduled job");
+    let (status, history) = server
+        .send(call(
+            "alice",
+            Method::GET,
+            format!("/v1/organizations/{org}/webhooks/{endpoint}/deliveries?state=pending"),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history["meta"]["pagination"]["total"], 1);
+    let delivery = &history["data"][0];
+    assert_eq!(delivery["attempts"], attempts);
+    assert_eq!(
+        delivery["next_attempt_at"],
+        zupflow_core::time::Timestamp::from_millis(next).to_string()
+    );
+    let (status, records) = server
+        .send(call(
+            "alice",
+            Method::GET,
+            format!(
+                "/v1/organizations/{org}/webhooks/{endpoint}/deliveries/{}/attempts",
+                id(delivery)
+            ),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{records}");
+    assert_eq!(records["meta"]["pagination"]["total"], attempts);
+}
+
 async fn run_now(pool: &sqlx::SqlitePool, kind: &str) {
     sqlx::query("UPDATE jobs SET run_at = 0 WHERE kind = ? AND state = 'queued'")
         .bind(kind)
@@ -994,11 +1112,13 @@ async fn charges_the_endpoint_only_for_its_own_failures() {
     let (claims, due) = due_in(&pool, "deliver_webhook").await;
     assert_eq!(claims, 1);
     assert!((4_000..=6_000).contains(&due), "backing off from 5 seconds: {due}");
+    check_retry_time(&server, &pool, &org, id(&endpoint), 0).await;
     run_now(&pool, "deliver_webhook").await;
     assert!(webhook_delivery::deliver_once(&server.state).await);
     let (claims, due) = due_in(&pool, "deliver_webhook").await;
     assert_eq!(claims, 2);
     assert!((8_500..=11_500).contains(&due), "then 10: {due}");
+    check_retry_time(&server, &pool, &org, id(&endpoint), 0).await;
 
     // Mended, it's the delivery's first attempt, whatever the job's claims.
     mend_secret().await;
@@ -1014,6 +1134,7 @@ async fn charges_the_endpoint_only_for_its_own_failures() {
     break_secret().await;
     run_now(&pool, "deliver_webhook").await;
     assert!(webhook_delivery::deliver_once(&server.state).await);
+    check_retry_time(&server, &pool, &org, id(&endpoint), 1).await;
     mend_secret().await;
     server.providers.script(HOOK, 200, json!({}));
     run_now(&pool, "deliver_webhook").await;
@@ -1067,7 +1188,7 @@ async fn waits_for_a_busy_endpoint_without_using_an_attempt() {
     let server = Server::new().await;
     let org = server.organization("alice", "northwind").await;
     let sandbox = server.workspace("alice", &org, "acme-sandbox", "sandbox").await;
-    hook(&server, "alice", &org, "sandbox", HOOK, json!(["run.completed"])).await;
+    let (endpoint, _) = hook(&server, "alice", &org, "sandbox", HOOK, json!(["run.completed"])).await;
     let ws = id(&sandbox).to_owned();
     let helper = agent(&server, "alice", &org, &ws).await;
     let pool = pool(&server).await;
@@ -1084,6 +1205,7 @@ async fn waits_for_a_busy_endpoint_without_using_an_attempt() {
     assert_eq!(claims, 0, "waiting isn't an attempt");
     assert!((2_000..=8_000).contains(&due), "about five seconds: {due}");
     assert_eq!(standing(&pool).await.1, 0);
+    check_retry_time(&server, &pool, &org, id(&endpoint), 0).await;
 
     sqlx::query("UPDATE webhook_endpoints SET delivery_holder = NULL, delivery_held_until = NULL")
         .execute(&pool)

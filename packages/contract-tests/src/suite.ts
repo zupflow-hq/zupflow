@@ -17,6 +17,9 @@ import {
   createHttpTransport,
   type MemberId,
   type OrganizationId,
+  type WebhookDeliveryId,
+  type WebhookDeliverySummary,
+  type WebhookEndpoint,
   type WorkspaceId,
   ZupflowApiError,
   type ZupflowClient,
@@ -345,6 +348,9 @@ export function contractSuite(target: Target) {
         });
         await owner.webhooks.update(org, hook.endpoint.id, { enabled: false });
         await owner.webhooks.sendTest(org, hook.endpoint.id);
+        const delivery = must((await owner.webhooks.deliveries(org, hook.endpoint.id)).items[0], "test delivery");
+        await owner.webhooks.delivery(org, hook.endpoint.id, delivery.id);
+        await owner.webhooks.deliveryAttempts(org, hook.endpoint.id, delivery.id);
         await owner.webhooks.delete(org, hook.endpoint.id);
         await owner.audit.list(org);
         await owner.workspaces.delete(workspace.id);
@@ -2978,6 +2984,330 @@ export function contractSuite(target: Target) {
     });
 
     describe("webhooks", () => {
+      const endpointIn = async (environment: "sandbox" | "production") =>
+        must(
+          (await owner.webhooks.list(fx.organization)).find((endpoint) => endpoint.environment === environment),
+          `${environment} webhook`,
+        );
+
+      it("lists every delivery outcome and returns its lean event and recorded attempts", async () => {
+        const endpoint = await endpointIn("production");
+        const list = await owner.webhooks.deliveries(fx.organization, endpoint.id);
+        expect(new Set(list.items.map((row) => row.state))).toEqual(
+          new Set(["pending", "succeeded", "failed", "skipped"]),
+        );
+        expect(list.items.length).toBeGreaterThanOrEqual(5);
+        for (const row of list.items) {
+          expect(row.organization_id).toBe(fx.organization);
+          expect(row.endpoint_id).toBe(endpoint.id);
+          expect(row.environment).toBe("production");
+          const detail = await owner.webhooks.delivery(fx.organization, endpoint.id, row.id);
+          expect(detail).toMatchObject(row);
+          expect(detail.event).toMatchObject({
+            id: row.event_id,
+            organization_id: fx.organization,
+            environment: row.environment,
+            type: row.event_type,
+            created_at: row.event_created_at,
+            workspace: row.workspace,
+          });
+          expect(detail.attempt_history_complete).toBe(true);
+          const attempts = await owner.webhooks.deliveryAttempts(fx.organization, endpoint.id, row.id);
+          expect(attempts.items).toHaveLength(row.attempts);
+          expect(attempts.items.map((attempt) => attempt.number)).toEqual(
+            Array.from({ length: row.attempts }, (_, index) => index + 1),
+          );
+          const last = attempts.items.at(-1);
+          expect(last?.status_code ?? null).toBe(row.last_status_code);
+          expect(last?.error_class ?? null).toBe(row.last_error);
+          expect(last?.attempted_at ?? null).toBe(row.last_attempt_at);
+          for (const attempt of attempts.items) expect(attempt.duration_ms).toBeGreaterThanOrEqual(0);
+          expect(row.next_attempt_at === null).toBe(row.state !== "pending");
+        }
+        const test = must(
+          list.items.find((row) => row.event_type === "webhook.test"),
+          "test event",
+        );
+        expect(test.workspace).toBeNull();
+      });
+
+      it("pages deliveries newest first and attempts oldest first without overlap", async () => {
+        const endpoint = await endpointIn("production");
+        const whole = await owner.webhooks.deliveries(fx.organization, endpoint.id, { limit: 100 });
+        const seen: WebhookDeliverySummary[] = [];
+        let cursor: string | undefined;
+        for (let pages = 0; pages < 20; pages++) {
+          const page = await owner.webhooks.deliveries(fx.organization, endpoint.id, { cursor, limit: 2 });
+          expect(page.items.length).toBeLessThanOrEqual(2);
+          expect(page.pagination.total).toBe(whole.items.length);
+          seen.push(...page.items);
+          cursor = page.pagination.next_cursor ?? undefined;
+          if (!cursor) break;
+        }
+        expect(cursor).toBeUndefined();
+        expect(seen).toEqual(whole.items);
+        const keys = whole.items.map((row) => `${row.created_at}/${row.id}`);
+        expect(keys).toEqual([...keys].sort().reverse());
+        const failed = must(
+          whole.items.find((row) => row.state === "failed"),
+          "failed delivery",
+        );
+        const numbers: number[] = [];
+        for (let pages = 0; pages < 20; pages++) {
+          const page = await owner.webhooks.deliveryAttempts(fx.organization, endpoint.id, failed.id, {
+            cursor,
+            limit: 3,
+          });
+          expect(page.items.length).toBeLessThanOrEqual(3);
+          expect(page.pagination.total).toBe(failed.attempts);
+          numbers.push(...page.items.map((row) => row.number));
+          cursor = page.pagination.next_cursor ?? undefined;
+          if (!cursor) break;
+        }
+        expect(cursor).toBeUndefined();
+        expect(numbers).toEqual(Array.from({ length: failed.attempts }, (_, index) => index + 1));
+        for (const [limit, count] of [
+          [0, 1],
+          [1000, whole.items.length],
+          [2.5, whole.items.length],
+        ] as const) {
+          expect((await owner.webhooks.deliveries(fx.organization, endpoint.id, { limit })).items).toHaveLength(count);
+        }
+      });
+
+      it("filters exactly by workspace, environment, state and event type", async () => {
+        const endpoint = await endpointIn("production");
+        const beta = await workspaceBySlug("beta-labs");
+        const all = await owner.webhooks.deliveries(fx.organization, endpoint.id);
+        for (const workspace of [fx.workspaces.acme, beta]) {
+          const page = await owner.webhooks.deliveries(fx.organization, endpoint.id, { workspace_id: workspace.id });
+          expect(page.items.length).toBeGreaterThan(0);
+          expect(
+            page.items.every(
+              (row) => row.workspace?.id === workspace.id && row.workspace.external_id === workspace.external_id,
+            ),
+          ).toBe(true);
+          expect(page.items).toEqual(all.items.filter((row) => row.workspace?.id === workspace.id));
+        }
+        const outsiderWorkspace = must(
+          (await as("outsider").workspaces.list(fx.otherOrganization)).items[0],
+          "outsider workspace",
+        );
+        for (const workspace_id of [fx.workspaces.acmeSandbox.id, outsiderWorkspace.id, "ws_missing" as const]) {
+          expect((await owner.webhooks.deliveries(fx.organization, endpoint.id, { workspace_id })).items).toEqual([]);
+        }
+        for (const state of ["pending", "succeeded", "failed", "skipped"] as const) {
+          const page = await owner.webhooks.deliveries(fx.organization, endpoint.id, { state });
+          expect(page.items).toEqual(all.items.filter((row) => row.state === state));
+        }
+        expect(
+          (await owner.webhooks.deliveries(fx.organization, endpoint.id, { event_type: "webhook.test" })).items,
+        ).toEqual(all.items.filter((row) => row.event_type === "webhook.test"));
+        expect(
+          (
+            await owner.webhooks.deliveries(fx.organization, endpoint.id, {
+              workspace_id: beta.id,
+              state: "succeeded",
+              event_type: "run.completed",
+            })
+          ).items,
+        ).toEqual(
+          all.items.filter(
+            (row) => row.workspace?.id === beta.id && row.state === "succeeded" && row.event_type === "run.completed",
+          ),
+        );
+        // @ts-expect-error: unknown filters are not a request for every event.
+        expect((await owner.webhooks.deliveries(fx.organization, endpoint.id, { state: "unknown" })).items).toEqual([]);
+        expect(
+          // @ts-expect-error: nor an unknown event type.
+          (await owner.webhooks.deliveries(fx.organization, endpoint.id, { event_type: "unknown" })).items,
+        ).toEqual([]);
+      });
+
+      it("binds cursors to their organization, endpoint, filters and delivery", async () => {
+        const endpoint = await endpointIn("production");
+        const sandbox = await endpointIn("sandbox");
+        const first = await owner.webhooks.deliveries(fx.organization, endpoint.id, { limit: 1 });
+        const cursor = must(first.pagination.next_cursor, "delivery cursor");
+        const invalid = async (call: Promise<unknown>) => {
+          expect(await failure(call)).toMatchObject({
+            status: 400,
+            code: "validation_failed",
+            fields: { cursor: expect.any(String) },
+          });
+        };
+        for (const bad of ["!invalid", "e30"])
+          await invalid(owner.webhooks.deliveries(fx.organization, endpoint.id, { cursor: bad }));
+        await invalid(owner.webhooks.deliveries(fx.organization, sandbox.id, { cursor }));
+        await invalid(
+          owner.webhooks.deliveries(fx.organization, endpoint.id, { cursor, workspace_id: fx.workspaces.acme.id }),
+        );
+        await invalid(owner.webhooks.deliveries(fx.organization, endpoint.id, { cursor, state: "pending" }));
+        await invalid(owner.webhooks.deliveries(fx.organization, endpoint.id, { cursor, event_type: "run.completed" }));
+        const outsider = as("outsider");
+        const other = must((await outsider.webhooks.list(fx.otherOrganization))[0], "other webhook");
+        await invalid(outsider.webhooks.deliveries(fx.otherOrganization, other.id, { cursor }));
+        const all = (await owner.webhooks.deliveries(fx.organization, endpoint.id)).items;
+        const delivery = must(
+          all.find((row) => row.attempts > 1),
+          "retried delivery",
+        );
+        const sibling = must(
+          all.find((row) => row.id !== delivery.id),
+          "other delivery",
+        );
+        const attempts = await owner.webhooks.deliveryAttempts(fx.organization, endpoint.id, delivery.id, { limit: 1 });
+        const attemptCursor = must(attempts.pagination.next_cursor, "attempt cursor");
+        await invalid(
+          owner.webhooks.deliveryAttempts(fx.organization, endpoint.id, sibling.id, { cursor: attemptCursor }),
+        );
+        await invalid(owner.webhooks.deliveryAttempts(fx.organization, endpoint.id, delivery.id, { cursor }));
+        await invalid(owner.webhooks.deliveries(fx.organization, endpoint.id, { cursor: attemptCursor }));
+      });
+
+      it("lets viewers and developers read the same history as owners", async () => {
+        const endpoint = await endpointIn("sandbox");
+        const expected = await owner.webhooks.deliveries(fx.organization, endpoint.id);
+        const delivery = must(expected.items[0], "delivery");
+        const detail = await owner.webhooks.delivery(fx.organization, endpoint.id, delivery.id);
+        const attempts = await owner.webhooks.deliveryAttempts(fx.organization, endpoint.id, delivery.id);
+        for (const persona of ["developer", "viewer"] as const) {
+          const reader = as(persona);
+          expect(await reader.webhooks.deliveries(fx.organization, endpoint.id)).toEqual(expected);
+          expect(await reader.webhooks.delivery(fx.organization, endpoint.id, delivery.id)).toEqual(detail);
+          expect(await reader.webhooks.deliveryAttempts(fx.organization, endpoint.id, delivery.id)).toEqual(attempts);
+        }
+      });
+
+      it("hides foreign and wrong-parent delivery IDs before checking their queries", async () => {
+        const mine = await endpointIn("production");
+        const sibling = await endpointIn("sandbox");
+        const outsider = as("outsider");
+        const other = must((await outsider.webhooks.list(fx.otherOrganization))[0], "foreign webhook");
+        const ownDelivery = must((await owner.webhooks.deliveries(fx.organization, mine.id)).items[0], "own delivery");
+        const otherList = await outsider.webhooks.deliveries(fx.otherOrganization, other.id);
+        const otherDelivery = must(otherList.items[0], "foreign delivery");
+        const checks: [ZupflowClient, OrganizationId, WebhookEndpoint, WebhookDeliveryId][] = [
+          [owner, fx.otherOrganization, other, otherDelivery.id],
+          [owner, fx.organization, other, otherDelivery.id],
+          [owner, fx.organization, mine, otherDelivery.id],
+          [owner, fx.organization, sibling, ownDelivery.id],
+          [outsider, fx.organization, mine, ownDelivery.id],
+          [outsider, fx.otherOrganization, mine, ownDelivery.id],
+          [outsider, fx.otherOrganization, other, ownDelivery.id],
+        ];
+        for (const [client, organization, endpoint, delivery] of checks) {
+          expect(await failure(client.webhooks.delivery(organization, endpoint.id, delivery))).toMatchObject({
+            status: 404,
+            code: "not_found",
+          });
+          expect(
+            await failure(client.webhooks.deliveryAttempts(organization, endpoint.id, delivery, { cursor: "invalid" })),
+          ).toMatchObject({ status: 404, code: "not_found" });
+          if (
+            endpoint.organization_id !== organization ||
+            (client === owner && organization === fx.otherOrganization) ||
+            (client === outsider && organization === fx.organization)
+          ) {
+            expect(
+              await failure(client.webhooks.deliveries(organization, endpoint.id, { cursor: "invalid" })),
+            ).toMatchObject({ status: 404, code: "not_found" });
+          }
+        }
+        expect(await outsider.webhooks.deliveries(fx.otherOrganization, other.id)).toEqual(otherList);
+        expect(
+          await failure(as(null).webhooks.deliveries(fx.organization, mine.id, { cursor: "invalid" })),
+        ).toMatchObject({ status: 401, code: "unauthenticated" });
+      });
+
+      it("keeps an API key's delivery history inside its organization and environment", async () => {
+        const production = await endpointIn("production");
+        const sandbox = await endpointIn("sandbox");
+        const endpoints = { production, sandbox };
+        for (const environment of ["sandbox", "production"] as const) {
+          const key = await owner.apiKeys.create(fx.organization, { name: "Webhook history", environment });
+          const client = withKey(key.secret);
+          const endpoint = endpoints[environment];
+          const other = endpoints[environment === "sandbox" ? "production" : "sandbox"];
+          const list = await owner.webhooks.deliveries(fx.organization, endpoint.id);
+          const row = must(list.items[0], "delivery in key environment");
+          const foreign = must(
+            (await owner.webhooks.deliveries(fx.organization, other.id)).items[0],
+            "other environment delivery",
+          );
+          expect(await client.webhooks.deliveries(fx.organization, endpoint.id)).toEqual(list);
+          expect(await client.webhooks.delivery(fx.organization, endpoint.id, row.id)).toEqual(
+            await owner.webhooks.delivery(fx.organization, endpoint.id, row.id),
+          );
+          expect(await client.webhooks.deliveryAttempts(fx.organization, endpoint.id, row.id)).toEqual(
+            await owner.webhooks.deliveryAttempts(fx.organization, endpoint.id, row.id),
+          );
+          expect(await failure(client.webhooks.deliveries(fx.organization, other.id))).toMatchObject({
+            status: 404,
+            code: "not_found",
+          });
+          expect(await failure(client.webhooks.delivery(fx.organization, other.id, foreign.id))).toMatchObject({
+            status: 404,
+            code: "not_found",
+          });
+          expect(await failure(client.webhooks.deliveryAttempts(fx.organization, other.id, foreign.id))).toMatchObject({
+            status: 404,
+            code: "not_found",
+          });
+          expect(await failure(client.webhooks.deliveries(fx.otherOrganization, endpoint.id))).toMatchObject({
+            status: 404,
+            code: "not_found",
+          });
+        }
+      });
+
+      it("records a test event once under idempotency and removes its endpoint's history on deletion", async () => {
+        const created = await owner.webhooks.create(fx.organization, {
+          environment: "sandbox",
+          url: "https://hooks.northwind.example/history",
+          description: "History",
+          events: ["run.completed"],
+        });
+        const endpoint = created.endpoint;
+        expect(await owner.webhooks.deliveries(fx.organization, endpoint.id)).toEqual({
+          items: [],
+          pagination: { next_cursor: null, total: 0 },
+        });
+        const first = await owner.webhooks.sendTest(fx.organization, endpoint.id, {
+          idempotencyKey: "delivery-history-test",
+        });
+        const replay = await owner.webhooks.sendTest(fx.organization, endpoint.id, {
+          idempotencyKey: "delivery-history-test",
+        });
+        expect(replay).toEqual(first);
+        const history = await owner.webhooks.deliveries(fx.organization, endpoint.id);
+        expect(history.items).toHaveLength(1);
+        const row = must(history.items[0], "test delivery");
+        expect(row).toMatchObject({
+          event_type: "webhook.test",
+          workspace: null,
+          attempts: 1,
+          last_status_code: first.status_code || null,
+          last_attempt_at: first.delivered_at,
+        });
+        const detail = await owner.webhooks.delivery(fx.organization, endpoint.id, row.id);
+        expect(detail.event.data).toEqual({ object: "webhook_endpoint", id: endpoint.id });
+        expect(JSON.stringify(detail)).not.toContain(created.signing_secret);
+        await owner.webhooks.delete(fx.organization, endpoint.id);
+        expect(await failure(owner.webhooks.deliveries(fx.organization, endpoint.id))).toMatchObject({
+          status: 404,
+          code: "not_found",
+        });
+        expect(await failure(owner.webhooks.delivery(fx.organization, endpoint.id, row.id))).toMatchObject({
+          status: 404,
+          code: "not_found",
+        });
+        expect(await failure(owner.webhooks.deliveryAttempts(fx.organization, endpoint.id, row.id))).toMatchObject({
+          status: 404,
+          code: "not_found",
+        });
+      });
+
       it("subscribes to every event type, and never to the test button's", async () => {
         const input = {
           environment: "sandbox" as const,

@@ -23,7 +23,13 @@ import {
   TERMINAL_RUN_STATUSES,
   type UsageReport,
   WEBHOOK_EVENT_TYPES,
+  WebhookDeliveryAttempt,
+  WebhookDeliveryErrorClass,
+  type WebhookDeliveryId,
+  type WebhookDeliverySummary,
   type WebhookEndpoint,
+  type WebhookEndpointId,
+  WebhookEvent,
   type WorkspaceId,
 } from "@zupflow/sdk";
 import { HttpResponse, http } from "msw";
@@ -86,6 +92,7 @@ import type {
   MembershipRow,
   OrganizationRow,
   RunRow,
+  WebhookDeliveryRow,
 } from "./model";
 import { levelInForce, levelRowsOf, levelsInput, policyRowOf, setLevels, toAppToolLevel, toToolPolicy } from "./policy";
 import { hash, token } from "./random";
@@ -179,6 +186,7 @@ const ID_PARAMS = {
   run: ["run", "Run"],
   key: ["api_key", "API key"],
   hook: ["webhook_endpoint", "Webhook endpoint"],
+  delivery: ["webhook_delivery", "Webhook delivery"],
 } as const satisfies Record<string, readonly [IdKind, string]>;
 
 /**
@@ -708,6 +716,109 @@ function paginate<T>(items: T[], cursor: string | null, limit: number) {
   return { page, meta: { pagination: { next_cursor: next, total: items.length } } };
 }
 
+function findWebhook(organizationId: OrganizationId, endpointId: WebhookEndpointId) {
+  const endpoint = db().webhooks.find((row) => row.organization_id === organizationId && row.id === endpointId);
+  if (!endpoint) throw notFound("Webhook endpoint");
+  return endpoint;
+}
+
+/** Joins an outbox event only within the endpoint's organization and environment. */
+function webhookEventFor(organizationId: OrganizationId, endpoint: WebhookEndpoint, row: WebhookDeliveryRow) {
+  if (row.organization_id !== organizationId || row.endpoint_id !== endpoint.id) return null;
+  const event = db().webhook_events.find(
+    (event) =>
+      event.organization_id === organizationId &&
+      event.id === row.event_id &&
+      event.environment === endpoint.environment,
+  );
+  if (!event) return null;
+  const parsed = WebhookEvent.safeParse(event.body);
+  if (!parsed.success) return null;
+  const body = parsed.data;
+  if (
+    body.organization_id !== organizationId ||
+    body.environment !== endpoint.environment ||
+    body.id !== event.id ||
+    (body.workspace?.id ?? null) !== event.workspace_id
+  )
+    return null;
+  if (
+    event.workspace_id !== null &&
+    !db().workspaces.some(
+      (workspace) =>
+        workspace.organization_id === organizationId &&
+        workspace.id === event.workspace_id &&
+        workspace.environment === endpoint.environment,
+    )
+  )
+    return null;
+  return body;
+}
+
+function webhookSummary(row: WebhookDeliveryRow, event: WebhookEvent): WebhookDeliverySummary {
+  return {
+    id: row.id,
+    organization_id: row.organization_id,
+    endpoint_id: row.endpoint_id,
+    event_id: row.event_id,
+    state: row.state,
+    attempts: row.attempts,
+    last_status_code: row.last_status_code,
+    last_attempt_at: row.last_attempt_at,
+    next_attempt_at: row.next_attempt_at,
+    created_at: row.created_at,
+    environment: event.environment,
+    event_type: event.type,
+    event_created_at: event.created_at,
+    workspace: event.workspace,
+    last_error: row.last_error === null ? null : (WebhookDeliveryErrorClass.safeParse(row.last_error).data ?? "failed"),
+  };
+}
+
+function findWebhookDelivery(organizationId: OrganizationId, endpoint: WebhookEndpoint, deliveryId: WebhookDeliveryId) {
+  const row = db().webhook_deliveries.find(
+    (row) => row.organization_id === organizationId && row.endpoint_id === endpoint.id && row.id === deliveryId,
+  );
+  const event = row ? webhookEventFor(organizationId, endpoint, row) : null;
+  if (!row || !event) throw notFound("Webhook delivery");
+  return { row, event };
+}
+
+function webhookAttempts(organizationId: OrganizationId, endpointId: WebhookEndpointId, deliveryId: WebhookDeliveryId) {
+  return db()
+    .webhook_delivery_attempts.filter(
+      (row) =>
+        row.organization_id === organizationId && row.endpoint_id === endpointId && row.delivery_id === deliveryId,
+    )
+    .sort((a, b) => a.number - b.number)
+    .map((row) =>
+      WebhookDeliveryAttempt.parse({
+        ...row,
+        error_class:
+          row.error_class === null ? null : (WebhookDeliveryErrorClass.safeParse(row.error_class).data ?? "failed"),
+      }),
+    );
+}
+
+function webhookCursor<T extends z.ZodType>(cursor: string | null, scope: string, shape: T): z.infer<T> | null {
+  if (cursor === null) return null;
+  try {
+    const decoded: unknown = JSON.parse(toolCursorName(cursor));
+    const parsed = z
+      .object({ scope: z.literal(scope), position: z.unknown() })
+      .strict()
+      .safeParse(decoded);
+    if (parsed.success) return shape.parse(parsed.data.position);
+  } catch {
+    // Invalid cursors never become an unfiltered first page.
+  }
+  throw new ApiFailure(400, "validation_failed", "Some fields are invalid.", {
+    cursor: "Not a cursor from this list.",
+  });
+}
+
+const nextWebhookCursor = (scope: string, position: unknown) => encodeToolCursor(JSON.stringify({ scope, position }));
+
 export function createHandlers(apiBase: string) {
   const u = (path: string) => `${apiBase.replace(/\/$/, "")}${path}`;
 
@@ -1200,6 +1311,32 @@ export function createHandlers(apiBase: string) {
         d.installation_tools = d.installation_tools.filter((t) => !here(t));
         d.tool_refreshes = d.tool_refreshes.filter((r) => !here(r));
         d.connect_sessions = d.connect_sessions.filter((s) => !here(s));
+        const deletedEvents = new Set(
+          d.webhook_events
+            .filter(
+              (event) => event.organization_id === workspace.organization_id && event.workspace_id === workspace.id,
+            )
+            .map((event) => event.id),
+        );
+        const deletedDeliveries = new Set(
+          d.webhook_deliveries
+            .filter(
+              (delivery) =>
+                delivery.organization_id === workspace.organization_id && deletedEvents.has(delivery.event_id),
+            )
+            .map((delivery) => delivery.id),
+        );
+        d.webhook_delivery_attempts = d.webhook_delivery_attempts.filter(
+          (attempt) =>
+            !(attempt.organization_id === workspace.organization_id && deletedDeliveries.has(attempt.delivery_id)),
+        );
+        d.webhook_deliveries = d.webhook_deliveries.filter(
+          (delivery) =>
+            !(delivery.organization_id === workspace.organization_id && deletedEvents.has(delivery.event_id)),
+        );
+        d.webhook_events = d.webhook_events.filter(
+          (event) => !(event.organization_id === workspace.organization_id && event.workspace_id === workspace.id),
+        );
         // Saved responses describe the workspace's rows, so they go with them.
         d.idempotency_keys = d.idempotency_keys.filter(
           (r) => !(r.organization_id === workspace.organization_id && r.workspace_id === workspace.id),
@@ -2568,6 +2705,12 @@ export function createHandlers(apiBase: string) {
         );
         if (!endpoint) throw notFound("Webhook endpoint");
         d.webhooks = d.webhooks.filter((w) => w !== endpoint);
+        d.webhook_deliveries = d.webhook_deliveries.filter(
+          (row) => !(row.organization_id === access.org.id && row.endpoint_id === endpoint.id),
+        );
+        d.webhook_delivery_attempts = d.webhook_delivery_attempts.filter(
+          (row) => !(row.organization_id === access.org.id && row.endpoint_id === endpoint.id),
+        );
         audit(
           access,
           "webhook.deleted",
@@ -2575,6 +2718,103 @@ export function createHandlers(apiBase: string) {
           { environment: endpoint.environment },
         );
         return noContent();
+      }),
+    ),
+
+    http.get(
+      u("/v1/organizations/:org/webhooks/:hook/deliveries"),
+      route(({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        const endpoint = findWebhook(access.org.id, idParam(params, "hook"));
+        const url = new URL(request.url);
+        const workspaceId = url.searchParams.get("workspace_id");
+        const state = url.searchParams.get("state");
+        const eventType = url.searchParams.get("event_type");
+        const scope = JSON.stringify([access.org.id, endpoint.id, endpoint.environment, workspaceId, state, eventType]);
+        const after = webhookCursor(
+          url.searchParams.get("cursor"),
+          scope,
+          z
+            .object({
+              created_at: z.iso.datetime(),
+              id: z.string().refine((value) => isId("webhook_delivery", value)),
+            })
+            .strict(),
+        );
+        const limit = clampedInt(url, "limit", 25, 100);
+        const rows = db()
+          .webhook_deliveries.filter((row) => row.organization_id === access.org.id && row.endpoint_id === endpoint.id)
+          .flatMap((row) => {
+            const event = webhookEventFor(access.org.id, endpoint, row);
+            if (
+              !event ||
+              (workspaceId !== null && event.workspace?.id !== workspaceId) ||
+              (state !== null && row.state !== state) ||
+              (eventType !== null && event.type !== eventType)
+            )
+              return [];
+            return [webhookSummary(row, event)];
+          })
+          .sort((a, b) => compareNames(b.created_at, a.created_at) || compareNames(b.id, a.id));
+        const remaining = after
+          ? rows.filter(
+              (row) => row.created_at < after.created_at || (row.created_at === after.created_at && row.id < after.id),
+            )
+          : rows;
+        const page = remaining.slice(0, limit);
+        const last = page.at(-1);
+        return ok(page, {
+          meta: {
+            pagination: {
+              total: rows.length,
+              next_cursor:
+                remaining.length > limit && last
+                  ? nextWebhookCursor(scope, { created_at: last.created_at, id: last.id })
+                  : null,
+            },
+          },
+        });
+      }),
+    ),
+
+    http.get(
+      u("/v1/organizations/:org/webhooks/:hook/deliveries/:delivery"),
+      route(({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        const endpoint = findWebhook(access.org.id, idParam(params, "hook"));
+        const { row, event } = findWebhookDelivery(access.org.id, endpoint, idParam(params, "delivery"));
+        const attempts = webhookAttempts(access.org.id, endpoint.id, row.id);
+        return ok({
+          ...webhookSummary(row, event),
+          event,
+          attempt_history_complete:
+            attempts.length === row.attempts && attempts.every((attempt, index) => attempt.number === index + 1),
+        });
+      }),
+    ),
+
+    http.get(
+      u("/v1/organizations/:org/webhooks/:hook/deliveries/:delivery/attempts"),
+      route(({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        const endpoint = findWebhook(access.org.id, idParam(params, "hook"));
+        const { row } = findWebhookDelivery(access.org.id, endpoint, idParam(params, "delivery"));
+        const url = new URL(request.url);
+        const scope = JSON.stringify([access.org.id, endpoint.id, endpoint.environment, row.id]);
+        const after = webhookCursor(url.searchParams.get("cursor"), scope, z.number().int().positive());
+        const limit = clampedInt(url, "limit", 25, 100);
+        const attempts = webhookAttempts(access.org.id, endpoint.id, row.id);
+        const remaining = after === null ? attempts : attempts.filter((attempt) => attempt.number > after);
+        const page = remaining.slice(0, limit);
+        const last = page.at(-1);
+        return ok(page, {
+          meta: {
+            pagination: {
+              total: attempts.length,
+              next_cursor: remaining.length > limit && last ? nextWebhookCursor(scope, last.number) : null,
+            },
+          },
+        });
       }),
     ),
 
@@ -2592,6 +2832,47 @@ export function createHandlers(apiBase: string) {
           delivered_at: new Date().toISOString(),
         };
         endpoint.last_delivery = delivery;
+        const eventId = newId("webhook_event");
+        const deliveryId = newId("webhook_delivery");
+        db().webhook_events.push({
+          id: eventId,
+          organization_id: access.org.id,
+          workspace_id: null,
+          environment: endpoint.environment,
+          body: {
+            id: eventId,
+            organization_id: access.org.id,
+            environment: endpoint.environment,
+            created_at: delivery.delivered_at,
+            type: "webhook.test",
+            workspace: null,
+            data: { object: "webhook_endpoint", id: endpoint.id },
+          },
+        });
+        const succeeded = delivery.status_code >= 200 && delivery.status_code < 300;
+        db().webhook_deliveries.push({
+          id: deliveryId,
+          organization_id: access.org.id,
+          endpoint_id: endpoint.id,
+          event_id: eventId,
+          state: succeeded ? "succeeded" : "failed",
+          attempts: 1,
+          last_status_code: delivery.status_code,
+          last_error: succeeded ? null : "status",
+          last_attempt_at: delivery.delivered_at,
+          next_attempt_at: null,
+          created_at: delivery.delivered_at,
+        });
+        db().webhook_delivery_attempts.push({
+          organization_id: access.org.id,
+          endpoint_id: endpoint.id,
+          delivery_id: deliveryId,
+          number: 1,
+          status_code: delivery.status_code,
+          error_class: succeeded ? null : "status",
+          attempted_at: delivery.delivered_at,
+          duration_ms: 15,
+        });
         return ok(delivery);
       }),
     ),

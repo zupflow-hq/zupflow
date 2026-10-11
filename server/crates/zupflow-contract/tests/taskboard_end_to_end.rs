@@ -31,7 +31,8 @@ use std::time::{Duration, Instant};
 
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
-use zupflow_taskboard::{Options, Running};
+use zupflow_core::webhooks::signature;
+use zupflow_taskboard::{Options, Running, WebhookRequest};
 
 const OWNER: &str = "contract:owner";
 
@@ -1053,4 +1054,335 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
         "{:?}",
         board.token_requests()
     );
+}
+
+/// An endpoint of this journey, separate from the frozen reference history.
+async fn history_hook(stack: &Stack, who: &str, org: &str, environment: &str) -> (String, String) {
+    let (status, created) = stack
+        .api(
+            who,
+            Method::POST,
+            &format!("/v1/organizations/{org}/webhooks"),
+            None,
+            Some(json!({
+                "url": format!("{}/webhooks", stack.taskboard.taskboard.base_url()),
+                "environment": environment, "events": ["run.completed"], "description": "History journey",
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    (
+        id(&data(&created)["endpoint"]),
+        data(&created)["signing_secret"].as_str().unwrap().to_owned(),
+    )
+}
+
+fn verify_webhook(request: &WebhookRequest, secret: &str) -> Value {
+    let header = request.signature.as_deref().unwrap();
+    let time: i64 = header
+        .strip_prefix("t=")
+        .and_then(|rest| rest.split(',').next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(header, signature(secret.as_bytes(), time, &request.body));
+    assert!((time - zupflow_core::time::Timestamp::now().millis() / 1000).abs() < 60);
+    let event: Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(request.event_id.as_deref(), event["id"].as_str());
+    assert_eq!(request.event_type.as_deref(), event["type"].as_str());
+    assert_eq!(request.attempt.as_deref(), Some("1"));
+    event
+}
+
+/// Checks the readable history against the actual signed HTTP request.
+async fn check_history(
+    stack: &Stack,
+    who: &str,
+    org: &str,
+    hook: &str,
+    summary: &Value,
+    request: &WebhookRequest,
+    secret: &str,
+) {
+    let event = verify_webhook(request, secret);
+    let path = format!("/v1/organizations/{org}/webhooks/{hook}/deliveries/{}", id(summary));
+    let (status, detail) = stack.api(who, Method::GET, &path, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(data(&detail)["event"], event, "history is the event actually sent");
+    assert_eq!(data(&detail)["attempt_history_complete"], true);
+    assert_eq!(data(&detail)["event_id"], event["id"]);
+    assert_eq!(data(&detail)["organization_id"], event["organization_id"]);
+    assert_eq!(data(&detail)["environment"], event["environment"]);
+    assert_eq!(data(&detail)["workspace"], event["workspace"]);
+    assert_eq!(data(&detail)["endpoint_id"], hook);
+    assert_eq!(data(&detail)["attempts"], 1);
+    assert_eq!(data(&detail)["next_attempt_at"], Value::Null);
+    let (status, attempts) = stack
+        .api(who, Method::GET, &format!("{path}/attempts?limit=1"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{attempts}");
+    assert_eq!(attempts["meta"]["pagination"]["total"], 1);
+    assert_eq!(attempts["meta"]["pagination"]["next_cursor"], Value::Null);
+    let attempt = &data(&attempts)[0];
+    assert_eq!(attempt["number"], 1);
+    assert_eq!(attempt["status_code"], data(&detail)["last_status_code"]);
+    assert_eq!(attempt["error_class"], data(&detail)["last_error"]);
+    assert_eq!(attempt["attempted_at"], data(&detail)["last_attempt_at"]);
+    assert!(
+        attempt["duration_ms"].as_u64().is_some(),
+        "duration is recorded: {attempt}"
+    );
+    for response in [&detail, &attempts] {
+        let serialized = response.to_string();
+        assert!(!serialized.contains(secret), "history never reveals a signing secret");
+        assert!(
+            !serialized.contains(request.signature.as_deref().unwrap()),
+            "history never stores signing headers"
+        );
+    }
+}
+
+/// A completed run in a fresh workspace; fixture jobs can't enter its history.
+async fn history_run(stack: &Stack, who: &str, org: &str, slug: &str, environment: &str) -> (String, String) {
+    let (status, workspace) = stack
+        .api(
+            who,
+            Method::POST,
+            &format!("/v1/organizations/{org}/workspaces"),
+            None,
+            Some(json!({ "name": slug, "slug": slug, "environment": environment, "external_id": slug })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{workspace}");
+    let ws = id(data(&workspace));
+    let (status, agent) = stack
+        .api(
+            who,
+            Method::POST,
+            &format!("/v1/workspaces/{ws}/agents"),
+            Some(org),
+            Some(json!({ "name": "Webhook trial", "description": "", "model": "model-balanced", "instructions": "Answer briefly." })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{agent}");
+    let caller = if environment == "production" {
+        let (status, key) = stack
+            .api(
+                who,
+                Method::POST,
+                &format!("/v1/organizations/{org}/api-keys"),
+                None,
+                Some(json!({ "name": "Webhook trial", "environment": "production" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{key}");
+        data(&key)["secret"].as_str().unwrap().to_owned()
+    } else {
+        who.to_owned()
+    };
+    let (status, run) = stack
+        .api(
+            &caller,
+            Method::POST,
+            &format!("/v1/workspaces/{ws}/agents/{}/runs", id(data(&agent))),
+            Some(org),
+            Some(json!({ "input": "A private message that never belongs in a webhook." })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{run}");
+    let run = id(data(&run));
+    eventually("the history run to finish", || async {
+        let (status, body) = stack
+            .api(
+                who,
+                Method::GET,
+                &format!("/v1/workspaces/{ws}/runs/{run}"),
+                Some(org),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_ne!(data(&body)["status"], "failed", "{body}");
+        (data(&body)["status"] == "completed").then_some(())
+    })
+    .await;
+    (ws, run)
+}
+
+#[tokio::test]
+async fn webhook_history_matches_deliveries_and_keeps_their_scope() {
+    let stack = Stack::start().await;
+    let board = &stack.taskboard.taskboard;
+    let mut organizations = Vec::new();
+    for (who, slug) in [(OWNER, "northwind"), ("contract:outsider", "larkspur")] {
+        let (status, me) = stack.api(who, Method::GET, "/v1/me", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        organizations.push(
+            data(&me)["organizations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|org| org["slug"] == slug)
+                .map(id)
+                .unwrap(),
+        );
+    }
+    let org = &organizations[0];
+    let other_org = &organizations[1];
+    let (sandbox, sandbox_secret) = history_hook(&stack, OWNER, org, "sandbox").await;
+    let (production, production_secret) = history_hook(&stack, OWNER, org, "production").await;
+    let (other, other_secret) = history_hook(&stack, "contract:outsider", other_org, "sandbox").await;
+    let sandbox_path = format!("/v1/organizations/{org}/webhooks/{sandbox}/deliveries");
+
+    // Both outcomes are actual HTTPS requests, and the synchronous test
+    // delivery needs no retry timer to exercise a terminal failure.
+    for status_code in [204, 503] {
+        board.set_webhook_status(Some(status_code));
+        let (status, sent) = stack
+            .api(
+                OWNER,
+                Method::POST,
+                &format!("/v1/organizations/{org}/webhooks/{sandbox}/test"),
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{sent}");
+        assert_eq!(data(&sent)["status_code"], status_code);
+    }
+    board.set_webhook_status(None);
+    let mut path = format!("{sandbox_path}?event_type=webhook.test&limit=1");
+    let mut test_deliveries = Vec::new();
+    loop {
+        let (status, page) = stack.api(OWNER, Method::GET, &path, None, None).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["meta"]["pagination"]["total"], 2);
+        test_deliveries.extend(data(&page).as_array().unwrap().iter().cloned());
+        let Some(cursor) = page["meta"]["pagination"]["next_cursor"].as_str() else {
+            break;
+        };
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("event_type", "webhook.test")
+            .append_pair("limit", "1")
+            .append_pair("cursor", cursor)
+            .finish();
+        path = format!("{sandbox_path}?{query}");
+        assert!(test_deliveries.len() < 3, "pagination makes progress");
+    }
+    assert_eq!(test_deliveries.len(), 2);
+    assert_ne!(test_deliveries[0]["id"], test_deliveries[1]["id"]);
+    for summary in &test_deliveries {
+        let failed = summary["last_status_code"] == 503;
+        assert_eq!(summary["state"], if failed { "failed" } else { "succeeded" });
+        assert_eq!(
+            summary["last_error"],
+            if failed { json!("status") } else { Value::Null }
+        );
+        assert_eq!(summary["workspace"], Value::Null);
+        let request = board
+            .webhook_requests()
+            .into_iter()
+            .find(|request| request.event_id.as_deref() == summary["event_id"].as_str())
+            .unwrap();
+        check_history(&stack, OWNER, org, &sandbox, summary, &request, &sandbox_secret).await;
+    }
+
+    // An organization can inspect both its workspaces, while the filter
+    // and each signed event preserve the workspace and its external ID.
+    let mut journeys = Vec::new();
+    for (who, organization, slug, environment, hook, secret) in [
+        (OWNER, org, "webhook-first", "sandbox", &sandbox, &sandbox_secret),
+        (OWNER, org, "webhook-second", "sandbox", &sandbox, &sandbox_secret),
+        (
+            OWNER,
+            org,
+            "webhook-live",
+            "production",
+            &production,
+            &production_secret,
+        ),
+        (
+            "contract:outsider",
+            other_org,
+            "webhook-other",
+            "sandbox",
+            &other,
+            &other_secret,
+        ),
+    ] {
+        let (ws, run) = history_run(&stack, who, organization, slug, environment).await;
+        let path = format!("/v1/organizations/{organization}/webhooks/{hook}/deliveries?workspace_id={ws}");
+        let summary = eventually("the scoped delivery history", || async {
+            let (status, page) = stack.api(who, Method::GET, &path, None, None).await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            let rows = data(&page).as_array().unwrap();
+            assert!(rows.len() <= 1, "only this workspace's event: {page}");
+            rows.first().filter(|row| row["state"] == "succeeded").cloned()
+        })
+        .await;
+        assert_eq!(summary["workspace"], json!({ "id": ws, "external_id": slug }));
+        assert_eq!(summary["environment"], environment);
+        let request = board
+            .webhook_requests()
+            .into_iter()
+            .find(|request| request.event_id.as_deref() == summary["event_id"].as_str())
+            .unwrap();
+        let event = verify_webhook(&request, secret);
+        assert_eq!(event["data"]["id"], run);
+        assert!(
+            !String::from_utf8_lossy(&request.body).contains("A private message"),
+            "the event has no run content"
+        );
+        check_history(&stack, who, organization, hook, &summary, &request, secret).await;
+        journeys.push((organization.to_owned(), hook.to_owned(), ws, summary));
+    }
+
+    for (organization, hook, ws, summary) in &journeys {
+        if hook != &sandbox {
+            let (status, filtered) = stack
+                .api(
+                    OWNER,
+                    Method::GET,
+                    &format!("{sandbox_path}?workspace_id={ws}"),
+                    None,
+                    None,
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{filtered}");
+            assert!(
+                data(&filtered).as_array().unwrap().is_empty(),
+                "another environment or org"
+            );
+            let (status, hidden) = stack
+                .api(
+                    OWNER,
+                    Method::GET,
+                    &format!("{sandbox_path}/{}", id(summary)),
+                    None,
+                    None,
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "a delivery under the wrong endpoint: {hidden}"
+            );
+        }
+        if organization == other_org {
+            let (status, hidden) = stack
+                .api(
+                    OWNER,
+                    Method::GET,
+                    &format!("/v1/organizations/{organization}/webhooks/{hook}/deliveries"),
+                    None,
+                    None,
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "another organization's history: {hidden}"
+            );
+        }
+    }
 }

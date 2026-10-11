@@ -14,7 +14,9 @@ import type {
   ToolLevel,
   User,
   UserId,
+  WebhookDeliveryState,
   WebhookEndpoint,
+  WebhookEvent,
   WorkspaceId,
 } from "@zupflow/sdk";
 import { CATALOG, type CatalogEntry } from "./catalog";
@@ -37,7 +39,7 @@ import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 import { appIn, timelineOf } from "./scope";
 import { listedFrom, recordListing } from "./tools";
 
-export const DB_SCHEMA = 19;
+export const DB_SCHEMA = 20;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -540,6 +542,9 @@ export function seed(nowMs: number = Date.now()): Db {
       },
     ],
     webhooks: [] as WebhookEndpoint[],
+    webhook_events: [],
+    webhook_deliveries: [],
+    webhook_delivery_attempts: [],
     audit: [] as Db["audit"],
     idempotency_keys: [],
     // Secure randomness, not the seed's: this key is a secret.
@@ -643,9 +648,96 @@ export function seed(nowMs: number = Date.now()): Db {
   seedFernhill(db, nowMs);
   seedTools(db, nowMs, sandboxLinear);
   seedLevels(db, nowMs, { google, linear, stripe, github }, jordan.id);
+  seedWebhookHistory(db, nowMs);
   // Seeded runs record their approvals as they're decided: newest first, like the log.
   db.audit.sort((a, b) => b.created_at.localeCompare(a.created_at));
   return db;
+}
+
+/** Fixed scenarios and times relative to `nowMs`, so resetting repeats every delivery outcome. */
+function seedWebhookHistory(db: Db, nowMs: number) {
+  const rng = mulberry32(20261011);
+  for (const endpoint of db.webhooks) {
+    const slugs =
+      endpoint.environment === "sandbox" ? ["acme-sandbox", "qa-playground"] : ["acme", "beta-labs", "harbor"];
+    const workspaces = db.workspaces.filter(
+      (workspace) =>
+        workspace.organization_id === endpoint.organization_id &&
+        workspace.environment === endpoint.environment &&
+        slugs.includes(workspace.slug),
+    );
+    if (workspaces.length === 0) continue;
+    const scenarios: { state: WebhookDeliveryState; count: number; test?: true }[] = [
+      { state: "pending", count: 2 },
+      { state: "succeeded", count: 2 },
+      { state: "failed", count: 8 },
+      { state: "skipped", count: 0 },
+      { state: "succeeded", count: 1, test: true },
+    ];
+    for (const [index, scenario] of scenarios.entries()) {
+      const workspace = workspaces[index % workspaces.length];
+      if (!workspace) continue;
+      const run = db.runs.find(
+        (row) =>
+          row.organization_id === endpoint.organization_id &&
+          row.workspace_id === workspace.id &&
+          row.status === "completed",
+      );
+      if (!run) continue;
+      const at = nowMs - (index + 1) * HOUR;
+      const created_at = new Date(at).toISOString();
+      const event_id = newId("webhook_event", { rng, at });
+      const id = newId("webhook_delivery", { rng, at });
+      const common = {
+        id: event_id,
+        organization_id: endpoint.organization_id,
+        environment: endpoint.environment,
+        created_at,
+      };
+      const event: WebhookEvent = scenario.test
+        ? { ...common, type: "webhook.test", workspace: null, data: { object: "webhook_endpoint", id: endpoint.id } }
+        : {
+            ...common,
+            type: "run.completed",
+            workspace: { id: workspace.id, external_id: workspace.external_id },
+            data: { object: "run", id: run.id, agent_id: run.agent_id, status: "completed" },
+          };
+      db.webhook_events.push({
+        id: event_id,
+        organization_id: endpoint.organization_id,
+        workspace_id: event.workspace?.id ?? null,
+        environment: endpoint.environment,
+        body: event,
+      });
+      const last_attempt_at = scenario.count ? new Date(at + scenario.count * 1000).toISOString() : null;
+      db.webhook_deliveries.push({
+        id,
+        organization_id: endpoint.organization_id,
+        endpoint_id: endpoint.id,
+        event_id,
+        state: scenario.state,
+        attempts: scenario.count,
+        last_status_code: scenario.count ? (scenario.state === "succeeded" ? 200 : 503) : null,
+        last_error: scenario.count && scenario.state !== "succeeded" ? "status" : null,
+        last_attempt_at,
+        next_attempt_at: scenario.state === "pending" ? new Date(nowMs + MINUTE).toISOString() : null,
+        created_at,
+      });
+      for (let number = 1; number <= scenario.count; number++) {
+        const succeeded = scenario.state === "succeeded" && number === scenario.count;
+        db.webhook_delivery_attempts.push({
+          organization_id: endpoint.organization_id,
+          endpoint_id: endpoint.id,
+          delivery_id: id,
+          number,
+          status_code: succeeded ? 200 : 503,
+          error_class: succeeded ? null : "status",
+          attempted_at: new Date(at + number * 1000).toISOString(),
+          duration_ms: 12 + number,
+        });
+      }
+    }
+  }
 }
 
 /**

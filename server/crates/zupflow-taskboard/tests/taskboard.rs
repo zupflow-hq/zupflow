@@ -690,3 +690,60 @@ async fn names_its_account() {
     let refused = f.http.get(f.running.taskboard.identity_url()).send().await.unwrap();
     assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn records_exact_webhook_bytes_and_can_fail_then_recover() {
+    let f = Fixture::new().await;
+    let board = &f.running.taskboard;
+    let body = r#" { "type": "webhook.test", "data": { "message": "\u0061" } } "#;
+    for (number, configured, expected) in [
+        (1, None, StatusCode::NO_CONTENT),
+        (2, Some(503), StatusCode::SERVICE_UNAVAILABLE),
+        (3, Some(204), StatusCode::NO_CONTENT),
+    ] {
+        board.set_webhook_status(configured);
+        let response = f
+            .http
+            .post(f.url("/webhooks"))
+            .header("content-type", "application/json")
+            .header("zupflow-signature", "t=123,v1=first,v1=second")
+            .header("zupflow-event-id", "evt_0000000000000000000001")
+            .header("zupflow-event-type", "webhook.test")
+            .header("zupflow-delivery-attempt", number.to_string())
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    let captured = board.webhook_requests();
+    assert_eq!(captured.len(), 3, "a refused delivery is recorded too");
+    for (index, request) in captured.iter().enumerate() {
+        assert_eq!(request.body, body.as_bytes(), "the signed body is not reserialized");
+        assert_eq!(request.signature.as_deref(), Some("t=123,v1=first,v1=second"));
+        assert_eq!(request.event_id.as_deref(), Some("evt_0000000000000000000001"));
+        assert_eq!(request.event_type.as_deref(), Some("webhook.test"));
+        assert_eq!(request.attempt.as_deref(), Some((index + 1).to_string().as_str()));
+    }
+    assert_eq!(
+        board.webhooks(),
+        vec![json!({ "type": "webhook.test", "data": { "message": "a" } }); 3],
+        "the existing parsed-event view is unchanged"
+    );
+    for (content_type, invalid, expected) in [
+        ("text/plain", body, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ("application/json", "{", StatusCode::BAD_REQUEST),
+    ] {
+        let response = f
+            .http
+            .post(f.url("/webhooks"))
+            .header("content-type", content_type)
+            .body(invalid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    assert_eq!(board.webhook_requests().len(), 3, "malformed events are never recorded");
+    assert_eq!(board.webhooks().len(), 3);
+}

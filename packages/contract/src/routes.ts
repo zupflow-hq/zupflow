@@ -842,6 +842,38 @@ export const routes: readonly Route[] = [
     response: noContent,
   },
   {
+    operationId: "listWebhookDeliveries",
+    method: "get",
+    path: "/v1/organizations/{org}/webhooks/{hook}/deliveries",
+    summary:
+      "An endpoint's deliveries, newest first by creation time and ID. Every member may read; an API key reads only its environment. Unknown state/event_type or a missing, foreign or other-environment workspace filter matches nothing. A malformed cursor, or one from another endpoint or set of filters, is `400 validation_failed`.",
+    callers: both,
+    params: { ...org, hook: idSchema("webhook_endpoint") },
+    query: s.WebhookDeliveryListQuery,
+    response: ok(s.WebhookDeliverySummary, { list: true, paginated: true }),
+  },
+  {
+    operationId: "getWebhookDelivery",
+    method: "get",
+    path: "/v1/organizations/{org}/webhooks/{hook}/deliveries/{delivery}",
+    summary:
+      "A delivery and its lean event. A missing, foreign or wrong-endpoint delivery is `404`. Older deliveries may have incomplete attempt history; response bodies, request headers and signatures are never returned.",
+    callers: both,
+    params: { ...org, hook: idSchema("webhook_endpoint"), delivery: idSchema("webhook_delivery") },
+    response: ok(s.WebhookDeliveryDetail),
+  },
+  {
+    operationId: "listWebhookDeliveryAttempts",
+    method: "get",
+    path: "/v1/organizations/{org}/webhooks/{hook}/deliveries/{delivery}/attempts",
+    summary:
+      "A delivery's recorded attempts, oldest first by number. A malformed cursor or one from another delivery is `400 validation_failed`. Historical summary-only attempts are not fabricated.",
+    callers: both,
+    params: { ...org, hook: idSchema("webhook_endpoint"), delivery: idSchema("webhook_delivery") },
+    query: s.PageQuery,
+    response: ok(s.WebhookDeliveryAttempt, { list: true, paginated: true }),
+  },
+  {
     operationId: "testWebhook",
     method: "post",
     path: "/v1/organizations/{org}/webhooks/{hook}/test",

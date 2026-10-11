@@ -4,6 +4,11 @@
 //! `organization_id`, joins included; a delivery's job is queued in the
 //! transaction that records the delivery, through the queue's own table.
 
+mod history;
+
+#[cfg(test)]
+mod history_tests;
+
 use async_trait::async_trait;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, Sqlite, Transaction};
@@ -15,10 +20,11 @@ use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::scope::Scope;
 use zupflow_core::time::Timestamp;
 use zupflow_core::webhooks::{
-    Attempt, DISABLE_AFTER, DeliveryState, EndpointChanges, LastDelivery, NewEndpoint, NewWebhookEvent,
-    PendingDelivery, SECRET_VERSION, SigningSecret, WebhookEndpoint, WebhookError, WebhookEventType, WebhookStore,
-    delivery_job,
+    Attempt, DISABLE_AFTER, DeliveryDetail, DeliveryFilter, DeliveryState, DeliverySummary, EndpointChanges,
+    LastDelivery, NewEndpoint, NewWebhookEvent, PendingDelivery, RecordedAttempt, SECRET_VERSION, SigningSecret,
+    TEST_EVENT, WebhookEndpoint, WebhookError, WebhookEventType, WebhookStore, delivery_job, safe_delivery_error,
 };
+use zupflow_core::workspaces::Page;
 
 use crate::Database;
 use crate::database::duration_millis;
@@ -134,6 +140,30 @@ async fn insert_event(
         return Err(WebhookError::Unavailable);
     }
     Ok(false)
+}
+
+async fn insert_attempt(
+    transaction: &mut Transaction<'_, Sqlite>,
+    organization_id: OrganizationId,
+    delivery_id: WebhookDeliveryId,
+    attempt: &Attempt,
+) -> Result<(), WebhookError> {
+    sqlx::query(
+        "INSERT INTO webhook_delivery_attempts (id, organization_id, delivery_id, number, status_code, \
+         error_class, attempted_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(organization_id.uuid())
+    .bind(delivery_id.uuid())
+    .bind(attempt.number)
+    .bind(attempt.status)
+    .bind(attempt.error.as_deref().map(safe_delivery_error))
+    .bind(attempt.at.millis())
+    .bind(i64::try_from(attempt.duration_ms).unwrap_or(i64::MAX))
+    .execute(&mut **transaction)
+    .await
+    .map_err(failed("insert_attempt"))?;
+    Ok(())
 }
 
 #[async_trait]
@@ -398,13 +428,15 @@ impl WebhookStore for SqliteWebhookStore {
         attempt: &Attempt,
     ) -> Result<WebhookDeliveryId, WebhookError> {
         let mut transaction = self.immediate("record_test").await?;
-        let here = sqlx::query("SELECT 1 FROM webhook_endpoints WHERE organization_id = ? AND id = ?")
-            .bind(organization_id.uuid())
-            .bind(endpoint_id.uuid())
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(failed("record_test"))?;
-        if here.is_none() {
+        let here =
+            sqlx::query("SELECT 1 FROM webhook_endpoints WHERE organization_id = ? AND id = ? AND environment = ?")
+                .bind(organization_id.uuid())
+                .bind(endpoint_id.uuid())
+                .bind(event.environment.as_str())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(failed("record_test"))?;
+        if here.is_none() || event.workspace_id.is_some() || event.kind != TEST_EVENT || attempt.number != 1 {
             return Err(WebhookError::NotFound);
         }
         insert_event(&mut transaction, organization_id, event).await?;
@@ -430,6 +462,7 @@ impl WebhookStore for SqliteWebhookStore {
         .execute(&mut *transaction)
         .await
         .map_err(failed("record_test"))?;
+        insert_attempt(&mut transaction, organization_id, delivery_id, attempt).await?;
         // A success is a successful delivery, so the endpoint isn't failing
         // any more; a failure is only the test's, so it starts no count.
         sqlx::query(
@@ -455,7 +488,7 @@ impl WebhookStore for SqliteWebhookStore {
         delivery_id: WebhookDeliveryId,
     ) -> Result<Option<PendingDelivery>, WebhookError> {
         let row = sqlx::query(
-            "SELECT d.id, d.endpoint_id, d.event_id, d.state, d.attempts, e.type, e.body, p.url, p.enabled, \
+            "SELECT d.id, d.endpoint_id, d.event_id, d.state, d.attempts, d.next_attempt_at, e.type, e.body, p.url, p.enabled, \
              p.events FROM webhook_deliveries d \
              JOIN webhook_events e ON e.organization_id = d.organization_id AND e.id = d.event_id \
              JOIN webhook_endpoints p ON p.organization_id = d.organization_id AND p.id = d.endpoint_id \
@@ -486,6 +519,10 @@ impl WebhookStore for SqliteWebhookStore {
             body: row.try_get("body").map_err(read)?,
             state: DeliveryState::parse(&state).ok_or_else(|| read("an unknown delivery state"))?,
             attempts: u32::try_from(row.try_get::<i64, _>("attempts").map_err(read)?).map_err(read)?,
+            next_attempt_at: row
+                .try_get::<Option<i64>, _>("next_attempt_at")
+                .map_err(read)?
+                .map(Timestamp::from_millis),
             url: row.try_get("url").map_err(read)?,
             enabled: row.try_get::<i64, _>("enabled").map_err(read)? == 1,
             subscribed,
@@ -499,10 +536,11 @@ impl WebhookStore for SqliteWebhookStore {
         attempt: &Attempt,
     ) -> Result<(), WebhookError> {
         let mut transaction = self.immediate("record_attempt").await?;
+        let previous = attempt.number.checked_sub(1).ok_or(WebhookError::NotFound)?;
         let endpoint: Option<uuid::Uuid> = sqlx::query_scalar(
             "UPDATE webhook_deliveries SET state = ?, attempts = ?, last_status_code = ?, last_error = ?, \
              last_attempt_at = ?, next_attempt_at = ? \
-             WHERE organization_id = ? AND id = ? AND state = 'pending' RETURNING endpoint_id",
+             WHERE organization_id = ? AND id = ? AND state = 'pending' AND attempts = ? RETURNING endpoint_id",
         )
         .bind(attempt.state.as_str())
         .bind(attempt.number)
@@ -512,12 +550,14 @@ impl WebhookStore for SqliteWebhookStore {
         .bind(attempt.next_attempt_at.map(Timestamp::millis))
         .bind(organization_id.uuid())
         .bind(delivery_id.uuid())
+        .bind(previous)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(failed("record_attempt"))?;
         let Some(endpoint) = endpoint else {
             return Err(WebhookError::NotFound);
         };
+        insert_attempt(&mut transaction, organization_id, delivery_id, attempt).await?;
         let at = attempt.at.millis();
         let query = if attempt.succeeded() {
             sqlx::query(
@@ -549,6 +589,32 @@ impl WebhookStore for SqliteWebhookStore {
             .await
             .map_err(failed("record_attempt"))?;
         transaction.commit().await.map_err(failed("record_attempt"))?;
+        Ok(())
+    }
+
+    async fn defer_delivery(
+        &self,
+        organization_id: OrganizationId,
+        delivery_id: WebhookDeliveryId,
+        attempts: u32,
+        previous_next_attempt_at: Option<Timestamp>,
+        next_attempt_at: Timestamp,
+    ) -> Result<(), WebhookError> {
+        let deferred = sqlx::query(
+            "UPDATE webhook_deliveries SET next_attempt_at = ? \
+             WHERE organization_id = ? AND id = ? AND state = 'pending' AND attempts = ? AND next_attempt_at IS ?",
+        )
+        .bind(next_attempt_at.millis())
+        .bind(organization_id.uuid())
+        .bind(delivery_id.uuid())
+        .bind(attempts)
+        .bind(previous_next_attempt_at.map(Timestamp::millis))
+        .execute(self.database.pool())
+        .await
+        .map_err(failed("defer_delivery"))?;
+        if deferred.rows_affected() == 0 {
+            return Err(WebhookError::NotFound);
+        }
         Ok(())
     }
 
@@ -653,6 +719,58 @@ impl WebhookStore for SqliteWebhookStore {
         .map_err(failed("release_endpoint"))?;
         Ok(())
     }
+
+    async fn list_deliveries(
+        &self,
+        organization_id: OrganizationId,
+        endpoint_id: WebhookEndpointId,
+        environment: Environment,
+        filter: &DeliveryFilter,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<Page<DeliverySummary>, WebhookError> {
+        history::list_deliveries(
+            &self.database,
+            organization_id,
+            endpoint_id,
+            environment,
+            filter,
+            cursor,
+            limit,
+        )
+        .await
+    }
+
+    async fn find_delivery_detail(
+        &self,
+        organization_id: OrganizationId,
+        endpoint_id: WebhookEndpointId,
+        environment: Environment,
+        delivery_id: WebhookDeliveryId,
+    ) -> Result<Option<DeliveryDetail>, WebhookError> {
+        history::find_delivery_detail(&self.database, organization_id, endpoint_id, environment, delivery_id).await
+    }
+
+    async fn list_delivery_attempts(
+        &self,
+        organization_id: OrganizationId,
+        endpoint_id: WebhookEndpointId,
+        environment: Environment,
+        delivery_id: WebhookDeliveryId,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<Page<RecordedAttempt>, WebhookError> {
+        history::list_delivery_attempts(
+            &self.database,
+            organization_id,
+            endpoint_id,
+            environment,
+            delivery_id,
+            cursor,
+            limit,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -681,7 +799,11 @@ mod tests {
                     .execute(pool)
                     .await
                     .unwrap();
-                for (workspace, environment) in [(tenant.sandbox, "sandbox"), (tenant.production, "production")] {
+                for (workspace, environment) in [
+                    (tenant.sandbox, "sandbox"),
+                    (tenant.sibling, "sandbox"),
+                    (tenant.production, "production"),
+                ] {
                     sqlx::query(
                         "INSERT INTO workspaces (id, organization_id, environment, name, slug, created_at) \
                          VALUES (?, ?, ?, 'W', ?, 0)",
@@ -730,11 +852,13 @@ mod tests {
         let a = Tenant {
             organization_id: OrganizationId::generate(),
             sandbox: WorkspaceId::generate(),
+            sibling: WorkspaceId::generate(),
             production: WorkspaceId::generate(),
         };
         let b = Tenant {
             organization_id: OrganizationId::generate(),
             sandbox: WorkspaceId::generate(),
+            sibling: WorkspaceId::generate(),
             production: WorkspaceId::generate(),
         };
         prepare(a).await;

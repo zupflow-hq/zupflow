@@ -19,14 +19,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use zupflow_core::environment::Environment;
-use zupflow_core::ids::{OrganizationId, WebhookDeliveryId, WebhookEndpointId, WebhookEventId, WorkspaceId};
+use zupflow_core::ids::{
+    AgentId, OrganizationId, RunId, WebhookDeliveryId, WebhookEndpointId, WebhookEventId, WorkspaceId,
+};
 use zupflow_core::jobs::{JobQueue, LeaseToken};
 use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
 use zupflow_core::webhooks::{
-    Attempt, DELIVER, DISABLE_AFTER, DeliveryState, EndpointChanges, NewEndpoint, NewWebhookEvent, TEST_EVENT,
-    WebhookError, WebhookEventType, WebhookStore, delivery_of,
+    Attempt, DELIVER, DISABLE_AFTER, DeliveryFilter, DeliveryState, EndpointChanges, NewEndpoint, NewWebhookEvent,
+    TEST_EVENT, WebhookError, WebhookEventType, WebhookStore, delivery_of, event_body,
 };
 
 use crate::audit_store::by_suite;
@@ -35,6 +37,7 @@ use crate::audit_store::by_suite;
 pub struct Tenant {
     pub organization_id: OrganizationId,
     pub sandbox: WorkspaceId,
+    pub sibling: WorkspaceId,
     pub production: WorkspaceId,
 }
 
@@ -49,6 +52,7 @@ async fn tenant(prepare: &Prepare) -> Tenant {
     let tenant = Tenant {
         organization_id: OrganizationId::generate(),
         sandbox: WorkspaceId::generate(),
+        sibling: WorkspaceId::generate(),
         production: WorkspaceId::generate(),
     };
     prepare(tenant).await;
@@ -127,6 +131,7 @@ fn failure(number: u32, at: Timestamp, last: bool) -> Attempt {
         status: Some(503),
         error: Some("status".to_owned()),
         at,
+        duration_ms: 12,
         state: if last {
             DeliveryState::Failed
         } else {
@@ -142,6 +147,7 @@ fn success(number: u32, at: Timestamp) -> Attempt {
         status: Some(204),
         error: None,
         at,
+        duration_ms: 7,
         state: DeliveryState::Succeeded,
         next_attempt_at: None,
     }
@@ -177,6 +183,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     deletes_deliveries_with_their_endpoint(&stores, a).await;
     abandons_a_delivery_without_charging_its_endpoint(&stores, a, b).await;
     holds_an_endpoint_for_one_delivery_at_a_time(&stores, a, b).await;
+    reads_history_in_its_endpoint_environment_and_workspace(&stores, a, b).await;
 }
 
 async fn keeps_endpoints_in_their_organization(stores: &Stores<'_>, a: Tenant, b: Tenant) {
@@ -566,6 +573,7 @@ async fn records_attempts_on_pending_deliveries(stores: &Stores<'_>, a: Tenant, 
         status: None,
         error: Some("timeout".to_owned()),
         at: later,
+        duration_ms: 10_000,
         state: DeliveryState::Failed,
         next_attempt_at: None,
     };
@@ -863,4 +871,417 @@ async fn holds_an_endpoint_for_one_delivery_at_a_time(stores: &Stores<'_>, a: Te
     for id in [hook, other] {
         stores.webhooks.delete_endpoint(org, id, &by_suite).await.unwrap();
     }
+}
+
+async fn reads_history_in_its_endpoint_environment_and_workspace(stores: &Stores<'_>, a: Tenant, b: Tenant) {
+    use serde_json::json;
+
+    let org = a.organization_id;
+    let env = Environment::Sandbox;
+    let now = Timestamp::now();
+    let hook = endpoint(stores, org, env, &[WebhookEventType::RunCompleted], 80, now).await;
+    let other = endpoint(stores, org, env, &[WebhookEventType::RunFailed], 81, now).await;
+    let production = endpoint(
+        stores,
+        org,
+        Environment::Production,
+        &[WebhookEventType::RunCompleted],
+        82,
+        now,
+    )
+    .await;
+    let foreign = endpoint(
+        stores,
+        b.organization_id,
+        env,
+        &[WebhookEventType::RunCompleted],
+        83,
+        now,
+    )
+    .await;
+    let mut deliveries = Vec::new();
+    for (organization, workspace, environment, external_id) in [
+        (org, a.sandbox, env, "tenant-a"),
+        (org, a.sibling, env, "tenant-b"),
+        (org, a.production, Environment::Production, "tenant-prod"),
+        (b.organization_id, b.sandbox, env, "tenant-other"),
+    ] {
+        let id = WebhookEventId::generate();
+        let event = NewWebhookEvent {
+            id,
+            environment,
+            workspace_id: Some(workspace),
+            kind: "run.completed".to_owned(),
+            body: event_body(
+                id,
+                "run.completed",
+                now,
+                environment,
+                organization,
+                Some((workspace, Some(external_id))),
+                json!({ "object": "run", "id": RunId::generate(), "agent_id": AgentId::generate(), "status": "completed" }),
+            ),
+            created_at: now,
+        };
+        deliveries.push(stores.webhooks.record_event(organization, &event).await.unwrap()[0]);
+    }
+    let first = deliveries[0];
+    let sibling = deliveries[1];
+    let page = stores
+        .webhooks
+        .list_deliveries(org, hook, env, &DeliveryFilter::default(), None, 1)
+        .await
+        .unwrap();
+    assert_eq!(page.total, 2, "only the endpoint's environment and organization");
+    assert_eq!(page.items.len(), 1);
+    let cursor = page.next_cursor.as_deref().unwrap();
+    let rest = stores
+        .webhooks
+        .list_deliveries(org, hook, env, &DeliveryFilter::default(), Some(cursor), 1)
+        .await
+        .unwrap();
+    assert_eq!(rest.total, 2);
+    assert_eq!(rest.items.len(), 1);
+    assert_ne!(rest.items[0].id, page.items[0].id);
+    assert!(rest.next_cursor.is_none());
+    for (organization, endpoint_id, environment) in [
+        (org, other, env),
+        (org, production, Environment::Production),
+        (b.organization_id, foreign, env),
+    ] {
+        assert_eq!(
+            stores
+                .webhooks
+                .list_deliveries(
+                    organization,
+                    endpoint_id,
+                    environment,
+                    &DeliveryFilter::default(),
+                    Some(cursor),
+                    25
+                )
+                .await
+                .unwrap_err(),
+            WebhookError::InvalidCursor,
+            "a cursor is bound to all three scopes"
+        );
+    }
+    for bad in ["", "not-a-cursor"] {
+        assert_eq!(
+            stores
+                .webhooks
+                .list_deliveries(org, hook, env, &DeliveryFilter::default(), Some(bad), 25)
+                .await
+                .unwrap_err(),
+            WebhookError::InvalidCursor
+        );
+    }
+    for (workspace, expected) in [
+        (a.sandbox, Some(first)),
+        (a.sibling, Some(sibling)),
+        (a.production, None),
+        (b.sandbox, None),
+        (WorkspaceId::generate(), None),
+    ] {
+        let filter = DeliveryFilter {
+            workspace_id: Some(workspace),
+            ..DeliveryFilter::default()
+        };
+        let page = stores
+            .webhooks
+            .list_deliveries(org, hook, env, &filter, None, 25)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            expected.into_iter().collect::<Vec<_>>()
+        );
+        assert_eq!(page.total, u64::from(expected.is_some()));
+        assert_eq!(
+            stores
+                .webhooks
+                .list_deliveries(org, hook, env, &filter, Some(cursor), 25)
+                .await
+                .unwrap_err(),
+            WebhookError::InvalidCursor
+        );
+    }
+    assert_eq!(
+        stores
+            .webhooks
+            .list_deliveries(org, foreign, env, &DeliveryFilter::default(), None, 25)
+            .await
+            .unwrap_err(),
+        WebhookError::NotFound
+    );
+    assert_eq!(
+        stores
+            .webhooks
+            .list_deliveries(org, hook, Environment::Production, &DeliveryFilter::default(), None, 25)
+            .await
+            .unwrap_err(),
+        WebhookError::NotFound
+    );
+    for (organization, endpoint_id, environment, delivery) in [
+        (b.organization_id, foreign, env, first),
+        (org, other, env, first),
+        (org, hook, Environment::Production, first),
+        (org, hook, env, deliveries[2]),
+        (org, hook, env, deliveries[3]),
+    ] {
+        assert!(
+            stores
+                .webhooks
+                .find_delivery_detail(organization, endpoint_id, environment, delivery)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            stores
+                .webhooks
+                .list_delivery_attempts(organization, endpoint_id, environment, delivery, None, 25)
+                .await
+                .unwrap_err(),
+            WebhookError::NotFound
+        );
+    }
+    let pending = stores
+        .webhooks
+        .find_delivery_detail(org, hook, env, first)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(pending.attempt_history_complete);
+    assert_eq!(
+        pending.summary.workspace.as_ref().unwrap().external_id.as_deref(),
+        Some("tenant-a")
+    );
+    assert_eq!(pending.event["workspace"]["id"], json!(a.sandbox));
+    assert_eq!(pending.event["id"], json!(pending.summary.event_id));
+    let previous_next = pending.summary.next_attempt_at;
+    let deferred_until = Timestamp::from_millis(now.millis() + 5_000);
+    for (organization, attempts, previous) in [
+        (b.organization_id, 0, previous_next),
+        (org, 1, previous_next),
+        (org, 0, Some(deferred_until)),
+    ] {
+        assert_eq!(
+            stores
+                .webhooks
+                .defer_delivery(organization, first, attempts, previous, deferred_until)
+                .await
+                .unwrap_err(),
+            WebhookError::NotFound,
+            "deferral belongs to the organization and the exact progress snapshot"
+        );
+    }
+    stores
+        .webhooks
+        .defer_delivery(org, first, 0, previous_next, deferred_until)
+        .await
+        .unwrap();
+    assert_eq!(
+        stores
+            .webhooks
+            .defer_delivery(org, first, 0, previous_next, now)
+            .await
+            .unwrap_err(),
+        WebhookError::NotFound,
+        "a stale worker cannot overwrite the winner's retry time"
+    );
+    let deferred = stores
+        .webhooks
+        .find_delivery_detail(org, hook, env, first)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(deferred.summary.next_attempt_at, Some(deferred_until));
+    assert_eq!(deferred.summary.attempts, 0);
+    assert!(deferred.attempt_history_complete, "no fabricated attempt");
+    assert_eq!(
+        stores
+            .webhooks
+            .list_delivery_attempts(org, hook, env, first, None, 25)
+            .await
+            .unwrap()
+            .total,
+        0
+    );
+    stores
+        .webhooks
+        .record_attempt(org, first, &failure(1, now, false))
+        .await
+        .unwrap();
+    for stale in [failure(1, now, false), success(3, now)] {
+        assert_eq!(
+            stores.webhooks.record_attempt(org, first, &stale).await.unwrap_err(),
+            WebhookError::NotFound,
+            "only the next number is recorded"
+        );
+    }
+    stores
+        .webhooks
+        .record_attempt(org, first, &success(2, Timestamp::from_millis(now.millis() + 100)))
+        .await
+        .unwrap();
+    let first_attempt = stores
+        .webhooks
+        .list_delivery_attempts(org, hook, env, first, None, 1)
+        .await
+        .unwrap();
+    assert_eq!(first_attempt.total, 2);
+    assert_eq!(
+        (
+            first_attempt.items[0].number,
+            first_attempt.items[0].status_code,
+            first_attempt.items[0].duration_ms
+        ),
+        (1, Some(503), Some(12))
+    );
+    assert_eq!(first_attempt.items[0].error_class.as_deref(), Some("status"));
+    let attempt_cursor = first_attempt.next_cursor.as_deref().unwrap();
+    let second_attempt = stores
+        .webhooks
+        .list_delivery_attempts(org, hook, env, first, Some(attempt_cursor), 1)
+        .await
+        .unwrap();
+    assert_eq!(second_attempt.total, 2);
+    assert_eq!(
+        (
+            second_attempt.items[0].number,
+            second_attempt.items[0].status_code,
+            second_attempt.items[0].duration_ms
+        ),
+        (2, Some(204), Some(7))
+    );
+    assert!(second_attempt.next_cursor.is_none());
+    assert_eq!(
+        stores
+            .webhooks
+            .list_delivery_attempts(org, hook, env, sibling, Some(attempt_cursor), 25)
+            .await
+            .unwrap_err(),
+        WebhookError::InvalidCursor
+    );
+    assert_eq!(
+        stores
+            .webhooks
+            .list_delivery_attempts(org, hook, env, first, Some(cursor), 25)
+            .await
+            .unwrap_err(),
+        WebhookError::InvalidCursor
+    );
+    let detail = stores
+        .webhooks
+        .find_delivery_detail(org, hook, env, first)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(detail.attempt_history_complete);
+    assert_eq!(detail.summary.attempts, 2);
+    assert_eq!(detail.summary.state, DeliveryState::Succeeded);
+    assert_eq!(
+        stores
+            .webhooks
+            .defer_delivery(org, first, 2, None, deferred_until)
+            .await
+            .unwrap_err(),
+        WebhookError::NotFound,
+        "a terminal delivery cannot be deferred"
+    );
+    let filter = DeliveryFilter {
+        state: Some(DeliveryState::Succeeded),
+        event_type: Some("run.completed".to_owned()),
+        ..DeliveryFilter::default()
+    };
+    let page = stores
+        .webhooks
+        .list_deliveries(org, hook, env, &filter, None, 25)
+        .await
+        .unwrap();
+    assert_eq!(page.items.iter().map(|item| item.id).collect::<Vec<_>>(), vec![first]);
+    assert_eq!(page.total, 1);
+    assert!(
+        stores
+            .webhooks
+            .list_deliveries(
+                org,
+                hook,
+                env,
+                &DeliveryFilter {
+                    matches_nothing: true,
+                    ..DeliveryFilter::default()
+                },
+                None,
+                25
+            )
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    let mut test = event(Environment::Production, None, TEST_EVENT);
+    assert_eq!(
+        stores
+            .webhooks
+            .record_test(org, hook, &test, &success(1, now))
+            .await
+            .unwrap_err(),
+        WebhookError::NotFound,
+        "the endpoint never records another environment's test"
+    );
+    test.environment = env;
+    test.body = event_body(
+        test.id,
+        TEST_EVENT,
+        test.created_at,
+        env,
+        org,
+        None,
+        json!({ "object": "webhook_endpoint", "id": hook }),
+    );
+    let test_delivery = stores
+        .webhooks
+        .record_test(org, hook, &test, &success(1, now))
+        .await
+        .unwrap();
+    let test_detail = stores
+        .webhooks
+        .find_delivery_detail(org, hook, env, test_delivery)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(test_detail.attempt_history_complete);
+    assert!(test_detail.summary.workspace.is_none());
+    assert_eq!(
+        stores
+            .webhooks
+            .list_delivery_attempts(org, hook, env, test_delivery, None, 25)
+            .await
+            .unwrap()
+            .total,
+        1
+    );
+    claim_deliveries(stores).await;
+    for endpoint_id in [hook, other, production] {
+        stores
+            .webhooks
+            .delete_endpoint(org, endpoint_id, &by_suite)
+            .await
+            .unwrap();
+    }
+    assert!(
+        stores
+            .webhooks
+            .find_delivery_detail(org, hook, env, first)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    stores
+        .webhooks
+        .delete_endpoint(b.organization_id, foreign, &by_suite)
+        .await
+        .unwrap();
 }

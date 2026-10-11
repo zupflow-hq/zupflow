@@ -305,6 +305,14 @@ eight attempts, at least once, unordered, the same event ID every time. An
 endpoint that has failed every attempt for three days is disabled; enabling
 it again doesn't replay what it missed.
 
+Each endpoint has paginated delivery history at
+`GET /v1/organizations/{org}/webhooks/{hook}/deliveries`, filtered by
+`workspace_id`, `state` and `event_type`. A delivery's own path returns its
+lean event, and `/attempts` lists its attempts with status, a safe error class,
+duration and timing. Response bodies, request headers and signing secrets are
+never included. Older deliveries may have only a summary;
+`attempt_history_complete` identifies those gaps without inventing attempts.
+
 Limits, per server process: one loop records events, so a slow endpoint never
 holds one up, and eight more send deliveries, so at most eight are in flight
 at once. An endpoint has at most one delivery in flight across every worker
@@ -359,7 +367,7 @@ database's queue, so a restart picks them up again.
 ### The contract suite against the backend
 
 ```bash
-pnpm contract:backend
+CARGO_INCREMENTAL=0 pnpm contract:backend
 ```
 
 Runs the shared contract suite (the same cases the mock passes) against the
@@ -368,11 +376,41 @@ the reference fixture into a throwaway database, serves it on loopback and
 points the suite at it. Cases that need an operation the backend doesn't serve
 yet are skipped, each naming the operation. CI runs it after `pnpm check`.
 
+For the shared suite and the complete Taskboard journeys in one command:
+
+```bash
+pnpm test:integration
+```
+
+This runs the suites serially, with incremental Rust builds disabled and the
+usual `server/target` directory. Each starts from a fresh temporary database,
+uses the same reference fixture and stops its local processes afterwards.
+The fixture has two fictional organizations, sibling workspaces, both
+environments and owner, developer, viewer and outsider personas. IDs and
+secrets are fresh; tests find the same logical scenarios by slug. No provider
+account or deployed service is needed.
+Webhook fixtures include pending, succeeded, failed and skipped deliveries,
+plus a test event, with frozen attempt histories for repeatable filters and
+pagination checks. They queue no work, so starting workers cannot advance
+those scenarios.
+
 To click through the Console on the same fixture, serve it for the Console's
-origin: `zupflow-contract-server serve <database> --console
-http://localhost:5181` answers CORS for that origin and signs a request
-without a token in as the owner, as `local` does; then run the Console with
+origin. Create a disposable database after the command above has built the
+development binary:
+
+```bash
+fixture_dir=$(mktemp -d)
+server/target/debug/zupflow-contract-server reset "$fixture_dir/contract.sqlite"
+server/target/debug/zupflow-contract-server serve "$fixture_dir/contract.sqlite" \
+  --console http://localhost:5181
+```
+
+`reset` is a development command that replaces that database's fixture,
+never a backend HTTP endpoint. `serve --console` answers CORS for that origin
+and signs a request without a token in as the owner, as `local` does; then run the Console with
 `PORT=5181 VITE_ZUPFLOW_API_URL=http://127.0.0.1:<port>`, the port it prints.
+Stop the server and remove the temporary directory when finished. For live
+Taskboard calls and workers, use the click-through script below instead.
 
 ### Taskboard: a fake MCP app, end to end
 
@@ -420,11 +458,14 @@ concurrent discovery and execution share one rotation. A revoked refresh token
 marks reconnect required with its audit event and webhook, a reconnect clears
 it, forgotten registrations are registered again, and foreign or missing
 advertised issuers are refused without exchanging a code.
+Another journey checks webhook delivery history against Taskboard's actual
+signed requests: successful and failed tests, then run events across sibling
+workspaces, organizations and environments.
 
 To click through it yourself:
 
 ```bash
-scripts/taskboard-dev.sh
+CARGO_INCREMENTAL=0 scripts/taskboard-dev.sh
 ```
 
 It serves Taskboard (on port 7443, `TASKBOARD_PORT`) and the contract server

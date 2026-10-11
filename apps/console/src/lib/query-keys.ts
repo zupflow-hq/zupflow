@@ -1,4 +1,4 @@
-import type { Environment, RunListQuery } from "@zupflow/sdk";
+import type { Environment, RunListQuery, WebhookDeliveryListQuery } from "@zupflow/sdk";
 
 /**
  * Every workspace-scoped key starts with `["ws", workspaceId]`, so invalidating
@@ -24,6 +24,12 @@ export const qk = {
   connectSettings: (orgId: string, env: Environment) => ["org", orgId, "connect-settings", env] as const,
   apiKeys: (orgId: string) => ["org", orgId, "api-keys"] as const,
   webhooks: (orgId: string) => ["org", orgId, "webhooks"] as const,
+  webhookDeliveries: (orgId: string, endpointId: string, env: Environment, query: WebhookDeliveryListQuery) =>
+    ["org", orgId, "webhooks", endpointId, env, "deliveries", query] as const,
+  webhookDelivery: (orgId: string, endpointId: string, env: Environment, deliveryId?: string) =>
+    ["org", orgId, "webhooks", endpointId, env, "delivery", deliveryId] as const,
+  webhookAttempts: (orgId: string, endpointId: string, env: Environment, deliveryId?: string) =>
+    ["org", orgId, "webhooks", endpointId, env, "delivery", deliveryId, "attempts"] as const,
   audit: (orgId: string, workspaceId?: string) => ["org", orgId, "audit", workspaceId ?? "all"] as const,
 
   workspace: (wsId: string) => ["ws", wsId] as const,

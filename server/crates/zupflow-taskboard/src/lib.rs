@@ -35,7 +35,8 @@
 //!
 //! Everything is in memory, and each registered client has its own board.
 //! [`Taskboard`] has hooks for tests: what was called with which token, the
-//! token requests, and ways to expire or revoke every token.
+//! token requests, ways to expire or revoke every token, and a webhook
+//! receiver with recorded raw requests and controllable responses.
 
 mod mcp;
 mod oauth;
@@ -121,6 +122,16 @@ pub struct TokenRequest {
     pub error: Option<String>,
 }
 
+/// One webhook as received, before parsing or reserializing its signed body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebhookRequest {
+    pub body: Vec<u8>,
+    pub signature: Option<String>,
+    pub event_id: Option<String>,
+    pub event_type: Option<String>,
+    pub attempt: Option<String>,
+}
+
 /// A task on a board.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Task {
@@ -201,6 +212,8 @@ struct State {
     unauthorized_requests: usize,
     mcp_status: Option<u16>,
     webhooks: Vec<Value>,
+    webhook_requests: Vec<WebhookRequest>,
+    webhook_status: Option<u16>,
     clients: HashMap<String, Client>,
     /// In the order registered, for listing.
     client_order: Vec<String>,
@@ -306,6 +319,14 @@ impl Taskboard {
     }
     pub fn webhooks(&self) -> Vec<Value> {
         self.state().webhooks.clone()
+    }
+    /// Raw bodies and signing headers, in the order received, including failures.
+    pub fn webhook_requests(&self) -> Vec<WebhookRequest> {
+        self.state().webhook_requests.clone()
+    }
+    /// Makes the receiver fail or recover deterministically; `None` restores `204`.
+    pub fn set_webhook_status(&self, status: Option<u16>) {
+        self.state().webhook_status = status;
     }
 
     /// Every client registered, in order.

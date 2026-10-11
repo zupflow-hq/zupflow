@@ -14,7 +14,8 @@
     "lint": "biome check .",
     "format": "biome check --write .",
     "check": "pnpm lint && turbo run typecheck test build",
-    "contract:backend": "scripts/contract-backend.sh"
+    "contract:backend": "scripts/contract-backend.sh",
+    "test:integration": "scripts/test-integration.sh"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.15",

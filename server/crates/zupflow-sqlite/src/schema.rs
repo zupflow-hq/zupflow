@@ -67,6 +67,7 @@ const TABLES: &[(&str, Scoping)] = &[
     ("webhook_endpoints", Scoping::Organization),
     ("webhook_events", Scoping::Organization),
     ("webhook_deliveries", Scoping::Organization),
+    ("webhook_delivery_attempts", Scoping::Organization),
     // A deleted workspace's events stay in the log.
     ("audit_events", Scoping::History),
 ];

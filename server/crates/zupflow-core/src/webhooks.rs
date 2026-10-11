@@ -36,6 +36,7 @@ use crate::keys::Sealed;
 use crate::runs::{QueuedJob, RunEventType};
 use crate::scope::Name;
 use crate::time::Timestamp;
+use crate::workspaces::Page;
 
 /// The event types an endpoint can subscribe to, as the contract's
 /// `WEBHOOK_EVENT_TYPES` lists them.
@@ -217,6 +218,88 @@ impl DeliveryState {
     }
 }
 
+impl Serialize for DeliveryState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+pub const DEFAULT_DELIVERY_PAGE: u32 = 25;
+pub const MAX_DELIVERY_PAGE: u32 = 100;
+
+/// Safe classifications only. Older or corrupt arbitrary text is never a
+/// response: an unrecognized class is represented by `failed`.
+pub fn safe_delivery_error(error: &str) -> &'static str {
+    match error {
+        "status" => "status",
+        "refused" => "refused",
+        "redirected" => "redirected",
+        "timeout" => "timeout",
+        "too_large" => "too_large",
+        "unreachable" => "unreachable",
+        "store_unavailable" => "store_unavailable",
+        "secret_unavailable" => "secret_unavailable",
+        _ => "failed",
+    }
+}
+
+/// The workspace attribution captured when the event was made, not a
+/// lookup of its current external ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EventWorkspace {
+    pub id: WorkspaceId,
+    pub external_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeliverySummary {
+    pub id: WebhookDeliveryId,
+    pub organization_id: OrganizationId,
+    pub endpoint_id: WebhookEndpointId,
+    pub event_id: WebhookEventId,
+    pub environment: Environment,
+    pub event_type: String,
+    pub event_created_at: Timestamp,
+    pub workspace: Option<EventWorkspace>,
+    pub state: DeliveryState,
+    pub attempts: u32,
+    pub last_status_code: Option<u16>,
+    pub last_error: Option<String>,
+    pub last_attempt_at: Option<Timestamp>,
+    pub next_attempt_at: Option<Timestamp>,
+    pub created_at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeliveryDetail {
+    #[serde(flatten)]
+    pub summary: DeliverySummary,
+    /// The original lean event, never response bodies, headers or signatures.
+    pub event: Value,
+    /// Every numbered, recorded attempt has a row. This makes no claim about
+    /// a process interrupted during a network call.
+    pub attempt_history_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecordedAttempt {
+    pub number: u32,
+    pub status_code: Option<u16>,
+    pub error_class: Option<String>,
+    pub attempted_at: Timestamp,
+    pub duration_ms: Option<u64>,
+}
+
+/// Invalid or unknown filters match nothing. Scope is still checked and
+/// cursors still validated before returning that empty page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeliveryFilter {
+    pub workspace_id: Option<WorkspaceId>,
+    pub state: Option<DeliveryState>,
+    pub event_type: Option<String>,
+    pub matches_nothing: bool,
+}
+
 /// A delivery with what sending it needs: its event, and its endpoint as it
 /// is now.
 #[derive(Debug, Clone)]
@@ -229,6 +312,7 @@ pub struct PendingDelivery {
     pub body: String,
     pub state: DeliveryState,
     pub attempts: u32,
+    pub next_attempt_at: Option<Timestamp>,
     pub url: String,
     pub enabled: bool,
     pub subscribed: bool,
@@ -245,6 +329,8 @@ pub struct Attempt {
     /// `refused`, `redirected`, `status`…), never the other side's words.
     pub error: Option<String>,
     pub at: Timestamp,
+    /// Time spent in the outbound request, excluding key and store lookups.
+    pub duration_ms: u64,
     /// `Pending` with another attempt to come at `next_attempt_at`,
     /// `Succeeded`, or `Failed` when it was the last.
     pub state: DeliveryState,
@@ -269,6 +355,8 @@ pub enum WebhookError {
     /// The endpoint (or delivery) isn't in this organization.
     #[error("not found")]
     NotFound,
+    #[error("not a cursor from this list")]
+    InvalidCursor,
 }
 
 #[async_trait]
@@ -354,15 +442,62 @@ pub trait WebhookStore: Send + Sync {
         delivery_id: WebhookDeliveryId,
     ) -> Result<Option<PendingDelivery>, WebhookError>;
 
+    /// Newest first by creation time and ID, in the explicit endpoint and
+    /// environment. Cursors belong to this scope and these filters only.
+    /// The endpoint must exist in this scope, even for an empty list.
+    async fn list_deliveries(
+        &self,
+        organization_id: OrganizationId,
+        endpoint_id: WebhookEndpointId,
+        environment: Environment,
+        filter: &DeliveryFilter,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<Page<DeliverySummary>, WebhookError>;
+
+    async fn find_delivery_detail(
+        &self,
+        organization_id: OrganizationId,
+        endpoint_id: WebhookEndpointId,
+        environment: Environment,
+        delivery_id: WebhookDeliveryId,
+    ) -> Result<Option<DeliveryDetail>, WebhookError>;
+
+    /// Recorded attempts, oldest number first, with no invented history for
+    /// older summary-only deliveries. The delivery must exist in the scope.
+    async fn list_delivery_attempts(
+        &self,
+        organization_id: OrganizationId,
+        endpoint_id: WebhookEndpointId,
+        environment: Environment,
+        delivery_id: WebhookDeliveryId,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<Page<RecordedAttempt>, WebhookError>;
+
     /// Records an attempt on a pending delivery, and the answer as its
     /// endpoint's last delivery. A failure disables an endpoint that has
     /// failed every attempt for [`DISABLE_AFTER`]; a success clears that.
-    /// `NotFound` unless the delivery is here and pending.
+    /// The immutable attempt and summary commit together. `NotFound` unless
+    /// the delivery is here, pending, and `number` follows its stored count.
     async fn record_attempt(
         &self,
         organization_id: OrganizationId,
         delivery_id: WebhookDeliveryId,
         attempt: &Attempt,
+    ) -> Result<(), WebhookError>;
+
+    /// Updates the retry time without recording an outbound attempt. The
+    /// delivery must be pending in this organization and still have the
+    /// supplied attempt count and previous retry time, otherwise `NotFound`.
+    /// A stale worker cannot overwrite another worker's progress or timing.
+    async fn defer_delivery(
+        &self,
+        organization_id: OrganizationId,
+        delivery_id: WebhookDeliveryId,
+        attempts: u32,
+        previous_next_attempt_at: Option<Timestamp>,
+        next_attempt_at: Timestamp,
     ) -> Result<(), WebhookError>;
 
     /// Settles a pending delivery as skipped: its endpoint is disabled or no

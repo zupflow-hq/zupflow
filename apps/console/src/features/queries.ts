@@ -41,6 +41,8 @@ import {
   type UpdateToolPolicyInput,
   type UpdateWebhookEndpointInput,
   type UpdateWorkspaceInput,
+  type WebhookDeliveryId,
+  type WebhookDeliveryListQuery,
   type WebhookEndpointId,
   type WorkspaceId,
   type WorkspaceListQuery,
@@ -704,6 +706,67 @@ export function useRevokeApiKey(orgId: OrganizationId) {
 
 export function useWebhooks(orgId: OrganizationId) {
   return useQuery({ queryKey: qk.webhooks(orgId), queryFn: () => api.webhooks.list(orgId) });
+}
+
+export function useWebhookDeliveries(
+  orgId: OrganizationId,
+  endpointId: WebhookEndpointId,
+  environment: Environment,
+  filters: Omit<WebhookDeliveryListQuery, "cursor" | "limit">,
+) {
+  return useInfiniteQuery({
+    queryKey: qk.webhookDeliveries(orgId, endpointId, environment, filters),
+    queryFn: ({ pageParam }) =>
+      api.webhooks.deliveries(orgId, endpointId, { ...filters, cursor: pageParam ?? undefined, limit: 25 }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.pagination.next_cursor,
+    refetchInterval: (query) =>
+      query.state.data?.pages.some((page) => page.items.some((item) => item.state === "pending")) ? 5_000 : false,
+  });
+}
+
+export function useWebhookDelivery(
+  orgId: OrganizationId,
+  endpointId: WebhookEndpointId,
+  environment: Environment,
+  deliveryId?: WebhookDeliveryId,
+) {
+  const qc = useQueryClient();
+  const query = useQuery({
+    queryKey: qk.webhookDelivery(orgId, endpointId, environment, deliveryId),
+    enabled: deliveryId !== undefined,
+    queryFn: () => api.webhooks.delivery(orgId, endpointId, required(deliveryId)),
+    refetchInterval: (query) => (query.state.data?.state === "pending" ? 5_000 : false),
+  });
+  const recordedAttempts = query.data?.attempts;
+  useEffect(() => {
+    if (deliveryId && recordedAttempts !== undefined) {
+      // Fetch the final attempt even when a completed delivery stops polling.
+      void qc.invalidateQueries({ queryKey: qk.webhookAttempts(orgId, endpointId, environment, deliveryId) });
+    }
+  }, [qc, orgId, endpointId, environment, deliveryId, recordedAttempts]);
+  return query;
+}
+
+export function useWebhookDeliveryAttempts(
+  orgId: OrganizationId,
+  endpointId: WebhookEndpointId,
+  environment: Environment,
+  deliveryId?: WebhookDeliveryId,
+  live = false,
+) {
+  return useInfiniteQuery({
+    queryKey: qk.webhookAttempts(orgId, endpointId, environment, deliveryId),
+    enabled: deliveryId !== undefined,
+    queryFn: ({ pageParam }) =>
+      api.webhooks.deliveryAttempts(orgId, endpointId, required(deliveryId), {
+        cursor: pageParam ?? undefined,
+        limit: 25,
+      }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.pagination.next_cursor,
+    refetchInterval: live ? 5_000 : false,
+  });
 }
 
 export function useCreateWebhook(orgId: OrganizationId) {

@@ -69,6 +69,11 @@ import type {
   UsageReport,
   Viewer,
   WebhookDelivery,
+  WebhookDeliveryAttempt,
+  WebhookDeliveryDetail,
+  WebhookDeliveryId,
+  WebhookDeliveryListQuery,
+  WebhookDeliverySummary,
   WebhookEndpoint,
   WebhookEndpointId,
   Workspace,
@@ -346,6 +351,24 @@ export function createClient(transport: Transport) {
 
     webhooks: {
       list: (organizationId: OrganizationId) => get<WebhookEndpoint[]>(`${org(organizationId)}/webhooks`),
+      deliveries: (
+        organizationId: OrganizationId,
+        endpointId: WebhookEndpointId,
+        query: WebhookDeliveryListQuery = {},
+      ) =>
+        getPage<WebhookDeliverySummary>(`${org(organizationId)}/webhooks/${enc(endpointId)}/deliveries`, { ...query }),
+      delivery: (organizationId: OrganizationId, endpointId: WebhookEndpointId, deliveryId: WebhookDeliveryId) =>
+        get<WebhookDeliveryDetail>(`${org(organizationId)}/webhooks/${enc(endpointId)}/deliveries/${enc(deliveryId)}`),
+      deliveryAttempts: (
+        organizationId: OrganizationId,
+        endpointId: WebhookEndpointId,
+        deliveryId: WebhookDeliveryId,
+        query: PageQuery = {},
+      ) =>
+        getPage<WebhookDeliveryAttempt>(
+          `${org(organizationId)}/webhooks/${enc(endpointId)}/deliveries/${enc(deliveryId)}/attempts`,
+          { ...query },
+        ),
       create: (organizationId: OrganizationId, input: CreateWebhookEndpointInput, options?: PostOptions) =>
         post<CreatedWebhookEndpoint>(`${org(organizationId)}/webhooks`, input, options),
       update: (organizationId: OrganizationId, endpointId: WebhookEndpointId, input: UpdateWebhookEndpointInput) =>

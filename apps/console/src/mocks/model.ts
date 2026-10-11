@@ -40,7 +40,13 @@ import type {
   ToolText,
   User,
   UserId,
+  WebhookDeliveryAttempt,
+  WebhookDeliveryId,
+  WebhookDeliverySummary,
   WebhookEndpoint,
+  WebhookEndpointId,
+  WebhookEvent,
+  WebhookEventId,
   WorkspaceId,
 } from "@zupflow/sdk";
 
@@ -300,6 +306,37 @@ export type RunEventRow = RunEvent & { organization_id: OrganizationId };
 /** What identifies a run's tenant: every lookup about a run carries all three. */
 export type RunScope = Pick<RunRow, "id" | "organization_id" | "workspace_id">;
 
+/** Organization-scoped outbox events, with a workspace only for non-test events. */
+export interface WebhookEventRow {
+  id: WebhookEventId;
+  organization_id: OrganizationId;
+  workspace_id: WorkspaceId | null;
+  environment: Environment;
+  body: WebhookEvent;
+}
+
+export type WebhookDeliveryRow = Pick<
+  WebhookDeliverySummary,
+  | "id"
+  | "organization_id"
+  | "endpoint_id"
+  | "event_id"
+  | "state"
+  | "attempts"
+  | "last_status_code"
+  | "last_error"
+  | "last_attempt_at"
+  | "next_attempt_at"
+  | "created_at"
+>;
+
+/** Natural key (organization, endpoint, delivery, number). */
+export type WebhookDeliveryAttemptRow = {
+  organization_id: OrganizationId;
+  endpoint_id: WebhookEndpointId;
+  delivery_id: WebhookDeliveryId;
+} & WebhookDeliveryAttempt;
+
 export interface Db {
   schema: number;
   users: User[];
@@ -326,6 +363,9 @@ export interface Db {
   connect_settings: ConnectSettingsRow[];
   api_keys: ApiKeyRow[];
   webhooks: WebhookEndpoint[];
+  webhook_events: WebhookEventRow[];
+  webhook_deliveries: WebhookDeliveryRow[];
+  webhook_delivery_attempts: WebhookDeliveryAttemptRow[];
   audit: Omit<AuditEvent, "workspace">[];
   /** Idempotency keys (decision 0016), each scoped to its organization, workspace and the caller that sent it. */
   idempotency_keys: IdempotencyRow[];

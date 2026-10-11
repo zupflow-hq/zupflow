@@ -1222,6 +1222,81 @@ export const WebhookDelivery = named(
 );
 export type WebhookDelivery = z.infer<typeof WebhookDelivery>;
 
+export const WEBHOOK_DELIVERY_STATES = ["pending", "succeeded", "failed", "skipped"] as const;
+export const WebhookDeliveryState = z.enum(WEBHOOK_DELIVERY_STATES);
+export type WebhookDeliveryState = z.infer<typeof WebhookDeliveryState>;
+
+/** Safe failure classes only: never the endpoint's response text or an internal error. */
+export const WebhookDeliveryErrorClass = z.enum([
+  "status",
+  "refused",
+  "redirected",
+  "timeout",
+  "too_large",
+  "unreachable",
+  "failed",
+  "store_unavailable",
+  "secret_unavailable",
+]);
+export type WebhookDeliveryErrorClass = z.infer<typeof WebhookDeliveryErrorClass>;
+
+/** One recorded attempt, numbered from one within its delivery. */
+export const WebhookDeliveryAttempt = named(
+  "WebhookDeliveryAttempt",
+  z.object({
+    number: z.number().int().positive(),
+    status_code: z.number().int().min(100).max(999).nullable(),
+    error_class: WebhookDeliveryErrorClass.nullable(),
+    attempted_at: instant,
+    /** Null when this attempt predates duration recording. */
+    duration_ms: z.number().int().nonnegative().nullable(),
+  }),
+);
+export type WebhookDeliveryAttempt = z.infer<typeof WebhookDeliveryAttempt>;
+
+/** A delivery to one endpoint; the legacy test-button answer stays `WebhookDelivery`. */
+export const WebhookDeliverySummary = named(
+  "WebhookDeliverySummary",
+  z.object({
+    id: idSchema("webhook_delivery"),
+    organization_id: idSchema("organization"),
+    endpoint_id: idSchema("webhook_endpoint"),
+    event_id: idSchema("webhook_event"),
+    environment: Environment,
+    event_type: z.enum(WEBHOOK_DELIVERY_TYPES),
+    event_created_at: instant,
+    workspace: WebhookEventWorkspace.nullable(),
+    state: WebhookDeliveryState,
+    attempts: z.number().int().nonnegative(),
+    last_status_code: z.number().int().min(100).max(999).nullable(),
+    last_error: WebhookDeliveryErrorClass.nullable(),
+    last_attempt_at: instant.nullable(),
+    next_attempt_at: instant.nullable(),
+    created_at: instant,
+  }),
+);
+export type WebhookDeliverySummary = z.infer<typeof WebhookDeliverySummary>;
+
+export const WebhookDeliveryDetail = named(
+  "WebhookDeliveryDetail",
+  WebhookDeliverySummary.extend({
+    event: WebhookEvent,
+    /**
+     * Whether every recorded attempt has a history row. Older deliveries can
+     * have only a summary. This says nothing about interrupted network calls.
+     */
+    attempt_history_complete: z.boolean(),
+  }),
+);
+export type WebhookDeliveryDetail = z.infer<typeof WebhookDeliveryDetail>;
+
+export const WebhookDeliveryListQuery = PageQuery.extend({
+  workspace_id: idSchema("workspace").optional(),
+  state: WebhookDeliveryState.optional(),
+  event_type: z.enum(WEBHOOK_DELIVERY_TYPES).optional(),
+});
+export type WebhookDeliveryListQuery = z.infer<typeof WebhookDeliveryListQuery>;
+
 export const WebhookEndpoint = named(
   "WebhookEndpoint",
   z.object({

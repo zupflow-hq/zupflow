@@ -12,7 +12,7 @@
 //! charged with.
 
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
@@ -21,21 +21,23 @@ use serde_json::{Value, json};
 use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
-use zupflow_core::ids::{WebhookEndpointId, WebhookEventId};
+use zupflow_core::ids::{WebhookDeliveryId, WebhookEndpointId, WebhookEventId, WorkspaceId};
 use zupflow_core::keys::{EncryptionContext, seal};
 use zupflow_core::organizations::MemberRole;
 use zupflow_core::time::Timestamp;
 use zupflow_core::webhooks::{
-    Attempt, DeliveryState, EndpointChanges, LastDelivery, NewEndpoint, NewWebhookEvent, SECRET_VERSION, TEST_EVENT,
-    WebhookEndpoint, WebhookError, WebhookEventType, event_body, new_signing_secret,
+    Attempt, DEFAULT_DELIVERY_PAGE, DeliveryFilter, DeliveryState, EndpointChanges, LastDelivery, MAX_DELIVERY_PAGE,
+    NewEndpoint, NewWebhookEvent, SECRET_VERSION, TEST_EVENT, WebhookEndpoint, WebhookError, WebhookEventType,
+    event_body, new_signing_secret,
 };
 
 use crate::app_configurations::check_public_https;
 use crate::auth::{Access, AppState, Caller};
-use crate::http::{Failure, envelope};
+use crate::http::{Failure, envelope, envelope_with_meta};
 use crate::input::{Body, Fields, Object};
+use crate::runs::query;
 use crate::webhook_delivery::{self, Unsent};
-use crate::workspaces::environment_mismatch;
+use crate::workspaces::{clamped_int, environment_mismatch, invalid_cursor};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -48,6 +50,18 @@ pub fn routes() -> Router<AppState> {
             patch(update_webhook).delete(delete_webhook),
         )
         .route("/v1/organizations/{org}/webhooks/{hook}/test", post(test_webhook))
+        .route(
+            "/v1/organizations/{org}/webhooks/{hook}/deliveries",
+            get(list_deliveries),
+        )
+        .route(
+            "/v1/organizations/{org}/webhooks/{hook}/deliveries/{delivery}",
+            get(get_delivery),
+        )
+        .route(
+            "/v1/organizations/{org}/webhooks/{hook}/deliveries/{delivery}/attempts",
+            get(list_attempts),
+        )
 }
 
 /// The longest description, in characters.
@@ -149,6 +163,127 @@ async fn list_webhooks(
         .await
         .map_err(unavailable)?;
     Ok(envelope(StatusCode::OK, endpoints))
+}
+
+fn history_error(error: WebhookError) -> Failure {
+    match error {
+        WebhookError::NotFound => ApiError::not_found("Webhook delivery").into(),
+        WebhookError::InvalidCursor => invalid_cursor(),
+        WebhookError::Unavailable => unavailable(error),
+    }
+}
+
+fn history_page<T: Serialize>(page: zupflow_core::workspaces::Page<T>) -> Response {
+    envelope_with_meta(
+        StatusCode::OK,
+        page.items,
+        json!({ "pagination": { "next_cursor": page.next_cursor, "total": page.total } }),
+    )
+}
+
+fn delivery_id(value: &str) -> Result<WebhookDeliveryId, Failure> {
+    WebhookDeliveryId::parse(value).map_err(|_| ApiError::not_found("Webhook delivery").into())
+}
+
+async fn list_deliveries(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path((org, hook)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, Failure> {
+    let access = Access::organization(&state, caller, &org).await?;
+    let endpoint = find(&state, &access, &hook).await?;
+    let query = query(raw.as_deref())?;
+    let mut filter = DeliveryFilter::default();
+    if let Some(workspace) = query.get("workspace_id") {
+        filter.workspace_id = WorkspaceId::parse(workspace).ok();
+        filter.matches_nothing |= filter.workspace_id.is_none();
+    }
+    if let Some(value) = query.get("state") {
+        filter.state = DeliveryState::parse(value);
+        filter.matches_nothing |= filter.state.is_none();
+    }
+    filter.event_type = query.get("event_type").cloned();
+    if let Some(kind) = &filter.event_type {
+        filter.matches_nothing |= kind != TEST_EVENT && WebhookEventType::parse(kind).is_none();
+    }
+    let limit = clamped_int(
+        query.get("limit").map(String::as_str),
+        i64::from(DEFAULT_DELIVERY_PAGE),
+        i64::from(MAX_DELIVERY_PAGE),
+    );
+    let page = state
+        .webhooks
+        .list_deliveries(
+            access.organization_id,
+            endpoint.id,
+            endpoint.environment,
+            &filter,
+            query.get("cursor").map(String::as_str),
+            u32::try_from(limit).unwrap_or(DEFAULT_DELIVERY_PAGE),
+        )
+        .await
+        .map_err(history_error)?;
+    Ok(history_page(page))
+}
+
+async fn get_delivery(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path((org, hook, delivery)): Path<(String, String, String)>,
+) -> Result<Response, Failure> {
+    let access = Access::organization(&state, caller, &org).await?;
+    let endpoint = find(&state, &access, &hook).await?;
+    let detail = state
+        .webhooks
+        .find_delivery_detail(
+            access.organization_id,
+            endpoint.id,
+            endpoint.environment,
+            delivery_id(&delivery)?,
+        )
+        .await
+        .map_err(history_error)?
+        .ok_or_else(|| history_error(WebhookError::NotFound))?;
+    Ok(envelope(StatusCode::OK, detail))
+}
+
+async fn list_attempts(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path((org, hook, delivery)): Path<(String, String, String)>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, Failure> {
+    let access = Access::organization(&state, caller, &org).await?;
+    let endpoint = find(&state, &access, &hook).await?;
+    let id = delivery_id(&delivery)?;
+    // Find the child before reading query parameters, as every resource read
+    // does. The paginated store repeats this inside its own snapshot.
+    state
+        .webhooks
+        .find_delivery_detail(access.organization_id, endpoint.id, endpoint.environment, id)
+        .await
+        .map_err(history_error)?
+        .ok_or_else(|| history_error(WebhookError::NotFound))?;
+    let query = query(raw.as_deref())?;
+    let limit = clamped_int(
+        query.get("limit").map(String::as_str),
+        i64::from(DEFAULT_DELIVERY_PAGE),
+        i64::from(MAX_DELIVERY_PAGE),
+    );
+    let page = state
+        .webhooks
+        .list_delivery_attempts(
+            access.organization_id,
+            endpoint.id,
+            endpoint.environment,
+            id,
+            query.get("cursor").map(String::as_str),
+            u32::try_from(limit).unwrap_or(DEFAULT_DELIVERY_PAGE),
+        )
+        .await
+        .map_err(history_error)?;
+    Ok(history_page(page))
 }
 
 /// The contract's `CreatedWebhookEndpoint`.
@@ -382,6 +517,7 @@ async fn test_webhook(
         status: sent.status,
         error: sent.error.map(str::to_owned),
         at,
+        duration_ms: sent.duration_ms,
         state: if sent.succeeded() {
             DeliveryState::Succeeded
         } else {

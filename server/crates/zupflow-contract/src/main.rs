@@ -32,6 +32,7 @@
 
 mod fixture_apps;
 mod fixture_runs;
+mod fixture_webhooks;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -973,7 +974,7 @@ async fn reset(path: &str) -> Result<(), String> {
         .map_err(|error| fail("paused agent")(&error))?;
 
     // Runs, as the run engine leaves them: a finished one for the agent of
-    // `acme`, `beta-labs`, `acme-sandbox` and `harbor`, and in `beta-labs` one
+    // `acme`, `beta-labs`, `acme-sandbox`, `qa-playground` and `harbor`, and in `beta-labs` one
     // waiting for approval of `send_email`. None is queued or running, so
     // nothing moves on its own (the contract server runs no worker).
     let runs = SqliteRunStore::new(database.clone());
@@ -982,6 +983,7 @@ async fn reset(path: &str) -> Result<(), String> {
         ("Google", "search_files", false),
         ("Google", "send_email", true),
         ("Engineering", "search_issues", false),
+        ("Echo", "echo", false),
         ("Harbor", "search_issues", false),
     ] {
         let (_, organization, workspace, installation_id, agent_id, model) = seeded_agents
@@ -1078,20 +1080,36 @@ async fn reset(path: &str) -> Result<(), String> {
             .map_err(|error| fail("session")(&error))?;
     }
 
-    // A webhook endpoint in each organization, its secret sealed as the API
-    // seals it. The contract server sends nothing anywhere: its outbound path
-    // is `FixtureProviders`.
+    // Endpoints in both Northwind environments and in Larkspur, with the
+    // same frozen delivery scenarios as the mock. Secrets are sealed as in
+    // the API; history adds no jobs, so live workers never advance it.
     let webhooks = SqliteWebhookStore::new(database.clone());
-    for (organization, environment, url) in [
+    let history_pool = SqlitePool::connect_with(
+        SqliteConnectOptions::new()
+            .filename(path)
+            .foreign_keys(true)
+            .busy_timeout(std::time::Duration::from_secs(5)),
+    )
+    .await
+    .map_err(|error| fail("webhook history connection")(&error))?;
+    for (organization, environment, url, workspace_slugs) in [
         (
             northwind.id,
             Environment::Production,
             "https://hooks.northwind.example/zupflow",
+            &["acme", "beta-labs"][..],
+        ),
+        (
+            northwind.id,
+            Environment::Sandbox,
+            "https://hooks.northwind.example/sandbox",
+            &["acme-sandbox", "qa-playground"][..],
         ),
         (
             larkspur.id,
-            Environment::Sandbox,
+            Environment::Production,
             "https://hooks.larkspur.example/zupflow",
+            &["harbor"][..],
         ),
     ] {
         let endpoint_id = WebhookEndpointId::generate();
@@ -1127,7 +1145,21 @@ async fn reset(path: &str) -> Result<(), String> {
             )
             .await
             .map_err(|error| fail("webhook")(&error))?;
+        let workspaces = workspace_slugs
+            .iter()
+            .map(|slug| workspace_id(slug).map(|(id, _)| id))
+            .collect::<Result<Vec<_>, _>>()?;
+        fixture_webhooks::seed(
+            &history_pool,
+            organization,
+            environment,
+            endpoint_id,
+            &workspaces,
+            Timestamp::now(),
+        )
+        .await?;
     }
+    history_pool.close().await;
 
     let secret = database
         .instance_secret("secret_key")

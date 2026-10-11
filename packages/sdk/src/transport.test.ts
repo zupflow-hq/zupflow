@@ -12,6 +12,50 @@ function fakeFetch(status: number, body: unknown, seen: Request[] = []): typeof 
 }
 
 describe("createHttpTransport", () => {
+  it("scopes delivery history and attempts to the organization and endpoint, preserving filters and pages", async () => {
+    const seen: Request[] = [];
+    const client = createClient(
+      createHttpTransport({
+        baseUrl: "https://api.zupflow.example",
+        getToken: async () => null,
+        fetch: fakeFetch(
+          200,
+          { data: [], meta: { pagination: { next_cursor: "page+2", total: 7 } }, error: null },
+          seen,
+        ),
+      }),
+    );
+    const page = await client.webhooks.deliveries("org_a b", "we_c/d", {
+      workspace_id: "ws_other",
+      state: "pending",
+      event_type: "run.completed",
+      cursor: "page+1",
+      limit: 2,
+    });
+    await client.webhooks.delivery("org_a b", "we_c/d", "whd_e f");
+    const attempts = await client.webhooks.deliveryAttempts("org_a b", "we_c/d", "whd_e f", {
+      cursor: "page+1",
+      limit: 2,
+    });
+    const first = new URL(seen[0]?.url ?? "");
+    expect(first.pathname).toBe("/v1/organizations/org_a%20b/webhooks/we_c%2Fd/deliveries");
+    expect(Object.fromEntries(first.searchParams)).toEqual({
+      workspace_id: "ws_other",
+      state: "pending",
+      event_type: "run.completed",
+      cursor: "page+1",
+      limit: "2",
+    });
+    expect(seen[1]?.url).toBe(
+      "https://api.zupflow.example/v1/organizations/org_a%20b/webhooks/we_c%2Fd/deliveries/whd_e%20f",
+    );
+    expect(new URL(seen[2]?.url ?? "").pathname).toBe(
+      "/v1/organizations/org_a%20b/webhooks/we_c%2Fd/deliveries/whd_e%20f/attempts",
+    );
+    expect(page.pagination).toEqual({ next_cursor: "page+2", total: 7 });
+    expect(attempts.pagination).toEqual(page.pagination);
+  });
+
   it("preserves an OAuth issuer exactly when updating either app scope", async () => {
     const seen: Request[] = [];
     const auth: AuthTemplate = {

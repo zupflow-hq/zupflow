@@ -31,7 +31,7 @@
 //!
 //! [`WebhookStore::record_event`]: zupflow_core::webhooks::WebhookStore::record_event
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -44,8 +44,8 @@ use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
 use zupflow_core::webhooks::{
     ANNOUNCE, ANNOUNCE_ATTEMPTS, Announcement, Attempt, DELIVER, DELIVERY_ATTEMPTS, DELIVERY_JOB_ATTEMPTS,
-    DeliveryState, NewWebhookEvent, RETRY_AFTER, Subject, WebhookError, WebhookEventType, delivery_of, event_body,
-    signature,
+    DeliveryState, NewWebhookEvent, PendingDelivery, RETRY_AFTER, Subject, WebhookError, WebhookEventType, delivery_of,
+    event_body, signature,
 };
 
 use crate::auth::AppState;
@@ -82,6 +82,7 @@ pub struct Sent {
     pub status: Option<u16>,
     /// Why it failed, as a short class; `None` on a `2xx`.
     pub error: Option<&'static str>,
+    pub duration_ms: u64,
 }
 
 impl Sent {
@@ -94,6 +95,7 @@ fn failed(error: &'static str) -> Sent {
     Sent {
         status: None,
         error: Some(error),
+        duration_ms: 0,
     }
 }
 
@@ -169,14 +171,17 @@ pub async fn send(
         ..Limits::default()
     };
     // Classified by status and error kind only: the endpoint's own words are never read.
-    Ok(match state.outbound.send(request, limits).await {
+    let started = Instant::now();
+    let mut sent = match state.outbound.send(request, limits).await {
         Ok(response) if (200..300).contains(&response.status) => Sent {
             status: Some(response.status),
             error: None,
+            duration_ms: 0,
         },
         Ok(response) => Sent {
             status: Some(response.status),
             error: Some("status"),
+            duration_ms: 0,
         },
         Err(OutboundError::Refused(_)) => failed("refused"),
         Err(OutboundError::Redirected) => failed("redirected"),
@@ -184,7 +189,9 @@ pub async fn send(
         Err(OutboundError::TooLarge) => failed("too_large"),
         Err(OutboundError::Unreachable) => failed("unreachable"),
         Err(OutboundError::Failed) => failed("failed"),
-    })
+    };
+    sent.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    Ok(sent)
 }
 
 /// How long after failed attempt `attempt` (from 1) the next one comes:
@@ -358,7 +365,7 @@ async fn announce(state: &AppState, job: &Job) -> Finish {
             }
             // Its workspace went between reading it and recording.
             Err(WebhookError::NotFound) => Finish::Complete,
-            Err(WebhookError::Unavailable) => unavailable(),
+            Err(WebhookError::Unavailable | WebhookError::InvalidCursor) => unavailable(),
         },
         // What it names is gone (its workspace, with everything in it), or
         // no longer what the event says.
@@ -455,16 +462,16 @@ async fn deliver(state: &AppState, job: &Job) -> Finish {
         Ok(Some(delivery)) => delivery,
         // Its endpoint was deleted, with its deliveries.
         Ok(None) => return Finish::Complete,
-        Err(_) => return ours(state, job, organization_id, delivery_id, 0, Unsent::StoreUnavailable).await,
+        Err(_) => return ours(state, job, organization_id, delivery_id, None, Unsent::StoreUnavailable).await,
     };
     if delivery.state != DeliveryState::Pending {
         return Finish::Complete;
     }
-    let ours = |unsent| ours(state, job, organization_id, delivery_id, delivery.attempts, unsent);
+    let ours = |unsent| ours(state, job, organization_id, delivery_id, Some(&delivery), unsent);
     if !delivery.enabled || !delivery.subscribed {
         return match state.webhooks.skip_delivery(organization_id, delivery_id).await {
             Ok(()) | Err(WebhookError::NotFound) => Finish::Complete,
-            Err(WebhookError::Unavailable) => ours(Unsent::StoreUnavailable).await,
+            Err(WebhookError::Unavailable | WebhookError::InvalidCursor) => ours(Unsent::StoreUnavailable).await,
         };
     }
     // One delivery in flight per endpoint: the claim's own lease token is the holder.
@@ -481,9 +488,13 @@ async fn deliver(state: &AppState, job: &Job) -> Finish {
         .await
     {
         Ok(true) => {}
-        Ok(false) => return Finish::Postpone(busy_wait(&delivery_id.to_string(), now)),
+        Ok(false) => {
+            let after = busy_wait(&delivery_id.to_string(), now);
+            defer(state, organization_id, &delivery, after).await;
+            return Finish::Postpone(after);
+        }
         Err(WebhookError::NotFound) => return Finish::Complete,
-        Err(WebhookError::Unavailable) => return ours(Unsent::StoreUnavailable).await,
+        Err(WebhookError::Unavailable | WebhookError::InvalidCursor) => return ours(Unsent::StoreUnavailable).await,
     }
     let finish = attempt(state, job, organization_id, &delivery).await;
     if let Err(error) = state
@@ -507,7 +518,7 @@ async fn attempt(
     state: &AppState,
     job: &Job,
     organization_id: OrganizationId,
-    delivery: &zupflow_core::webhooks::PendingDelivery,
+    delivery: &PendingDelivery,
 ) -> Result<Finish, Unsent> {
     let delivery_id = delivery.id;
     // The delivery counts its attempts; the job's claims include ones that weren't.
@@ -551,6 +562,7 @@ async fn attempt(
         status: sent.status,
         error: sent.error.map(str::to_owned),
         at,
+        duration_ms: sent.duration_ms,
         state: state_after,
         next_attempt_at,
     };
@@ -570,7 +582,7 @@ async fn attempt(
     {
         Ok(()) | Err(WebhookError::NotFound) => {}
         // Sent, but not recorded: tried again, so it may arrive twice, never not at all.
-        Err(WebhookError::Unavailable) => return Err(Unsent::StoreUnavailable),
+        Err(WebhookError::Unavailable | WebhookError::InvalidCursor) => return Err(Unsent::StoreUnavailable),
     }
     Ok(match state_after {
         DeliveryState::Pending => Finish::Retry(after, "delivery_failed"),
@@ -586,14 +598,19 @@ async fn ours(
     job: &Job,
     organization_id: OrganizationId,
     delivery_id: WebhookDeliveryId,
-    attempts: u32,
+    delivery: Option<&PendingDelivery>,
     unsent: Unsent,
 ) -> Finish {
     let reason = unsent.code();
     if job.attempt < DELIVERY_JOB_ATTEMPTS {
         // The claims so far that weren't attempts, about.
+        let attempts = delivery.map_or(0, |delivery| delivery.attempts);
         let failures = job.attempt.saturating_sub(attempts).max(1);
-        return Finish::Retry(backoff(&delivery_id.to_string(), failures), reason);
+        let after = backoff(&delivery_id.to_string(), failures);
+        if let Some(delivery) = delivery {
+            defer(state, organization_id, delivery, after).await;
+        }
+        return Finish::Retry(after, reason);
     }
     let settled = state
         .webhooks
@@ -608,7 +625,31 @@ async fn ours(
     );
     match settled {
         Ok(()) | Err(WebhookError::NotFound) => Finish::Complete,
-        Err(WebhookError::Unavailable) => Finish::Bury(reason),
+        Err(WebhookError::Unavailable | WebhookError::InvalidCursor) => Finish::Bury(reason),
+    }
+}
+
+/// Keeps the visible retry time aligned with postponement and internal
+/// backoff. The queue still retries when the store is unavailable, and a
+/// stale snapshot cannot overwrite a newer worker's summary.
+async fn defer(state: &AppState, organization_id: OrganizationId, delivery: &PendingDelivery, after: Duration) {
+    let next = Timestamp::from_millis(
+        Timestamp::now()
+            .millis()
+            .saturating_add(i64::try_from(after.as_millis()).unwrap_or(i64::MAX)),
+    );
+    if let Err(WebhookError::Unavailable | WebhookError::InvalidCursor) = state
+        .webhooks
+        .defer_delivery(
+            organization_id,
+            delivery.id,
+            delivery.attempts,
+            delivery.next_attempt_at,
+            next,
+        )
+        .await
+    {
+        tracing::warn!(event = "webhooks.defer_failed", %organization_id, delivery_id = %delivery.id);
     }
 }
 

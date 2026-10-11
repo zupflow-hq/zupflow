@@ -1,0 +1,289 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import {
+  type Organization,
+  type WebhookDeliveryDetail,
+  type WebhookDeliveryId,
+  type WebhookDeliveryListQuery,
+  type WebhookEndpoint,
+  ZupflowApiError,
+} from "@zupflow/sdk";
+import { useState } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { qk } from "@/lib/query-keys";
+import { newId } from "@/mocks/ids";
+import { WebhookHistory } from "./history";
+
+const { api } = vi.hoisted(() => ({
+  api: {
+    webhooks: { deliveries: vi.fn(), delivery: vi.fn(), deliveryAttempts: vi.fn() },
+    workspaces: { list: vi.fn(), get: vi.fn() },
+  },
+}));
+vi.mock("@/lib/api", () => ({ api }));
+
+const at = "2026-10-11T12:00:00.000Z";
+const org: Organization = {
+  id: newId("organization"),
+  name: "Fernhill",
+  slug: "fernhill",
+  role: "viewer",
+  created_at: at,
+  setup: {
+    has_app: true,
+    has_ready_configuration: true,
+    has_workspace: true,
+    has_api_key: true,
+    has_installation: true,
+    has_agent: true,
+    has_run: true,
+  },
+};
+const workspace = { id: newId("workspace"), external_id: "fern-account" };
+const endpoint: WebhookEndpoint = {
+  id: newId("webhook_endpoint"),
+  organization_id: org.id,
+  environment: "sandbox",
+  url: "https://hooks.fernhill.example/events",
+  description: "Run events",
+  events: ["run.completed"],
+  enabled: true,
+  signing_secret_last4: "1234",
+  created_at: at,
+  last_delivery: null,
+};
+const eventId = newId("webhook_event");
+const delivery: WebhookDeliveryDetail = {
+  id: newId("webhook_delivery"),
+  organization_id: org.id,
+  endpoint_id: endpoint.id,
+  event_id: eventId,
+  environment: "sandbox",
+  event_type: "run.completed",
+  event_created_at: at,
+  workspace,
+  state: "failed",
+  attempts: 2,
+  last_status_code: 503,
+  last_error: "status",
+  last_attempt_at: at,
+  next_attempt_at: null,
+  created_at: at,
+  attempt_history_complete: true,
+  event: {
+    id: eventId,
+    organization_id: org.id,
+    environment: "sandbox",
+    type: "run.completed",
+    created_at: at,
+    workspace,
+    data: { object: "run", id: newId("run"), agent_id: newId("agent"), status: "completed" },
+  },
+};
+const page = <T,>(items: T[], next_cursor: string | null = null, total = items.length) => ({
+  items,
+  pagination: { next_cursor, total },
+});
+
+function Harness({
+  currentOrg = org,
+  currentEndpoint = endpoint,
+  filters = {},
+}: {
+  currentOrg?: Organization;
+  currentEndpoint?: WebhookEndpoint;
+  filters?: Omit<WebhookDeliveryListQuery, "cursor" | "limit">;
+}) {
+  const [selected, onSelect] = useState<WebhookDeliveryId>();
+  return (
+    <TooltipProvider>
+      <WebhookHistory
+        org={currentOrg}
+        endpoint={currentEndpoint}
+        filters={filters}
+        onFiltersChange={vi.fn()}
+        selected={selected}
+        onSelect={onSelect}
+      />
+    </TooltipProvider>
+  );
+}
+
+const clients: QueryClient[] = [];
+function setup(props: Parameters<typeof Harness>[0] = {}) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Infinity }, mutations: { retry: false } },
+  });
+  clients.push(client);
+  const view = render(
+    <QueryClientProvider client={client}>
+      <Harness {...props} />
+    </QueryClientProvider>,
+  );
+  return {
+    ...view,
+    client,
+    change: (next: Parameters<typeof Harness>[0]) =>
+      view.rerender(
+        <QueryClientProvider client={client}>
+          <Harness {...next} />
+        </QueryClientProvider>,
+      ),
+  };
+}
+
+describe("webhook history", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    api.webhooks.deliveries.mockResolvedValue(page([delivery]));
+    api.webhooks.delivery.mockResolvedValue(delivery);
+    api.webhooks.deliveryAttempts.mockResolvedValue(
+      page([
+        { number: 1, status_code: null, error_class: "timeout", attempted_at: at, duration_ms: null },
+        { number: 2, status_code: 503, error_class: "status", attempted_at: at, duration_ms: 42 },
+      ]),
+    );
+    api.workspaces.list.mockResolvedValue(page([]));
+    api.workspaces.get.mockResolvedValue({ ...workspace, name: "Fern account" });
+  });
+  afterEach(() => {
+    cleanup();
+    for (const client of clients.splice(0)) client.clear();
+  });
+
+  it("lets a viewer open details and recorded attempts in the selected endpoint", async () => {
+    setup();
+    expect(api.webhooks.delivery).not.toHaveBeenCalled();
+    await userEvent.click(await screen.findByRole("button", { name: /View run.completed delivery/ }));
+    const dialog = await screen.findByRole("dialog");
+    expect(await within(dialog).findByText("42 ms")).toBeInTheDocument();
+    expect(within(dialog).getByText("Timed out")).toBeInTheDocument();
+    expect(within(dialog).getByText("Duration not recorded")).toBeInTheDocument();
+    expect(api.webhooks.delivery).toHaveBeenCalledWith(org.id, endpoint.id, delivery.id);
+    expect(api.webhooks.deliveryAttempts).toHaveBeenCalledWith(org.id, endpoint.id, delivery.id, {
+      limit: 25,
+      cursor: undefined,
+    });
+    expect(within(dialog).getByText("None scheduled")).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("loads older deliveries and further attempts only when requested", async () => {
+    const older = { ...delivery, id: newId("webhook_delivery"), event_type: "run.failed" };
+    api.webhooks.deliveries.mockImplementation((_org, _endpoint, query) =>
+      Promise.resolve(query.cursor ? page([older], null, 2) : page([delivery], "older", 2)),
+    );
+    api.webhooks.deliveryAttempts.mockImplementation((_org, _endpoint, _delivery, query) =>
+      Promise.resolve(
+        query.cursor
+          ? page([{ number: 2, status_code: 503, error_class: "status", attempted_at: at, duration_ms: 42 }], null, 2)
+          : page(
+              [{ number: 1, status_code: null, error_class: "timeout", attempted_at: at, duration_ms: null }],
+              "next-attempt",
+              2,
+            ),
+      ),
+    );
+    setup();
+    await userEvent.click(await screen.findByRole("button", { name: "Load older deliveries" }));
+    expect(await screen.findByText("run.failed")).toBeInTheDocument();
+    expect(api.webhooks.deliveries).toHaveBeenLastCalledWith(org.id, endpoint.id, { cursor: "older", limit: 25 });
+    expect(screen.queryByRole("button", { name: "Load older deliveries" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: /View run.completed delivery/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "Load more attempts" }));
+    expect(await screen.findByText("42 ms")).toBeInTheDocument();
+    expect(api.webhooks.deliveryAttempts).toHaveBeenLastCalledWith(org.id, endpoint.id, delivery.id, {
+      cursor: "next-attempt",
+      limit: 25,
+    });
+  });
+
+  it("fetches the final attempt when a pending delivery completes and stops polling", async () => {
+    api.webhooks.delivery.mockResolvedValue({ ...delivery, state: "pending", attempts: 1 });
+    api.webhooks.deliveryAttempts.mockResolvedValue(
+      page([{ number: 1, status_code: 503, error_class: "status", attempted_at: at, duration_ms: 42 }]),
+    );
+    const { client } = setup();
+    await userEvent.click(await screen.findByRole("button", { name: /View run.completed delivery/ }));
+    expect(await screen.findByText("42 ms")).toBeInTheDocument();
+    api.webhooks.deliveryAttempts.mockResolvedValue(
+      page([
+        { number: 1, status_code: 503, error_class: "status", attempted_at: at, duration_ms: 42 },
+        { number: 2, status_code: 204, error_class: null, attempted_at: at, duration_ms: 17 },
+      ]),
+    );
+    act(() => {
+      client.setQueryData(qk.webhookDelivery(org.id, endpoint.id, endpoint.environment, delivery.id), {
+        ...delivery,
+        state: "succeeded",
+        last_status_code: 204,
+        last_error: null,
+      });
+    });
+    expect(await screen.findByText("17 ms")).toBeInTheDocument();
+  });
+
+  it("explains legacy gaps without inventing individual results", async () => {
+    api.webhooks.delivery.mockResolvedValue({ ...delivery, attempt_history_complete: false });
+    api.webhooks.deliveryAttempts.mockResolvedValue(page([]));
+    setup();
+    await userEvent.click(await screen.findByRole("button", { name: /View run.completed delivery/ }));
+    expect(await screen.findByRole("note")).toHaveTextContent("Some older attempts have only a summary");
+    expect(await screen.findByText("No individual attempts recorded.")).toBeInTheDocument();
+    expect(screen.queryByText("42 ms")).toBeNull();
+  });
+
+  it("shows loading, an error with retry, then the empty state", async () => {
+    let reject: (error: unknown) => void = () => {};
+    api.webhooks.deliveries.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, fail) => {
+          reject = fail;
+        }),
+    );
+    setup();
+    expect(screen.getByRole("status", { name: "Loading", busy: true })).toHaveAttribute("aria-busy", "true");
+    reject(new ZupflowApiError(503, { code: "unavailable", message: "Try again shortly.", fields: null }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't load delivery history.");
+    api.webhooks.deliveries.mockResolvedValue(page([]));
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("No deliveries for these filters")).toBeInTheDocument();
+  });
+
+  it("does not reuse cached rows across organizations, endpoints, environments or workspace filters", async () => {
+    const view = setup();
+    await screen.findByRole("button", { name: /View run.completed delivery/ });
+    api.webhooks.deliveries.mockResolvedValue(page([]));
+    view.change({ filters: { workspace_id: workspace.id } });
+    await waitFor(() =>
+      expect(api.webhooks.deliveries).toHaveBeenLastCalledWith(org.id, endpoint.id, {
+        workspace_id: workspace.id,
+        limit: 25,
+        cursor: undefined,
+      }),
+    );
+    expect(await screen.findByText("No deliveries for these filters")).toBeInTheDocument();
+    view.change({ currentEndpoint: { ...endpoint, environment: "production" } });
+    await waitFor(() => expect(api.webhooks.deliveries).toHaveBeenCalledTimes(3));
+    const siblingEndpoint = { ...endpoint, id: newId("webhook_endpoint") };
+    view.change({ currentEndpoint: siblingEndpoint });
+    await waitFor(() =>
+      expect(api.webhooks.deliveries).toHaveBeenLastCalledWith(org.id, siblingEndpoint.id, {
+        limit: 25,
+        cursor: undefined,
+      }),
+    );
+    const foreignOrg = { ...org, id: newId("organization") };
+    view.change({ currentOrg: foreignOrg });
+    await waitFor(() =>
+      expect(api.webhooks.deliveries).toHaveBeenLastCalledWith(foreignOrg.id, endpoint.id, {
+        limit: 25,
+        cursor: undefined,
+      }),
+    );
+    expect(screen.queryByRole("button", { name: /View run.completed delivery/ })).toBeNull();
+  });
+});
