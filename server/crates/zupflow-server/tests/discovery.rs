@@ -6,6 +6,8 @@
 #![allow(clippy::unwrap_used)]
 
 mod common;
+#[path = "common/rotate_on_read.rs"]
+mod rotate_on_read;
 
 use axum::http::{Method, StatusCode};
 use common::{Server, call};
@@ -347,12 +349,11 @@ async fn discovers_a_workspace_apps_tools() {
     );
 }
 
-/// An OAuth app's tools are listed with the installation's access token as a bearer.
-#[tokio::test]
-async fn discovers_an_oauth_apps_tools_with_its_access_token() {
-    const TOKEN: &str = "https://accounts.example/token";
-    const IDENTITY: &str = "https://accounts.example/me";
-    const TRACKER: &str = "https://tracker.example/mcp";
+const TOKEN: &str = "https://accounts.example/token";
+const IDENTITY: &str = "https://accounts.example/me";
+const TRACKER: &str = "https://tracker.example/mcp";
+
+async fn connect_oauth() -> (Server, Installed) {
     let server = Server::new().await;
     let org = server.organization("alice", "northwind").await;
     let sandbox = id(&server.workspace("alice", &org, "acme-sandbox", "sandbox").await).to_owned();
@@ -437,6 +438,15 @@ async fn discovers_an_oauth_apps_tools_with_its_access_token() {
         installation: hosted["data"]["installation_id"].as_str().unwrap().to_owned(),
     };
 
+    (server, installed)
+}
+
+/// An OAuth app's tools are listed with the installation's access token as a bearer.
+#[tokio::test]
+async fn discovers_an_oauth_apps_tools_with_its_access_token() {
+    let (server, installed) = connect_oauth().await;
+    let org = installed.org.clone();
+    let sandbox = installed.ws.clone();
     let before = server.providers.sent().len();
     assert!(work_once(&server.state).await, "the callback queued a discovery");
     let sent = server.providers.sent();
@@ -449,6 +459,77 @@ async fn discovers_an_oauth_apps_tools_with_its_access_token() {
         statuses(&installed.tools(&server).await),
         [("list_issues", ToolStatus::Current)]
     );
+
+    let org_id = OrganizationId::parse(&org).unwrap();
+    let ws_id = WorkspaceId::parse(&sandbox).unwrap();
+    let inst_id = InstallationId::parse(&installed.installation).unwrap();
+    sqlx::query("UPDATE installations SET expires_at = ? WHERE organization_id = ? AND workspace_id = ? AND id = ?")
+        .bind(zupflow_core::time::Timestamp::now().millis() + 10_000)
+        .bind(org_id.uuid())
+        .bind(ws_id.uuid())
+        .bind(inst_id.uuid())
+        .execute(&database(&server).await)
+        .await
+        .unwrap();
+    server.providers.script(
+        TOKEN,
+        200,
+        json!({"access_token":"at-rotated", "refresh_token":"rt-rotated", "token_type":"Bearer", "expires_in":3600}),
+    );
+    let before = server.providers.sent().len();
+    assert_eq!(installed.discover(&server).await, Outcome::Done);
+    let sent = server.providers.sent();
+    assert_eq!(sent[before].url, TOKEN);
+    assert!(
+        sent[before + 1..]
+            .iter()
+            .all(|request| request.credential == Some(("Authorization".to_owned(), "Bearer at-rotated".to_owned())))
+    );
+    let forms = server.providers.bodies();
+    let forms: Vec<std::collections::BTreeMap<String, String>> = forms
+        .iter()
+        .filter(|(url, _)| url == TOKEN)
+        .map(|(_, body)| {
+            url::form_urlencoded::parse(body.as_ref().unwrap().as_bytes())
+                .into_owned()
+                .collect()
+        })
+        .collect();
+    assert_eq!(forms.len(), 2);
+    assert_eq!(forms[0]["grant_type"], "authorization_code");
+    assert!(
+        forms.iter().all(|form| !form.contains_key("resource")),
+        "configured OAuth refresh preserves the original exchange's absent resource"
+    );
+    let form = &forms[1];
+    assert_eq!(form["grant_type"], "refresh_token");
+    assert_eq!(form["refresh_token"], "rt-1");
+    let rotated = server
+        .state
+        .installations
+        .find_installation(org_id, ws_id, inst_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rotated.connection.unwrap().credential_version, 2);
+    // A stale claimed refresh, even one a process left a day ago, is never
+    // sent twice. Discovery reports reconnect and emits the transition.
+    sqlx::query("UPDATE installations SET expires_at = 0, refresh_started_at = 1 WHERE organization_id = ? AND workspace_id = ? AND id = ?")
+        .bind(org_id.uuid()).bind(ws_id.uuid()).bind(inst_id.uuid()).execute(&database(&server).await).await.unwrap();
+    let before = server.providers.sent().len();
+    assert_eq!(installed.discover(&server).await, Outcome::Done);
+    assert_eq!(server.providers.sent().len(), before);
+    assert_eq!(
+        server
+            .state
+            .installations
+            .find_installation(org_id, ws_id, inst_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        zupflow_core::installations::InstallationStatus::ReconnectRequired
+    );
 }
 
 #[tokio::test]
@@ -459,9 +540,8 @@ async fn tries_again_only_when_the_server_may_answer_later() {
     let app = catalog_token_app(&server, &org).await;
     let installed = connect_token(&server, "alice", &org, &sandbox, &app, "tk_live_1234").await;
 
-    // Not an MCP server: the test providers answer 401, then 503.
-    server.providers.answer(Ok(401));
-    assert_eq!(installed.discover(&server).await, Outcome::Done);
+    // A transient failure keeps the installation connected; a later 401
+    // ends discovery and marks its credential as needing a reconnect.
     server.providers.answer(Ok(503));
     assert_eq!(installed.discover(&server).await, Outcome::Retry("server_unavailable"));
     assert_eq!(installed.tools(&server).await, []);
@@ -490,4 +570,141 @@ async fn tries_again_only_when_the_server_may_answer_later() {
         .await
         .unwrap();
     assert_eq!(left, 0, "completed");
+}
+
+struct UnauthorizedOnce {
+    inner: std::sync::Arc<dyn zupflow_core::outbound::OutboundHttp>,
+    sent: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl zupflow_core::outbound::OutboundHttp for UnauthorizedOnce {
+    async fn send(
+        &self,
+        request: zupflow_core::outbound::OutboundRequest,
+        limits: zupflow_core::outbound::Limits,
+    ) -> Result<zupflow_core::outbound::OutboundResponse, zupflow_core::outbound::OutboundError> {
+        if !self.sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(zupflow_core::outbound::OutboundResponse {
+                status: 401,
+                headers: Vec::new(),
+                body: Vec::new(),
+            });
+        }
+        self.inner.send(request, limits).await
+    }
+}
+
+#[tokio::test]
+async fn reads_a_competing_refresh_again_at_each_credential_boundary() {
+    use rotate_on_read::{Read, RotateOnRead};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize},
+    };
+    use zupflow_core::environment::Environment;
+    use zupflow_core::installations::NewCredential;
+    use zupflow_core::keys::{self, EncryptionContext};
+
+    for (read, at, unauthorized) in [
+        (Read::Installation, 1, false),
+        (Read::Credential, 2, false),
+        (Read::Installation, 2, true),
+    ] {
+        let (server, installed) = connect_oauth().await;
+        let (org, ws, installation) = installed.ids();
+        if !unauthorized {
+            sqlx::query(
+                "UPDATE installations SET expires_at = 0 WHERE organization_id = ? AND workspace_id = ? AND id = ?",
+            )
+            .bind(org.uuid())
+            .bind(ws.uuid())
+            .bind(installation.uuid())
+            .execute(&database(&server).await)
+            .await
+            .unwrap();
+        }
+        let snapshot = server
+            .state
+            .installations
+            .find_installation(org, ws, installation)
+            .await
+            .unwrap()
+            .unwrap();
+        let sealed = keys::seal(
+            server.state.keys.as_ref(),
+            &EncryptionContext::installation_credential(
+                org,
+                ws,
+                Environment::Sandbox,
+                snapshot.app.id(),
+                installation,
+                2,
+            ),
+            br#"{"access_token":"winner-token","refresh_token":"winner-refresh","token_type":"Bearer"}"#,
+        )
+        .await
+        .unwrap();
+        let mut state = server.state.clone();
+        state.installations = Arc::new(RotateOnRead {
+            inner: state.installations.clone(),
+            scope: (org, ws, installation),
+            credential: NewCredential { sealed, version: 2 },
+            read,
+            at,
+            reads: AtomicUsize::new(0),
+        });
+        let before = server.providers.requests_to(TOKEN).len();
+        let reach = zupflow_server::mcp_access::reach(&state, org, ws, &snapshot)
+            .await
+            .unwrap();
+        if unauthorized {
+            state.outbound = Arc::new(UnauthorizedOnce {
+                inner: state.outbound.clone(),
+                sent: AtomicBool::new(false),
+            });
+            zupflow_server::mcp_access::call_tool(
+                &state,
+                org,
+                ws,
+                installation,
+                reach,
+                "list_issues",
+                &serde_json::Map::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(server.providers.tool_calls().len(), 1);
+            assert!(
+                server
+                    .providers
+                    .sent()
+                    .iter()
+                    .filter(|request| request.url == TRACKER)
+                    .all(|request| request
+                        .credential
+                        .as_ref()
+                        .is_some_and(|(header, value)| header == "Authorization" && value == "Bearer winner-token"))
+            );
+        } else {
+            assert_eq!(reach.credential().value, "Bearer winner-token");
+        }
+        assert_eq!(
+            server.providers.requests_to(TOKEN).len(),
+            before,
+            "the loser never exchanges an old refresh token"
+        );
+        assert_eq!(
+            state
+                .installations
+                .find_installation(org, ws, installation)
+                .await
+                .unwrap()
+                .unwrap()
+                .connection
+                .unwrap()
+                .credential_version,
+            2
+        );
+    }
 }

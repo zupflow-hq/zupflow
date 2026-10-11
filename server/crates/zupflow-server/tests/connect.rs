@@ -1210,8 +1210,12 @@ async fn connects_an_oauth_app_through_its_callback() {
     ] {
         let (status, location, body) = server.visit(&stale).await;
         assert_eq!(
-            (status, location, code(&body)),
-            (StatusCode::BAD_REQUEST, None, "invalid_oauth_state"),
+            (
+                status,
+                location,
+                body.as_str().is_some_and(|body| body.contains("invalid_oauth_state"))
+            ),
+            (StatusCode::BAD_REQUEST, None, true),
             "{stale}"
         );
     }
@@ -1310,7 +1314,8 @@ async fn connects_an_oauth_app_through_its_callback() {
 
     // The state is spent.
     let (status, _, body) = server.visit(&arrival).await;
-    assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "invalid_oauth_state"));
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.as_str().unwrap().contains("invalid_oauth_state"));
     let (status, body) = server
         .send(call(
             "nobody",
@@ -1485,4 +1490,31 @@ async fn refuses_consent_without_the_providers_endpoints() {
         (status, code(&body)),
         (StatusCode::UNPROCESSABLE_ENTITY, "configuration_not_ready")
     );
+}
+
+#[tokio::test]
+async fn refuses_a_supplied_issuer_without_a_trusted_configured_issuer() {
+    let server = Server::new().await;
+    let t = tenant(&server, "alice", "northwind").await;
+    let app = oauth_app(&server, &t.org).await;
+    let (_, created) = server
+        .send(start("alice", &t.org, &t.sandbox, session(&app, Value::Null)))
+        .await;
+    let reference = reference_of(&created["data"]);
+    let (_, consent) = authorize(&server, &reference).await;
+    let (status, _, _) = server
+        .visit(&format!(
+            "/connect/oauth/callback?code=c&state={}&iss=https%3A%2F%2Faccounts.example",
+            consent["state"]
+        ))
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(
+        server.providers.sent().is_empty(),
+        "an unbound issuer exchanges nothing"
+    );
+    let (_, body) = server
+        .send(call("nobody", Method::GET, format!("/v1/connect/sessions/{reference}")))
+        .await;
+    assert_eq!(body["data"]["failure_code"], "authorization_failed");
 }

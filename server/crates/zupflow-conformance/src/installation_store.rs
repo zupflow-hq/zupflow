@@ -1,24 +1,33 @@
 //! The `InstallationStore` suite (decisions 0031 and 0034): installations
 //! reached only through their own workspace, of an app the workspace may
 //! install, their credentials kept and returned exactly and gone once
-//! disconnected or deleted, and the catalog-wide list paged without repeats.
+//! disconnected or deleted, and the catalog-wide list paged without repeats;
+//! reconnect required records its audit and outbox exactly once, only for
+//! the current credential in its own scope.
 //!
-//! `prepare` makes a [`Tenant`] exist: its organization, a Sandbox and a
+//! `prepare` makes a [`Tenant`] exist: its organization, two Sandbox and a
 //! Production workspace, a catalog app, and an app of the Sandbox workspace's own.
 
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use zupflow_core::apps::{AuthTemplate, OAuthScope};
+use zupflow_core::audit::{
+    AuditAction, AuditActor, AuditEntry, AuditFilter, AuditObject, AuditPlace, AuditStore, AuditTarget,
+};
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::{
     ConnectedAccount, DiscoveredClient, Installation, InstallationError, InstallationStatus, InstallationStore,
     InstalledApp, NewCredential, NewInstallation, TemplateSnapshot,
 };
+use zupflow_core::jobs::JobQueue;
 use zupflow_core::keys::{Sealed, WrappedKey};
+use zupflow_core::scope::{Name, Scope};
+use zupflow_core::webhooks::{ANNOUNCE, Announcement, Subject, WebhookEventType};
 
 use crate::audit_store::by_suite_in;
 
@@ -26,6 +35,8 @@ use crate::audit_store::by_suite_in;
 pub struct Tenant {
     pub organization_id: OrganizationId,
     pub sandbox: WorkspaceId,
+    /// Another workspace in the same environment, independent of its sibling.
+    pub sibling: WorkspaceId,
     pub production: WorkspaceId,
     pub catalog_app: AppId,
     /// The Sandbox workspace's own app.
@@ -38,6 +49,7 @@ async fn tenant(prepare: &Prepare) -> Tenant {
     let tenant = Tenant {
         organization_id: OrganizationId::generate(),
         sandbox: WorkspaceId::generate(),
+        sibling: WorkspaceId::generate(),
         production: WorkspaceId::generate(),
         catalog_app: AppId::generate(),
         own_app: AppId::generate(),
@@ -89,6 +101,7 @@ pub fn signed_in_snapshot(app_version: u32) -> TemplateSnapshot {
         },
         app_version,
         client: Some(DiscoveredClient {
+            response_iss_supported: false,
             issuer: "https://auth.example/tenant".to_owned(),
             token_endpoint: "https://auth.example/tenant/token".to_owned(),
             client_id: "client-1".to_owned(),
@@ -131,7 +144,10 @@ async fn install(
         .unwrap()
 }
 
-pub async fn run(store: &dyn InstallationStore, prepare: Prepare) {
+/// `audit` and `jobs` read the effects written by the installation store.
+/// The queue is isolated to this suite, with no workers consuming it.
+pub async fn run(store: &dyn InstallationStore, audit: &dyn AuditStore, jobs: &dyn JobQueue, prepare: Prepare) {
+    serializes_refresh_and_guards_every_scope(store, audit, jobs, &prepare).await;
     creates_and_finds_within_its_workspace(store, &prepare).await;
     refuses_an_app_the_workspace_cannot_install(store, &prepare).await;
     lists_its_own_workspace_newest_first(store, &prepare).await;
@@ -518,5 +534,241 @@ async fn counts_installations_per_app(store: &dyn InstallationStore, prepare: &P
             .await
             .unwrap(),
         [(a.catalog_app, 1)]
+    );
+}
+
+async fn serializes_refresh_and_guards_every_scope(
+    store: &dyn InstallationStore,
+    audit_store: &dyn AuditStore,
+    jobs: &dyn JobQueue,
+    prepare: &Prepare,
+) {
+    use zupflow_core::{installations::RefreshClaim, time::Timestamp};
+    let a = tenant(prepare).await;
+    let b = tenant(prepare).await;
+    let i = install(store, &a, a.sandbox, InstalledApp::Catalog(a.catalog_app)).await;
+    let now = Timestamp::from_millis(1000);
+    let mut next = credential(2);
+    next.version = 2;
+    let audit = |i: &Installation| {
+        AuditEntry::new(
+            AuditActor::System {
+                name: "Credentials".to_owned(),
+            },
+            AuditAction::InstallationReconnectRequired,
+            AuditTarget::new(AuditObject::Installation(i.id), &i.label),
+            AuditPlace::Workspace(a.sandbox),
+        )
+    };
+    let events = |org| async move {
+        audit_store
+            .list_audit_events(org, &AuditFilter::default(), None, 100)
+            .await
+            .unwrap()
+    };
+    let kind = Name::new(ANNOUNCE).unwrap();
+    let announced = || async {
+        let mut claimed = Vec::new();
+        while let Some(job) = jobs
+            .claim_next(std::slice::from_ref(&kind), Duration::from_secs(60))
+            .await
+            .unwrap()
+        {
+            jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+            claimed.push((
+                job.scope,
+                Announcement::parse(&job.payload).expect("an announcement reads back"),
+            ));
+        }
+        claimed
+    };
+    assert!(announced().await.is_empty());
+    for (org, ws) in [
+        (b.organization_id, a.sandbox),
+        (a.organization_id, a.sibling),
+        (a.organization_id, a.production),
+        (b.organization_id, b.sandbox),
+    ] {
+        assert_eq!(
+            store.claim_refresh(org, ws, i.id, 1, now).await.unwrap(),
+            RefreshClaim::Changed
+        );
+        assert!(
+            !store
+                .rotate_credential(org, ws, i.id, &next, Some(now), now)
+                .await
+                .unwrap()
+        );
+        assert!(!store.require_reconnect(org, ws, i.id, 1, now, &audit).await.unwrap());
+        assert_eq!(events(a.organization_id).await.total, 0, "wrong scope records no audit");
+        assert_eq!(events(b.organization_id).await.total, 0);
+        assert!(announced().await.is_empty(), "wrong scope announces nothing");
+    }
+    assert!(
+        !store
+            .rotate_credential(a.organization_id, a.sandbox, i.id, &next, None, now)
+            .await
+            .unwrap(),
+        "must claim before rotating"
+    );
+    let (one, two) = tokio::join!(
+        store.claim_refresh(a.organization_id, a.sandbox, i.id, 1, now),
+        store.claim_refresh(a.organization_id, a.sandbox, i.id, 1, now)
+    );
+    assert!(matches!(
+        (one.unwrap(), two.unwrap()),
+        (RefreshClaim::Claimed, RefreshClaim::Pending { .. }) | (RefreshClaim::Pending { .. }, RefreshClaim::Claimed)
+    ));
+    assert_eq!(
+        store
+            .claim_refresh(a.organization_id, a.sandbox, i.id, 1, Timestamp::from_millis(999999))
+            .await
+            .unwrap(),
+        RefreshClaim::Pending { started_at: now },
+        "an abandoned exchange can never be claimed again"
+    );
+    assert!(
+        store
+            .rotate_credential(a.organization_id, a.sandbox, i.id, &next, Some(now), now)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.find_credential(a.organization_id, a.sandbox, i.id).await.unwrap(),
+        Some(next.clone())
+    );
+    let rotated = store
+        .find_installation(a.organization_id, a.sandbox, i.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rotated.connection.unwrap().expires_at, Some(now));
+    assert!(
+        !store
+            .rotate_credential(a.organization_id, a.sandbox, i.id, &next, None, now)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .require_reconnect(a.organization_id, a.sandbox, i.id, 1, now, &audit)
+            .await
+            .unwrap(),
+        "stale failure cannot flag winner"
+    );
+    assert_eq!(
+        events(a.organization_id).await.total,
+        0,
+        "stale failure records no audit"
+    );
+    assert!(announced().await.is_empty(), "stale failure announces nothing");
+    assert_eq!(
+        store
+            .require_reconnect(a.organization_id, a.sandbox, i.id, 2, now, &|i| AuditEntry {
+                place: AuditPlace::Workspace(a.sibling),
+                ..audit(i)
+            })
+            .await,
+        Err(InstallationError::Unavailable),
+        "an audit placed in another workspace fails the whole transition"
+    );
+    assert_eq!(
+        store
+            .find_installation(a.organization_id, a.sandbox, i.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        InstallationStatus::Connected
+    );
+    assert_eq!(events(a.organization_id).await.total, 0, "failed audit rolls back");
+    assert!(announced().await.is_empty(), "failed audit queues no announcement");
+    let (one, two) = tokio::join!(
+        store.require_reconnect(a.organization_id, a.sandbox, i.id, 2, now, &audit),
+        store.require_reconnect(a.organization_id, a.sandbox, i.id, 2, now, &audit)
+    );
+    assert_ne!(one.unwrap(), two.unwrap(), "only one worker commits the transition");
+    assert!(
+        !store
+            .require_reconnect(a.organization_id, a.sandbox, i.id, 2, now, &audit)
+            .await
+            .unwrap(),
+        "exactly one transition"
+    );
+    let page = events(a.organization_id).await;
+    assert_eq!(
+        page.total, 1,
+        "one audit event, including concurrent and repeated attempts"
+    );
+    assert_eq!(page.items.len(), 1);
+    let event = &page.items[0];
+    let expected = audit(&i);
+    assert_eq!(event.organization_id, a.organization_id);
+    assert_eq!(event.workspace_id, Some(a.sandbox));
+    assert_eq!(event.workspace.as_ref().map(|workspace| workspace.id), Some(a.sandbox));
+    assert_eq!(event.environment, Some(Environment::Sandbox));
+    assert_eq!(event.actor, expected.actor);
+    assert_eq!(event.action, expected.action);
+    assert_eq!(event.target, expected.target);
+    assert_eq!(events(b.organization_id).await.total, 0);
+    let claimed = announced().await;
+    assert_eq!(claimed.len(), 1, "one outbox event for the committed transition");
+    let (scope, announcement) = claimed[0];
+    assert_eq!(scope, Scope::Workspace(a.organization_id, a.sandbox));
+    assert_eq!(
+        (announcement.kind, announcement.subject, announcement.created_at),
+        (
+            WebhookEventType::InstallationReconnectRequired,
+            Subject::Installation(i.id),
+            now
+        )
+    );
+    assert_eq!(
+        store
+            .find_installation(a.organization_id, a.sandbox, i.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        InstallationStatus::ReconnectRequired
+    );
+    assert_eq!(
+        store
+            .claim_refresh(a.organization_id, a.sandbox, i.id, 2, now)
+            .await
+            .unwrap(),
+        RefreshClaim::Changed
+    );
+    let other = install(store, &a, a.sandbox, InstalledApp::Catalog(a.catalog_app)).await;
+    store
+        .claim_refresh(a.organization_id, a.sandbox, other.id, 1, now)
+        .await
+        .unwrap();
+    store
+        .disconnect_installation(a.organization_id, a.sandbox, other.id, &|_| by_suite_in(a.sandbox))
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .rotate_credential(a.organization_id, a.sandbox, other.id, &next, None, now)
+            .await
+            .unwrap(),
+        "disconnect stops a late refresh"
+    );
+    let before = events(a.organization_id).await;
+    assert!(
+        !store
+            .require_reconnect(a.organization_id, a.sandbox, other.id, 1, now, &audit)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        events(a.organization_id).await,
+        before,
+        "disconnected credentials record no reconnect audit"
+    );
+    assert!(
+        announced().await.is_empty(),
+        "disconnected credentials announce nothing"
     );
 }

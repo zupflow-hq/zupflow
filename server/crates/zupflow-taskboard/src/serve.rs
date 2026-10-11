@@ -87,6 +87,16 @@ fn router(taskboard: Taskboard) -> Router {
             "/.well-known/oauth-authorization-server",
             get(oauth::authorization_server),
         )
+        .route(
+            "/webhooks",
+            post(
+                |axum::extract::State(board): axum::extract::State<Taskboard>,
+                 axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    board.state().webhooks.push(body);
+                    axum::http::StatusCode::NO_CONTENT
+                },
+            ),
+        )
         .route("/register", post(oauth::register))
         .route("/authorize", get(oauth::authorize).post(oauth::decide))
         .route("/token", post(oauth::token))

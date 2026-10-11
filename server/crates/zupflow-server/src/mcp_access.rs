@@ -17,6 +17,7 @@ use crate::auth::AppState;
 /// The server and the credential to reach it with.
 pub struct Reach {
     pub server_url: String,
+    version: u32,
     header: String,
     value: Zeroizing<String>,
     secret: Zeroizing<String>,
@@ -53,13 +54,15 @@ impl Unreachable {
     pub fn needs_reconnect(self) -> bool {
         matches!(
             self,
-            Self::Skip("not_connected" | "no_credential" | "credential_without_token" | "server_moved")
+            Self::Skip(
+                "not_connected" | "no_credential" | "credential_without_token" | "server_moved" | "reconnect_required"
+            )
         )
     }
 }
 
 /// The installation's server and credential, read again in its own scope.
-pub async fn reach(
+async fn open_reach(
     state: &AppState,
     organization_id: OrganizationId,
     workspace_id: WorkspaceId,
@@ -163,8 +166,162 @@ pub async fn reach(
     };
     Ok(Reach {
         server_url,
+        version: sealed.version,
         header,
         value: Zeroizing::new(format!("{prefix}{secret}")),
         secret: Zeroizing::new(secret.to_owned()),
     })
+}
+
+/// Reads current state in the explicit scope, refreshing once before use
+/// when expiry is at most 30 seconds away. A racing winner is read again.
+pub async fn reach(
+    state: &AppState,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    installation: &Installation,
+) -> Result<Reach, Unreachable> {
+    let (current, reach) = current_reach(state, organization_id, workspace_id, installation.id).await?;
+    let expires = current.connection.as_ref().and_then(|c| c.expires_at);
+    if !matches!(
+        current.snapshot.as_ref().map(|s| &s.auth),
+        Some(AuthTemplate::Token { .. })
+    ) && expires
+        .is_some_and(|at| at.millis() <= zupflow_core::time::Timestamp::now().millis().saturating_add(30_000))
+    {
+        crate::oauth_refresh::refresh(state, organization_id, workspace_id, &current).await?;
+        return current_reach(state, organization_id, workspace_id, current.id)
+            .await
+            .map(|(_, reach)| reach);
+    }
+    Ok(reach)
+}
+
+// A reconnect or refresh can commit between the two reads. Retry only
+// this pre-send snapshot race, bounded so continuous changes can't starve.
+async fn current_reach(
+    state: &AppState,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    installation_id: zupflow_core::ids::InstallationId,
+) -> Result<(Installation, Reach), Unreachable> {
+    for _ in 0..3 {
+        let installation = current(state, organization_id, workspace_id, installation_id).await?;
+        match open_reach(state, organization_id, workspace_id, &installation).await {
+            Err(Unreachable::Retry("credential_replaced")) => continue,
+            result => return result.map(|reach| (installation, reach)),
+        }
+    }
+    Err(Unreachable::Retry("credential_replaced"))
+}
+
+async fn current(
+    state: &AppState,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    installation_id: zupflow_core::ids::InstallationId,
+) -> Result<Installation, Unreachable> {
+    state
+        .installations
+        .find_installation(organization_id, workspace_id, installation_id)
+        .await
+        .map_err(|_| Unreachable::Retry("store_unavailable"))?
+        .ok_or(Unreachable::Skip("not_connected"))
+}
+
+async fn after_unauthorized(
+    state: &AppState,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    installation_id: zupflow_core::ids::InstallationId,
+    previous: &Reach,
+) -> Result<Reach, Unreachable> {
+    let (installation, current) = current_reach(state, organization_id, workspace_id, installation_id).await?;
+    if current.version != previous.version {
+        return Ok(current);
+    }
+    crate::oauth_refresh::refresh(state, organization_id, workspace_id, &installation).await?;
+    current_reach(state, organization_id, workspace_id, installation_id)
+        .await
+        .map(|(_, reach)| reach)
+}
+
+/// Only a 401 proves the tool did not execute. No other result is replayed.
+pub async fn call_tool(
+    state: &AppState,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    installation_id: zupflow_core::ids::InstallationId,
+    reach: Reach,
+    name: &str,
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<zupflow_mcp::ToolResult, zupflow_mcp::CallError> {
+    use zupflow_mcp::{CallError, McpError};
+    let first = zupflow_mcp::call_tool(
+        state.outbound.as_ref(),
+        &reach.server_url,
+        Some(reach.credential()),
+        name,
+        arguments,
+        zupflow_core::outbound::Limits::default(),
+    )
+    .await;
+    if first != Err(CallError::Unauthorized) {
+        return first;
+    }
+    let renewed = after_unauthorized(state, organization_id, workspace_id, installation_id, &reach)
+        .await
+        .map_err(|error| {
+            if error.needs_reconnect() {
+                CallError::Unauthorized
+            } else {
+                CallError::NotSent(McpError::Unavailable)
+            }
+        })?;
+    let second = zupflow_mcp::call_tool(
+        state.outbound.as_ref(),
+        &renewed.server_url,
+        Some(renewed.credential()),
+        name,
+        arguments,
+        zupflow_core::outbound::Limits::default(),
+    )
+    .await;
+    if second == Err(CallError::Unauthorized) {
+        crate::oauth_refresh::require_reconnect(state, organization_id, workspace_id, installation_id, renewed.version)
+            .await
+            .map_err(|_| CallError::NotSent(McpError::Unavailable))?;
+    }
+    second
+}
+
+pub async fn list_tools(
+    state: &AppState,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    installation_id: zupflow_core::ids::InstallationId,
+    reach: Reach,
+) -> Result<Vec<zupflow_core::tools::ListedTool>, zupflow_mcp::McpError> {
+    use zupflow_mcp::McpError;
+    let first = zupflow_mcp::list_tools(state.outbound.as_ref(), &reach.server_url, Some(reach.credential())).await;
+    if first != Err(McpError::Unauthorized) {
+        return first;
+    }
+    let renewed = after_unauthorized(state, organization_id, workspace_id, installation_id, &reach)
+        .await
+        .map_err(|error| {
+            if error.needs_reconnect() {
+                McpError::Unauthorized
+            } else {
+                McpError::Unavailable
+            }
+        })?;
+    let second =
+        zupflow_mcp::list_tools(state.outbound.as_ref(), &renewed.server_url, Some(renewed.credential())).await;
+    if second == Err(McpError::Unauthorized) {
+        crate::oauth_refresh::require_reconnect(state, organization_id, workspace_id, installation_id, renewed.version)
+            .await
+            .map_err(|_| McpError::Unavailable)?;
+    }
+    second
 }

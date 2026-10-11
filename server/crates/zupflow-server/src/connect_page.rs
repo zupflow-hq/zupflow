@@ -421,6 +421,31 @@ fn generic() -> Response {
     secured(response, &content_security_policy(&[], None), false, "no-store")
 }
 
+/// A bad callback state is a browser outcome, with the hosted page's CSP
+/// and no request text or session information reflected in it.
+pub(crate) fn invalid_oauth_state() -> Response {
+    let card = format!(
+        "<div class=\"card\" data-state=\"invalid_oauth_state\">{}</div>",
+        outcome(
+            "failure",
+            X_CIRCLE,
+            "This sign-in link isn't valid",
+            "This sign-in link isn't valid or was already used. Start again from the app.",
+            ""
+        )
+    );
+    let response = (
+        StatusCode::BAD_REQUEST,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        )],
+        document("Connect", None, &card),
+    )
+        .into_response();
+    secured(response, &content_security_policy(&[], None), false, "no-store")
+}
+
 /// Our own store or key service failed: nothing about the link is known.
 fn unavailable() -> Response {
     let card = format!(

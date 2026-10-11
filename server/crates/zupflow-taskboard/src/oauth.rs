@@ -214,7 +214,15 @@ fn back_to_client(board: &Taskboard, redirect_uri: &str, params: &[(&str, &str)]
         for (name, value) in params {
             query.append_pair(name, value);
         }
-        query.append_pair("iss", board.base_url());
+        match board.state().response_issuer {
+            crate::ResponseIssuer::Correct => {
+                query.append_pair("iss", board.base_url());
+            }
+            crate::ResponseIssuer::Foreign => {
+                query.append_pair("iss", "https://foreign.example");
+            }
+            crate::ResponseIssuer::Missing => {}
+        }
     }
     let mut response = StatusCode::SEE_OTHER.into_response();
     if let Ok(location) = HeaderValue::try_from(url.as_str()) {
@@ -432,7 +440,18 @@ pub(crate) async fn token(State(board): State<Taskboard>, headers: HeaderMap, bo
     let grant_type = param(&lenient, "grant_type").unwrap_or_default().to_owned();
     let client_id = param(&lenient, "client_id").map(str::to_owned);
     let resource = param(&lenient, "resource").map(str::to_owned);
+    if grant_type == "refresh_token" {
+        let delay = {
+            let mut state = board.state();
+            state.refreshes_in_flight += 1;
+            state.refresh_delay
+        };
+        tokio::time::sleep(delay).await;
+    }
     let answer = exchange(&board, &headers, form);
+    if grant_type == "refresh_token" {
+        board.state().refreshes_in_flight -= 1;
+    }
     board.state().token_requests.push(TokenRequest {
         grant_type,
         client_id,

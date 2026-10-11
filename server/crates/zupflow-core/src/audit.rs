@@ -287,6 +287,7 @@ actions! {
     InstallationUpdated => "installation.updated",
     InstallationConnected => "installation.connected",
     InstallationReconnected => "installation.reconnected",
+    InstallationReconnectRequired => "installation.reconnect_required",
     InstallationDisconnected => "installation.disconnected",
     InstallationToolChangeAccepted => "installation.tool_change_accepted",
     InstallationDeleted => "installation.deleted",

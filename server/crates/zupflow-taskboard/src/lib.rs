@@ -184,8 +184,23 @@ struct Board {
     tasks: Vec<Task>,
 }
 
+/// RFC 9207 test responses.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum ResponseIssuer {
+    #[default]
+    Correct,
+    Missing,
+    Foreign,
+}
+
 #[derive(Debug, Default)]
 struct State {
+    response_issuer: ResponseIssuer,
+    refresh_delay: Duration,
+    refreshes_in_flight: usize,
+    unauthorized_requests: usize,
+    mcp_status: Option<u16>,
+    webhooks: Vec<Value>,
     clients: HashMap<String, Client>,
     /// In the order registered, for listing.
     client_order: Vec<String>,
@@ -270,6 +285,28 @@ impl Taskboard {
     }
 
     // --- Hooks for tests ---------------------------------------------------
+
+    pub fn set_response_issuer(&self, issuer: ResponseIssuer) {
+        self.state().response_issuer = issuer;
+    }
+    pub fn forget_clients(&self) {
+        self.state().clients.clear();
+    }
+    pub fn set_refresh_delay(&self, delay: Duration) {
+        self.state().refresh_delay = delay;
+    }
+    pub fn refreshes_in_flight(&self) -> usize {
+        self.state().refreshes_in_flight
+    }
+    pub fn unauthorized_requests(&self) -> usize {
+        self.state().unauthorized_requests
+    }
+    pub fn set_mcp_status(&self, status: Option<u16>) {
+        self.state().mcp_status = status;
+    }
+    pub fn webhooks(&self) -> Vec<Value> {
+        self.state().webhooks.clone()
+    }
 
     /// Every client registered, in order.
     pub fn registered_clients(&self) -> Vec<RegisteredClient> {

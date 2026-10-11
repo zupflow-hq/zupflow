@@ -181,6 +181,10 @@ fn checked(issuer: &str, metadata: &Map<String, Value>) -> Result<AuthorizationS
     }
     Ok(AuthorizationServer {
         issuer: issuer.to_owned(),
+        response_iss_supported: metadata
+            .get("authorization_response_iss_parameter_supported")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         authorization_endpoint,
         token_endpoint,
         registration_endpoint,
@@ -573,6 +577,7 @@ mod tests {
 
     fn expected() -> AuthorizationServer {
         AuthorizationServer {
+            response_iss_supported: false,
             issuer: ISSUER.to_owned(),
             authorization_endpoint: "https://auth.example/tenant/authorize".to_owned(),
             token_endpoint: "https://auth.example/tenant/token".to_owned(),

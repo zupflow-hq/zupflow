@@ -151,6 +151,8 @@ pub trait ToolRegistry: Send + Sync {
     /// latest; every name not listed marked gone. Effects of known tools are
     /// never changed by a listing. Then, in the same transaction, gone tools
     /// beyond [`MAX_GONE`] are deleted, those gone longest first.
+    /// Suggested catalog-app levels are saved in the same transaction;
+    /// an existing level is never overwritten.
     async fn record_listing(
         &self,
         organization_id: OrganizationId,

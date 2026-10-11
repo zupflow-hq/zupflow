@@ -114,7 +114,10 @@ pub(crate) async fn get() -> Response {
 pub(crate) async fn delete(State(board): State<Taskboard>, headers: HeaderMap) -> Response {
     let bearer = match bearer(&board, &headers) {
         Ok(bearer) => bearer,
-        Err(refused) => return refused.answer(&board),
+        Err(refused) => {
+            board.state().unauthorized_requests += 1;
+            return refused.answer(&board);
+        }
     };
     let Some(session) = headers.get(SESSION_HEADER).and_then(|value| value.to_str().ok()) else {
         return bad_request("Name the session with Mcp-Session-Id.");
@@ -130,10 +133,16 @@ pub(crate) async fn delete(State(board): State<Taskboard>, headers: HeaderMap) -
 }
 
 pub(crate) async fn post(State(board): State<Taskboard>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Some(status) = board.state().mcp_status.and_then(|s| StatusCode::from_u16(s).ok()) {
+        return status.into_response();
+    }
     // The token first: a client finds the authorization server from this `401`.
     let bearer = match bearer(&board, &headers) {
         Ok(bearer) => bearer,
-        Err(refused) => return refused.answer(&board),
+        Err(refused) => {
+            board.state().unauthorized_requests += 1;
+            return refused.answer(&board);
+        }
     };
     let json_body = headers
         .get(header::CONTENT_TYPE)

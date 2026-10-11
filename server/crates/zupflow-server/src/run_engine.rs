@@ -36,7 +36,6 @@ use zupflow_core::jobs::{Job, JobId, JobOptions, LeaseToken};
 use zupflow_core::models::{
     MAX_MODEL_TOOL_NAME, Message, ModelToolCall, ProviderError, Reply, TokenUsage, ToolSpec, Turn, validate_completion,
 };
-use zupflow_core::outbound::Limits;
 use zupflow_core::policy::{CallApp, Decision, GrantedAs, OrganizationLevel, ToolCall, Verdict, floor};
 use zupflow_core::runs::{
     CallOutcome, CallState, CallTarget, Ending, Failure, NewRunEvent, NewToolCall, NewTurn, QueuedJob,
@@ -697,13 +696,14 @@ impl Engine<'_> {
             Err(error) => return retry(error),
         }
         let began = Timestamp::now();
-        let answer = zupflow_mcp::call_tool(
-            self.state.outbound.as_ref(),
-            &reach.server_url,
-            Some(reach.credential()),
+        let answer = mcp_access::call_tool(
+            self.state,
+            self.organization_id,
+            self.workspace_id,
+            installation.id,
+            reach,
             &target.tool,
             &call.arguments,
-            Limits::default(),
         )
         .await;
         let duration = Timestamp::now().millis() - began.millis();

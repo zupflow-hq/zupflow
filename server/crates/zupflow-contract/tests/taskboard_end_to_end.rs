@@ -10,8 +10,9 @@
 //! allowing; its tools are discovered; an agent is granted them within the
 //! organization's levels; runs call them on Taskboard with the
 //! installation's token, pausing for approval where the policy says; and an
-//! expired or revoked token surfaces as the installation needing a reconnect,
-//! which a reconnect fixes.
+//! expired token refreshes once across concurrent workers; a revoked refresh
+//! token requires reconnect with an audit event and webhook; reconnecting
+//! clears it, forgotten clients register again, and callback issuers are checked.
 //!
 //! The browser is a headless HTTP client following each redirect by hand and
 //! answering the consent page's form, so every hop can be checked.
@@ -524,6 +525,35 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
         .await;
     assert_eq!(data(&installations), &json!([]));
 
+    // A foreign issuer, including on an error, and a missing advertised iss
+    // fail before the token endpoint or registration invalidation.
+    for issuer in [
+        zupflow_taskboard::ResponseIssuer::Foreign,
+        zupflow_taskboard::ResponseIssuer::Missing,
+    ] {
+        let reference = t.session(&stack, None).await;
+        let page = t.consent_page(&stack, &reference).await;
+        board.set_response_issuer(issuer);
+        let failed = t.answer(&stack, &reference, &page, "approve").await;
+        board.set_response_issuer(zupflow_taskboard::ResponseIssuer::Correct);
+        assert_eq!(failed["failure_code"], "authorization_failed");
+        assert!(board.token_requests().is_empty());
+    }
+    let reference = t.session(&stack, None).await;
+    let page = t.consent_page(&stack, &reference).await;
+    board.set_response_issuer(zupflow_taskboard::ResponseIssuer::Foreign);
+    let callback_url = t.decide_consent(&stack, &page, "deny").await;
+    board.set_response_issuer(zupflow_taskboard::ResponseIssuer::Correct);
+    let failed = t
+        .follow(
+            &stack,
+            &reference,
+            &callback_url.replace("access_denied", "invalid_client"),
+        )
+        .await;
+    assert_eq!(failed["failure_code"], "authorization_failed");
+    assert!(board.token_requests().is_empty());
+
     // --- Allowed: installed, as the account Taskboard names ---------------
     let reference = t.session(&stack, None).await;
     let page = t.consent_page(&stack, &reference).await;
@@ -552,7 +582,8 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
     assert_ne!(tampered.as_str(), callback_url);
     let (status, _, body) = stack.browse(Method::GET, tampered.as_str(), None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(code(&serde_json::from_str(&body).unwrap()), "invalid_oauth_state");
+    assert!(body.starts_with("<!doctype html>"), "{body}");
+    assert!(body.contains("invalid_oauth_state"));
     assert!(
         board.token_requests().is_empty(),
         "nothing exchanged for a tampered state"
@@ -580,7 +611,8 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
     // sent a second time.
     let (status, _, body) = stack.browse(Method::GET, &callback_url, None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(code(&serde_json::from_str(&body).unwrap()), "invalid_oauth_state");
+    assert!(body.starts_with("<!doctype html>"), "{body}");
+    assert!(body.contains("invalid_oauth_state"));
     assert_eq!(board.token_requests().len(), 1, "a replayed callback exchanges nothing");
     let installation_id = completed["installation_id"].as_str().unwrap().to_owned();
     let installation = t.installation(&stack, &installation_id).await;
@@ -613,7 +645,7 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
     let mut names: Vec<&str> = tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
     names.sort_unstable();
     assert_eq!(names, ["create_task", "delete_task", "list_tasks"]);
-    // Levels are suggested just after the listing is recorded.
+    // The listing and suggested levels commit together.
     let levels = eventually("the suggested levels", || async {
         let (status, body) = stack
             .api(
@@ -842,65 +874,175 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
     assert_eq!(board.tool_calls().len(), 2, "a denied call is never sent");
     assert_eq!(board.tasks(&client_id).len(), 1);
 
-    // --- An expired access token ------------------------------------------
-    // Today the backend never refreshes: the installation keeps the refresh
-    // token Taskboard issued, but a run that meets an expired access token
-    // fails, asking for a reconnect, and the installation still reads as
-    // connected. This changes when refreshing lands (the next change): it
-    // becomes a run that completes after one `refresh_token` request.
+    // Signed webhook delivery uses the real outbound path too.
+    let (status, body) = stack
+        .api(
+            OWNER,
+            Method::POST,
+            &format!("/v1/organizations/{}/webhooks", t.org),
+            None,
+            Some(json!({
+                "url": format!("{}/webhooks", board.base_url()), "environment":"sandbox",
+                "events":["installation.reconnect_required"], "description":"Reconnect notifications"
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Expire only at the server: the first 401 is refreshed once. Hold the
+    // exchange open while the independent discovery worker hits the same
+    // expired token. Both must use one rotation, or Taskboard revokes the family.
     board.expire_access_tokens();
+    board.set_refresh_delay(Duration::from_secs(3));
+    let unauthorized = board.unauthorized_requests();
+    let run = t.start_run(&stack, &agent, "call list_tasks {}").await;
+    eventually("the run's refresh in flight", || async {
+        (board.refreshes_in_flight() == 1).then_some(())
+    })
+    .await;
+    let (status, body) = stack
+        .api(
+            OWNER,
+            Method::POST,
+            &format!("/v1/workspaces/{}/installations/{installation_id}/refresh-tools", t.ws),
+            Some(&t.org),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    eventually("discovery overlapping the run's refresh", || async {
+        (board.unauthorized_requests() >= unauthorized + 2 && board.refreshes_in_flight() == 1).then_some(())
+    })
+    .await;
+    t.run_reaches(&stack, &run, "completed").await;
+    board.set_refresh_delay(Duration::ZERO);
+    let refreshes = || {
+        board
+            .token_requests()
+            .iter()
+            .filter(|r| r.grant_type == "refresh_token")
+            .count()
+    };
+    assert_eq!(refreshes(), 1, "concurrent workers exchange a rotating token once");
+    assert_eq!(
+        t.installation(&stack, &installation_id).await["connection"]["credential_version"],
+        2
+    );
+    assert_eq!(board.tool_calls().len(), 3, "the refused call did not execute twice");
+
+    // A revoked refresh token durably flags the installation, once, with
+    // both its webhook and its audit event in the same transition.
+    board.revoke_all_tokens();
     let run = t.start_run(&stack, &agent, "call list_tasks {}").await;
     let failed = t.run_reaches(&stack, &run, "failed").await;
     assert_eq!(failed["error"]["code"], "installation_reconnect_required", "{failed}");
     assert_eq!(
-        failed["error"]["message"],
-        "Robin's board needs to be reconnected before its tools can run."
+        t.installation(&stack, &installation_id).await["status"],
+        "reconnect_required"
     );
-    assert!(
+    eventually("the reconnect webhook", || async {
         board
-            .token_requests()
-            .iter()
-            .all(|request| request.grant_type != "refresh_token"),
-        "no refresh is tried"
+            .webhooks()
+            .into_iter()
+            .find(|event| event["type"] == "installation.reconnect_required")
+    })
+    .await;
+    let event = board.webhooks().pop().unwrap();
+    assert_eq!(
+        event["data"],
+        json!({"object":"installation", "id":installation_id, "app_id":t.app, "status":"reconnect_required"})
     );
-    assert_eq!(t.installation(&stack, &installation_id).await["status"], "connected");
-    assert_eq!(board.tool_calls().len(), 2, "refused before the tool ran");
+    assert_eq!(event["organization_id"], t.org);
+    assert_eq!(event["workspace"]["id"], t.ws);
+    assert_eq!(event["environment"], "sandbox");
+    let (status, body) = stack
+        .api(
+            OWNER,
+            Method::GET,
+            &format!("/v1/organizations/{}/audit-events?workspace_id={}", t.org, t.ws),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        data(&body)
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["action"] == "installation.reconnect_required" && e["target"]["id"] == installation_id)
+            .count(),
+        1
+    );
+    let requests = board.token_requests().len();
+    let run = t.start_run(&stack, &agent, "call list_tasks {}").await;
+    t.run_reaches(&stack, &run, "failed").await;
+    assert_eq!(
+        board.token_requests().len(),
+        requests,
+        "a failed refresh is never reused"
+    );
+    assert_eq!(board.webhooks().len(), 1);
 
-    // --- A reconnect signs in again, as the same account ------------------
+    // Reconnect clears the flag and preserves the original account and grants.
     let reference = t.session(&stack, Some(&installation_id)).await;
     let page = t.consent_page(&stack, &reference).await;
     let reconnected = t.answer(&stack, &reference, &page, "approve").await;
     assert_eq!(reconnected["status"], "completed", "{reconnected}");
     let installation = t.installation(&stack, &installation_id).await;
-    assert_eq!(installation["connection"]["credential_version"], 2);
+    assert_eq!(installation["status"], "connected");
+    assert_eq!(installation["connection"]["credential_version"], 3);
     let run = t.start_run(&stack, &agent, "call list_tasks {}").await;
     let done = t.run_reaches(&stack, &run, "completed").await;
     assert!(
         done["output"]
             .as_str()
             .unwrap()
-            .contains("TB-1 [open] Send the quarterly report"),
-        "{done}"
-    );
-    let renewed = board.access_tokens_issued(&client_id).last().unwrap().clone();
-    assert_ne!(renewed, token);
-    assert_eq!(
-        board.tool_calls().last().unwrap().access_token,
-        renewed,
-        "with the new token"
+            .contains("TB-1 [open] Send the quarterly report")
     );
 
-    // --- A revoked token: the same, reconnect required --------------------
-    board.revoke_all_tokens();
+    // A 403 is never treated as a 401: no refresh or automatic replay.
+    board.set_mcp_status(Some(403));
+    let requests = board.token_requests().len();
     let run = t.start_run(&stack, &agent, "call list_tasks {}").await;
-    let failed = t.run_reaches(&stack, &run, "failed").await;
-    assert_eq!(failed["error"]["code"], "installation_reconnect_required", "{failed}");
-    let events = t.events(&stack, &run).await;
-    assert_eq!(&types(&events)[events.len() - 2..], ["tool_call.failed", "run.failed"]);
+    t.run_reaches(&stack, &run, "completed").await;
+    assert_eq!(board.token_requests().len(), requests);
+    assert_eq!(t.installation(&stack, &installation_id).await["status"], "connected");
+    board.set_mcp_status(None);
+
+    // A server that forgot its dynamic client reports invalid_client on a
+    // refresh; the next Connect registers again in the same app scope.
+    board.forget_clients();
+    board.expire_access_tokens();
+    let run = t.start_run(&stack, &agent, "call list_tasks {}").await;
+    t.run_reaches(&stack, &run, "failed").await;
     assert_eq!(
-        events[events.len() - 2]["data"]["error"]["code"],
-        "installation_reconnect_required"
+        board.token_requests().last().unwrap().error.as_deref(),
+        Some("invalid_client")
     );
+    let reference = t.session(&stack, Some(&installation_id)).await;
+    let page = t.consent_page(&stack, &reference).await;
+    let new_client = board.registered_clients()[0].client_id.clone();
+    assert_ne!(new_client, client_id);
+    let reconnected = t.answer(&stack, &reference, &page, "approve").await;
+    assert_eq!(reconnected["status"], "completed");
+    assert_eq!(t.installation(&stack, &installation_id).await["status"], "connected");
+
+    // Discovery receives a persistent 401 after one successful refresh: it
+    // performs the same reconnect transition even when no run is involved.
+    board.set_mcp_status(Some(401));
+    let before = refreshes();
+    let reference = t.session(&stack, Some(&installation_id)).await;
+    let page = t.consent_page(&stack, &reference).await;
+    let reconnected = t.answer(&stack, &reference, &page, "approve").await;
+    assert_eq!(reconnected["status"], "completed");
+    eventually("discovery's reconnect flag", || async {
+        let i = t.installation(&stack, &installation_id).await;
+        (i["status"] == "reconnect_required").then_some(())
+    })
+    .await;
+    assert_eq!(refreshes(), before + 1, "one refresh even on a persistent 401");
+    board.set_mcp_status(None);
 
     // Every token request named the MCP server as its resource (RFC 8707).
     assert!(

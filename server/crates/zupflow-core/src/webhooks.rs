@@ -509,6 +509,15 @@ impl Announcement {
         })
     }
 
+    pub fn reconnect_required(installation_id: InstallationId, at: Timestamp) -> Self {
+        Self {
+            event_id: WebhookEventId::generate(),
+            kind: WebhookEventType::InstallationReconnectRequired,
+            subject: Subject::Installation(installation_id),
+            created_at: at,
+        }
+    }
+
     /// The announcement that a listing changed one or more of an installation's tools.
     pub fn tools_changed(installation_id: InstallationId, at: Timestamp) -> Self {
         Self {

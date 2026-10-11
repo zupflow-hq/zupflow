@@ -2163,6 +2163,22 @@ export function contractSuite(target: Target) {
         expect(referenceOf(await create())).not.toBe(reference);
       });
 
+      it("reconnects a stopped installation with a new credential version", async () => {
+        const session = await create();
+        const first = await owner.connect.submitCredentials(referenceOf(session), { values: { token: "abc123" } });
+        await owner.installations.disconnect(qa(), first.installation.id);
+        const reconnect = await create({ intent: "reconnect", installation_id: first.installation.id });
+        const result = await owner.connect.submitCredentials(referenceOf(reconnect), {
+          values: { token: "renewed123" },
+        });
+        expect(result.installation.id).toBe(first.installation.id);
+        expect(result.installation.status).toBe("connected");
+        expect(result.installation.connection?.credential_version).toBe(
+          (first.installation.connection?.credential_version ?? 0) + 1,
+        );
+        expect(result.installation.connection?.account).toEqual(first.installation.connection?.account);
+      });
+
       it("shows a used link its outcome, which the OAuth callback sends the browser back to read", async () => {
         // Until five minutes past the link's expiry; after that, and for a
         // link that expired unused, the same 404 as no session (the mock's

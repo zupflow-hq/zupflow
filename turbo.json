@@ -1,6 +1,7 @@
 {
   "$schema": "https://turbo.build/schema.json",
   "agentGuidance": false,
+  "globalPassThroughEnv": ["CARGO_INCREMENTAL"],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],

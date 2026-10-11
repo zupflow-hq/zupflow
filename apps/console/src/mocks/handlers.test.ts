@@ -308,6 +308,41 @@ describe("idempotency store", () => {
 });
 
 describe("Connect (simulated consent)", () => {
+  it("clears reconnect required with the same account and the next credential version", async () => {
+    const sandbox = ws("acme-sandbox");
+    const transport = createHttpTransport({ baseUrl: API, getToken: async () => null });
+    const consent = async (session: { url: string }) =>
+      transport.request<ConnectResult>({
+        method: "POST",
+        path: `/v1/connect/sessions/${referenceOf(session)}/simulate-consent`,
+        body: { decision: "approved", email: "reconnect@acme.example" },
+      });
+    const first = await owner.connectSessions.create(sandbox.id, {
+      app_id: app("google-workspace").id,
+      intent: "create",
+      label: "Reconnect test",
+      installation_id: null,
+      return_url: null,
+    });
+    const { data } = await consent(first);
+    const installation = must(db().installations.find((i) => i.id === data.installation.id));
+    installation.status = "reconnect_required";
+    const connection = must(installation.connection);
+    const version = connection.credential_version;
+    const session = await owner.connectSessions.create(sandbox.id, {
+      app_id: installation.app_id,
+      intent: "reconnect",
+      label: "ignored",
+      installation_id: installation.id,
+      return_url: null,
+    });
+    await consent(session);
+    const renewed = await owner.installations.get(sandbox.id, installation.id);
+    expect(renewed.status).toBe("connected");
+    expect(renewed.connection?.credential_version).toBe(version + 1);
+    expect(renewed.connection?.account).toEqual(connection.account);
+  });
+
   it("refuses to reconnect a different account", async () => {
     const sandbox = ws("acme-sandbox");
     const installation = db().installations.find(

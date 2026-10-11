@@ -14,7 +14,7 @@ use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::{
     AccountConnection, AppInstallation, ConnectedAccount, Installation, InstallationError, InstallationStatus,
-    InstallationStore, InstalledApp, NewCredential, NewInstallation, TemplateSnapshot,
+    InstallationStore, InstalledApp, NewCredential, NewInstallation, RefreshClaim, TemplateSnapshot,
 };
 use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::time::Timestamp;
@@ -249,7 +249,7 @@ pub(crate) async fn reconnect(
     let now = Timestamp::now().millis();
     let credential = renewal.credential;
     let row = sqlx::query(concat!(
-        "UPDATE installations SET status = 'connected', configuration_version = ?, account_external_id = ?, \
+        "UPDATE installations SET status = 'connected', refresh_started_at = NULL, configuration_version = ?, account_external_id = ?, \
          account_display_name = ?, account_email = ?, granted_scopes = ?, credential_version = ?, \
          connected_at = ?, expires_at = ?, updated_at = ?, auth_template = ?, app_version = ?, oauth_client = ? \
          WHERE organization_id = ? AND workspace_id = ? AND id = ? AND coalesce(credential_version, 0) = ? RETURNING ",
@@ -475,7 +475,7 @@ impl InstallationStore for SqliteInstallationStore {
     ) -> Result<Installation, InstallationError> {
         let mut transaction = self.immediate().await?;
         let row = sqlx::query(concat!(
-            "UPDATE installations SET status = 'disconnected', updated_at = ? \
+            "UPDATE installations SET status = 'disconnected', refresh_started_at = NULL, updated_at = ? \
              WHERE organization_id = ? AND workspace_id = ? AND id = ? RETURNING ",
             returning!()
         ))
@@ -563,6 +563,102 @@ impl InstallationStore for SqliteInstallationStore {
             },
             version: u32::try_from(version).map_err(read)?,
         }))
+    }
+
+    async fn claim_refresh(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        installation_id: InstallationId,
+        version: u32,
+        now: Timestamp,
+    ) -> Result<RefreshClaim, InstallationError> {
+        let mut transaction = self.immediate().await?;
+        let row = sqlx::query("SELECT refresh_started_at FROM installations WHERE organization_id = ? AND workspace_id = ? AND id = ? AND status = 'connected' AND credential_version = ?")
+            .bind(organization_id.uuid()).bind(workspace_id.uuid()).bind(installation_id.uuid()).bind(i64::from(version))
+            .fetch_optional(&mut *transaction).await.map_err(failed("claim_refresh"))?;
+        let Some(row) = row else {
+            return Ok(RefreshClaim::Changed);
+        };
+        let started: Option<i64> = row.try_get("refresh_started_at").map_err(read)?;
+        if let Some(started_at) = started {
+            return Ok(RefreshClaim::Pending {
+                started_at: Timestamp::from_millis(started_at),
+            });
+        }
+        sqlx::query("UPDATE installations SET refresh_started_at = ? WHERE organization_id = ? AND workspace_id = ? AND id = ? AND status = 'connected' AND credential_version = ? AND refresh_started_at IS NULL")
+            .bind(now.millis()).bind(organization_id.uuid()).bind(workspace_id.uuid()).bind(installation_id.uuid()).bind(i64::from(version))
+            .execute(&mut *transaction).await.map_err(failed("claim_refresh"))?;
+        transaction.commit().await.map_err(failed("claim_refresh"))?;
+        Ok(RefreshClaim::Claimed)
+    }
+
+    async fn rotate_credential(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        installation_id: InstallationId,
+        credential: &NewCredential,
+        expires_at: Option<Timestamp>,
+        now: Timestamp,
+    ) -> Result<bool, InstallationError> {
+        let Some(previous) = credential.version.checked_sub(1).filter(|v| *v > 0) else {
+            return Ok(false);
+        };
+        let mut transaction = self.immediate().await?;
+        let changed = sqlx::query("UPDATE installations SET credential_version = ?, expires_at = ?, refresh_started_at = NULL, updated_at = ? WHERE organization_id = ? AND workspace_id = ? AND id = ? AND status = 'connected' AND credential_version = ? AND refresh_started_at IS NOT NULL")
+            .bind(i64::from(credential.version)).bind(expires_at.map(Timestamp::millis)).bind(now.millis())
+            .bind(organization_id.uuid()).bind(workspace_id.uuid()).bind(installation_id.uuid()).bind(i64::from(previous))
+            .execute(&mut *transaction).await.map_err(failed("rotate_credential"))?.rows_affected();
+        if changed == 0 {
+            return Ok(false);
+        }
+        let replaced = sqlx::query("UPDATE installation_credentials SET version = ?, key_id = ?, wrapped_key = ?, nonce = ?, ciphertext = ?, created_at = ? WHERE organization_id = ? AND workspace_id = ? AND installation_id = ? AND version = ?")
+            .bind(i64::from(credential.version)).bind(&credential.sealed.wrapped_key.key_id)
+            .bind(&credential.sealed.wrapped_key.bytes).bind(credential.sealed.nonce.as_slice()).bind(&credential.sealed.ciphertext).bind(now.millis())
+            .bind(organization_id.uuid()).bind(workspace_id.uuid()).bind(installation_id.uuid()).bind(i64::from(previous))
+            .execute(&mut *transaction).await.map_err(failed("rotate_credential"))?.rows_affected();
+        if replaced != 1 {
+            return Err(InstallationError::Unavailable);
+        }
+        transaction.commit().await.map_err(failed("rotate_credential"))?;
+        Ok(true)
+    }
+
+    async fn require_reconnect(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        installation_id: InstallationId,
+        version: u32,
+        now: Timestamp,
+        audit: &Audit<'_, Installation>,
+    ) -> Result<bool, InstallationError> {
+        let mut transaction = self.immediate().await?;
+        let row = sqlx::query(concat!("UPDATE installations SET status = 'reconnect_required', refresh_started_at = NULL, updated_at = ? WHERE organization_id = ? AND workspace_id = ? AND id = ? AND status = 'connected' AND credential_version = ? RETURNING ", returning!()))
+            .bind(now.millis()).bind(organization_id.uuid()).bind(workspace_id.uuid()).bind(installation_id.uuid()).bind(i64::from(version))
+            .fetch_optional(&mut *transaction).await.map_err(failed("require_reconnect"))?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let installation = installation_from(&row)?;
+        crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&installation))
+            .await
+            .map_err(failed("audit"))?;
+        let job = zupflow_core::webhooks::Announcement::reconnect_required(installation_id, now)
+            .job()
+            .ok_or(InstallationError::Unavailable)?;
+        crate::job_queue::insert_job(
+            &mut *transaction,
+            &zupflow_core::scope::Scope::Workspace(organization_id, workspace_id),
+            &job.kind,
+            job.payload,
+            job.options,
+        )
+        .await
+        .map_err(|_| InstallationError::Unavailable)?;
+        transaction.commit().await.map_err(failed("require_reconnect"))?;
+        Ok(true)
     }
 
     async fn list_app_installations(
@@ -690,7 +786,11 @@ mod tests {
                     .execute(pool)
                     .await
                     .unwrap();
-                for (workspace, environment) in [(tenant.sandbox, "sandbox"), (tenant.production, "production")] {
+                for (workspace, environment) in [
+                    (tenant.sandbox, "sandbox"),
+                    (tenant.sibling, "sandbox"),
+                    (tenant.production, "production"),
+                ] {
                     sqlx::query(
                         "INSERT INTO workspaces (id, organization_id, environment, name, slug, created_at) \
                          VALUES (?, ?, ?, ?, ?, 0)",
@@ -737,9 +837,149 @@ mod tests {
         } = temporary().await;
         zupflow_conformance::installation_store::run(
             &SqliteInstallationStore::new(database.clone()),
+            &crate::SqliteAuditStore::new(database.clone()),
+            &crate::SqliteJobQueue::new(database.clone()),
             prepare(database),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_status_audit_and_outbox_commit_together_once() {
+        use zupflow_core::audit::{AuditAction, AuditActor, AuditEntry, AuditObject, AuditPlace, AuditTarget};
+        let Temporary {
+            database,
+            directory: _directory,
+        } = temporary().await;
+        let tenant = Tenant {
+            organization_id: OrganizationId::generate(),
+            sandbox: WorkspaceId::generate(),
+            sibling: WorkspaceId::generate(),
+            production: WorkspaceId::generate(),
+            catalog_app: AppId::generate(),
+            own_app: AppId::generate(),
+        };
+        prepare(database.clone())(tenant).await;
+        let store = SqliteInstallationStore::new(database.clone());
+        let installation = store
+            .create_installation(
+                tenant.organization_id,
+                tenant.sandbox,
+                InstallationId::generate(),
+                &NewInstallation {
+                    app: InstalledApp::Catalog(tenant.catalog_app),
+                    label: "Board".to_owned(),
+                    configuration_version: 1,
+                    account: ConnectedAccount {
+                        external_id: "one".to_owned(),
+                        display_name: "Robin".to_owned(),
+                        email: None,
+                    },
+                    granted_scopes: vec![],
+                    expires_at: None,
+                    credential: NewCredential {
+                        sealed: Sealed {
+                            wrapped_key: WrappedKey {
+                                key_id: "local".to_owned(),
+                                bytes: vec![1; 40],
+                            },
+                            nonce: [1; 12],
+                            ciphertext: vec![1; 16],
+                        },
+                        version: 1,
+                    },
+                    snapshot: zupflow_conformance::installation_store::snapshot(1),
+                },
+            )
+            .await
+            .unwrap();
+        let audit = |i: &Installation| {
+            AuditEntry::new(
+                AuditActor::System {
+                    name: "Credentials".to_owned(),
+                },
+                AuditAction::InstallationReconnectRequired,
+                AuditTarget::new(AuditObject::Installation(i.id), &i.label),
+                AuditPlace::Workspace(tenant.sandbox),
+            )
+        };
+        sqlx::query("CREATE TRIGGER refuse_outbox BEFORE INSERT ON jobs BEGIN SELECT RAISE(ABORT, 'unavailable'); END")
+            .execute(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .require_reconnect(
+                    tenant.organization_id,
+                    tenant.sandbox,
+                    installation.id,
+                    1,
+                    Timestamp::now(),
+                    &audit
+                )
+                .await,
+            Err(InstallationError::Unavailable)
+        );
+        assert_eq!(
+            store
+                .find_installation(tenant.organization_id, tenant.sandbox, installation.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            InstallationStatus::Connected
+        );
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE organization_id = ? AND workspace_id = ?")
+                .bind(tenant.organization_id.uuid())
+                .bind(tenant.sandbox.uuid())
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+        sqlx::query("DROP TRIGGER refuse_outbox")
+            .execute(database.pool())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .require_reconnect(
+                    tenant.organization_id,
+                    tenant.sandbox,
+                    installation.id,
+                    1,
+                    Timestamp::now(),
+                    &audit
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .require_reconnect(
+                    tenant.organization_id,
+                    tenant.sandbox,
+                    installation.id,
+                    1,
+                    Timestamp::now(),
+                    &audit
+                )
+                .await
+                .unwrap()
+        );
+        let audit_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE organization_id = ? AND workspace_id = ?")
+                .bind(tenant.organization_id.uuid())
+                .bind(tenant.sandbox.uuid())
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(audit_count, 1);
+        let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(jobs, 1);
     }
 
     /// Deleting a workspace takes its installations and their credentials,
@@ -755,6 +995,7 @@ mod tests {
         let tenant = Tenant {
             organization_id: OrganizationId::generate(),
             sandbox: WorkspaceId::generate(),
+            sibling: WorkspaceId::generate(),
             production: WorkspaceId::generate(),
             catalog_app: AppId::generate(),
             own_app: AppId::generate(),

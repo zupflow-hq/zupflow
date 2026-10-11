@@ -98,6 +98,8 @@ pub struct TemplateSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveredClient {
     pub issuer: String,
+    #[serde(default)]
+    pub response_iss_supported: bool,
     pub token_endpoint: String,
     pub client_id: String,
     pub resource: String,
@@ -162,6 +164,15 @@ pub enum InstallationError {
     InvalidCursor,
 }
 
+/// The durable claim of one credential version. A pending claim must never
+/// be taken over: the server may already have rotated its refresh token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshClaim {
+    Claimed,
+    Pending { started_at: Timestamp },
+    Changed,
+}
+
 #[async_trait]
 pub trait InstallationStore: Send + Sync {
     /// The workspace's installations, newest first.
@@ -224,6 +235,42 @@ pub trait InstallationStore: Send + Sync {
         workspace_id: WorkspaceId,
         installation_id: InstallationId,
     ) -> Result<Option<NewCredential>, InstallationError>;
+
+    /// Claims a refresh only if connected with exactly `version`, atomically.
+    /// The claim survives a crash. A loser re-reads the winner's credential.
+    async fn claim_refresh(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        installation_id: InstallationId,
+        version: u32,
+        now: Timestamp,
+    ) -> Result<RefreshClaim, InstallationError>;
+
+    /// Saves the next sealed version and expiry together. Succeeds only for
+    /// the still-connected claimed version; reconnect/disconnect wins a race.
+    async fn rotate_credential(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        installation_id: InstallationId,
+        credential: &NewCredential,
+        expires_at: Option<Timestamp>,
+        now: Timestamp,
+    ) -> Result<bool, InstallationError>;
+
+    /// Marks exactly this connected version as needing reconnect, with its
+    /// audit event and webhook outbox in one transaction. Repeats, foreign
+    /// scopes and stale failures change nothing and announce nothing.
+    async fn require_reconnect(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        installation_id: InstallationId,
+        version: u32,
+        now: Timestamp,
+        audit: &Audit<'_, Installation>,
+    ) -> Result<bool, InstallationError>;
 
     /// A catalog app's installations across the organization's workspaces,
     /// newest first, at most `limit` (1–100), in one environment if given.

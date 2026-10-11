@@ -397,9 +397,11 @@ async fn event_of(
             }
         }
         Subject::Installation(installation_id) => {
-            if announcement.kind != WebhookEventType::AppToolsChanged {
-                return Err(Unread::Malformed);
-            }
+            let status = match announcement.kind {
+                WebhookEventType::AppToolsChanged => "connected",
+                WebhookEventType::InstallationReconnectRequired => "reconnect_required",
+                _ => return Err(Unread::Malformed),
+            };
             match state
                 .installations
                 .find_installation(organization_id, workspace_id, installation_id)
@@ -407,12 +409,17 @@ async fn event_of(
             {
                 // Discovery lists connected installations only, but it may
                 // have been disconnected since: then there's nothing to say.
-                Ok(Some(installation)) if installation.status != InstallationStatus::Connected => return Ok(None),
+                Ok(Some(installation))
+                    if announcement.kind == WebhookEventType::AppToolsChanged
+                        && installation.status != InstallationStatus::Connected =>
+                {
+                    return Ok(None);
+                }
                 Ok(Some(installation)) => json!({
                     "object": "installation",
                     "id": installation.id,
                     "app_id": installation.app.id(),
-                    "status": "connected",
+                    "status": status,
                 }),
                 Ok(None) => return Ok(None),
                 Err(_) => return Err(Unread::Unavailable),

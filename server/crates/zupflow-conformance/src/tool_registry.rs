@@ -5,7 +5,8 @@
 //! time, by name; gone tools kept up to a bound; a change accepted only as
 //! reviewed, and only in its own installation; a listing that changes a
 //! tool announcing `app.tools_changed` with it, in the installation's
-//! workspace, and no other listing announcing anything.
+//! workspace, and no other listing announcing anything; catalog levels
+//! suggested once with the listing, never by a refused one.
 //!
 //! `prepare` makes a [`Tenant`] exist: its organization, two workspaces, and
 //! an installation of one app in each.
@@ -16,9 +17,10 @@ use std::sync::Arc;
 
 use std::time::Duration;
 use zupflow_core::apps::ToolEffect;
-use zupflow_core::ids::{InstallationId, OrganizationId, WorkspaceId};
+use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
 
 use zupflow_core::jobs::JobQueue;
+use zupflow_core::policy::{AppToolLevel, ToolLevel, ToolPolicyStore};
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{
@@ -27,11 +29,13 @@ use zupflow_core::tools::{
 };
 use zupflow_core::webhooks::{ANNOUNCE, Announcement, Subject, WebhookEventType};
 
-use crate::audit_store::by_suite_in;
+use crate::audit_store::{by_suite, by_suite_in};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Tenant {
     pub organization_id: OrganizationId,
+    /// The catalog app installed in both workspaces.
+    pub catalog_app: AppId,
     pub workspace: WorkspaceId,
     pub installation: InstallationId,
     /// Another workspace of the organization, with its own installation of the same app.
@@ -44,6 +48,7 @@ pub type Prepare = Arc<dyn Fn(Tenant) -> Pin<Box<dyn Future<Output = ()> + Send>
 async fn tenant(prepare: &Prepare) -> Tenant {
     let tenant = Tenant {
         organization_id: OrganizationId::generate(),
+        catalog_app: AppId::generate(),
         workspace: WorkspaceId::generate(),
         installation: InstallationId::generate(),
         sibling: WorkspaceId::generate(),
@@ -121,16 +126,105 @@ fn strings(names: &[&str]) -> Vec<String> {
     names.iter().map(|name| (*name).to_owned()).collect()
 }
 
-/// `jobs` is the queue the registry queues its announcements in.
-pub async fn run(registry: &dyn ToolRegistry, jobs: &dyn JobQueue, prepare: Prepare) {
+/// `jobs` and `policy` read the registry's announcements and suggested levels.
+pub async fn run(registry: &dyn ToolRegistry, jobs: &dyn JobQueue, policy: &dyn ToolPolicyStore, prepare: Prepare) {
     announces_changed_tools(registry, jobs, &prepare).await;
+    suggests_catalog_levels_once_with_the_listing(registry, policy, &prepare).await;
     keeps_tools_per_installation(registry, &prepare).await;
     pins_the_first_definition_and_holds_changes(registry, &prepare).await;
     marks_missing_tools_gone_until_listed_again(registry, &prepare).await;
-    records_an_invalid_listing_not_at_all(registry, &prepare).await;
+    records_an_invalid_listing_not_at_all(registry, policy, &prepare).await;
     pages_by_name(registry, &prepare).await;
     keeps_a_bounded_number_of_gone_tools(registry, &prepare).await;
     accepts_exactly_the_change_reviewed(registry, &prepare).await;
+}
+
+async fn levels(policy: &dyn ToolPolicyStore, tenant: &Tenant) -> Vec<AppToolLevel> {
+    let page = policy
+        .list_levels(tenant.organization_id, tenant.catalog_app, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(page.total, page.items.len() as u64, "these fixtures fit in one page");
+    assert!(page.next_after.is_none());
+    page.items
+}
+
+async fn suggests_catalog_levels_once_with_the_listing(
+    registry: &dyn ToolRegistry,
+    policy: &dyn ToolPolicyStore,
+    prepare: &Prepare,
+) {
+    let a = tenant(prepare).await;
+    let b = tenant(prepare).await;
+    let now = Timestamp::from_millis(1_000_000);
+    let first = [
+        listed("erase", 1, ToolEffect::Destructive),
+        listed("read", 1, ToolEffect::Read),
+        listed("write", 1, ToolEffect::Write),
+    ];
+    record(registry, a.at(), &first, now).await.unwrap();
+    let expected: Vec<_> = [
+        ("erase", ToolLevel::Approve, true),
+        ("read", ToolLevel::Allow, false),
+        ("write", ToolLevel::Approve, false),
+    ]
+    .map(|(tool, level, destructive)| AppToolLevel {
+        app_id: a.catalog_app,
+        tool: tool.to_owned(),
+        level,
+        confirmed: false,
+        destructive,
+        updated_at: now,
+        updated_by: None,
+    })
+    .into();
+    assert_eq!(levels(policy, &a).await, expected, "the listing saves its suggestions");
+    assert!(levels(policy, &b).await.is_empty(), "another organization is untouched");
+
+    policy
+        .set_levels(
+            a.organization_id,
+            a.catalog_app,
+            &[("read".to_owned(), ToolLevel::Deny)],
+            None,
+            now,
+            &by_suite,
+        )
+        .await
+        .unwrap();
+    let confirmed = levels(policy, &a).await;
+    assert!(
+        confirmed
+            .iter()
+            .any(|level| level.tool == "read" && level.confirmed && level.level == ToolLevel::Deny)
+    );
+    let later = Timestamp::from_millis(now.millis() + 1_000);
+    let changed = [
+        listed("erase", 2, ToolEffect::Read),
+        listed("read", 2, ToolEffect::Destructive),
+        listed("write", 2, ToolEffect::Read),
+    ];
+    for (at, listing) in [(a.at(), &first), (a.at(), &changed), (a.sibling_at(), &changed)] {
+        record(registry, at, listing, later).await.unwrap();
+        assert_eq!(
+            levels(policy, &a).await,
+            confirmed,
+            "repeated or changed listings, including a sibling's, overwrite no level"
+        );
+    }
+
+    let before = list(registry, a.at()).await.unwrap();
+    let forbidden = [listed("wrong_scope", 1, ToolEffect::Read)];
+    for at in [
+        At(a.organization_id, a.sibling, a.installation),
+        At(b.organization_id, a.workspace, a.installation),
+        At(b.organization_id, b.workspace, a.installation),
+    ] {
+        assert_eq!(record(registry, at, &forbidden, later).await, Err(ToolError::NotFound));
+        assert_eq!(levels(policy, &a).await, confirmed, "wrong scope suggests nothing");
+        assert!(levels(policy, &b).await.is_empty());
+    }
+    assert_eq!(list(registry, a.at()).await.unwrap(), before);
 }
 
 async fn pages_by_name(registry: &dyn ToolRegistry, prepare: &Prepare) {
@@ -432,13 +526,18 @@ async fn marks_missing_tools_gone_until_listed_again(registry: &dyn ToolRegistry
     assert_eq!(changes.gone, ["a", "b"]);
 }
 
-async fn records_an_invalid_listing_not_at_all(registry: &dyn ToolRegistry, prepare: &Prepare) {
+async fn records_an_invalid_listing_not_at_all(
+    registry: &dyn ToolRegistry,
+    policy: &dyn ToolPolicyStore,
+    prepare: &Prepare,
+) {
     let a = tenant(prepare).await;
     let owner = a.at();
     let now = Timestamp::now();
     record(registry, owner, &[listed("kept", 1, ToolEffect::Read)], now)
         .await
         .unwrap();
+    let before = levels(policy, &a).await;
     let too_many: Vec<ListedTool> = (0..=MAX_TOOLS)
         .map(|index| listed(&format!("tool_{index}"), 1, ToolEffect::Read))
         .collect();
@@ -464,6 +563,7 @@ async fn records_an_invalid_listing_not_at_all(registry: &dyn ToolRegistry, prep
             record(registry, owner, &invalid, now).await,
             Err(ToolError::InvalidListing)
         );
+        assert_eq!(levels(policy, &a).await, before, "an invalid listing suggests nothing");
     }
     assert_eq!(
         names(&list(registry, owner).await.unwrap()),

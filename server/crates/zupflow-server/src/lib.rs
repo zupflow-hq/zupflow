@@ -23,6 +23,7 @@ pub mod input;
 pub mod installations;
 pub mod invitations;
 pub mod mcp_access;
+mod oauth_refresh;
 pub mod organizations;
 pub mod run_engine;
 pub mod runs;

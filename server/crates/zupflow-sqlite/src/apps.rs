@@ -219,7 +219,7 @@ fn stored_secret_from(row: &SqliteRow) -> Result<Option<StoredClientSecret>, App
 macro_rules! registration_columns {
     () => {
         "id, issuer, authorization_endpoint, token_endpoint, registration_endpoint, client_id, \
-         token_endpoint_auth_method, key_id, wrapped_key, nonce, ciphertext, created_at"
+         token_endpoint_auth_method, key_id, wrapped_key, nonce, ciphertext, created_at, response_iss_supported"
     };
 }
 
@@ -244,6 +244,7 @@ fn registration_from(row: &SqliteRow) -> Result<ClientRegistration, AppError> {
         id: ClientRegistrationId::from_uuid(row.try_get("id").map_err(read)?),
         server: AuthorizationServer {
             issuer: row.try_get("issuer").map_err(read)?,
+            response_iss_supported: row.try_get("response_iss_supported").map_err(read)?,
             authorization_endpoint: row.try_get("authorization_endpoint").map_err(read)?,
             token_endpoint: row.try_get("token_endpoint").map_err(read)?,
             registration_endpoint: row.try_get("registration_endpoint").map_err(read)?,
@@ -938,8 +939,8 @@ impl AppStore for SqliteAppStore {
         sqlx::query(
             "INSERT INTO oauth_client_registrations (id, organization_id, app_id, environment, issuer, \
              authorization_endpoint, token_endpoint, registration_endpoint, client_id, token_endpoint_auth_method, \
-             key_id, wrapped_key, nonce, ciphertext, created_at) \
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM apps WHERE organization_id = ? AND id = ? \
+             key_id, wrapped_key, nonce, ciphertext, created_at, response_iss_supported) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM apps WHERE organization_id = ? AND id = ? \
              ON CONFLICT (organization_id, app_id, environment, issuer) DO NOTHING",
         )
         .bind(registration.id.uuid())
@@ -957,6 +958,7 @@ impl AppStore for SqliteAppStore {
         .bind(sealed.map(|sealed| sealed.nonce.as_slice()))
         .bind(sealed.map(|sealed| sealed.ciphertext.as_slice()))
         .bind(Timestamp::now().millis())
+        .bind(registration.server.response_iss_supported)
         .bind(organization_id.uuid())
         .bind(app_id.uuid())
         .execute(&mut *transaction)
@@ -984,6 +986,34 @@ impl AppStore for SqliteAppStore {
             .map(registration_from)
             .transpose()?
             .ok_or(AppError::NotFound)
+    }
+
+    async fn forget_organization_client_registration(
+        &self,
+        organization_id: OrganizationId,
+        app_id: AppId,
+        environment: Environment,
+        issuer: &str,
+        client_id: &str,
+    ) -> Result<(), AppError> {
+        sqlx::query("DELETE FROM oauth_client_registrations WHERE organization_id = ? AND app_id = ? AND environment = ? AND issuer = ? AND client_id = ?")
+            .bind(organization_id.uuid()).bind(app_id.uuid()).bind(environment.as_str()).bind(issuer).bind(client_id)
+            .execute(self.database.pool()).await.map_err(failed("forget_registration"))?;
+        Ok(())
+    }
+
+    async fn forget_workspace_client_registration(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        app_id: AppId,
+        issuer: &str,
+        client_id: &str,
+    ) -> Result<(), AppError> {
+        sqlx::query("DELETE FROM workspace_oauth_client_registrations WHERE organization_id = ? AND workspace_id = ? AND app_id = ? AND issuer = ? AND client_id = ?")
+            .bind(organization_id.uuid()).bind(workspace_id.uuid()).bind(app_id.uuid()).bind(issuer).bind(client_id)
+            .execute(self.database.pool()).await.map_err(failed("forget_registration"))?;
+        Ok(())
     }
 
     async fn find_workspace_client_registration(
@@ -1021,8 +1051,8 @@ impl AppStore for SqliteAppStore {
         sqlx::query(
             "INSERT INTO workspace_oauth_client_registrations (id, organization_id, workspace_id, app_id, issuer, \
              authorization_endpoint, token_endpoint, registration_endpoint, client_id, token_endpoint_auth_method, \
-             key_id, wrapped_key, nonce, ciphertext, created_at) \
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM workspace_apps \
+             key_id, wrapped_key, nonce, ciphertext, created_at, response_iss_supported) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM workspace_apps \
              WHERE organization_id = ? AND workspace_id = ? AND id = ? \
              ON CONFLICT (organization_id, workspace_id, app_id, issuer) DO NOTHING",
         )
@@ -1041,6 +1071,7 @@ impl AppStore for SqliteAppStore {
         .bind(sealed.map(|sealed| sealed.nonce.as_slice()))
         .bind(sealed.map(|sealed| sealed.ciphertext.as_slice()))
         .bind(Timestamp::now().millis())
+        .bind(registration.server.response_iss_supported)
         .bind(organization_id.uuid())
         .bind(workspace_id.uuid())
         .bind(app_id.uuid())

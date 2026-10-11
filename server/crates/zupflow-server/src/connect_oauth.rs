@@ -357,6 +357,7 @@ async fn signed_in_consent(
         pkce: true,
         client: Some(DiscoveredClient {
             issuer: server.issuer,
+            response_iss_supported: server.response_iss_supported,
             token_endpoint: server.token_endpoint,
             client_id: registration.client_id,
             resource: resource.clone(),
@@ -583,12 +584,7 @@ fn derived_account(issuer: &str, subject: &str) -> String {
 /// A callback that names no attempt we hold: no `state`, an unknown one, or
 /// one already used. Nothing of any session is said.
 fn unknown_state() -> Response {
-    Failure(ApiError::new(
-        400,
-        "invalid_oauth_state",
-        "This sign-in link isn't valid or was already used. Start again from the app.",
-    ))
-    .into_response()
+    crate::connect_page::invalid_oauth_state()
 }
 
 /// Back to the hosted page, which reads the session's outcome. Neither the
@@ -603,15 +599,21 @@ fn back_to(state: &AppState, reference: &str) -> Response {
 }
 
 /// Why a callback didn't complete its session: the session's `failure_code`.
-struct Failed(&'static str);
+pub(crate) struct Failed(pub(crate) &'static str);
 
 /// The provider's answer: the browser returns with `code`, or with `error`.
 /// The code is used once, at the token endpoint, and never logged.
 pub async fn callback(State(state): State<AppState>, RawQuery(query): RawQuery) -> Response {
-    let params: BTreeMap<String, String> = query
+    let pairs: Vec<(String, String)> = query
         .as_deref()
         .and_then(|query| serde_urlencoded::from_str(query).ok())
         .unwrap_or_default();
+    let mut params = BTreeMap::new();
+    for (name, value) in pairs {
+        if params.insert(name, value).is_some() {
+            return unknown_state();
+        }
+    }
     let Some(oauth_state) = params
         .get("state")
         .filter(|value| !value.is_empty() && value.len() <= 64)
@@ -641,27 +643,41 @@ pub async fn callback(State(state): State<AppState>, RawQuery(query): RawQuery) 
     let verifier = pending.verifier.map(Zeroizing::new);
     let client = pending.client;
 
-    let outcome = match (params.get("code"), params.get("error")) {
-        (_, Some(error)) => {
-            // The provider's own words are never passed on, only whether consent was refused.
-            tracing::info!(event = "connect.oauth_error", session_id = %session.id, denied = error == "access_denied");
-            Err(Failed(if error == "access_denied" {
-                "consent_denied"
-            } else {
-                "authorization_failed"
-            }))
+    // RFC 9207: bind the response to the issuer before exchanging a code
+    // or interpreting an error.
+    let issuer_valid = client
+        .as_ref()
+        .map_or(!params.contains_key("iss"), |client| match params.get("iss") {
+            Some(issuer) => issuer == &client.issuer,
+            None => !client.response_iss_supported,
+        });
+    let outcome = if !issuer_valid {
+        Err(Failed("authorization_failed"))
+    } else {
+        match (params.get("code"), params.get("error")) {
+            (_, Some(error)) => {
+                // The provider's own words are never passed on, only whether consent was refused.
+                tracing::info!(event = "connect.oauth_error", session_id = %session.id, denied = error == "access_denied");
+                // Browser-supplied errors can fail this session, but cannot
+                // invalidate a registration shared with other workspaces.
+                Err(Failed(if error == "access_denied" {
+                    "consent_denied"
+                } else {
+                    "authorization_failed"
+                }))
+            }
+            (Some(code), None) if !code.is_empty() => {
+                complete(
+                    &state,
+                    &session,
+                    &Zeroizing::new(code.clone()),
+                    verifier.as_deref().map(String::as_str),
+                    client.as_ref(),
+                )
+                .await
+            }
+            _ => Err(Failed("authorization_failed")),
         }
-        (Some(code), None) if !code.is_empty() => {
-            complete(
-                &state,
-                &session,
-                &Zeroizing::new(code.clone()),
-                verifier.as_deref().map(String::as_str),
-                client.as_ref(),
-            )
-            .await
-        }
-        _ => Err(Failed("authorization_failed")),
     };
     if let Err(Failed(failure_code)) = outcome {
         match state
@@ -690,21 +706,21 @@ pub async fn callback(State(state): State<AppState>, RawQuery(query): RawQuery) 
 struct TokenResponse {
     access_token: String,
     #[serde(default)]
-    token_type: Option<String>,
+    pub(crate) token_type: Option<String>,
     #[serde(default)]
     refresh_token: Option<String>,
     #[serde(default)]
-    expires_in: Option<i64>,
+    pub(crate) expires_in: Option<i64>,
     #[serde(default)]
-    scope: Option<String>,
+    pub(crate) scope: Option<String>,
 }
 
 /// What an installation's OAuth credential holds, sealed as one value.
 #[derive(Serialize)]
-struct OAuthCredential<'a> {
-    access_token: &'a str,
-    refresh_token: Option<&'a str>,
-    token_type: Option<&'a str>,
+pub(crate) struct OAuthCredential<'a> {
+    pub(crate) access_token: &'a str,
+    pub(crate) refresh_token: Option<&'a str>,
+    pub(crate) token_type: Option<&'a str>,
 }
 
 /// Exchanges the code, identifies the account, and completes the session
@@ -765,7 +781,22 @@ async fn complete(
                 secret: secret.as_deref().map(String::as_str),
                 resource: Some(&discovered.resource),
             };
-            let tokens = exchange(state, &app, &discovered.token_endpoint, &client, code, verifier).await?;
+            let tokens = match exchange(state, &app, &discovered.token_endpoint, &client, code, verifier).await {
+                Err(Failed("invalid_client")) => {
+                    crate::oauth_refresh::forget_registration(
+                        state,
+                        session.organization_id,
+                        session.workspace_id,
+                        session.environment,
+                        session.app,
+                        discovered,
+                    )
+                    .await
+                    .map_err(|_| Failed("unavailable"))?;
+                    return Err(Failed("token_exchange_failed"));
+                }
+                result => result?,
+            };
             (tokens, identity_url)
         }
         // The template changed since the start.
@@ -876,7 +907,7 @@ async fn complete(
     };
     let expires_at = tokens
         .expires_in
-        .filter(|seconds| *seconds > 0)
+        .filter(|seconds| *seconds >= 0)
         .and_then(|seconds| seconds.checked_mul(1000))
         .and_then(|millis| now.millis().checked_add(millis))
         .map(Timestamp::from_millis);
@@ -948,22 +979,22 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// The tokens, kept zeroized until sealed.
-struct Tokens {
-    access_token: Zeroizing<String>,
-    refresh_token: Option<Zeroizing<String>>,
-    token_type: Option<String>,
-    expires_in: Option<i64>,
-    scope: Option<String>,
+pub(crate) struct Tokens {
+    pub(crate) access_token: Zeroizing<String>,
+    pub(crate) refresh_token: Option<Zeroizing<String>>,
+    pub(crate) token_type: Option<String>,
+    pub(crate) expires_in: Option<i64>,
+    pub(crate) scope: Option<String>,
 }
 
 /// The client an exchange authenticates as: with a secret, by HTTP Basic
 /// (`client_secret_basic`); without one, as a public client that names
 /// itself in the form and proves itself with PKCE.
-struct TokenClient<'a> {
-    client_id: &'a str,
-    secret: Option<&'a str>,
+pub(crate) struct TokenClient<'a> {
+    pub(crate) client_id: &'a str,
+    pub(crate) secret: Option<&'a str>,
     /// For an `mcp_oauth` app, the MCP server the token is for (RFC 8707).
-    resource: Option<&'a str>,
+    pub(crate) resource: Option<&'a str>,
 }
 
 /// An OAuth app's own client: its configured ID and secret, opened.
@@ -1022,14 +1053,6 @@ async fn exchange(
     code: &str,
     verifier: Option<&str>,
 ) -> Result<Tokens, Failed> {
-    // RFC 6749, section 2.3.1: each part form-encoded before joining.
-    let basic = client.secret.map(|secret| {
-        Zeroizing::new(format!(
-            "{}:{}",
-            url::form_urlencoded::byte_serialize(client.client_id.as_bytes()).collect::<String>(),
-            Zeroizing::new(url::form_urlencoded::byte_serialize(secret.as_bytes()).collect::<String>()).as_str()
-        ))
-    });
     let redirect = redirect_uri(&state.public_url);
     let mut form = vec![
         ("grant_type", "authorization_code"),
@@ -1039,6 +1062,25 @@ async fn exchange(
     if let Some(verifier) = verifier {
         form.push(("code_verifier", verifier));
     }
+    request_tokens(state, app.id, token_url, client, form).await
+}
+
+/// Shared token exchange for a code or a claimed refresh. Never retried.
+pub(crate) async fn request_tokens<'a>(
+    state: &AppState,
+    app_id: zupflow_core::ids::AppId,
+    token_url: &str,
+    client: &TokenClient<'a>,
+    mut form: Vec<(&'a str, &'a str)>,
+) -> Result<Tokens, Failed> {
+    // RFC 6749, section 2.3.1: each part form-encoded before joining.
+    let basic = client.secret.map(|secret| {
+        Zeroizing::new(format!(
+            "{}:{}",
+            url::form_urlencoded::byte_serialize(client.client_id.as_bytes()).collect::<String>(),
+            Zeroizing::new(url::form_urlencoded::byte_serialize(secret.as_bytes()).collect::<String>()).as_str()
+        ))
+    });
     if client.secret.is_none() {
         // RFC 6749, section 4.1.3: a public client names itself.
         form.push(("client_id", client.client_id));
@@ -1066,13 +1108,20 @@ async fn exchange(
     let response = match state.outbound.send(request, Limits::default()).await {
         Ok(response) => response,
         Err(error) => {
-            tracing::warn!(event = "connect.token_exchange_failed", app_id = %app.id, %error);
+            tracing::warn!(event = "connect.token_exchange_failed", %app_id, %error);
             return Err(Failed("provider_unavailable"));
         }
     };
     let body = Zeroizing::new(response.body);
     if !(200..300).contains(&response.status) {
-        tracing::warn!(event = "connect.token_exchange_refused", app_id = %app.id, status = response.status);
+        tracing::warn!(event = "connect.token_exchange_refused", %app_id, status = response.status);
+        if matches!(response.status, 400 | 401)
+            && serde_json::from_slice::<Value>(&body)
+                .ok()
+                .is_some_and(|v| v["error"] == "invalid_client")
+        {
+            return Err(Failed("invalid_client"));
+        }
         return Err(Failed(if response.status >= 500 {
             "provider_unavailable"
         } else {
@@ -1088,21 +1137,47 @@ async fn exchange(
             .iter()
             .any(|secret| contains(&body, secret.as_bytes()))
         {
-            tracing::warn!(event = "connect.token_response_echoes_secret", app_id = %app.id);
+            tracing::warn!(event = "connect.token_response_echoes_secret", %app_id);
+            return Err(Failed("token_exchange_failed"));
+        }
+    }
+    if let Some(secret) = client.secret {
+        fn contains_decoded(value: &Value, secret: &str) -> bool {
+            match value {
+                Value::String(text) => text.contains(secret),
+                Value::Array(items) => items.iter().any(|value| contains_decoded(value, secret)),
+                Value::Object(items) => items
+                    .iter()
+                    .any(|(key, value)| key.contains(secret) || contains_decoded(value, secret)),
+                _ => false,
+            }
+        }
+        if !secret.is_empty()
+            && serde_json::from_slice::<Value>(&body)
+                .ok()
+                .is_some_and(|value| contains_decoded(&value, secret))
+        {
             return Err(Failed("token_exchange_failed"));
         }
     }
     let tokens: TokenResponse = serde_json::from_slice(&body).map_err(|_| {
-        tracing::warn!(event = "connect.token_response_unreadable", app_id = %app.id);
+        tracing::warn!(event = "connect.token_response_unreadable", %app_id);
         Failed("token_exchange_failed")
     })?;
     if tokens.access_token.is_empty()
+        || tokens.expires_in.is_some_and(|seconds| {
+            seconds < 0
+                || seconds
+                    .checked_mul(1000)
+                    .and_then(|millis| Timestamp::now().millis().checked_add(millis))
+                    .is_none()
+        })
         || tokens
             .token_type
             .as_deref()
             .is_some_and(|kind| !kind.eq_ignore_ascii_case("bearer"))
     {
-        tracing::warn!(event = "connect.token_response_unusable", app_id = %app.id);
+        tracing::warn!(event = "connect.token_response_unusable", %app_id);
         return Err(Failed("token_exchange_failed"));
     }
     Ok(Tokens {

@@ -71,10 +71,12 @@ pub async fn run(store: &dyn AppStore, prepare: Prepare) {
     keeps_one_client_registration_per_owner_and_issuer(store, &prepare).await;
     keeps_the_first_of_concurrent_registrations(store, &prepare).await;
     keeps_workspace_registrations_to_their_workspace(store, &prepare).await;
+    forgets_only_the_failed_registration(store, &prepare).await;
 }
 
 fn server(issuer: &str) -> AuthorizationServer {
     AuthorizationServer {
+        response_iss_supported: false,
         issuer: issuer.to_owned(),
         authorization_endpoint: format!("{issuer}/authorize"),
         token_endpoint: format!("{issuer}/token"),
@@ -951,4 +953,128 @@ async fn refuses_a_workspace_of_another_organization(store: &dyn AppStore, prepa
         .await;
     assert_eq!(result, Err(AppError::NotFound));
     assert_eq!(store.list_workspace_apps(a, b_workspace).await.unwrap(), []);
+}
+
+async fn forgets_only_the_failed_registration(store: &dyn AppStore, prepare: &Prepare) {
+    let (org, one, two) = organization(prepare).await;
+    let (foreign, _, _) = organization(prepare).await;
+    let catalog = catalog_app(
+        store,
+        org,
+        NewApp::blank("Board".into(), "board".into(), String::new(), AuthType::McpOAuth),
+    )
+    .await;
+    let own = workspace_app(
+        store,
+        org,
+        one,
+        NewApp::blank("Board".into(), "board".into(), String::new(), AuthType::McpOAuth),
+    )
+    .await;
+    let mut original = registration(ISSUER, "first", None);
+    original.server.response_iss_supported = true;
+    let saved = store
+        .save_organization_client_registration(org, catalog.id, Environment::Sandbox, &original)
+        .await
+        .unwrap();
+    assert!(saved.server.response_iss_supported);
+    store
+        .save_workspace_client_registration(org, one, own.id, &original)
+        .await
+        .unwrap();
+    for (organization, app, environment, issuer, client) in [
+        (foreign, catalog.id, Environment::Sandbox, ISSUER, "first"),
+        (org, catalog.id, Environment::Production, ISSUER, "first"),
+        (org, own.id, Environment::Sandbox, ISSUER, "first"),
+        (org, catalog.id, Environment::Sandbox, "https://other.example", "first"),
+        (org, catalog.id, Environment::Sandbox, ISSUER, "stale"),
+    ] {
+        store
+            .forget_organization_client_registration(organization, app, environment, issuer, client)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .find_organization_client_registration(org, catalog.id, Environment::Sandbox, ISSUER)
+                .await
+                .unwrap(),
+            Some(saved.clone())
+        );
+    }
+    for (organization, workspace, app, issuer, client) in [
+        (foreign, one, own.id, ISSUER, "first"),
+        (org, two, own.id, ISSUER, "first"),
+        (org, one, catalog.id, ISSUER, "first"),
+        (org, one, own.id, "https://other.example", "first"),
+        (org, one, own.id, ISSUER, "stale"),
+    ] {
+        store
+            .forget_workspace_client_registration(organization, workspace, app, issuer, client)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .find_workspace_client_registration(org, one, own.id, ISSUER)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+    store
+        .forget_organization_client_registration(org, catalog.id, Environment::Sandbox, ISSUER, "first")
+        .await
+        .unwrap();
+    store
+        .forget_workspace_client_registration(org, one, own.id, ISSUER, "first")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .find_organization_client_registration(org, catalog.id, Environment::Sandbox, ISSUER)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .find_workspace_client_registration(org, one, own.id, ISSUER)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let next = registration(ISSUER, "second", None);
+    store
+        .save_organization_client_registration(org, catalog.id, Environment::Sandbox, &next)
+        .await
+        .unwrap();
+    store
+        .save_workspace_client_registration(org, one, own.id, &next)
+        .await
+        .unwrap();
+    store
+        .forget_organization_client_registration(org, catalog.id, Environment::Sandbox, ISSUER, "first")
+        .await
+        .unwrap();
+    store
+        .forget_workspace_client_registration(org, one, own.id, ISSUER, "first")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .find_organization_client_registration(org, catalog.id, Environment::Sandbox, ISSUER)
+            .await
+            .unwrap()
+            .unwrap()
+            .client_id,
+        "second"
+    );
+    assert_eq!(
+        store
+            .find_workspace_client_registration(org, one, own.id, ISSUER)
+            .await
+            .unwrap()
+            .unwrap()
+            .client_id,
+        "second"
+    );
 }

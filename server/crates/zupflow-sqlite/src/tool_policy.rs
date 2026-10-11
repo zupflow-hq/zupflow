@@ -331,24 +331,35 @@ impl ToolPolicyStore for SqliteToolPolicyStore {
             .await
             .map_err(failed("suggest_levels"))?;
         app_exists(&mut transaction, organization_id, app_id).await?;
-        let mut suggested = 0;
-        for (tool, effect) in listed {
-            suggested += sqlx::query(SUGGEST)
-                .bind(Uuid::now_v7())
-                .bind(organization_id.uuid())
-                .bind(app_id.uuid())
-                .bind(tool)
-                .bind(ToolLevel::suggested(*effect).as_str())
-                .bind(*effect == ToolEffect::Destructive)
-                .bind(now.millis())
-                .execute(&mut *transaction)
-                .await
-                .map_err(failed("suggest_levels"))?
-                .rows_affected();
-        }
+        let suggested = suggest_in_transaction(&mut transaction, organization_id, app_id, listed, now).await?;
         transaction.commit().await.map_err(failed("suggest_levels"))?;
         Ok(suggested)
     }
+}
+
+pub(crate) async fn suggest_in_transaction(
+    transaction: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    organization_id: OrganizationId,
+    app_id: AppId,
+    listed: &[(String, ToolEffect)],
+    now: Timestamp,
+) -> Result<u64, PolicyError> {
+    let mut suggested = 0;
+    for (tool, effect) in listed {
+        suggested += sqlx::query(SUGGEST)
+            .bind(Uuid::now_v7())
+            .bind(organization_id.uuid())
+            .bind(app_id.uuid())
+            .bind(tool)
+            .bind(ToolLevel::suggested(*effect).as_str())
+            .bind(*effect == ToolEffect::Destructive)
+            .bind(now.millis())
+            .execute(&mut **transaction)
+            .await
+            .map_err(failed("suggest_levels"))?
+            .rows_affected();
+    }
+    Ok(suggested)
 }
 
 #[cfg(test)]

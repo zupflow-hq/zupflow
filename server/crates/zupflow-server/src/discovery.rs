@@ -15,12 +15,10 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use zupflow_core::ids::{InstallationId, OrganizationId, WorkspaceId};
-use zupflow_core::installations::InstalledApp;
 use zupflow_core::jobs::{Job, JobOptions};
-use zupflow_core::policy::PolicyError;
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
-use zupflow_core::tools::{ListedTool, ToolError};
+use zupflow_core::tools::ToolError;
 use zupflow_mcp::McpError;
 
 use crate::auth::AppState;
@@ -113,8 +111,7 @@ pub async fn discover(
         Err(Unreachable::Skip(why)) => return skip(why),
         Err(Unreachable::Retry(why)) => return Outcome::Retry(why),
     };
-    let listed = match zupflow_mcp::list_tools(state.outbound.as_ref(), &reach.server_url, Some(reach.credential()))
-        .await
+    let listed = match crate::mcp_access::list_tools(state, organization_id, workspace_id, installation_id, reach).await
     {
         Ok(listed) => listed,
         Err(McpError::Unavailable) => return Outcome::Retry("server_unavailable"),
@@ -147,7 +144,7 @@ pub async fn discover(
                 gone = changes.gone.len(),
                 returned = changes.returned.len(),
             );
-            suggest_levels(state, organization_id, installation.app, &listed).await
+            Outcome::Done
         }
         Err(ToolError::Unavailable) => Outcome::Retry("store_unavailable"),
         Err(error) => {
@@ -213,38 +210,6 @@ pub async fn run_worker(state: AppState) {
     loop {
         if !work_once(&state).await {
             tokio::time::sleep(IDLE).await;
-        }
-    }
-}
-
-/// Suggests a level for each listed tool of a catalog app the organization
-/// has none for. Retried with the job when the store is unavailable: the
-/// listing is recorded again, unchanged, and the suggestions made.
-async fn suggest_levels(
-    state: &AppState,
-    organization_id: OrganizationId,
-    app: InstalledApp,
-    listed: &[ListedTool],
-) -> Outcome {
-    let InstalledApp::Catalog(app_id) = app else {
-        return Outcome::Done;
-    };
-    let tools: Vec<_> = listed.iter().map(|tool| (tool.name.clone(), tool.effect)).collect();
-    match state
-        .policies
-        .suggest_levels(organization_id, app_id, &tools, Timestamp::now())
-        .await
-    {
-        Ok(suggested) => {
-            if suggested > 0 {
-                tracing::info!(event = "discovery.levels_suggested", %organization_id, %app_id, suggested);
-            }
-            Outcome::Done
-        }
-        Err(PolicyError::Unavailable) => Outcome::Retry("store_unavailable"),
-        Err(error) => {
-            tracing::warn!(event = "discovery.levels_not_suggested", %organization_id, %app_id, %error);
-            Outcome::Done
         }
     }
 }

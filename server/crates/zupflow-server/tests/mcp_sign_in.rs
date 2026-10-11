@@ -337,7 +337,7 @@ async fn connects_through_the_servers_own_sign_in() {
         .unwrap();
     assert_eq!(
         serde_json::from_str::<Value>(&kept).unwrap(),
-        json!({ "issuer": ISSUER, "token_endpoint": TOKEN, "client_id": "client-1", "resource": MCP })
+        json!({ "issuer": ISSUER, "response_iss_supported": false, "token_endpoint": TOKEN, "client_id": "client-1", "resource": MCP })
     );
     let clients: Vec<(String, String, Option<Vec<u8>>)> = sqlx::query_as(
         "SELECT client_id, token_endpoint_auth_method, ciphertext FROM oauth_client_registrations \
@@ -470,6 +470,56 @@ async fn connects_through_the_servers_own_sign_in() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(discover(&server.state, ids.0, ids.1, ids.2).await, Outcome::Done);
     assert!(!server.providers.urls().iter().any(|url| url == elsewhere));
+}
+
+#[tokio::test]
+async fn callback_errors_leave_a_shared_registration_usable() {
+    let server = Server::new().await;
+    let t = tenant(&server).await;
+    let app = catalog_app(&server, &t.org, None).await;
+    serve(&server, json!({ "client_id": "client-1", "redirect_uris": [CALLBACK] }));
+    let mut advertised = metadata(ISSUER);
+    advertised["authorization_response_iss_parameter_supported"] = json!(true);
+    server.providers.script(AS_METADATA, 200, advertised);
+
+    let reference = start(&server, &t, &t.sandbox, &app, None).await;
+    let (_, query) = consent(&server, &reference).await;
+    let sibling = start(&server, &t, &t.other, &app, None).await;
+    let (_, sibling_query) = consent(&server, &sibling).await;
+    assert_eq!(query["client_id"], sibling_query["client_id"]);
+
+    // Knowing the expected issuer doesn't authenticate a browser query.
+    let callback = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("state", &query["state"])
+        .append_pair("iss", ISSUER)
+        .append_pair("error", "invalid_client")
+        .finish();
+    let (status, _, _) = server.visit(&format!("/connect/oauth/callback?{callback}")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let failed = hosted(&server, &reference).await;
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["failure_code"], "authorization_failed");
+    assert!(server.providers.requests_to(TOKEN).is_empty());
+
+    // The other workspace's already-started exchange still uses that registration.
+    server.providers.script(
+        TOKEN,
+        200,
+        json!({ "access_token": jwt("u-7"), "token_type": "Bearer", "refresh_token": "rt-1", "expires_in": 3600 }),
+    );
+    let callback = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("state", &sibling_query["state"])
+        .append_pair("iss", ISSUER)
+        .append_pair("code", "c-1")
+        .finish();
+    let (status, _, _) = server.visit(&format!("/connect/oauth/callback?{callback}")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(hosted(&server, &sibling).await["status"], "completed");
+    assert_eq!(form(&server, TOKEN)["client_id"], "client-1");
+
+    let again = start(&server, &t, &t.other, &app, None).await;
+    assert_eq!(consent(&server, &again).await.1["client_id"], "client-1");
+    assert_eq!(server.providers.requests_to(REGISTER).len(), 1);
 }
 
 /// A server that issues a secret gets Basic, and an answer that echoes the

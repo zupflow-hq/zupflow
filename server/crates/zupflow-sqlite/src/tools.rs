@@ -267,6 +267,27 @@ impl ToolRegistry for SqliteToolRegistry {
             .execute(&mut *transaction)
             .await
             .map_err(failed("record_listing"))?;
+        let catalog_app: Option<Uuid> = sqlx::query_scalar(
+            "SELECT catalog_app_id FROM installations WHERE organization_id = ? AND workspace_id = ? AND id = ?",
+        )
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(installation_id.uuid())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(failed("listing_app"))?;
+        if let Some(app) = catalog_app {
+            let suggestions: Vec<_> = listed.iter().map(|tool| (tool.name.clone(), tool.effect)).collect();
+            crate::tool_policy::suggest_in_transaction(
+                &mut transaction,
+                organization_id,
+                zupflow_core::ids::AppId::from_uuid(app),
+                &suggestions,
+                now,
+            )
+            .await
+            .map_err(|_| ToolError::Unavailable)?;
+        }
         // The outbox: a changed tool is announced with the listing that changed it.
         if !changes.changed.is_empty() {
             let Some(job) = Announcement::tools_changed(installation_id, now).job() else {
@@ -409,7 +430,7 @@ mod tests {
             Box::pin(async move {
                 let pool = database.pool();
                 let org = tenant.organization_id.uuid();
-                let app = Uuid::now_v7();
+                let app = tenant.catalog_app.uuid();
                 sqlx::query("INSERT INTO organizations (id, name, slug, created_at) VALUES (?, 'Test', ?, 0)")
                     .bind(org)
                     .bind(format!("org-{}", org.simple()))
@@ -460,6 +481,7 @@ mod tests {
     fn tenant() -> Tenant {
         Tenant {
             organization_id: OrganizationId::generate(),
+            catalog_app: zupflow_core::ids::AppId::generate(),
             workspace: WorkspaceId::generate(),
             installation: InstallationId::generate(),
             sibling: WorkspaceId::generate(),
@@ -476,9 +498,70 @@ mod tests {
         zupflow_conformance::tool_registry::run(
             &SqliteToolRegistry::new(database.clone()),
             &crate::SqliteJobQueue::new(database.clone()),
+            &crate::SqliteToolPolicyStore::new(database.clone()),
             prepare(database),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn rolls_back_the_listing_when_suggestions_cannot_be_saved() {
+        let Temporary {
+            database,
+            directory: _directory,
+        } = temporary().await;
+        let tenant = tenant();
+        prepare(database.clone())(tenant).await;
+        let registry = SqliteToolRegistry::new(database.clone());
+        let tool = ListedTool {
+            name: "read_board".to_owned(),
+            revision: ToolRevision {
+                definition: "{}".to_owned(),
+                hash: [1; 32],
+            },
+            effect: zupflow_core::apps::ToolEffect::Read,
+        };
+        sqlx::query("CREATE TRIGGER refuse_suggestion BEFORE INSERT ON app_tool_levels BEGIN SELECT RAISE(ABORT, 'unavailable'); END").execute(database.pool()).await.unwrap();
+        assert_eq!(
+            registry
+                .record_listing(
+                    tenant.organization_id,
+                    tenant.workspace,
+                    tenant.installation,
+                    std::slice::from_ref(&tool),
+                    Timestamp::now()
+                )
+                .await,
+            Err(ToolError::Unavailable)
+        );
+        assert_eq!(
+            registry
+                .list_tools(tenant.organization_id, tenant.workspace, tenant.installation, None, 100)
+                .await
+                .unwrap()
+                .total,
+            0
+        );
+        sqlx::query("DROP TRIGGER refuse_suggestion")
+            .execute(database.pool())
+            .await
+            .unwrap();
+        registry
+            .record_listing(
+                tenant.organization_id,
+                tenant.workspace,
+                tenant.installation,
+                &[tool],
+                Timestamp::now(),
+            )
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM app_tool_levels WHERE organization_id = ?")
+            .bind(tenant.organization_id.uuid())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     /// An installation's tools go with it, and so do a workspace's, while a

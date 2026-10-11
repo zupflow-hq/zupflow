@@ -410,6 +410,8 @@ pub struct StoredClientSecret {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationServer {
     pub issuer: String,
+    #[serde(default)]
+    pub response_iss_supported: bool,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub registration_endpoint: String,
@@ -640,6 +642,26 @@ pub trait AppStore: Send + Sync {
         environment: Environment,
         registration: &NewClientRegistration,
     ) -> Result<ClientRegistration, AppError>;
+
+    /// Forgets only the refused client, never a newer registration or one
+    /// in another organization, environment or workspace.
+    async fn forget_organization_client_registration(
+        &self,
+        organization_id: OrganizationId,
+        app_id: AppId,
+        environment: Environment,
+        issuer: &str,
+        client_id: &str,
+    ) -> Result<(), AppError>;
+
+    async fn forget_workspace_client_registration(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        app_id: AppId,
+        issuer: &str,
+        client_id: &str,
+    ) -> Result<(), AppError>;
 
     /// As [`AppStore::find_organization_client_registration`], for a workspace app.
     async fn find_workspace_client_registration(

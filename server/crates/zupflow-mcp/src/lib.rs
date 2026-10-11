@@ -47,7 +47,7 @@ const MAX_SESSION_ID: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum McpError {
-    /// The server refused the credential (`401` or `403`): the installation
+    /// The server refused the credential (`401`): the installation
     /// needs reconnecting.
     #[error("the server refused the credential")]
     Unauthorized,
@@ -149,7 +149,7 @@ pub enum CallError {
     /// couldn't be reached, or the session couldn't be set up.
     #[error("the call wasn't sent: {0}")]
     NotSent(McpError),
-    /// The server refused the credential (`401` or `403`): the installation
+    /// The server refused the credential (`401`): the installation
     /// needs reconnecting. The tool didn't act.
     #[error("the server refused the credential")]
     Unauthorized,
@@ -219,7 +219,7 @@ pub async fn call_tool(
     })?;
     match response.status {
         200..=299 => {}
-        401 | 403 => return Err(CallError::Unauthorized),
+        401 => return Err(CallError::Unauthorized),
         400..=499 => return Err(CallError::Rejected("an unexpected status")),
         _ => return Err(CallError::Unknown("a server error")),
     }
@@ -333,7 +333,8 @@ impl Session<'_> {
 fn check_status(status: u16) -> Result<(), McpError> {
     match status {
         200..=299 => Ok(()),
-        401 | 403 => Err(McpError::Unauthorized),
+        401 => Err(McpError::Unauthorized),
+        403 => Err(McpError::Protocol("access forbidden")),
         429 | 500..=599 => Err(McpError::Unavailable),
         _ => Err(McpError::Protocol("an unexpected status")),
     }
@@ -731,7 +732,7 @@ mod tests {
     async fn classifies_what_goes_wrong() {
         let cases: Vec<(Vec<Result<OutboundResponse, OutboundError>>, McpError)> = vec![
             (vec![status(401)], McpError::Unauthorized),
-            (vec![status(403)], McpError::Unauthorized),
+            (vec![status(403)], McpError::Protocol("access forbidden")),
             (vec![status(503)], McpError::Unavailable),
             (vec![status(429)], McpError::Unavailable),
             (vec![Err(OutboundError::TimedOut)], McpError::Unavailable),
@@ -948,7 +949,7 @@ mod tests {
                 CallError::Unknown("the exchange failed"),
             ),
             (with(status(500)), CallError::Unknown("a server error")),
-            (with(status(403)), CallError::Unauthorized),
+            (with(status(403)), CallError::Rejected("an unexpected status")),
             (with(status(404)), CallError::Rejected("an unexpected status")),
             (
                 with(json_answer(

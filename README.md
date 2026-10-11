@@ -318,12 +318,38 @@ delivery as failed, leaving the endpoint's record alone. An announcement is
 claimed up to 30 times, about 20 hours of backing off, and is then buried and
 logged as lost.
 
+An installation's OAuth access token is refreshed before discovery or a tool
+call when it expires within 30 seconds. Refresh preserves the original
+authorization's audience: `mcp_oauth` sends its saved `resource`, while
+configured `oauth2` omits it. A `401` refreshes once and retries
+once; a `403`, timeout, `5xx` or uncertain tool outcome never triggers replay.
+A durable claim serializes each credential version before exchanging its
+single-use refresh token. The winner seals the rotated tokens as a new
+version, saving them with the new expiry atomically; other workers read that
+version. A claim left by a crash is never reused: after a minute it requires
+a reconnect, as does a failed refresh or a second `401`. That status change,
+its audit event and its `installation.reconnect_required` webhook outbox
+commit together. Reconnecting clears the status. An `invalid_client` response
+from the token endpoint forgets only the refused dynamic registration so the
+next Connect registers again. Browser callback errors affect only their own
+session. A configured OAuth client's configuration changing also requires a
+reconnect before refresh, preserving which client the old token belongs to.
+
+OAuth callbacks check a discovered server's `iss` exactly, before exchanging
+a code or trusting an error; a server advertising RFC 9207 must send it.
+Configured `oauth2` templates currently have no trusted issuer field, so a
+callback supplying `iss` for those templates is refused. Providers returning
+`iss` need `mcp_oauth` discovery until configured issuers are supported. A bad
+or already-used `state` shows a generic HTML error with Connect's security
+headers and no session details.
+
 Once an installation connects, a background worker in the same process lists
 its app's tools from the app's MCP server (Streamable HTTP, through the safe
 outbound path, with the installation's credential) and records them as that
 installation's own in the tool registry: the first definition of each tool is
 pinned, a later one that differs is kept beside it as changed, for review, and
-a listing that repeats the credential is refused. Jobs wait in the
+a listing that repeats the credential is refused. The listing and suggested
+catalog tool levels commit in the same transaction. Jobs wait in the
 database's queue, so a restart picks them up again.
 
 ### The contract suite against the backend
@@ -385,8 +411,11 @@ Taskboard as a catalog app in Sandbox, connects it through hosted Connect
 exchanges nothing), waits for its tools, grants an agent the tools
 its levels allow, and runs it: `list_tasks` runs with the installation's
 token, `create_task` waits for an approval from an API key, a denied
-`delete_task` is never sent, and an expired or revoked token fails the run
-with `installation_reconnect_required`, which a reconnect fixes.
+`delete_task` is never sent. An expired token refreshes and the run succeeds;
+concurrent discovery and execution share one rotation. A revoked refresh token
+marks reconnect required with its audit event and webhook, a reconnect clears
+it, forgotten registrations are registered again, and foreign or missing
+advertised issuers are refused without exchanging a code.
 
 To click through it yourself:
 
@@ -406,8 +435,9 @@ installation**, choose Taskboard, and allow access on Taskboard's page. Runs
 are answered by the scripted model: `call create_task {"title":"Hello"}` calls
 a tool. Taskboard's home page expires or revokes every token, to see what an
 installation does then. Taskboard keeps nothing across restarts: a client the
-backend registered with an earlier run is unknown to it, so start from a
-fresh database (the script does).
+backend registered with an earlier run is unknown to it. When refreshing
+reports `invalid_client`, Zupflow forgets that registration and the next
+Connect registers again.
 
 ## Checks
 
