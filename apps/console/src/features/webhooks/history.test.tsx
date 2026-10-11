@@ -16,13 +16,15 @@ import { qk } from "@/lib/query-keys";
 import { newId } from "@/mocks/ids";
 import { WebhookHistory } from "./history";
 
-const { api } = vi.hoisted(() => ({
+const { api, toasts } = vi.hoisted(() => ({
   api: {
-    webhooks: { deliveries: vi.fn(), delivery: vi.fn(), deliveryAttempts: vi.fn() },
+    webhooks: { deliveries: vi.fn(), delivery: vi.fn(), deliveryAttempts: vi.fn(), resendDelivery: vi.fn() },
     workspaces: { list: vi.fn(), get: vi.fn() },
   },
+  toasts: { success: vi.fn(), error: vi.fn() },
 }));
 vi.mock("@/lib/api", () => ({ api }));
+vi.mock("sonner", () => ({ toast: toasts }));
 
 const at = "2026-10-11T12:00:00.000Z";
 const org: Organization = {
@@ -86,6 +88,19 @@ const page = <T,>(items: T[], next_cursor: string | null = null, total = items.l
   items,
   pagination: { next_cursor, total },
 });
+
+function freshDelivery(): WebhookDeliveryDetail {
+  return {
+    ...delivery,
+    id: newId("webhook_delivery"),
+    state: "pending",
+    attempts: 0,
+    last_status_code: null,
+    last_error: null,
+    last_attempt_at: null,
+    next_attempt_at: at,
+  };
+}
 
 function Harness({
   currentOrg = org,
@@ -285,5 +300,124 @@ describe("webhook history", () => {
       }),
     );
     expect(screen.queryByRole("button", { name: /View run.completed delivery/ })).toBeNull();
+  });
+
+  it.each([
+    ["owner", "sandbox"],
+    ["admin", "production"],
+  ] as const)("lets an %s confirm a resend in %s and opens its fresh history", async (role, environment) => {
+    const source = { ...delivery, environment, event: { ...delivery.event, environment } };
+    const fresh = { ...freshDelivery(), environment, event: source.event };
+    api.webhooks.resendDelivery.mockImplementation(async () => {
+      api.webhooks.deliveries.mockResolvedValue(page([fresh, source]));
+      return fresh;
+    });
+    api.webhooks.deliveries.mockResolvedValue(page([source]));
+    api.webhooks.delivery.mockImplementation(async (_org, _endpoint, id) => (id === fresh.id ? fresh : source));
+    api.webhooks.deliveryAttempts.mockImplementation(async (_org, _endpoint, id) =>
+      page(
+        id === fresh.id
+          ? []
+          : [{ number: 2, status_code: 503, error_class: "status", attempted_at: at, duration_ms: 42 }],
+      ),
+    );
+    setup({ currentOrg: { ...org, role }, currentEndpoint: { ...endpoint, environment } });
+    await userEvent.click(await screen.findByRole("button", { name: /View run.completed delivery/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "Resend event" }));
+    let confirmation = await screen.findByRole("alertdialog");
+    expect(confirmation).toHaveTextContent(endpoint.url);
+    expect(confirmation).toHaveTextContent("same event ID and body");
+    await userEvent.click(within(confirmation).getByRole("button", { name: "Cancel" }));
+    expect(api.webhooks.resendDelivery).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Resend event" }));
+    confirmation = await screen.findByRole("alertdialog");
+    await userEvent.click(within(confirmation).getByRole("button", { name: "Resend event" }));
+    await waitFor(() => expect(api.webhooks.delivery).toHaveBeenLastCalledWith(org.id, endpoint.id, fresh.id));
+    const detail = await screen.findByRole("dialog");
+    expect(await within(detail).findByText("No attempt recorded")).toBeInTheDocument();
+    expect(within(detail).getByText("0 recorded attempts")).toBeInTheDocument();
+    expect(within(detail).getByRole("button", { name: "Resend event" })).toBeDisabled();
+    expect(api.webhooks.resendDelivery).toHaveBeenCalledExactlyOnceWith(org.id, endpoint.id, delivery.id);
+    expect(toasts.success).toHaveBeenCalledWith("Event queued for resend");
+    await userEvent.click(within(detail).getByRole("button", { name: "Close" }));
+    const rows = await screen.findAllByRole("button", { name: /View run.completed delivery/ });
+    expect(rows).toHaveLength(2);
+    expect(rows[1]).toHaveTextContent("Failed");
+    expect(rows[1]).toHaveTextContent("2 attempts");
+  });
+
+  it.each(["viewer", "developer"] as const)("keeps resend unavailable to a %s", async (role) => {
+    setup({ currentOrg: { ...org, role } });
+    await userEvent.click(await screen.findByRole("button", { name: /View run.completed delivery/ }));
+    await screen.findByText("42 ms");
+    expect(screen.queryByRole("button", { name: "Resend event" })).toBeNull();
+    expect(api.webhooks.resendDelivery).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["pending", "This delivery is still pending. Wait until it finishes before resending."],
+    ["disabled", "Enable this webhook endpoint before resending."],
+    ["unsubscribed", "Subscribe this endpoint to the event type before resending."],
+  ] as const)("explains why a %s delivery cannot be resent", async (condition, explanation) => {
+    if (condition === "pending") api.webhooks.delivery.mockResolvedValue({ ...delivery, state: "pending" });
+    setup({
+      currentOrg: { ...org, role: "admin" },
+      currentEndpoint: {
+        ...endpoint,
+        enabled: condition !== "disabled",
+        events: condition === "unsubscribed" ? ["run.failed"] : endpoint.events,
+      },
+    });
+    await userEvent.click(await screen.findByRole("button", { name: /View run.completed delivery/ }));
+    expect(await screen.findByText(explanation)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Resend event" })).toBeDisabled();
+    expect(api.webhooks.resendDelivery).not.toHaveBeenCalled();
+  });
+
+  it("allows a test event without an event subscription", async () => {
+    api.webhooks.delivery.mockResolvedValue({
+      ...delivery,
+      event_type: "webhook.test",
+      workspace: null,
+      event: {
+        ...delivery.event,
+        type: "webhook.test",
+        workspace: null,
+        data: { object: "webhook_endpoint", id: endpoint.id },
+      },
+    });
+    setup({ currentOrg: { ...org, role: "admin" } });
+    await userEvent.click(await screen.findByRole("button", { name: /View run.completed delivery/ }));
+    expect(await screen.findByRole("button", { name: "Resend event" })).toBeEnabled();
+  });
+
+  it("blocks duplicate clicks while sending and keeps a rejected resend open for retry", async () => {
+    let reject: (error: unknown) => void = () => {};
+    api.webhooks.resendDelivery.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, fail) => {
+          reject = fail;
+        }),
+    );
+    const fresh = freshDelivery();
+    api.webhooks.resendDelivery.mockResolvedValueOnce(fresh);
+    api.webhooks.delivery.mockImplementation(async (_org, _endpoint, id) => (id === fresh.id ? fresh : delivery));
+    setup({ currentOrg: { ...org, role: "owner" } });
+    await userEvent.click(await screen.findByRole("button", { name: /View run.completed delivery/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "Resend event" }));
+    const confirmation = await screen.findByRole("alertdialog");
+    const action = within(confirmation).getByRole("button", { name: "Resend event" });
+    await userEvent.dblClick(action);
+    expect(action).toBeDisabled();
+    expect(within(confirmation).getByRole("button", { name: "Cancel" })).toBeDisabled();
+    expect(api.webhooks.resendDelivery).toHaveBeenCalledTimes(1);
+    reject(new ZupflowApiError(503, { code: "unavailable", message: "Try again shortly.", fields: null }));
+    await waitFor(() => expect(action).toBeEnabled());
+    expect(toasts.error).toHaveBeenCalledWith("Couldn't resend event", { description: "Try again shortly." });
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    expect(api.webhooks.delivery).toHaveBeenLastCalledWith(org.id, endpoint.id, delivery.id);
+    await userEvent.click(action);
+    await waitFor(() => expect(api.webhooks.delivery).toHaveBeenLastCalledWith(org.id, endpoint.id, fresh.id));
+    expect(api.webhooks.resendDelivery).toHaveBeenCalledTimes(2);
   });
 });

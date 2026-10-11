@@ -11196,6 +11196,94 @@
         }
       }
     },
+    "/v1/organizations/{org}/webhooks/{hook}/deliveries/{delivery}/resend": {
+      "post": {
+        "operationId": "resendWebhookDelivery",
+        "summary": "Queue a new pending delivery of the original event, preserving its ID and body and leaving the source history unchanged. Owners, admins and an API key for the endpoint's environment may resend, including in Production. The new delivery starts with zero attempts and the normal retry budget. A pending source (including an in-flight send) is `409 delivery_pending`, a disabled endpoint `409 webhook_disabled`, and one no longer subscribed `409 webhook_not_subscribed`; webhook.test is exempt from subscriptions. A missing, foreign or wrong-endpoint delivery is `404`. Normal POST idempotency applies. Records webhook.delivery_resent against the new webhook_delivery, attributed to the event's workspace and environment.",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "hook",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WebhookEndpointId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "delivery",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WebhookDeliveryId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/WebhookDeliverySummary"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/v1/organizations/{org}/webhooks/{hook}/test": {
       "post": {
         "operationId": "testWebhook",

@@ -802,6 +802,14 @@ export function useTestWebhook(orgId: OrganizationId) {
   });
 }
 
+export function useResendWebhookDelivery(orgId: OrganizationId, endpointId: WebhookEndpointId) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (deliveryId: WebhookDeliveryId) => api.webhooks.resendDelivery(orgId, endpointId, deliveryId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.webhooks(orgId) }),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Audit
 

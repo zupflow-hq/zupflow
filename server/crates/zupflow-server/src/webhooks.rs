@@ -26,13 +26,13 @@ use zupflow_core::keys::{EncryptionContext, seal};
 use zupflow_core::organizations::MemberRole;
 use zupflow_core::time::Timestamp;
 use zupflow_core::webhooks::{
-    Attempt, DEFAULT_DELIVERY_PAGE, DeliveryFilter, DeliveryState, EndpointChanges, LastDelivery, MAX_DELIVERY_PAGE,
-    NewEndpoint, NewWebhookEvent, SECRET_VERSION, TEST_EVENT, WebhookEndpoint, WebhookError, WebhookEventType,
-    event_body, new_signing_secret,
+    Attempt, DEFAULT_DELIVERY_PAGE, DeliveryFilter, DeliveryState, DeliverySummary, EndpointChanges, LastDelivery,
+    MAX_DELIVERY_PAGE, NewEndpoint, NewWebhookEvent, ResendError, SECRET_VERSION, TEST_EVENT, WebhookEndpoint,
+    WebhookError, WebhookEventType, WebhookManager, event_body, new_signing_secret,
 };
 
 use crate::app_configurations::check_public_https;
-use crate::auth::{Access, AppState, Caller};
+use crate::auth::{Access, Actor, AppState, Caller};
 use crate::http::{Failure, envelope, envelope_with_meta};
 use crate::input::{Body, Fields, Object};
 use crate::runs::query;
@@ -61,6 +61,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/v1/organizations/{org}/webhooks/{hook}/deliveries/{delivery}/attempts",
             get(list_attempts),
+        )
+        .route(
+            "/v1/organizations/{org}/webhooks/{hook}/deliveries/{delivery}/resend",
+            post(resend_delivery),
         )
 }
 
@@ -284,6 +288,71 @@ async fn list_attempts(
         .await
         .map_err(history_error)?;
     Ok(history_page(page))
+}
+
+fn resend_error(error: ResendError) -> Failure {
+    match error {
+        ResendError::Unavailable => unavailable(WebhookError::Unavailable),
+        ResendError::NotFound => ApiError::not_found("Webhook delivery").into(),
+        ResendError::NotAllowed => ApiError::forbidden("You can no longer resend webhook deliveries.").into(),
+        ResendError::Pending => ApiError::new(
+            409,
+            "delivery_pending",
+            "This delivery is still pending. Wait until it finishes before resending.",
+        )
+        .into(),
+        ResendError::Disabled => ApiError::new(
+            409,
+            "webhook_disabled",
+            "Enable this webhook endpoint before resending.",
+        )
+        .into(),
+        ResendError::NotSubscribed => ApiError::new(
+            409,
+            "webhook_not_subscribed",
+            "Subscribe this endpoint to the event type before resending.",
+        )
+        .into(),
+    }
+}
+
+async fn resend_delivery(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path((org, hook, delivery)): Path<(String, String, String)>,
+) -> Result<Response, Failure> {
+    let access = Access::organization(&state, caller, &org).await?;
+    access.require(MemberRole::is_admin, "resend webhook deliveries")?;
+    let endpoint = find(&state, &access, &hook).await?;
+    let manager = match &access.actor {
+        Actor::Member(member) => WebhookManager::Member(member.member.id),
+        Actor::ApiKey(key) => WebhookManager::ApiKey(key.id),
+    };
+    let resent = state
+        .webhooks
+        .resend_delivery(
+            access.organization_id,
+            endpoint.id,
+            endpoint.environment,
+            delivery_id(&delivery)?,
+            manager,
+            &|delivery: &DeliverySummary| {
+                AuditEntry::new(
+                    access.audit_actor(),
+                    AuditAction::WebhookDeliveryResent,
+                    AuditTarget::new(AuditObject::WebhookDelivery(delivery.id), &delivery.event_type),
+                    delivery
+                        .workspace
+                        .as_ref()
+                        .map_or(AuditPlace::Environment(delivery.environment), |workspace| {
+                            AuditPlace::Workspace(workspace.id)
+                        }),
+                )
+            },
+        )
+        .await
+        .map_err(resend_error)?;
+    Ok(envelope(StatusCode::CREATED, resent))
 }
 
 /// The contract's `CreatedWebhookEndpoint`.

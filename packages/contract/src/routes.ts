@@ -874,6 +874,16 @@ export const routes: readonly Route[] = [
     response: ok(s.WebhookDeliveryAttempt, { list: true, paginated: true }),
   },
   {
+    operationId: "resendWebhookDelivery",
+    method: "post",
+    path: "/v1/organizations/{org}/webhooks/{hook}/deliveries/{delivery}/resend",
+    summary:
+      "Queue a new pending delivery of the original event, preserving its ID and body and leaving the source history unchanged. Owners, admins and an API key for the endpoint's environment may resend, including in Production. The new delivery starts with zero attempts and the normal retry budget. A pending source (including an in-flight send) is `409 delivery_pending`, a disabled endpoint `409 webhook_disabled`, and one no longer subscribed `409 webhook_not_subscribed`; webhook.test is exempt from subscriptions. A missing, foreign or wrong-endpoint delivery is `404`. Normal POST idempotency applies. Records webhook.delivery_resent against the new webhook_delivery, attributed to the event's workspace and environment.",
+    callers: both,
+    params: { ...org, hook: idSchema("webhook_endpoint"), delivery: idSchema("webhook_delivery") },
+    response: created(s.WebhookDeliverySummary),
+  },
+  {
     operationId: "testWebhook",
     method: "post",
     path: "/v1/organizations/{org}/webhooks/{hook}/test",

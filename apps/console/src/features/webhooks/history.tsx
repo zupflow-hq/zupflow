@@ -11,8 +11,11 @@ import {
   type WebhookDeliverySummary,
   type WebhookEndpoint,
 } from "@zupflow/sdk";
-import { ChevronRightIcon, RefreshCwIcon, WebhookIcon } from "lucide-react";
+import { ChevronRightIcon, RefreshCwIcon, SendIcon, WebhookIcon } from "lucide-react";
+import { useState } from "react";
+import { toast } from "sonner";
 import { CodeTabs } from "@/components/app/code-block";
+import { ConfirmDialog } from "@/components/app/confirm-dialog";
 import { EnvBadge } from "@/components/app/environment";
 import { MonoValue, QueryError, RelativeTime, RowsSkeleton } from "@/components/app/misc";
 import { PageContainer, PageHeader, Panel, Properties, Property, SectionHeader } from "@/components/app/page";
@@ -23,8 +26,15 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
-import { useWebhookDeliveries, useWebhookDelivery, useWebhookDeliveryAttempts } from "@/features/queries";
+import { canAdminister } from "@/features/context";
+import {
+  useResendWebhookDelivery,
+  useWebhookDeliveries,
+  useWebhookDelivery,
+  useWebhookDeliveryAttempts,
+} from "@/features/queries";
 import { WorkspacePicker } from "@/features/workspaces/workspace-picker";
+import { toastError } from "@/lib/errors";
 import { fullDateTime, shortId } from "@/lib/format";
 
 type Filters = Omit<WebhookDeliveryListQuery, "cursor" | "limit">;
@@ -205,6 +215,15 @@ export function WebhookHistory({
           ) : (
             <>
               <DeliveryDetails delivery={detail.data} />
+              {canAdminister(org) ? (
+                <ResendDelivery
+                  key={detail.data.id}
+                  org={org}
+                  endpoint={endpoint}
+                  delivery={detail.data}
+                  onResent={onSelect}
+                />
+              ) : null}
               <section className="min-w-0">
                 <SectionHeader
                   title="Attempts"
@@ -251,7 +270,7 @@ export function WebhookHistory({
               <section className="min-w-0">
                 <SectionHeader
                   title="Event"
-                  description="Deduplicate by event ID, which stays the same across attempts."
+                  description="Deduplicate by event ID, which stays the same across attempts and resends."
                 />
                 <CodeTabs samples={[{ label: "JSON", code: JSON.stringify(detail.data.event, null, 2) }]} />
               </section>
@@ -289,7 +308,11 @@ function DeliveryRow({ delivery, onSelect }: { delivery: WebhookDeliverySummary;
           </p>
           {delivery.next_attempt_at ? (
             <p className="text-xs text-muted-foreground">
-              {Date.parse(delivery.next_attempt_at) <= Date.now() ? "Retry due · " : "Next retry "}
+              {delivery.attempts === 0
+                ? "First attempt "
+                : Date.parse(delivery.next_attempt_at) <= Date.now()
+                  ? "Retry due · "
+                  : "Next retry "}
               <RelativeTime iso={delivery.next_attempt_at} />
             </p>
           ) : null}
@@ -338,7 +361,7 @@ function DeliveryDetails({ delivery }: { delivery: WebhookDeliveryDetail }) {
         <Property label="Latest result">
           {delivery.last_attempt_at ? result(delivery.last_status_code, delivery.last_error) : "No attempt recorded"}
         </Property>
-        <Property label="Next retry">
+        <Property label="Next attempt">
           {delivery.next_attempt_at ? (
             <>
               <RelativeTime iso={delivery.next_attempt_at} />{" "}
@@ -350,6 +373,73 @@ function DeliveryDetails({ delivery }: { delivery: WebhookDeliveryDetail }) {
         </Property>
       </Properties>
     </Panel>
+  );
+}
+
+function ResendDelivery({
+  org,
+  endpoint,
+  delivery,
+  onResent,
+}: {
+  org: Organization;
+  endpoint: WebhookEndpoint;
+  delivery: WebhookDeliveryDetail;
+  onResent: (id: WebhookDeliveryId) => void;
+}) {
+  const resend = useResendWebhookDelivery(org.id, endpoint.id);
+  const [confirming, setConfirming] = useState(false);
+  const reason =
+    delivery.state === "pending"
+      ? "This delivery is still pending. Wait until it finishes before resending."
+      : !endpoint.enabled
+        ? "Enable this webhook endpoint before resending."
+        : delivery.event_type !== "webhook.test" && !endpoint.events.includes(delivery.event_type)
+          ? "Subscribe this endpoint to the event type before resending."
+          : null;
+  return (
+    <div className="space-y-2">
+      <Button variant="outline" disabled={reason !== null || resend.isPending} onClick={() => setConfirming(true)}>
+        <SendIcon />
+        Resend event
+      </Button>
+      {reason ? <p className="text-sm text-muted-foreground">{reason}</p> : null}
+      <ConfirmDialog
+        open={confirming}
+        onOpenChange={(open) => !resend.isPending && setConfirming(open)}
+        title="Resend this event?"
+        description={
+          <>
+            <p>
+              Send this event again to <span className="break-all font-mono text-xs">{endpoint.url}</span>.
+            </p>
+            <p>
+              It keeps the same event ID and body, with a new delivery and fresh retry attempts. The original history
+              stays intact. Your endpoint may ignore an event it has already handled.
+            </p>
+          </>
+        }
+        actionLabel="Resend event"
+        destructive={false}
+        pending={resend.isPending}
+        onConfirm={() => {
+          if (resend.isPending) return;
+          if (reason) {
+            setConfirming(false);
+            toast.error("Couldn't resend event", { description: reason });
+            return;
+          }
+          resend.mutate(delivery.id, {
+            onSuccess: (created) => {
+              setConfirming(false);
+              toast.success("Event queued for resend");
+              onResent(created.id);
+            },
+            onError: (error) => toastError(error, "Couldn't resend event"),
+          });
+        }}
+      />
+    </div>
   );
 }
 

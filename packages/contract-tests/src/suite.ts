@@ -346,11 +346,12 @@ export function contractSuite(target: Target) {
           description: "Contract",
           events: ["run.completed"],
         });
-        await owner.webhooks.update(org, hook.endpoint.id, { enabled: false });
+        await owner.webhooks.update(org, hook.endpoint.id, { enabled: true });
         await owner.webhooks.sendTest(org, hook.endpoint.id);
         const delivery = must((await owner.webhooks.deliveries(org, hook.endpoint.id)).items[0], "test delivery");
         await owner.webhooks.delivery(org, hook.endpoint.id, delivery.id);
         await owner.webhooks.deliveryAttempts(org, hook.endpoint.id, delivery.id);
+        await owner.webhooks.resendDelivery(org, hook.endpoint.id, delivery.id);
         await owner.webhooks.delete(org, hook.endpoint.id);
         await owner.audit.list(org);
         await owner.workspaces.delete(workspace.id);
@@ -2616,6 +2617,16 @@ export function contractSuite(target: Target) {
           ["updateWebhook", () => c.webhooks.update(t.org, t.hook.id, { enabled: false })],
           ["deleteWebhook", () => c.webhooks.delete(t.org, t.hook.id)],
           ["testWebhook", () => c.webhooks.sendTest(t.org, t.hook.id)],
+          [
+            "resendWebhookDelivery",
+            async () => {
+              const source = must(
+                (await owner.webhooks.deliveries(t.org, t.hook.id)).items.find((row) => row.state === "failed"),
+                "failed delivery",
+              );
+              return c.webhooks.resendDelivery(t.org, t.hook.id, source.id);
+            },
+          ],
         ];
       };
 
@@ -2671,6 +2682,7 @@ export function contractSuite(target: Target) {
           "updateWebhook",
           "deleteWebhook",
           "testWebhook",
+          "resendWebhookDelivery",
         ]);
         const t = await northwind();
         const changes = changesBy(as("developer"), t, await sandboxKey());
@@ -2990,6 +3002,236 @@ export function contractSuite(target: Target) {
           `${environment} webhook`,
         );
 
+      it("resends each terminal outcome with a fresh delivery and the exact original event", async () => {
+        for (const environment of ["sandbox", "production"] as const) {
+          const endpoint = await endpointIn(environment);
+          const original = await owner.webhooks.deliveries(fx.organization, endpoint.id);
+          // Unrelated pending work at this endpoint does not prevent resending a terminal delivery.
+          expect(original.items.some((row) => row.state === "pending")).toBe(true);
+          for (const state of ["succeeded", "failed", "skipped"] as const) {
+            const source = must(
+              original.items.find((row) => row.state === state && row.event_type !== "webhook.test"),
+              `${state} delivery`,
+            );
+            const detail = await owner.webhooks.delivery(fx.organization, endpoint.id, source.id);
+            const attempts = await owner.webhooks.deliveryAttempts(fx.organization, endpoint.id, source.id);
+            const resent = await owner.webhooks.resendDelivery(fx.organization, endpoint.id, source.id);
+            expect(resent).toEqual({
+              id: expect.any(String),
+              organization_id: fx.organization,
+              endpoint_id: endpoint.id,
+              event_id: source.event_id,
+              environment,
+              event_type: source.event_type,
+              event_created_at: source.event_created_at,
+              workspace: source.workspace,
+              state: "pending",
+              attempts: 0,
+              last_status_code: null,
+              last_error: null,
+              last_attempt_at: null,
+              next_attempt_at: expect.any(String),
+              created_at: expect.any(String),
+            });
+            expect(resent.id).not.toBe(source.id);
+            expect(resent.next_attempt_at).toBe(resent.created_at);
+            expect(await owner.webhooks.delivery(fx.organization, endpoint.id, resent.id)).toEqual({
+              ...resent,
+              event: detail.event,
+              attempt_history_complete: true,
+            });
+            expect(await owner.webhooks.deliveryAttempts(fx.organization, endpoint.id, resent.id)).toEqual({
+              items: [],
+              pagination: { next_cursor: null, total: 0 },
+            });
+            expect(await owner.webhooks.delivery(fx.organization, endpoint.id, source.id)).toEqual(detail);
+            expect(await owner.webhooks.deliveryAttempts(fx.organization, endpoint.id, source.id)).toEqual(attempts);
+          }
+          const after = await owner.webhooks.deliveries(fx.organization, endpoint.id);
+          expect(after.pagination.total).toBe(must(original.pagination.total, "delivery count") + 3);
+          expect(after.items.filter((row) => original.items.some((source) => row.id === source.id))).toEqual(
+            original.items,
+          );
+        }
+      });
+
+      it("refuses pending, disabled and unsubscribed resends without changing history or auditing", async () => {
+        const endpoint = await endpointIn("sandbox");
+        const history = await owner.webhooks.deliveries(fx.organization, endpoint.id);
+        const pending = must(
+          history.items.find((row) => row.state === "pending"),
+          "pending delivery",
+        );
+        const failed = must(
+          history.items.find((row) => row.state === "failed"),
+          "failed delivery",
+        );
+        const test = must(
+          history.items.find((row) => row.event_type === "webhook.test"),
+          "test delivery",
+        );
+        const details = await Promise.all(
+          history.items.map((row) => owner.webhooks.delivery(fx.organization, endpoint.id, row.id)),
+        );
+        const attempts = await Promise.all(
+          history.items.map((row) => owner.webhooks.deliveryAttempts(fx.organization, endpoint.id, row.id)),
+        );
+        const refused = async (source: WebhookDeliveryId, code: string) => {
+          const audit = await owner.audit.list(fx.organization, { limit: 100 });
+          expect(await failure(owner.webhooks.resendDelivery(fx.organization, endpoint.id, source))).toMatchObject({
+            status: 409,
+            code,
+          });
+          expect(await owner.webhooks.deliveries(fx.organization, endpoint.id)).toEqual(history);
+          expect(await owner.audit.list(fx.organization, { limit: 100 })).toEqual(audit);
+        };
+        await refused(pending.id, "delivery_pending");
+        await owner.webhooks.update(fx.organization, endpoint.id, { enabled: false });
+        await refused(failed.id, "webhook_disabled");
+        await refused(test.id, "webhook_disabled");
+        await owner.webhooks.update(fx.organization, endpoint.id, { enabled: true, events: ["run.failed"] });
+        expect(failed.event_type).toBe("run.completed");
+        await refused(failed.id, "webhook_not_subscribed");
+        expect(
+          await Promise.all(history.items.map((row) => owner.webhooks.delivery(fx.organization, endpoint.id, row.id))),
+        ).toEqual(details);
+        expect(
+          await Promise.all(
+            history.items.map((row) => owner.webhooks.deliveryAttempts(fx.organization, endpoint.id, row.id)),
+          ),
+        ).toEqual(attempts);
+        // A test event cannot be subscribed to, so it is exempt only from the subscription check.
+        const resent = await owner.webhooks.resendDelivery(fx.organization, endpoint.id, test.id);
+        expect(resent).toMatchObject({ event_id: test.event_id, event_type: "webhook.test", workspace: null });
+        const event = must(
+          (await owner.audit.list(fx.organization)).items.find((row) => row.target.id === resent.id),
+          "test resend audit",
+        );
+        expect(event).toMatchObject({
+          action: "webhook.delivery_resent",
+          target: { type: "webhook_delivery", id: resent.id, name: "webhook.test" },
+          workspace_id: null,
+          environment: "sandbox",
+        });
+      });
+
+      it("replays a resend once and audits only a newly created delivery", async () => {
+        const endpoint = await endpointIn("production");
+        const history = await owner.webhooks.deliveries(fx.organization, endpoint.id);
+        const source = must(
+          history.items.find((row) => row.state === "failed"),
+          "failed delivery",
+        );
+        const sibling = must(
+          history.items.find((row) => row.state === "skipped"),
+          "skipped delivery",
+        );
+        const options = { idempotencyKey: "resend-once" };
+        const first = await owner.webhooks.resendDelivery(fx.organization, endpoint.id, source.id, options);
+        expect(await owner.webhooks.resendDelivery(fx.organization, endpoint.id, source.id, options)).toEqual(first);
+        expect(
+          await failure(owner.webhooks.resendDelivery(fx.organization, endpoint.id, sibling.id, options)),
+        ).toMatchObject({ status: 422, code: "idempotency_key_reused" });
+        expect((await owner.webhooks.deliveries(fx.organization, endpoint.id)).pagination.total).toBe(
+          must(history.pagination.total, "delivery count") + 1,
+        );
+        const me = (await owner.me.get()).user;
+        const audit = (await owner.audit.list(fx.organization, { limit: 100 })).items.filter(
+          (row) => row.action === "webhook.delivery_resent",
+        );
+        expect(audit).toHaveLength(1);
+        expect(audit[0]).toMatchObject({
+          organization_id: fx.organization,
+          workspace_id: source.workspace?.id,
+          environment: "production",
+          actor: { type: "user", id: me.id, name: me.name },
+          target: { type: "webhook_delivery", id: first.id, name: source.event_type },
+        });
+        const again = await owner.webhooks.resendDelivery(fx.organization, endpoint.id, source.id);
+        expect(again.id).not.toBe(first.id);
+        expect(again.event_id).toBe(source.event_id);
+        expect((await owner.webhooks.deliveries(fx.organization, endpoint.id)).pagination.total).toBe(
+          must(history.pagination.total, "delivery count") + 2,
+        );
+        expect(
+          (await owner.audit.list(fx.organization, { limit: 100 })).items.filter(
+            (row) => row.action === "webhook.delivery_resent",
+          ),
+        ).toHaveLength(2);
+      });
+
+      it("keeps resends inside the original organization, workspace and environment", async () => {
+        const endpoint = await endpointIn("production");
+        const sandbox = await endpointIn("sandbox");
+        const outsider = as("outsider");
+        const other = must((await outsider.webhooks.list(fx.otherOrganization))[0], "foreign webhook");
+        const source = must(
+          (await owner.webhooks.deliveries(fx.organization, endpoint.id, { state: "failed" })).items[0],
+          "failed delivery",
+        );
+        const workspace = must(source.workspace, "source workspace");
+        const beta = await workspaceBySlug("beta-labs");
+        const sibling = workspace.id === beta.id ? fx.workspaces.acme : beta;
+        const inWorkspace = await owner.webhooks.deliveries(fx.organization, endpoint.id, {
+          workspace_id: workspace.id,
+        });
+        const inSibling = await owner.webhooks.deliveries(fx.organization, endpoint.id, { workspace_id: sibling.id });
+        const inSandbox = await owner.webhooks.deliveries(fx.organization, sandbox.id);
+        const inOther = await outsider.webhooks.deliveries(fx.otherOrganization, other.id);
+        const resent = await owner.webhooks.resendDelivery(fx.organization, endpoint.id, source.id);
+        expect(
+          (await owner.webhooks.deliveries(fx.organization, endpoint.id, { workspace_id: workspace.id })).items,
+        ).toEqual([resent, ...inWorkspace.items]);
+        expect(await owner.webhooks.deliveries(fx.organization, endpoint.id, { workspace_id: sibling.id })).toEqual(
+          inSibling,
+        );
+        expect(await owner.webhooks.deliveries(fx.organization, sandbox.id)).toEqual(inSandbox);
+        expect(await outsider.webhooks.deliveries(fx.otherOrganization, other.id)).toEqual(inOther);
+        for (const [client, org, hook] of [
+          [owner, fx.organization, sandbox],
+          [owner, fx.organization, other],
+          [outsider, fx.otherOrganization, other],
+        ] as const) {
+          expect(await failure(client.webhooks.delivery(org, hook.id, resent.id))).toMatchObject({
+            status: 404,
+            code: "not_found",
+          });
+          expect(await failure(client.webhooks.resendDelivery(org, hook.id, resent.id))).toMatchObject({
+            status: 404,
+            code: "not_found",
+          });
+        }
+      });
+
+      it("lets an admin resend in Production without rewriting the event's workspace snapshot", async () => {
+        const endpoint = await endpointIn("production");
+        const source = must(
+          (await owner.webhooks.deliveries(fx.organization, endpoint.id, { state: "failed" })).items[0],
+          "failed delivery",
+        );
+        const detail = await owner.webhooks.delivery(fx.organization, endpoint.id, source.id);
+        const workspace = must(source.workspace, "source workspace");
+        await owner.workspaces.update(workspace.id, { external_id: "renamed-after-event" });
+        const person = (await as("developer").me.get()).user;
+        const member = must(
+          (await owner.members.list(fx.organization)).find((row) => row.user.id === person.id),
+          "developer member",
+        );
+        await owner.members.update(fx.organization, member.id, { role: "admin" });
+        const resent = await as("developer").webhooks.resendDelivery(fx.organization, endpoint.id, source.id);
+        expect(resent.workspace).toEqual(workspace);
+        expect((await owner.webhooks.delivery(fx.organization, endpoint.id, resent.id)).event).toEqual(detail.event);
+        const audit = must(
+          (await owner.audit.list(fx.organization)).items.find((row) => row.target.id === resent.id),
+          "admin resend audit",
+        );
+        expect(audit).toMatchObject({
+          actor: { type: "user", id: person.id, name: person.name },
+          workspace_id: workspace.id,
+          environment: "production",
+        });
+      });
+
       it("lists every delivery outcome and returns its lean event and recorded attempts", async () => {
         const endpoint = await endpointIn("production");
         const list = await owner.webhooks.deliveries(fx.organization, endpoint.id);
@@ -3204,6 +3446,10 @@ export function contractSuite(target: Target) {
           expect(
             await failure(client.webhooks.deliveryAttempts(organization, endpoint.id, delivery, { cursor: "invalid" })),
           ).toMatchObject({ status: 404, code: "not_found" });
+          expect(await failure(client.webhooks.resendDelivery(organization, endpoint.id, delivery))).toMatchObject({
+            status: 404,
+            code: "not_found",
+          });
           if (
             endpoint.organization_id !== organization ||
             (client === owner && organization === fx.otherOrganization) ||
@@ -3218,9 +3464,16 @@ export function contractSuite(target: Target) {
         expect(
           await failure(as(null).webhooks.deliveries(fx.organization, mine.id, { cursor: "invalid" })),
         ).toMatchObject({ status: 401, code: "unauthenticated" });
+        expect(await failure(as(null).webhooks.resendDelivery(fx.organization, mine.id, ownDelivery.id))).toMatchObject(
+          { status: 401, code: "unauthenticated" },
+        );
+        expect(await failure(owner.webhooks.resendDelivery(fx.organization, mine.id, "whd_missing"))).toMatchObject({
+          status: 404,
+          code: "not_found",
+        });
       });
 
-      it("keeps an API key's delivery history inside its organization and environment", async () => {
+      it("keeps an API key's delivery history and resends inside its organization and environment", async () => {
         const production = await endpointIn("production");
         const sandbox = await endpointIn("sandbox");
         const endpoints = { production, sandbox };
@@ -3254,9 +3507,43 @@ export function contractSuite(target: Target) {
             status: 404,
             code: "not_found",
           });
+          expect(await failure(client.webhooks.resendDelivery(fx.organization, other.id, foreign.id))).toMatchObject({
+            status: 404,
+            code: "not_found",
+          });
           expect(await failure(client.webhooks.deliveries(fx.otherOrganization, endpoint.id))).toMatchObject({
             status: 404,
             code: "not_found",
+          });
+          expect(
+            await failure(client.webhooks.resendDelivery(fx.otherOrganization, endpoint.id, row.id)),
+          ).toMatchObject({
+            status: 404,
+            code: "not_found",
+          });
+          const terminal = must(
+            list.items.find((delivery) => delivery.state === "failed"),
+            "failed delivery",
+          );
+          const resent = await client.webhooks.resendDelivery(fx.organization, endpoint.id, terminal.id);
+          expect(resent).toMatchObject({
+            organization_id: fx.organization,
+            endpoint_id: endpoint.id,
+            environment,
+            event_id: terminal.event_id,
+            workspace: terminal.workspace,
+            state: "pending",
+            attempts: 0,
+          });
+          const audit = must(
+            (await owner.audit.list(fx.organization)).items.find((event) => event.target.id === resent.id),
+            "API-key resend audit",
+          );
+          expect(audit).toMatchObject({
+            action: "webhook.delivery_resent",
+            actor: { type: "api_key", id: key.key.id, name: key.key.name },
+            workspace_id: terminal.workspace?.id,
+            environment,
           });
         }
       });

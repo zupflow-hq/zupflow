@@ -2819,6 +2819,59 @@ export function createHandlers(apiBase: string) {
     ),
 
     http.post(
+      u("/v1/organizations/:org/webhooks/:hook/deliveries/:delivery/resend"),
+      route(({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        requireRole(access, ADMINS, "resend webhook deliveries");
+        const endpoint = findWebhook(access.org.id, idParam(params, "hook"));
+        const { row, event } = findWebhookDelivery(access.org.id, endpoint, idParam(params, "delivery"));
+        if (row.state === "pending") {
+          throw new ApiFailure(
+            409,
+            "delivery_pending",
+            "This delivery is still pending. Wait until it finishes before resending.",
+          );
+        }
+        if (!endpoint.enabled) {
+          throw new ApiFailure(409, "webhook_disabled", "Enable this webhook endpoint before resending.");
+        }
+        if (event.type !== "webhook.test" && !endpoint.events.includes(event.type)) {
+          throw new ApiFailure(
+            409,
+            "webhook_not_subscribed",
+            "Subscribe this endpoint to the event type before resending.",
+          );
+        }
+        const now = new Date().toISOString();
+        const delivery: WebhookDeliveryRow = {
+          id: newId("webhook_delivery"),
+          organization_id: access.org.id,
+          endpoint_id: endpoint.id,
+          event_id: row.event_id,
+          state: "pending",
+          attempts: 0,
+          last_status_code: null,
+          last_error: null,
+          last_attempt_at: null,
+          next_attempt_at: now,
+          created_at: now,
+        };
+        // Reuse the event row verbatim; a resend neither rewrites it nor invents an attempt.
+        db().webhook_deliveries.push(delivery);
+        audit(
+          access,
+          "webhook.delivery_resent",
+          { type: "webhook_delivery", id: delivery.id, name: event.type },
+          {
+            workspace: event.workspace ? { id: event.workspace.id, environment: endpoint.environment } : undefined,
+            environment: endpoint.environment,
+          },
+        );
+        return created(webhookSummary(delivery, event));
+      }),
+    ),
+
+    http.post(
       u("/v1/organizations/:org/webhooks/:hook/test"),
       route(({ request, params }) => {
         const access = orgAccess(request, param(params, "org"));

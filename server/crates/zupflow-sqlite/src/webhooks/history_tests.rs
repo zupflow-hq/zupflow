@@ -18,7 +18,9 @@ async fn organization(database: &Database, id: OrganizationId) {
         .unwrap();
 }
 
-async fn recorded(database: &Database) -> (OrganizationId, WorkspaceId, WebhookEndpointId, WebhookDeliveryId) {
+pub(super) async fn recorded(
+    database: &Database,
+) -> (OrganizationId, WorkspaceId, WebhookEndpointId, WebhookDeliveryId) {
     let org = OrganizationId::generate();
     organization(database, org).await;
     let ws = WorkspaceId::generate();
@@ -71,7 +73,7 @@ async fn recorded(database: &Database) -> (OrganizationId, WorkspaceId, WebhookE
     (org, ws, hook, delivery)
 }
 
-fn success(number: u32) -> Attempt {
+pub(super) fn success(number: u32) -> Attempt {
     Attempt {
         number,
         status: Some(204),

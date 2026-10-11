@@ -272,7 +272,7 @@ export function audit(
   access: OrgAccess,
   action: string,
   target: { type: string; id: AnyId | null; name: string },
-  scope: { workspace?: WorkspaceRow; environment?: Environment } = {},
+  scope: { workspace?: Pick<WorkspaceRow, "id" | "environment">; environment?: Environment } = {},
 ) {
   db().audit.unshift({
     id: newId("audit_event"),

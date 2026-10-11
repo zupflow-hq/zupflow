@@ -11,7 +11,10 @@
 //! delivery at a time.
 //!
 //! `prepare` makes a [`Tenant`] exist: its organization, a Sandbox workspace
-//! and a Production workspace. The suite claims delivery jobs through `jobs`.
+//! and a Production workspace, an active admin and an API key per environment.
+//! The suite claims delivery jobs through `jobs`.
+
+mod resend;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -20,7 +23,8 @@ use std::time::Duration;
 
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{
-    AgentId, OrganizationId, RunId, WebhookDeliveryId, WebhookEndpointId, WebhookEventId, WorkspaceId,
+    AgentId, ApiKeyId, MemberId, OrganizationId, RunId, WebhookDeliveryId, WebhookEndpointId, WebhookEventId,
+    WorkspaceId,
 };
 use zupflow_core::jobs::{JobQueue, LeaseToken};
 use zupflow_core::keys::{Sealed, WrappedKey};
@@ -39,6 +43,9 @@ pub struct Tenant {
     pub sandbox: WorkspaceId,
     pub sibling: WorkspaceId,
     pub production: WorkspaceId,
+    pub admin: MemberId,
+    pub sandbox_key: ApiKeyId,
+    pub production_key: ApiKeyId,
 }
 
 pub type Prepare = Arc<dyn Fn(Tenant) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -54,6 +61,9 @@ async fn tenant(prepare: &Prepare) -> Tenant {
         sandbox: WorkspaceId::generate(),
         sibling: WorkspaceId::generate(),
         production: WorkspaceId::generate(),
+        admin: MemberId::generate(),
+        sandbox_key: ApiKeyId::generate(),
+        production_key: ApiKeyId::generate(),
     };
     prepare(tenant).await;
     tenant
@@ -184,6 +194,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     abandons_a_delivery_without_charging_its_endpoint(&stores, a, b).await;
     holds_an_endpoint_for_one_delivery_at_a_time(&stores, a, b).await;
     reads_history_in_its_endpoint_environment_and_workspace(&stores, a, b).await;
+    resend::run(&stores, tenant(&prepare).await, tenant(&prepare).await).await;
 }
 
 async fn keeps_endpoints_in_their_organization(stores: &Stores<'_>, a: Tenant, b: Tenant) {
@@ -708,7 +719,10 @@ async fn records_the_test_buttons_event(stores: &Stores<'_>, a: Tenant, b: Tenan
         (recorded.kind.as_str(), recorded.state, recorded.attempts),
         (TEST_EVENT, DeliveryState::Succeeded, 1)
     );
-    assert!(!recorded.subscribed, "nobody subscribes to the test button's event");
+    assert!(
+        recorded.subscribed,
+        "test events stay eligible for explicit resends without a subscription"
+    );
     let last = stores
         .webhooks
         .find_endpoint(org, hook)

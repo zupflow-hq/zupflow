@@ -369,6 +369,17 @@ export function createClient(transport: Transport) {
           `${org(organizationId)}/webhooks/${enc(endpointId)}/deliveries/${enc(deliveryId)}/attempts`,
           { ...query },
         ),
+      resendDelivery: (
+        organizationId: OrganizationId,
+        endpointId: WebhookEndpointId,
+        deliveryId: WebhookDeliveryId,
+        options?: PostOptions,
+      ) =>
+        post<WebhookDeliverySummary>(
+          `${org(organizationId)}/webhooks/${enc(endpointId)}/deliveries/${enc(deliveryId)}/resend`,
+          undefined,
+          options,
+        ),
       create: (organizationId: OrganizationId, input: CreateWebhookEndpointInput, options?: PostOptions) =>
         post<CreatedWebhookEndpoint>(`${org(organizationId)}/webhooks`, input, options),
       update: (organizationId: OrganizationId, endpointId: WebhookEndpointId, input: UpdateWebhookEndpointInput) =>

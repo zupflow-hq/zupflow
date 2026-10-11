@@ -166,6 +166,96 @@ describe("webhook delivery history isolation", () => {
     return { organization, endpoint, delivery, event, otherOrganization };
   };
 
+  it("resend creates only its own delivery, leaving poisoned rows and the original event and attempts intact", async () => {
+    const { organization, endpoint, delivery, event, otherOrganization } = fixture();
+    delivery.state = "failed";
+    delivery.next_attempt_at = null;
+    db().webhooks.unshift({ ...structuredClone(endpoint), organization_id: otherOrganization, enabled: false });
+    db().webhook_deliveries.unshift({ ...delivery, organization_id: otherOrganization, state: "pending" });
+    db().webhook_events.unshift({ ...structuredClone(event), organization_id: otherOrganization });
+    const attempt = must(
+      db().webhook_delivery_attempts.find(
+        (row) =>
+          row.organization_id === organization && row.endpoint_id === endpoint.id && row.delivery_id === delivery.id,
+      ),
+    );
+    db().webhook_delivery_attempts.unshift({ ...attempt, organization_id: otherOrganization, status_code: 418 });
+    const before = structuredClone({
+      endpoints: db().webhooks,
+      deliveries: db().webhook_deliveries,
+      events: db().webhook_events,
+      attempts: db().webhook_delivery_attempts,
+    });
+    const resent = await owner.webhooks.resendDelivery(organization, endpoint.id, delivery.id);
+    expect(resent).toMatchObject({
+      organization_id: organization,
+      endpoint_id: endpoint.id,
+      event_id: event.id,
+      environment: endpoint.environment,
+      workspace: event.body.workspace,
+      state: "pending",
+      attempts: 0,
+      last_status_code: null,
+      last_error: null,
+      last_attempt_at: null,
+    });
+    expect(resent.id).not.toBe(delivery.id);
+    expect({
+      endpoints: db().webhooks,
+      deliveries: db().webhook_deliveries.filter((row) => row.id !== resent.id),
+      events: db().webhook_events,
+      attempts: db().webhook_delivery_attempts,
+    }).toEqual(before);
+    expect((await owner.webhooks.delivery(organization, endpoint.id, resent.id)).event).toEqual(event.body);
+    expect((await owner.webhooks.deliveryAttempts(organization, endpoint.id, resent.id)).items).toEqual([]);
+    const stored = must(db().webhook_deliveries.find((row) => row.id === resent.id));
+    expect(Object.keys(stored).slice(0, 2)).toEqual(["id", "organization_id"]);
+    const auditEvent = must(db().audit.find((row) => row.target.id === resent.id));
+    expect(auditEvent).toMatchObject({
+      organization_id: organization,
+      workspace_id: event.workspace_id,
+      environment: endpoint.environment,
+      action: "webhook.delivery_resent",
+      target: { type: "webhook_delivery", id: resent.id, name: event.body.type },
+    });
+    expect(Object.keys(auditEvent).slice(0, 3)).toEqual(["id", "organization_id", "workspace_id"]);
+
+    // Sending a test creates an attempt; queuing the resend above correctly created none.
+    await owner.webhooks.sendTest(organization, endpoint.id);
+    const newAttempt = must(db().webhook_delivery_attempts.at(-1));
+    expect(newAttempt).toMatchObject({ organization_id: organization, endpoint_id: endpoint.id, number: 1 });
+    expect(Object.keys(newAttempt).slice(0, 3)).toEqual(["organization_id", "endpoint_id", "delivery_id"]);
+    const testDelivery = must(db().webhook_deliveries.find((row) => row.id === newAttempt.delivery_id));
+    expect(Object.keys(testDelivery).slice(0, 2)).toEqual(["id", "organization_id"]);
+  });
+
+  it.each(["body organization", "body environment", "workspace organization", "workspace environment"])(
+    "resend refuses an event with a mismatched %s without inserting or auditing a delivery",
+    async (mismatch) => {
+      const { organization, endpoint, delivery, event, otherOrganization } = fixture();
+      delivery.state = "failed";
+      delivery.next_attempt_at = null;
+      if (mismatch === "body organization") event.body.organization_id = otherOrganization;
+      else if (mismatch === "body environment") event.body.environment = "sandbox";
+      else {
+        event.workspace_id = ws(mismatch === "workspace organization" ? "harbor" : "acme-sandbox").id;
+        if (event.body.workspace) event.body.workspace.id = event.workspace_id;
+      }
+      const snapshot = () => ({
+        deliveries: db().webhook_deliveries,
+        events: db().webhook_events,
+        attempts: db().webhook_delivery_attempts,
+        audit: db().audit,
+      });
+      const before = structuredClone(snapshot());
+      expect(await failure(owner.webhooks.resendDelivery(organization, endpoint.id, delivery.id))).toMatchObject({
+        status: 404,
+        code: "not_found",
+      });
+      expect(snapshot()).toEqual(before);
+    },
+  );
+
   it("ignores poisoned delivery, event and attempt rows carrying another organization", async () => {
     const { organization, endpoint, delivery, event, otherOrganization } = fixture();
     const before = await owner.webhooks.delivery(organization, endpoint.id, delivery.id);

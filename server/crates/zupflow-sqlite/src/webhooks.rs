@@ -5,9 +5,12 @@
 //! transaction that records the delivery, through the queue's own table.
 
 mod history;
+mod resend;
 
 #[cfg(test)]
 mod history_tests;
+#[cfg(test)]
+mod resend_tests;
 
 use async_trait::async_trait;
 use sqlx::sqlite::SqliteRow;
@@ -21,8 +24,9 @@ use zupflow_core::scope::Scope;
 use zupflow_core::time::Timestamp;
 use zupflow_core::webhooks::{
     Attempt, DISABLE_AFTER, DeliveryDetail, DeliveryFilter, DeliveryState, DeliverySummary, EndpointChanges,
-    LastDelivery, NewEndpoint, NewWebhookEvent, PendingDelivery, RecordedAttempt, SECRET_VERSION, SigningSecret,
-    TEST_EVENT, WebhookEndpoint, WebhookError, WebhookEventType, WebhookStore, delivery_job, safe_delivery_error,
+    LastDelivery, NewEndpoint, NewWebhookEvent, PendingDelivery, RecordedAttempt, ResendError, SECRET_VERSION,
+    SigningSecret, TEST_EVENT, WebhookEndpoint, WebhookError, WebhookEventType, WebhookManager, WebhookStore,
+    delivery_job, safe_delivery_error,
 };
 use zupflow_core::workspaces::Page;
 
@@ -505,11 +509,12 @@ impl WebhookStore for SqliteWebhookStore {
         let kind: String = row.try_get("type").map_err(read)?;
         let state: String = row.try_get("state").map_err(read)?;
         let events: String = row.try_get("events").map_err(read)?;
-        let subscribed = WebhookEventType::parse(&kind).is_some_and(|kind| {
-            events_from(&events)
-                .map(|events| events.contains(&kind))
-                .unwrap_or(false)
-        });
+        let subscribed = kind == TEST_EVENT
+            || WebhookEventType::parse(&kind).is_some_and(|kind| {
+                events_from(&events)
+                    .map(|events| events.contains(&kind))
+                    .unwrap_or(false)
+            });
         Ok(Some(PendingDelivery {
             id: WebhookDeliveryId::from_uuid(row.try_get("id").map_err(read)?),
             organization_id,
@@ -771,6 +776,27 @@ impl WebhookStore for SqliteWebhookStore {
         )
         .await
     }
+
+    async fn resend_delivery(
+        &self,
+        organization_id: OrganizationId,
+        endpoint_id: WebhookEndpointId,
+        environment: Environment,
+        delivery_id: WebhookDeliveryId,
+        manager: WebhookManager,
+        audit: &Audit<'_, DeliverySummary>,
+    ) -> Result<DeliverySummary, ResendError> {
+        resend::resend_delivery(
+            self,
+            organization_id,
+            endpoint_id,
+            environment,
+            delivery_id,
+            manager,
+            audit,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -786,7 +812,7 @@ mod tests {
     use crate::schema::{Temporary, temporary};
 
     /// Makes the tenant's rows straight in the database: an organization
-    /// with a Sandbox and a Production workspace.
+    /// with workspaces in both environments and current management authority.
     fn prepare(database: Database) -> Prepare {
         Arc::new(move |tenant: Tenant| {
             let database = database.clone();
@@ -815,6 +841,20 @@ mod tests {
                     .execute(pool)
                     .await
                     .unwrap();
+                }
+                let user = zupflow_core::ids::UserId::generate();
+                sqlx::query("INSERT INTO users (id, name, email, created_at) VALUES (?, 'Jordan', ?, 0)")
+                    .bind(user.uuid())
+                    .bind(format!("{}@northwind.example", user.uuid().simple()))
+                    .execute(pool)
+                    .await
+                    .unwrap();
+                sqlx::query("INSERT INTO members (id, organization_id, user_id, role, status, invited_at, joined_at) VALUES (?, ?, ?, 'admin', 'active', 0, 0)")
+                    .bind(tenant.admin.uuid()).bind(org).bind(user.uuid()).execute(pool).await.unwrap();
+                for (key, environment) in [(tenant.sandbox_key, "sandbox"), (tenant.production_key, "production")] {
+                    let hash = key.uuid().as_bytes().repeat(2);
+                    sqlx::query("INSERT INTO api_keys (id, organization_id, environment, name, prefix, last4, secret_hash, created_by_user_id, created_at) VALUES (?, ?, ?, 'Test', 'test', 'abcd', ?, ?, 0)")
+                        .bind(key.uuid()).bind(org).bind(environment).bind(hash).bind(user.uuid()).execute(pool).await.unwrap();
                 }
             })
         })
@@ -854,12 +894,18 @@ mod tests {
             sandbox: WorkspaceId::generate(),
             sibling: WorkspaceId::generate(),
             production: WorkspaceId::generate(),
+            admin: zupflow_core::ids::MemberId::generate(),
+            sandbox_key: zupflow_core::ids::ApiKeyId::generate(),
+            production_key: zupflow_core::ids::ApiKeyId::generate(),
         };
         let b = Tenant {
             organization_id: OrganizationId::generate(),
             sandbox: WorkspaceId::generate(),
             sibling: WorkspaceId::generate(),
             production: WorkspaceId::generate(),
+            admin: zupflow_core::ids::MemberId::generate(),
+            sandbox_key: zupflow_core::ids::ApiKeyId::generate(),
+            production_key: zupflow_core::ids::ApiKeyId::generate(),
         };
         prepare(a).await;
         prepare(b).await;

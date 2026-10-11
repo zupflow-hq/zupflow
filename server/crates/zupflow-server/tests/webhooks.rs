@@ -654,6 +654,73 @@ async fn retries_a_failing_delivery_until_its_attempts_run_out() {
         "nothing after the last"
     );
 
+    // A manual resend has a fresh, bounded delivery budget. It does not
+    // revive the exhausted source or change any of its attempts.
+    let (status, resent) = server
+        .send(call("alice", Method::POST, format!("{path}/{delivery}/resend")))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{resent}");
+    let new_delivery = id(&resent["data"]);
+    assert_ne!(new_delivery, delivery);
+    assert_eq!(resent["data"]["state"], "pending");
+    assert_eq!(resent["data"]["attempts"], 0);
+    assert_eq!(resent["data"]["next_attempt_at"], resent["data"]["created_at"]);
+    let org_id = zupflow_core::ids::OrganizationId::parse(&org).unwrap();
+    let new_id = zupflow_core::ids::WebhookDeliveryId::parse(new_delivery).unwrap();
+    let payload = zupflow_core::webhooks::delivery_job(new_id).unwrap().payload;
+    let budget: (i64, i64) = sqlx::query_as("SELECT attempts, max_attempts FROM jobs WHERE organization_id = ? AND kind = 'deliver_webhook' AND payload = ?")
+        .bind(org_id.uuid()).bind(&payload).fetch_one(&pool).await.unwrap();
+    assert_eq!(budget, (0, i64::from(zupflow_core::webhooks::DELIVERY_JOB_ATTEMPTS)));
+    for number in 1..=DELIVERY_ATTEMPTS {
+        assert!(webhook_delivery::work_once(&server.state).await);
+        let sent = server.providers.requests_to(HOOK);
+        let request = sent.last().unwrap();
+        assert_eq!(
+            request.header("Zupflow-Delivery-Attempt"),
+            Some(number.to_string().as_str())
+        );
+        assert_eq!(request.body, sent[0].body);
+        assert_eq!(request.header("Zupflow-Event-Id"), sent[0].header("Zupflow-Event-Id"));
+        assert!(
+            !webhook_delivery::work_once(&server.state).await,
+            "resend retries wait for their due time"
+        );
+        if number == 1 {
+            let next: i64 = sqlx::query_scalar(
+                "SELECT next_attempt_at - last_attempt_at FROM webhook_deliveries WHERE organization_id = ? AND id = ?",
+            )
+            .bind(org_id.uuid())
+            .bind(new_id.uuid())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(
+                (54_000..=66_000).contains(&next),
+                "resend starts the normal first backoff: {next}"
+            );
+        }
+        sqlx::query("UPDATE jobs SET run_at = 0 WHERE organization_id = ? AND kind = 'deliver_webhook' AND payload = ? AND state = 'queued'")
+            .bind(org_id.uuid()).bind(&payload).execute(&pool).await.unwrap();
+    }
+    assert!(
+        !webhook_delivery::work_once(&server.state).await,
+        "resend also stops after eight sends"
+    );
+    let (_, original_after) = server
+        .send(call("alice", Method::GET, format!("{path}/{delivery}")))
+        .await;
+    let (_, original_attempts_after) = server
+        .send(call("alice", Method::GET, format!("{path}/{delivery}/attempts")))
+        .await;
+    assert_eq!(original_after["data"], detail["data"]);
+    assert_eq!(original_attempts_after["data"], history_attempts["data"]);
+    let (_, retry_after) = server
+        .send(call("alice", Method::GET, format!("{path}/{new_delivery}")))
+        .await;
+    assert_eq!(retry_after["data"]["state"], "failed");
+    assert_eq!(retry_after["data"]["attempts"], 8);
+    assert_eq!(retry_after["data"]["attempt_history_complete"], true);
+
     // A success stops the retries.
     server.providers.script(HOOK, 202, json!({}));
     start(&server, "alice", &org, &ws, &helper, "Again").await;
@@ -663,7 +730,7 @@ async fn retries_a_failing_delivery_until_its_attempts_run_out() {
         .await
         .unwrap();
     assert!(!webhook_delivery::work_once(&server.state).await);
-    assert_eq!(server.providers.requests_to(HOOK).len(), 9);
+    assert_eq!(server.providers.requests_to(HOOK).len(), 17);
     pool.close().await;
 }
 

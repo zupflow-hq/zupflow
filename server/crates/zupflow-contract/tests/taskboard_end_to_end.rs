@@ -13,6 +13,8 @@
 //! expired token refreshes once across concurrent workers; a revoked refresh
 //! token requires reconnect with an audit event and webhook; reconnecting
 //! clears it, forgotten clients register again, and callback issuers are checked.
+//! A second journey verifies signed webhook history and resends against
+//! Taskboard's receiver across organizations, workspaces and environments.
 //!
 //! The browser is a headless HTTP client following each redirect by hand and
 //! answering the consent page's form, so every hop can be checked.
@@ -1142,6 +1144,151 @@ async fn check_history(
     }
 }
 
+/// A resend has its own history, while the event and source stay unchanged.
+async fn resend_history(
+    stack: &Stack,
+    who: &str,
+    org: &str,
+    hook: &str,
+    source: &Value,
+    original: &WebhookRequest,
+    secret: &str,
+) -> Value {
+    let path = format!("/v1/organizations/{org}/webhooks/{hook}/deliveries");
+    let source_path = format!("{path}/{}", id(source));
+    let mut before = Vec::new();
+    for suffix in ["", "/attempts"] {
+        let (status, body) = stack
+            .api(who, Method::GET, &format!("{source_path}{suffix}"), None, None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        before.push(body);
+    }
+    let key = format!("resend-{}", id(source));
+    let send = || {
+        stack
+            .http
+            .post(format!("{}{source_path}/resend", stack.base))
+            .bearer_auth(who)
+            .header("Idempotency-Key", key.as_str())
+            .send()
+    };
+    let response = send().await.unwrap();
+    let status = response.status();
+    let first = response.text().await.unwrap();
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let created: Value = serde_json::from_str(&first).unwrap();
+    let delivery = data(&created);
+    assert_ne!(delivery["id"], source["id"]);
+    for field in [
+        "organization_id",
+        "endpoint_id",
+        "event_id",
+        "environment",
+        "event_type",
+        "event_created_at",
+        "workspace",
+    ] {
+        assert_eq!(delivery[field], source[field], "resend preserves {field}");
+    }
+    assert_eq!(delivery["state"], "pending");
+    assert_eq!(delivery["attempts"], 0);
+    for field in ["last_status_code", "last_error", "last_attempt_at"] {
+        assert_eq!(delivery[field], Value::Null, "a resend has no previous {field}");
+    }
+    assert!(delivery["created_at"].is_string());
+    assert_eq!(delivery["next_attempt_at"], delivery["created_at"]);
+
+    let resent_path = format!("{path}/{}", id(delivery));
+    let completed = eventually("the queued resend to succeed", || async {
+        let (status, body) = stack.api(who, Method::GET, &resent_path, None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_ne!(data(&body)["state"], "failed", "{body}");
+        (data(&body)["state"] == "succeeded").then_some(data(&body).clone())
+    })
+    .await;
+    assert_eq!(completed["last_status_code"], 204);
+    let requests: Vec<_> = stack
+        .taskboard
+        .taskboard
+        .webhook_requests()
+        .into_iter()
+        .filter(|request| request.event_id == original.event_id)
+        .collect();
+    assert_eq!(requests.len(), 2, "the original and one queued resend");
+    let resent = &requests[1];
+    assert_eq!(
+        resent.body, original.body,
+        "send the stored bytes without reserializing"
+    );
+    assert_eq!(resent.event_id, original.event_id);
+    assert_eq!(resent.event_type, original.event_type);
+    check_history(stack, who, org, hook, &completed, resent, secret).await;
+
+    // Replay after the worker finishes still returns the original pending
+    // response, with no new delivery, attempt or audit event.
+    let replay = send().await.unwrap();
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(replay.text().await.unwrap(), first);
+    let query = source["workspace"]["id"]
+        .as_str()
+        .map(|workspace| format!("workspace_id={workspace}"))
+        .unwrap_or_else(|| "event_type=webhook.test".to_owned());
+    let (status, page) = stack
+        .api(who, Method::GET, &format!("{path}?{query}"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let rows = data(&page).as_array().unwrap();
+    assert!(rows.iter().all(|row| row["workspace"] == source["workspace"]));
+    let same_event: Vec<_> = rows
+        .iter()
+        .filter(|row| row["event_id"] == source["event_id"])
+        .collect();
+    assert_eq!(same_event.len(), 2, "one source and one resend after replay");
+    assert!(same_event.iter().any(|row| row["id"] == source["id"]));
+    assert!(same_event.iter().any(|row| row["id"] == delivery["id"]));
+    for (suffix, expected) in ["", "/attempts"].into_iter().zip(before) {
+        let (status, after) = stack
+            .api(who, Method::GET, &format!("{source_path}{suffix}"), None, None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{after}");
+        assert_eq!(after, expected, "the original delivery and its attempts are immutable");
+    }
+    let (status, me) = stack.api(who, Method::GET, "/v1/me", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, audit) = stack
+        .api(
+            who,
+            Method::GET,
+            &format!("/v1/organizations/{org}/audit-events?limit=100"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{audit}");
+    let records: Vec<_> = data(&audit)
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["action"] == "webhook.delivery_resent" && event["target"]["id"] == delivery["id"])
+        .collect();
+    assert_eq!(records.len(), 1, "idempotency replay never audits a second resend");
+    let record = records[0];
+    assert_eq!(record["organization_id"], org);
+    assert_eq!(record["workspace_id"], source["workspace"]["id"]);
+    assert_eq!(record["workspace"]["id"], source["workspace"]["id"]);
+    assert_eq!(record["environment"], source["environment"]);
+    assert_eq!(
+        record["actor"],
+        json!({ "type": "user", "id": data(&me)["user"]["id"], "name": data(&me)["user"]["name"] })
+    );
+    assert_eq!(
+        record["target"],
+        json!({ "type": "webhook_delivery", "id": delivery["id"], "name": source["event_type"] })
+    );
+    completed
+}
+
 /// A completed run in a fresh workspace; fixture jobs can't enter its history.
 async fn history_run(stack: &Stack, who: &str, org: &str, slug: &str, environment: &str) -> (String, String) {
     let (status, workspace) = stack
@@ -1285,6 +1432,11 @@ async fn webhook_history_matches_deliveries_and_keeps_their_scope() {
             .find(|request| request.event_id.as_deref() == summary["event_id"].as_str())
             .unwrap();
         check_history(&stack, OWNER, org, &sandbox, summary, &request, &sandbox_secret).await;
+        if failed {
+            // The recovered receiver accepts a queued test event even
+            // though the endpoint subscribes only to run.completed.
+            resend_history(&stack, OWNER, org, &sandbox, summary, &request, &sandbox_secret).await;
+        }
     }
 
     // An organization can inspect both its workspaces, while the filter
@@ -1334,7 +1486,8 @@ async fn webhook_history_matches_deliveries_and_keeps_their_scope() {
             "the event has no run content"
         );
         check_history(&stack, who, organization, hook, &summary, &request, secret).await;
-        journeys.push((organization.to_owned(), hook.to_owned(), ws, summary));
+        let resent = resend_history(&stack, who, organization, hook, &summary, &request, secret).await;
+        journeys.push((organization.to_owned(), hook.to_owned(), ws, resent));
     }
 
     for (organization, hook, ws, summary) in &journeys {
@@ -1367,6 +1520,16 @@ async fn webhook_history_matches_deliveries_and_keeps_their_scope() {
                 StatusCode::NOT_FOUND,
                 "a delivery under the wrong endpoint: {hidden}"
             );
+            let (status, refused) = stack
+                .api(
+                    OWNER,
+                    Method::POST,
+                    &format!("{sandbox_path}/{}/resend", id(summary)),
+                    None,
+                    None,
+                )
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "a wrong-endpoint resend: {refused}");
         }
         if organization == other_org {
             let (status, hidden) = stack
@@ -1382,6 +1545,23 @@ async fn webhook_history_matches_deliveries_and_keeps_their_scope() {
                 status,
                 StatusCode::NOT_FOUND,
                 "another organization's history: {hidden}"
+            );
+            let (status, refused) = stack
+                .api(
+                    OWNER,
+                    Method::POST,
+                    &format!(
+                        "/v1/organizations/{organization}/webhooks/{hook}/deliveries/{}/resend",
+                        id(summary)
+                    ),
+                    None,
+                    None,
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "another organization's resend: {refused}"
             );
         }
     }

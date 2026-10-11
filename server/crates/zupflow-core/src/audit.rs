@@ -23,8 +23,8 @@ use uuid::Uuid;
 
 use crate::environment::Environment;
 use crate::ids::{
-    AgentId, ApiKeyId, AppId, AuditEventId, InstallationId, MemberId, OrganizationId, RunId, UserId, WebhookEndpointId,
-    WorkspaceId,
+    AgentId, ApiKeyId, AppId, AuditEventId, InstallationId, MemberId, OrganizationId, RunId, UserId, WebhookDeliveryId,
+    WebhookEndpointId, WorkspaceId,
 };
 use crate::time::Timestamp;
 use crate::workspaces::Page;
@@ -123,6 +123,7 @@ pub enum AuditObject {
     Agent(AgentId),
     ApiKey(ApiKeyId),
     Webhook(WebhookEndpointId),
+    WebhookDelivery(WebhookDeliveryId),
     Run(RunId),
     /// The organization's tool policy, which has no ID.
     ToolPolicy,
@@ -142,6 +143,7 @@ impl AuditObject {
             Self::Agent(_) => "agent",
             Self::ApiKey(_) => "api_key",
             Self::Webhook(_) => "webhook",
+            Self::WebhookDelivery(_) => "webhook_delivery",
             Self::Run(_) => "run",
             Self::ToolPolicy => "tool_policy",
             Self::ConnectSettings => "connect_settings",
@@ -159,6 +161,7 @@ impl AuditObject {
             Self::Agent(id) => Some(id.uuid()),
             Self::ApiKey(id) => Some(id.uuid()),
             Self::Webhook(id) => Some(id.uuid()),
+            Self::WebhookDelivery(id) => Some(id.uuid()),
             Self::Run(id) => Some(id.uuid()),
             Self::ToolPolicy | Self::ConnectSettings => None,
         }
@@ -175,6 +178,7 @@ impl AuditObject {
             ("agent", Some(uuid)) => Self::Agent(AgentId::from_uuid(uuid)),
             ("api_key", Some(uuid)) => Self::ApiKey(ApiKeyId::from_uuid(uuid)),
             ("webhook", Some(uuid)) => Self::Webhook(WebhookEndpointId::from_uuid(uuid)),
+            ("webhook_delivery", Some(uuid)) => Self::WebhookDelivery(WebhookDeliveryId::from_uuid(uuid)),
             ("run", Some(uuid)) => Self::Run(RunId::from_uuid(uuid)),
             ("tool_policy", None) => Self::ToolPolicy,
             ("connect_settings", None) => Self::ConnectSettings,
@@ -229,6 +233,7 @@ impl Serialize for AuditTarget {
             AuditObject::Agent(id) => target.serialize_field("id", id)?,
             AuditObject::ApiKey(id) => target.serialize_field("id", id)?,
             AuditObject::Webhook(id) => target.serialize_field("id", id)?,
+            AuditObject::WebhookDelivery(id) => target.serialize_field("id", id)?,
             AuditObject::Run(id) => target.serialize_field("id", id)?,
             AuditObject::ToolPolicy | AuditObject::ConnectSettings => target.serialize_field("id", &None::<()>)?,
         }
@@ -306,6 +311,7 @@ actions! {
     /// Changed: its URL, events, description, or enabled.
     WebhookUpdated => "webhook.updated",
     WebhookDeleted => "webhook.deleted",
+    WebhookDeliveryResent => "webhook.delivery_resent",
     /// A decision on a call a run waited for, recorded by an API key.
     ApprovalResolved => "approval.resolved",
     RunCancelled => "run.cancelled",
@@ -464,6 +470,7 @@ mod tests {
             AuditObject::Agent(AgentId::from_uuid(uuid)),
             AuditObject::ApiKey(ApiKeyId::from_uuid(uuid)),
             AuditObject::Webhook(WebhookEndpointId::from_uuid(uuid)),
+            AuditObject::WebhookDelivery(WebhookDeliveryId::from_uuid(uuid)),
             AuditObject::Run(RunId::from_uuid(uuid)),
             AuditObject::ToolPolicy,
             AuditObject::ConnectSettings,

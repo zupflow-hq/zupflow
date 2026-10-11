@@ -313,6 +313,15 @@ duration and timing. Response bodies, request headers and signing secrets are
 never included. Older deliveries may have only a summary;
 `attempt_history_complete` identifies those gaps without inventing attempts.
 
+Owners, admins and an API key for the endpoint's environment can resend a
+delivery with `POST …/deliveries/{delivery}/resend`, including from the Console
+in Production. It returns `201` with a new pending delivery and a fresh retry
+budget. The original event ID, exact body and previous history stay intact;
+consumers still deduplicate by event ID. Pending deliveries, disabled endpoints
+and events the endpoint no longer subscribes to answer `409`. Test events need
+no subscription. An `Idempotency-Key` replays the same response; each newly
+created resend records one `webhook.delivery_resent` audit event.
+
 Limits, per server process: one loop records events, so a slow endpoint never
 holds one up, and eight more send deliveries, so at most eight are in flight
 at once. An endpoint has at most one delivery in flight across every worker
@@ -460,7 +469,11 @@ it, forgotten registrations are registered again, and foreign or missing
 advertised issuers are refused without exchanging a code.
 Another journey checks webhook delivery history against Taskboard's actual
 signed requests: successful and failed tests, then run events across sibling
-workspaces, organizations and environments.
+workspaces, organizations and environments. It resends a failed test after the
+receiver recovers, then scoped run events, verifying identical event bytes and
+valid signatures, fresh delivery attempts, unchanged source history and one
+audit event under idempotent replay. Test-event resends exercise the real job
+queue even though test events cannot be subscribed to.
 
 To click through it yourself:
 

@@ -12,6 +12,28 @@ function fakeFetch(status: number, body: unknown, seen: Request[] = []): typeof 
 }
 
 describe("createHttpTransport", () => {
+  it("resends the named delivery without a replacement event and preserves the caller's idempotency key", async () => {
+    const seen: Request[] = [];
+    const queued = { id: "whd_new", state: "pending", attempts: 0, event_id: "evt_original" };
+    const client = createClient(
+      createHttpTransport({
+        baseUrl: "https://api.zupflow.example",
+        getToken: async () => null,
+        fetch: fakeFetch(201, { data: queued, meta: null, error: null }, seen),
+      }),
+    );
+    expect(
+      await client.webhooks.resendDelivery("org_a b", "we_c/d", "whd_e f", { idempotencyKey: "resend-once" }),
+    ).toEqual(queued);
+    const request = seen[0];
+    expect(request?.url).toBe(
+      "https://api.zupflow.example/v1/organizations/org_a%20b/webhooks/we_c%2Fd/deliveries/whd_e%20f/resend",
+    );
+    expect(request?.method).toBe("POST");
+    expect(request?.headers.get(IDEMPOTENCY_HEADER)).toBe("resend-once");
+    expect(await request?.text()).toBe("");
+  });
+
   it("scopes delivery history and attempts to the organization and endpoint, preserving filters and pages", async () => {
     const seen: Request[] = [];
     const client = createClient(

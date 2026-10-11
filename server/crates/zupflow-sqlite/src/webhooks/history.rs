@@ -275,7 +275,7 @@ pub(super) async fn list_deliveries(
     })
 }
 
-async fn detail(
+pub(super) async fn detail(
     transaction: &mut Transaction<'_, Sqlite>,
     organization_id: OrganizationId,
     endpoint_id: WebhookEndpointId,

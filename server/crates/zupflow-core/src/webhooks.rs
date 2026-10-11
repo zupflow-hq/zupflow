@@ -29,7 +29,8 @@ use sha2::Sha256;
 use crate::audit::Audit;
 use crate::environment::Environment;
 use crate::ids::{
-    InstallationId, OrganizationId, RunId, WebhookDeliveryId, WebhookEndpointId, WebhookEventId, WorkspaceId,
+    ApiKeyId, InstallationId, MemberId, OrganizationId, RunId, WebhookDeliveryId, WebhookEndpointId, WebhookEventId,
+    WorkspaceId,
 };
 use crate::jobs::{JobOptions, LeaseToken};
 use crate::keys::Sealed;
@@ -359,6 +360,30 @@ pub enum WebhookError {
     InvalidCursor,
 }
 
+/// An authenticated caller whose current authority a mutation rechecks
+/// inside its transaction. The caller cannot supply this through the API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookManager {
+    Member(MemberId),
+    ApiKey(ApiKeyId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ResendError {
+    #[error("the store is unavailable")]
+    Unavailable,
+    #[error("not found")]
+    NotFound,
+    #[error("the caller can no longer manage this endpoint")]
+    NotAllowed,
+    #[error("the delivery is still pending")]
+    Pending,
+    #[error("the endpoint is disabled")]
+    Disabled,
+    #[error("the endpoint no longer subscribes to this event")]
+    NotSubscribed,
+}
+
 #[async_trait]
 pub trait WebhookStore: Send + Sync {
     /// The organization's endpoints, oldest first; only `environment`'s when given.
@@ -474,6 +499,21 @@ pub trait WebhookStore: Send + Sync {
         cursor: Option<&str>,
         limit: u32,
     ) -> Result<Page<RecordedAttempt>, WebhookError>;
+
+    /// Creates a new pending delivery of a terminal delivery's exact event,
+    /// with a fresh job and retry budget. Its source and attempts stay intact.
+    /// Rechecks the manager, endpoint, environment, source, enabled state and
+    /// subscription in the transaction that writes the delivery, job and audit.
+    /// `webhook.test` is exempt from subscriptions, never from other checks.
+    async fn resend_delivery(
+        &self,
+        organization_id: OrganizationId,
+        endpoint_id: WebhookEndpointId,
+        environment: Environment,
+        delivery_id: WebhookDeliveryId,
+        manager: WebhookManager,
+        audit: &Audit<'_, DeliverySummary>,
+    ) -> Result<DeliverySummary, ResendError>;
 
     /// Records an attempt on a pending delivery, and the answer as its
     /// endpoint's last delivery. A failure disables an endpoint that has
