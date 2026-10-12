@@ -13,6 +13,17 @@ workspace = true
 [[bin]]
 name = "zupflow"
 path = "src/main.rs"
+required-features = ["sqlite"]
+
+# The `zupflow` binary stores everything in SQLite. A deployment that supplies
+# its own stores depends on this crate without default features and builds
+# its own binary with `bootstrap`. `local-identity` compiles in
+# `ZUPFLOW_IDENTITY=local` (every Console request is the built-in owner);
+# without it, that value stops startup.
+[features]
+default = ["sqlite", "local-identity"]
+sqlite = ["dep:zupflow-sqlite"]
+local-identity = ["zupflow-basic/local-identity"]
 
 [dependencies]
 async-trait.workspace = true
@@ -35,9 +46,11 @@ zupflow-core.workspace = true
 zupflow-mcp.workspace = true
 zupflow-oidc.workspace = true
 zupflow-outbound.workspace = true
-zupflow-sqlite.workspace = true
+zupflow-sqlite = { workspace = true, optional = true }
 
 [dev-dependencies]
+zupflow-basic = { workspace = true, features = ["local-identity"] }
+zupflow-sqlite.workspace = true
 aws-lc-rs.workspace = true
 jsonwebtoken.workspace = true
 http-body-util.workspace = true

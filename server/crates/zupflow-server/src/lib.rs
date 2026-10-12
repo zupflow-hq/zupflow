@@ -11,6 +11,7 @@ pub mod apps;
 pub mod audit;
 pub mod auth;
 pub mod auth_templates;
+pub mod bootstrap;
 pub mod config;
 pub mod connect;
 pub mod connect_oauth;

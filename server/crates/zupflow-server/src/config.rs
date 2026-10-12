@@ -16,7 +16,10 @@ pub struct Config {
     /// `ZUPFLOW_DATABASE`: the SQLite file. Defaults to `zupflow.db` in the
     /// working directory; created if missing.
     pub database: PathBuf,
-    /// `ZUPFLOW_IDENTITY`: how the Console signs in, `local` (the default) or `oidc`.
+    /// `ZUPFLOW_IDENTITY`: how the Console signs in, `oidc` or `local`.
+    /// Required: there's no default, so no deployment signs everyone in as
+    /// the owner by leaving it out. `local` exists only in a build with the
+    /// `local-identity` feature.
     pub identity: IdentityMode,
     /// `ZUPFLOW_SECRET_KEY`: 32 bytes, base64, the server's own key: API keys
     /// are hashed and idempotency fingerprints keyed under it, each use
@@ -57,6 +60,7 @@ pub enum ModelProviderMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentityMode {
     /// No sign-in: every Console request is the built-in owner. Loopback only.
+    #[cfg(feature = "local-identity")]
     Local,
     /// Any OpenID Connect provider: `ZUPFLOW_OIDC_ISSUER` and
     /// `ZUPFLOW_OIDC_AUDIENCE` (the Console's client ID), and optionally
@@ -99,6 +103,11 @@ pub enum ConfigError {
     UnknownModelProvider,
     #[error("ZUPFLOW_IDENTITY must be `local` or `oidc`")]
     UnknownIdentity,
+    #[error("ZUPFLOW_IDENTITY is required: set it to `oidc`, or to `local` for one person on their own machine")]
+    IdentityRequired,
+    /// `local` asked of a build without the `local-identity` feature.
+    #[error("ZUPFLOW_IDENTITY=local isn't available: this build has no local sign-in; set it to `oidc`")]
+    LocalNotBuilt,
     #[error("ZUPFLOW_IDENTITY=oidc needs {name}")]
     Missing { name: &'static str },
     /// `local` lets anyone who reaches the server in as the owner.
@@ -131,7 +140,11 @@ impl Config {
         let database = set("ZUPFLOW_DATABASE")?.map_or_else(|| PathBuf::from("zupflow.db"), PathBuf::from);
         let required = |name: &'static str| set(name)?.ok_or(ConfigError::Missing { name });
         let identity = match set("ZUPFLOW_IDENTITY")?.as_deref() {
-            None | Some("local") => IdentityMode::Local,
+            None => return Err(ConfigError::IdentityRequired),
+            #[cfg(feature = "local-identity")]
+            Some("local") => IdentityMode::Local,
+            #[cfg(not(feature = "local-identity"))]
+            Some("local") => return Err(ConfigError::LocalNotBuilt),
             Some("oidc") => IdentityMode::Oidc {
                 issuer: required("ZUPFLOW_OIDC_ISSUER")?,
                 audience: required("ZUPFLOW_OIDC_AUDIENCE")?,
@@ -139,6 +152,7 @@ impl Config {
             },
             Some(_) => return Err(ConfigError::UnknownIdentity),
         };
+        #[cfg(feature = "local-identity")]
         if identity == IdentityMode::Local && !listen.ip().is_loopback() {
             return Err(ConfigError::LocalNeedsLoopback);
         }
@@ -242,21 +256,97 @@ fn valid_origin(origin: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// What `oidc` needs, so each test sets only what it's about.
+    const OIDC: [(&str, &str); 4] = [
+        ("ZUPFLOW_IDENTITY", "oidc"),
+        ("ZUPFLOW_OIDC_ISSUER", "https://idp.example"),
+        ("ZUPFLOW_OIDC_AUDIENCE", "console"),
+        ("ZUPFLOW_SECRET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+    ];
+
+    /// The configuration from exactly `vars`; everything else unset.
+    fn only(vars: &[(&'static str, &str)]) -> Result<Config, ConfigError> {
+        let vars: Vec<(&'static str, String)> = vars.iter().map(|(name, value)| (*name, (*value).to_owned())).collect();
+        Config::from_vars(move |name| {
+            Ok(vars
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.clone()))
+        })
+    }
+
+    /// A working `oidc` configuration with `vars` set over it.
+    fn oidc_with(vars: &[(&'static str, &str)]) -> Result<Config, ConfigError> {
+        let mut all = vars.to_vec();
+        all.extend(
+            OIDC.into_iter()
+                .filter(|(name, _)| !vars.iter().any(|(key, _)| key == name)),
+        );
+        only(&all)
+    }
+
     #[test]
     fn listens_on_loopback_unless_told_otherwise() {
-        let config = Config::from_vars(|_| Ok(None)).expect("defaults are valid");
+        let config = oidc_with(&[]).expect("defaults are valid");
         assert_eq!(config.listen, SocketAddr::from(([127, 0, 0, 1], 8080)));
         assert_eq!(config.log, "info");
         assert_eq!(config.database, PathBuf::from("zupflow.db"));
-        assert_eq!(config.identity, IdentityMode::Local);
         assert_eq!(config.public_url, "http://localhost:8080");
     }
 
     #[test]
-    fn takes_a_public_url_that_is_an_origin() {
-        let public = |value: &'static str| {
-            Config::from_vars(move |name| Ok((name == "ZUPFLOW_PUBLIC_URL").then(|| value.to_owned())))
+    fn requires_the_sign_in_to_be_named() {
+        let unset = only(&OIDC[1..]);
+        assert!(matches!(unset, Err(ConfigError::IdentityRequired)));
+        assert!(matches!(
+            oidc_with(&[("ZUPFLOW_IDENTITY", "")]),
+            Err(ConfigError::Empty {
+                name: "ZUPFLOW_IDENTITY"
+            })
+        ));
+        for unknown in ["none", "LOCAL", "Oidc", "oidc "] {
+            assert!(
+                matches!(
+                    oidc_with(&[("ZUPFLOW_IDENTITY", unknown)]),
+                    Err(ConfigError::UnknownIdentity)
+                ),
+                "{unknown}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "local-identity"))]
+    #[test]
+    fn refuses_local_sign_in_when_it_is_not_built() {
+        assert!(matches!(
+            only(&[("ZUPFLOW_IDENTITY", "local")]),
+            Err(ConfigError::LocalNotBuilt)
+        ));
+    }
+
+    #[cfg(feature = "local-identity")]
+    #[test]
+    fn signs_in_locally_only_when_asked_and_only_on_loopback() {
+        let local = |vars: &[(&'static str, &str)]| {
+            let mut all = vec![("ZUPFLOW_IDENTITY", "local")];
+            all.extend_from_slice(vars);
+            only(&all)
         };
+        let config = local(&[]).expect("local is valid on its own");
+        assert_eq!(config.identity, IdentityMode::Local);
+        assert_eq!(config.secret_key, None, "local generates one when unset");
+        for address in ["0.0.0.0:8080", "[::]:8080", "192.168.1.5:8080"] {
+            let config = local(&[("ZUPFLOW_LISTEN", address)]);
+            assert!(matches!(config, Err(ConfigError::LocalNeedsLoopback)), "{address}");
+        }
+        for address in ["127.0.0.1:9000", "[::1]:9000"] {
+            assert!(local(&[("ZUPFLOW_LISTEN", address)]).is_ok(), "{address}");
+        }
+    }
+
+    #[test]
+    fn takes_a_public_url_that_is_an_origin() {
+        let public = |value: &'static str| oidc_with(&[("ZUPFLOW_PUBLIC_URL", value)]);
         assert_eq!(
             public("https://zupflow.example/").expect("an origin").public_url,
             "https://zupflow.example"
@@ -282,10 +372,8 @@ mod tests {
 
     #[test]
     fn takes_one_console_origin_and_stops_on_anything_else() {
-        let console = |value: &'static str| {
-            Config::from_vars(move |name| Ok((name == "ZUPFLOW_CONSOLE_ORIGIN").then(|| value.to_owned())))
-        };
-        assert_eq!(Config::from_vars(|_| Ok(None)).expect("defaults").console_origin, None);
+        let console = |value: &'static str| oidc_with(&[("ZUPFLOW_CONSOLE_ORIGIN", value)]);
+        assert_eq!(oidc_with(&[]).expect("defaults").console_origin, None);
         assert_eq!(
             console("https://Console.Zupflow.example/")
                 .expect("an origin")
@@ -323,18 +411,8 @@ mod tests {
     }
 
     #[test]
-    fn refuses_local_sign_in_beyond_loopback() {
-        for address in ["0.0.0.0:8080", "[::]:8080", "192.168.1.5:8080"] {
-            let config = Config::from_vars(|name| Ok((name == "ZUPFLOW_LISTEN").then(|| address.to_owned())));
-            assert!(matches!(config, Err(ConfigError::LocalNeedsLoopback)), "{address}");
-        }
-        for address in ["127.0.0.1:9000", "[::1]:9000"] {
-            let config = Config::from_vars(|name| Ok((name == "ZUPFLOW_LISTEN").then(|| address.to_owned())));
-            assert!(config.is_ok(), "{address}");
-        }
-        let origins = |value: &'static str| {
-            Config::from_vars(move |name| Ok((name == "ZUPFLOW_ALLOWED_ORIGINS").then(|| value.to_owned())))
-        };
+    fn takes_allowed_origins_and_stops_on_anything_else() {
+        let origins = |value: &'static str| oidc_with(&[("ZUPFLOW_ALLOWED_ORIGINS", value)]);
         assert_eq!(
             origins("http://localhost:5173, https://console.example")
                 .expect("valid origins")
@@ -344,22 +422,11 @@ mod tests {
         for bad in ["localhost:5173", "http://x/path", "*", "http://"] {
             assert!(matches!(origins(bad), Err(ConfigError::InvalidOrigins)), "{bad}");
         }
-        let oidc = |vars: &'static [(&'static str, &'static str)]| {
-            Config::from_vars(move |name| {
-                Ok(vars
-                    .iter()
-                    .find(|(key, _)| *key == name)
-                    .map(|(_, value)| (*value).to_owned()))
-            })
-        };
-        let configured = oidc(&[
-            ("ZUPFLOW_IDENTITY", "oidc"),
-            ("ZUPFLOW_LISTEN", "0.0.0.0:8080"),
-            ("ZUPFLOW_OIDC_ISSUER", "https://idp.example"),
-            ("ZUPFLOW_OIDC_AUDIENCE", "console"),
-            ("ZUPFLOW_SECRET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
-        ])
-        .expect("oidc may listen beyond loopback");
+    }
+
+    #[test]
+    fn signs_in_with_oidc_given_its_provider_and_a_secret_key() {
+        let configured = oidc_with(&[("ZUPFLOW_LISTEN", "0.0.0.0:8080")]).expect("oidc may listen beyond loopback");
         assert_eq!(
             configured.identity,
             IdentityMode::Oidc {
@@ -369,54 +436,35 @@ mod tests {
             }
         );
         assert!(matches!(
-            oidc(&[
-                ("ZUPFLOW_IDENTITY", "oidc"),
-                ("ZUPFLOW_OIDC_ISSUER", "https://idp.example")
-            ]),
+            only(&OIDC[..2]),
             Err(ConfigError::Missing {
                 name: "ZUPFLOW_OIDC_AUDIENCE"
             })
         ));
         assert!(
-            matches!(
-                oidc(&[
-                    ("ZUPFLOW_IDENTITY", "oidc"),
-                    ("ZUPFLOW_OIDC_ISSUER", "https://idp.example"),
-                    ("ZUPFLOW_OIDC_AUDIENCE", "console"),
-                ]),
-                Err(ConfigError::SecretKeyRequired)
-            ),
+            matches!(only(&OIDC[..3]), Err(ConfigError::SecretKeyRequired)),
             "oidc keeps the secret key outside the database"
         );
-        for bad in [
-            oidc(&[("ZUPFLOW_SECRET_KEY", "not base64!")]),
-            oidc(&[("ZUPFLOW_SECRET_KEY", "AAAA")]),
-        ] {
-            assert!(matches!(bad, Err(ConfigError::InvalidSecretKey)));
+        for bad in ["not base64!", "AAAA"] {
+            assert!(matches!(
+                oidc_with(&[("ZUPFLOW_SECRET_KEY", bad)]),
+                Err(ConfigError::InvalidSecretKey)
+            ));
         }
-        assert_eq!(
-            Config::from_vars(|_| Ok(None)).expect("defaults").secret_key,
-            None,
-            "local generates one when unset"
-        );
         assert!(matches!(
-            oidc(&[(
+            oidc_with(&[(
                 "ZUPFLOW_API_KEY_HASH_KEY",
                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
             )]),
             Err(ConfigError::Renamed { .. })
         ));
-        let unknown = Config::from_vars(|name| Ok((name == "ZUPFLOW_IDENTITY").then(|| "none".to_owned())));
-        assert!(matches!(unknown, Err(ConfigError::UnknownIdentity)));
     }
 
     #[test]
     fn offers_the_models_it_is_given_and_stops_on_a_mistyped_list() {
-        let models = |value: &'static str| {
-            Config::from_vars(move |name| Ok((name == "ZUPFLOW_MODELS").then(|| value.to_owned())))
-        };
+        let models = |value: &'static str| oidc_with(&[("ZUPFLOW_MODELS", value)]);
         assert_eq!(
-            Config::from_vars(|_| Ok(None)).expect("defaults").models,
+            oidc_with(&[]).expect("defaults").models,
             ConfiguredModels::none(),
             "none unless configured"
         );
@@ -440,11 +488,9 @@ mod tests {
 
     #[test]
     fn answers_runs_with_the_scripted_model_only_when_asked() {
-        let provider = |value: &'static str| {
-            Config::from_vars(move |name| Ok((name == "ZUPFLOW_MODEL_PROVIDER").then(|| value.to_owned())))
-        };
+        let provider = |value: &'static str| oidc_with(&[("ZUPFLOW_MODEL_PROVIDER", value)]);
         assert_eq!(
-            Config::from_vars(|_| Ok(None)).expect("defaults").model_provider,
+            oidc_with(&[]).expect("defaults").model_provider,
             ModelProviderMode::None,
             "no provider unless configured: runs fail rather than answer from a script"
         );
@@ -465,7 +511,7 @@ mod tests {
 
     #[test]
     fn refuses_an_invalid_address_instead_of_falling_back() {
-        let error = Config::from_vars(|name| Ok((name == "ZUPFLOW_LISTEN").then(|| "everywhere".to_owned())));
+        let error = oidc_with(&[("ZUPFLOW_LISTEN", "everywhere")]);
         assert!(matches!(
             error,
             Err(ConfigError::InvalidAddress { name: "ZUPFLOW_LISTEN" })
@@ -474,7 +520,7 @@ mod tests {
 
     #[test]
     fn refuses_an_empty_or_unreadable_value_instead_of_treating_it_as_unset() {
-        let empty = Config::from_vars(|name| Ok((name == "ZUPFLOW_LOG").then(String::new)));
+        let empty = oidc_with(&[("ZUPFLOW_LOG", "")]);
         assert!(matches!(empty, Err(ConfigError::Empty { name: "ZUPFLOW_LOG" })));
         let unreadable = Config::from_vars(|name| {
             if name == "ZUPFLOW_LISTEN" {

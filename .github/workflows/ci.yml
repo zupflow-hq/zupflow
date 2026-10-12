@@ -17,6 +17,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
+      # The debug builds, the contract fixtures and the browser fill the
+      # runner's disk; drop toolchains this job never uses.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
@@ -63,4 +69,8 @@ jobs:
           workspaces: server
           key: release
       - run: cargo build --release --locked -p zupflow-server
+        working-directory: server
+      # A deployment with its own stores builds without default features,
+      # so without `ZUPFLOW_IDENTITY=local`: that build must keep compiling.
+      - run: cargo clippy --locked -p zupflow-server --no-default-features --all-targets -- -D warnings
         working-directory: server

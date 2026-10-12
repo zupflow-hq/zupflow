@@ -8,6 +8,6 @@
     "typecheck": "cargo fmt --check && cargo clippy --workspace --all-targets --locked --features zupflow-contract/local-apps -- -D warnings",
     "test": "cargo test --workspace --locked --features zupflow-contract/local-apps",
     "build": "cargo build --workspace --locked",
-    "dev": "cargo run --bin zupflow"
+    "dev": "ZUPFLOW_IDENTITY=local cargo run --bin zupflow"
   }
 }

@@ -116,7 +116,7 @@ Requires Rust (the version is pinned in `server/rust-toolchain.toml`; rustup
 picks it up).
 
 ```bash
-pnpm --filter @zupflow/server dev   # or: cd server && cargo run --bin zupflow
+pnpm --filter @zupflow/server dev   # or: cd server && ZUPFLOW_IDENTITY=local cargo run --bin zupflow
 ```
 
 It listens on `127.0.0.1:8080` (`ZUPFLOW_LISTEN`), keeps its data in one
@@ -124,8 +124,11 @@ SQLite file (`ZUPFLOW_DATABASE`, default `zupflow.db`, created readable by its
 owner only) and logs JSON (`ZUPFLOW_LOG`, a tracing filter). An invalid, empty
 or non-UTF-8 value stops startup rather than falling back.
 
-Console sign-in defaults to `ZUPFLOW_IDENTITY=local`: no sign-in, every Console
-request is one built-in owner (`owner@local.invalid`). Because that trusts
+`ZUPFLOW_IDENTITY` is required: there's no default, and unset stops startup.
+The `dev` script sets `ZUPFLOW_IDENTITY=local`, for one person on their own
+machine: no sign-in, every Console request is one built-in owner
+(`owner@local.invalid`). It exists only in a build with the `local-identity`
+feature (on by default; a build without it refuses `local`). Because that trusts
 anyone who can reach the port, the server refuses to start with it on
 anything but a loopback address, and answers only requests addressed to
 `localhost`, `127.0.0.1` or `[::1]` and its port, so a web page can't reach it

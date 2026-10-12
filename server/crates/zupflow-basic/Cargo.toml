@@ -10,6 +10,12 @@ publish.workspace = true
 [lints]
 workspace = true
 
+# `local-identity`: `LocalIdentity`, Console sign-in that makes every request
+# the built-in owner, for one person on their own machine. Off unless a crate
+# asks for it, so a deployment can't select what it doesn't contain.
+[features]
+local-identity = []
+
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true

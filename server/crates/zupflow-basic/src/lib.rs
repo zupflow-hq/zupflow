@@ -8,6 +8,8 @@ pub mod in_process_events;
 pub mod in_process_metrics;
 #[cfg(unix)]
 pub mod local_files;
+// Signs every Console request in as the owner: compiled only when asked for.
+#[cfg(feature = "local-identity")]
 pub mod local_identity;
 pub mod local_keys;
 pub mod memory_cache;
