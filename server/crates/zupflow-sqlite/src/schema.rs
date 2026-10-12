@@ -65,6 +65,10 @@ const TABLES: &[(&str, Scoping)] = &[
     ("runs", Scoping::Workspace),
     ("run_events", Scoping::Workspace),
     ("run_tool_calls", Scoping::Workspace),
+    ("run_transitions", Scoping::Workspace),
+    ("run_turns", Scoping::Workspace),
+    ("run_model_attempts", Scoping::Workspace),
+    ("run_call_attempts", Scoping::Workspace),
     // An event names its workspace, except the test button's, which has none.
     ("webhook_endpoints", Scoping::Organization),
     ("webhook_events", Scoping::Organization),

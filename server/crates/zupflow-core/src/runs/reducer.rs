@@ -20,7 +20,7 @@
 //! | any other, no claim held | `Claim` under a fresh claimant, or idle while another lease or a send claim is live |
 //! | a call failed for a reconnect | `Finish` failed |
 //! | `NeedModel` | `PrepareModel` + call the model; `Finish` past the turn limit; `Yield` past the step budget |
-//! | `AwaitModel` with its answer | `CommitTurn`; `Finish` failed; `Yield` when the model is unavailable |
+//! | `AwaitModel` with its answer | `CommitTurn`; `Finish` failed; `Yield` when the model is unavailable, `Finish` failed `model_unavailable` on the job's last attempt |
 //! | `AwaitModel` without one | `PrepareModel` of a new attempt, the old one abandoned |
 //! | `NeedCall` | `Park`, `AuthorizeCall` (send or refuse) + send; `Yield` past the step budget |
 //! | `AwaitCall`, send lease live | `Yield` until it lapses (the store reads when, from its own records) |
@@ -28,6 +28,7 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::audit::AuditActor;
 use crate::ids::{ApiKeyId, InstallationId, OrganizationId, RunId, ToolCallId, WorkspaceId};
 use crate::models::{Completion, Message, ModelToolCall, Reply, ToolSpec, Turn, validate_completion, validate_turn};
 use crate::runs::digest::{Sha256Digest, call_digest, digest_json};
@@ -57,6 +58,10 @@ pub const UNKNOWN: &str =
 /// The failure code of a call that needs its installation reconnected; a
 /// call failing with it fails the run (decision 0047).
 pub const RECONNECT_REQUIRED: &str = "installation_reconnect_required";
+
+/// The failure code of a run whose model gave no answer on its job's last
+/// attempt.
+pub const MODEL_UNAVAILABLE: &str = "model_unavailable";
 
 /// The limits a worker runs under. Facts, so tests choose them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +170,10 @@ pub struct Facts {
     pub invocation_id: Option<InvocationId>,
     /// The sender's outcome.
     pub sent: Option<SendResult>,
+    /// Whether the job this worker holds is on its last attempt: a model
+    /// that gives no answer then fails the run, as it always has, instead of
+    /// leaving it for the sweep.
+    pub last_attempt: bool,
 }
 
 impl Facts {
@@ -183,6 +192,7 @@ impl Facts {
             send_check: None,
             invocation_id: None,
             sent: None,
+            last_attempt: false,
         }
     }
 }
@@ -978,6 +988,10 @@ impl Worker<'_> {
             ));
         }
         let completion = match &answer.result {
+            // On the job's last attempt the run fails now, as it always has.
+            ModelResult::Unavailable if self.facts.last_attempt => {
+                return Ok(self.fail(MODEL_UNAVAILABLE, "The model provider did not respond in time."));
+            }
             // Release the claim at once, so the retry doesn't wait out the
             // lease, and record that nothing answered.
             ModelResult::Unavailable => {
@@ -1338,6 +1352,8 @@ pub struct Approval<'a> {
     pub call_id: ToolCallId,
     pub decision: ApprovalDecision,
     pub api_key_id: ApiKeyId,
+    /// The key's name, as the audit log records it.
+    pub api_key_name: &'a str,
     /// For a denial, what the model reads back.
     pub reason: Option<&'a str>,
 }
@@ -1366,6 +1382,7 @@ pub fn resolve_approval(
         call_id,
         decision,
         api_key_id,
+        api_key_name,
         reason,
     } = approval;
     let snapshot = in_scope(organization_id, workspace_id, snapshot)?;
@@ -1404,6 +1421,7 @@ pub fn resolve_approval(
             call_digest: call.call_digest,
             decision,
             api_key_id,
+            api_key_name: api_key_name.to_owned(),
             reason: reason.map(str::to_owned),
             outcome,
             next,
@@ -1414,13 +1432,15 @@ pub fn resolve_approval(
 /// Cancels a run that isn't finished: every open call closed with
 /// `run_cancelled`, no claim or send after it. A send already authorized
 /// may still complete; its outcome is recorded. `request_id` is fresh for
-/// each caller's request.
+/// each caller's request; `actor` is who asked, as the timeline and the
+/// audit log name them.
 pub fn cancel(
     organization_id: OrganizationId,
     workspace_id: WorkspaceId,
     snapshot: &Snapshot,
     request_id: RequestId,
     source: RunTrigger,
+    actor: AuditActor,
 ) -> Result<TransitionRequest, ControlError> {
     let snapshot = in_scope(organization_id, workspace_id, snapshot)?;
     if snapshot.control.status.is_terminal() {
@@ -1438,6 +1458,7 @@ pub fn cancel(
         Operation::Cancel(Cancel {
             request_id,
             source,
+            actor,
             closing,
             abandons: prepared_attempt(snapshot),
         }),

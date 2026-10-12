@@ -37,11 +37,14 @@
 //!   sweep's own operations.
 //! - [`names`]: the names tools reach the model by (decision 0047).
 //! - [`digest`]: canonical JSON digests, the call digest among them.
+//! - [`store`]: [`store::DurableRunStore`], whose `apply` commits each
+//!   transition with everything it implies.
 
 pub mod digest;
 pub mod names;
 pub mod reducer;
 pub mod state;
+pub mod store;
 pub mod transition;
 
 use async_trait::async_trait;

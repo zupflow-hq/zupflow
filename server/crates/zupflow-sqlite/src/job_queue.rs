@@ -103,8 +103,9 @@ pub(crate) async fn insert_job<'e, E: sqlx::Executor<'e, Database = Sqlite>>(
     insert_job_at(executor, scope, kind, payload, options, millis(SystemTime::now())).await
 }
 
-/// [`insert_job`], at `now` (milliseconds).
-async fn insert_job_at<'e, E: sqlx::Executor<'e, Database = Sqlite>>(
+/// [`insert_job`], at `now` (milliseconds): for a store that keeps its own
+/// clock.
+pub(crate) async fn insert_job_at<'e, E: sqlx::Executor<'e, Database = Sqlite>>(
     executor: E,
     scope: &Scope,
     kind: &Name,

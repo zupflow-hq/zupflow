@@ -15,6 +15,7 @@ use std::fmt;
 use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 
+use crate::audit::AuditActor;
 use crate::ids::{AgentId, ApiKeyId, OrganizationId, RunId, SessionId, ToolCallId, WorkspaceId};
 use crate::runs::digest::{Sha256Digest, digest_json};
 use crate::runs::names::Offer;
@@ -245,6 +246,8 @@ pub struct ResolveApproval {
     pub call_digest: Option<Sha256Digest>,
     pub decision: ApprovalDecision,
     pub api_key_id: ApiKeyId,
+    /// The key's name as the audit log records it.
+    pub api_key_name: String,
     pub reason: Option<String>,
     /// For a denial, what the model reads back.
     #[serde(serialize_with = "ser::call_outcome_option")]
@@ -361,6 +364,9 @@ pub struct Cancel {
     pub request_id: RequestId,
     /// Who asked.
     pub source: RunTrigger,
+    /// Who asked, as the timeline (`cancelled_by`) and the audit log name
+    /// them.
+    pub actor: AuditActor,
     pub closing: Closing,
     pub abandons: Option<ModelAttemptRef>,
 }

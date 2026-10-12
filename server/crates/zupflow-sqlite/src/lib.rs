@@ -6,6 +6,8 @@
 //! - [`SqliteAuditStore`]: the audit log, which every store writes with the change it records.
 //! - [`SqliteAppStore`]: catalog apps and workspace apps.
 //! - [`SqliteConnectStore`]: Connect settings and sessions.
+//! - [`SqliteDurableRunStore`]: runs as the durable engine advances them,
+//!   one transition at a time.
 //! - [`SqliteIdempotencyStore`]: idempotency keys for `POST`.
 //! - [`SqliteInstallationStore`]: installations and their sealed credentials.
 //! - [`SqliteJobQueue`]: the job queue, in the same database.
@@ -26,6 +28,7 @@ mod apps;
 mod audit;
 mod connect;
 mod database;
+mod durable_runs;
 mod idempotency;
 mod installations;
 mod job_queue;
@@ -44,6 +47,7 @@ pub use apps::SqliteAppStore;
 pub use audit::SqliteAuditStore;
 pub use connect::SqliteConnectStore;
 pub use database::{Database, DatabaseError};
+pub use durable_runs::SqliteDurableRunStore;
 pub use idempotency::SqliteIdempotencyStore;
 pub use installations::SqliteInstallationStore;
 pub use job_queue::SqliteJobQueue;

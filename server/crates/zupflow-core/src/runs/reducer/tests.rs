@@ -61,7 +61,16 @@ fn approval(call_id: ToolCallId, decision: ApprovalDecision, reason: Option<&str
         call_id,
         decision,
         api_key_id: api_key(),
+        api_key_name: "Backend",
         reason,
+    }
+}
+
+/// Who cancels, as the timeline and the audit log name them.
+fn canceller() -> AuditActor {
+    AuditActor::ApiKey {
+        id: api_key(),
+        name: "Backend".to_owned(),
     }
 }
 
@@ -926,6 +935,43 @@ fn a_failed_or_unusable_answer_fails_the_run_and_an_unavailable_one_yields() {
             ..
         })
     ));
+    // On the job's last attempt the run fails at once, the attempt
+    // abandoned, rather than waiting for the sweep.
+    let last = Facts {
+        last_attempt: true,
+        ..unavailable.clone()
+    };
+    let plan = planned(&snapshot, &last);
+    assert_eq!(failure_code(&plan), MODEL_UNAVAILABLE);
+    assert_eq!(guards(&plan), releases(1));
+    assert!(matches!(
+        operation(&plan),
+        Operation::Finish(Finish {
+            abandons: Some(ModelAttemptRef { turn: 0, attempt: 1 }),
+            ..
+        })
+    ));
+    let mut ended = snapshot.clone();
+    step(&mut ended, &last);
+    assert_eq!(ended.control.status, RunStatus::Failed);
+    assert_eq!(ended.model_attempts[0].state, ModelAttemptState::Abandoned);
+    // An answer on the last attempt is taken as any other.
+    let answered_last = Facts {
+        last_attempt: true,
+        model: Some(ModelAnswer {
+            turn: 0,
+            attempt: 1,
+            result: ModelResult::Answered(Completion {
+                reply: Reply::Text("Done.".to_owned()),
+                usage: TokenUsage::default(),
+            }),
+        }),
+        ..claimed()
+    };
+    assert!(matches!(
+        operation(&planned(&snapshot, &answered_last)),
+        Operation::CommitTurn(_)
+    ));
     let failed = Facts {
         model: Some(ModelAnswer {
             turn: 0,
@@ -1655,7 +1701,15 @@ fn cancel_closes_every_call_not_yet_sent() {
         .push(record(3, 2, WORK_CREATE, CallState::AwaitingApproval));
     snapshot.calls.push(record(4, 3, WORK_CREATE, CallState::Approved));
     snapshot.calls.push(record(5, 4, WORK_CREATE, CallState::Refused));
-    let request = cancel(organization(), workspace(), &snapshot, caller(1), RunTrigger::Console).expect("cancels");
+    let request = cancel(
+        organization(),
+        workspace(),
+        &snapshot,
+        caller(1),
+        RunTrigger::Console,
+        canceller(),
+    )
+    .expect("cancels");
     let Operation::Cancel(cancel_op) = request.operation() else {
         panic!("cancels");
     };
@@ -1678,12 +1732,39 @@ fn cancel_closes_every_call_not_yet_sent() {
         let mut finished = running(Continuation::Done);
         finished.control.status = status;
         assert_eq!(
-            cancel(organization(), workspace(), &finished, caller(1), RunTrigger::Api),
+            cancel(
+                organization(),
+                workspace(),
+                &finished,
+                caller(1),
+                RunTrigger::Api,
+                canceller()
+            ),
             Err(ControlError::Finished)
         );
     }
-    assert!(cancel(organization(), workspace(), &parked(), caller(1), RunTrigger::Api).is_ok());
-    assert!(cancel(organization(), workspace(), &fresh(), caller(1), RunTrigger::Api).is_ok());
+    assert!(
+        cancel(
+            organization(),
+            workspace(),
+            &parked(),
+            caller(1),
+            RunTrigger::Api,
+            canceller()
+        )
+        .is_ok()
+    );
+    assert!(
+        cancel(
+            organization(),
+            workspace(),
+            &fresh(),
+            caller(1),
+            RunTrigger::Api,
+            canceller()
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -1855,6 +1936,7 @@ fn every_operation_says_where_it_leaves_the_run() {
             Operation::Cancel(Cancel {
                 request_id: caller(1),
                 source: RunTrigger::Api,
+                actor: canceller(),
                 closing: closing.clone(),
                 abandons: None,
             }),
@@ -2368,7 +2450,15 @@ fn a_worker_that_dies_before_the_answer_is_committed_asks_again() {
 #[test]
 fn a_cancel_after_authorization_records_the_send_and_runs_nothing_after() {
     let mut run = sending(30_000);
-    let cancelled = cancel(organization(), workspace(), &run, caller(1), RunTrigger::Api).expect("cancels");
+    let cancelled = cancel(
+        organization(),
+        workspace(),
+        &run,
+        caller(1),
+        RunTrigger::Api,
+        canceller(),
+    )
+    .expect("cancels");
     commit(&mut run, &cancelled, at(0));
     assert_eq!(run.control.status, RunStatus::Cancelled);
     assert_eq!(run.calls[1].state, CallState::Refused, "the call not sent is closed");
@@ -2483,7 +2573,15 @@ fn a_step_is_its_claimants_own() {
 #[test]
 fn a_dead_senders_call_on_a_cancelled_run_is_settled_after_its_lease() {
     let mut run = sending(30_000);
-    let cancelled = cancel(organization(), workspace(), &run, caller(1), RunTrigger::Api).expect("cancels");
+    let cancelled = cancel(
+        organization(),
+        workspace(),
+        &run,
+        caller(1),
+        RunTrigger::Api,
+        canceller(),
+    )
+    .expect("cancels");
     commit(&mut run, &cancelled, at(0));
     // Its sender never answers. Until the send lease lapses, wait.
     assert_eq!(planned(&run, &facts()), Plan::Idle(Idle::Busy { until: at(30_000) }));
@@ -2568,7 +2666,14 @@ fn control_operations_refuse_a_run_of_another_scope() {
             Err(ControlError::NotFound)
         );
         assert_eq!(
-            cancel(organization_id, workspace_id, &parked(), caller(1), RunTrigger::Api),
+            cancel(
+                organization_id,
+                workspace_id,
+                &parked(),
+                caller(1),
+                RunTrigger::Api,
+                canceller()
+            ),
             Err(ControlError::NotFound)
         );
         assert_eq!(
@@ -2602,6 +2707,7 @@ fn a_run_ended_while_awaiting_the_model_abandons_the_attempt() {
         &awaiting_model(),
         caller(1),
         RunTrigger::Api,
+        canceller(),
     )
     .expect("cancels");
     assert!(matches!(
@@ -2644,7 +2750,17 @@ fn two_callers_of_one_control_operation_conflict() {
         first,
         "the same caller's retry replays"
     );
-    let cancel_by = |n| cancel(organization(), workspace(), &snapshot, caller(n), RunTrigger::Api).expect("cancels");
+    let cancel_by = |n| {
+        cancel(
+            organization(),
+            workspace(),
+            &snapshot,
+            caller(n),
+            RunTrigger::Api,
+            canceller(),
+        )
+        .expect("cancels")
+    };
     assert_eq!(cancel_by(1), cancel_by(1));
     assert_ne!(cancel_by(1).digest(), cancel_by(2).digest());
     let mut lapsed = running(Continuation::NeedModel { turn: 0 });

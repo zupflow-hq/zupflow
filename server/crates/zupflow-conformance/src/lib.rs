@@ -15,6 +15,7 @@ pub mod approval_policy;
 pub mod audit_store;
 pub mod cache;
 pub mod connect_store;
+pub mod durable_run_store;
 pub mod event_bus;
 pub mod idempotency_store;
 pub mod identity;

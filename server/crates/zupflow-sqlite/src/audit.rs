@@ -35,8 +35,18 @@ pub(crate) async fn record(
     organization_id: OrganizationId,
     entry: &AuditEntry,
 ) -> Result<AuditEventId, sqlx::Error> {
+    record_at(connection, organization_id, entry, Timestamp::now()).await
+}
+
+/// [`record`], at `at`: for a store that keeps its own clock.
+pub(crate) async fn record_at(
+    connection: &mut SqliteConnection,
+    organization_id: OrganizationId,
+    entry: &AuditEntry,
+    at: Timestamp,
+) -> Result<AuditEventId, sqlx::Error> {
     let id = AuditEventId::generate();
-    let created_at = Timestamp::now().millis();
+    let created_at = at.millis();
     let written = match entry.place {
         AuditPlace::Workspace(workspace_id) => sqlx::query(
             "INSERT INTO audit_events (id, organization_id, workspace_id, environment, actor_type, actor_id, \

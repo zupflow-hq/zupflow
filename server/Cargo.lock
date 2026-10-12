@@ -2974,6 +2974,7 @@ dependencies = [
  "axum",
  "serde_json",
  "tokio",
+ "uuid",
  "zupflow-core",
 ]
 
