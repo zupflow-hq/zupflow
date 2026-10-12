@@ -211,7 +211,13 @@ export function advanceRun(db: Db, run: RunRow, at: string, rng: Rng): StepOutco
       run.usage.output_tokens += 20 + Math.floor(rng() * 60);
       return "continue";
 
-    case "approval":
+    case "approval": {
+      // Nobody is asked about a call whose installation went: it's refused.
+      const gone = goneFor(db, run, step.call);
+      if (gone) {
+        refuseCall(db, run, step.call, gone, at);
+        return "continue";
+      }
       run.status = "waiting_for_approval";
       pushEvent(db, run, at, "approval.requested", {
         call_id: step.call.call_id,
@@ -222,6 +228,7 @@ export function advanceRun(db: Db, run: RunRow, at: string, rng: Rng): StepOutco
         arguments: step.call.arguments,
       });
       return "paused";
+    }
 
     case "tool_call": {
       const { result: _result, error: _error, ...ref } = step.call;
@@ -271,6 +278,78 @@ export function advanceRun(db: Db, run: RunRow, at: string, rng: Rng): StepOutco
       finish(db, run, at, step.error);
       return "finished";
   }
+}
+
+/** How an installation went away (decision 0047): deleted, or disconnected. */
+export type InstallationGone = "removed" | "disconnected";
+
+/** Whether the call's installation went, read within the run's own workspace. */
+function goneFor(db: Db, run: RunRow, call: PlannedCall): InstallationGone | null {
+  const installation = db.installations.find((i) => sameWorkspace(i, run) && i.id === call.installation_id);
+  if (!installation) return "removed";
+  return installation.status === "disconnected" ? "disconnected" : null;
+}
+
+/**
+ * Refuses a call whose installation went, never sent: its timeline shows why,
+ * its steps leave the plan, and the run says it skipped it, as a denial does.
+ */
+function refuseCall(db: Db, run: RunRow, call: PlannedCall, gone: InstallationGone, at: string) {
+  const error: RunError =
+    gone === "removed"
+      ? { code: "installation_removed", message: `${call.installation_label} was removed, so this call wasn't made.` }
+      : {
+          code: "installation_disconnected",
+          message: `${call.installation_label} was disconnected, so this call wasn't made.`,
+        };
+  pushEvent(db, run, at, "tool_call.failed", {
+    call_id: call.call_id,
+    installation_id: call.installation_id,
+    installation_label: call.installation_label,
+    app_name: call.app_name,
+    tool: call.tool,
+    error,
+    duration_ms: 0,
+  });
+  run.plan = run.plan.filter(
+    (s) => !((s.kind === "tool_call" || s.kind === "tool_result") && s.call.call_id === call.call_id),
+  );
+  for (const s of run.plan) {
+    if (s.kind === "complete") s.parts = s.parts.filter((p) => p.call_id !== call.call_id);
+  }
+  run.plan.unshift({ kind: "message", text: `Skipping ${call.tool} on ${call.installation_label} — ${error.message}` });
+}
+
+/**
+ * Refuses the call each run of the workspace waits on for approval through
+ * `installationId`, once it was deleted or disconnected (decision 0047): the
+ * run moves on without anyone deciding, and a decision sent later answers
+ * `409 not_waiting`. The backend does this in a job the installation's change
+ * queues; the mock at once. Only runs of exactly this organization and
+ * workspace are read. The runs that moved on, to schedule.
+ */
+export function refuseWaitingOn(
+  db: Db,
+  scope: { organization_id: RunRow["organization_id"]; workspace_id: RunRow["workspace_id"] },
+  installationId: PlannedCall["installation_id"],
+  gone: InstallationGone,
+  at: string,
+): RunRow[] {
+  const moved: RunRow[] = [];
+  for (const run of db.runs) {
+    if (!sameWorkspace(run, scope) || run.status !== "waiting_for_approval") continue;
+    const events = timelineOf(db, run);
+    const requested = [...events].reverse().find((event) => event.type === "approval.requested");
+    if (requested?.type !== "approval.requested" || requested.data.installation_id !== installationId) continue;
+    const callId = requested.data.call_id;
+    if (events.some((event) => event.type === "approval.resolved" && event.data.call_id === callId)) continue;
+    const step = run.plan.find((s) => s.kind === "tool_call" && s.call.call_id === callId);
+    if (step?.kind !== "tool_call") continue;
+    refuseCall(db, run, step.call, gone, at);
+    run.status = "running";
+    moved.push(run);
+  }
+  return moved;
 }
 
 /** A run as the audit log names it: by its agent, within the run's own workspace. */

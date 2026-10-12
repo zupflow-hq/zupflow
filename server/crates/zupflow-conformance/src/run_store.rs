@@ -27,6 +27,10 @@
 //!   claim is held once; an outcome that arrives after the call was settled
 //!   unknown is kept as evidence only; a model attempt left by a stopped
 //!   worker is marked abandoned.
+//! - **Installations that go away** (decision 0047): a call waiting for
+//!   approval on one is refused, parked on or not yet, only with the reason
+//!   it went, and its run moves on; the runs such calls wait in are found
+//!   only in their own workspace.
 //!
 //! The suite drives runs with the reducer (`advance`) where a worker would,
 //! and builds the requests a buggy or stale caller would by hand. Its
@@ -52,8 +56,9 @@ use zupflow_core::models::{Completion, ModelToolCall, Reply, TokenUsage};
 use zupflow_core::runs::digest::{Sha256Digest, call_digest};
 use zupflow_core::runs::names::{Candidate, Offer, build_offer};
 use zupflow_core::runs::reducer::{
-    Approval, Facts, InstallationCheck, Io, ModelAnswer, ModelResult, Plan, SendCheck, SendRequest, SendResult, admit,
-    advance, calls_to_decide, cancel, fail_abandoned, resolve_approval,
+    Approval, Facts, Gone, INSTALLATION_DISCONNECTED, INSTALLATION_REMOVED, InstallationCheck, Io, ModelAnswer,
+    ModelResult, Plan, SendCheck, SendRequest, SendResult, admit, advance, calls_to_decide, cancel, fail_abandoned,
+    refuse_waiting, resolve_approval,
 };
 use zupflow_core::runs::state::{
     CallDecision, CallVerdict, ClaimantId, Continuation, EXECUTION_VERSION, InvocationId, ModelAttemptState, RequestId,
@@ -64,8 +69,8 @@ use zupflow_core::runs::store::{
 };
 use zupflow_core::runs::transition::{
     Authorization, AuthorizeCall, Claim, Closing, CommitTurn, Conflict, Finish, Guards, NewCall, Operation, OwnerGuard,
-    PrepareModel, RecordOutcome, RunEnding, SendGuard, SendLease, SendOutcome, SettleUnknown, Settlement,
-    TransitionRequest, Yield, YieldReason,
+    PrepareModel, RecordOutcome, RefuseWaiting, RunEnding, SendGuard, SendLease, SendOutcome, SettleUnknown,
+    Settlement, TransitionRequest, Yield, YieldReason,
 };
 use zupflow_core::runs::{
     ApprovalDecision, CallState, Failure, NewRun, OrganizationRunFilter, RunEventType, RunFilter, RunStatus,
@@ -380,9 +385,33 @@ fn facts(stores: &Stores<'_>, who: ClaimantId, epoch: Option<u64>) -> Facts {
     }
 }
 
-/// The plan `advance` makes for the run as committed.
+/// The plan `advance` makes for the run as committed. At a call waiting for
+/// approval, the worker found its installation still there, unless `facts`
+/// say otherwise.
 async fn plan(stores: &Stores<'_>, at: At, facts: &Facts) -> Plan {
-    advance(&snapshot(stores, at).await, facts).expect("a plan")
+    let snapshot = snapshot(stores, at).await;
+    let mut facts = facts.clone();
+    if facts.send_check.is_none() {
+        facts.send_check = parking_check(&snapshot, InstallationCheck::Usable);
+    }
+    advance(&snapshot, &facts).expect("a plan")
+}
+
+/// The check of the call waiting for approval the run is at, before it parks
+/// on it: its installation as `installation` says.
+fn parking_check(snapshot: &Snapshot, installation: InstallationCheck) -> Option<SendCheck> {
+    let Continuation::NeedCall { turn, position } = snapshot.control.continuation else {
+        return None;
+    };
+    let call = snapshot
+        .call_at(turn, position)
+        .filter(|call| call.state == CallState::AwaitingApproval)?;
+    Some(SendCheck {
+        call_id: call.id,
+        installation,
+        definition_sha256: call.target.as_ref().map(|target| target.definition_sha256),
+        decision: call.decision.clone()?,
+    })
 }
 
 fn request(plan: &Plan) -> TransitionRequest {
@@ -605,6 +634,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     cancel_beats_an_authorization_not_yet_committed(&stores, a, agent_a).await;
     records_a_send_authorized_before_a_cancel(&stores, a, agent_a).await;
     holds_a_send_claim_once(&stores, a, agent_a).await;
+    refuses_a_waiting_call_whose_installation_went(&stores, a, b, agent_a, agent_sibling, agent_b).await;
     keeps_a_late_outcome_as_evidence(&stores, a, agent_a).await;
     abandons_a_model_attempt_a_stopped_worker_left(&stores, a, agent_a).await;
     yields_without_using_an_attempt(&stores, a, agent_a).await;
@@ -1668,6 +1698,372 @@ async fn decides_only_the_call_the_run_waits_on(stores: &Stores<'_>, a: Tenant, 
     );
     let stop = cancel(org, a.workspace, &decided, caller(), RunTrigger::Api, person()).unwrap();
     committed(apply(stores, at, &stop).await);
+}
+
+/// A call waiting for approval on an installation that was deleted or
+/// disconnected (decision 0047): refused before the run parks on it, or,
+/// once parked, by the job the installation's change queued, only with the
+/// reason it went; the run moves on and its job is queued. The runs such
+/// calls wait in are found only in their own workspace and organization.
+async fn refuses_a_waiting_call_whose_installation_went(
+    stores: &Stores<'_>,
+    a: Tenant,
+    b: Tenant,
+    agent_a: AgentId,
+    agent_sibling: AgentId,
+    agent_b: AgentId,
+) {
+    let org = a.organization_id;
+    // The same installation ID in a run of each other scope, parked on it:
+    // none is found, or refused, from here, nor this one from there.
+    let mut elsewhere = Vec::new();
+    for (organization, workspace, agent) in [
+        (org, a.sibling, agent_sibling),
+        (b.organization_id, b.workspace, agent_b),
+    ] {
+        let there = admitted(stores, organization, workspace, agent, "Elsewhere").await;
+        let who = claimant();
+        let epoch = claim(stores, there, who).await;
+        prepare(stores, there, who, epoch).await;
+        answer(stores, there, who, epoch, calls(&[("m1", CREATE)]), |_| {
+            needs_approval()
+        })
+        .await;
+        step(stores, there, &facts(stores, who, Some(epoch))).await;
+        assert_eq!(
+            snapshot(stores, there).await.control.status,
+            RunStatus::WaitingForApproval
+        );
+        elsewhere.push(there);
+    }
+
+    // Parked on a call to Personal, a second one to Personal after it.
+    let at = admitted(stores, org, a.workspace, agent_a, "Waiting").await;
+    let who = claimant();
+    let epoch = claim(stores, at, who).await;
+    prepare(stores, at, who, epoch).await;
+    answer(
+        stores,
+        at,
+        who,
+        epoch,
+        calls(&[("m1", CREATE), ("m2", CREATE), ("m3", LIST)]),
+        |name| if name == LIST { allow() } else { needs_approval() },
+    )
+    .await;
+    // Not parked yet: found all the same, for the job to wait on.
+    assert_eq!(
+        stores
+            .runs
+            .runs_waiting_on(org, a.workspace, personal(), None, 10)
+            .await
+            .unwrap(),
+        [at.run]
+    );
+    step(stores, at, &facts(stores, who, Some(epoch))).await;
+    let parked = snapshot(stores, at).await;
+    assert_eq!(parked.control.status, RunStatus::WaitingForApproval);
+    let (first, second) = (parked.calls[0].id, parked.calls[1].id);
+    assert_eq!(
+        parked.control.continuation,
+        Continuation::AwaitApproval { call_id: first }
+    );
+
+    for there in &elsewhere {
+        assert_eq!(
+            stores
+                .runs
+                .runs_waiting_on(there.org, there.ws, personal(), None, 10)
+                .await
+                .unwrap(),
+            [there.run],
+            "each scope finds its own"
+        );
+    }
+    for (organization, workspace) in [
+        (org, a.sibling),
+        (b.organization_id, b.workspace),
+        (b.organization_id, a.workspace),
+        (org, b.workspace),
+    ] {
+        let found = stores
+            .runs
+            .runs_waiting_on(organization, workspace, personal(), None, 10)
+            .await
+            .unwrap();
+        assert!(!found.contains(&at.run), "another scope never finds it");
+    }
+    assert_eq!(
+        stores
+            .runs
+            .runs_waiting_on(org, a.workspace, personal(), None, 10)
+            .await
+            .unwrap(),
+        [at.run]
+    );
+    assert!(
+        stores
+            .runs
+            .runs_waiting_on(org, a.workspace, work(), None, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing waits on another installation"
+    );
+    assert!(
+        stores
+            .runs
+            .runs_waiting_on(org, a.workspace, personal(), Some(at.run), 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "paged after a run"
+    );
+
+    // The job's request, applied in another scope: not found, nothing changed.
+    let request = refuse_waiting(org, a.workspace, &parked, caller(), personal(), Gone::Removed).unwrap();
+    let before = state(stores, at).await;
+    for (organization, workspace) in [
+        (org, a.sibling),
+        (b.organization_id, b.workspace),
+        (b.organization_id, a.workspace),
+    ] {
+        assert_eq!(
+            stores.runs.apply(organization, workspace, &request).await,
+            Err(StoreError::NotFound)
+        );
+    }
+    assert_eq!(state(stores, at).await, before, "nothing changed");
+    // Nor can the job reach another scope's run with this run's request.
+    for there in &elsewhere {
+        let theirs = state(stores, *there).await;
+        let pretend = TransitionRequest::new(
+            there.org,
+            there.ws,
+            there.run,
+            theirs.0.control.revision,
+            Guards::default(),
+            request.operation().clone(),
+        );
+        assert!(matches!(
+            apply(stores, *there, &pretend).await,
+            Err(StoreError::Refused(_))
+        ));
+        assert_eq!(state(stores, *there).await, theirs, "another run, untouched");
+    }
+
+    // By hand: only the call the run waits on, only for its installation,
+    // only with the reason it went, moving on as it leads, unclaimed.
+    let Operation::RefuseWaiting(refuse) = request.operation().clone() else {
+        panic!("a refusal");
+    };
+    let owned = Guards {
+        owner: Some(OwnerGuard {
+            epoch,
+            claimant: who,
+            renew_lease_ms: None,
+        }),
+        ..Guards::default()
+    };
+    for (guards, operation, why) in [
+        (
+            Guards::default(),
+            RefuseWaiting {
+                call_id: second,
+                ..refuse.clone()
+            },
+            "a call the run doesn't wait on",
+        ),
+        (
+            Guards::default(),
+            RefuseWaiting {
+                installation_id: work(),
+                ..refuse.clone()
+            },
+            "an installation the call isn't bound to",
+        ),
+        (
+            Guards::default(),
+            RefuseWaiting {
+                failure: Failure::new("tool_refused", "No."),
+                ..refuse.clone()
+            },
+            "another reason",
+        ),
+        (
+            Guards::default(),
+            RefuseWaiting {
+                next: Continuation::NeedModel { turn: 1 },
+                ..refuse.clone()
+            },
+            "a next step it doesn't lead to",
+        ),
+    ] {
+        let by_hand = by_hand(stores, at, guards, Operation::RefuseWaiting(operation)).await;
+        refuses_with_nothing_written(stores, at, &by_hand, why).await;
+    }
+    // A parked run has no owner whose claim could fence it.
+    let claimed = by_hand(stores, at, owned, Operation::RefuseWaiting(refuse.clone())).await;
+    refuses_without_change(
+        stores,
+        at,
+        &claimed,
+        Ok(Applied::Conflict(Conflict::Owner)),
+        "under a claim",
+    )
+    .await;
+
+    // The job's request commits: the call refused, never sent, the run
+    // running again at the next call, its job queued.
+    jobs_of(stores, RUN_JOB, Some(at.run)).await;
+    let receipt = committed(apply(stores, at, &request).await);
+    assert_eq!(
+        (receipt.status, receipt.continuation, receipt.lease_until),
+        (
+            RunStatus::Running,
+            Continuation::NeedCall { turn: 0, position: 1 },
+            None
+        )
+    );
+    assert_eq!(kinds(&receipt), [RunEventType::ToolCallFailed], "the timeline says why");
+    assert_eq!(receipt.events[0].data["call_id"], json!(first));
+    assert_eq!(receipt.events[0].data["error"]["code"], INSTALLATION_REMOVED);
+    assert_eq!(
+        receipt.events[0].data["error"]["message"],
+        "Personal was removed, so this call wasn't made."
+    );
+    let job = run_job(stores, at).await.expect("the run's job, queued with it");
+    assert_eq!(job.scope, Scope::Workspace(org, a.workspace));
+    stores.jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+    let refused = snapshot(stores, at).await;
+    let call = refused.call(first).unwrap();
+    assert_eq!(call.state, CallState::Refused);
+    assert_eq!(
+        call.outcome
+            .as_ref()
+            .map(|outcome| (outcome.content.as_str(), outcome.is_error)),
+        Some(("Personal was removed, so this call wasn't made.", true)),
+        "what the model reads back"
+    );
+    assert_eq!(call.approval, None, "nobody decided it");
+    assert!(call.attempts.is_empty(), "never authorized to send");
+    // The same request again: the same receipt, nothing more.
+    let again = committed(apply(stores, at, &request).await);
+    assert_eq!(
+        (again.to_revision, again.events.clone()),
+        (receipt.to_revision, receipt.events.clone())
+    );
+    assert!(run_job(stores, at).await.is_none(), "no second job");
+    // Another job's, or a decision, from the same revision: one winner.
+    let late = refuse_waiting(org, a.workspace, &parked, caller(), personal(), Gone::Removed).unwrap();
+    assert_eq!(
+        apply(stores, at, &late).await,
+        Ok(Applied::Conflict(Conflict::Revision))
+    );
+    let (key, name) = api_key();
+    let decision = resolve_approval(
+        org,
+        a.workspace,
+        &parked,
+        caller(),
+        Approval {
+            call_id: first,
+            decision: ApprovalDecision::Approved,
+            api_key_id: key,
+            api_key_name: name,
+            reason: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        apply(stores, at, &decision).await,
+        Ok(Applied::Conflict(Conflict::Revision))
+    );
+    assert!(
+        resolve_approval(
+            org,
+            a.workspace,
+            &refused,
+            caller(),
+            Approval {
+                call_id: first,
+                decision: ApprovalDecision::Approved,
+                api_key_id: key,
+                api_key_name: name,
+                reason: None,
+            },
+        )
+        .is_err(),
+        "a decision rebuilt from the run as it is: not waiting"
+    );
+
+    // The next call waits for approval on the same installation, now
+    // disconnected: refused before the run parks on it, only with that reason.
+    let who = claimant();
+    let epoch = claim(stores, at, who).await;
+    let at_call = snapshot(stores, at).await;
+    let mut wrong = facts(stores, who, Some(epoch));
+    wrong.send_check = parking_check(&at_call, InstallationCheck::Disconnected);
+    let Operation::AuthorizeCall(mut authorize) = request_of(&advance(&at_call, &wrong).unwrap()) else {
+        panic!("a refusal at the call");
+    };
+    let Authorization::Refuse { outcome, failure } = authorize.authorization.clone() else {
+        panic!("refused");
+    };
+    assert_eq!(failure.code, INSTALLATION_DISCONNECTED);
+    authorize.authorization = Authorization::Refuse {
+        outcome: outcome.clone(),
+        failure: Failure::new("tool_refused", "No."),
+    };
+    let other_reason = by_hand(stores, at, owner(epoch, who, true), Operation::AuthorizeCall(authorize)).await;
+    refuses_with_nothing_written(
+        stores,
+        at,
+        &other_reason,
+        "a waiting call refused for another reason than its installation",
+    )
+    .await;
+    let (_, refused_here) = step(stores, at, &wrong).await;
+    assert_eq!(kinds(&refused_here), [RunEventType::ToolCallFailed]);
+    assert_eq!(refused_here.events[0].data["error"]["code"], INSTALLATION_DISCONNECTED);
+    assert_eq!(refused_here.status, RunStatus::Running, "never parked");
+    assert_eq!(
+        refused_here.continuation,
+        Continuation::NeedCall { turn: 0, position: 2 },
+        "on to the next call"
+    );
+    assert_eq!(
+        snapshot(stores, at).await.call(second).unwrap().state,
+        CallState::Refused
+    );
+    assert!(
+        stores
+            .runs
+            .runs_waiting_on(org, a.workspace, personal(), None, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing waits on it any more"
+    );
+    let stop = cancel(
+        org,
+        a.workspace,
+        &snapshot(stores, at).await,
+        caller(),
+        RunTrigger::Api,
+        person(),
+    )
+    .unwrap();
+    committed(apply(stores, at, &stop).await);
+    for there in elsewhere {
+        let theirs = snapshot(stores, there).await;
+        let stop = cancel(there.org, there.ws, &theirs, caller(), RunTrigger::Api, person()).unwrap();
+        committed(apply(stores, there, &stop).await);
+    }
+}
+
+fn request_of(plan: &Plan) -> Operation {
+    request(plan).operation().clone()
 }
 
 /// A model that gives no answer uses one of the job's attempts each time;

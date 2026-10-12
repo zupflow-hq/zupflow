@@ -10,7 +10,9 @@
 //!
 //! The worker's steps come from [`advance`]. The others have their own pure
 //! constructors: [`admit`] (the API), [`resolve_approval`] (an API key),
-//! [`cancel`] (the API or the Console) and [`fail_abandoned`] (the sweep).
+//! [`cancel`] (the API or the Console), [`fail_abandoned`] (the sweep) and
+//! [`refuse_waiting`] (the job an installation's deletion or disconnection
+//! queues).
 //!
 //! | Continuation | Plan |
 //! | --- | --- |
@@ -22,7 +24,7 @@
 //! | `NeedModel` | `PrepareModel` + call the model; `Finish` past the turn limit; `Yield` past the step budget |
 //! | `AwaitModel` with its answer | `CommitTurn`; `Finish` failed; `Yield` when the model is unavailable, `Finish` failed `model_unavailable` on the job's last attempt |
 //! | `AwaitModel` without one | `PrepareModel` of a new attempt, the old one abandoned |
-//! | `NeedCall` | `Park`, `AuthorizeCall` (send or refuse) + send; `Yield` past the step budget |
+//! | `NeedCall` | `Park`, or `AuthorizeCall` refusing a call waiting for approval whose installation went away; `AuthorizeCall` (send or refuse) + send; `Yield` past the step budget |
 //! | `AwaitCall`, send lease live | `Yield` until it lapses (the store reads when, from its own records) |
 //! | `AwaitCall`, send lease lapsed | `SettleUnknown` |
 
@@ -39,8 +41,8 @@ use crate::runs::state::{
 };
 use crate::runs::transition::{
     Admit, Authorization, AuthorizeCall, Cancel, Claim, Closing, CommitTurn, FailAbandoned, Finish, Guards,
-    ModelAttemptRef, NewCall, Operation, OwnerGuard, Park, PrepareModel, RecordOutcome, ResolveApproval, RunEnding,
-    SendGuard, SendLease, SendOutcome, SettleUnknown, Settlement, TransitionRequest, Yield, YieldReason,
+    ModelAttemptRef, NewCall, Operation, OwnerGuard, Park, PrepareModel, RecordOutcome, RefuseWaiting, ResolveApproval,
+    RunEnding, SendGuard, SendLease, SendOutcome, SettleUnknown, Settlement, TransitionRequest, Yield, YieldReason,
 };
 use crate::runs::{ApprovalDecision, CallOutcome, CallState, Failure, NewRun, RunStatus, RunTrigger};
 use crate::time::Timestamp;
@@ -62,6 +64,51 @@ pub const RECONNECT_REQUIRED: &str = "installation_reconnect_required";
 /// The failure code of a run whose model gave no answer on its job's last
 /// attempt.
 pub const MODEL_UNAVAILABLE: &str = "model_unavailable";
+
+/// The failure code of a call whose installation was deleted (decision
+/// 0047): refused, and the run goes on.
+pub const INSTALLATION_REMOVED: &str = "installation_removed";
+
+/// The failure code of a call whose installation was disconnected (decision
+/// 0047): refused, and the run goes on.
+pub const INSTALLATION_DISCONNECTED: &str = "installation_disconnected";
+
+/// How an installation went away (decision 0047).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gone {
+    /// Deleted: its row is gone.
+    Removed,
+    /// Its credential was deleted; the row is kept.
+    Disconnected,
+}
+
+impl Gone {
+    /// The code a call to the installation labelled `label` is refused with,
+    /// and what the model and the timeline read.
+    pub fn refusal(self, label: &str) -> (&'static str, String) {
+        match self {
+            Self::Removed => (
+                INSTALLATION_REMOVED,
+                format!("{label} was removed, so this call wasn't made."),
+            ),
+            Self::Disconnected => (
+                INSTALLATION_DISCONNECTED,
+                format!("{label} was disconnected, so this call wasn't made."),
+            ),
+        }
+    }
+}
+
+impl InstallationCheck {
+    /// How the installation went away, if it did.
+    pub fn gone(self) -> Option<Gone> {
+        match self {
+            Self::Removed => Some(Gone::Removed),
+            Self::Disconnected => Some(Gone::Disconnected),
+            Self::Usable | Self::ReconnectRequired | Self::Unusable => None,
+        }
+    }
+}
 
 /// The limits a worker runs under. Facts, so tests choose them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +172,9 @@ pub enum InstallationCheck {
     Unusable,
 }
 
-/// A call checked again just before it's sent.
+/// A call checked again just before it's sent, or, for a call waiting for
+/// approval, just before the run parks on it: then only its installation
+/// counts, and `decision` is the one recorded with the call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendCheck {
     pub call_id: ToolCallId,
@@ -1144,9 +1193,61 @@ impl Worker<'_> {
             return Ok(plan);
         }
         match call.state {
-            CallState::AwaitingApproval => Ok(self.park(call, None)),
+            CallState::AwaitingApproval => self.park_waiting(call),
             CallState::Allowed | CallState::Approved => self.authorize(call),
             _ => Err(AdvanceError::InvalidSnapshot("the next call isn't open")),
+        }
+    }
+
+    /// The send check for `call`, which the driver must give.
+    fn send_check(&self, call: &CallRecord) -> Result<&SendCheck, AdvanceError> {
+        let check = self
+            .facts
+            .send_check
+            .as_ref()
+            .ok_or(AdvanceError::MissingFact("send_check"))?;
+        if check.call_id != call.id {
+            return Err(AdvanceError::InvalidFact("a send check for another call"));
+        }
+        Ok(check)
+    }
+
+    /// Refuses `call` at this step, never sent, with `code` and `message`.
+    fn refuse(
+        &self,
+        call: &CallRecord,
+        decision: &CallDecision,
+        code: &str,
+        message: String,
+    ) -> Result<Plan, AdvanceError> {
+        let operation = Operation::AuthorizeCall(AuthorizeCall {
+            call_id: call.id,
+            decision: decision.clone(),
+            authorization: Authorization::Refuse {
+                outcome: refused(message.clone()),
+                failure: Failure::new(code, message),
+            },
+            next: next_after(self.snapshot, call)?,
+        });
+        Ok(self.apply(self.keeps(), operation, Io::Nothing))
+    }
+
+    /// Parks the run on a call waiting for approval, unless its installation
+    /// went away (decision 0047): then nobody is asked, and the call is
+    /// refused with why. Checked here as well as by the job the deletion or
+    /// disconnection queued, which only finds runs already parked.
+    fn park_waiting(&self, call: &CallRecord) -> Result<Plan, AdvanceError> {
+        let target = call
+            .target
+            .as_ref()
+            .ok_or(AdvanceError::InvalidSnapshot("an open call without a target"))?;
+        let check = self.send_check(call)?;
+        match check.installation.gone() {
+            Some(gone) => {
+                let (code, message) = gone.refusal(&target.installation_label);
+                self.refuse(call, &check.decision, code, message)
+            }
+            None => Ok(self.park(call, None)),
         }
     }
 
@@ -1166,41 +1267,15 @@ impl Worker<'_> {
             .target
             .as_ref()
             .ok_or(AdvanceError::InvalidSnapshot("an open call without a target"))?;
-        let check = self
-            .facts
-            .send_check
-            .as_ref()
-            .ok_or(AdvanceError::MissingFact("send_check"))?;
-        if check.call_id != call.id {
-            return Err(AdvanceError::InvalidFact("a send check for another call"));
-        }
+        let check = self.send_check(call)?;
         let label = &target.installation_label;
-        let refuse = |code: &str, message: String| {
-            let operation = Operation::AuthorizeCall(AuthorizeCall {
-                call_id: call.id,
-                decision: check.decision.clone(),
-                authorization: Authorization::Refuse {
-                    outcome: refused(message.clone()),
-                    failure: Failure::new(code, message),
-                },
-                next: next_after(self.snapshot, call)?,
-            });
-            Ok(self.apply(self.keeps(), operation, Io::Nothing))
-        };
+        let refuse = |code: &str, message: String| self.refuse(call, &check.decision, code, message);
+        if let Some(gone) = check.installation.gone() {
+            let (code, message) = gone.refusal(label);
+            return refuse(code, message);
+        }
         match check.installation {
-            InstallationCheck::Usable => {}
-            InstallationCheck::Removed => {
-                return refuse(
-                    "installation_removed",
-                    format!("{label} was removed, so this call wasn't made."),
-                );
-            }
-            InstallationCheck::Disconnected => {
-                return refuse(
-                    "installation_disconnected",
-                    format!("{label} was disconnected, so this call wasn't made."),
-                );
-            }
+            InstallationCheck::Usable | InstallationCheck::Removed | InstallationCheck::Disconnected => {}
             InstallationCheck::Unusable => {
                 return refuse(
                     "tool_refused",
@@ -1437,6 +1512,71 @@ pub fn resolve_approval(
             next,
         }),
     ))
+}
+
+/// Refuses the call the run waits on for approval because its installation,
+/// `installation_id`, went away (decision 0047): the call is never sent, and
+/// the run goes on without asking anyone. The job the installation's
+/// deletion or disconnection queued builds it; `request_id` is fresh for
+/// each of its requests. [`ControlError::NotWaiting`] unless the run waits
+/// for a decision on a call to that installation.
+pub fn refuse_waiting(
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    snapshot: &Snapshot,
+    request_id: RequestId,
+    installation_id: InstallationId,
+    gone: Gone,
+) -> Result<TransitionRequest, ControlError> {
+    let snapshot = in_scope(organization_id, workspace_id, snapshot)?;
+    let control = &snapshot.control;
+    if !supports(control.execution_version) {
+        return Err(ControlError::UnsupportedVersion(control.execution_version));
+    }
+    let Continuation::AwaitApproval { call_id } = control.continuation else {
+        return Err(ControlError::NotWaiting);
+    };
+    let call = snapshot
+        .call(call_id)
+        .filter(|call| control.status == RunStatus::WaitingForApproval && call.state == CallState::AwaitingApproval)
+        .ok_or(ControlError::NotWaiting)?;
+    let target = call
+        .target
+        .as_ref()
+        .filter(|target| target.installation_id == installation_id)
+        .ok_or(ControlError::NotWaiting)?;
+    let (code, message) = gone.refusal(&target.installation_label);
+    Ok(request(
+        snapshot,
+        Guards::default(),
+        Operation::RefuseWaiting(RefuseWaiting {
+            request_id,
+            call_id,
+            installation_id,
+            outcome: refused(message.clone()),
+            failure: Failure::new(code, message),
+            next: next_after(snapshot, call)?,
+        }),
+    ))
+}
+
+/// Whether a worker may be about to park the run on a call waiting for
+/// approval on `installation_id`: the run is at that call and hasn't parked.
+/// The worker read the installation before parking, perhaps before it went,
+/// so the job that refuses such calls waits for the park rather than miss it.
+pub fn may_park_on(snapshot: &Snapshot, installation_id: InstallationId) -> bool {
+    let control = &snapshot.control;
+    let Continuation::NeedCall { turn, position } = control.continuation else {
+        return false;
+    };
+    control.status == RunStatus::Running
+        && snapshot.call_at(turn, position).is_some_and(|call| {
+            call.state == CallState::AwaitingApproval
+                && call
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| target.installation_id == installation_id)
+        })
 }
 
 /// Cancels a run that isn't finished: every open call closed with

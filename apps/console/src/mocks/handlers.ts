@@ -106,7 +106,7 @@ import type {
 } from "./model";
 import { levelInForce, levelRowsOf, levelsInput, policyRowOf, setLevels, toAppToolLevel, toToolPolicy } from "./policy";
 import { hash, token } from "./random";
-import { cancelRun, enqueueRun, planRun, resolveApproval, runTarget } from "./runner";
+import { cancelRun, enqueueRun, planRun, refuseWaitingOn, resolveApproval, runTarget } from "./runner";
 import { appIn, configurationOf, inWorkspace, issueShortId, runEventsKey, timelineOf } from "./scope";
 import {
   acceptChange,
@@ -1789,6 +1789,8 @@ export function createHandlers(apiBase: string) {
         if (row.status === "disconnected") return ok(toInstallation(row));
         row.status = "disconnected";
         row.updated_at = new Date().toISOString();
+        const scope = { organization_id: access.org.id, workspace_id: access.workspace.id };
+        for (const run of refuseWaitingOn(db(), scope, row.id, "disconnected", row.updated_at)) scheduleRun(run);
         announceLifecycle(
           access.org.id,
           access.workspace.id,
@@ -1897,6 +1899,8 @@ export function createHandlers(apiBase: string) {
         const d = db();
         d.grants = d.grants.filter((g) => !(inWorkspace(g, access.workspace) && g.installation_id === row.id));
         d.installations = d.installations.filter((i) => i !== row);
+        const scope = { organization_id: access.org.id, workspace_id: access.workspace.id };
+        for (const run of refuseWaitingOn(d, scope, row.id, "removed", new Date().toISOString())) scheduleRun(run);
         announceLifecycle(
           access.org.id,
           access.workspace.id,

@@ -25,6 +25,11 @@
 //! of the workspace and of its environment, as a notification: listeners
 //! read the timeline from the store.
 //!
+//! The same worker takes the job an installation's deletion or
+//! disconnection queues ([`REFUSE_WAITING_JOB`], decision 0047): it refuses
+//! each call waiting for approval on that installation, through
+//! [`refuse_waiting`] and the store, so those runs move on.
+//!
 //! [`ApprovalPolicy`]: zupflow_core::policy::ApprovalPolicy
 
 use std::collections::{BTreeMap, HashMap};
@@ -42,11 +47,13 @@ use zupflow_core::policy::{CallApp, Decision, GrantedAs, OrganizationLevel, Tool
 use zupflow_core::runs::digest::{Sha256Digest, call_digest};
 use zupflow_core::runs::names::{Candidate, Offer, OfferedTool, build_offer};
 use zupflow_core::runs::reducer::{
-    Facts, Idle, InstallationCheck, Io, Limits, ModelAnswer, ModelRequest, ModelResult, Plan, SendCheck, SendRequest,
-    SendResult, advance, calls_to_decide, fail_abandoned,
+    Facts, Gone, Idle, InstallationCheck, Io, Limits, ModelAnswer, ModelRequest, ModelResult, Plan, SendCheck,
+    SendRequest, SendResult, advance, calls_to_decide, fail_abandoned, may_park_on, refuse_waiting,
 };
 use zupflow_core::runs::state::{CallDecision, CallRecord, CallVerdict, ClaimantId, InvocationId, RequestId, Snapshot};
-use zupflow_core::runs::store::{Applied, RUN_JOB, RunStore, StoreError, run_of_job};
+use zupflow_core::runs::store::{
+    Applied, REFUSE_WAITING_JOB, RUN_JOB, RunStore, StoreError, installation_of_job, run_of_job,
+};
 use zupflow_core::runs::transition::{Conflict, Operation, SendOutcome};
 use zupflow_core::runs::{CallState, Failure, RunEvent};
 use zupflow_core::scope::{Name, Scope};
@@ -70,6 +77,10 @@ const IDLE: Duration = Duration::from_secs(1);
 
 /// How often the worker looks for runs no job takes forward.
 const SWEEP: Duration = Duration::from_secs(60);
+
+/// How long the job refusing calls on an installation that went waits for a
+/// run a worker may be about to park on one.
+const PARKING: Duration = Duration::from_secs(2);
 
 /// The limits a worker runs under: the reducer's, with the lease above.
 fn limits() -> Limits {
@@ -443,17 +454,18 @@ impl<P: ToolPort> Driver<'_, P> {
                 }
                 Some(_) => {}
             },
-            Continuation::NeedCall { turn, position } => {
-                if let Some(call) = snapshot
-                    .call_at(turn, position)
-                    .filter(|call| matches!(call.state, CallState::Allowed | CallState::Approved))
-                {
+            Continuation::NeedCall { turn, position } => match snapshot.call_at(turn, position) {
+                Some(call) if matches!(call.state, CallState::Allowed | CallState::Approved) => {
                     let (check, opened) = self.send_check(call).await?;
                     facts.send_check = Some(check);
                     facts.invocation_id = Some(InvocationId::from_uuid(Uuid::now_v7()));
                     *reach = opened;
                 }
-            }
+                Some(call) if call.state == CallState::AwaitingApproval => {
+                    facts.send_check = Some(self.parking_check(call).await?);
+                }
+                _ => {}
+            },
             Continuation::AwaitApproval { .. } | Continuation::AwaitCall { .. } | Continuation::Done => {}
         }
         Ok(facts)
@@ -676,6 +688,28 @@ impl<P: ToolPort> Driver<'_, P> {
             },
             opened,
         ))
+    }
+
+    /// A call waiting for approval, checked before the run parks on it: only
+    /// whether its installation is still there and connected counts, so
+    /// nobody is asked about a call that can't be made (decision 0047). Its
+    /// server isn't reached, and its decision stays the one recorded.
+    async fn parking_check(&self, call: &CallRecord) -> Result<SendCheck, &'static str> {
+        let (Some(target), Some(decision)) = (&call.target, &call.decision) else {
+            // A call waiting for approval always has both; the store says so.
+            return Err("run_inconsistent");
+        };
+        let installation = match self.installation(target.installation_id).await? {
+            None => InstallationCheck::Removed,
+            Some(found) if found.status == InstallationStatus::Disconnected => InstallationCheck::Disconnected,
+            Some(_) => InstallationCheck::Usable,
+        };
+        Ok(SendCheck {
+            call_id: call.id,
+            installation,
+            definition_sha256: Some(target.definition_sha256),
+            decision: decision.clone(),
+        })
     }
 
     async fn installation(&self, installation_id: InstallationId) -> Result<Option<Installation>, &'static str> {
@@ -916,13 +950,14 @@ pub async fn sweep(state: &AppState) -> usize {
     abandoned.len()
 }
 
-/// Claims and works one run's job, if one is due. Whether one was.
+/// Claims and works one job, if one is due: a run's, or one refusing the
+/// calls waiting on an installation that went. Whether one was.
 pub async fn work_once(state: &AppState) -> bool {
-    let Ok(kind) = Name::new(RUN_AGENT) else {
+    let (Ok(run), Ok(refusals)) = (Name::new(RUN_AGENT), Name::new(REFUSE_WAITING_JOB)) else {
         return false;
     };
     // Cross-tenant by design: a worker takes the next job of any scope.
-    let job = match state.jobs.claim_next(std::slice::from_ref(&kind), LEASE).await {
+    let job = match state.jobs.claim_next(&[run, refusals.clone()], LEASE).await {
         Ok(Some(job)) => job,
         Ok(None) => return false,
         Err(error) => {
@@ -930,8 +965,187 @@ pub async fn work_once(state: &AppState) -> bool {
             return false;
         }
     };
-    handle(state, &McpTools::new(state), job).await;
+    if job.kind == refusals {
+        handle_refusals(state, job).await;
+    } else {
+        handle(state, &McpTools::new(state), job).await;
+    }
     true
+}
+
+/// What came of refusing one run's waiting call.
+enum Refusal {
+    /// Refused, or nothing to refuse now.
+    Done,
+    /// A worker may be about to park the run on such a call.
+    MayPark,
+    /// The store couldn't be read or written.
+    Retry,
+}
+
+/// The job an installation's deletion or disconnection queued in its
+/// transaction (decision 0047): every call waiting for approval on it is
+/// refused, `installation_removed` or `installation_disconnected` as the
+/// installation is found now, and its run moves on. A run a worker may be
+/// about to park on such a call is waited for; one reconnected since keeps
+/// its calls waiting.
+async fn handle_refusals(state: &AppState, job: Job) {
+    let Job {
+        id,
+        scope,
+        payload,
+        attempt,
+        lease,
+        ..
+    } = job;
+    let (Scope::Workspace(organization_id, workspace_id), Some(installation_id)) =
+        (scope, installation_of_job(&payload))
+    else {
+        tracing::error!(event = "runs.malformed_job", kind = REFUSE_WAITING_JOB);
+        if let Ok(reason) = Name::new("malformed") {
+            let _ = state.jobs.bury(&scope, id, &lease, &reason).await;
+        }
+        return;
+    };
+    let outcome = refuse_waiting_calls(state, organization_id, workspace_id, installation_id).await;
+    let finished = match outcome {
+        Outcome::Complete | Outcome::Leave => state.jobs.complete(&scope, id, &lease).await,
+        Outcome::Postpone(until) => {
+            let after = until.millis().saturating_sub(state.clock.now().millis());
+            let after = Duration::from_millis(u64::try_from(after).unwrap_or(0));
+            state.jobs.postpone(&scope, id, &lease, after).await
+        }
+        Outcome::Retry(why) => match Name::new(why) {
+            Ok(reason) => {
+                let after = Duration::from_secs(5 * u64::from(attempt.max(1)));
+                state.jobs.retry(&scope, id, &lease, after, &reason).await.map(|_| ())
+            }
+            Err(_) => state.jobs.complete(&scope, id, &lease).await,
+        },
+    };
+    if let Err(error) = finished {
+        tracing::warn!(event = "runs.refusals_finish_failed", %organization_id, %workspace_id, %installation_id, %error);
+    }
+}
+
+async fn refuse_waiting_calls(
+    state: &AppState,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    installation_id: InstallationId,
+) -> Outcome {
+    let gone = match state
+        .installations
+        .find_installation(organization_id, workspace_id, installation_id)
+        .await
+    {
+        Ok(None) => Gone::Removed,
+        Ok(Some(installation)) if installation.status == InstallationStatus::Disconnected => Gone::Disconnected,
+        // Reconnected since: its calls may still be made.
+        Ok(Some(_)) => return Outcome::Complete,
+        Err(_) => return Outcome::Retry("store_unavailable"),
+    };
+    let environment = match state.workspaces.find_workspace(organization_id, workspace_id).await {
+        Ok(Some(workspace)) => workspace.environment,
+        // Gone, with its runs.
+        Ok(None) => return Outcome::Complete,
+        Err(_) => return Outcome::Retry("store_unavailable"),
+    };
+    let page = zupflow_core::runs::MAX_PAGE;
+    let mut may_park = false;
+    let mut after: Option<RunId> = None;
+    loop {
+        let runs = match state
+            .runs
+            .runs_waiting_on(organization_id, workspace_id, installation_id, after, page)
+            .await
+        {
+            Ok(runs) => runs,
+            Err(_) => return Outcome::Retry("store_unavailable"),
+        };
+        for run_id in &runs {
+            match refuse_one(
+                state,
+                organization_id,
+                workspace_id,
+                environment,
+                *run_id,
+                installation_id,
+                gone,
+            )
+            .await
+            {
+                Refusal::Done => {}
+                Refusal::MayPark => may_park = true,
+                Refusal::Retry => return Outcome::Retry("store_unavailable"),
+            }
+        }
+        match runs.last() {
+            Some(last) if runs.len() >= usize::try_from(page).unwrap_or(usize::MAX) => after = Some(*last),
+            _ => break,
+        }
+    }
+    if may_park {
+        let until = state
+            .clock
+            .now()
+            .millis()
+            .saturating_add(i64::try_from(PARKING.as_millis()).unwrap_or(0));
+        return Outcome::Postpone(zupflow_core::time::Timestamp::from_millis(until));
+    }
+    Outcome::Complete
+}
+
+/// Refuses the call `run_id` waits on for approval on `installation_id`, if
+/// it does.
+async fn refuse_one(
+    state: &AppState,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    environment: Environment,
+    run_id: RunId,
+    installation_id: InstallationId,
+    gone: Gone,
+) -> Refusal {
+    // A revision conflict means the run moved: read it again.
+    for _ in 0..3 {
+        let snapshot = match state.runs.find_snapshot(organization_id, workspace_id, run_id).await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) | Err(StoreError::Unsupported) => return Refusal::Done,
+            Err(_) => return Refusal::Retry,
+        };
+        if may_park_on(&snapshot, installation_id) {
+            return Refusal::MayPark;
+        }
+        // Not waiting on such a call (yet): one later in its turn is checked
+        // before the run parks on it.
+        let Ok(request) = refuse_waiting(
+            organization_id,
+            workspace_id,
+            &snapshot,
+            RequestId::from_uuid(Uuid::now_v7()),
+            installation_id,
+            gone,
+        ) else {
+            return Refusal::Done;
+        };
+        match state.runs.apply(organization_id, workspace_id, &request).await {
+            Ok(Applied::Committed(receipt)) => {
+                tracing::info!(event = "runs.waiting_call_refused", %organization_id, %workspace_id, %run_id, %installation_id);
+                publish(state, organization_id, workspace_id, environment, &receipt.events).await;
+                return Refusal::Done;
+            }
+            Ok(Applied::Conflict(conflict)) if conflict.reload() => {}
+            Ok(Applied::Conflict(_)) => return Refusal::Done,
+            Err(StoreError::Unavailable) => return Refusal::Retry,
+            Err(error) => {
+                tracing::error!(event = "runs.transition_refused", %organization_id, %workspace_id, %run_id, operation = request.operation().name(), %error);
+                return Refusal::Done;
+            }
+        }
+    }
+    // Still moving after three reads: the job looks again.
+    Refusal::MayPark
 }
 
 async fn handle<P: ToolPort>(state: &AppState, tools: &P, job: Job) {

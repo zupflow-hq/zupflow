@@ -250,8 +250,11 @@ pub trait InstallationStore: Send + Sync {
 
     /// Marks it disconnected and deletes its credential, as one: nothing can
     /// use an account it no longer holds. Records `audit`, an immutable
-    /// installation.disconnected event and delivery jobs in that transaction.
-    /// An already disconnected installation is returned unchanged, with no new audit or event.
+    /// installation.disconnected event and delivery jobs in that transaction,
+    /// and queues the job that refuses the calls waiting for approval on it
+    /// ([`crate::runs::store::refuse_waiting_job`], decision 0047).
+    /// An already disconnected installation is returned unchanged, with no
+    /// new audit, event or job.
     async fn disconnect_installation(
         &self,
         organization_id: OrganizationId,
@@ -261,7 +264,10 @@ pub trait InstallationStore: Send + Sync {
     ) -> Result<Installation, InstallationError>;
 
     /// Deletes it and its credential, recording `audit` of it as it was, and
-    /// an immutable installation.disconnected event with its delivery jobs.
+    /// an immutable installation.disconnected event with its delivery jobs,
+    /// and queues the job that refuses the calls waiting for approval on it
+    /// ([`crate::runs::store::refuse_waiting_job`], decision 0047), all in
+    /// one transaction.
     async fn delete_installation(
         &self,
         organization_id: OrganizationId,

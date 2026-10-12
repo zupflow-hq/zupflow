@@ -17,11 +17,14 @@ use zupflow_core::installations::{
     InstallationStore, InstalledApp, NewCredential, NewInstallation, RefreshClaim, ShortId, TemplateSnapshot,
 };
 use zupflow_core::keys::{Sealed, WrappedKey};
+use zupflow_core::runs::store::refuse_waiting_job;
+use zupflow_core::scope::Scope;
 use zupflow_core::time::Timestamp;
 use zupflow_core::webhooks::WebhookEventType;
 use zupflow_core::workspaces::Page;
 
 use crate::Database;
+use crate::job_queue::insert_job_at;
 
 pub struct SqliteInstallationStore {
     database: Database,
@@ -46,6 +49,32 @@ fn failed(operation: &'static str) -> impl FnOnce(sqlx::Error) -> InstallationEr
         tracing::error!(event = "installations.database_error", operation, %error);
         InstallationError::Unavailable
     }
+}
+
+/// Queues, in the transaction that deletes or disconnects the installation,
+/// the job that refuses the calls waiting for approval on it (decision
+/// 0047). Its payload names the installation only.
+async fn queue_refusals(
+    transaction: &mut Transaction<'static, Sqlite>,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    installation_id: InstallationId,
+) -> Result<(), InstallationError> {
+    let job = refuse_waiting_job(installation_id).ok_or(InstallationError::Unavailable)?;
+    insert_job_at(
+        &mut **transaction,
+        &Scope::Workspace(organization_id, workspace_id),
+        &job.kind,
+        job.payload,
+        job.options,
+        Timestamp::now().millis(),
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(event = "installations.refusals_not_queued", %error);
+        InstallationError::Unavailable
+    })?;
+    Ok(())
 }
 
 fn read(error: impl std::fmt::Display) -> InstallationError {
@@ -598,6 +627,7 @@ impl InstallationStore for SqliteInstallationStore {
         )
         .await
         .map_err(|_| InstallationError::Unavailable)?;
+        queue_refusals(&mut transaction, organization_id, workspace_id, installation.id).await?;
         transaction.commit().await.map_err(failed("disconnect_installation"))?;
         Ok(installation)
     }
@@ -636,6 +666,7 @@ impl InstallationStore for SqliteInstallationStore {
         )
         .await
         .map_err(|_| InstallationError::Unavailable)?;
+        queue_refusals(&mut transaction, organization_id, workspace_id, installation.id).await?;
         transaction.commit().await.map_err(failed("delete_installation"))?;
         Ok(())
     }

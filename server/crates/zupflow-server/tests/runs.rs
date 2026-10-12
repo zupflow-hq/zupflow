@@ -1420,6 +1420,19 @@ impl zupflow_core::runs::RunStore for ReadsFailAfterCommit {
         self.inner.usage(organization_id, environment, since).await
     }
 
+    async fn runs_waiting_on(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        installation_id: InstallationId,
+        after: Option<RunId>,
+        limit: u32,
+    ) -> Result<Vec<RunId>, zupflow_core::runs::store::StoreError> {
+        self.inner
+            .runs_waiting_on(organization_id, workspace_id, installation_id, after, limit)
+            .await
+    }
+
     async fn abandoned_runs(
         &self,
         limit: u32,
@@ -1692,4 +1705,453 @@ async fn refuses_a_call_whose_installation_cant_be_reached_as_set_up() {
         "Main can't be used as it's set up: check its app's configuration, or reconnect it."
     );
     assert!(setup.server.providers.tool_calls().is_empty(), "nothing sent");
+}
+
+/// A run waiting for approval on `send` in another organization: Larkspur's
+/// Sandbox workspace, with an installation of its own app and an agent.
+struct Elsewhere {
+    org: String,
+    ws: String,
+    run: String,
+    call_id: String,
+    key: String,
+}
+
+/// The short ID of `installation` in `ws`.
+async fn short_id_of(server: &Server, who: &str, org: &str, ws: &str, installation: &str) -> String {
+    let (status, read) = server
+        .send(
+            call(
+                who,
+                Method::GET,
+                format!("/v1/workspaces/{ws}/installations/{installation}"),
+            )
+            .naming(org),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    read["data"]["short_id"].as_str().unwrap().to_owned()
+}
+
+/// Starts a run of `agent` in `ws` with `key` calling `send` through
+/// `installation`, works it until it parks: its ID and the call's.
+async fn waiting_in(
+    setup: &Setup,
+    org: &str,
+    ws: &str,
+    agent: &str,
+    installation: &str,
+    key: &str,
+) -> (String, String) {
+    let short_id = short_id_of(&setup.server, key, org, ws, installation).await;
+    let (status, run) = setup
+        .server
+        .send(
+            call(key, Method::POST, format!("/v1/workspaces/{ws}/agents/{agent}/runs"))
+                .body(json!({ "input": format!("call tools_{short_id}_send {{}}") })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{run}");
+    let run = id(&run["data"]).to_owned();
+    setup.work().await;
+    let (status, events) = setup
+        .server
+        .send(call(key, Method::GET, format!("/v1/workspaces/{ws}/runs/{run}/events")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{events}");
+    let requested = events["data"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(requested["type"], "approval.requested", "{events}");
+    (run, requested["data"]["call_id"].as_str().unwrap().to_owned())
+}
+
+async fn elsewhere(setup: &Setup) -> Elsewhere {
+    let server = &setup.server;
+    let org = server.organization("alice", "larkspur").await;
+    let ws = id(&server.workspace("alice", &org, "sandbox", "sandbox").await).to_owned();
+    let (status, created) = server
+        .send(
+            call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(json!({
+                "kind": "mcp", "name": "Tools", "key": "tools", "description": "", "auth_type": "token",
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let app = id(&created["data"]).to_owned();
+    let (status, body) = server
+        .send(
+            call("alice", Method::PATCH, format!("/v1/organizations/{org}/apps/{app}")).body(json!({ "auth": {
+                "type": "token",
+                "inputs": [{ "key": "api_key", "label": "API key", "secret": true, "help": null, "placeholder": null, "pattern": null }],
+                "placement": { "location": "header", "name": "X-Api-Key", "prefix": "" },
+                "verify_url": null, "instructions": "", "docs_url": null,
+            }})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = server
+        .send(
+            call(
+                "alice",
+                Method::PUT,
+                format!("/v1/organizations/{org}/apps/{app}/environments/sandbox/configuration"),
+            )
+            .body(json!({ "mcp_server_url": MCP })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let installation = connect(server, "alice", &org, &ws, &app).await;
+    levels(server, &org, &app, "allow", "approve").await;
+    let agent = agent(server, &org, &ws, &installation).await;
+    let key = api_key(server, &org, "sandbox").await;
+    let (run, call_id) = waiting_in(setup, &org, &ws, &agent, &installation, &key).await;
+    Elsewhere {
+        org,
+        ws,
+        run,
+        call_id,
+        key,
+    }
+}
+
+/// How the Sandbox installation goes away.
+#[derive(Clone, Copy)]
+enum GoesAway {
+    Deleted,
+    Disconnected,
+}
+
+impl Setup {
+    async fn take_away(&self, how: GoesAway) {
+        let installation = format!("/v1/workspaces/{}/installations/{}", self.sandbox, self.installation);
+        let (status, body) = match how {
+            GoesAway::Deleted => {
+                self.server
+                    .send(call("alice", Method::DELETE, installation).naming(&self.org))
+                    .await
+            }
+            GoesAway::Disconnected => {
+                self.server
+                    .send(call("alice", Method::POST, format!("{installation}/disconnect")).naming(&self.org))
+                    .await
+            }
+        };
+        assert!(status.is_success(), "{status}: {body}");
+    }
+
+    /// The Production workspace's installation.
+    async fn production_installation(&self) -> String {
+        let (status, listed) = self
+            .server
+            .send(
+                call(
+                    "alice",
+                    Method::GET,
+                    format!("/v1/workspaces/{}/installations", self.production),
+                )
+                .naming(&self.org),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        id(&listed["data"][0]).to_owned()
+    }
+}
+
+/// Decision 0047, case 1: deleting or disconnecting an installation refuses
+/// the call a run waits on for approval through it, with why, and the run
+/// moves on without anyone deciding; an approval that comes later answers
+/// `409 not_waiting`. Nothing reaches the app's server, and runs waiting in
+/// the organization's other workspace and in another organization still
+/// wait, and go on once approved.
+async fn refuses_waiting_calls_once_the_installation_goes(how: GoesAway, code_expected: &str, verb: &str) {
+    let setup = setup().await;
+    let key = api_key(&setup.server, &setup.org, "sandbox").await;
+    let production_key = api_key(&setup.server, &setup.org, "production").await;
+    let (run, call_id) = setup.waiting_on_send().await;
+    // A second run waiting on the same installation.
+    let (other_run, other_call) = setup.waiting_on_send().await;
+    let production_installation = setup.production_installation().await;
+    let (production_run, production_call) = waiting_in(
+        &setup,
+        &setup.org,
+        &setup.production,
+        &setup.production_agent,
+        &production_installation,
+        &production_key,
+    )
+    .await;
+    let theirs = elsewhere(&setup).await;
+
+    setup.take_away(how).await;
+    setup.work().await;
+
+    for (run, call_id) in [(&run, &call_id), (&other_run, &other_call)] {
+        let done = setup.get(run).await;
+        assert_eq!(done["status"], "completed", "the run moved on: {done}");
+        let message = format!("Main was {verb}, so this call wasn't made.");
+        assert_eq!(
+            done["output"],
+            format!("{} failed: {message}", setup.tool("send")),
+            "the model read why"
+        );
+        let events = setup.events(run).await;
+        let types: Vec<&str> = events.iter().map(|event| event["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            [
+                "run.queued",
+                "run.started",
+                "message.assistant",
+                "approval.requested",
+                "tool_call.failed",
+                "message.assistant",
+                "run.completed"
+            ],
+            "nobody decided it, and it was never sent"
+        );
+        let failed = &events[4];
+        assert_eq!(failed["data"]["call_id"], call_id.as_str());
+        assert_eq!(failed["data"]["error"]["code"], code_expected);
+        assert_eq!(failed["data"]["error"]["message"], message.as_str());
+        assert_eq!(failed["data"]["installation_label"], "Main");
+        assert_eq!(done["usage"]["tool_calls"], 0);
+        // Too late to decide.
+        let (status, body) = setup.resolve(&key, run, call_id, "approved").await;
+        assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "not_waiting"), "{body}");
+        let call = setup.call_of(RunId::parse(run).unwrap()).await;
+        assert_eq!((call.state, call.approval), (CallState::Refused, None));
+    }
+    assert!(setup.server.providers.tool_calls().is_empty(), "nothing was sent");
+
+    // The organization's other workspace, and another organization: still
+    // waiting, and approved, sent through their own installations.
+    let (status, waiting) = setup
+        .server
+        .send(call(
+            &production_key,
+            Method::GET,
+            format!("/v1/workspaces/{}/runs/{production_run}", setup.production),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(waiting["data"]["status"], "waiting_for_approval");
+    let (status, waiting) = setup
+        .server
+        .send(call(
+            &theirs.key,
+            Method::GET,
+            format!("/v1/workspaces/{}/runs/{}", theirs.ws, theirs.run),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(waiting["data"]["status"], "waiting_for_approval");
+    for (key, ws, run, call_id) in [
+        (&production_key, &setup.production, &production_run, &production_call),
+        (&theirs.key, &theirs.ws, &theirs.run, &theirs.call_id),
+    ] {
+        let (status, body) = setup
+            .server
+            .send(
+                call(key, Method::POST, format!("/v1/workspaces/{ws}/runs/{run}/approvals"))
+                    .body(json!({ "call_id": call_id, "decision": "approved" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    setup.work().await;
+    for (key, ws, run) in [
+        (&production_key, &setup.production, &production_run),
+        (&theirs.key, &theirs.ws, &theirs.run),
+    ] {
+        let (_, done) = setup
+            .server
+            .send(call(key, Method::GET, format!("/v1/workspaces/{ws}/runs/{run}")))
+            .await;
+        assert_eq!(done["data"]["status"], "completed", "{done}");
+        assert_eq!(done["data"]["usage"]["tool_calls"], 1);
+    }
+    assert_eq!(setup.server.providers.tool_calls().len(), 2, "only the approved calls");
+    assert!(!theirs.org.is_empty());
+}
+
+#[tokio::test]
+async fn refuses_the_calls_waiting_on_a_deleted_installation() {
+    refuses_waiting_calls_once_the_installation_goes(GoesAway::Deleted, "installation_removed", "removed").await;
+}
+
+#[tokio::test]
+async fn refuses_the_calls_waiting_on_a_disconnected_installation() {
+    refuses_waiting_calls_once_the_installation_goes(
+        GoesAway::Disconnected,
+        "installation_disconnected",
+        "disconnected",
+    )
+    .await;
+}
+
+/// A call further on in the turn, waiting for approval on an installation
+/// that went while the run waited on another: refused when the run gets to
+/// it, never asked about.
+#[tokio::test]
+async fn never_asks_about_a_call_whose_installation_went_before_the_run_got_to_it() {
+    let setup = setup().await;
+    let key = api_key(&setup.server, &setup.org, "sandbox").await;
+    let run = setup
+        .run(&format!(
+            "{}\n{}",
+            setup.calling("send", "{\"n\":1}"),
+            setup.calling("send", "{\"n\":2}")
+        ))
+        .await;
+    let first = setup.events(&run).await.last().unwrap()["data"]["call_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The first is approved before the installation goes; the second hasn't
+    // been asked about yet.
+    let (status, _) = setup.resolve(&key, &run, &first, "approved").await;
+    assert_eq!(status, StatusCode::OK);
+    setup.take_away(GoesAway::Deleted).await;
+    setup.work().await;
+    let done = setup.get(&run).await;
+    assert_eq!(done["status"], "completed", "{done}");
+    let events = setup.events(&run).await;
+    let asked = events
+        .iter()
+        .filter(|event| event["type"] == "approval.requested")
+        .count();
+    assert_eq!(asked, 1, "the second call was never asked about");
+    let codes: Vec<&str> = events
+        .iter()
+        .filter(|event| event["type"] == "tool_call.failed")
+        .map(|event| event["data"]["error"]["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(codes, ["installation_removed", "installation_removed"]);
+    assert!(setup.server.providers.tool_calls().is_empty(), "nothing was sent");
+}
+
+/// Disconnected, then reconnected before the job ran: the installation is
+/// the same row with the same short ID, so the call still waits, and its
+/// approval still authorizes it.
+#[tokio::test]
+async fn keeps_a_call_waiting_on_an_installation_reconnected_since() {
+    let setup = setup().await;
+    let key = api_key(&setup.server, &setup.org, "sandbox").await;
+    let (run, call_id) = setup.waiting_on_send().await;
+    setup.take_away(GoesAway::Disconnected).await;
+    let (status, session) = setup
+        .server
+        .send(
+            call("alice", Method::POST, format!("/v1/workspaces/{}/connect-sessions", setup.sandbox))
+                .naming(&setup.org)
+                .body(json!({ "app_id": setup.app, "intent": "reconnect", "label": "Main", "installation_id": setup.installation, "return_url": null })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let reference = session["data"]["url"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let (status, done) = setup
+        .server
+        .send(
+            call(
+                "nobody",
+                Method::POST,
+                format!("/v1/connect/sessions/{reference}/credentials"),
+            )
+            .body(json!({ "values": { "api_key": "tk_1234" } })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert_eq!(
+        short_id_of(&setup.server, "alice", &setup.org, &setup.sandbox, &setup.installation).await,
+        setup.short_id,
+        "the same short ID"
+    );
+    setup.work().await;
+    assert_eq!(setup.get(&run).await["status"], "waiting_for_approval", "still waiting");
+    let (status, body) = setup.resolve(&key, &run, &call_id, "approved").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    setup.work().await;
+    let done = setup.get(&run).await;
+    assert_eq!(done["status"], "completed", "{done}");
+    assert_eq!(done["usage"]["tool_calls"], 1);
+    assert_eq!(setup.server.providers.tool_calls().len(), 1);
+}
+
+/// While a call waited for approval, its grant was removed, or the
+/// organization denied its tool: the approval that comes then doesn't send
+/// it; it's refused at send, and the run goes on.
+#[tokio::test]
+async fn refuses_an_approved_call_whose_grant_or_level_went_while_it_waited() {
+    for what in ["grant", "level"] {
+        let setup = setup().await;
+        let key = api_key(&setup.server, &setup.org, "sandbox").await;
+        let (run, call_id) = setup.waiting_on_send().await;
+        match what {
+            "grant" => {
+                let grants = format!("/v1/workspaces/{}/agents/{}/grants", setup.sandbox, setup.agent);
+                let (_, listed) = setup
+                    .server
+                    .send(call("alice", Method::GET, grants.clone()).naming(&setup.org))
+                    .await;
+                let grant = listed["data"][0]["id"].as_str().unwrap().to_owned();
+                let (status, _) = setup
+                    .server
+                    .send(call("alice", Method::DELETE, format!("{grants}/{grant}")).naming(&setup.org))
+                    .await;
+                assert_eq!(status, StatusCode::NO_CONTENT);
+            }
+            _ => levels(&setup.server, &setup.org, &setup.app, "allow", "deny").await,
+        }
+        assert_eq!(
+            setup.approve_and_finish(&key, &run, &call_id).await,
+            "tool_refused",
+            "{what}"
+        );
+        assert!(setup.server.providers.tool_calls().is_empty(), "{what}: nothing sent");
+    }
+}
+
+/// Deleted and installed again: the new installation has a new short ID, a
+/// call by the old name reaches nothing, and the approval that came for the
+/// old installation's call answers `409 not_waiting`.
+#[tokio::test]
+async fn never_reaches_a_reinstalled_installation_through_the_old_one() {
+    let setup = setup().await;
+    let key = api_key(&setup.server, &setup.org, "sandbox").await;
+    let (run, call_id) = setup.waiting_on_send().await;
+    setup.take_away(GoesAway::Deleted).await;
+    let again = connect(&setup.server, "alice", &setup.org, &setup.sandbox, &setup.app).await;
+    let short_id = short_id_of(&setup.server, "alice", &setup.org, &setup.sandbox, &again).await;
+    assert_ne!(short_id, setup.short_id, "a new short ID");
+    let grants = format!("/v1/workspaces/{}/agents/{}/grants", setup.sandbox, setup.agent);
+    let (status, body) = setup
+        .server
+        .send(
+            call("alice", Method::POST, grants)
+                .naming(&setup.org)
+                .body(json!({ "installation_id": again, "tools": ["lookup", "send"], "approval_required": ["send"] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    setup.work().await;
+    let (status, body) = setup.resolve(&key, &run, &call_id, "approved").await;
+    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "not_waiting"), "{body}");
+    // The old name isn't offered any more.
+    let old = setup.run(&setup.calling("lookup", "{}")).await;
+    let done = setup.get(&old).await;
+    assert_eq!(done["status"], "completed", "{done}");
+    assert_eq!(
+        done["output"],
+        format!("I can't use {}: it isn't one of my tools.", setup.tool("lookup")),
+        "the model wasn't offered it"
+    );
+    assert!(
+        setup.server.providers.tool_calls().is_empty(),
+        "nothing reached the new installation"
+    );
 }

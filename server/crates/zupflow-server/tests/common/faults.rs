@@ -28,7 +28,7 @@ use serde_json::Value;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use zupflow_core::environment::Environment;
-use zupflow_core::ids::{OrganizationId, RunId, WorkspaceId};
+use zupflow_core::ids::{InstallationId, OrganizationId, RunId, WorkspaceId};
 use zupflow_core::models::{Completion, Message, ModelProvider, ProviderError, TokenUsage, ToolSpec, Turn};
 use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse};
 use zupflow_core::runs::state::{CallRecord, CommittedTurn, ModelAttempt, Snapshot};
@@ -86,6 +86,7 @@ pub enum Write {
     CommitTurn,
     Park,
     ResolveApproval,
+    RefuseWaiting,
     AuthorizeCall,
     RecordOutcome,
     SettleUnknown,
@@ -104,6 +105,7 @@ impl Write {
             Operation::CommitTurn(_) => Self::CommitTurn,
             Operation::Park(_) => Self::Park,
             Operation::ResolveApproval(_) => Self::ResolveApproval,
+            Operation::RefuseWaiting(_) => Self::RefuseWaiting,
             Operation::AuthorizeCall(_) => Self::AuthorizeCall,
             Operation::RecordOutcome(_) => Self::RecordOutcome,
             Operation::SettleUnknown(_) => Self::SettleUnknown,
@@ -360,6 +362,19 @@ impl RunStore for FaultyRuns {
         since: Timestamp,
     ) -> Result<Vec<UsageDay>, StoreError> {
         self.inner.usage(organization_id, environment, since).await
+    }
+
+    async fn runs_waiting_on(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        installation_id: InstallationId,
+        after: Option<RunId>,
+        limit: u32,
+    ) -> Result<Vec<RunId>, StoreError> {
+        self.inner
+            .runs_waiting_on(organization_id, workspace_id, installation_id, after, limit)
+            .await
     }
 
     async fn abandoned_runs(&self, limit: u32) -> Result<Vec<(OrganizationId, WorkspaceId, RunId)>, StoreError> {
@@ -633,6 +648,34 @@ impl Kit {
             model_attempts: snapshot.model_attempts,
             calls,
         }
+    }
+}
+
+impl Kit {
+    /// The run's job as the queue holds it: how many attempts it has used
+    /// and its state; `None` once it's gone.
+    pub async fn run_job(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+    ) -> Option<(i64, String)> {
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", self.database.display()))
+            .await
+            .unwrap();
+        let job: Option<(i64, String)> = sqlx::query_as(
+            "SELECT j.attempts, j.state FROM jobs j JOIN runs r ON r.organization_id = j.organization_id \
+             AND r.workspace_id = j.workspace_id AND r.job_id = j.id \
+             WHERE r.organization_id = ? AND r.workspace_id = ? AND r.id = ?",
+        )
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(run_id.uuid())
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+        job
     }
 }
 

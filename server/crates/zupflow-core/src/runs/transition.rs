@@ -16,7 +16,7 @@ use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 
 use crate::audit::AuditActor;
-use crate::ids::{AgentId, ApiKeyId, OrganizationId, RunId, SessionId, ToolCallId, WorkspaceId};
+use crate::ids::{AgentId, ApiKeyId, InstallationId, OrganizationId, RunId, SessionId, ToolCallId, WorkspaceId};
 use crate::runs::digest::{Sha256Digest, digest_json};
 use crate::runs::names::Offer;
 use crate::runs::state::{BoundTarget, CallDecision, ClaimantId, Continuation, InvocationId, RequestId, Usage, ser};
@@ -255,6 +255,26 @@ pub struct ResolveApproval {
     pub next: Continuation,
 }
 
+/// A call the run waits on for approval, refused because its installation
+/// was deleted or disconnected (decision 0047): never sent, and the run
+/// runnable again. Nobody decided it, so no approval is recorded. The job
+/// the installation's deletion or disconnection queued asks for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RefuseWaiting {
+    /// The job's request: two jobs never build the same request.
+    pub request_id: RequestId,
+    pub call_id: ToolCallId,
+    /// The installation that went away. The store refuses the request
+    /// unless the call is bound to it.
+    pub installation_id: InstallationId,
+    /// What the model reads back.
+    #[serde(serialize_with = "ser::call_outcome")]
+    pub outcome: CallOutcome,
+    /// `installation_removed` or `installation_disconnected`.
+    pub failure: Failure,
+    pub next: Continuation,
+}
+
 /// What a call's check at send allows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "authorization", rename_all = "snake_case")]
@@ -428,6 +448,8 @@ pub enum Operation {
     Park(Park),
     /// An API key.
     ResolveApproval(ResolveApproval),
+    /// The job an installation's deletion or disconnection queued.
+    RefuseWaiting(RefuseWaiting),
     /// A worker.
     AuthorizeCall(AuthorizeCall),
     /// The sender, under its send claim.
@@ -453,6 +475,7 @@ impl Operation {
             Self::CommitTurn(_) => "commit_turn",
             Self::Park(_) => "park",
             Self::ResolveApproval(_) => "resolve_approval",
+            Self::RefuseWaiting(_) => "refuse_waiting",
             Self::AuthorizeCall(_) => "authorize_call",
             Self::RecordOutcome(_) => "record_outcome",
             Self::SettleUnknown(_) => "settle_unknown",
@@ -474,7 +497,7 @@ impl Operation {
             Self::Claim(claim) if claim.starts => RunStatus::Running,
             Self::CommitTurn(commit) => commit.ending.as_ref().map_or(RunStatus::Running, ended),
             Self::Park(_) => RunStatus::WaitingForApproval,
-            Self::ResolveApproval(_) => RunStatus::Running,
+            Self::ResolveApproval(_) | Self::RefuseWaiting(_) => RunStatus::Running,
             Self::Cancel(_) => RunStatus::Cancelled,
             Self::Finish(finish) => ended(&finish.ending),
             Self::FailAbandoned(_) => RunStatus::Failed,
@@ -498,6 +521,7 @@ impl Operation {
             Self::CommitTurn(commit) => commit.next,
             Self::Park(park) => Continuation::AwaitApproval { call_id: park.call_id },
             Self::ResolveApproval(resolve) => resolve.next,
+            Self::RefuseWaiting(refuse) => refuse.next,
             Self::AuthorizeCall(authorize) => authorize.next,
             Self::RecordOutcome(record) => record.next.unwrap_or(before),
             Self::SettleUnknown(settle) => settle.next.unwrap_or(before),

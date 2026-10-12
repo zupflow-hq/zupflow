@@ -36,6 +36,7 @@ use zupflow_core::ids::{
 };
 use zupflow_core::runs::digest::{Sha256Digest, call_digest};
 use zupflow_core::runs::names::Offer;
+use zupflow_core::runs::reducer::{INSTALLATION_DISCONNECTED, INSTALLATION_REMOVED};
 use zupflow_core::runs::state::{
     BoundTarget, CallAttempt, CallDecision, CallRecord, CallVerdict, ClaimantId, CommittedTurn, Continuation,
     EXECUTION_VERSION, InvocationId, ModelAttempt, ModelAttemptState, RunControl, Snapshot, supports,
@@ -43,8 +44,8 @@ use zupflow_core::runs::state::{
 use zupflow_core::runs::store::{Applied, Durability, MODEL_RETRY_STEP, Receipt, RunStore, StoreError, run_job};
 use zupflow_core::runs::transition::{
     Admit, Authorization, AuthorizeCall, Cancel, Claim, Closing, CommitTurn, Conflict, FailAbandoned, Finish, Guards,
-    ModelAttemptRef, NewCall, Operation, Park, PrepareModel, RecordOutcome, ResolveApproval, RunEnding, SendLease,
-    SendOutcome, SettleUnknown, TransitionId, TransitionRequest, Yield, YieldReason,
+    ModelAttemptRef, NewCall, Operation, Park, PrepareModel, RecordOutcome, RefuseWaiting, ResolveApproval, RunEnding,
+    SendLease, SendOutcome, SettleUnknown, TransitionId, TransitionRequest, Yield, YieldReason,
 };
 use zupflow_core::runs::{
     AgentActivity, ApprovalDecision, CallOutcome, CallState, Failure, OrganizationRun, OrganizationRunFilter, Page,
@@ -583,7 +584,21 @@ fn check_required(guards: &Guards, operation: &Operation) -> Result<(), StoreErr
             Ok(())
         }
         Operation::ResolveApproval(_) | Operation::Cancel(_) => Ok(()),
+        // The job holds no claim on the run, and no send claim.
+        Operation::RefuseWaiting(_) => {
+            if guards.owner.is_some() || guards.send.is_some() {
+                return Err(refused("a refusal guarded by a claim"));
+            }
+            Ok(())
+        }
     }
+}
+
+/// Whether `failure` says the call's installation went away (decision 0047):
+/// the only reason a call waiting for approval is refused without a
+/// decision.
+fn installation_went(failure: &Failure) -> bool {
+    failure.code == INSTALLATION_REMOVED || failure.code == INSTALLATION_DISCONNECTED
 }
 
 /// What a transition does to the run's job.
@@ -1465,6 +1480,34 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
             .await?;
             Ok(Effects::job(JobAction::Queue))
         }
+        Operation::RefuseWaiting(RefuseWaiting {
+            call_id,
+            installation_id,
+            outcome,
+            failure,
+            next,
+            ..
+        }) => {
+            let waiting = control.status == RunStatus::WaitingForApproval
+                && control.continuation == Continuation::AwaitApproval { call_id: *call_id };
+            let call = snapshot
+                .call(*call_id)
+                .filter(|call| waiting && call.state == CallState::AwaitingApproval)
+                .ok_or(refused("a refusal of a call the run doesn't wait for"))?;
+            let target = target_of(call)?;
+            if target.installation_id != *installation_id {
+                return Err(refused("a refusal for an installation the call isn't bound to"));
+            }
+            if !installation_went(failure) || !outcome.is_error {
+                return Err(refused("a refusal that doesn't say the installation went"));
+            }
+            expect_next(*next, next_after(snapshot, call))?;
+            writer
+                .settle(*call_id, CallState::Refused, outcome, Some(failure))
+                .await?;
+            writer.call_failed(*call_id, target, failure, 0);
+            Ok(Effects::job(JobAction::Queue))
+        }
         Operation::AuthorizeCall(AuthorizeCall {
             call_id,
             decision,
@@ -1472,7 +1515,14 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
             next,
         }) => {
             let call = next_call(snapshot, *call_id)?;
-            if !matches!(call.state, CallState::Allowed | CallState::Approved) {
+            // A call waiting for approval is refused, instead of parked on,
+            // only because its installation went away.
+            let fits = match (call.state, authorization) {
+                (CallState::Allowed | CallState::Approved, _) => true,
+                (CallState::AwaitingApproval, Authorization::Refuse { failure, .. }) => installation_went(failure),
+                _ => false,
+            };
+            if !fits {
                 return Err(refused("a send of a call that isn't allowed or approved"));
             }
             let target = target_of(call)?;
@@ -2548,6 +2598,35 @@ impl RunStore for SqliteRunStore {
                 })
             })
             .collect()
+    }
+
+    async fn runs_waiting_on(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        installation_id: InstallationId,
+        after: Option<RunId>,
+        limit: u32,
+    ) -> Result<Vec<RunId>, StoreError> {
+        let rows: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT r.id FROM runs r WHERE r.organization_id = ? AND r.workspace_id = ? \
+             AND r.status IN ('running', 'waiting_for_approval') AND r.execution_version >= 1 \
+             AND (? IS NULL OR r.id > ?) \
+             AND EXISTS (SELECT 1 FROM run_tool_calls c \
+               WHERE c.organization_id = r.organization_id AND c.workspace_id = r.workspace_id \
+               AND c.run_id = r.id AND c.installation_id = ? AND c.state = 'awaiting_approval') \
+             ORDER BY r.id LIMIT ?",
+        )
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(after.map(|run| run.uuid()))
+        .bind(after.map(|run| run.uuid()))
+        .bind(installation_id.uuid())
+        .bind(i64::from(limit.clamp(1, zupflow_core::runs::MAX_PAGE)))
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(failed("runs_waiting_on"))?;
+        Ok(rows.into_iter().map(RunId::from_uuid).collect())
     }
 
     /// **Cross-tenant**, by design: the sweep serves every organization. It

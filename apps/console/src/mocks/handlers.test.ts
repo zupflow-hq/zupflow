@@ -1410,6 +1410,131 @@ describe("approvals", () => {
   });
 });
 
+describe("calls waiting on an installation that goes", () => {
+  /** A waiting run, the call it waits on and that call's installation. */
+  function waiting() {
+    const run = must(
+      db().runs.find((r) => r.status === "waiting_for_approval"),
+      "waiting run",
+    );
+    const requested = [...timelineOf(db(), run)].reverse().find((e) => e.type === "approval.requested");
+    if (requested?.type !== "approval.requested") throw new Error("Missing pending call");
+    return { run, callId: requested.data.call_id, installationId: requested.data.installation_id };
+  }
+
+  for (const [how, code] of [
+    ["removed", "installation_removed"],
+    ["disconnected", "installation_disconnected"],
+  ] as const) {
+    it(`refuses the call a run waits on once its installation is ${how}, and only in its workspace`, async () => {
+      const { run, callId, installationId } = waiting();
+      // A run of another workspace, and one of another organization, whose
+      // pending call names the same installation ID: neither is touched.
+      const others = db().runs.filter(
+        (r) =>
+          r.status === "waiting_for_approval" &&
+          !(r.organization_id === run.organization_id && r.workspace_id === run.workspace_id),
+      );
+      const sibling = must(
+        others.find((r) => r.organization_id === run.organization_id),
+        "a waiting run in a sibling workspace",
+      );
+      // Another organization's run, under this workspace's own ID.
+      const larkspur = must(
+        db().organizations.find((o) => o.slug === "larkspur"),
+        "Larkspur",
+      ).id;
+      const foreign = { ...structuredClone(run), id: newId("run"), organization_id: larkspur };
+      db().runs.push(foreign);
+      db().run_events[runEventsKey(foreign)] = timelineOf(db(), run).map((e) => ({
+        ...structuredClone(e),
+        id: newId("run_event"),
+        organization_id: larkspur,
+        run_id: foreign.id,
+      }));
+      others.push(foreign);
+      for (const other of [sibling, foreign]) {
+        const pending = [...timelineOf(db(), other)].reverse().find((e) => e.type === "approval.requested");
+        if (pending?.type !== "approval.requested") throw new Error("Missing pending call");
+        pending.data.installation_id = installationId;
+      }
+      const before = others.map((r) => [r.id, r.status, timelineOf(db(), r).length]);
+
+      const workspace = must(
+        db().workspaces.find((w) => w.organization_id === run.organization_id && w.id === run.workspace_id),
+        "workspace",
+      );
+      if (how === "removed") await owner.installations.delete(workspace.id, installationId);
+      else await owner.installations.disconnect(workspace.id, installationId);
+
+      expect(run.status).toBe("running");
+      const events = timelineOf(db(), run);
+      expect(events.some((e) => e.type === "approval.resolved" && e.data.call_id === callId)).toBe(false);
+      const failed = must(
+        events.find((e) => e.type === "tool_call.failed" && e.data.call_id === callId),
+        "the refusal",
+      );
+      expect(failed.type === "tool_call.failed" ? failed.data.error.code : null).toBe(code);
+      expect(events.some((e) => e.type === "tool_call.started" && e.data.call_id === callId)).toBe(false);
+      expect(others.map((r) => [r.id, r.status, timelineOf(db(), r).length])).toEqual(before);
+
+      // A decision that comes later: too late.
+      const created = await owner.apiKeys.create(run.organization_id, {
+        name: "Late approver",
+        environment: workspace.environment,
+      });
+      const keyed = createClient(createHttpTransport({ baseUrl: API, getToken: async () => created.secret }));
+      expect(
+        await failure(keyed.runs.resolveApproval(workspace.id, run.id, { call_id: callId, decision: "approved" })),
+      ).toMatchObject({ status: 409, code: "not_waiting" });
+    });
+  }
+
+  it("never asks about a call whose installation went before the run got to it", async () => {
+    const { advanceRun } = await import("./runner");
+    const { run, callId, installationId } = waiting();
+    const step = must(
+      run.plan.find((s) => s.kind === "tool_call" && s.call.call_id === callId),
+      "the pending call's step",
+    );
+    if (step.kind !== "tool_call") throw new Error("Not a call");
+    run.status = "running";
+    run.plan.unshift({ kind: "approval", call: step.call });
+    const d = db();
+    const gone = must(
+      d.installations.find(
+        (i) =>
+          i.organization_id === run.organization_id && i.workspace_id === run.workspace_id && i.id === installationId,
+      ),
+      "the installation",
+    );
+    // The same ID, connected, in a sibling workspace and in another
+    // organization's workspace of the same ID: neither is the run's.
+    const sibling = must(
+      d.workspaces.find((w) => w.organization_id === run.organization_id && w.id !== run.workspace_id),
+      "sibling workspace",
+    );
+    const larkspur = must(
+      d.organizations.find((o) => o.slug === "larkspur"),
+      "Larkspur",
+    ).id;
+    d.installations.push(
+      { ...structuredClone(gone), workspace_id: sibling.id, status: "connected" },
+      { ...structuredClone(gone), organization_id: larkspur, status: "connected" },
+    );
+    d.installations = d.installations.filter(
+      (i) =>
+        !(i.organization_id === run.organization_id && i.workspace_id === run.workspace_id && i.id === installationId),
+    );
+    const asked = timelineOf(d, run).filter((e) => e.type === "approval.requested").length;
+    expect(advanceRun(d, run, new Date().toISOString(), () => 0.5)).toBe("continue");
+    expect(run.status).toBe("running");
+    expect(timelineOf(d, run).filter((e) => e.type === "approval.requested")).toHaveLength(asked);
+    const last = must(timelineOf(d, run).at(-1), "event");
+    expect(last.type === "tool_call.failed" ? last.data.error.code : null).toBe("installation_removed");
+  });
+});
+
 describe("approvals in the audit log", () => {
   it("names the API key that recorded the decision", async () => {
     const run = must(

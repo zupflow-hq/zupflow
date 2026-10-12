@@ -5,7 +5,9 @@
 //! reconnect required records its audit and outbox exactly once, only for
 //! the current credential in its own scope. Each installation has a short ID
 //! of its own in its workspace, kept while it is renamed or disconnected
-//! (decision 0047).
+//! (decision 0047). Disconnecting or deleting one queues, with it, the job
+//! that refuses the calls waiting for approval on it, in its own workspace
+//! and naming it alone (decision 0047).
 //!
 //! `prepare` makes a [`Tenant`] exist: its organization, two Sandbox and a
 //! Production workspace, a catalog app, and an app of the Sandbox workspace's own.
@@ -28,6 +30,7 @@ use zupflow_core::installations::{
 };
 use zupflow_core::jobs::JobQueue;
 use zupflow_core::keys::{Sealed, WrappedKey};
+use zupflow_core::runs::store::{REFUSE_WAITING_JOB, installation_of_job};
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::webhooks::{DELIVER, NewEndpoint, WebhookEventType, WebhookStore, delivery_of};
 
@@ -165,6 +168,96 @@ pub async fn run(
     forgets_the_credential_when_disconnected_or_deleted(store, &prepare).await;
     lists_a_catalog_apps_installations_page_by_page(store, &prepare).await;
     counts_installations_per_app(store, &prepare).await;
+    queues_the_refusals_when_it_goes(store, jobs, &prepare).await;
+}
+
+/// The jobs refusing waiting calls queued so far, each with its scope and
+/// the installation it names, claimed and completed.
+async fn refusals(jobs: &dyn JobQueue) -> Vec<(Scope, InstallationId)> {
+    let kind = Name::new(REFUSE_WAITING_JOB).unwrap();
+    let mut queued = Vec::new();
+    while let Some(job) = jobs
+        .claim_next(std::slice::from_ref(&kind), Duration::from_secs(60))
+        .await
+        .unwrap()
+    {
+        jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+        queued.push((
+            job.scope,
+            installation_of_job(&job.payload).expect("names an installation"),
+        ));
+    }
+    queued
+}
+
+async fn queues_the_refusals_when_it_goes(store: &dyn InstallationStore, jobs: &dyn JobQueue, prepare: &Prepare) {
+    let a = tenant(prepare).await;
+    let b = tenant(prepare).await;
+    refusals(jobs).await;
+    let here = install(store, &a, a.sandbox, InstalledApp::Catalog(a.catalog_app)).await;
+    let sibling = install(store, &a, a.sibling, InstalledApp::Catalog(a.catalog_app)).await;
+    let theirs = install(store, &b, b.sandbox, InstalledApp::Catalog(b.catalog_app)).await;
+    assert!(refusals(jobs).await.is_empty(), "nothing queued by connecting");
+
+    // Refused from any other scope: nothing queued.
+    for (organization, workspace, installation) in [
+        (b.organization_id, a.sandbox, here.id),
+        (a.organization_id, a.sibling, here.id),
+        (a.organization_id, a.sandbox, theirs.id),
+    ] {
+        assert_eq!(
+            store
+                .disconnect_installation(organization, workspace, installation, &|_| by_suite_in(workspace))
+                .await,
+            Err(InstallationError::NotFound)
+        );
+        assert_eq!(
+            store
+                .delete_installation(organization, workspace, installation, &|_| by_suite_in(workspace))
+                .await,
+            Err(InstallationError::NotFound)
+        );
+    }
+    assert!(refusals(jobs).await.is_empty(), "nothing queued by a refused change");
+
+    store
+        .disconnect_installation(a.organization_id, a.sandbox, here.id, &|_| by_suite_in(a.sandbox))
+        .await
+        .unwrap();
+    assert_eq!(
+        refusals(jobs).await,
+        [(Scope::Workspace(a.organization_id, a.sandbox), here.id)],
+        "one job, in its workspace, naming it"
+    );
+    store
+        .disconnect_installation(a.organization_id, a.sandbox, here.id, &|_| by_suite_in(a.sandbox))
+        .await
+        .unwrap();
+    assert!(refusals(jobs).await.is_empty(), "a repeated disconnect queues nothing");
+    store
+        .delete_installation(a.organization_id, a.sandbox, here.id, &|_| by_suite_in(a.sandbox))
+        .await
+        .unwrap();
+    store
+        .delete_installation(a.organization_id, a.sibling, sibling.id, &|_| by_suite_in(a.sibling))
+        .await
+        .unwrap();
+    assert_eq!(
+        refusals(jobs).await,
+        [
+            (Scope::Workspace(a.organization_id, a.sandbox), here.id),
+            (Scope::Workspace(a.organization_id, a.sibling), sibling.id),
+        ],
+        "deleting queues one too, each in its own workspace"
+    );
+    assert!(
+        store
+            .find_installation(b.organization_id, b.sandbox, theirs.id)
+            .await
+            .unwrap()
+            .is_some_and(|installation| installation.status == InstallationStatus::Connected),
+        "the other organization's untouched"
+    );
 }
 
 async fn creates_and_finds_within_its_workspace(store: &dyn InstallationStore, prepare: &Prepare) {

@@ -7,6 +7,9 @@
 //! `#[ignore = "fixed when …: …"]` and failing on the assertion that names
 //! the hole (`cargo test -p zupflow-server --test run_faults -- --ignored`);
 //! the change that closes it removes the `ignore`. None is open today.
+//!
+//! Whatever happens, the app's server receives at most one request per call:
+//! its own ledger says so, not the runtime's records.
 
 #![allow(clippy::unwrap_used)]
 
@@ -17,10 +20,13 @@ mod faults;
 use axum::http::{Method, StatusCode};
 use common::{Server, call, code};
 use faults::{Kit, Point, RecordedCall, Worker, Write, accounted_tokens, kept_answers, produced_tokens};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use std::sync::Arc;
 use zupflow_core::ids::{OrganizationId, RunId, WorkspaceId};
+use zupflow_core::models::{Completion, Message, ModelProvider, ModelToolCall, ProviderError, Reply, TokenUsage, Turn};
 use zupflow_core::runs::CallState;
 use zupflow_core::runs::state::ModelAttemptState;
+use zupflow_server::run_engine;
 
 const MCP: &str = "https://tools.example/mcp";
 
@@ -570,4 +576,389 @@ async fn names_a_tool_after_its_installation_whatever_the_grant_order() {
         received[0], received[1],
         "{name} reached another installation once the grants were in another order"
     );
+}
+
+/// The `tools/call` requests the app's server received with `arguments`.
+fn received_with(setup: &Setup, arguments: &Value) -> usize {
+    setup
+        .server
+        .providers
+        .received_calls()
+        .iter()
+        .filter(|received| &received.arguments == arguments)
+        .count()
+}
+
+/// Every point a worker can stop at while it takes a run with two calls
+/// forward: each write it makes, the model's answer and the send.
+const STOPS: [Point; 12] = [
+    Point::After(Write::Claim),
+    Point::Before(Write::PrepareModel),
+    Point::After(Write::PrepareModel),
+    Point::BeforeModel,
+    Point::AfterModel,
+    Point::Before(Write::CommitTurn),
+    Point::After(Write::CommitTurn),
+    Point::Before(Write::AuthorizeCall),
+    Point::After(Write::AuthorizeCall),
+    Point::BeforeSend,
+    Point::AfterSend,
+    Point::Before(Write::RecordOutcome),
+];
+
+/// Worker A stops at each point, its lease runs out and B takes the run over
+/// and finishes it; then A is crashed there, or let go on. The app's server
+/// receives each call at most once, a call it never received is never
+/// reported as done, and the run completes.
+async fn sends_each_call_at_most_once_after_a_takeover(a_goes_on: bool) {
+    for stop in STOPS {
+        let setup = setup(&[("Main", "tk_main")]).await;
+        let first = json!({ "n": 1 });
+        let second = json!({ "n": 2 });
+        let run = setup
+            .start(&format!(
+                "{}\n{}",
+                setup.calling("lookup", &first.to_string()).await,
+                setup.calling("lookup", &second.to_string()).await
+            ))
+            .await;
+        let takeover = setup.kit.take_over(stop, None).await;
+        if a_goes_on {
+            takeover.a_gate.release();
+            assert!(takeover.a.finish().await, "{stop:?}");
+        } else {
+            takeover.a.crash().await;
+        }
+        setup.kit.drain(Worker::B).await;
+        let done = setup.get(run).await;
+        assert_eq!(done["status"], "completed", "{stop:?}: {done}");
+        let calls = setup.calls(run).await;
+        assert_eq!(calls.len(), 2, "{stop:?}");
+        for (call, arguments) in calls.iter().zip([&first, &second]) {
+            let received = received_with(&setup, arguments);
+            assert!(
+                received <= 1,
+                "{stop:?}: the app's server received {arguments} {received} times"
+            );
+            assert!(call.state.is_settled(), "{stop:?}: {:?}", call.state);
+            if call.state == CallState::Completed {
+                assert_eq!(received, 1, "{stop:?}: done, so received once");
+            }
+            if received == 0 {
+                assert_ne!(call.state, CallState::Completed, "{stop:?}: never received");
+            }
+        }
+        assert!(
+            setup
+                .credentials_received()
+                .iter()
+                .all(|credential| credential == &main_credential()),
+            "{stop:?}: only its own credential"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sends_each_call_at_most_once_when_the_first_worker_dies() {
+    sends_each_call_at_most_once_after_a_takeover(false).await;
+}
+
+#[tokio::test]
+async fn sends_each_call_at_most_once_when_the_first_worker_comes_back() {
+    sends_each_call_at_most_once_after_a_takeover(true).await;
+}
+
+#[tokio::test]
+async fn records_the_send_a_cancel_came_after() {
+    let setup = setup(&[("Main", "tk_main")]).await;
+    let first = json!({ "n": 1 });
+    let second = json!({ "n": 2 });
+    let run = setup
+        .start(&format!(
+            "{}\n{}",
+            setup.calling("lookup", &first.to_string()).await,
+            setup.calling("lookup", &second.to_string()).await
+        ))
+        .await;
+    // The first call is authorized to send; the cancel commits before it
+    // leaves.
+    let gate = setup.kit.faults.arm(Worker::A, Point::BeforeSend);
+    let a = setup.kit.spawn(Worker::A);
+    gate.reached().await;
+    setup.cancel(run).await;
+    gate.release();
+    assert!(a.finish().await);
+    setup.kit.drain(Worker::B).await;
+    assert_eq!(setup.get(run).await["status"], "cancelled");
+    assert_eq!(received_with(&setup, &first), 1, "the send already authorized went out");
+    assert_eq!(received_with(&setup, &second), 0, "nothing after it");
+    let calls = setup.calls(run).await;
+    assert_eq!(calls[0].state, CallState::Completed, "its outcome recorded");
+    assert_eq!(calls[1].state, CallState::Refused);
+    assert_eq!(
+        calls[1].failure.as_ref().map(|failure| failure.code.as_str()),
+        Some("run_cancelled")
+    );
+}
+
+#[tokio::test]
+async fn records_a_call_in_flight_when_its_credential_is_deleted() {
+    let setup = setup(&[("Main", "tk_main")]).await;
+    let first = json!({ "n": 1 });
+    let second = json!({ "n": 2 });
+    let run = setup
+        .start(&format!(
+            "{}\n{}",
+            setup.calling("lookup", &first.to_string()).await,
+            setup.calling("lookup", &second.to_string()).await
+        ))
+        .await;
+    let gate = setup.kit.faults.arm(Worker::A, Point::BeforeSend);
+    let a = setup.kit.spawn(Worker::A);
+    gate.reached().await;
+    // The credential goes while the first call is on its way.
+    let installation = &setup.installations[0].1;
+    let (status, body) = setup
+        .kit
+        .send(
+            call(
+                "alice",
+                Method::POST,
+                format!("/v1/workspaces/{}/installations/{installation}/disconnect", setup.ws),
+            )
+            .naming(&setup.org),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    gate.release();
+    assert!(a.finish().await);
+    setup.kit.drain(Worker::B).await;
+    assert_eq!(setup.get(run).await["status"], "completed");
+    assert_eq!(
+        setup.credentials_received(),
+        [main_credential()],
+        "that request went out"
+    );
+    assert_eq!(received_with(&setup, &second), 0);
+    let calls = setup.calls(run).await;
+    assert_eq!(calls[0].state, CallState::Completed, "and its outcome is recorded");
+    assert_eq!(calls[1].state, CallState::Refused, "the next call to it is refused");
+    assert_eq!(
+        calls[1].failure.as_ref().map(|failure| failure.code.as_str()),
+        Some("installation_disconnected")
+    );
+}
+
+#[tokio::test]
+async fn refuses_at_send_a_call_whose_installation_went_after_its_turn() {
+    for (disconnect, code) in [(false, "installation_removed"), (true, "installation_disconnected")] {
+        let setup = setup(&[("Main", "tk_main")]).await;
+        let run = setup.start(&setup.calling("lookup", "{}").await).await;
+        let gate = setup.kit.faults.arm(Worker::A, Point::After(Write::CommitTurn));
+        let a = setup.kit.spawn(Worker::A);
+        gate.reached().await;
+        let installation = format!("/v1/workspaces/{}/installations/{}", setup.ws, setup.installations[0].1);
+        let (status, body) = if disconnect {
+            setup
+                .kit
+                .send(call("alice", Method::POST, format!("{installation}/disconnect")).naming(&setup.org))
+                .await
+        } else {
+            setup
+                .kit
+                .send(call("alice", Method::DELETE, installation).naming(&setup.org))
+                .await
+        };
+        assert!(status.is_success(), "{body}");
+        gate.release();
+        assert!(a.finish().await);
+        setup.kit.drain(Worker::B).await;
+        let done = setup.get(run).await;
+        assert_eq!(done["status"], "completed", "the model read why and went on: {done}");
+        assert!(setup.server.providers.received_calls().is_empty(), "nothing sent");
+        let calls = setup.calls(run).await;
+        assert_eq!(calls[0].state, CallState::Refused);
+        assert_eq!(
+            calls[0].failure.as_ref().map(|failure| failure.code.as_str()),
+            Some(code)
+        );
+    }
+}
+
+/// The installation is deleted after worker A read it there, on its way to
+/// parking the run on a call to it: the job its deletion queued finds the
+/// run not parked yet, and waits for the park instead of missing it. The
+/// call is refused once parked, nobody is asked, and nothing is sent.
+#[tokio::test]
+async fn refuses_a_call_parked_on_after_its_installation_went() {
+    let setup = setup(&[("Main", "tk_main")]).await;
+    let (status, key) = setup
+        .server
+        .send(
+            call(
+                "alice",
+                Method::POST,
+                format!("/v1/organizations/{}/api-keys", setup.org),
+            )
+            .body(json!({ "name": "Backend", "environment": "sandbox" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{key}");
+    let key = key["data"]["secret"].as_str().unwrap().to_owned();
+    let run = setup.start(&setup.calling("send", "{}").await).await;
+    let gate = setup.kit.faults.arm(Worker::A, Point::Before(Write::Park));
+    let a = setup.kit.spawn(Worker::A);
+    gate.reached().await;
+    let installation = &setup.installations[0].1;
+    let (status, _) = setup
+        .kit
+        .send(
+            call(
+                "alice",
+                Method::DELETE,
+                format!("/v1/workspaces/{}/installations/{installation}", setup.ws),
+            )
+            .naming(&setup.org),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // B takes the job the deletion queued: the run isn't parked yet.
+    assert!(run_engine::work_once(&setup.kit.state(Worker::B)).await);
+    assert_eq!(setup.get(run).await["status"], "running", "not parked yet");
+    assert_eq!(setup.calls(run).await[0].state, CallState::AwaitingApproval);
+    gate.release();
+    assert!(a.finish().await);
+    assert_eq!(setup.get(run).await["status"], "waiting_for_approval", "A parked it");
+    setup.kit.drain(Worker::B).await;
+    let done = setup.get(run).await;
+    assert_eq!(done["status"], "completed", "{done}");
+    let calls = setup.calls(run).await;
+    assert_eq!(calls[0].state, CallState::Refused);
+    assert_eq!(
+        calls[0].failure.as_ref().map(|failure| failure.code.as_str()),
+        Some("installation_removed")
+    );
+    let refused = setup
+        .kit
+        .faults
+        .writes()
+        .into_iter()
+        .filter(|attempted| attempted.write == Write::RefuseWaiting && attempted.result.is_ok())
+        .map(|attempted| attempted.worker)
+        .collect::<Vec<_>>();
+    assert_eq!(refused, [Worker::B], "the job refused it once it was parked");
+    let (status, body) = setup
+        .kit
+        .send(
+            call(
+                &key,
+                Method::POST,
+                format!("/v1/workspaces/{}/runs/{run}/approvals", setup.ws),
+            )
+            .body(json!({ "call_id": calls[0].id, "decision": "approved" })),
+        )
+        .await;
+    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "not_waiting"));
+    assert!(setup.server.providers.received_calls().is_empty(), "nothing sent");
+}
+
+/// A model that asks for `per_turn` lookups a turn, `turns` times, then
+/// answers.
+struct Busy {
+    turns: usize,
+    per_turn: usize,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for Busy {
+    fn name(&self) -> &'static str {
+        "busy"
+    }
+
+    async fn complete(&self, turn: &Turn<'_>) -> Result<Completion, ProviderError> {
+        let asked = turn
+            .messages
+            .iter()
+            .filter(|message| matches!(message, Message::Assistant { .. }))
+            .count();
+        let usage = TokenUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+        };
+        if asked >= self.turns {
+            return Ok(Completion {
+                reply: Reply::Text("Done.".to_owned()),
+                usage,
+            });
+        }
+        let lookup = turn
+            .tools
+            .iter()
+            .find(|tool| tool.description.contains(LOOKUP))
+            .expect("lookup is offered");
+        Ok(Completion {
+            reply: Reply::ToolCalls {
+                text: None,
+                calls: (0..self.per_turn)
+                    .map(|n| {
+                        let mut arguments = Map::new();
+                        arguments.insert("n".to_owned(), json!(n));
+                        ModelToolCall {
+                            id: format!("c{asked}_{n}"),
+                            name: lookup.name.clone(),
+                            arguments,
+                        }
+                    })
+                    .collect(),
+            },
+            usage,
+        })
+    }
+}
+
+/// A run of more steps than one claim takes completes on one job attempt:
+/// each claim hands the run back with a yield, which gives the attempt
+/// back, rather than failing and using one.
+#[tokio::test]
+async fn completes_a_three_hundred_step_run_on_one_job_attempt() {
+    let setup = setup(&[("Main", "tk_main")]).await;
+    let run = setup.start("Look everything up.").await;
+    let mut state = setup.kit.state(Worker::A);
+    // Nine turns of twenty calls, and an answer: 381 steps.
+    state.provider = Arc::new(Busy { turns: 9, per_turn: 20 });
+    let (org, ws) = setup.scope();
+    let mut claims = 0;
+    while run_engine::work_once(&state).await {
+        claims += 1;
+        assert!(claims < 10, "the run keeps being given back");
+        if let Some((attempts, job_state)) = setup.kit.run_job(org, ws, run).await {
+            assert_eq!(
+                (attempts, job_state.as_str()),
+                (0, "queued"),
+                "a yield gives the job's attempt back"
+            );
+        }
+    }
+    let done = setup.get(run).await;
+    assert_eq!(done["status"], "completed", "{done}");
+    assert_eq!(done["usage"]["tool_calls"], 180);
+    assert_eq!(setup.server.providers.received_calls().len(), 180, "each call once");
+    let committed: Vec<Write> = setup
+        .kit
+        .faults
+        .writes()
+        .into_iter()
+        .filter(|attempted| attempted.worker == Worker::A && attempted.result.is_ok())
+        .map(|attempted| attempted.write)
+        .collect();
+    assert!(committed.len() >= 300, "{} steps", committed.len());
+    let yields = committed.iter().filter(|write| **write == Write::Yield).count();
+    assert!(yields >= 1, "it yielded");
+    assert_eq!(
+        committed.iter().filter(|write| **write == Write::Claim).count(),
+        yields + 1,
+        "claimed once more per yield, and only then"
+    );
+    assert_eq!(claims, yields + 1, "each claim its job's first attempt again");
+    assert_eq!(setup.kit.run_job(org, ws, run).await, None, "its job is done");
 }

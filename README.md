@@ -275,7 +275,12 @@ decided again on what holds then (a call that now needs approval waits for
 it; one now refused, or whose installation was removed or disconnected, or
 whose tool changed since, isn't sent), and it is sent under a claim of its
 own: one whose worker stopped is settled as unknown once that claim lapses,
-and never sent again. Cancelling closes every call not yet sent. A worker
+and never sent again. Deleting or disconnecting an installation queues a job
+in the same transaction that refuses each call waiting for approval on it
+(`installation_removed` or `installation_disconnected`), so its run goes on
+without anyone deciding, and a decision sent later answers `409
+not_waiting`; a call to it the run hasn't asked about yet is refused before
+anyone is asked. Cancelling closes every call not yet sent. A worker
 whose claim ran out can't write, and a long run hands its claim back
 without using up its job's attempts. A run no job takes forward any more
 (its last job died) is failed `run_unavailable` by the worker's periodic

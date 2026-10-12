@@ -216,8 +216,19 @@ pub async fn seed(
     let snapshot = seeding.snapshot().await?;
     let call = snapshot.calls.first().ok_or("the call isn't recorded")?;
     if waiting {
-        // Parks on the call: waiting for an API key's decision.
-        seeding.step(seeding.facts()).await?;
+        // Parks on the call, its installation still there: waiting for an
+        // API key's decision.
+        seeding
+            .step(Facts {
+                send_check: Some(SendCheck {
+                    call_id: call.id,
+                    installation: InstallationCheck::Usable,
+                    definition_sha256: Some(target.definition_sha256),
+                    decision: decision.clone(),
+                }),
+                ..seeding.facts()
+            })
+            .await?;
         return Ok(());
     }
     let Io::SendCall(send) = seeding

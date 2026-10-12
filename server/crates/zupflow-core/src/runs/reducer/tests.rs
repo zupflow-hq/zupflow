@@ -1085,13 +1085,36 @@ fn await_model_refuses_what_does_not_fit() {
 // ---------------------------------------------------------------------------
 // NeedCall
 
+/// A call waiting for approval checked before the run parks on it: its
+/// installation as `installation` finds it, its recorded decision.
+fn before_parking(call: &CallRecord, installation: InstallationCheck) -> Facts {
+    Facts {
+        send_check: Some(SendCheck {
+            installation,
+            ..check(call, approve())
+        }),
+        ..claimed()
+    }
+}
+
 #[test]
 fn a_call_awaiting_approval_parks_the_run() {
     let snapshot = with_calls(
         Continuation::NeedCall { turn: 0, position: 0 },
         vec![record(1, 0, WORK_CREATE, CallState::AwaitingApproval)],
     );
-    let plan = planned(&snapshot, &claimed());
+    // Its installation is checked first; one that is there, even if it
+    // needs a reconnect or can't be reached now, is asked about.
+    for installation in [InstallationCheck::ReconnectRequired, InstallationCheck::Unusable] {
+        assert!(matches!(
+            operation(&planned(&snapshot, &before_parking(&snapshot.calls[0], installation))),
+            Operation::Park(_)
+        ));
+    }
+    let plan = planned(
+        &snapshot,
+        &before_parking(&snapshot.calls[0], InstallationCheck::Usable),
+    );
     assert_eq!(
         operation(&plan),
         &Operation::Park(Park {
@@ -1107,6 +1130,66 @@ fn a_call_awaiting_approval_parks_the_run() {
     assert_eq!(
         operation(&plan).status_after(RunStatus::Running),
         RunStatus::WaitingForApproval
+    );
+}
+
+#[test]
+fn a_call_awaiting_approval_on_an_installation_that_went_is_refused_not_parked() {
+    let snapshot = with_calls(
+        Continuation::NeedCall { turn: 0, position: 0 },
+        vec![
+            record(1, 0, WORK_CREATE, CallState::AwaitingApproval),
+            record(2, 1, PERSONAL_CREATE, CallState::Allowed),
+        ],
+    );
+    let call = &snapshot.calls[0];
+    for (installation, code, message) in [
+        (
+            InstallationCheck::Removed,
+            INSTALLATION_REMOVED,
+            "Work was removed, so this call wasn't made.",
+        ),
+        (
+            InstallationCheck::Disconnected,
+            INSTALLATION_DISCONNECTED,
+            "Work was disconnected, so this call wasn't made.",
+        ),
+    ] {
+        let plan = planned(&snapshot, &before_parking(call, installation));
+        assert_eq!(
+            operation(&plan),
+            &Operation::AuthorizeCall(AuthorizeCall {
+                call_id: call_id(1),
+                decision: approve(),
+                authorization: Authorization::Refuse {
+                    outcome: CallOutcome {
+                        content: message.to_owned(),
+                        is_error: true,
+                    },
+                    failure: Failure::new(code, message),
+                },
+                next: Continuation::NeedCall { turn: 0, position: 1 },
+            }),
+            "{installation:?}"
+        );
+        assert_eq!(guards(&plan), keeps(1), "the worker keeps the run");
+        assert_eq!(plan.io(), &Io::Nothing, "nothing is sent");
+    }
+    // The check is required, and must be of this call.
+    assert_eq!(
+        advance(&snapshot, &claimed()),
+        Err(AdvanceError::MissingFact("send_check"))
+    );
+    let other = Facts {
+        send_check: Some(SendCheck {
+            call_id: call_id(2),
+            ..check(call, approve())
+        }),
+        ..claimed()
+    };
+    assert_eq!(
+        advance(&snapshot, &other),
+        Err(AdvanceError::InvalidFact("a send check for another call"))
     );
 }
 
@@ -1694,6 +1777,149 @@ fn an_approval_answers_not_waiting_unless_the_run_waits_for_that_call() {
     }
 }
 
+/// The job's refusal of the call `snapshot` waits on, its installation
+/// gone as `gone` says, by caller 1, in the run's own scope.
+fn refuse_parked(
+    snapshot: &Snapshot,
+    installation_id: InstallationId,
+    gone: Gone,
+) -> Result<TransitionRequest, ControlError> {
+    refuse_waiting(organization(), workspace(), snapshot, caller(1), installation_id, gone)
+}
+
+#[test]
+fn a_call_waiting_on_an_installation_that_went_is_refused_and_the_run_moves_on() {
+    let snapshot = parked();
+    for (gone, code, message) in [
+        (
+            Gone::Removed,
+            INSTALLATION_REMOVED,
+            "Work was removed, so this call wasn't made.",
+        ),
+        (
+            Gone::Disconnected,
+            INSTALLATION_DISCONNECTED,
+            "Work was disconnected, so this call wasn't made.",
+        ),
+    ] {
+        let request = refuse_parked(&snapshot, work(), gone).expect("refuses");
+        assert_eq!(
+            request.operation(),
+            &Operation::RefuseWaiting(RefuseWaiting {
+                request_id: caller(1),
+                call_id: call_id(2),
+                installation_id: work(),
+                outcome: CallOutcome {
+                    content: message.to_owned(),
+                    is_error: true,
+                },
+                failure: Failure::new(code, message),
+                next: Continuation::NeedCall { turn: 0, position: 2 },
+            })
+        );
+        assert_eq!(request.guards(), &Guards::default(), "no claim is needed");
+        assert_eq!(request.from_revision(), snapshot.control.revision);
+        assert_eq!(
+            request.operation().status_after(RunStatus::WaitingForApproval),
+            RunStatus::Running,
+            "runnable again"
+        );
+        assert_eq!(
+            request.operation().continuation_after(snapshot.control.continuation),
+            Continuation::NeedCall { turn: 0, position: 2 }
+        );
+        // Deterministic for one request; two jobs never build the same one.
+        assert_eq!(refuse_parked(&snapshot, work(), gone), Ok(request.clone()));
+        let other = refuse_waiting(organization(), workspace(), &snapshot, caller(2), work(), gone).expect("refuses");
+        assert_eq!(other.id(), request.id());
+        assert_ne!(other.digest(), request.digest());
+    }
+    // The last open call of its turn: the next turn.
+    let mut last = parked();
+    last.calls[2].state = CallState::Completed;
+    let request = refuse_parked(&last, work(), Gone::Removed).expect("refuses");
+    assert_eq!(
+        request.operation().continuation_after(last.control.continuation),
+        Continuation::NeedModel { turn: 1 }
+    );
+}
+
+#[test]
+fn only_a_call_waiting_on_the_installation_that_went_is_refused() {
+    let snapshot = parked();
+    // Another installation's call, or another installation gone.
+    assert_eq!(
+        refuse_parked(&snapshot, personal(), Gone::Removed),
+        Err(ControlError::NotWaiting)
+    );
+    let mut cancelled = parked();
+    cancelled.control.status = RunStatus::Cancelled;
+    cancelled.control.continuation = Continuation::Done;
+    cancelled.control.cancel_requested_at = Some(at(0));
+    let mut decided = parked();
+    decided.control.status = RunStatus::Running;
+    decided.control.continuation = Continuation::NeedCall { turn: 0, position: 1 };
+    decided.calls[1].state = CallState::Approved;
+    let mut odd = parked();
+    odd.calls[1].state = CallState::Approved;
+    let mut no_target = parked();
+    no_target.calls[1].target = None;
+    for snapshot in [cancelled, decided, odd, no_target] {
+        assert_eq!(
+            refuse_parked(&snapshot, work(), Gone::Disconnected),
+            Err(ControlError::NotWaiting)
+        );
+    }
+    // Only in the run's own organization and workspace.
+    for (organization_id, workspace_id) in [
+        (organization(), WorkspaceId::from_uuid(Uuid::from_u128(99))),
+        (OrganizationId::from_uuid(Uuid::from_u128(99)), workspace()),
+    ] {
+        assert_eq!(
+            refuse_waiting(
+                organization_id,
+                workspace_id,
+                &snapshot,
+                caller(1),
+                work(),
+                Gone::Removed
+            ),
+            Err(ControlError::NotFound)
+        );
+    }
+    let mut other_version = parked();
+    other_version.control.execution_version = EXECUTION_VERSION + 1;
+    assert_eq!(
+        refuse_parked(&other_version, work(), Gone::Removed),
+        Err(ControlError::UnsupportedVersion(EXECUTION_VERSION + 1))
+    );
+}
+
+#[test]
+fn a_run_at_a_call_waiting_on_an_installation_may_still_park_on_it() {
+    let at_call = with_calls(
+        Continuation::NeedCall { turn: 0, position: 1 },
+        vec![
+            record(1, 0, WORK_LIST, CallState::Completed),
+            record(2, 1, WORK_CREATE, CallState::AwaitingApproval),
+            record(3, 2, PERSONAL_CREATE, CallState::AwaitingApproval),
+        ],
+    );
+    assert!(may_park_on(&at_call, work()));
+    // Not the call it's at, or parked already: the job finds it, or the
+    // check before parking does.
+    assert!(!may_park_on(&at_call, personal()));
+    assert!(!may_park_on(&parked(), work()));
+    let mut allowed = at_call.clone();
+    allowed.calls[1].state = CallState::Allowed;
+    assert!(!may_park_on(&allowed, work()));
+    let mut cancelled = at_call;
+    cancelled.control.status = RunStatus::Cancelled;
+    cancelled.control.continuation = Continuation::Done;
+    cancelled.control.cancel_requested_at = Some(at(0));
+    assert!(!may_park_on(&cancelled, work()));
+}
+
 #[test]
 fn cancel_closes_every_call_not_yet_sent() {
     let mut snapshot = sending(30_000);
@@ -1908,6 +2134,18 @@ fn every_operation_says_where_it_leaves_the_run() {
                 next,
             }),
             RunStatus::Queued,
+            next,
+        ),
+        (
+            Operation::RefuseWaiting(RefuseWaiting {
+                request_id: caller(1),
+                call_id: call,
+                installation_id: work(),
+                outcome: refused("x".to_owned()),
+                failure: Failure::new("x", "x"),
+                next,
+            }),
+            RunStatus::Running,
             next,
         ),
         (
@@ -2136,6 +2374,19 @@ fn commit(snapshot: &mut Snapshot, request: &TransitionRequest, now: Timestamp) 
             record.approval = Some((resolve.decision, resolve.api_key_id));
             record.outcome = resolve.outcome.clone();
         }
+        Operation::RefuseWaiting(refuse) => {
+            let index = call(snapshot, refuse.call_id);
+            let record = &mut snapshot.calls[index];
+            assert_eq!(record.state, CallState::AwaitingApproval, "only a waiting call");
+            assert_eq!(
+                record.target.as_ref().map(|target| target.installation_id),
+                Some(refuse.installation_id),
+                "bound to the installation that went"
+            );
+            record.state = CallState::Refused;
+            record.outcome = Some(refuse.outcome.clone());
+            record.failure = Some(refuse.failure.clone());
+        }
         Operation::AuthorizeCall(authorize) => {
             let index = call(snapshot, authorize.call_id);
             let epoch = snapshot.control.owner_epoch;
@@ -2313,8 +2564,16 @@ fn a_run_with_an_approval_and_a_lost_outcome_completes_without_resending() {
         },
     );
     assert_eq!(run.calls[0].state, CallState::Completed);
-    // The write waits for a person; the claim is released.
-    step(&mut run, &worker(1, Some(1), now));
+    // The write waits for a person, its installation still there; the
+    // claim is released.
+    let waiting = run.calls[1].clone();
+    step(
+        &mut run,
+        &Facts {
+            send_check: Some(check(&waiting, approve())),
+            ..worker(1, Some(1), now)
+        },
+    );
     assert_eq!(run.control.status, RunStatus::WaitingForApproval);
     assert_eq!(run.control.lease_until, None);
     assert_eq!(
