@@ -13,6 +13,7 @@
 //! - [`storage`]: the [`storage::Cache`] and [`storage::ObjectStore`] traits.
 //! - [`events`]: the [`events::EventBus`] trait.
 //! - [`jobs`]: the [`jobs::JobQueue`] trait.
+//! - [`metrics`]: the [`metrics::Metrics`] trait: what operators count and time.
 //! - [`idempotency`]: idempotency keys for `POST`, and their store.
 //! - [`identity`]: Console sign-in, the [`identity::Identity`] trait.
 //! - [`installations`]: connected accounts, their sealed credentials and their store.
@@ -40,6 +41,7 @@ pub mod ids;
 pub mod installations;
 pub mod jobs;
 pub mod keys;
+pub mod metrics;
 pub mod models;
 pub mod organizations;
 pub mod outbound;

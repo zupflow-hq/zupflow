@@ -22,6 +22,7 @@ mod imitations;
 pub mod installation_store;
 pub mod job_queue;
 pub mod key_service;
+pub mod metrics;
 pub mod model_catalog;
 pub mod model_provider;
 pub mod object_store;

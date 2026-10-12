@@ -16,288 +16,21 @@
 mod common;
 #[path = "common/faults.rs"]
 mod faults;
+#[path = "common/run_setup.rs"]
+mod run_setup;
 
 use axum::http::{Method, StatusCode};
-use common::{Server, call, code};
-use faults::{Kit, Point, RecordedCall, Worker, Write, accounted_tokens, kept_answers, produced_tokens};
+use common::{call, code};
+use faults::{Point, Worker, Write, accounted_tokens, kept_answers, produced_tokens};
+use run_setup::{LOOKUP, Setup, main_credential, setup};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
-use zupflow_core::ids::{OrganizationId, RunId, WorkspaceId};
+use std::sync::atomic::{AtomicBool, Ordering};
+use zupflow_core::ids::RunId;
 use zupflow_core::models::{Completion, Message, ModelProvider, ModelToolCall, ProviderError, Reply, TokenUsage, Turn};
 use zupflow_core::runs::CallState;
 use zupflow_core::runs::state::ModelAttemptState;
 use zupflow_server::run_engine;
-
-const MCP: &str = "https://tools.example/mcp";
-
-/// What `lookup` is described as.
-const LOOKUP: &str = "Look something up";
-
-fn id(value: &Value) -> &str {
-    value["id"].as_str().unwrap()
-}
-
-/// An organization's Sandbox workspace with installations of one catalog
-/// app, each with its own label and token, and an agent granted `lookup`
-/// (allowed) and `send` (needs approval) on each, in the order given.
-struct Setup {
-    server: Server,
-    kit: Kit,
-    org: String,
-    ws: String,
-    agent: String,
-    /// By label.
-    installations: Vec<(String, String)>,
-}
-
-async fn setup(installations: &[(&str, &str)]) -> Setup {
-    let server = Server::new().await;
-    server.providers.serve_mcp(
-        MCP,
-        json!([
-            { "name": "lookup", "description": LOOKUP, "inputSchema": { "type": "object" }, "annotations": { "readOnlyHint": true } },
-            { "name": "send", "description": "Send a message", "inputSchema": { "type": "object" } },
-        ]),
-    );
-    let org = server.organization("alice", "northwind").await;
-    let ws = id(&server.workspace("alice", &org, "sandbox", "sandbox").await).to_owned();
-    let (status, created) = server
-        .send(
-            call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(json!({
-                "kind": "mcp", "name": "Tools", "key": "tools", "description": "", "auth_type": "token",
-            })),
-        )
-        .await;
-    assert_eq!(status, StatusCode::CREATED, "{created}");
-    let app = id(&created["data"]).to_owned();
-    let (status, body) = server
-        .send(
-            call("alice", Method::PATCH, format!("/v1/organizations/{org}/apps/{app}")).body(json!({ "auth": {
-                "type": "token",
-                "inputs": [{ "key": "api_key", "label": "API key", "secret": true, "help": null, "placeholder": null, "pattern": null }],
-                "placement": { "location": "header", "name": "X-Api-Key", "prefix": "" },
-                "verify_url": null, "instructions": "", "docs_url": null,
-            }})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, _) = server
-        .send(
-            call(
-                "alice",
-                Method::PUT,
-                format!("/v1/organizations/{org}/apps/{app}/environments/sandbox/configuration"),
-            )
-            .body(json!({ "mcp_server_url": MCP })),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK);
-    let mut connected = Vec::new();
-    for (label, token) in installations {
-        connected.push((
-            (*label).to_owned(),
-            connect(&server, &org, &ws, &app, label, token).await,
-        ));
-    }
-    let (status, body) = server
-        .send(
-            call(
-                "alice",
-                Method::PATCH,
-                format!("/v1/organizations/{org}/apps/{app}/tool-levels"),
-            )
-            .body(json!({
-                "levels": [{ "tool": "lookup", "level": "allow" }, { "tool": "send", "level": "approve" }],
-            })),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, agent) = server
-        .send(
-            call("alice", Method::POST, format!("/v1/workspaces/{ws}/agents"))
-                .naming(&org)
-                .body(json!({ "name": "Helper", "description": "", "model": "model-a", "instructions": "Be brief." })),
-        )
-        .await;
-    assert_eq!(status, StatusCode::CREATED, "{agent}");
-    let agent = id(&agent["data"]).to_owned();
-    let kit = Kit::new(&server);
-    let setup = Setup {
-        server,
-        kit,
-        org,
-        ws,
-        agent,
-        installations: connected,
-    };
-    for (_, installation) in &setup.installations {
-        setup.grant(installation).await;
-    }
-    setup
-}
-
-async fn connect(server: &Server, org: &str, ws: &str, app: &str, label: &str, token: &str) -> String {
-    let (status, session) = server
-        .send(
-            call("alice", Method::POST, format!("/v1/workspaces/{ws}/connect-sessions"))
-                .naming(org)
-                .body(json!({ "app_id": app, "intent": "create", "label": label, "installation_id": null, "return_url": null })),
-        )
-        .await;
-    assert_eq!(status, StatusCode::CREATED, "{session}");
-    let reference = session["data"]["url"]
-        .as_str()
-        .unwrap()
-        .rsplit('/')
-        .next()
-        .unwrap()
-        .to_owned();
-    let (status, done) = server
-        .send(
-            call(
-                "nobody",
-                Method::POST,
-                format!("/v1/connect/sessions/{reference}/credentials"),
-            )
-            .body(json!({ "values": { "api_key": token } })),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{done}");
-    while zupflow_server::discovery::work_once(&server.state).await {}
-    id(&done["data"]["installation"]).to_owned()
-}
-
-impl Setup {
-    /// `call <tool> <arguments>`, naming the first installation's `tool` as
-    /// the model is offered it: `tools_<short_id>_<tool>` (decision 0047).
-    async fn calling(&self, tool: &str, arguments: &str) -> String {
-        let installation = &self.installations[0].1;
-        let (status, read) = self
-            .kit
-            .send(
-                call(
-                    "alice",
-                    Method::GET,
-                    format!("/v1/workspaces/{}/installations/{installation}", self.ws),
-                )
-                .naming(&self.org),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{read}");
-        format!(
-            "call tools_{}_{tool} {arguments}",
-            read["data"]["short_id"].as_str().unwrap()
-        )
-    }
-
-    fn scope(&self) -> (OrganizationId, WorkspaceId) {
-        (
-            OrganizationId::parse(&self.org).unwrap(),
-            WorkspaceId::parse(&self.ws).unwrap(),
-        )
-    }
-
-    async fn grant(&self, installation: &str) {
-        let (status, grant) = self
-            .kit
-            .send(
-                call(
-                    "alice",
-                    Method::POST,
-                    format!("/v1/workspaces/{}/agents/{}/grants", self.ws, self.agent),
-                )
-                .naming(&self.org)
-                .body(json!({ "installation_id": installation, "tools": ["lookup", "send"], "approval_required": ["send"] })),
-            )
-            .await;
-        assert_eq!(status, StatusCode::CREATED, "{grant}");
-    }
-
-    /// Removes the agent's grant on `installation` and grants it again, so
-    /// it comes last among the agent's grants.
-    async fn grant_again(&self, installation: &str) {
-        let grants = format!("/v1/workspaces/{}/agents/{}/grants", self.ws, self.agent);
-        let (status, listed) = self
-            .kit
-            .send(call("alice", Method::GET, grants.clone()).naming(&self.org))
-            .await;
-        assert_eq!(status, StatusCode::OK, "{listed}");
-        let grant = listed["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|grant| grant["installation_id"] == installation)
-            .unwrap();
-        let (status, _) = self
-            .kit
-            .send(call("alice", Method::DELETE, format!("{grants}/{}", id(grant))).naming(&self.org))
-            .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        self.grant(installation).await;
-    }
-
-    /// Starts a run as alice; its ID. Nothing works it yet.
-    async fn start(&self, input: &str) -> RunId {
-        let (status, run) = self
-            .kit
-            .send(
-                call(
-                    "alice",
-                    Method::POST,
-                    format!("/v1/workspaces/{}/agents/{}/runs", self.ws, self.agent),
-                )
-                .naming(&self.org)
-                .body(json!({ "input": input })),
-            )
-            .await;
-        assert_eq!(status, StatusCode::CREATED, "{run}");
-        RunId::parse(id(&run["data"])).unwrap()
-    }
-
-    async fn get(&self, run: RunId) -> Value {
-        let (status, body) = self
-            .kit
-            .send(call("alice", Method::GET, format!("/v1/workspaces/{}/runs/{run}", self.ws)).naming(&self.org))
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        body["data"].clone()
-    }
-
-    async fn cancel(&self, run: RunId) {
-        let (status, body) = self
-            .kit
-            .send(
-                call(
-                    "alice",
-                    Method::POST,
-                    format!("/v1/workspaces/{}/runs/{run}/cancel", self.ws),
-                )
-                .naming(&self.org),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["data"]["status"], "cancelled");
-    }
-
-    async fn calls(&self, run: RunId) -> Vec<RecordedCall> {
-        let (org, ws) = self.scope();
-        self.kit.progress(org, ws, run).await.calls
-    }
-
-    /// The credential each `tools/call` the app's server received carried.
-    fn credentials_received(&self) -> Vec<Option<(String, String)>> {
-        self.server
-            .providers
-            .received_calls()
-            .into_iter()
-            .map(|received| received.credential)
-            .collect()
-    }
-}
-
-fn main_credential() -> Option<(String, String)> {
-    Some(("X-Api-Key".to_owned(), "tk_main".to_owned()))
-}
 
 #[tokio::test]
 async fn never_sends_a_call_whose_worker_died_before_it_left() {
@@ -589,83 +322,338 @@ fn received_with(setup: &Setup, arguments: &Value) -> usize {
         .count()
 }
 
-/// Every point a worker can stop at while it takes a run with two calls
-/// forward: each write it makes, the model's answer and the send.
-const STOPS: [Point; 12] = [
-    Point::After(Write::Claim),
-    Point::Before(Write::PrepareModel),
-    Point::After(Write::PrepareModel),
-    Point::BeforeModel,
-    Point::AfterModel,
-    Point::Before(Write::CommitTurn),
-    Point::After(Write::CommitTurn),
-    Point::Before(Write::AuthorizeCall),
-    Point::After(Write::AuthorizeCall),
-    Point::BeforeSend,
-    Point::AfterSend,
-    Point::Before(Write::RecordOutcome),
+/// One named boundary on a worker's way: `point`, the `nth` time the worker
+/// reaches it.
+#[derive(Debug, Clone, Copy)]
+struct Stop {
+    point: Point,
+    nth: usize,
+}
+
+const fn at(point: Point, nth: usize) -> Stop {
+    Stop { point, nth }
+}
+
+/// Every boundary a worker crosses on a run with two calls and a closing
+/// turn, before and after each: its claim; the first turn's model attempt,
+/// the model's answer and the turn; each call's authorization, send and
+/// outcome; the closing turn's model attempt, answer and turn, which ends
+/// the run.
+const TWO_CALLS: [Stop; 26] = [
+    at(Point::Before(Write::Claim), 1),
+    at(Point::After(Write::Claim), 1),
+    at(Point::Before(Write::PrepareModel), 1),
+    at(Point::After(Write::PrepareModel), 1),
+    at(Point::BeforeModel, 1),
+    at(Point::AfterModel, 1),
+    at(Point::Before(Write::CommitTurn), 1),
+    at(Point::After(Write::CommitTurn), 1),
+    at(Point::Before(Write::AuthorizeCall), 1),
+    at(Point::After(Write::AuthorizeCall), 1),
+    at(Point::BeforeSend, 1),
+    at(Point::AfterSend, 1),
+    at(Point::Before(Write::RecordOutcome), 1),
+    at(Point::After(Write::RecordOutcome), 1),
+    at(Point::Before(Write::AuthorizeCall), 2),
+    at(Point::After(Write::AuthorizeCall), 2),
+    at(Point::BeforeSend, 2),
+    at(Point::AfterSend, 2),
+    at(Point::Before(Write::RecordOutcome), 2),
+    at(Point::After(Write::RecordOutcome), 2),
+    at(Point::Before(Write::PrepareModel), 2),
+    at(Point::After(Write::PrepareModel), 2),
+    at(Point::BeforeModel, 2),
+    at(Point::AfterModel, 2),
+    at(Point::Before(Write::CommitTurn), 2),
+    at(Point::After(Write::CommitTurn), 2),
 ];
 
-/// Worker A stops at each point, its lease runs out and B takes the run over
-/// and finishes it; then A is crashed there, or let go on. The app's server
-/// receives each call at most once, a call it never received is never
-/// reported as done, and the run completes.
-async fn sends_each_call_at_most_once_after_a_takeover(a_goes_on: bool) {
-    for stop in STOPS {
-        let setup = setup(&[("Main", "tk_main")]).await;
-        let first = json!({ "n": 1 });
-        let second = json!({ "n": 2 });
-        let run = setup
-            .start(&format!(
-                "{}\n{}",
-                setup.calling("lookup", &first.to_string()).await,
-                setup.calling("lookup", &second.to_string()).await
-            ))
-            .await;
-        let takeover = setup.kit.take_over(stop, None).await;
-        if a_goes_on {
+/// What becomes of whoever was stopped at a boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Then {
+    /// Crashed there, as a process dying would.
+    Dies,
+    /// Let go on, late.
+    ComesBack,
+}
+
+/// Whether every answer an app's server gave reaches the store: not when
+/// the worker holding one dies with it.
+fn answers_kept(stop: Stop, then: Then) -> bool {
+    !(then == Then::Dies && matches!(stop.point, Point::AfterSend | Point::Before(Write::RecordOutcome)))
+}
+
+/// The run's ledger, state and timeline owe nothing, and it ended `status`.
+async fn holds(setup: &Setup, run: RunId, asked: &[Value], stop: Stop, then: Then, status: &str) {
+    let broken = setup.violations(run, asked, answers_kept(stop, then)).await;
+    assert!(broken.is_empty(), "{stop:?}, {then:?}: {broken:#?}");
+    let done = setup.get(run).await;
+    assert_eq!(done["status"], status, "{stop:?}, {then:?}: {done}");
+}
+
+/// Worker A stops at `stop`; its lease runs out and B takes the run over,
+/// where there is a run to take; A dies there or comes back; then B works
+/// whatever is left.
+async fn stop_and_take_over(setup: &Setup, stop: Stop, then: Then) {
+    let takeover = setup.kit.take_over_at(stop.point, stop.nth).await;
+    match then {
+        Then::Dies => takeover.a.crash().await,
+        Then::ComesBack => {
             takeover.a_gate.release();
             assert!(takeover.a.finish().await, "{stop:?}");
-        } else {
-            takeover.a.crash().await;
         }
-        setup.kit.drain(Worker::B).await;
-        let done = setup.get(run).await;
-        assert_eq!(done["status"], "completed", "{stop:?}: {done}");
-        let calls = setup.calls(run).await;
-        assert_eq!(calls.len(), 2, "{stop:?}");
-        for (call, arguments) in calls.iter().zip([&first, &second]) {
-            let received = received_with(&setup, arguments);
-            assert!(
-                received <= 1,
-                "{stop:?}: the app's server received {arguments} {received} times"
-            );
-            assert!(call.state.is_settled(), "{stop:?}: {:?}", call.state);
-            if call.state == CallState::Completed {
-                assert_eq!(received, 1, "{stop:?}: done, so received once");
-            }
-            if received == 0 {
-                assert_ne!(call.state, CallState::Completed, "{stop:?}: never received");
-            }
-        }
-        assert!(
-            setup
-                .credentials_received()
-                .iter()
-                .all(|credential| credential == &main_credential()),
-            "{stop:?}: only its own credential"
-        );
+    }
+    setup.kit.drain(Worker::B).await;
+}
+
+fn two_lookups() -> Vec<Value> {
+    vec![json!({ "n": 1 }), json!({ "n": 2 })]
+}
+
+async fn two_call_matrix(stops: &[Stop], then: Then) {
+    for stop in stops {
+        let setup = setup(&[("Main", "tk_main")]).await;
+        let run = setup.run_calling(&["lookup", "lookup"], &two_lookups()).await;
+        stop_and_take_over(&setup, *stop, then).await;
+        holds(&setup, run, &two_lookups(), *stop, then, "completed").await;
     }
 }
 
 #[tokio::test]
-async fn sends_each_call_at_most_once_when_the_first_worker_dies() {
-    sends_each_call_at_most_once_after_a_takeover(false).await;
+async fn holds_from_each_boundary_of_the_claim_and_first_turn_when_the_worker_dies() {
+    two_call_matrix(&TWO_CALLS[..8], Then::Dies).await;
 }
 
 #[tokio::test]
-async fn sends_each_call_at_most_once_when_the_first_worker_comes_back() {
-    sends_each_call_at_most_once_after_a_takeover(true).await;
+async fn holds_from_each_boundary_of_the_claim_and_first_turn_when_the_worker_comes_back() {
+    two_call_matrix(&TWO_CALLS[..8], Then::ComesBack).await;
+}
+
+#[tokio::test]
+async fn holds_from_each_boundary_of_the_first_call_when_the_worker_dies() {
+    two_call_matrix(&TWO_CALLS[8..14], Then::Dies).await;
+}
+
+#[tokio::test]
+async fn holds_from_each_boundary_of_the_first_call_when_the_worker_comes_back() {
+    two_call_matrix(&TWO_CALLS[8..14], Then::ComesBack).await;
+}
+
+#[tokio::test]
+async fn holds_from_each_boundary_of_the_second_call_when_the_worker_dies() {
+    two_call_matrix(&TWO_CALLS[14..20], Then::Dies).await;
+}
+
+#[tokio::test]
+async fn holds_from_each_boundary_of_the_second_call_when_the_worker_comes_back() {
+    two_call_matrix(&TWO_CALLS[14..20], Then::ComesBack).await;
+}
+
+#[tokio::test]
+async fn holds_from_each_boundary_of_the_closing_turn_when_the_worker_dies() {
+    two_call_matrix(&TWO_CALLS[20..], Then::Dies).await;
+}
+
+#[tokio::test]
+async fn holds_from_each_boundary_of_the_closing_turn_when_the_worker_comes_back() {
+    two_call_matrix(&TWO_CALLS[20..], Then::ComesBack).await;
+}
+
+/// How the model answers the closing turn, after the first turn's calls.
+enum Closing {
+    /// It fails: the run ends failed, through `Finish`.
+    Fails,
+    /// No answer the first time it's asked: the worker yields.
+    SilentOnce(AtomicBool),
+}
+
+/// The scripted model for the first turn, then `closing`.
+struct ClosingTurn {
+    inner: Arc<dyn ModelProvider>,
+    closing: Closing,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for ClosingTurn {
+    fn name(&self) -> &'static str {
+        "closing-turn"
+    }
+
+    async fn complete(&self, turn: &Turn<'_>) -> Result<Completion, ProviderError> {
+        let closing = turn
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::Assistant { .. }));
+        match &self.closing {
+            Closing::Fails if closing => Err(ProviderError::Failed("the closing turn fails")),
+            Closing::SilentOnce(silent) if closing && !silent.swap(true, Ordering::SeqCst) => {
+                Err(ProviderError::Unavailable)
+            }
+            _ => self.inner.complete(turn).await,
+        }
+    }
+}
+
+/// `Finish` (the closing turn's model fails) and `Yield` (it doesn't
+/// answer the first time), before and after each.
+async fn closing_matrix(closing: fn() -> Closing, write: Write, status: &str) {
+    for then in [Then::Dies, Then::ComesBack] {
+        for stop in [at(Point::Before(write), 1), at(Point::After(write), 1)] {
+            let mut setup = setup(&[("Main", "tk_main")]).await;
+            let inner = setup.server.state.provider.clone();
+            setup.kit.set_model(Arc::new(ClosingTurn {
+                inner,
+                closing: closing(),
+            }));
+            let run = setup.run_calling(&["lookup", "lookup"], &two_lookups()).await;
+            stop_and_take_over(&setup, stop, then).await;
+            holds(&setup, run, &two_lookups(), stop, then, status).await;
+            let calls = setup.calls(run).await;
+            assert!(
+                calls.iter().all(|call| call.state == CallState::Completed),
+                "{stop:?}, {then:?}: both calls were done before the closing turn"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn holds_from_each_boundary_of_a_finish() {
+    closing_matrix(|| Closing::Fails, Write::Finish, "failed").await;
+}
+
+#[tokio::test]
+async fn holds_from_each_boundary_of_a_yield() {
+    closing_matrix(
+        || Closing::SilentOnce(AtomicBool::new(false)),
+        Write::Yield,
+        "completed",
+    )
+    .await;
+}
+
+/// A run with a call that needs approval, then a lookup: worker A stopped
+/// before or after parking it (and taken over), or the API's decision
+/// stopped before or after it commits; the call approved once, sent once.
+#[tokio::test]
+async fn holds_from_each_boundary_of_an_approval() {
+    let asked = [json!({ "n": 1 }), json!({ "n": 2 })];
+    let stops = [
+        (Worker::A, Point::Before(Write::Park)),
+        (Worker::A, Point::After(Write::Park)),
+        (Worker::Api, Point::Before(Write::ResolveApproval)),
+        (Worker::Api, Point::After(Write::ResolveApproval)),
+    ];
+    for then in [Then::Dies, Then::ComesBack] {
+        for (worker, point) in stops {
+            let setup = setup(&[("Main", "tk_main")]).await;
+            let key = setup.api_key().await;
+            let run = setup.run_calling(&["send", "lookup"], &asked).await;
+            if worker == Worker::A {
+                stop_and_take_over(&setup, at(point, 1), then).await;
+            } else {
+                setup.kit.drain(Worker::A).await;
+            }
+            assert_eq!(
+                setup.get(run).await["status"],
+                "waiting_for_approval",
+                "{point:?}, {then:?}"
+            );
+            let call_id = setup.calls(run).await[0].id.to_string();
+            let uri = format!("/v1/workspaces/{}/runs/{run}/approvals", setup.ws);
+            let body = json!({ "call_id": call_id, "decision": "approved" });
+            let (status, answer) = if worker == Worker::Api {
+                setup
+                    .api_stopped(point, then == Then::Dies, &key, uri, Some(body))
+                    .await
+            } else {
+                setup.decide(&key, run, &call_id, "approved").await
+            };
+            let committed_first = worker == Worker::Api && then == Then::Dies && matches!(point, Point::After(_));
+            if committed_first {
+                assert_eq!(
+                    (status, code(&answer)),
+                    (StatusCode::CONFLICT, "not_waiting"),
+                    "{point:?}"
+                );
+            } else {
+                assert_eq!(status, StatusCode::OK, "{point:?}, {then:?}: {answer}");
+            }
+            setup.kit.drain(Worker::B).await;
+            holds(&setup, run, &asked, at(point, 1), then, "completed").await;
+            let resolved = setup
+                .events(run)
+                .await
+                .into_iter()
+                .filter(|event| event["type"] == "approval.resolved")
+                .count();
+            assert_eq!(resolved, 1, "{point:?}, {then:?}: decided once");
+            assert_eq!(received_with(&setup, &asked[0]), 1, "{point:?}, {then:?}: sent once");
+        }
+    }
+}
+
+/// A cancel stopped before or after it commits, let go on or crashed and
+/// sent again: while worker A holds the run between its two calls, and
+/// while the run waits for an approval. Nothing is sent after it.
+#[tokio::test]
+async fn holds_from_each_boundary_of_a_cancel() {
+    for parked in [false, true] {
+        for then in [Then::Dies, Then::ComesBack] {
+            for point in [Point::Before(Write::Cancel), Point::After(Write::Cancel)] {
+                let setup = setup(&[("Main", "tk_main")]).await;
+                let tools = if parked {
+                    ["send", "lookup"]
+                } else {
+                    ["lookup", "lookup"]
+                };
+                let asked = two_lookups();
+                let run = setup.run_calling(&tools, &asked).await;
+                let a = if parked {
+                    setup.kit.drain(Worker::A).await;
+                    None
+                } else {
+                    let gate = setup.kit.faults.arm(Worker::A, Point::After(Write::RecordOutcome));
+                    let a = setup.kit.spawn(Worker::A);
+                    gate.reached().await;
+                    Some((a, gate))
+                };
+                let uri = format!("/v1/workspaces/{}/runs/{run}/cancel", setup.ws);
+                let (status, answer) = setup.api_stopped(point, then == Then::Dies, "alice", uri, None).await;
+                if then == Then::Dies && matches!(point, Point::After(_)) {
+                    assert_eq!(
+                        (status, code(&answer)),
+                        (StatusCode::CONFLICT, "run_finished"),
+                        "{point:?}"
+                    );
+                } else {
+                    assert_eq!(status, StatusCode::OK, "{point:?}, {then:?}: {answer}");
+                }
+                if let Some((a, gate)) = a {
+                    gate.release();
+                    assert!(a.finish().await);
+                }
+                setup.kit.drain(Worker::B).await;
+                holds(&setup, run, &asked, at(point, 1), then, "cancelled").await;
+                let calls = setup.calls(run).await;
+                let sent: Vec<usize> = asked.iter().map(|arguments| received_with(&setup, arguments)).collect();
+                let expected = if parked { [0, 0] } else { [1, 0] };
+                assert_eq!(
+                    sent, expected,
+                    "parked {parked}, {point:?}, {then:?}: nothing after the cancel"
+                );
+                for (call, sent) in calls.iter().zip(sent) {
+                    if sent == 0 {
+                        assert_eq!(
+                            (call.state, call.failure.as_ref().map(|failure| failure.code.as_str())),
+                            (CallState::Refused, Some("run_cancelled")),
+                            "parked {parked}, {point:?}, {then:?}: closed by the cancel"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]

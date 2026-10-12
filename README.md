@@ -20,11 +20,12 @@ packages/
   brand/          B1 Precision brand kit (SVG/PNG/ICO) and usage notes
 server/           The Rust backend — a Cargo workspace
   crates/zupflow-core/        Shared types and the external-resource traits: typed IDs, API errors, scopes,
-                              KeyService, Cache, ObjectStore, EventBus, JobQueue, Identity,
+                              KeyService, Cache, ObjectStore, EventBus, JobQueue, Metrics, Identity,
                               ModelCatalog, the organizations, workspaces, API key, app, installation, tool,
                               agent, run and webhook stores
   crates/zupflow-basic/       The basic implementations: local keys, an in-memory cache, local files,
-                              an in-process event bus, local sign-in, the configured model catalog
+                              an in-process event bus, in-process metrics, local sign-in, the configured
+                              model catalog
   crates/zupflow-sqlite/      The basic database: SQLite, its migrations, the stores, the job queue
   crates/zupflow-oidc/        Console sign-in through any OpenID Connect provider
   crates/zupflow-outbound/    The safe outbound HTTP path: public HTTPS only, no redirects, bounded
@@ -287,16 +288,38 @@ without using up its job's attempts. A run no job takes forward any more
 sweep. Each event is announced on the in-process event bus, to the workspace
 and to its environment.
 
+Every transition a run commits is logged as one JSON line (`runs.transition`,
+with the run's ID, organization, workspace and environment, the operation and
+the call, turn, code or outcome it concerned), and every send that comes back
+as another (`runs.call_answered`, with its latency); never a run's input, the
+model's text, a call's arguments or result, or a credential. The same
+transitions are counted through the `Metrics` trait: runs started, waiting,
+completed, failed (by code) and cancelled; tool calls by how their send came
+back, with a latency histogram; calls refused or settled unknown; model
+attempts abandoned. The basic implementation, `InProcessMetrics`, keeps them in
+memory, bounded, and exports nothing yet. A run's job that gives up after its
+attempts logs `runs.job_exhausted` (the periodic sweep then fails the run
+`run_unavailable`), and a job that refuses the calls waiting on a deleted or
+disconnected installation and gives up logs `runs.refusals_job_exhausted`;
+such a call is still refused when it would be sent.
+
 The run engine is tested under faults too (`server/crates/zupflow-server/tests/run_faults.rs`,
 with the kit in `tests/common/faults.rs`): real workers are stopped or crashed
 at named points around every transition they apply, the model's answer and the
-outbound `tools/call`; a test clock runs leases out; two workers race on one
-run. What happened is read from the fake MCP server's own ledger of the
-requests it received (with the credential each carried) and the answers the
-model produced, never only from the runtime's records. A hole found later is
-written there as a test marked `#[ignore = "…"]`, failing on the assertion
-that names it (`cargo test -p zupflow-server --test run_faults -- --ignored`),
-until the change that closes it; none is open today.
+outbound `tools/call`, the first time or the nth; a test clock runs leases out;
+two workers race on one run. A run with two calls is stopped at every boundary
+of both calls and both turns, as are approvals, cancels, finishes and yields,
+the stopped worker or request crashed there or let go on. What happened is
+read from the fake MCP server's own ledger of the requests it received (with
+the credential each carried) and the answers the model produced, never only
+from the runtime's records. `tests/run_races.rs` interleaves two workers and
+the API's cancels and decisions at boundaries a seeded generator picks, ten
+seeds a run (`ZUPFLOW_RUN_RACE_SEEDS=1000` for more,
+`ZUPFLOW_RUN_RACE_SEED=<seed>` to replay one), and checks the same invariants.
+A hole found later is written there as a test marked `#[ignore = "…"]`,
+failing on the assertion that names it (`cargo test -p zupflow-server --test
+run_faults -- --ignored`), or as a seed in the races' regressions, until the
+change that closes it; none is open today.
 
 Usage is served too: runs, failed runs and tool calls per UTC day in one
 environment (`?environment=`, required; `days` 1 to 90, 14 by default), every

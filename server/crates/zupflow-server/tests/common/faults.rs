@@ -6,7 +6,8 @@
 //!
 //! Each worker is the real engine (`run_engine::work_once`) over its own
 //! copy of the state, whose run store, model provider and outbound path are
-//! wrapped to stop at the points a test arms. A worker stopped at a point
+//! wrapped to stop at the points a test arms: the first time the worker
+//! reaches one, or the nth (`Faults::arm_nth`), such as a run's second send. A worker stopped at a point
 //! holds no transaction; crashing it drops it there, as a process dying
 //! would. What happened is read from records the runtime can't rewrite: the
 //! fake MCP server's ledger (`Providers::ledger`), the answers the model
@@ -18,7 +19,7 @@
 
 #![allow(dead_code, clippy::unwrap_used, clippy::too_many_arguments)]
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,6 +28,7 @@ use axum::http::StatusCode;
 use serde_json::Value;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use zupflow_basic::in_process_metrics::InProcessMetrics;
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{InstallationId, OrganizationId, RunId, WorkspaceId};
 use zupflow_core::models::{Completion, Message, ModelProvider, ProviderError, TokenUsage, ToolSpec, Turn};
@@ -148,11 +150,26 @@ pub enum Point {
 pub struct Gate {
     worker: Worker,
     point: Point,
+    /// How many more times the worker passes the point before it stops there.
+    skip: AtomicUsize,
     reached: watch::Sender<bool>,
     released: watch::Sender<bool>,
 }
 
 impl Gate {
+    /// Whether the worker stopped here.
+    pub fn is_reached(&self) -> bool {
+        *self.reached.borrow()
+    }
+
+    pub fn worker(&self) -> Worker {
+        self.worker
+    }
+
+    pub fn point(&self) -> Point {
+        self.point
+    }
+
     /// Waits until the worker stops here.
     pub async fn reached(&self) {
         let mut reached = self.reached.subscribe();
@@ -164,6 +181,12 @@ impl Gate {
             self.worker,
             self.point
         );
+    }
+
+    /// Waits, however long, until the worker stops here.
+    pub async fn stopped(&self) {
+        let mut reached = self.reached.subscribe();
+        let _ = reached.wait_for(|reached| *reached).await;
     }
 
     /// Lets the worker go on.
@@ -183,6 +206,9 @@ impl Gate {
 pub struct Attempted {
     pub worker: Worker,
     pub write: Write,
+    /// The owner epoch it claims (a `Claim`) or is guarded by (a worker's
+    /// step); `None` for the API's, the sweep's and a sender's.
+    pub epoch: Option<u64>,
     pub result: Result<(), Refused>,
 }
 
@@ -201,6 +227,11 @@ pub struct Answer {
 #[derive(Default)]
 pub struct Faults {
     armed: Mutex<Vec<Arc<Gate>>>,
+    /// While set, the run store can't list the runs waiting on an
+    /// installation, as if the database were down for that read.
+    pub runs_waiting_on_unavailable: std::sync::atomic::AtomicBool,
+    /// While set, the run store can't read a run's snapshot.
+    pub snapshots_unavailable: std::sync::atomic::AtomicBool,
     writes: Mutex<Vec<Attempted>>,
     answers: Mutex<Vec<Answer>>,
 }
@@ -208,9 +239,18 @@ pub struct Faults {
 impl Faults {
     /// Stops `worker` the next time it reaches `point`, once.
     pub fn arm(&self, worker: Worker, point: Point) -> Arc<Gate> {
+        self.arm_nth(worker, point, 1)
+    }
+
+    /// Stops `worker` the `nth` time (from 1) it reaches `point` from now,
+    /// once: the second call's send, say, or the closing turn's model
+    /// attempt.
+    pub fn arm_nth(&self, worker: Worker, point: Point, nth: usize) -> Arc<Gate> {
+        assert!(nth >= 1, "the first time is 1");
         let gate = Arc::new(Gate {
             worker,
             point,
+            skip: AtomicUsize::new(nth - 1),
             reached: watch::Sender::new(false),
             released: watch::Sender::new(false),
         });
@@ -218,13 +258,25 @@ impl Faults {
         gate
     }
 
+    /// Takes back every point armed and not reached yet.
+    pub fn disarm_all(&self) {
+        self.armed.lock().unwrap().clear();
+    }
+
     async fn pass(&self, worker: Worker, point: Point) {
         let gate = {
             let mut armed = self.armed.lock().unwrap();
-            armed
+            match armed
                 .iter()
                 .position(|gate| gate.worker == worker && gate.point == point)
-                .map(|at| armed.remove(at))
+            {
+                Some(at) if armed[at].skip.load(Ordering::SeqCst) > 0 => {
+                    armed[at].skip.fetch_sub(1, Ordering::SeqCst);
+                    None
+                }
+                Some(at) => Some(armed.remove(at)),
+                None => None,
+            }
         };
         if let Some(gate) = gate {
             gate.hold().await;
@@ -281,6 +333,10 @@ impl RunStore for FaultyRuns {
         self.faults.writes.lock().unwrap().push(Attempted {
             worker: self.worker,
             write,
+            epoch: match request.operation() {
+                Operation::Claim(claim) => Some(claim.epoch),
+                _ => request.guards().owner.map(|owner| owner.epoch),
+            },
             result: match &applied {
                 Ok(Applied::Committed(_)) => Ok(()),
                 Ok(Applied::Conflict(conflict)) => Err(Refused::Conflict(*conflict)),
@@ -297,6 +353,9 @@ impl RunStore for FaultyRuns {
         workspace_id: WorkspaceId,
         run_id: RunId,
     ) -> Result<Option<Snapshot>, StoreError> {
+        if self.faults.snapshots_unavailable.load(Ordering::SeqCst) {
+            return Err(StoreError::Unavailable);
+        }
         self.inner.find_snapshot(organization_id, workspace_id, run_id).await
     }
 
@@ -372,6 +431,9 @@ impl RunStore for FaultyRuns {
         after: Option<RunId>,
         limit: u32,
     ) -> Result<Vec<RunId>, StoreError> {
+        if self.faults.runs_waiting_on_unavailable.load(Ordering::SeqCst) {
+            return Err(StoreError::Unavailable);
+        }
         self.inner
             .runs_waiting_on(organization_id, workspace_id, installation_id, after, limit)
             .await
@@ -467,7 +529,34 @@ pub struct Running {
     handle: JoinHandle<bool>,
 }
 
+/// Where a worker is once it stopped at its gate or finished first.
+pub enum Halt {
+    /// Stopped at the gate; still running.
+    Stopped(Running),
+    /// Finished its claim without reaching the gate: whether it had one.
+    Finished(bool),
+}
+
 impl Running {
+    /// Waits until the worker stops at `gate` or finishes its claim first.
+    pub async fn until(mut self, gate: &Gate) -> Halt {
+        let worker = self.worker;
+        let mut reached = gate.reached.subscribe();
+        let halted = tokio::time::timeout(PATIENCE, async {
+            tokio::select! {
+                biased;
+                _ = reached.wait_for(|reached| *reached) => None,
+                joined = &mut self.handle => Some(joined.unwrap()),
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{worker:?} neither stopped nor finished"));
+        match halted {
+            None => Halt::Stopped(self),
+            Some(had_one) => Halt::Finished(had_one),
+        }
+    }
+
     /// Waits for the worker to finish its claim: whether it had one.
     pub async fn finish(self) -> bool {
         let worker = self.worker;
@@ -494,12 +583,17 @@ pub struct Takeover {
     pub b_gate: Option<Arc<Gate>>,
     /// The writes tried before A's lease ran out (see [`Faults::committed_since`]).
     pub lease_ran_out: usize,
+    /// Whether B found the run's job: not when A's step at the point
+    /// released the job with the claim (it parked, or the run ended).
+    pub b_found: bool,
 }
 
 /// The kit over one test server.
 pub struct Kit {
     pub clock: Arc<TestClock>,
     pub faults: Arc<Faults>,
+    /// What every worker and the API measured, readable.
+    pub metrics: Arc<InProcessMetrics>,
     /// The server's state on the kit's clock, with a run store and a job
     /// queue on it too.
     base: AppState,
@@ -517,10 +611,13 @@ impl Kit {
         base.clock = clock.clone();
         base.jobs = Arc::new(SqliteJobQueue::with_clock(server.database.clone(), clock.clone()));
         base.runs = Arc::new(SqliteRunStore::with_clock(server.database.clone(), clock.clone()));
+        let metrics = Arc::new(InProcessMetrics::default());
+        base.metrics = metrics.clone();
         let api = zupflow_server::app(worker_state(&base, &faults, Worker::Api), RequestGuard::default());
         Self {
             clock,
             faults,
+            metrics,
             base,
             database: server.directory.join("zupflow.sqlite"),
             api,
@@ -576,19 +673,36 @@ impl Kit {
             !run_engine::work_once(&self.state(Worker::B)).await,
             "while A's lease holds, nobody else claims its run"
         );
+        let takeover = self.after_a_stopped(a, a_gate, b_at).await;
+        assert!(takeover.b_found, "B found the run's job to take over");
+        takeover
+    }
+
+    /// The race from any boundary: worker A works until the `nth` time it
+    /// reaches `a_at`, where it stops; its lease runs out; worker B claims
+    /// the run's job, if there's one to claim (a step that releases the
+    /// claim deals with the job too: parked or finished, nobody takes the
+    /// run over), and works it to the end of its claim.
+    pub async fn take_over_at(&self, a_at: Point, nth: usize) -> Takeover {
+        let a_gate = self.faults.arm_nth(Worker::A, a_at, nth);
+        let a = match self.spawn(Worker::A).until(&a_gate).await {
+            Halt::Stopped(a) => a,
+            Halt::Finished(_) => panic!("A never reached {a_at:?} #{nth}"),
+        };
+        self.after_a_stopped(a, a_gate, None).await
+    }
+
+    async fn after_a_stopped(&self, a: Running, a_gate: Arc<Gate>, b_at: Option<Point>) -> Takeover {
         self.expire_lease();
         let lease_ran_out = self.faults.mark();
         let b_gate = b_at.map(|at| self.faults.arm(Worker::B, at));
         let b = self.spawn(Worker::B);
-        let b = match &b_gate {
+        let (b, b_found) = match &b_gate {
             Some(gate) => {
                 gate.reached().await;
-                Some(b)
+                (Some(b), true)
             }
-            None => {
-                assert!(b.finish().await, "B found the run's job to take over");
-                None
-            }
+            None => (None, b.finish().await),
         };
         Takeover {
             a,
@@ -596,7 +710,38 @@ impl Kit {
             b,
             b_gate,
             lease_ran_out,
+            b_found,
         }
+    }
+
+    /// Replaces the model every worker asks, from now on.
+    pub fn set_model(&mut self, provider: Arc<dyn ModelProvider>) {
+        self.base.provider = provider;
+    }
+
+    /// A request to the API in the background, so the test can stop it at
+    /// a point (as [`Worker::Api`]) and crash it there, as a handler whose
+    /// process died.
+    pub fn spawn_send(
+        &self,
+        user: &str,
+        method: axum::http::Method,
+        uri: String,
+        organization: Option<&str>,
+        body: Option<Value>,
+    ) -> JoinHandle<(StatusCode, Value)> {
+        let api = self.api.clone();
+        let (user, organization) = (user.to_owned(), organization.map(str::to_owned));
+        tokio::spawn(async move {
+            let mut call = crate::common::call(&user, method, uri);
+            if let Some(organization) = &organization {
+                call = call.naming(organization);
+            }
+            if let Some(body) = body {
+                call = call.body(body);
+            }
+            send_to(&api, call).await
+        })
     }
 
     /// The run as the store holds it, with its turns and calls, and what
@@ -652,6 +797,21 @@ impl Kit {
 }
 
 impl Kit {
+    /// Whether the run ended: completed, failed or cancelled.
+    pub async fn run_finished(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+    ) -> bool {
+        self.base
+            .runs
+            .find_run(organization_id, workspace_id, run_id)
+            .await
+            .unwrap()
+            .is_some_and(|run| run.status.is_terminal())
+    }
+
     /// The run's job as the queue holds it: how many attempts it has used
     /// and its state; `None` once it's gone.
     pub async fn run_job(

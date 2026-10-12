@@ -266,13 +266,25 @@ impl OutboundHttp for Providers {
                             body: Vec::new(),
                         });
                     }
-                    (
-                        200,
-                        json!({ "jsonrpc": "2.0", "id": id, "result": {
-                            "content": [{ "type": "text", "text": format!("{name} done") }],
-                            "structuredContent": { "tool": name, "arguments": arguments },
-                        } }),
-                    )
+                    // Arguments with `"fail": true` get the tool's own error,
+                    // echoing them.
+                    if arguments["fail"] == true {
+                        (
+                            200,
+                            json!({ "jsonrpc": "2.0", "id": id, "result": {
+                                "isError": true,
+                                "content": [{ "type": "text", "text": format!("{name} failed on {arguments}") }],
+                            } }),
+                        )
+                    } else {
+                        (
+                            200,
+                            json!({ "jsonrpc": "2.0", "id": id, "result": {
+                                "content": [{ "type": "text", "text": format!("{name} done") }],
+                                "structuredContent": { "tool": name, "arguments": arguments },
+                            } }),
+                        )
+                    }
                 }
                 _ => (202, Value::Null),
             };
@@ -398,6 +410,7 @@ impl Server {
                 zupflow_sqlite::SqliteToolPolicyStore::new(database.clone()),
             ))),
             events: Arc::new(zupflow_basic::in_process_events::InProcessEventBus::default()),
+            metrics: Arc::new(zupflow_basic::in_process_metrics::InProcessMetrics::default()),
             models: Arc::new(zupflow_basic::configured_models::ConfiguredModels::parse(MODELS).unwrap()),
             connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
             jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),

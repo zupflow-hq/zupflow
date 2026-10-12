@@ -287,6 +287,7 @@ async fn serve(path: &str, serving: Serving) -> Result<(), String> {
             zupflow_sqlite::SqliteToolPolicyStore::new(database.clone()),
         ))),
         events: Arc::new(zupflow_basic::in_process_events::InProcessEventBus::default()),
+        metrics: Arc::new(zupflow_basic::in_process_metrics::InProcessMetrics::default()),
         models: Arc::new(models),
         connect: Arc::new(SqliteConnectStore::new(database.clone())),
         jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),

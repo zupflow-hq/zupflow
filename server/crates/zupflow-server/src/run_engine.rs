@@ -41,7 +41,7 @@ use uuid::Uuid;
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AgentId, InstallationId, OrganizationId, RunId, ToolCallId, WorkspaceId};
 use zupflow_core::installations::{Installation, InstallationStatus, InstalledApp};
-use zupflow_core::jobs::{Job, JobId, LeaseToken};
+use zupflow_core::jobs::{Job, JobId, LeaseToken, Retry};
 use zupflow_core::models::{ProviderError, validate_completion};
 use zupflow_core::policy::{CallApp, Decision, GrantedAs, OrganizationLevel, ToolCall, Verdict, floor};
 use zupflow_core::runs::digest::{Sha256Digest, call_digest};
@@ -62,6 +62,7 @@ use zupflow_mcp::CallError;
 
 use crate::auth::AppState;
 use crate::mcp_access::{self, Unreachable};
+use crate::run_observe;
 
 /// The job kind: [`RUN_JOB`].
 pub const RUN_AGENT: &str = RUN_JOB;
@@ -362,12 +363,13 @@ impl<P: ToolPort> Driver<'_, P> {
                     continue;
                 }
             };
-            publish(
+            run_observe::committed(
                 self.state,
                 self.organization_id,
                 self.workspace_id,
                 self.environment,
-                &receipt.events,
+                &request,
+                &receipt,
             )
             .await;
             self.steps = self.steps.saturating_add(1);
@@ -385,6 +387,7 @@ impl<P: ToolPort> Driver<'_, P> {
             match then {
                 Io::CallModel(asked) => model = Some(self.ask(&asked).await),
                 Io::SendCall(send) => {
+                    let started = std::time::Instant::now();
                     let outcome = match reach.take() {
                         Some(opened) => {
                             // The run's own scope, never one read off the plan.
@@ -402,6 +405,17 @@ impl<P: ToolPort> Driver<'_, P> {
                         // Authorized without its server opened: it never left.
                         None => SendOutcome::NotSent,
                     };
+                    run_observe::sent(
+                        self.state,
+                        self.organization_id,
+                        self.workspace_id,
+                        self.environment,
+                        self.run_id,
+                        &send,
+                        &outcome,
+                        started.elapsed(),
+                    )
+                    .await;
                     sent = Some(sent_result(&send, outcome));
                 }
                 Io::Nothing if released => return Outcome::Leave,
@@ -922,7 +936,7 @@ pub async fn sweep(state: &AppState) -> usize {
             Ok(Some(workspace)) => workspace.environment,
             _ => continue,
         };
-        tracing::warn!(event = "runs.abandoned", %organization_id, %workspace_id, %run_id);
+        tracing::warn!(event = "runs.abandoned", %organization_id, %workspace_id, %environment, %run_id);
         // A revision conflict means the run moved: read it again.
         for _ in 0..3 {
             let Ok(Some(snapshot)) = state.runs.find_snapshot(organization_id, workspace_id, run_id).await else {
@@ -939,7 +953,7 @@ pub async fn sweep(state: &AppState) -> usize {
             };
             match state.runs.apply(organization_id, workspace_id, &request).await {
                 Ok(Applied::Committed(receipt)) => {
-                    publish(state, organization_id, workspace_id, environment, &receipt.events).await;
+                    run_observe::committed(state, organization_id, workspace_id, environment, &request, &receipt).await;
                     break;
                 }
                 Ok(Applied::Conflict(conflict)) if conflict.reload() => {}
@@ -1018,7 +1032,15 @@ async fn handle_refusals(state: &AppState, job: Job) {
         Outcome::Retry(why) => match Name::new(why) {
             Ok(reason) => {
                 let after = Duration::from_secs(5 * u64::from(attempt.max(1)));
-                state.jobs.retry(&scope, id, &lease, after, &reason).await.map(|_| ())
+                let retried = state.jobs.retry(&scope, id, &lease, after, &reason).await;
+                if retried == Ok(Retry::Exhausted) {
+                    // Nothing refuses those calls at once any more: each stays
+                    // waiting for a decision, and is refused when it would be
+                    // sent, since every send checks its installation again.
+                    let environment = environment_of(state, organization_id, workspace_id).await;
+                    tracing::warn!(event = "runs.refusals_job_exhausted", %organization_id, %workspace_id, environment, %installation_id, attempt, why);
+                }
+                retried.map(|_| ())
             }
             Err(_) => state.jobs.complete(&scope, id, &lease).await,
         },
@@ -1131,8 +1153,7 @@ async fn refuse_one(
         };
         match state.runs.apply(organization_id, workspace_id, &request).await {
             Ok(Applied::Committed(receipt)) => {
-                tracing::info!(event = "runs.waiting_call_refused", %organization_id, %workspace_id, %run_id, %installation_id);
-                publish(state, organization_id, workspace_id, environment, &receipt.events).await;
+                run_observe::committed(state, organization_id, workspace_id, environment, &request, &receipt).await;
                 return Refusal::Done;
             }
             Ok(Applied::Conflict(conflict)) if conflict.reload() => {}
@@ -1171,7 +1192,13 @@ async fn handle<P: ToolPort>(state: &AppState, tools: &P, job: Job) {
                 return state.jobs.complete(scope, id, lease).await;
             };
             let after = Duration::from_secs(5 * u64::from(attempt.max(1)));
-            state.jobs.retry(scope, id, lease, after, &reason).await.map(|_| ())
+            let retried = state.jobs.retry(scope, id, lease, after, &reason).await;
+            if retried == Ok(Retry::Exhausted) {
+                // The sweep fails the run `run_unavailable`.
+                let environment = environment_of(state, organization_id, workspace_id).await;
+                tracing::warn!(event = "runs.job_exhausted", %organization_id, %workspace_id, environment, %run_id, attempt, why);
+            }
+            retried.map(|_| ())
         }
     };
     let environment = match state.workspaces.find_workspace(organization_id, workspace_id).await {
@@ -1228,6 +1255,19 @@ async fn handle<P: ToolPort>(state: &AppState, tools: &P, job: Job) {
         Err(error) => {
             tracing::warn!(event = "runs.finish_failed", %organization_id, %workspace_id, %run_id, %error);
         }
+    }
+}
+
+/// The workspace's environment, for a log line: `None` when it can't be
+/// read (the store being down is often why a job gives up).
+async fn environment_of(
+    state: &AppState,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+) -> Option<&'static str> {
+    match state.workspaces.find_workspace(organization_id, workspace_id).await {
+        Ok(Some(workspace)) => Some(workspace.environment.as_str()),
+        _ => None,
     }
 }
 

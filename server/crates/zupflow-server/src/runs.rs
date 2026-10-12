@@ -44,7 +44,7 @@ use zupflow_core::time::Timestamp;
 use crate::auth::{Access, Actor, AppState, Caller, WorkspaceAccess};
 use crate::http::{Failure, envelope, envelope_with_meta};
 use crate::input::{Body, Fields};
-use crate::run_engine;
+use crate::run_observe;
 use crate::workspaces::{clamped_int, environment_mismatch, invalid_cursor};
 
 pub fn routes() -> Router<AppState> {
@@ -216,7 +216,7 @@ async fn control(
     workspace_id: WorkspaceId,
     run_id: RunId,
     build: impl Fn(Option<&Snapshot>) -> Result<TransitionRequest, Failure>,
-) -> Result<Receipt, Failure> {
+) -> Result<(TransitionRequest, Receipt), Failure> {
     for _ in 0..CONTROL_ATTEMPTS {
         let snapshot = match state.runs.find_snapshot(organization_id, workspace_id, run_id).await {
             Ok(Some(snapshot)) => Some(snapshot),
@@ -231,7 +231,7 @@ async fn control(
             .await
             .map_err(run_failure)?
         {
-            Applied::Committed(receipt) => return Ok(receipt),
+            Applied::Committed(receipt) => return Ok((request, receipt)),
             Applied::Conflict(_) => continue,
         }
     }
@@ -634,12 +634,13 @@ async fn start_run(
         // A new run's ID is fresh: nothing else starts from its revision 0.
         Applied::Conflict(_) => return Err(ApiError::internal().into()),
     };
-    run_engine::publish(
+    run_observe::committed(
         &state,
         organization_id,
         workspace_id,
         access.workspace.environment,
-        &receipt.events,
+        &request,
+        &receipt,
     )
     .await;
     // The run as it committed: never read again, so a failed read can't turn
@@ -665,7 +666,7 @@ async fn cancel_run(
     };
     let actor = access.access.audit_actor();
     let (organization_id, workspace_id) = (access.access.organization_id, access.workspace.id);
-    let receipt = control(&state, organization_id, workspace_id, run.id, |snapshot| {
+    let (request, receipt) = control(&state, organization_id, workspace_id, run.id, |snapshot| {
         // Only a run this engine never advances has no snapshot, and every
         // such run is finished (migration 0029).
         let Some(snapshot) = snapshot else {
@@ -689,12 +690,13 @@ async fn cancel_run(
         })
     })
     .await?;
-    run_engine::publish(
+    run_observe::committed(
         &state,
         organization_id,
         workspace_id,
         access.workspace.environment,
-        &receipt.events,
+        &request,
+        &receipt,
     )
     .await;
     Ok(envelope(StatusCode::OK, run_view(*receipt.run)))
@@ -753,7 +755,7 @@ async fn resolve_approval(
         return Err(ApiError::internal().into());
     };
     let (organization_id, workspace_id) = (access.access.organization_id, access.workspace.id);
-    let receipt = control(&state, organization_id, workspace_id, run.id, |snapshot| {
+    let (request, receipt) = control(&state, organization_id, workspace_id, run.id, |snapshot| {
         let Some(snapshot) = snapshot else {
             return Err(not_waiting());
         };
@@ -780,12 +782,13 @@ async fn resolve_approval(
         })
     })
     .await?;
-    run_engine::publish(
+    run_observe::committed(
         &state,
         organization_id,
         workspace_id,
         access.workspace.environment,
-        &receipt.events,
+        &request,
+        &receipt,
     )
     .await;
     Ok(envelope(StatusCode::OK, run_view(*receipt.run)))

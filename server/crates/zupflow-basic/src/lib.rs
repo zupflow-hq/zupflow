@@ -5,6 +5,7 @@
 pub mod configured_models;
 pub mod configured_policy;
 pub mod in_process_events;
+pub mod in_process_metrics;
 #[cfg(unix)]
 pub mod local_files;
 pub mod local_identity;

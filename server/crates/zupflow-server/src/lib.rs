@@ -26,6 +26,7 @@ pub mod mcp_access;
 mod oauth_refresh;
 pub mod organizations;
 pub mod run_engine;
+pub mod run_observe;
 pub mod runs;
 pub mod sign_in;
 pub mod tool_policy;

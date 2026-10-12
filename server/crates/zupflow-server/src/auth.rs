@@ -73,6 +73,8 @@ pub struct AppState {
     pub approvals: Arc<dyn zupflow_core::policy::ApprovalPolicy>,
     /// Announces run events to listeners in this process.
     pub events: Arc<dyn zupflow_core::events::EventBus>,
+    /// What operators count and time: runs and their tool calls.
+    pub metrics: Arc<dyn zupflow_core::metrics::Metrics>,
     /// Webhook endpoints, their events and deliveries (decision 0017).
     pub webhooks: Arc<dyn zupflow_core::webhooks::WebhookStore>,
     /// The audit log, which the other stores write with each change.

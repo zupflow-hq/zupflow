@@ -79,6 +79,7 @@ async fn setup() -> Setup {
             zupflow_sqlite::SqliteToolPolicyStore::new(database.clone()),
         ))),
         events: Arc::new(zupflow_basic::in_process_events::InProcessEventBus::default()),
+        metrics: Arc::new(zupflow_basic::in_process_metrics::InProcessMetrics::default()),
         models: Arc::new(zupflow_basic::configured_models::ConfiguredModels::none()),
         connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
         jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
