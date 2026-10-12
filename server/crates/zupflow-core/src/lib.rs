@@ -20,7 +20,7 @@
 //! - [`outbound`]: the one path every outbound call takes, and which addresses are public.
 //! - [`policy`]: tool permissions: the organization's levels and the [`policy::ApprovalPolicy`] trait.
 //! - [`organizations`]: organizations, members and users, and their store.
-//! - [`runs`]: runs, their timelines and tool calls, and their store.
+//! - [`runs`]: runs, their timelines and tool calls, and their store; the durable engine's state, reducer and tool names.
 //! - [`time`]: instants as stored and as the API writes them.
 //! - [`tools`]: the tools apps' MCP servers list, pinned, and their registry.
 //! - [`webhooks`]: webhook endpoints, their signed events and their store.

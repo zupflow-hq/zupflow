@@ -26,6 +26,23 @@
 //! Every method takes the organization, then the workspace, and reaches
 //! nothing outside them. A run outlives its agent: deleting an agent keeps
 //! its runs, named "Deleted agent".
+//!
+//! The durable engine that replaces these steps (decision 0046) is built
+//! beside them and not used by the server yet:
+//!
+//! - [`state`]: a run's continuation and control fields, and the snapshot
+//!   the reducer reads.
+//! - [`transition`]: transition requests, their guards, IDs and digests.
+//! - [`reducer`]: `advance(snapshot, facts) -> Plan`, and the API's and the
+//!   sweep's own operations.
+//! - [`names`]: the names tools reach the model by (decision 0047).
+//! - [`digest`]: canonical JSON digests, the call digest among them.
+
+pub mod digest;
+pub mod names;
+pub mod reducer;
+pub mod state;
+pub mod transition;
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
