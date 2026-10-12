@@ -818,6 +818,11 @@ async fn delivers_approvals_and_changed_tools() {
         .await;
     assert_eq!(status, StatusCode::OK, "{done}");
     let installation = id(&done["data"]["installation"]).to_owned();
+    // `send` as the model is offered it (decision 0047).
+    let send = format!(
+        "tools_{}_send",
+        done["data"]["installation"]["short_id"].as_str().unwrap()
+    );
     work(&server).await;
     assert!(
         server.providers.requests_to(HOOK).is_empty(),
@@ -852,7 +857,7 @@ async fn delivers_approvals_and_changed_tools() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{grant}");
-    let run = start(&server, "alice", &org, &ws, &helper, "call send {}").await;
+    let run = start(&server, "alice", &org, &ws, &helper, &format!("call {send} {{}}")).await;
     work(&server).await;
     let sent = server.providers.requests_to(HOOK);
     assert_eq!(sent.len(), 1, "{sent:?}");

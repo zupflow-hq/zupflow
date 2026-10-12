@@ -132,6 +132,13 @@ async fn main() -> ExitCode {
             Arc::new(zupflow_basic::scripted_model::ScriptedModel::serving(served))
         }
     };
+    let runs = Arc::new(zupflow_sqlite::SqliteRunStore::new(database.clone()));
+    // A run's transitions must survive a power cut once applied (decision
+    // 0046): a store weaker than WAL with `synchronous = FULL` is refused.
+    if zupflow_core::runs::RunStore::durability(runs.as_ref()) != zupflow_core::runs::store::Durability::Synchronous {
+        tracing::error!(event = "server.run_store_not_durable");
+        return ExitCode::FAILURE;
+    }
     let state = AppState {
         clock: Arc::new(zupflow_core::time::SystemClock),
         identity,
@@ -141,7 +148,7 @@ async fn main() -> ExitCode {
         installations: Arc::new(zupflow_sqlite::SqliteInstallationStore::new(database.clone())),
         agents: Arc::new(zupflow_sqlite::SqliteAgentStore::new(database.clone())),
         policies: Arc::new(zupflow_sqlite::SqliteToolPolicyStore::new(database.clone())),
-        runs: Arc::new(zupflow_sqlite::SqliteRunStore::new(database.clone())),
+        runs,
         provider,
         approvals: Arc::new(zupflow_basic::configured_policy::ConfiguredPolicy::new(Arc::new(
             zupflow_sqlite::SqliteToolPolicyStore::new(database.clone()),

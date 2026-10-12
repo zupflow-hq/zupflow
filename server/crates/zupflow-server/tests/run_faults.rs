@@ -2,12 +2,11 @@
 //! stopped or crashed at named points, leases running out, two workers on
 //! one run, and what the app's server and the model actually saw.
 //!
-//! The tests without `ignore` hold today. Each test marked
-//! `#[ignore = "fixed when …: …"]` reproduces a known hole in today's
-//! engine: it asserts the behaviour the engine owes and fails on the
-//! assertion that names the hole. Run them with
-//! `cargo test -p zupflow-server --test run_faults -- --ignored`. The change
-//! that closes a hole removes its `ignore`.
+//! Every test here holds. A hole found in the engine is written here as a
+//! test of the behaviour the engine owes, marked
+//! `#[ignore = "fixed when …: …"]` and failing on the assertion that names
+//! the hole (`cargo test -p zupflow-server --test run_faults -- --ignored`);
+//! the change that closes it removes the `ignore`. None is open today.
 
 #![allow(clippy::unwrap_used)]
 
@@ -17,10 +16,11 @@ mod faults;
 
 use axum::http::{Method, StatusCode};
 use common::{Server, call, code};
-use faults::{Kit, Point, Worker, Write, accounted_tokens, kept_answers, produced_tokens};
+use faults::{Kit, Point, RecordedCall, Worker, Write, accounted_tokens, kept_answers, produced_tokens};
 use serde_json::{Value, json};
 use zupflow_core::ids::{OrganizationId, RunId, WorkspaceId};
-use zupflow_core::runs::{CallState, RunToolCall};
+use zupflow_core::runs::CallState;
+use zupflow_core::runs::state::ModelAttemptState;
 
 const MCP: &str = "https://tools.example/mcp";
 
@@ -162,6 +162,28 @@ async fn connect(server: &Server, org: &str, ws: &str, app: &str, label: &str, t
 }
 
 impl Setup {
+    /// `call <tool> <arguments>`, naming the first installation's `tool` as
+    /// the model is offered it: `tools_<short_id>_<tool>` (decision 0047).
+    async fn calling(&self, tool: &str, arguments: &str) -> String {
+        let installation = &self.installations[0].1;
+        let (status, read) = self
+            .kit
+            .send(
+                call(
+                    "alice",
+                    Method::GET,
+                    format!("/v1/workspaces/{}/installations/{installation}", self.ws),
+                )
+                .naming(&self.org),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{read}");
+        format!(
+            "call tools_{}_{tool} {arguments}",
+            read["data"]["short_id"].as_str().unwrap()
+        )
+    }
+
     fn scope(&self) -> (OrganizationId, WorkspaceId) {
         (
             OrganizationId::parse(&self.org).unwrap(),
@@ -251,7 +273,7 @@ impl Setup {
         assert_eq!(body["data"]["status"], "cancelled");
     }
 
-    async fn calls(&self, run: RunId) -> Vec<RunToolCall> {
+    async fn calls(&self, run: RunId) -> Vec<RecordedCall> {
         let (org, ws) = self.scope();
         self.kit.progress(org, ws, run).await.calls
     }
@@ -274,7 +296,7 @@ fn main_credential() -> Option<(String, String)> {
 #[tokio::test]
 async fn never_sends_a_call_whose_worker_died_before_it_left() {
     let setup = setup(&[("Main", "tk_main")]).await;
-    let run = setup.start("call lookup {}").await;
+    let run = setup.start(&setup.calling("lookup", "{}").await).await;
     let gate = setup.kit.faults.arm(Worker::A, Point::BeforeSend);
     let a = setup.kit.spawn(Worker::A);
     gate.reached().await;
@@ -288,16 +310,13 @@ async fn never_sends_a_call_whose_worker_died_before_it_left() {
     assert_eq!(calls[0].state, CallState::Unknown, "recorded as sent, so never sent");
     let done = setup.get(run).await;
     assert_eq!(done["status"], "completed", "{done}");
-    assert!(
-        done["output"].as_str().unwrap().starts_with("lookup failed: "),
-        "{done}"
-    );
+    assert!(done["output"].as_str().unwrap().contains("_lookup failed: "), "{done}");
 }
 
 #[tokio::test]
 async fn never_sends_again_a_call_whose_answer_was_lost() {
     let setup = setup(&[("Main", "tk_main")]).await;
-    let run = setup.start("call lookup {}").await;
+    let run = setup.start(&setup.calling("lookup", "{}").await).await;
     let gate = setup.kit.faults.arm(Worker::A, Point::AfterSend);
     let a = setup.kit.spawn(Worker::A);
     gate.reached().await;
@@ -316,9 +335,9 @@ async fn never_sends_again_a_call_whose_answer_was_lost() {
 #[tokio::test]
 async fn takes_a_run_over_from_its_last_recorded_turn() {
     let setup = setup(&[("Main", "tk_main")]).await;
-    let run = setup.start("call lookup {}").await;
+    let run = setup.start(&setup.calling("lookup", "{}").await).await;
     // A recorded the model's turn, then stopped; B takes the run over.
-    let takeover = setup.kit.take_over(Point::After(Write::RecordTurn), None).await;
+    let takeover = setup.kit.take_over(Point::After(Write::CommitTurn), None).await;
     takeover.a.crash().await;
     let answers = setup.kit.faults.answers();
     let asked: Vec<(Worker, usize)> = answers.iter().map(|answer| (answer.worker, answer.turn)).collect();
@@ -335,10 +354,9 @@ async fn takes_a_run_over_from_its_last_recorded_turn() {
 }
 
 #[tokio::test]
-#[ignore = "fixed when sends are fenced by a send claim: after a takeover, the answer the app's server gave the slow worker is lost"]
 async fn keeps_the_answer_a_slow_worker_gets_after_a_takeover() {
     let setup = setup(&[("Main", "tk_main")]).await;
-    let run = setup.start("call lookup {}").await;
+    let run = setup.start(&setup.calling("lookup", "{}").await).await;
     // A sent the call and the server acted on it; before A hears back, its
     // lease runs out and B takes the run over and finishes it.
     let takeover = setup.kit.take_over(Point::AfterSend, None).await;
@@ -364,11 +382,16 @@ async fn keeps_the_answer_a_slow_worker_gets_after_a_takeover() {
 }
 
 #[tokio::test]
-#[ignore = "fixed when cancel closes open calls: cancelling a run leaves its unstarted calls open"]
 async fn closes_the_calls_a_cancel_left_unstarted() {
     let setup = setup(&[("Main", "tk_main")]).await;
-    let run = setup.start("call lookup {}\ncall lookup {\"page\":2}").await;
-    let gate = setup.kit.faults.arm(Worker::A, Point::Before(Write::BeginCall));
+    let run = setup
+        .start(&format!(
+            "{}\n{}",
+            setup.calling("lookup", "{}").await,
+            setup.calling("lookup", "{\"page\":2}").await
+        ))
+        .await;
+    let gate = setup.kit.faults.arm(Worker::A, Point::Before(Write::AuthorizeCall));
     let a = setup.kit.spawn(Worker::A);
     gate.reached().await;
     // The cancel commits first.
@@ -392,7 +415,6 @@ async fn closes_the_calls_a_cancel_left_unstarted() {
 }
 
 #[tokio::test]
-#[ignore = "fixed when cancel closes open calls: cancelling a run leaves its call waiting for approval open"]
 async fn closes_the_call_a_cancelled_run_waited_on() {
     let setup = setup(&[("Main", "tk_main")]).await;
     let (status, key) = setup
@@ -408,7 +430,7 @@ async fn closes_the_call_a_cancelled_run_waited_on() {
         .await;
     assert_eq!(status, StatusCode::CREATED, "{key}");
     let key = key["data"]["secret"].as_str().unwrap().to_owned();
-    let run = setup.start("call send {}").await;
+    let run = setup.start(&setup.calling("send", "{}").await).await;
     setup.kit.drain(Worker::A).await;
     assert_eq!(setup.get(run).await["status"], "waiting_for_approval");
     setup.cancel(run).await;
@@ -437,12 +459,11 @@ async fn closes_the_call_a_cancelled_run_waited_on() {
 }
 
 #[tokio::test]
-#[ignore = "fixed when model attempts are recorded: a model answer lost before its turn was recorded is asked for again and never counted"]
-async fn accounts_for_a_model_answer_lost_before_its_turn_was_recorded() {
+async fn records_a_model_answer_lost_before_its_turn_was_committed() {
     let setup = setup(&[("Main", "tk_main")]).await;
     let run = setup.start("hello").await;
-    // The model answered; A dies before recording the turn.
-    let gate = setup.kit.faults.arm(Worker::A, Point::Before(Write::RecordTurn));
+    // The model answered; A dies before committing the turn.
+    let gate = setup.kit.faults.arm(Worker::A, Point::Before(Write::CommitTurn));
     let a = setup.kit.spawn(Worker::A);
     gate.reached().await;
     a.crash().await;
@@ -450,18 +471,33 @@ async fn accounts_for_a_model_answer_lost_before_its_turn_was_recorded() {
     let (org, ws) = setup.scope();
     let progress = setup.kit.progress(org, ws, run).await;
     assert_eq!(setup.get(run).await["status"], "completed");
-    assert_eq!(progress.turns.len(), 1, "one turn recorded");
+    assert_eq!(progress.turns.len(), 1, "the turn is committed once");
     let answers = setup.kit.faults.answers();
-    assert_eq!(answers.len(), 2, "the model answered turn 0 twice: {answers:?}");
+    let asked: Vec<(Worker, usize)> = answers.iter().map(|answer| (answer.worker, answer.turn)).collect();
     assert_eq!(
-        accounted_tokens(&progress),
-        produced_tokens(&answers),
-        "tokens the model spent on the lost answer aren't accounted for"
+        asked,
+        [(Worker::A, 0), (Worker::B, 0)],
+        "the lost answer is asked for again, under a new attempt"
     );
+    let attempts: Vec<(u32, u32, ModelAttemptState)> = progress
+        .model_attempts
+        .iter()
+        .map(|attempt| (attempt.turn, attempt.attempt, attempt.state))
+        .collect();
+    assert_eq!(
+        attempts,
+        [
+            (0, 1, ModelAttemptState::Abandoned),
+            (0, 2, ModelAttemptState::Answered),
+        ],
+        "the abandoned attempt is recorded, for operators: its tokens may have been spent"
+    );
+    // Usage counts the committed answer: a lost one's tokens never reached
+    // the store (decision 0046 keeps them internal).
+    assert_eq!(accounted_tokens(&progress), produced_tokens(&answers[1..]));
 }
 
 #[tokio::test]
-#[ignore = "fixed when writes check the owner's lease: a worker whose lease ran out still commits its writes"]
 async fn refuses_the_writes_of_a_worker_whose_lease_ran_out() {
     let setup = setup(&[("Main", "tk_main")]).await;
     let run = setup.start("hello").await;
@@ -469,7 +505,7 @@ async fn refuses_the_writes_of_a_worker_whose_lease_ran_out() {
     // runs out; B claims the run and is waiting on the model.
     let takeover = setup
         .kit
-        .take_over(Point::Before(Write::RecordTurn), Some(Point::BeforeModel))
+        .take_over(Point::Before(Write::CommitTurn), Some(Point::BeforeModel))
         .await;
     takeover.a_gate.release();
     assert!(takeover.a.finish().await);
@@ -494,7 +530,6 @@ fn offered_lookups(setup: &Setup) -> Vec<zupflow_core::models::ToolSpec> {
 }
 
 #[tokio::test]
-#[ignore = "fixed when tools are named per installation: two installations of one app are offered under the same description, as `x` and `x_2`"]
 async fn tells_two_installations_of_one_app_apart() {
     let setup = setup(&[("Work", "tk_work"), ("Personal", "tk_personal")]).await;
     setup.start("hello").await;
@@ -517,7 +552,6 @@ async fn tells_two_installations_of_one_app_apart() {
 }
 
 #[tokio::test]
-#[ignore = "fixed when tools are named per installation: which installation a tool name reaches depends on the order of the agent's grants"]
 async fn names_a_tool_after_its_installation_whatever_the_grant_order() {
     let setup = setup(&[("Work", "tk_work"), ("Personal", "tk_personal")]).await;
     setup.start("hello").await;

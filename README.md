@@ -254,33 +254,44 @@ stops startup; the server logs which applies.
 Runs are served: started (`403 console_read_only_in_production` for a
 Console session in Production, `422 agent_paused`), listed per workspace and
 across the organization, read with their timelines, and cancelled. A worker
-in the same process takes each run through the run engine: every turn, the
-model is offered the agent's granted tools that neither the floor nor the
-policy refuses; each call it asks for is decided again (floor, then policy)
-and recorded with its policy, mode and rule; allowed calls go to the
-installation's MCP server through the safe outbound path with its credential
-injected last. A call that needs approval pauses the run until the
-organization's backend decides with an API key (`POST …/runs/{run}/approvals`;
-a Console session gets `403 approval_requires_api_key`); a denial goes back
-to the model as the call's result. A call is recorded as sent before it is
-sent, and decided again on what holds then (a call that now needs approval
-waits for it; one now refused isn't sent): one cut off by a restart is
-settled as unknown and never sent again. A denial's optional `reason` goes
-back to the model. A run no job takes forward any more (its last job died)
-is failed `run_unavailable` by the worker's periodic sweep.
-Each event is announced on the in-process event bus, to the workspace and to
-its environment.
+in the same process takes each run forward as an explicit state machine
+(decision 0046): a pure reducer plans each step from the run as committed,
+the run store commits it in one transaction with its events, webhook
+announcements, audit rows and jobs, and only then does the worker make the
+one call the step allows. Every turn, the model is offered the agent's
+granted tools that neither the floor nor the policy refuses, each named
+`<app_key>_<short_id>_<tool_name>` after its app's key and its
+installation's short ID and described with the installation's label
+(`taskboard_k7m2qd_create_task`, decision 0047), frozen for that model
+request; a name the model uses is looked up in that offer, never parsed.
+Each call it asks for is decided (floor, then policy) and recorded with its
+policy, mode and rule; allowed calls go only to their own installation's MCP
+server through the safe outbound path, with its credential injected last. A
+call that needs approval pauses the run until the organization's backend
+decides with an API key (`POST …/runs/{run}/approvals`; a Console session
+gets `403 approval_requires_api_key`); a denial and its optional `reason` go
+back to the model as the call's result. Just before a call is sent it is
+decided again on what holds then (a call that now needs approval waits for
+it; one now refused, or whose installation was removed or disconnected, or
+whose tool changed since, isn't sent), and it is sent under a claim of its
+own: one whose worker stopped is settled as unknown once that claim lapses,
+and never sent again. Cancelling closes every call not yet sent. A worker
+whose claim ran out can't write, and a long run hands its claim back
+without using up its job's attempts. A run no job takes forward any more
+(its last job died) is failed `run_unavailable` by the worker's periodic
+sweep. Each event is announced on the in-process event bus, to the workspace
+and to its environment.
 
 The run engine is tested under faults too (`server/crates/zupflow-server/tests/run_faults.rs`,
 with the kit in `tests/common/faults.rs`): real workers are stopped or crashed
-at named points around every run-store write, the model's answer and the
+at named points around every transition they apply, the model's answer and the
 outbound `tools/call`; a test clock runs leases out; two workers race on one
 run. What happened is read from the fake MCP server's own ledger of the
 requests it received (with the credential each carried) and the answers the
-model produced, never only from the runtime's records. Tests marked
-`#[ignore = "…"]` reproduce holes today's engine still has, each failing on
-the assertion that names it: `cargo test -p zupflow-server --test run_faults
--- --ignored`.
+model produced, never only from the runtime's records. A hole found later is
+written there as a test marked `#[ignore = "…"]`, failing on the assertion
+that names it (`cargo test -p zupflow-server --test run_faults -- --ignored`),
+until the change that closes it; none is open today.
 
 Usage is served too: runs, failed runs and tool calls per UTC day in one
 environment (`?environment=`, required; `days` 1 to 90, 14 by default), every

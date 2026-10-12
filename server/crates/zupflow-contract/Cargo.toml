@@ -36,6 +36,7 @@ serde_json.workspace = true
 sha2.workspace = true
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "uuid"] }
 tokio.workspace = true
+uuid.workspace = true
 zupflow-basic.workspace = true
 zupflow-core.workspace = true
 zupflow-mcp.workspace = true

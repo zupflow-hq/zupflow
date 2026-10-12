@@ -119,6 +119,10 @@ pub enum InstallationCheck {
     Disconnected,
     /// Its credential stopped working: the run fails.
     ReconnectRequired,
+    /// It can't be reached as it's set up (its app's configuration names no
+    /// server for its environment, say): the call is refused, and the run
+    /// goes on.
+    Unusable,
 }
 
 /// A call checked again just before it's sent.
@@ -1195,6 +1199,12 @@ impl Worker<'_> {
                 return refuse(
                     "installation_disconnected",
                     format!("{label} was disconnected, so this call wasn't made."),
+                );
+            }
+            InstallationCheck::Unusable => {
+                return refuse(
+                    "tool_refused",
+                    format!("{label} can't be used as it's set up: check its app's configuration, or reconnect it."),
                 );
             }
             // The call is refused; the next step fails the run.

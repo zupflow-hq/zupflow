@@ -1,8 +1,8 @@
 //! A deterministic fault kit for the run engine: a clock the test moves,
-//! named points around every run-store write, the model's answer and the
-//! outbound MCP `tools/call` where a worker can be stopped or crashed, and
-//! the race where a second worker takes a run over from a first whose lease
-//! ran out.
+//! named points around every transition a worker or the API applies to the
+//! run store, the model's answer and the outbound MCP `tools/call` where a
+//! worker can be stopped or crashed, and the race where a second worker
+//! takes a run over from a first whose lease ran out.
 //!
 //! Each worker is the real engine (`run_engine::work_once`) over its own
 //! copy of the state, whose run store, model provider and outbound path are
@@ -10,14 +10,14 @@
 //! holds no transaction; crashing it drops it there, as a process dying
 //! would. What happened is read from records the runtime can't rewrite: the
 //! fake MCP server's ledger (`Providers::ledger`), the answers the model
-//! actually produced (`Faults::answers`), and every write each worker tried
-//! with whether it committed (`Faults::writes`).
+//! actually produced (`Faults::answers`), and every transition each worker
+//! tried with whether it committed (`Faults::writes`). The run store and the
+//! job queue run on the kit's clock.
 //!
 //! Include it beside `common` with `#[path = "common/faults.rs"] mod faults;`.
 
 #![allow(dead_code, clippy::unwrap_used, clippy::too_many_arguments)]
 
-use std::future::Future;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,19 +27,19 @@ use axum::http::StatusCode;
 use serde_json::Value;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use zupflow_core::audit::Audit;
 use zupflow_core::environment::Environment;
-use zupflow_core::ids::{ApiKeyId, OrganizationId, RunId, ToolCallId, WorkspaceId};
+use zupflow_core::ids::{OrganizationId, RunId, WorkspaceId};
 use zupflow_core::models::{Completion, Message, ModelProvider, ProviderError, TokenUsage, ToolSpec, Turn};
 use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse};
+use zupflow_core::runs::state::{CallRecord, CommittedTurn, ModelAttempt, Snapshot};
+use zupflow_core::runs::store::{Applied, Durability, RunStore, StoreError};
+use zupflow_core::runs::transition::{Conflict, Operation, TransitionRequest};
 use zupflow_core::runs::{
-    AgentActivity, ApprovalDecision, CallOutcome, CallState, Ending, NewRun, NewRunEvent, NewTurn, OrganizationRun,
-    OrganizationRunFilter, Page, QueuedJob, RecordedDecision, Run, RunError, RunEvent, RunFilter, RunProgress,
-    RunStore, RunToolCall, UsageDay,
+    AgentActivity, CallState, OrganizationRun, OrganizationRunFilter, Page, Run, RunEvent, RunFilter, UsageDay,
 };
 use zupflow_core::time::{Clock, Timestamp};
 use zupflow_server::{AppState, RequestGuard, run_engine};
-use zupflow_sqlite::SqliteJobQueue;
+use zupflow_sqlite::{SqliteJobQueue, SqliteRunStore};
 
 use crate::common::{Call, Server, send_to};
 
@@ -47,8 +47,9 @@ use crate::common::{Call, Server, send_to};
 const PATIENCE: Duration = Duration::from_secs(20);
 
 /// A clock that stands still until the test moves it. It starts an hour
-/// ahead of the wall clock: jobs the stores queue with their changes take
-/// the wall clock's time, so they are already due by this one.
+/// ahead of the wall clock: jobs the other stores queue with their changes
+/// (discovery's, say) take the wall clock's time, so they are already due by
+/// this one.
 pub struct TestClock(AtomicI64);
 
 impl TestClock {
@@ -76,19 +77,50 @@ pub enum Worker {
     B,
 }
 
-/// Each write of the run store, by the method that makes it.
+/// Each write of the run store: a transition, by its operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Write {
-    CreateRun,
-    StartRun,
-    RecordTurn,
-    RequestApproval,
+    Admit,
+    Claim,
+    PrepareModel,
+    CommitTurn,
+    Park,
     ResolveApproval,
-    BeginCall,
-    SettleCall,
-    DecideCall,
-    FinishRun,
-    CancelRun,
+    AuthorizeCall,
+    RecordOutcome,
+    SettleUnknown,
+    Cancel,
+    Yield,
+    Finish,
+    FailAbandoned,
+}
+
+impl Write {
+    fn of(operation: &Operation) -> Self {
+        match operation {
+            Operation::Admit(_) => Self::Admit,
+            Operation::Claim(_) => Self::Claim,
+            Operation::PrepareModel(_) => Self::PrepareModel,
+            Operation::CommitTurn(_) => Self::CommitTurn,
+            Operation::Park(_) => Self::Park,
+            Operation::ResolveApproval(_) => Self::ResolveApproval,
+            Operation::AuthorizeCall(_) => Self::AuthorizeCall,
+            Operation::RecordOutcome(_) => Self::RecordOutcome,
+            Operation::SettleUnknown(_) => Self::SettleUnknown,
+            Operation::Cancel(_) => Self::Cancel,
+            Operation::Yield(_) => Self::Yield,
+            Operation::Finish(_) => Self::Finish,
+            Operation::FailAbandoned(_) => Self::FailAbandoned,
+        }
+    }
+}
+
+/// Why a transition didn't commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// A guard, or another request from the same revision.
+    Conflict(Conflict),
+    Store(StoreError),
 }
 
 /// A named boundary a worker can be stopped at.
@@ -144,12 +176,12 @@ impl Gate {
     }
 }
 
-/// One write a worker tried: whether it committed, or the store's answer.
+/// One transition a worker tried: whether it committed, or why not.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Attempted {
     pub worker: Worker,
     pub write: Write,
-    pub result: Result<(), RunError>,
+    pub result: Result<(), Refused>,
 }
 
 /// One answer the model produced, whatever became of it.
@@ -222,49 +254,48 @@ impl Faults {
     }
 }
 
-/// The run store, stopping its worker around each write and noting the write.
+/// The run store, stopping its worker around each transition and noting it.
 struct FaultyRuns {
     inner: Arc<dyn RunStore>,
     worker: Worker,
     faults: Arc<Faults>,
 }
 
-impl FaultyRuns {
-    async fn write<T: Send>(
+#[async_trait]
+impl RunStore for FaultyRuns {
+    fn durability(&self) -> Durability {
+        self.inner.durability()
+    }
+
+    async fn apply(
         &self,
-        write: Write,
-        call: impl Future<Output = Result<T, RunError>> + Send,
-    ) -> Result<T, RunError> {
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        request: &TransitionRequest,
+    ) -> Result<Applied, StoreError> {
+        let write = Write::of(request.operation());
         self.faults.pass(self.worker, Point::Before(write)).await;
-        let result = call.await;
+        let applied = self.inner.apply(organization_id, workspace_id, request).await;
         self.faults.writes.lock().unwrap().push(Attempted {
             worker: self.worker,
             write,
-            result: result.as_ref().map(|_| ()).map_err(|error| *error),
+            result: match &applied {
+                Ok(Applied::Committed(_)) => Ok(()),
+                Ok(Applied::Conflict(conflict)) => Err(Refused::Conflict(*conflict)),
+                Err(error) => Err(Refused::Store(*error)),
+            },
         });
         self.faults.pass(self.worker, Point::After(write)).await;
-        result
+        applied
     }
-}
 
-#[async_trait]
-impl RunStore for FaultyRuns {
-    async fn create_run(
+    async fn find_snapshot(
         &self,
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         run_id: RunId,
-        run: &NewRun,
-        events: &[NewRunEvent],
-        job: &QueuedJob,
-        now: Timestamp,
-    ) -> Result<(Run, Vec<RunEvent>), RunError> {
-        self.write(
-            Write::CreateRun,
-            self.inner
-                .create_run(organization_id, workspace_id, run_id, run, events, job, now),
-        )
-        .await
+    ) -> Result<Option<Snapshot>, StoreError> {
+        self.inner.find_snapshot(organization_id, workspace_id, run_id).await
     }
 
     async fn find_run(
@@ -272,7 +303,7 @@ impl RunStore for FaultyRuns {
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         run_id: RunId,
-    ) -> Result<Option<Run>, RunError> {
+    ) -> Result<Option<Run>, StoreError> {
         self.inner.find_run(organization_id, workspace_id, run_id).await
     }
 
@@ -283,7 +314,7 @@ impl RunStore for FaultyRuns {
         filter: &RunFilter,
         cursor: Option<&str>,
         limit: u32,
-    ) -> Result<Page<Run>, RunError> {
+    ) -> Result<Page<Run>, StoreError> {
         self.inner
             .list_runs(organization_id, workspace_id, filter, cursor, limit)
             .await
@@ -295,7 +326,7 @@ impl RunStore for FaultyRuns {
         filter: &OrganizationRunFilter,
         cursor: Option<&str>,
         limit: u32,
-    ) -> Result<Page<OrganizationRun>, RunError> {
+    ) -> Result<Page<OrganizationRun>, StoreError> {
         self.inner
             .list_organization_runs(organization_id, filter, cursor, limit)
             .await
@@ -307,7 +338,7 @@ impl RunStore for FaultyRuns {
         workspace_id: WorkspaceId,
         run_id: RunId,
         after: u64,
-    ) -> Result<Vec<RunEvent>, RunError> {
+    ) -> Result<Vec<RunEvent>, StoreError> {
         self.inner
             .list_events(organization_id, workspace_id, run_id, after)
             .await
@@ -318,7 +349,7 @@ impl RunStore for FaultyRuns {
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         since: Timestamp,
-    ) -> Result<Vec<AgentActivity>, RunError> {
+    ) -> Result<Vec<AgentActivity>, StoreError> {
         self.inner.agent_activity(organization_id, workspace_id, since).await
     }
 
@@ -327,216 +358,12 @@ impl RunStore for FaultyRuns {
         organization_id: OrganizationId,
         environment: Environment,
         since: Timestamp,
-    ) -> Result<Vec<UsageDay>, RunError> {
+    ) -> Result<Vec<UsageDay>, StoreError> {
         self.inner.usage(organization_id, environment, since).await
     }
 
-    async fn find_progress(
-        &self,
-        organization_id: OrganizationId,
-        workspace_id: WorkspaceId,
-        run_id: RunId,
-    ) -> Result<Option<RunProgress>, RunError> {
-        self.inner.find_progress(organization_id, workspace_id, run_id).await
-    }
-
-    async fn start_run(
-        &self,
-        organization_id: OrganizationId,
-        workspace_id: WorkspaceId,
-        run_id: RunId,
-        events: &[NewRunEvent],
-        now: Timestamp,
-    ) -> Result<Vec<RunEvent>, RunError> {
-        self.write(
-            Write::StartRun,
-            self.inner.start_run(organization_id, workspace_id, run_id, events, now),
-        )
-        .await
-    }
-
-    async fn record_turn(
-        &self,
-        organization_id: OrganizationId,
-        workspace_id: WorkspaceId,
-        run_id: RunId,
-        index: u32,
-        turn: &NewTurn,
-        events: &[NewRunEvent],
-        now: Timestamp,
-    ) -> Result<Vec<RunEvent>, RunError> {
-        self.write(
-            Write::RecordTurn,
-            self.inner
-                .record_turn(organization_id, workspace_id, run_id, index, turn, events, now),
-        )
-        .await
-    }
-
-    async fn request_approval(
-        &self,
-        organization_id: OrganizationId,
-        workspace_id: WorkspaceId,
-        run_id: RunId,
-        call_id: ToolCallId,
-        events: &[NewRunEvent],
-        now: Timestamp,
-    ) -> Result<Vec<RunEvent>, RunError> {
-        self.write(
-            Write::RequestApproval,
-            self.inner
-                .request_approval(organization_id, workspace_id, run_id, call_id, events, now),
-        )
-        .await
-    }
-
-    async fn resolve_approval(
-        &self,
-        organization_id: OrganizationId,
-        workspace_id: WorkspaceId,
-        run_id: RunId,
-        call_id: ToolCallId,
-        decision: ApprovalDecision,
-        api_key_id: ApiKeyId,
-        denial: &CallOutcome,
-        events: &[NewRunEvent],
-        job: &QueuedJob,
-        now: Timestamp,
-        audit: &Audit<'_, Run>,
-    ) -> Result<(Run, Vec<RunEvent>), RunError> {
-        self.write(
-            Write::ResolveApproval,
-            self.inner.resolve_approval(
-                organization_id,
-                workspace_id,
-                run_id,
-                call_id,
-                decision,
-                api_key_id,
-                denial,
-                events,
-                job,
-                now,
-                audit,
-            ),
-        )
-        .await
-    }
-
-    async fn begin_call(
-        &self,
-        organization_id: OrganizationId,
-        workspace_id: WorkspaceId,
-        run_id: RunId,
-        call_id: ToolCallId,
-        events: &[NewRunEvent],
-        now: Timestamp,
-    ) -> Result<Vec<RunEvent>, RunError> {
-        self.write(
-            Write::BeginCall,
-            self.inner
-                .begin_call(organization_id, workspace_id, run_id, call_id, events, now),
-        )
-        .await
-    }
-
-    async fn settle_call(
-        &self,
-        organization_id: OrganizationId,
-        workspace_id: WorkspaceId,
-        run_id: RunId,
-        call_id: ToolCallId,
-        from: &[CallState],
-        to: CallState,
-        outcome: &CallOutcome,
-        events: &[NewRunEvent],
-        now: Timestamp,
-    ) -> Result<Vec<RunEvent>, RunError> {
-        self.write(
-            Write::SettleCall,
-            self.inner.settle_call(
-                organization_id,
-                workspace_id,
-                run_id,
-                call_id,
-                from,
-                to,
-                outcome,
-                events,
-                now,
-            ),
-        )
-        .await
-    }
-
-    async fn decide_call(
-        &self,
-        organization_id: OrganizationId,
-        workspace_id: WorkspaceId,
-        run_id: RunId,
-        call_id: ToolCallId,
-        from: &[CallState],
-        to: CallState,
-        decision: &RecordedDecision,
-        outcome: Option<&CallOutcome>,
-        events: &[NewRunEvent],
-        now: Timestamp,
-    ) -> Result<Vec<RunEvent>, RunError> {
-        self.write(
-            Write::DecideCall,
-            self.inner.decide_call(
-                organization_id,
-                workspace_id,
-                run_id,
-                call_id,
-                from,
-                to,
-                decision,
-                outcome,
-                events,
-                now,
-            ),
-        )
-        .await
-    }
-
-    async fn finish_run(
-        &self,
-        organization_id: OrganizationId,
-        workspace_id: WorkspaceId,
-        run_id: RunId,
-        turns: u32,
-        ending: &Ending,
-        events: &[NewRunEvent],
-        now: Timestamp,
-    ) -> Result<Vec<RunEvent>, RunError> {
-        self.write(
-            Write::FinishRun,
-            self.inner
-                .finish_run(organization_id, workspace_id, run_id, turns, ending, events, now),
-        )
-        .await
-    }
-
-    async fn abandoned_runs(&self, limit: u32) -> Result<Vec<(OrganizationId, WorkspaceId, RunId)>, RunError> {
+    async fn abandoned_runs(&self, limit: u32) -> Result<Vec<(OrganizationId, WorkspaceId, RunId)>, StoreError> {
         self.inner.abandoned_runs(limit).await
-    }
-
-    async fn cancel_run(
-        &self,
-        organization_id: OrganizationId,
-        workspace_id: WorkspaceId,
-        run_id: RunId,
-        events: &[NewRunEvent],
-        now: Timestamp,
-        audit: &Audit<'_, Run>,
-    ) -> Result<(Run, Vec<RunEvent>), RunError> {
-        self.write(
-            Write::CancelRun,
-            self.inner
-                .cancel_run(organization_id, workspace_id, run_id, events, now, audit),
-        )
-        .await
     }
 }
 
@@ -658,8 +485,11 @@ pub struct Takeover {
 pub struct Kit {
     pub clock: Arc<TestClock>,
     pub faults: Arc<Faults>,
-    /// The server's state on the kit's clock, with a job queue on it too.
+    /// The server's state on the kit's clock, with a run store and a job
+    /// queue on it too.
     base: AppState,
+    /// The server's database file, read directly for what no API shows.
+    database: std::path::PathBuf,
     /// The API over the run store as [`Worker::Api`] writes to it.
     api: axum::Router,
 }
@@ -671,11 +501,13 @@ impl Kit {
         let mut base = server.state.clone();
         base.clock = clock.clone();
         base.jobs = Arc::new(SqliteJobQueue::with_clock(server.database.clone(), clock.clone()));
+        base.runs = Arc::new(SqliteRunStore::with_clock(server.database.clone(), clock.clone()));
         let api = zupflow_server::app(worker_state(&base, &faults, Worker::Api), RequestGuard::default());
         Self {
             clock,
             faults,
             base,
+            database: server.directory.join("zupflow.sqlite"),
             api,
         }
     }
@@ -752,38 +584,100 @@ impl Kit {
         }
     }
 
-    /// The run as the store holds it, with its turns and calls.
+    /// The run as the store holds it, with its turns and calls, and what
+    /// each call's attempts kept of the answers their senders got.
     pub async fn progress(
         &self,
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         run_id: RunId,
-    ) -> RunProgress {
-        self.base
+    ) -> Progress {
+        let run = self
+            .base
             .runs
-            .find_progress(organization_id, workspace_id, run_id)
+            .find_run(organization_id, workspace_id, run_id)
             .await
             .unwrap()
+            .unwrap();
+        let snapshot = self
+            .base
+            .runs
+            .find_snapshot(organization_id, workspace_id, run_id)
+            .await
             .unwrap()
+            .unwrap();
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", self.database.display()))
+            .await
+            .unwrap();
+        let mut calls = Vec::new();
+        for record in snapshot.calls {
+            // What each attempt's sender reported, kept on the attempt
+            // whether it settled the call or came too late to.
+            let evidence: Vec<String> = sqlx::query_scalar(
+                "SELECT outcome FROM run_call_attempts WHERE organization_id = ? AND workspace_id = ? \
+                 AND run_id = ? AND call_id = ? AND outcome IS NOT NULL ORDER BY attempt",
+            )
+            .bind(organization_id.uuid())
+            .bind(workspace_id.uuid())
+            .bind(run_id.uuid())
+            .bind(record.id.uuid())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            calls.push(RecordedCall { record, evidence });
+        }
+        pool.close().await;
+        Progress {
+            run,
+            turns: snapshot.turns,
+            model_attempts: snapshot.model_attempts,
+            calls,
+        }
     }
 }
 
-/// What the runtime kept of the answer a sent call got back. Today that is
-/// the call's outcome once it settled `completed` or `failed`; an `unknown`
-/// call keeps only the placeholder the model reads. Once sends are fenced
-/// by a send claim, this adds the evidence an attempt keeps when its answer
-/// arrives after the call was settled unknown.
-pub fn kept_answers(call: &RunToolCall) -> Vec<String> {
-    match (call.state, &call.outcome) {
+/// A run as [`Kit::progress`] reads it.
+pub struct Progress {
+    pub run: Run,
+    pub turns: Vec<CommittedTurn>,
+    /// Every request to the model, by turn and attempt.
+    pub model_attempts: Vec<ModelAttempt>,
+    pub calls: Vec<RecordedCall>,
+}
+
+/// A call, with what its attempts kept of their senders' answers.
+#[derive(Debug, Clone)]
+pub struct RecordedCall {
+    pub record: CallRecord,
+    /// Each attempt's recorded outcome, as the store keeps it.
+    pub evidence: Vec<String>,
+}
+
+impl std::ops::Deref for RecordedCall {
+    type Target = CallRecord;
+
+    fn deref(&self) -> &CallRecord {
+        &self.record
+    }
+}
+
+/// What the runtime kept of the answer a sent call got back: the call's
+/// outcome once it settled `completed` or `failed`, and the outcome each
+/// attempt recorded, including one that arrived after the call was settled
+/// unknown (late evidence, for operators only).
+pub fn kept_answers(call: &RecordedCall) -> Vec<String> {
+    let mut kept = match (call.state, &call.outcome) {
         (CallState::Completed | CallState::Failed, Some(outcome)) => vec![outcome.content.clone()],
         _ => Vec::new(),
-    }
+    };
+    kept.extend(call.evidence.iter().cloned());
+    kept
 }
 
-/// The model's tokens the runtime accounts for in a run. Today that is the
-/// run's usage, counted from recorded turns only. Once model attempts are
-/// recorded, this adds the attempts a run abandoned.
-pub fn accounted_tokens(progress: &RunProgress) -> u64 {
+/// The model's tokens the runtime accounts for in a run: the run's usage,
+/// counted from its committed turns. An attempt a stopped worker abandoned
+/// keeps no tokens: its answer never reached the store.
+pub fn accounted_tokens(progress: &Progress) -> u64 {
     progress.run.usage.input_tokens + progress.run.usage.output_tokens
 }
 

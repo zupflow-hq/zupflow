@@ -623,6 +623,9 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
     let installation_id = completed["installation_id"].as_str().unwrap().to_owned();
     let installation = t.installation(&stack, &installation_id).await;
     assert_eq!(installation["status"], "connected", "{installation}");
+    // A tool as the model is offered it: `<app_key>_<short_id>_<tool>`.
+    let short_id = installation["short_id"].as_str().unwrap().to_owned();
+    let calling = |tool: &str, arguments: &str| format!("call taskboard_live_{short_id}_{tool} {arguments}");
     assert_eq!(
         installation["connection"]["account"],
         json!({ "external_id": "tb-user-1", "display_name": "Robin Park", "email": "robin@taskboard.example" })
@@ -770,7 +773,11 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
         .start_run(
             &stack,
             &agent,
-            "call list_tasks {}\ncall create_task {\"title\":\"Send the quarterly report\"}",
+            &format!(
+                "{}\n{}",
+                calling("list_tasks", "{}"),
+                calling("create_task", "{\"title\":\"Send the quarterly report\"}")
+            ),
         )
         .await;
     t.run_reaches(&stack, &run, "waiting_for_approval").await;
@@ -864,17 +871,18 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let run = t.start_run(&stack, &agent, "call delete_task {\"id\":\"TB-1\"}").await;
+    let run = t
+        .start_run(&stack, &agent, &calling("delete_task", "{\"id\":\"TB-1\"}"))
+        .await;
     t.run_reaches(&stack, &run, "waiting_for_approval").await;
     let call_id = awaiting(&t.events(&stack, &run).await, "delete_task");
     let (status, body) = t.decide(&stack, &key, &run, &call_id, "denied").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let done = t.run_reaches(&stack, &run, "completed").await;
     assert!(
-        done["output"]
-            .as_str()
-            .unwrap()
-            .starts_with("delete_task failed: A person denied this call"),
+        done["output"].as_str().unwrap().starts_with(&format!(
+            "taskboard_live_{short_id}_delete_task failed: A person denied this call"
+        )),
         "{done}"
     );
     assert_eq!(board.tool_calls().len(), 2, "a denied call is never sent");
@@ -901,7 +909,7 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
     board.expire_access_tokens();
     board.set_refresh_delay(Duration::from_secs(3));
     let unauthorized = board.unauthorized_requests();
-    let run = t.start_run(&stack, &agent, "call list_tasks {}").await;
+    let run = t.start_run(&stack, &agent, &calling("list_tasks", "{}")).await;
     eventually("the run's refresh in flight", || async {
         (board.refreshes_in_flight() == 1).then_some(())
     })
@@ -939,7 +947,7 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
     // A revoked refresh token durably flags the installation, once, with
     // both its webhook and its audit event in the same transition.
     board.revoke_all_tokens();
-    let run = t.start_run(&stack, &agent, "call list_tasks {}").await;
+    let run = t.start_run(&stack, &agent, &calling("list_tasks", "{}")).await;
     let failed = t.run_reaches(&stack, &run, "failed").await;
     assert_eq!(failed["error"]["code"], "installation_reconnect_required", "{failed}");
     assert_eq!(
@@ -981,7 +989,7 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
         1
     );
     let requests = board.token_requests().len();
-    let run = t.start_run(&stack, &agent, "call list_tasks {}").await;
+    let run = t.start_run(&stack, &agent, &calling("list_tasks", "{}")).await;
     t.run_reaches(&stack, &run, "failed").await;
     assert_eq!(
         board.token_requests().len(),
@@ -998,7 +1006,7 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
     let installation = t.installation(&stack, &installation_id).await;
     assert_eq!(installation["status"], "connected");
     assert_eq!(installation["connection"]["credential_version"], 3);
-    let run = t.start_run(&stack, &agent, "call list_tasks {}").await;
+    let run = t.start_run(&stack, &agent, &calling("list_tasks", "{}")).await;
     let done = t.run_reaches(&stack, &run, "completed").await;
     assert!(
         done["output"]
@@ -1010,7 +1018,7 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
     // A 403 is never treated as a 401: no refresh or automatic replay.
     board.set_mcp_status(Some(403));
     let requests = board.token_requests().len();
-    let run = t.start_run(&stack, &agent, "call list_tasks {}").await;
+    let run = t.start_run(&stack, &agent, &calling("list_tasks", "{}")).await;
     t.run_reaches(&stack, &run, "completed").await;
     assert_eq!(board.token_requests().len(), requests);
     assert_eq!(t.installation(&stack, &installation_id).await["status"], "connected");
@@ -1020,7 +1028,7 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
     // refresh; the next Connect registers again in the same app scope.
     board.forget_clients();
     board.expire_access_tokens();
-    let run = t.start_run(&stack, &agent, "call list_tasks {}").await;
+    let run = t.start_run(&stack, &agent, &calling("list_tasks", "{}")).await;
     t.run_reaches(&stack, &run, "failed").await;
     assert_eq!(
         board.token_requests().last().unwrap().error.as_deref(),

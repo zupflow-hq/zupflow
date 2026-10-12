@@ -1,7 +1,7 @@
-//! The durable engine's store (decision 0046): [`DurableRunStore`].
+//! A run's store (decision 0046): [`RunStore`].
 //!
-//! [`DurableRunStore::apply`] is the only way the durable engine changes a
-//! run. It takes the organization and the workspace the caller acts in and
+//! [`RunStore::apply`] is the only way a run changes. It takes the
+//! organization and the workspace the caller acts in and
 //! one [`TransitionRequest`], and answers a [`Receipt`] or a [`Conflict`].
 //! Every adapter, in one transaction under its write lock:
 //!
@@ -27,9 +27,9 @@
 //! The reads are the ones the API and the driver need: a run's snapshot
 //! (what [`super::reducer::advance`] reads), the run as the API shows it,
 //! lists, the timeline, activity and usage. The one statement without a
-//! scope is [`DurableRunStore::abandoned_runs`], for the sweep.
+//! scope is [`RunStore::abandoned_runs`], for the sweep.
 //!
-//! The suite every adapter passes is `zupflow-conformance::durable_run_store`.
+//! The suite every adapter passes is `zupflow-conformance::run_store`.
 
 use std::time::Duration;
 
@@ -77,8 +77,8 @@ pub fn run_of_job(payload: &[u8]) -> Option<RunId> {
     RunId::parse(payload.get("run_id")?.as_str()?).ok()
 }
 
-/// What a committed transition did. Answered again, the same, to a retry of
-/// the same request.
+/// What a committed transition did. Answered again, the same (but for
+/// [`Receipt::run`]), to a retry of the same request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Receipt {
     pub transition_id: TransitionId,
@@ -96,6 +96,12 @@ pub struct Receipt {
     pub committed_at: Timestamp,
     /// The events it appended, in order: what to publish once it commits.
     pub events: Vec<RunEvent>,
+    /// The run as the API shows it, read in the same transaction as the
+    /// commit, so a caller answers with what committed without reading it
+    /// again. A receipt answered again to a retry carries the run as it is
+    /// then: every other field is the first answer's.
+    /// Boxed: a receipt is large beside a conflict.
+    pub run: Box<Run>,
 }
 
 /// What `apply` answers.
@@ -160,7 +166,7 @@ pub enum Durability {
 }
 
 #[async_trait]
-pub trait DurableRunStore: Send + Sync {
+pub trait RunStore: Send + Sync {
     /// How safely it keeps what it commits.
     fn durability(&self) -> Durability;
 

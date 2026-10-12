@@ -1,46 +1,54 @@
-//! The run engine (milestone 4): a worker claims a run's job with a lease
-//! and takes it step by step, each step recorded in the run store before the
-//! next is taken, so a run survives a restart and no step is taken twice.
+//! The run engine's driver (decision 0046): a worker claims a run's job,
+//! reads the run as committed, gathers the facts the reducer needs, calls
+//! [`advance`], applies the one transition it plans through the
+//! [`RunStore`], and only then does the one piece of I/O the plan names:
+//! asks the model, or sends one call through the [`ToolPort`]. What comes of
+//! the I/O is the next step's fact. Nothing here decides how a run moves:
+//! the reducer does, and the store holds every write to its guards.
 //!
-//! A run is a conversation with the agent's model, kept as it started (its
-//! model and instructions). Each turn, the model is offered the tools the
-//! agent's grants name that the floor and the [`ApprovalPolicy`] wouldn't
-//! refuse (a refused tool is never shown; a changed one that nobody
-//! reviewed is offered with its pinned definition, and waits for approval).
-//! Each call it asks for is decided again, the floor first and then the
-//! policy, and the decision is recorded with the call: allowed calls are
-//! sent in order through the installation's MCP server (`OutboundHttp`, the
-//! credential injected last); a call that needs approval pauses the run
-//! until the customer's backend decides; a refusal or a denial goes back to
-//! the model as the call's result, with its reason.
+//! The facts are read fresh for every step, in the run's own organization
+//! and workspace: the store's clock time, a claimant of this worker's own,
+//! IDs for the calls and the send claim, the tools offered to the model
+//! (each granted tool of each installation, named
+//! `<app_key>_<short_id>_<tool_name>` and frozen with the model attempt,
+//! decision 0047), the floor's and the [`ApprovalPolicy`]'s decision on
+//! each call, and, before a call is sent, its installation, grant and
+//! pinned definition read again.
 //!
-//! Delivery is at least once. Every step is a conditional write that
-//! answers `Moved` when another worker, a cancel or a decision got there
-//! first; the worker then reads the run again. A call is recorded as sent
-//! before it's sent, and its outcome after: a call found sent without an
-//! outcome (the worker stopped mid-call) is settled as unknown and never
-//! sent again. Asking the model again is safe: nothing it is sent acts.
+//! The job queue's lease and the run's claim go together: the job's lease
+//! is extended before every step that keeps the claim, and once a step
+//! releases the claim (it parks, yields or finishes) the store has queued,
+//! postponed or released the run's job in the same transaction, so the
+//! worker leaves it alone.
 //!
-//! Every event appended is published on the [`EVENTS_TOPIC`] of the
-//! workspace and of its environment, as a notification: listeners read the
-//! timeline from the store.
+//! Every event a transition appended is published on the [`EVENTS_TOPIC`]
+//! of the workspace and of its environment, as a notification: listeners
+//! read the timeline from the store.
+//!
+//! [`ApprovalPolicy`]: zupflow_core::policy::ApprovalPolicy
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serde_json::{Map, Value, json};
+use uuid::Uuid;
 use zupflow_core::environment::Environment;
-use zupflow_core::ids::{AgentId, OrganizationId, RunId, ToolCallId, WorkspaceId};
-use zupflow_core::installations::{Installation, InstalledApp};
-use zupflow_core::jobs::{Job, JobId, JobOptions, LeaseToken};
-use zupflow_core::models::{
-    MAX_MODEL_TOOL_NAME, Message, ModelToolCall, ProviderError, Reply, TokenUsage, ToolSpec, Turn, validate_completion,
-};
+use zupflow_core::ids::{AgentId, InstallationId, OrganizationId, RunId, ToolCallId, WorkspaceId};
+use zupflow_core::installations::{Installation, InstallationStatus, InstalledApp};
+use zupflow_core::jobs::{Job, JobId, LeaseToken};
+use zupflow_core::models::{ProviderError, validate_completion};
 use zupflow_core::policy::{CallApp, Decision, GrantedAs, OrganizationLevel, ToolCall, Verdict, floor};
-use zupflow_core::runs::{
-    CallOutcome, CallState, CallTarget, Ending, Failure, NewRunEvent, NewToolCall, NewTurn, QueuedJob,
-    RecordedDecision, RunError, RunEvent, RunEventType, RunProgress, RunStatus, RunToolCall, RunUsage,
+use zupflow_core::runs::digest::{Sha256Digest, call_digest};
+use zupflow_core::runs::names::{Candidate, Offer, OfferedTool, build_offer};
+use zupflow_core::runs::reducer::{
+    Facts, Idle, InstallationCheck, Io, Limits, ModelAnswer, ModelRequest, ModelResult, Plan, SendCheck, SendRequest,
+    SendResult, advance, calls_to_decide, fail_abandoned,
 };
+use zupflow_core::runs::state::{CallDecision, CallRecord, CallVerdict, ClaimantId, InvocationId, RequestId, Snapshot};
+use zupflow_core::runs::store::{Applied, RUN_JOB, RunStore, StoreError, run_of_job};
+use zupflow_core::runs::transition::{Conflict, Operation, SendOutcome};
+use zupflow_core::runs::{CallState, Failure, RunEvent};
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::tools::{RegisteredTool, ToolError};
 use zupflow_mcp::CallError;
@@ -48,49 +56,27 @@ use zupflow_mcp::CallError;
 use crate::auth::AppState;
 use crate::mcp_access::{self, Unreachable};
 
-/// The job kind.
-pub const RUN_AGENT: &str = "run_agent";
+/// The job kind: [`RUN_JOB`].
+pub const RUN_AGENT: &str = RUN_JOB;
 
 /// The event bus topic every appended run event is announced on.
 pub const EVENTS_TOPIC: &str = "run_events";
 
-/// How long a claim holds a run; renewed before every step, and longer than
-/// any one step (a model turn, a tool call).
+/// How long a claim holds a run, and the job's lease with it; renewed by
+/// every step, and longer than any one step (a model turn, a tool call).
 pub const LEASE: Duration = Duration::from_secs(5 * 60);
 
 const IDLE: Duration = Duration::from_secs(1);
 
-/// How many times a run's job is tried before the run fails.
-pub const ATTEMPTS: u32 = 5;
+/// How often the worker looks for runs no job takes forward.
+const SWEEP: Duration = Duration::from_secs(60);
 
-/// The most turns a run takes before it fails.
-pub const MAX_TURNS: usize = 10;
-
-/// The most calls one turn may ask for; the rest are refused.
-pub const MAX_CALLS_PER_TURN: usize = 20;
-
-/// The most steps one claim takes before it gives the run back to the queue.
-const MAX_STEPS: usize = 200;
-
-/// What the model reads back for a call a person denied.
-pub const DENIED: &str = "A person denied this call, so it wasn't made. Continue without it.";
-
-const UNKNOWN: &str = "The call was sent, but no answer came back, so whether it acted is unknown. It wasn't repeated.";
-
-fn kind() -> Option<Name> {
-    Name::new(RUN_AGENT).ok()
-}
-
-/// The job that takes a run forward, to queue with a change that needs one.
-pub fn job(run_id: RunId) -> Option<QueuedJob> {
-    Some(QueuedJob {
-        kind: kind()?,
-        payload: json!({ "run_id": run_id.to_string() }).to_string().into_bytes(),
-        options: JobOptions {
-            delay: Duration::ZERO,
-            max_attempts: ATTEMPTS,
-        },
-    })
+/// The limits a worker runs under: the reducer's, with the lease above.
+fn limits() -> Limits {
+    Limits {
+        lease_ms: u64::try_from(LEASE.as_millis()).unwrap_or(u64::MAX),
+        ..Limits::default()
+    }
 }
 
 /// Announces appended events on the workspace's and its environment's
@@ -125,704 +111,620 @@ pub async fn publish(
     }
 }
 
-/// A call's reference, as its events show it.
-pub fn reference(call_id: ToolCallId, target: &CallTarget) -> Map<String, Value> {
-    let mut data = Map::new();
-    data.insert("call_id".to_owned(), json!(call_id));
-    data.insert("installation_id".to_owned(), json!(target.installation_id));
-    data.insert("installation_label".to_owned(), json!(target.installation_label));
-    data.insert("app_name".to_owned(), json!(target.app_name));
-    data.insert("tool".to_owned(), json!(target.tool));
-    data
+/// How a run reaches an app's server: the one way a call is sent. Every
+/// method takes the run's organization and workspace and reaches only the
+/// installation it names, in them.
+#[async_trait]
+pub trait ToolPort: Send + Sync {
+    /// The installation's server and credential, opened for the call about
+    /// to be made.
+    type Reach: Send;
+
+    /// Reads the installation's server and credential again in its own
+    /// scope, refreshing an OAuth token near expiry. Never another
+    /// installation's.
+    async fn reach(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        installation: &Installation,
+    ) -> Result<Self::Reach, Unreachable>;
+
+    /// Sends one `tools/call` under its original MCP name, with the
+    /// installation's credential added last. A `401` allows one refresh and
+    /// one replay (decision 0042); nothing else is replayed.
+    async fn send(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        installation_id: InstallationId,
+        reach: Self::Reach,
+        tool: &str,
+        arguments: &Map<String, Value>,
+    ) -> SendOutcome;
 }
 
-fn with(mut data: Map<String, Value>, more: &[(&str, Value)]) -> Value {
-    for (key, value) in more {
-        data.insert((*key).to_owned(), value.clone());
-    }
-    Value::Object(data)
+/// The MCP path: [`mcp_access`] over the server's `OutboundHttp`.
+pub struct McpTools<'a> {
+    state: &'a AppState,
 }
 
-fn failed_event(call_id: ToolCallId, target: &CallTarget, error: &Failure, duration_ms: i64) -> NewRunEvent {
-    NewRunEvent::new(
-        RunEventType::ToolCallFailed,
-        with(
-            reference(call_id, target),
-            &[("error", json!(error)), ("duration_ms", json!(duration_ms.max(0)))],
-        ),
-    )
-}
-
-fn recorded(decision: &Decision) -> RecordedDecision {
-    let (verdict, reason) = match &decision.verdict {
-        Verdict::Allow => ("allow", None),
-        Verdict::RequireApproval { reason } => ("require_approval", Some(reason.clone())),
-        Verdict::Deny { reason } => ("deny", Some(reason.clone())),
-    };
-    RecordedDecision {
-        verdict: verdict.to_owned(),
-        policy: decision.policy.to_owned(),
-        mode: decision.mode.map(|mode| mode.as_str().to_owned()),
-        rule: decision.rule.as_str().to_owned(),
-        reason,
-    }
-}
-
-fn reconnect(label: &str) -> Failure {
-    Failure::new(
-        "installation_reconnect_required",
-        format!("{label} needs to be reconnected before its tools can run."),
-    )
-}
-
-/// What came of one claim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Outcome {
-    /// Finished, paused, or gone: nothing more for this job.
-    Done,
-    /// Worth another attempt later, with why.
-    Retry(&'static str),
-    /// The lease was lost: another worker has the run.
-    Lost,
-}
-
-/// What one step did.
-enum Step {
-    /// Read the run again and take the next step.
-    Next,
-    Stop(Outcome),
-}
-
-fn retry(error: RunError) -> Step {
-    match error {
-        RunError::Unavailable => Step::Stop(Outcome::Retry("store_unavailable")),
-        // Moved on: read it again.
-        _ => Step::Next,
+impl<'a> McpTools<'a> {
+    pub fn new(state: &'a AppState) -> Self {
+        Self { state }
     }
 }
 
-/// A tool offered to the model this turn.
-struct Offer {
-    /// The name the model calls it by.
-    name: String,
-    target: CallTarget,
-    call: ToolCall,
-    spec: ToolSpec,
-}
+#[async_trait]
+impl ToolPort for McpTools<'_> {
+    type Reach = mcp_access::Reach;
 
-/// A tool name a model can call: the tool's own, with anything else
-/// replaced, cut to length, and made unique in the turn.
-fn model_name(tool: &str, taken: &mut HashSet<String>) -> String {
-    let base: String = tool
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(MAX_MODEL_TOOL_NAME)
-        .collect();
-    let base = if base.is_empty() { "tool".to_owned() } else { base };
-    let mut name = base.clone();
-    let mut n = 2;
-    while taken.contains(&name) {
-        let suffix = format!("_{n}");
-        let keep = MAX_MODEL_TOOL_NAME.saturating_sub(suffix.len());
-        name = format!("{}{suffix}", base.chars().take(keep).collect::<String>());
-        n += 1;
+    async fn reach(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        installation: &Installation,
+    ) -> Result<Self::Reach, Unreachable> {
+        mcp_access::reach(self.state, organization_id, workspace_id, installation).await
     }
-    taken.insert(name.clone());
-    name
-}
 
-/// What the model is told about a tool: its pinned definition.
-fn spec(name: String, tool: &RegisteredTool) -> ToolSpec {
-    let definition: Map<String, Value> = serde_json::from_str(&tool.pinned.definition).unwrap_or_default();
-    let description = definition
-        .get("description")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let input_schema = definition
-        .get("inputSchema")
-        .filter(|schema| schema.is_object())
-        .cloned()
-        .unwrap_or_else(|| json!({ "type": "object" }));
-    ToolSpec {
-        name,
-        description,
-        input_schema,
-    }
-}
-
-/// The conversation so far, rebuilt from what the store recorded.
-fn conversation(progress: &RunProgress) -> Vec<Message> {
-    let mut messages = vec![Message::User {
-        text: progress.run.input.clone(),
-    }];
-    let calls: HashMap<ToolCallId, &RunToolCall> = progress.calls.iter().map(|call| (call.id, call)).collect();
-    for turn in &progress.turns {
-        let asked: Vec<&RunToolCall> = turn.calls.iter().filter_map(|id| calls.get(id).copied()).collect();
-        messages.push(Message::Assistant {
-            text: turn.text.clone(),
-            tool_calls: asked
-                .iter()
-                .map(|call| ModelToolCall {
-                    id: call.model_call_id.clone(),
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                })
-                .collect(),
-        });
-        for call in asked {
-            if let Some(outcome) = &call.outcome {
-                messages.push(Message::ToolResult {
-                    call_id: call.model_call_id.clone(),
-                    content: outcome.content.clone(),
-                    is_error: outcome.is_error,
-                });
-            }
+    async fn send(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        installation_id: InstallationId,
+        reach: Self::Reach,
+        tool: &str,
+        arguments: &Map<String, Value>,
+    ) -> SendOutcome {
+        let answer = mcp_access::call_tool(
+            self.state,
+            organization_id,
+            workspace_id,
+            installation_id,
+            reach,
+            tool,
+            arguments,
+        )
+        .await;
+        match answer {
+            Ok(answer) if !answer.is_error => SendOutcome::Completed { result: answer.result },
+            Ok(answer) => SendOutcome::ToolError { result: answer.result },
+            Err(CallError::NotSent(_)) => SendOutcome::NotSent,
+            Err(CallError::Rejected(_)) => SendOutcome::Rejected,
+            Err(CallError::Withheld) => SendOutcome::Withheld,
+            Err(CallError::Unknown(_)) => SendOutcome::Unknown,
+            Err(CallError::Unauthorized) => SendOutcome::Unauthorized,
         }
     }
-    messages
+}
+
+/// What becomes of the job once the worker stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// Nothing more for it: the run finished, waits for a person, or is gone.
+    Complete,
+    /// Another worker's claim, or a call's send claim, holds the run until
+    /// then: claim again then, without using an attempt.
+    Postpone(zupflow_core::time::Timestamp),
+    /// Worth another attempt later, with why.
+    Retry(&'static str),
+    /// The store already queued, postponed or released the run's job with
+    /// the step that released the claim, or the job's lease is lost.
+    Leave,
+}
+
+/// The organization's levels for a catalog app's tools, as read.
+enum Levels {
+    Read(HashMap<String, OrganizationLevel>),
+    Unreadable,
 }
 
 /// One claim of one run, in its organization and workspace.
-struct Engine<'a> {
+struct Driver<'a, P: ToolPort> {
     state: &'a AppState,
+    tools: &'a P,
     organization_id: OrganizationId,
     workspace_id: WorkspaceId,
     environment: Environment,
     run_id: RunId,
-    claim: Option<(&'a Scope, JobId, &'a LeaseToken)>,
+    agent_id: AgentId,
+    /// The job this worker holds: its scope, ID and lease.
+    job: (&'a Scope, JobId, &'a LeaseToken),
+    /// This worker's own identity for its claim: fresh per claim.
+    claimant: ClaimantId,
+    /// The owner epoch this worker's claim holds.
+    claim: Option<u64>,
+    /// Steps committed under this claim.
+    steps: u32,
+    last_attempt: bool,
+    limits: Limits,
 }
 
-impl Engine<'_> {
-    async fn publish(&self, events: &[RunEvent]) {
-        publish(
-            self.state,
-            self.organization_id,
-            self.workspace_id,
-            self.environment,
-            events,
-        )
-        .await;
+fn fresh_claimant() -> ClaimantId {
+    ClaimantId::from_uuid(Uuid::now_v7())
+}
+
+impl<P: ToolPort> Driver<'_, P> {
+    fn store(&self) -> &dyn RunStore {
+        self.state.runs.as_ref()
     }
 
-    /// Renews the lease; `false` once it's lost.
-    async fn renew(&self) -> bool {
-        let Some((scope, id, lease)) = self.claim else {
-            return true;
-        };
+    /// Keeps the job's lease as long as the claim's; `false` once it's lost:
+    /// another worker has the job.
+    async fn extend_job(&self) -> bool {
+        let (scope, id, lease) = self.job;
         self.state.jobs.extend(scope, id, lease, LEASE).await.is_ok()
     }
 
-    async fn advance(&self) -> Outcome {
-        for _ in 0..MAX_STEPS {
-            if !self.renew().await {
-                return Outcome::Lost;
-            }
-            let progress = match self
-                .state
-                .runs
-                .find_progress(self.organization_id, self.workspace_id, self.run_id)
+    /// Works the run until it parks, yields, finishes, or another worker
+    /// holds it.
+    async fn work(&mut self) -> Outcome {
+        let mut model: Option<ModelAnswer> = None;
+        let mut sent: Option<SendResult> = None;
+        let mut reach: Option<P::Reach> = None;
+        // Every step commits or reloads; a run that keeps conflicting is
+        // given back rather than worked forever.
+        let budget = self.limits.max_steps_per_claim.saturating_mul(4).saturating_add(16);
+        for _ in 0..budget {
+            let snapshot = match self
+                .store()
+                .find_snapshot(self.organization_id, self.workspace_id, self.run_id)
                 .await
             {
-                Ok(Some(progress)) => progress,
-                Ok(None) => return Outcome::Done,
+                Ok(Some(snapshot)) => snapshot,
+                // Gone with its workspace, or not one this engine advances.
+                Ok(None) | Err(StoreError::Unsupported) => return Outcome::Complete,
                 Err(_) => return Outcome::Retry("store_unavailable"),
             };
-            let step = match progress.run.status {
-                RunStatus::Queued => self.start(&progress).await,
-                RunStatus::Running => self.step(&progress).await,
-                // Paused for a decision, or finished.
-                _ => return Outcome::Done,
+            // An answer to an attempt the run no longer waits on is nobody's.
+            if model.as_ref().is_some_and(|answer| {
+                snapshot.control.continuation
+                    != (zupflow_core::runs::state::Continuation::AwaitModel {
+                        turn: answer.turn,
+                        attempt: answer.attempt,
+                    })
+            }) {
+                model = None;
+            }
+            let facts = match self.facts(&snapshot, model.as_ref(), sent.as_ref(), &mut reach).await {
+                Ok(facts) => facts,
+                Err(why) => return Outcome::Retry(why),
             };
-            if let Step::Stop(outcome) = step {
-                return outcome;
+            let plan = match advance(&snapshot, &facts) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    tracing::error!(event = "runs.advance_failed", organization_id = %self.organization_id, workspace_id = %self.workspace_id, run_id = %self.run_id, %error);
+                    return Outcome::Retry("run_inconsistent");
+                }
+            };
+            let (request, then) = match plan {
+                Plan::Apply { request, then } => (request, then),
+                Plan::Idle(Idle::Recorded) => {
+                    sent = None;
+                    continue;
+                }
+                Plan::Idle(Idle::Finished | Idle::AwaitingApproval) => return Outcome::Complete,
+                Plan::Idle(Idle::Busy { until }) => return Outcome::Postpone(until),
+                // This worker's claim ran out or another worker took the
+                // run: claim it again, as a new claimant, if it's free.
+                Plan::Idle(Idle::Lost) => {
+                    self.claim = None;
+                    self.claimant = fresh_claimant();
+                    self.steps = 0;
+                    continue;
+                }
+            };
+            let operation = request.operation();
+            let worker_step = request.guards().owner.is_some() || matches!(operation, Operation::Claim(_));
+            if worker_step && !self.extend_job().await {
+                return Outcome::Leave;
+            }
+            let applied = match self
+                .store()
+                .apply(self.organization_id, self.workspace_id, &request)
+                .await
+            {
+                Ok(applied) => applied,
+                Err(StoreError::NotFound | StoreError::Unsupported) => return Outcome::Complete,
+                Err(StoreError::Unavailable) => return Outcome::Retry("store_unavailable"),
+                Err(error) => {
+                    tracing::error!(event = "runs.transition_refused", organization_id = %self.organization_id, workspace_id = %self.workspace_id, run_id = %self.run_id, operation = operation.name(), %error);
+                    return Outcome::Retry("transition_refused");
+                }
+            };
+            let receipt = match applied {
+                Applied::Committed(receipt) => receipt,
+                // Nothing changed, and no I/O the request allowed happens.
+                Applied::Conflict(conflict) => {
+                    match conflict {
+                        // Read the run again and plan again.
+                        Conflict::Revision | Conflict::Cancelled | Conflict::Claimed => {}
+                        Conflict::Owner => {
+                            self.claim = None;
+                            self.claimant = fresh_claimant();
+                            self.steps = 0;
+                        }
+                        // The send claim isn't this outcome's to record.
+                        Conflict::SendClaim => sent = None,
+                    }
+                    continue;
+                }
+            };
+            publish(
+                self.state,
+                self.organization_id,
+                self.workspace_id,
+                self.environment,
+                &receipt.events,
+            )
+            .await;
+            self.steps = self.steps.saturating_add(1);
+            match operation {
+                Operation::Claim(claim) => self.claim = Some(claim.epoch),
+                Operation::RecordOutcome(_) => sent = None,
+                Operation::CommitTurn(_) | Operation::Yield(_) | Operation::Finish(_) => model = None,
+                _ => {}
+            }
+            // A step that released the claim dealt with the job too.
+            let released = request
+                .guards()
+                .owner
+                .is_some_and(|owner| owner.renew_lease_ms.is_none());
+            match then {
+                Io::CallModel(asked) => model = Some(self.ask(&asked).await),
+                Io::SendCall(send) => {
+                    let outcome = match reach.take() {
+                        Some(opened) => {
+                            // The run's own scope, never one read off the plan.
+                            self.tools
+                                .send(
+                                    self.organization_id,
+                                    self.workspace_id,
+                                    send.installation_id,
+                                    opened,
+                                    &send.tool,
+                                    &send.arguments,
+                                )
+                                .await
+                        }
+                        // Authorized without its server opened: it never left.
+                        None => SendOutcome::NotSent,
+                    };
+                    sent = Some(sent_result(&send, outcome));
+                }
+                Io::Nothing if released => return Outcome::Leave,
+                Io::Nothing => {}
             }
         }
         Outcome::Retry("too_many_steps")
     }
 
-    async fn start(&self, progress: &RunProgress) -> Step {
-        let started = NewRunEvent::new(RunEventType::RunStarted, json!({ "model": progress.model }));
-        match self
-            .state
-            .runs
-            .start_run(
-                self.organization_id,
-                self.workspace_id,
-                self.run_id,
-                &[started],
-                self.state.clock.now(),
-            )
-            .await
-        {
-            Ok(events) => {
-                self.publish(&events).await;
-                Step::Next
-            }
-            Err(error) => retry(error),
-        }
-    }
-
-    async fn step(&self, progress: &RunProgress) -> Step {
-        // A call recorded as sent with no outcome: the worker that sent it
-        // stopped. It may have acted, so it's never sent again.
-        if let Some(call) = progress.calls.iter().find(|call| call.state == CallState::Started) {
-            return self.settle_unknown(call).await;
-        }
-        let pending = progress.calls.iter().find(|call| {
-            matches!(
-                call.state,
-                CallState::Allowed | CallState::Approved | CallState::AwaitingApproval
-            )
-        });
-        match pending {
-            Some(call) if call.state == CallState::AwaitingApproval => self.pause(call).await,
-            Some(call) => self.send(progress, call).await,
-            None => self.turn(progress).await,
-        }
-    }
-
-    async fn settle(
+    /// The facts the next step needs, read now.
+    async fn facts(
         &self,
-        call: &RunToolCall,
-        from: &[CallState],
-        to: CallState,
-        outcome: CallOutcome,
-        events: Vec<NewRunEvent>,
-    ) -> Step {
-        match self
-            .state
-            .runs
-            .settle_call(
-                self.organization_id,
-                self.workspace_id,
-                self.run_id,
-                call.id,
-                from,
-                to,
-                &outcome,
-                &events,
-                self.state.clock.now(),
-            )
-            .await
-        {
-            Ok(events) => {
-                self.publish(&events).await;
-                Step::Next
-            }
-            Err(error) => retry(error),
+        snapshot: &Snapshot,
+        model: Option<&ModelAnswer>,
+        sent: Option<&SendResult>,
+        reach: &mut Option<P::Reach>,
+    ) -> Result<Facts, &'static str> {
+        use zupflow_core::runs::state::Continuation;
+
+        let mut facts = Facts::at(self.state.clock.now());
+        facts.claimant = Some(self.claimant);
+        facts.claim = self.claim;
+        facts.steps = self.steps;
+        facts.limits = self.limits;
+        facts.last_attempt = self.last_attempt;
+        facts.model = model.cloned();
+        facts.sent = sent.cloned();
+        *reach = None;
+        let control = &snapshot.control;
+        let holds = self.claim == Some(control.owner_epoch) && control.owner_claimant == Some(self.claimant);
+        // An outcome to record, a claim to make, or a claim lost: nothing
+        // else is read.
+        if facts.sent.is_some() || !holds {
+            return Ok(facts);
         }
-    }
-
-    async fn settle_unknown(&self, call: &RunToolCall) -> Step {
-        let duration = call
-            .started_at
-            .map_or(0, |started| self.state.clock.now().millis() - started.millis());
-        let events = call
-            .target
-            .as_ref()
-            .map(|target| {
-                failed_event(
-                    call.id,
-                    target,
-                    &Failure::new(
-                        "outcome_unknown",
-                        "The call was sent, but its outcome is unknown. It wasn't repeated.",
-                    ),
-                    duration,
-                )
-            })
-            .into_iter()
-            .collect();
-        tracing::warn!(event = "runs.call_outcome_unknown", organization_id = %self.organization_id, workspace_id = %self.workspace_id, run_id = %self.run_id, call_id = %call.id);
-        self.settle(
-            call,
-            &[CallState::Started],
-            CallState::Unknown,
-            CallOutcome {
-                content: UNKNOWN.to_owned(),
-                is_error: true,
-            },
-            events,
-        )
-        .await
-    }
-
-    async fn pause(&self, call: &RunToolCall) -> Step {
-        let Some(target) = &call.target else {
-            return self.refuse(call, "This call can't be made.".to_owned()).await;
-        };
-        let requested = NewRunEvent::new(
-            RunEventType::ApprovalRequested,
-            with(
-                reference(call.id, target),
-                &[("arguments", Value::Object(call.arguments.clone()))],
-            ),
-        );
-        match self
-            .state
-            .runs
-            .request_approval(
-                self.organization_id,
-                self.workspace_id,
-                self.run_id,
-                call.id,
-                &[requested],
-                self.state.clock.now(),
-            )
-            .await
-        {
-            Ok(events) => {
-                self.publish(&events).await;
-                // Waiting: the decision queues the run again.
-                Step::Stop(Outcome::Done)
-            }
-            Err(error) => retry(error),
-        }
-    }
-
-    /// Settles an allowed or approved call as refused, never sent.
-    async fn refuse(&self, call: &RunToolCall, reason: String) -> Step {
-        let events = call
-            .target
-            .as_ref()
-            .map(|target| failed_event(call.id, target, &Failure::new("tool_refused", reason.clone()), 0))
-            .into_iter()
-            .collect();
-        self.settle(
-            call,
-            &[CallState::Allowed, CallState::Approved],
-            CallState::Refused,
-            CallOutcome {
-                content: reason,
-                is_error: true,
-            },
-            events,
-        )
-        .await
-    }
-
-    /// Fails the run, as long as it still has the turns `progress` read.
-    async fn fail(&self, progress: &RunProgress, failure: Failure) -> Step {
-        let Ok(turns) = u32::try_from(progress.turns.len()) else {
-            return Step::Stop(Outcome::Done);
-        };
-        let event = NewRunEvent::new(RunEventType::RunFailed, json!({ "error": failure }));
-        match self
-            .state
-            .runs
-            .finish_run(
-                self.organization_id,
-                self.workspace_id,
-                self.run_id,
-                turns,
-                &Ending::Failed(failure),
-                &[event],
-                self.state.clock.now(),
-            )
-            .await
-        {
-            Ok(events) => {
-                self.publish(&events).await;
-                Step::Stop(Outcome::Done)
-            }
-            Err(error) => retry(error),
-        }
-    }
-
-    /// Records a new decision on an allowed or approved call before it's
-    /// sent: it now waits for approval, or is refused.
-    async fn redecide(
-        &self,
-        call: &RunToolCall,
-        target: &CallTarget,
-        to: CallState,
-        decision: &Decision,
-        outcome: Option<CallOutcome>,
-    ) -> Step {
-        let events: Vec<NewRunEvent> = outcome
-            .as_ref()
-            .map(|outcome| {
-                failed_event(
-                    call.id,
-                    target,
-                    &Failure::new("tool_refused", outcome.content.clone()),
-                    0,
-                )
-            })
-            .into_iter()
-            .collect();
-        match self
-            .state
-            .runs
-            .decide_call(
-                self.organization_id,
-                self.workspace_id,
-                self.run_id,
-                call.id,
-                &[CallState::Allowed, CallState::Approved],
-                to,
-                &recorded(decision),
-                outcome.as_ref(),
-                &events,
-                self.state.clock.now(),
-            )
-            .await
-        {
-            Ok(events) => {
-                self.publish(&events).await;
-                Step::Next
-            }
-            Err(error) => retry(error),
-        }
-    }
-
-    /// Sends an allowed or approved call, once.
-    async fn send(&self, progress: &RunProgress, call: &RunToolCall) -> Step {
-        let Some(target) = &call.target else {
-            return self.refuse(call, "This call can't be made.".to_owned()).await;
-        };
-        // The floor holds at the moment of sending: a grant revoked or a
-        // tool gone since the call was decided refuses it now.
-        let installation = match self
-            .state
-            .installations
-            .find_installation(self.organization_id, self.workspace_id, target.installation_id)
-            .await
-        {
-            Ok(Some(installation)) => installation,
-            Ok(None) => {
-                return self
-                    .refuse(call, format!("{} is no longer installed.", target.installation_label))
-                    .await;
-            }
-            Err(_) => return Step::Stop(Outcome::Retry("store_unavailable")),
-        };
-        let checked = match self.tool_call(progress.run.agent_id, &installation, &target.tool).await {
-            Ok(checked) => checked,
-            Err(why) => return Step::Stop(Outcome::Retry(why)),
-        };
-        // Decided again on what holds now, the floor first and then the
-        // policy: a call allowed then may need approval now, and one
-        // allowed or approved then may be refused now. A person's approval
-        // stands for what needed it.
-        let decision = self.decide(&checked).await;
-        match &decision.verdict {
-            Verdict::Deny { reason } => {
-                let reason = reason.clone();
-                return self
-                    .redecide(
-                        call,
-                        target,
-                        CallState::Refused,
-                        &decision,
-                        Some(CallOutcome {
-                            content: reason,
-                            is_error: true,
-                        }),
-                    )
-                    .await;
-            }
-            Verdict::RequireApproval { .. } if call.state == CallState::Allowed => {
-                return self
-                    .redecide(call, target, CallState::AwaitingApproval, &decision, None)
-                    .await;
-            }
-            _ => {}
-        }
-        let reach = match mcp_access::reach(self.state, self.organization_id, self.workspace_id, &installation).await {
-            Ok(reach) => reach,
-            Err(Unreachable::Retry(why)) => return Step::Stop(Outcome::Retry(why)),
-            Err(unreachable) if unreachable.needs_reconnect() => {
-                let failure = reconnect(&target.installation_label);
-                let settled = self
-                    .settle(
-                        call,
-                        &[CallState::Allowed, CallState::Approved],
-                        CallState::Refused,
-                        CallOutcome {
-                            content: failure.message.clone(),
-                            is_error: true,
-                        },
-                        vec![failed_event(call.id, target, &failure, 0)],
-                    )
-                    .await;
-                if let Step::Stop(outcome) = settled {
-                    return Step::Stop(outcome);
+        match control.continuation {
+            Continuation::NeedModel { .. } => facts.offer = Some(self.offer().await?),
+            Continuation::AwaitModel { .. } => match model.map(|answer| &answer.result) {
+                None => facts.offer = Some(self.offer().await?),
+                Some(ModelResult::Answered(completion)) => {
+                    let wanted = calls_to_decide(snapshot, completion, &self.limits).map_err(|_| "run_inconsistent")?;
+                    for (position, tool) in wanted {
+                        facts.decisions.push((position, self.decide_offered(tool).await?));
+                    }
+                    let asked = match &completion.reply {
+                        zupflow_core::models::Reply::ToolCalls { calls, .. } => calls.len(),
+                        zupflow_core::models::Reply::Text(_) => 0,
+                    };
+                    facts.call_ids = (0..asked).map(|_| ToolCallId::generate()).collect();
                 }
-                return self.fail(progress, failure).await;
+                Some(_) => {}
+            },
+            Continuation::NeedCall { turn, position } => {
+                if let Some(call) = snapshot
+                    .call_at(turn, position)
+                    .filter(|call| matches!(call.state, CallState::Allowed | CallState::Approved))
+                {
+                    let (check, opened) = self.send_check(call).await?;
+                    facts.send_check = Some(check);
+                    facts.invocation_id = Some(InvocationId::from_uuid(Uuid::now_v7()));
+                    *reach = opened;
+                }
             }
-            Err(unreachable) => {
-                tracing::warn!(event = "runs.installation_unreachable", organization_id = %self.organization_id, workspace_id = %self.workspace_id, installation_id = %target.installation_id, why = unreachable.why());
-                return self
-                    .refuse(
-                        call,
-                        format!(
-                            "{} can't be used as it's set up: check its app's configuration, or reconnect it.",
-                            target.installation_label
-                        ),
-                    )
-                    .await;
+            Continuation::AwaitApproval { .. } | Continuation::AwaitCall { .. } | Continuation::Done => {}
+        }
+        Ok(facts)
+    }
+
+    /// Asks the model; what came of it, for the step that commits it.
+    async fn ask(&self, asked: &ModelRequest) -> ModelAnswer {
+        let turn = asked.as_turn();
+        let result = match self.state.provider.complete(&turn).await {
+            Ok(completion) => {
+                if let Err(why) = validate_completion(&turn, &completion) {
+                    tracing::error!(event = "runs.model_answer_invalid", provider = self.state.provider.name(), run_id = %self.run_id, why);
+                }
+                ModelResult::Answered(completion)
+            }
+            Err(ProviderError::Unavailable) => ModelResult::Unavailable,
+            Err(ProviderError::NotConfigured) => ModelResult::Failed(Failure::new(
+                "model_unavailable",
+                "No model provider is configured for this deployment, so the run can't be answered.",
+            )),
+            Err(ProviderError::UnknownModel) => ModelResult::Failed(Failure::new(
+                "model_unavailable",
+                format!(
+                    "The model {} isn't available. Choose another model for the agent and start a new run.",
+                    asked.model
+                ),
+            )),
+            Err(error) => {
+                tracing::error!(event = "runs.model_failed", provider = self.state.provider.name(), organization_id = %self.organization_id, workspace_id = %self.workspace_id, run_id = %self.run_id, %error);
+                ModelResult::Failed(Failure::new(
+                    "model_failed",
+                    "The model provider couldn't answer this run. Start it again.",
+                ))
             }
         };
-        let started = NewRunEvent::new(
-            RunEventType::ToolCallStarted,
-            with(
-                reference(call.id, target),
-                &[("arguments", Value::Object(call.arguments.clone()))],
-            ),
-        );
-        match self
+        ModelAnswer {
+            turn: asked.turn,
+            attempt: asked.attempt,
+            result,
+        }
+    }
+
+    /// The tools to offer the next model attempt: each granted tool of each
+    /// installation that neither the floor nor the policy refuses, named
+    /// after its app's key, its installation's short ID and itself, and
+    /// described with its pinned definition. A deleted or disconnected
+    /// installation offers nothing (decision 0047).
+    async fn offer(&self) -> Result<Offer, &'static str> {
+        let grants = match self
             .state
-            .runs
-            .begin_call(
-                self.organization_id,
-                self.workspace_id,
-                self.run_id,
-                call.id,
-                &[started],
-                self.state.clock.now(),
-            )
+            .agents
+            .list_grants(self.organization_id, self.workspace_id, self.agent_id)
             .await
         {
-            Ok(events) => self.publish(&events).await,
-            Err(error) => return retry(error),
-        }
-        let began = self.state.clock.now();
-        let answer = mcp_access::call_tool(
-            self.state,
-            self.organization_id,
-            self.workspace_id,
-            installation.id,
-            reach,
-            &target.tool,
-            &call.arguments,
-        )
-        .await;
-        let duration = self.state.clock.now().millis() - began.millis();
-        let from = [CallState::Started];
-        let failed = |code: &str, message: &str| {
-            let failure = Failure::new(code, message);
-            (
-                CallOutcome {
-                    content: message.to_owned(),
-                    is_error: true,
-                },
-                vec![failed_event(call.id, target, &failure, duration)],
-            )
+            Ok(grants) => grants,
+            Err(zupflow_core::agents::AgentError::Unavailable) => return Err("store_unavailable"),
+            // The agent is gone: its run goes on without tools.
+            Err(_) => Vec::new(),
         };
-        let (to, (outcome, events)) = match answer {
-            Ok(result) if !result.is_error => {
-                let result = Value::Object(result.result);
-                let completed = NewRunEvent::new(
-                    RunEventType::ToolCallCompleted,
-                    with(
-                        reference(call.id, target),
-                        &[("result", result.clone()), ("duration_ms", json!(duration.max(0)))],
-                    ),
+        let mut candidates = Vec::new();
+        for grant in grants {
+            let Some(installation) = self.installation(grant.installation_id).await? else {
+                continue;
+            };
+            if installation.status == InstallationStatus::Disconnected {
+                continue;
+            }
+            let Some((app_key, app_name)) = self.app(&installation).await? else {
+                continue;
+            };
+            let registered = self.registry(&installation).await?;
+            let levels = self.levels(&installation, &grant.tools).await;
+            for tool in &grant.tools {
+                let call = self.policy_call(
+                    &installation,
+                    tool,
+                    Some(grant.approval_required.contains(tool)),
+                    registered.get(tool),
+                    &levels,
                 );
-                (
-                    CallState::Completed,
-                    (
-                        CallOutcome {
-                            content: result.to_string(),
-                            is_error: false,
-                        },
-                        vec![completed],
-                    ),
-                )
-            }
-            Ok(result) => {
-                // The tool's own report is for the model; the timeline says what happened.
-                let (_, events) = failed("tool_error", "The tool reported an error.");
-                (
-                    CallState::Failed,
-                    (
-                        CallOutcome {
-                            content: Value::Object(result.result).to_string(),
-                            is_error: true,
-                        },
-                        events,
-                    ),
-                )
-            }
-            Err(CallError::NotSent(_)) => (
-                CallState::Failed,
-                failed(
-                    "tool_unreachable",
-                    "The app's server couldn't be reached, so the call wasn't made.",
-                ),
-            ),
-            Err(CallError::Rejected(_)) => (
-                CallState::Failed,
-                failed("tool_rejected", "The app's server refused the call without acting."),
-            ),
-            Err(CallError::Withheld) => (
-                CallState::Failed,
-                failed(
-                    "result_withheld",
-                    "The app's answer repeated the installation's credential, so it was withheld.",
-                ),
-            ),
-            Err(CallError::Unknown(_)) => (
-                CallState::Unknown,
-                (
-                    CallOutcome {
-                        content: UNKNOWN.to_owned(),
-                        is_error: true,
-                    },
-                    vec![failed_event(
-                        call.id,
-                        target,
-                        &Failure::new(
-                            "outcome_unknown",
-                            "The call was sent, but its outcome is unknown. It wasn't repeated.",
-                        ),
-                        duration,
-                    )],
-                ),
-            ),
-            Err(CallError::Unauthorized) => {
-                let failure = reconnect(&target.installation_label);
-                let settled = self
-                    .settle(
-                        call,
-                        &from,
-                        CallState::Failed,
-                        CallOutcome {
-                            content: failure.message.clone(),
-                            is_error: true,
-                        },
-                        vec![failed_event(call.id, target, &failure, duration)],
-                    )
-                    .await;
-                if let Step::Stop(outcome) = settled {
-                    return Step::Stop(outcome);
+                let policy = self.state.approvals.name();
+                if floor(&call, policy).is_some_and(|decision| matches!(decision.verdict, Verdict::Deny { .. })) {
+                    continue;
                 }
-                return self.fail(progress, failure).await;
+                if matches!(self.state.approvals.decide(&call).await.verdict, Verdict::Deny { .. }) {
+                    continue;
+                }
+                let Some(registered) = registered.get(tool) else {
+                    continue;
+                };
+                // The model is given the pinned definition, never a changed one.
+                let definition: Map<String, Value> =
+                    serde_json::from_str(&registered.pinned.definition).unwrap_or_default();
+                candidates.push(Candidate {
+                    installation_id: installation.id,
+                    installation_short_id: installation.short_id.as_str().to_owned(),
+                    installation_label: installation.label.clone(),
+                    app_key: app_key.clone(),
+                    app_name: app_name.clone(),
+                    tool: tool.clone(),
+                    description: definition
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    input_schema: definition
+                        .get("inputSchema")
+                        .filter(|schema| schema.is_object())
+                        .cloned()
+                        .unwrap_or_else(|| json!({ "type": "object" })),
+                    definition_sha256: Sha256Digest::from_bytes(registered.pinned.hash),
+                });
+            }
+        }
+        let built = build_offer(candidates);
+        for clash in &built.clashes {
+            let installations: Vec<String> = clash.entries.iter().map(|(id, _)| id.to_string()).collect();
+            tracing::warn!(event = "runs.tool_names_clash", organization_id = %self.organization_id, workspace_id = %self.workspace_id, run_id = %self.run_id, name = %clash.name, installations = ?installations);
+        }
+        for excluded in &built.excluded {
+            tracing::warn!(event = "runs.tool_not_named", organization_id = %self.organization_id, workspace_id = %self.workspace_id, run_id = %self.run_id, installation_id = %excluded.installation_id, why = ?excluded.why);
+        }
+        Ok(built.offer)
+    }
+
+    /// The floor's and then the policy's decision on a call to an offered
+    /// tool, read now.
+    async fn decide_offered(&self, tool: &OfferedTool) -> Result<CallDecision, &'static str> {
+        let Some(installation) = self.installation(tool.installation_id).await? else {
+            // Deleted since it was offered, and its grants with it.
+            return Ok(not_granted(&tool.tool, self.state.approvals.name()));
+        };
+        let call = self.tool_call(&installation, &tool.tool).await?;
+        Ok(CallDecision::from(&self.decide(&call).await))
+    }
+
+    /// A call checked again just before it's sent: its installation, the
+    /// floor and the policy, and the tool's pinned definition. When it would
+    /// be sent, its server is reached now, so a credential that needs
+    /// reconnecting refuses it before it's recorded as sent.
+    async fn send_check(&self, call: &CallRecord) -> Result<(SendCheck, Option<P::Reach>), &'static str> {
+        let Some(target) = &call.target else {
+            // An open call always has a target; the reducer says so.
+            return Err("run_inconsistent");
+        };
+        let Some(installation) = self.installation(target.installation_id).await? else {
+            let decision = call.decision.clone().ok_or("run_inconsistent")?;
+            return Ok((
+                SendCheck {
+                    call_id: call.id,
+                    installation: InstallationCheck::Removed,
+                    definition_sha256: None,
+                    decision,
+                },
+                None,
+            ));
+        };
+        let registered = self.registry(&installation).await?;
+        let definition = registered
+            .get(&target.tool)
+            .map(|tool| Sha256Digest::from_bytes(tool.pinned.hash));
+        let tool_call = self.tool_call_with(&installation, &target.tool, &registered).await?;
+        let decision = CallDecision::from(&self.decide(&tool_call).await);
+        let mut opened = None;
+        let check = match installation.status {
+            InstallationStatus::Disconnected => InstallationCheck::Disconnected,
+            InstallationStatus::ReconnectRequired => InstallationCheck::ReconnectRequired,
+            InstallationStatus::Connected => {
+                let sends = match &decision.verdict {
+                    CallVerdict::Allow => true,
+                    CallVerdict::RequireApproval { .. } => call.state == CallState::Approved,
+                    CallVerdict::Deny { .. } => false,
+                } && definition.is_some_and(|definition| {
+                    Some(call_digest(
+                        target.installation_id,
+                        &target.app_key,
+                        &target.tool,
+                        &definition,
+                        &call.arguments,
+                    )) == call.call_digest
+                });
+                if sends {
+                    match self
+                        .tools
+                        .reach(self.organization_id, self.workspace_id, &installation)
+                        .await
+                    {
+                        Ok(reach) => {
+                            opened = Some(reach);
+                            InstallationCheck::Usable
+                        }
+                        Err(Unreachable::Retry(why)) => return Err(why),
+                        // Removed or disconnected since it was read: say so,
+                        // and the run goes on.
+                        Err(unreachable) if unreachable.needs_reconnect() => {
+                            match self.installation(installation.id).await? {
+                                None => InstallationCheck::Removed,
+                                Some(now) if now.status == InstallationStatus::Disconnected => {
+                                    InstallationCheck::Disconnected
+                                }
+                                Some(_) => InstallationCheck::ReconnectRequired,
+                            }
+                        }
+                        Err(unreachable) => {
+                            tracing::warn!(event = "runs.installation_unreachable", organization_id = %self.organization_id, workspace_id = %self.workspace_id, installation_id = %installation.id, why = unreachable.why());
+                            InstallationCheck::Unusable
+                        }
+                    }
+                } else {
+                    InstallationCheck::Usable
+                }
             }
         };
-        self.settle(call, &from, to, outcome, events).await
+        Ok((
+            SendCheck {
+                call_id: call.id,
+                installation: check,
+                definition_sha256: definition,
+                decision,
+            },
+            opened,
+        ))
+    }
+
+    async fn installation(&self, installation_id: InstallationId) -> Result<Option<Installation>, &'static str> {
+        self.state
+            .installations
+            .find_installation(self.organization_id, self.workspace_id, installation_id)
+            .await
+            .map_err(|_| "store_unavailable")
+    }
+
+    /// The installation's app's key and name, as the model and the timeline
+    /// name it; `None` once the app is gone.
+    async fn app(&self, installation: &Installation) -> Result<Option<(String, String)>, &'static str> {
+        let found = match installation.app {
+            InstalledApp::Catalog(app_id) => {
+                self.state
+                    .apps
+                    .find_organization_app(self.organization_id, app_id)
+                    .await
+            }
+            InstalledApp::Workspace(app_id) => {
+                self.state
+                    .apps
+                    .find_workspace_app(self.organization_id, self.workspace_id, app_id)
+                    .await
+            }
+        };
+        found
+            .map(|app| app.map(|app| (app.key, app.name)))
+            .map_err(|_| "store_unavailable")
     }
 
     /// The policy's view of one call to `tool` through `installation`, read
     /// now: the grant, the registry and the organization's level.
-    async fn tool_call(
+    async fn tool_call(&self, installation: &Installation, tool: &str) -> Result<ToolCall, &'static str> {
+        let registered = self.registry(installation).await?;
+        self.tool_call_with(installation, tool, &registered).await
+    }
+
+    async fn tool_call_with(
         &self,
-        agent_id: AgentId,
         installation: &Installation,
         tool: &str,
+        registered: &BTreeMap<String, RegisteredTool>,
     ) -> Result<ToolCall, &'static str> {
         let grants = match self
             .state
             .agents
-            .list_grants(self.organization_id, self.workspace_id, agent_id)
+            .list_grants(self.organization_id, self.workspace_id, self.agent_id)
             .await
         {
             Ok(grants) => grants,
@@ -832,10 +734,8 @@ impl Engine<'_> {
         let grant = grants
             .iter()
             .find(|grant| grant.installation_id == installation.id && grant.tools.iter().any(|name| name == tool));
-        let registered = self.registry(installation).await?;
         let levels = self.levels(installation, &[tool.to_owned()]).await;
         Ok(self.policy_call(
-            agent_id,
             installation,
             tool,
             grant.map(|grant| grant.approval_required.iter().any(|name| name == tool)),
@@ -846,7 +746,6 @@ impl Engine<'_> {
 
     fn policy_call(
         &self,
-        agent_id: AgentId,
         installation: &Installation,
         tool: &str,
         approval_required: Option<bool>,
@@ -866,7 +765,7 @@ impl Engine<'_> {
         ToolCall {
             organization_id: self.organization_id,
             workspace_id: self.workspace_id,
-            agent_id,
+            agent_id: self.agent_id,
             installation_id: installation.id,
             app,
             tool: tool.to_owned(),
@@ -940,95 +839,6 @@ impl Engine<'_> {
         }
     }
 
-    /// The app's name, as the timeline shows it.
-    async fn app_name(&self, installation: &Installation) -> Result<Option<String>, &'static str> {
-        let found = match installation.app {
-            InstalledApp::Catalog(app_id) => {
-                self.state
-                    .apps
-                    .find_organization_app(self.organization_id, app_id)
-                    .await
-            }
-            InstalledApp::Workspace(app_id) => {
-                self.state
-                    .apps
-                    .find_workspace_app(self.organization_id, self.workspace_id, app_id)
-                    .await
-            }
-        };
-        found
-            .map(|app| app.map(|app| app.name))
-            .map_err(|_| "store_unavailable")
-    }
-
-    /// The tools to offer this turn: the grants' tools that neither the
-    /// floor nor the policy refuses.
-    async fn offers(&self, agent_id: AgentId) -> Result<Vec<Offer>, &'static str> {
-        let grants = match self
-            .state
-            .agents
-            .list_grants(self.organization_id, self.workspace_id, agent_id)
-            .await
-        {
-            Ok(grants) => grants,
-            Err(zupflow_core::agents::AgentError::Unavailable) => return Err("store_unavailable"),
-            // The agent is gone: its run goes on without tools.
-            Err(_) => Vec::new(),
-        };
-        let mut offers = Vec::new();
-        let mut taken = HashSet::new();
-        for grant in grants {
-            let installation = match self
-                .state
-                .installations
-                .find_installation(self.organization_id, self.workspace_id, grant.installation_id)
-                .await
-            {
-                Ok(Some(installation)) => installation,
-                Ok(None) => continue,
-                Err(_) => return Err("store_unavailable"),
-            };
-            let Some(app_name) = self.app_name(&installation).await? else {
-                continue;
-            };
-            let registered = self.registry(&installation).await?;
-            let levels = self.levels(&installation, &grant.tools).await;
-            for tool in &grant.tools {
-                let call = self.policy_call(
-                    agent_id,
-                    &installation,
-                    tool,
-                    Some(grant.approval_required.contains(tool)),
-                    registered.get(tool),
-                    &levels,
-                );
-                let policy = self.state.approvals.name();
-                if floor(&call, policy).is_some_and(|decision| matches!(decision.verdict, Verdict::Deny { .. })) {
-                    continue;
-                }
-                if matches!(self.state.approvals.decide(&call).await.verdict, Verdict::Deny { .. }) {
-                    continue;
-                }
-                let Some(registered) = registered.get(tool) else {
-                    continue;
-                };
-                let name = model_name(tool, &mut taken);
-                offers.push(Offer {
-                    spec: spec(name.clone(), registered),
-                    name,
-                    target: CallTarget {
-                        installation_id: installation.id,
-                        installation_label: installation.label.clone(),
-                        app_name: app_name.clone(),
-                        tool: tool.clone(),
-                    },
-                    call,
-                });
-            }
-        }
-        Ok(offers)
-    }
-
     /// Floor, then policy.
     async fn decide(&self, call: &ToolCall) -> Decision {
         match floor(call, self.state.approvals.name()) {
@@ -1036,276 +846,33 @@ impl Engine<'_> {
             None => self.state.approvals.decide(call).await,
         }
     }
+}
 
-    /// Asks the model for the next turn and records it with its calls decided.
-    async fn turn(&self, progress: &RunProgress) -> Step {
-        if progress.turns.len() >= MAX_TURNS {
-            return self
-                .fail(
-                    progress,
-                    Failure::new(
-                        "too_many_turns",
-                        format!(
-                            "The agent took {MAX_TURNS} turns without finishing. Start a run with a narrower request."
-                        ),
-                    ),
-                )
-                .await;
-        }
-        let Ok(index) = u32::try_from(progress.turns.len()) else {
-            return Step::Stop(Outcome::Done);
-        };
-        let offers = match self.offers(progress.run.agent_id).await {
-            Ok(offers) => offers,
-            Err(why) => return Step::Stop(Outcome::Retry(why)),
-        };
-        let specs: Vec<ToolSpec> = offers.iter().map(|offer| offer.spec.clone()).collect();
-        let messages = conversation(progress);
-        let turn = Turn {
-            model: &progress.model,
-            instructions: &progress.instructions,
-            messages: &messages,
-            tools: &specs,
-        };
-        let completion = match self.state.provider.complete(&turn).await {
-            Ok(completion) => completion,
-            Err(ProviderError::Unavailable) => return Step::Stop(Outcome::Retry("model_unavailable")),
-            Err(ProviderError::NotConfigured) => {
-                return self
-                    .fail(
-                        progress,
-                        Failure::new(
-                            "model_unavailable",
-                            "No model provider is configured for this deployment, so the run can't be answered.",
-                        ),
-                    )
-                    .await;
-            }
-            Err(ProviderError::UnknownModel) => {
-                return self
-                    .fail(
-                        progress,
-                        Failure::new(
-                            "model_unavailable",
-                            format!(
-                                "The model {} isn't available. Choose another model for the agent and start a new run.",
-                                progress.model
-                            ),
-                        ),
-                    )
-                    .await;
-            }
-            Err(error) => {
-                tracing::error!(event = "runs.model_failed", provider = self.state.provider.name(), organization_id = %self.organization_id, workspace_id = %self.workspace_id, run_id = %self.run_id, %error);
-                return self
-                    .fail(
-                        progress,
-                        Failure::new(
-                            "model_failed",
-                            "The model provider couldn't answer this run. Start it again.",
-                        ),
-                    )
-                    .await;
-            }
-        };
-        if let Err(why) = validate_completion(&turn, &completion) {
-            tracing::error!(event = "runs.model_answer_invalid", provider = self.state.provider.name(), run_id = %self.run_id, why);
-            return self
-                .fail(
-                    progress,
-                    Failure::new(
-                        "model_failed",
-                        "The model provider couldn't answer this run. Start it again.",
-                    ),
-                )
-                .await;
-        }
-        match completion.reply {
-            Reply::Text(text) => self.complete(progress, index, text, completion.usage).await,
-            Reply::ToolCalls { text, calls } => self.record(index, text, calls, &offers, completion.usage).await,
-        }
-    }
-
-    /// Records the final answer and ends the run with it, in one change.
-    async fn complete(&self, progress: &RunProgress, index: u32, text: String, usage: TokenUsage) -> Step {
-        let total = RunUsage {
-            input_tokens: progress.run.usage.input_tokens + usage.input_tokens,
-            output_tokens: progress.run.usage.output_tokens + usage.output_tokens,
-            tool_calls: progress.run.usage.tool_calls,
-        };
-        let mut events: Vec<NewRunEvent> = (!text.trim().is_empty())
-            .then(|| NewRunEvent::new(RunEventType::MessageAssistant, json!({ "text": text })))
-            .into_iter()
-            .collect();
-        events.push(NewRunEvent::new(RunEventType::RunCompleted, json!({ "usage": total })));
-        let turn = NewTurn {
-            text: Some(text.clone()),
-            calls: Vec::new(),
-            usage,
-            finish: Some(Ending::Completed { output: text }),
-        };
-        match self
-            .state
-            .runs
-            .record_turn(
-                self.organization_id,
-                self.workspace_id,
-                self.run_id,
-                index,
-                &turn,
-                &events,
-                self.state.clock.now(),
-            )
-            .await
-        {
-            Ok(events) => {
-                self.publish(&events).await;
-                Step::Stop(Outcome::Done)
-            }
-            Err(error) => retry(error),
-        }
-    }
-
-    async fn record(
-        &self,
-        index: u32,
-        text: Option<String>,
-        asked: Vec<ModelToolCall>,
-        offers: &[Offer],
-        usage: TokenUsage,
-    ) -> Step {
-        let mut events = Vec::new();
-        if let Some(text) = text.as_ref().filter(|text| !text.trim().is_empty()) {
-            events.push(NewRunEvent::new(
-                RunEventType::MessageAssistant,
-                json!({ "text": text }),
-            ));
-        }
-        let mut calls = Vec::with_capacity(asked.len());
-        for (position, call) in asked.into_iter().enumerate() {
-            let id = ToolCallId::generate();
-            let offer = offers.iter().find(|offer| offer.name == call.name);
-            let refused = |reason: String| CallOutcome {
-                content: reason,
-                is_error: true,
-            };
-            let Some(offer) = offer else {
-                calls.push(NewToolCall {
-                    id,
-                    model_call_id: call.id,
-                    outcome: Some(refused(format!(
-                        "There's no tool named {} available to you.",
-                        call.name
-                    ))),
-                    name: call.name,
-                    target: None,
-                    arguments: call.arguments,
-                    state: CallState::Refused,
-                    decision: None,
-                });
-                continue;
-            };
-            let (state, decision, outcome) = if position >= MAX_CALLS_PER_TURN {
-                let reason = format!("Only {MAX_CALLS_PER_TURN} calls can be made in one turn.");
-                events.push(failed_event(
-                    id,
-                    &offer.target,
-                    &Failure::new("tool_refused", reason.clone()),
-                    0,
-                ));
-                (CallState::Refused, None, Some(refused(reason)))
-            } else {
-                let decision = self.decide(&offer.call).await;
-                match &decision.verdict {
-                    Verdict::Allow => (CallState::Allowed, Some(recorded(&decision)), None),
-                    Verdict::RequireApproval { .. } => (CallState::AwaitingApproval, Some(recorded(&decision)), None),
-                    Verdict::Deny { reason } => {
-                        events.push(failed_event(
-                            id,
-                            &offer.target,
-                            &Failure::new("tool_refused", reason.clone()),
-                            0,
-                        ));
-                        (
-                            CallState::Refused,
-                            Some(recorded(&decision)),
-                            Some(refused(reason.clone())),
-                        )
-                    }
-                }
-            };
-            calls.push(NewToolCall {
-                id,
-                model_call_id: call.id,
-                name: call.name,
-                target: Some(offer.target.clone()),
-                arguments: call.arguments,
-                state,
-                decision,
-                outcome,
-            });
-        }
-        let turn = NewTurn {
-            text,
-            calls,
-            usage,
-            finish: None,
-        };
-        match self
-            .state
-            .runs
-            .record_turn(
-                self.organization_id,
-                self.workspace_id,
-                self.run_id,
-                index,
-                &turn,
-                &events,
-                self.state.clock.now(),
-            )
-            .await
-        {
-            Ok(events) => {
-                self.publish(&events).await;
-                Step::Next
-            }
-            Err(error) => retry(error),
-        }
+/// The floor's answer for a tool no grant names any more.
+fn not_granted(tool: &str, policy: &str) -> CallDecision {
+    CallDecision {
+        verdict: CallVerdict::Deny {
+            reason: format!("{tool} isn't granted to this agent."),
+        },
+        policy: policy.to_owned(),
+        mode: None,
+        rule: zupflow_core::policy::Rule::NotGranted.as_str().to_owned(),
     }
 }
 
-enum Levels {
-    Read(HashMap<String, OrganizationLevel>),
-    Unreadable,
-}
-
-/// Fails a run whose job ran out of attempts, or that no job takes
-/// forward any more, unless it moved on meanwhile.
-async fn give_up(engine: &Engine<'_>, why: &'static str) {
-    let failure = if why == "model_unavailable" {
-        Failure::new("model_unavailable", "The model provider did not respond in time.")
-    } else {
-        Failure::new("run_unavailable", "The run couldn't continue. Start it again.")
-    };
-    let progress = match engine
-        .state
-        .runs
-        .find_progress(engine.organization_id, engine.workspace_id, engine.run_id)
-        .await
-    {
-        Ok(Some(progress)) => progress,
-        _ => return,
-    };
-    if matches!(progress.run.status, RunStatus::Queued | RunStatus::Running) {
-        let _ = engine.fail(&progress, failure).await;
+fn sent_result(send: &SendRequest, outcome: SendOutcome) -> SendResult {
+    SendResult {
+        call_id: send.call_id,
+        attempt: send.attempt,
+        invocation_id: send.invocation_id,
+        outcome,
     }
 }
 
-/// How often the worker looks for runs no job takes forward.
-const SWEEP: Duration = Duration::from_secs(60);
-
-/// Fails runs whose job died (its last attempt's lease ran out, say), so
-/// none stays queued or running forever. How many it found.
+/// Fails the runs no job takes forward any more (their last job died), so
+/// none stays queued or running forever: `run_unavailable`, unless a
+/// worker's lease or a call's send claim on it is still live. How many it
+/// found.
 pub async fn sweep(state: &AppState) -> usize {
     // Cross-tenant by design, as the claim: each run comes with its scope.
     let abandoned = match state.runs.abandoned_runs(100).await {
@@ -1316,27 +883,44 @@ pub async fn sweep(state: &AppState) -> usize {
         }
     };
     for (organization_id, workspace_id, run_id) in &abandoned {
-        let environment = match state.workspaces.find_workspace(*organization_id, *workspace_id).await {
+        let (organization_id, workspace_id, run_id) = (*organization_id, *workspace_id, *run_id);
+        let environment = match state.workspaces.find_workspace(organization_id, workspace_id).await {
             Ok(Some(workspace)) => workspace.environment,
             _ => continue,
         };
         tracing::warn!(event = "runs.abandoned", %organization_id, %workspace_id, %run_id);
-        let engine = Engine {
-            state,
-            organization_id: *organization_id,
-            workspace_id: *workspace_id,
-            environment,
-            run_id: *run_id,
-            claim: None,
-        };
-        give_up(&engine, "abandoned").await;
+        // A revision conflict means the run moved: read it again.
+        for _ in 0..3 {
+            let Ok(Some(snapshot)) = state.runs.find_snapshot(organization_id, workspace_id, run_id).await else {
+                break;
+            };
+            let Ok(request) = fail_abandoned(
+                organization_id,
+                workspace_id,
+                &snapshot,
+                RequestId::from_uuid(Uuid::now_v7()),
+                state.clock.now(),
+            ) else {
+                break;
+            };
+            match state.runs.apply(organization_id, workspace_id, &request).await {
+                Ok(Applied::Committed(receipt)) => {
+                    publish(state, organization_id, workspace_id, environment, &receipt.events).await;
+                    break;
+                }
+                Ok(Applied::Conflict(conflict)) if conflict.reload() => {}
+                _ => break,
+            }
+        }
     }
     abandoned.len()
 }
 
 /// Claims and works one run's job, if one is due. Whether one was.
 pub async fn work_once(state: &AppState) -> bool {
-    let Some(kind) = kind() else { return false };
+    let Ok(kind) = Name::new(RUN_AGENT) else {
+        return false;
+    };
     // Cross-tenant by design: a worker takes the next job of any scope.
     let job = match state.jobs.claim_next(std::slice::from_ref(&kind), LEASE).await {
         Ok(Some(job)) => job,
@@ -1346,11 +930,11 @@ pub async fn work_once(state: &AppState) -> bool {
             return false;
         }
     };
-    handle(state, job).await;
+    handle(state, &McpTools::new(state), job).await;
     true
 }
 
-async fn handle(state: &AppState, job: Job) {
+async fn handle<P: ToolPort>(state: &AppState, tools: &P, job: Job) {
     let Job {
         id,
         scope,
@@ -1359,16 +943,22 @@ async fn handle(state: &AppState, job: Job) {
         lease,
         ..
     } = job;
-    let run_id = serde_json::from_slice::<Value>(&payload)
-        .ok()
-        .and_then(|payload| payload.get("run_id")?.as_str().map(str::to_owned))
-        .and_then(|id| RunId::parse(&id).ok());
-    let (Scope::Workspace(organization_id, workspace_id), Some(run_id)) = (scope, run_id) else {
+    let (Scope::Workspace(organization_id, workspace_id), Some(run_id)) = (scope, run_of_job(&payload)) else {
         tracing::error!(event = "runs.malformed_job", kind = RUN_AGENT);
         if let Ok(reason) = Name::new("malformed") {
             let _ = state.jobs.bury(&scope, id, &lease, &reason).await;
         }
         return;
+    };
+    let retry = |why: &'static str| {
+        let (scope, lease) = (&scope, &lease);
+        async move {
+            let Ok(reason) = Name::new(why) else {
+                return state.jobs.complete(scope, id, lease).await;
+            };
+            let after = Duration::from_secs(5 * u64::from(attempt.max(1)));
+            state.jobs.retry(scope, id, lease, after, &reason).await.map(|_| ())
+        }
     };
     let environment = match state.workspaces.find_workspace(organization_id, workspace_id).await {
         Ok(Some(workspace)) => workspace.environment,
@@ -1378,40 +968,52 @@ async fn handle(state: &AppState, job: Job) {
             return;
         }
         Err(_) => {
-            if let Ok(reason) = Name::new("store_unavailable") {
-                let _ = state
-                    .jobs
-                    .retry(&scope, id, &lease, Duration::from_secs(5), &reason)
-                    .await;
-            }
+            let _ = retry("store_unavailable").await;
             return;
         }
     };
-    let engine = Engine {
+    let agent_id = match state.runs.find_run(organization_id, workspace_id, run_id).await {
+        Ok(Some(run)) => run.agent_id,
+        Ok(None) => {
+            let _ = state.jobs.complete(&scope, id, &lease).await;
+            return;
+        }
+        Err(_) => {
+            let _ = retry("store_unavailable").await;
+            return;
+        }
+    };
+    let mut driver = Driver {
         state,
+        tools,
         organization_id,
         workspace_id,
         environment,
         run_id,
-        claim: Some((&scope, id, &lease)),
+        agent_id,
+        job: (&scope, id, &lease),
+        claimant: fresh_claimant(),
+        claim: None,
+        steps: 0,
+        last_attempt: attempt >= zupflow_core::runs::store::RUN_JOB_ATTEMPTS,
+        limits: limits(),
     };
-    let finished = match engine.advance().await {
-        Outcome::Done => state.jobs.complete(&scope, id, &lease).await,
-        Outcome::Lost => return,
-        Outcome::Retry(why) if attempt >= ATTEMPTS => {
-            give_up(&engine, why).await;
-            state.jobs.complete(&scope, id, &lease).await
+    let finished = match driver.work().await {
+        Outcome::Complete => state.jobs.complete(&scope, id, &lease).await,
+        Outcome::Leave => Ok(()),
+        Outcome::Postpone(until) => {
+            let after = until.millis().saturating_sub(state.clock.now().millis());
+            let after = Duration::from_millis(u64::try_from(after).unwrap_or(0));
+            state.jobs.postpone(&scope, id, &lease, after).await
         }
-        Outcome::Retry(why) => match Name::new(why) {
-            Ok(reason) => {
-                let after = Duration::from_secs(5 * u64::from(attempt.max(1)));
-                state.jobs.retry(&scope, id, &lease, after, &reason).await.map(|_| ())
-            }
-            Err(_) => state.jobs.complete(&scope, id, &lease).await,
-        },
+        Outcome::Retry(why) => retry(why).await,
     };
-    if let Err(error) = finished {
-        tracing::warn!(event = "runs.finish_failed", %organization_id, %workspace_id, %run_id, %error);
+    match finished {
+        // The store dealt with the run's job in the step that released it.
+        Ok(()) | Err(zupflow_core::jobs::JobError::LeaseLost) => {}
+        Err(error) => {
+            tracing::warn!(event = "runs.finish_failed", %organization_id, %workspace_id, %run_id, %error);
+        }
     }
 }
 

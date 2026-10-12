@@ -9,6 +9,12 @@
 //! backend with an API key: a Console session only observes them. A
 //! decision on the call the run waits for sets it running again and queues
 //! it for the run engine.
+//!
+//! Starting, cancelling and deciding are each one transition of the run
+//! (decision 0046), built by the reducer from the run as committed and
+//! applied by the store with its events, audit row and job. A cancel or a
+//! decision races the run's worker on the run's revision: when the worker
+//! moves first, it's built again from the run as it is then.
 
 use std::collections::BTreeMap;
 
@@ -19,16 +25,19 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use serde::Serialize;
 use serde_json::{Value, json};
+use uuid::Uuid;
 use zupflow_core::agents::{AgentError, AgentStatus};
-use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
-use zupflow_core::ids::{AgentId, RunEventId, RunId, SessionId, ToolCallId, WorkspaceId};
+use zupflow_core::ids::{AgentId, OrganizationId, RunEventId, RunId, SessionId, ToolCallId, WorkspaceId};
 use zupflow_core::organizations::MemberRole;
+use zupflow_core::runs::reducer::{self, Approval, ControlError};
+use zupflow_core::runs::state::{RequestId, Snapshot};
+use zupflow_core::runs::store::{Applied, Receipt, StoreError};
+use zupflow_core::runs::transition::TransitionRequest;
 use zupflow_core::runs::{
-    ApprovalDecision, CallOutcome, Failure as RunFailure, MAX_INPUT, NewRun, NewRunEvent, OrganizationRun,
-    OrganizationRunFilter, Page, Run, RunError, RunEvent, RunEventType, RunFilter, RunStatus, RunTrigger, RunUsage,
-    day_of,
+    ApprovalDecision, Failure as RunFailure, MAX_INPUT, NewRun, OrganizationRun, OrganizationRunFilter, Page, Run,
+    RunEvent, RunFilter, RunStatus, RunTrigger, RunUsage, day_of,
 };
 use zupflow_core::time::Timestamp;
 
@@ -156,28 +165,82 @@ fn unavailable() -> Failure {
     .into()
 }
 
-fn run_failure(error: RunError) -> Failure {
+fn run_failure(error: StoreError) -> Failure {
     match error {
-        RunError::NotFound => ApiError::not_found("Run").into(),
-        RunError::AgentNotFound => ApiError::not_found("Agent").into(),
-        RunError::InvalidCursor => invalid_cursor(),
-        RunError::Finished => finished(),
-        RunError::NotWaiting => ApiError::new(
-            409,
-            "not_waiting",
-            "This run isn't waiting for a decision on that call. Read the run's events for the call it waits for.",
-        )
-        .into(),
-        // A step moved it first; the caller can read it again.
-        RunError::Moved => ApiError::new(
-            409,
-            "run_changed",
-            "The run changed while this request was handled. Read it again, then retry.",
-        )
-        .into(),
+        StoreError::NotFound => ApiError::not_found("Run").into(),
+        StoreError::AgentNotFound => ApiError::not_found("Agent").into(),
+        StoreError::InvalidCursor => invalid_cursor(),
         // The store has logged the cause.
-        RunError::Unavailable => unavailable(),
+        StoreError::Unavailable => unavailable(),
+        // A request the store refused is a bug of ours, never the caller's.
+        StoreError::Refused(why) => {
+            tracing::error!(event = "runs.request_refused", why);
+            ApiError::internal().into()
+        }
+        StoreError::Unsupported => {
+            tracing::error!(event = "runs.run_unsupported");
+            ApiError::internal().into()
+        }
     }
+}
+
+fn not_waiting() -> Failure {
+    ApiError::new(
+        409,
+        "not_waiting",
+        "This run isn't waiting for a decision on that call. Read the run's events for the call it waits for.",
+    )
+    .into()
+}
+
+/// The workers kept moving the run while this request was handled.
+fn run_changed() -> Failure {
+    ApiError::new(
+        409,
+        "run_changed",
+        "The run changed while this request was handled. Read it again, then retry.",
+    )
+    .into()
+}
+
+/// How many times a control request is built again after the run's worker
+/// moved it first.
+const CONTROL_ATTEMPTS: usize = 8;
+
+/// Applies the control request `build` makes of the run as committed, built
+/// again from the run as it is whenever another transition got there first.
+/// `None` from `build` for a run this engine doesn't advance.
+async fn control(
+    state: &AppState,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    run_id: RunId,
+    build: impl Fn(Option<&Snapshot>) -> Result<TransitionRequest, Failure>,
+) -> Result<Receipt, Failure> {
+    for _ in 0..CONTROL_ATTEMPTS {
+        let snapshot = match state.runs.find_snapshot(organization_id, workspace_id, run_id).await {
+            Ok(Some(snapshot)) => Some(snapshot),
+            Ok(None) => return Err(ApiError::not_found("Run").into()),
+            Err(StoreError::Unsupported) => None,
+            Err(error) => return Err(run_failure(error)),
+        };
+        let request = build(snapshot.as_ref())?;
+        match state
+            .runs
+            .apply(organization_id, workspace_id, &request)
+            .await
+            .map_err(run_failure)?
+        {
+            Applied::Committed(receipt) => return Ok(receipt),
+            Applied::Conflict(_) => continue,
+        }
+    }
+    Err(run_changed())
+}
+
+/// A fresh identity for one caller's control request.
+fn request_id() -> RequestId {
+    RequestId::from_uuid(Uuid::now_v7())
 }
 
 fn finished() -> Failure {
@@ -546,67 +609,42 @@ async fn start_run(
         return Err(ApiError::internal().into());
     };
     let run_id = RunId::generate();
-    let Some(job) = run_engine::job(run_id) else {
-        return Err(ApiError::internal().into());
-    };
-    let (run, events) = state
+    let request = reducer::admit(
+        organization_id,
+        workspace_id,
+        run_id,
+        &NewRun {
+            agent_id: agent.id,
+            session_id: SessionId::generate(),
+            trigger,
+            input,
+            model: agent.model,
+            instructions: agent.instructions,
+        },
+    );
+    let receipt = match state
         .runs
-        .create_run(
-            organization_id,
-            workspace_id,
-            run_id,
-            &NewRun {
-                agent_id: agent.id,
-                session_id: SessionId::generate(),
-                trigger,
-                input,
-                model: agent.model,
-                instructions: agent.instructions,
-            },
-            &[NewRunEvent::new(RunEventType::RunQueued, json!({}))],
-            &job,
-            Timestamp::now(),
-        )
+        .apply(organization_id, workspace_id, &request)
         .await
-        .map_err(run_failure)?;
+        .map_err(|error| match error {
+            StoreError::AgentNotFound => not_found(),
+            error => run_failure(error),
+        })? {
+        Applied::Committed(receipt) => receipt,
+        // A new run's ID is fresh: nothing else starts from its revision 0.
+        Applied::Conflict(_) => return Err(ApiError::internal().into()),
+    };
     run_engine::publish(
         &state,
         organization_id,
         workspace_id,
         access.workspace.environment,
-        &events,
+        &receipt.events,
     )
     .await;
-    Ok(envelope(StatusCode::CREATED, run_view(run)))
-}
-
-/// What the audit log records of a change to a run: the run, named by its
-/// agent ("Agent" once the agent is gone), in its workspace.
-async fn run_audit(
-    state: &AppState,
-    access: &WorkspaceAccess,
-    run: &Run,
-    action: AuditAction,
-) -> Result<impl Fn(&Run) -> AuditEntry + Send + Sync + use<>, Failure> {
-    let agent = state
-        .agents
-        .find_agent(access.access.organization_id, access.workspace.id, run.agent_id)
-        .await
-        .map_err(|error| match error {
-            AgentError::Unavailable => unavailable(),
-            _ => Failure(ApiError::internal()),
-        })?;
-    let name = agent.map_or_else(|| "Agent".to_owned(), |agent| agent.name);
-    let actor = access.access.audit_actor();
-    let workspace_id = access.workspace.id;
-    Ok(move |run: &Run| {
-        AuditEntry::new(
-            actor.clone(),
-            action,
-            AuditTarget::new(AuditObject::Run(run.id), &name),
-            AuditPlace::Workspace(workspace_id),
-        )
-    })
+    // The run as it committed: never read again, so a failed read can't turn
+    // a committed start into an error a retry would start again.
+    Ok(envelope(StatusCode::CREATED, run_view(*receipt.run)))
 }
 
 async fn cancel_run(
@@ -621,35 +659,45 @@ async fn cancel_run(
     if run.status.is_terminal() {
         return Err(finished());
     }
-    let cancelled_by = match &access.access.actor {
-        Actor::Member(member) => member.user.name.clone(),
-        Actor::ApiKey(key) => key.name.clone(),
+    let source = match access.access.actor {
+        Actor::Member(_) => RunTrigger::Console,
+        Actor::ApiKey(_) => RunTrigger::Api,
     };
-    let audit = run_audit(&state, &access, &run, AuditAction::RunCancelled).await?;
-    let (run, events) = state
-        .runs
-        .cancel_run(
-            access.access.organization_id,
-            access.workspace.id,
-            run.id,
-            &[NewRunEvent::new(
-                RunEventType::RunCancelled,
-                json!({ "cancelled_by": cancelled_by }),
-            )],
-            Timestamp::now(),
-            &audit,
+    let actor = access.access.audit_actor();
+    let (organization_id, workspace_id) = (access.access.organization_id, access.workspace.id);
+    let receipt = control(&state, organization_id, workspace_id, run.id, |snapshot| {
+        // Only a run this engine never advances has no snapshot, and every
+        // such run is finished (migration 0029).
+        let Some(snapshot) = snapshot else {
+            return Err(finished());
+        };
+        reducer::cancel(
+            organization_id,
+            workspace_id,
+            snapshot,
+            request_id(),
+            source,
+            actor.clone(),
         )
-        .await
-        .map_err(run_failure)?;
+        .map_err(|error| match error {
+            ControlError::Finished => finished(),
+            ControlError::NotFound => ApiError::not_found("Run").into(),
+            error => {
+                tracing::error!(event = "runs.cancel_unplanned", %error);
+                ApiError::internal().into()
+            }
+        })
+    })
+    .await?;
     run_engine::publish(
         &state,
-        access.access.organization_id,
-        access.workspace.id,
+        organization_id,
+        workspace_id,
         access.workspace.environment,
-        &events,
+        &receipt.events,
     )
     .await;
-    Ok(envelope(StatusCode::OK, run_view(run)))
+    Ok(envelope(StatusCode::OK, run_view(*receipt.run)))
 }
 
 /// Records the decision the customer's product made on the call a run
@@ -664,8 +712,8 @@ async fn resolve_approval(
 ) -> Result<Response, Failure> {
     let access = WorkspaceAccess::resolve(&state, caller, &headers, &ws).await?;
     let run = find(&state, &access, &run).await?;
-    let api_key_id = match &access.access.actor {
-        Actor::ApiKey(key) => key.id,
+    let (api_key_id, api_key_name) = match &access.access.actor {
+        Actor::ApiKey(key) => (key.id, key.name.clone()),
         Actor::Member(_) => {
             return Err(ApiError::new(
                 403,
@@ -704,43 +752,41 @@ async fn resolve_approval(
     let (Some(call_id), Some(decision)) = (call_id, decision) else {
         return Err(ApiError::internal().into());
     };
-    let Some(job) = run_engine::job(run.id) else {
-        return Err(ApiError::internal().into());
-    };
-    let audit = run_audit(&state, &access, &run, AuditAction::ApprovalResolved).await?;
-    let (run, events) = state
-        .runs
-        .resolve_approval(
-            access.access.organization_id,
-            access.workspace.id,
-            run.id,
-            call_id,
-            decision,
-            api_key_id,
-            &CallOutcome {
-                content: match reason {
-                    Some(reason) => format!("A person denied this call, so it wasn't made. Their reason: {reason}"),
-                    None => run_engine::DENIED.to_owned(),
-                },
-                is_error: true,
+    let (organization_id, workspace_id) = (access.access.organization_id, access.workspace.id);
+    let receipt = control(&state, organization_id, workspace_id, run.id, |snapshot| {
+        let Some(snapshot) = snapshot else {
+            return Err(not_waiting());
+        };
+        reducer::resolve_approval(
+            organization_id,
+            workspace_id,
+            snapshot,
+            request_id(),
+            Approval {
+                call_id,
+                decision,
+                api_key_id,
+                api_key_name: &api_key_name,
+                reason: reason.as_deref(),
             },
-            &[NewRunEvent::new(
-                RunEventType::ApprovalResolved,
-                json!({ "call_id": call_id, "decision": decision.as_str(), "api_key_id": api_key_id }),
-            )],
-            &job,
-            Timestamp::now(),
-            &audit,
         )
-        .await
-        .map_err(run_failure)?;
+        .map_err(|error| match error {
+            ControlError::NotWaiting | ControlError::Finished | ControlError::UnsupportedVersion(_) => not_waiting(),
+            ControlError::NotFound => ApiError::not_found("Run").into(),
+            error => {
+                tracing::error!(event = "runs.approval_unplanned", %error);
+                ApiError::internal().into()
+            }
+        })
+    })
+    .await?;
     run_engine::publish(
         &state,
-        access.access.organization_id,
-        access.workspace.id,
+        organization_id,
+        workspace_id,
         access.workspace.environment,
-        &events,
+        &receipt.events,
     )
     .await;
-    Ok(envelope(StatusCode::OK, run_view(run)))
+    Ok(envelope(StatusCode::OK, run_view(*receipt.run)))
 }

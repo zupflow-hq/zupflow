@@ -1210,6 +1210,7 @@ fn a_call_is_refused_at_send_with_its_reason() {
             "installation_disconnected",
         ),
         (installation(InstallationCheck::ReconnectRequired), RECONNECT_REQUIRED),
+        (installation(InstallationCheck::Unusable), "tool_refused"),
     ];
     for (send_check, code) in cases {
         let facts = Facts {

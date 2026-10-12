@@ -20,7 +20,14 @@ use zupflow_core::models::{Completion, ModelProvider, ProviderError, ToolSpec, T
 use zupflow_core::policy::{
     AppToolLevel, LevelPage, PolicyError, PolicySettings, ToolLevel, ToolPolicy, ToolPolicyStore,
 };
-use zupflow_core::runs::{CallState, CallTarget, NewToolCall, NewTurn, RecordedDecision};
+use zupflow_core::runs::CallState;
+use zupflow_core::runs::digest::Sha256Digest;
+use zupflow_core::runs::names::{Candidate, build_offer};
+use zupflow_core::runs::reducer::{
+    Facts, InstallationCheck, Io, Limits, ModelAnswer, ModelResult, Plan, SendCheck, advance,
+};
+use zupflow_core::runs::state::{CallDecision, CallRecord, CallVerdict, ClaimantId, InvocationId};
+use zupflow_core::runs::store::Applied;
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
 use zupflow_server::run_engine;
@@ -41,6 +48,9 @@ struct Setup {
     production: String,
     app: String,
     installation: String,
+    /// The installation's short ID: its tools reach the model as
+    /// `tools_<short_id>_<tool>` (decision 0047).
+    short_id: String,
     agent: String,
     production_agent: String,
 }
@@ -148,6 +158,18 @@ async fn setup() -> Setup {
         assert_eq!(status, StatusCode::OK);
     }
     let installation = connect(&server, "alice", &org, &sandbox, &app).await;
+    let (status, read) = server
+        .send(
+            call(
+                "alice",
+                Method::GET,
+                format!("/v1/workspaces/{sandbox}/installations/{installation}"),
+            )
+            .naming(&org),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    let short_id = read["data"]["short_id"].as_str().unwrap().to_owned();
     // The Console doesn't connect accounts in Production: a key does.
     let production_key = api_key(&server, &org, "production").await;
     let production_installation = connect(&server, &production_key, &org, &production, &app).await;
@@ -161,6 +183,7 @@ async fn setup() -> Setup {
         production,
         app,
         installation,
+        short_id,
         agent,
         production_agent,
     }
@@ -198,6 +221,16 @@ async fn api_key(server: &Server, org: &str, environment: &str) -> String {
 }
 
 impl Setup {
+    /// The name the model calls `tool` of the Sandbox installation by.
+    fn tool(&self, tool: &str) -> String {
+        format!("tools_{}_{tool}", self.short_id)
+    }
+
+    /// `call <tool> <arguments>`, naming the tool as the model is offered it.
+    fn calling(&self, tool: &str, arguments: &str) -> String {
+        format!("call {} {arguments}", self.tool(tool))
+    }
+
     async fn start(&self, who: &str, input: &str) -> (StatusCode, Value) {
         self.start_in(who, &self.sandbox, &self.agent, input).await
     }
@@ -279,52 +312,149 @@ impl Setup {
     }
 
     /// A running run whose model asked for `tool`, decided allowed and
-    /// not sent yet, as a worker leaves it between two steps.
+    /// not sent yet, as a worker leaves it between two steps. The worker
+    /// stopped there: its claim has lapsed.
     async fn allowed_call(&self, tool: &str) -> (RunId, ToolCallId) {
+        self.stopped_worker(tool, false).await
+    }
+
+    /// The same, with the call recorded as sent by a worker that stopped
+    /// before sending it: its claim and its send claim have lapsed.
+    async fn authorized_call(&self, tool: &str) -> (RunId, ToolCallId) {
+        self.stopped_worker(tool, true).await
+    }
+
+    async fn stopped_worker(&self, tool: &str, authorized: bool) -> (RunId, ToolCallId) {
         let (status, started) = self.start("alice", "hello").await;
         assert_eq!(status, StatusCode::CREATED);
         let run = RunId::parse(id(&started["data"])).unwrap();
         let (org, ws) = self.scope();
-        let runs = &self.server.state.runs;
-        runs.start_run(org, ws, run, &[], Timestamp::now()).await.unwrap();
-        let call_id = ToolCallId::generate();
-        let turn = NewTurn {
-            text: None,
-            calls: vec![NewToolCall {
-                id: call_id,
-                model_call_id: "m-1".to_owned(),
-                name: tool.to_owned(),
-                target: Some(CallTarget {
-                    installation_id: InstallationId::parse(&self.installation).unwrap(),
-                    installation_label: "Main".to_owned(),
-                    app_name: "Tools".to_owned(),
-                    tool: tool.to_owned(),
-                }),
-                arguments: Map::new(),
-                state: CallState::Allowed,
-                decision: None,
-                outcome: None,
-            }],
-            usage: TokenUsage::default(),
-            finish: None,
-        };
-        runs.record_turn(org, ws, run, 0, &turn, &[], Timestamp::now())
+        let state = &self.server.state;
+        let installation = InstallationId::parse(&self.installation).unwrap();
+        let pinned = state
+            .tools
+            .list_tools(org, ws, installation, None, 100)
             .await
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|registered| registered.name == tool)
             .unwrap();
+        let definition = Sha256Digest::from_bytes(pinned.pinned.hash);
+        let offer = build_offer([Candidate {
+            installation_id: installation,
+            installation_short_id: self.short_id.clone(),
+            installation_label: "Main".to_owned(),
+            app_key: "tools".to_owned(),
+            app_name: "Tools".to_owned(),
+            tool: tool.to_owned(),
+            description: String::new(),
+            input_schema: json!({ "type": "object" }),
+            definition_sha256: definition,
+        }])
+        .offer;
+        let allow = CallDecision {
+            verdict: CallVerdict::Allow,
+            policy: "configured".to_owned(),
+            mode: Some("manual".to_owned()),
+            rule: "allowed".to_owned(),
+        };
+        let claimant = ClaimantId::from_uuid(uuid::Uuid::now_v7());
+        // The worker's last step leaves its claims to lapse at once.
+        let lapsing = Limits {
+            lease_ms: 1,
+            send_lease_ms: 1,
+            ..Limits::default()
+        };
+        let facts = |claim: Option<u64>, more: Facts| Facts {
+            claimant: Some(claimant),
+            claim,
+            ..more
+        };
+        let step = |facts: Facts| async move {
+            let snapshot = state.runs.find_snapshot(org, ws, run).await.unwrap().unwrap();
+            let Plan::Apply { request, then } = advance(&snapshot, &facts).unwrap() else {
+                panic!("a step to take");
+            };
+            assert!(matches!(
+                state.runs.apply(org, ws, &request).await.unwrap(),
+                Applied::Committed(_)
+            ));
+            then
+        };
+        step(facts(None, Facts::at(Timestamp::now()))).await;
+        let claim = Some(1);
+        let Io::CallModel(asked) = step(facts(
+            claim,
+            Facts {
+                offer: Some(offer.clone()),
+                ..Facts::at(Timestamp::now())
+            },
+        ))
+        .await
+        else {
+            panic!("the model is asked");
+        };
+        let call_id = ToolCallId::generate();
+        let completion = zupflow_core::models::Completion {
+            reply: zupflow_core::models::Reply::ToolCalls {
+                text: None,
+                calls: vec![zupflow_core::models::ModelToolCall {
+                    id: "m-1".to_owned(),
+                    name: self.tool(tool),
+                    arguments: Map::new(),
+                }],
+            },
+            usage: TokenUsage::default(),
+        };
+        step(facts(
+            claim,
+            Facts {
+                model: Some(ModelAnswer {
+                    turn: asked.turn,
+                    attempt: asked.attempt,
+                    result: ModelResult::Answered(completion),
+                }),
+                decisions: vec![(0, allow.clone())],
+                call_ids: vec![call_id],
+                limits: if authorized { Limits::default() } else { lapsing },
+                ..Facts::at(Timestamp::now())
+            },
+        ))
+        .await;
+        if authorized {
+            let sent = step(facts(
+                claim,
+                Facts {
+                    send_check: Some(SendCheck {
+                        call_id,
+                        installation: InstallationCheck::Usable,
+                        definition_sha256: Some(definition),
+                        decision: allow,
+                    }),
+                    invocation_id: Some(InvocationId::from_uuid(uuid::Uuid::now_v7())),
+                    limits: lapsing,
+                    ..Facts::at(Timestamp::now())
+                },
+            ))
+            .await;
+            assert!(matches!(sent, Io::SendCall(_)), "authorized, and never sent");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         (run, call_id)
     }
 
-    async fn call_of(&self, run: RunId) -> zupflow_core::runs::RunToolCall {
+    async fn call_of(&self, run: RunId) -> CallRecord {
         let (org, ws) = self.scope();
-        let progress = self
+        let snapshot = self
             .server
             .state
             .runs
-            .find_progress(org, ws, run)
+            .find_snapshot(org, ws, run)
             .await
             .unwrap()
             .unwrap();
-        progress.calls[0].clone()
+        snapshot.calls[0].clone()
     }
 
     fn scope(&self) -> (OrganizationId, WorkspaceId) {
@@ -398,11 +528,17 @@ async fn answers_from_the_conversation_alone() {
 #[tokio::test]
 async fn calls_an_allowed_tool_through_the_installation() {
     let setup = setup().await;
-    let run = setup.run("call lookup {\"q\":\"invoices\"}").await;
+    let run = setup.run(&setup.calling("lookup", "{\"q\":\"invoices\"}")).await;
     let done = setup.get(&run).await;
     assert_eq!(done["status"], "completed", "{done}");
     assert_eq!(done["usage"]["tool_calls"], 1);
-    assert!(done["output"].as_str().unwrap().starts_with("lookup: "), "{done}");
+    assert!(
+        done["output"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("{}: ", setup.tool("lookup"))),
+        "{done}"
+    );
     assert_eq!(
         setup.server.providers.tool_calls(),
         [("lookup".to_owned(), json!({ "q": "invoices" }))]
@@ -447,7 +583,7 @@ async fn calls_an_allowed_tool_through_the_installation() {
 async fn pauses_for_approval_until_a_backend_decides() {
     let setup = setup().await;
     let key = api_key(&setup.server, &setup.org, "sandbox").await;
-    let run = setup.run("call send {\"to\":\"ops\"}").await;
+    let run = setup.run(&setup.calling("send", "{\"to\":\"ops\"}")).await;
     let waiting = setup.get(&run).await;
     assert_eq!(waiting["status"], "waiting_for_approval");
     assert!(
@@ -496,7 +632,7 @@ async fn pauses_for_approval_until_a_backend_decides() {
     assert!(events.iter().any(|event| event["type"] == "tool_call.completed"));
 
     // A denial goes back to the model as the call's result; nothing is sent.
-    let denied = setup.run("call send {\"to\":\"everyone\"}").await;
+    let denied = setup.run(&setup.calling("send", "{\"to\":\"everyone\"}")).await;
     let call_id = setup.events(&denied).await.last().unwrap()["data"]["call_id"]
         .as_str()
         .unwrap()
@@ -510,7 +646,7 @@ async fn pauses_for_approval_until_a_backend_decides() {
         done["output"]
             .as_str()
             .unwrap()
-            .starts_with("send failed: A person denied this call"),
+            .starts_with(&format!("{} failed: A person denied this call", setup.tool("send"))),
         "{done}"
     );
     assert_eq!(setup.server.providers.tool_calls().len(), 1);
@@ -520,43 +656,57 @@ async fn pauses_for_approval_until_a_backend_decides() {
 #[tokio::test]
 async fn records_each_decision_with_its_policy_mode_and_rule() {
     let setup = setup().await;
-    let run = setup.run("call lookup {}\ncall send {}").await;
+    let run = setup
+        .run(&format!(
+            "{}\n{}",
+            setup.calling("lookup", "{}"),
+            setup.calling("send", "{}")
+        ))
+        .await;
     let (org, ws) = setup.scope();
-    let progress = setup
+    let snapshot = setup
         .server
         .state
         .runs
-        .find_progress(org, ws, RunId::parse(&run).unwrap())
+        .find_snapshot(org, ws, RunId::parse(&run).unwrap())
         .await
         .unwrap()
         .unwrap();
-    let decisions: Vec<(&str, CallState, Option<&RecordedDecision>)> = progress
+    let decisions: Vec<(&str, CallState, Option<&CallDecision>)> = snapshot
         .calls
         .iter()
-        .map(|call| (call.name.as_str(), call.state, call.decision.as_ref()))
+        .map(|call| {
+            (
+                call.target.as_ref().unwrap().tool.as_str(),
+                call.state,
+                call.decision.as_ref(),
+            )
+        })
         .collect();
     assert_eq!(decisions[0].0, "lookup");
     assert_eq!(decisions[0].1, CallState::Completed);
     let allowed = decisions[0].2.unwrap();
     assert_eq!(
-        (allowed.verdict.as_str(), allowed.policy.as_str(), allowed.rule.as_str()),
-        ("allow", "configured", "allowed")
+        (&allowed.verdict, allowed.policy.as_str(), allowed.rule.as_str()),
+        (&CallVerdict::Allow, "configured", "allowed")
     );
     assert_eq!(allowed.mode.as_deref(), Some("manual"));
     assert_eq!(decisions[1].1, CallState::AwaitingApproval);
     let waiting = decisions[1].2.unwrap();
-    assert_eq!(waiting.verdict, "require_approval");
-    assert!(waiting.reason.is_some());
+    assert!(matches!(waiting.verdict, CallVerdict::RequireApproval { .. }));
 }
 
 #[tokio::test]
 async fn never_offers_a_tool_the_organization_denies() {
     let setup = setup().await;
     levels(&setup.server, &setup.org, &setup.app, "allow", "deny").await;
-    let run = setup.run("call send {}").await;
+    let run = setup.run(&setup.calling("send", "{}")).await;
     let done = setup.get(&run).await;
     assert_eq!(done["status"], "completed");
-    assert_eq!(done["output"], "I can't use send: it isn't one of my tools.");
+    assert_eq!(
+        done["output"],
+        format!("I can't use {}: it isn't one of my tools.", setup.tool("send"))
+    );
     assert!(setup.server.providers.tool_calls().is_empty());
 }
 
@@ -565,7 +715,7 @@ async fn never_sends_a_call_again_once_its_outcome_is_unknown() {
     let setup = setup().await;
     // The server takes the call and never answers usably.
     *setup.server.providers.tool_status.lock().unwrap() = 502;
-    let run = setup.run("call lookup {}").await;
+    let run = setup.run(&setup.calling("lookup", "{}")).await;
     let done = setup.get(&run).await;
     assert_eq!(done["status"], "completed");
     assert_eq!(setup.server.providers.tool_calls().len(), 1);
@@ -576,30 +726,29 @@ async fn never_sends_a_call_again_once_its_outcome_is_unknown() {
         .find(|event| event["type"] == "tool_call.failed")
         .unwrap();
     assert_eq!(failed["data"]["error"]["code"], "outcome_unknown");
-    assert!(done["output"].as_str().unwrap().starts_with("lookup failed: "));
+    assert!(
+        done["output"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("{} failed: ", setup.tool("lookup")))
+    );
 
     // A worker stopped after recording a call as sent: the next one settles
     // it as unknown instead of sending it again.
     *setup.server.providers.tool_status.lock().unwrap() = 200;
-    let (run, call_id) = setup.allowed_call("lookup").await;
-    let (org, ws) = setup.scope();
-    let runs = &setup.server.state.runs;
-    runs.begin_call(org, ws, run, call_id, &[], Timestamp::now())
-        .await
-        .unwrap();
+    let (run, _) = setup.authorized_call("lookup").await;
     setup.work().await;
     let done = setup.get(&run.to_string()).await;
     assert_eq!(done["status"], "completed", "{done}");
     assert_eq!(setup.server.providers.tool_calls().len(), 1, "not sent again");
-    let progress = runs.find_progress(org, ws, run).await.unwrap().unwrap();
-    assert_eq!(progress.calls[0].state, CallState::Unknown);
+    assert_eq!(setup.call_of(run).await.state, CallState::Unknown);
 }
 
 #[tokio::test]
 async fn fails_the_run_when_the_installation_needs_reconnecting() {
     let setup = setup().await;
     *setup.server.providers.tool_status.lock().unwrap() = 401;
-    let run = setup.run("call lookup {}").await;
+    let run = setup.run(&setup.calling("lookup", "{}")).await;
     let done = setup.get(&run).await;
     assert_eq!(done["status"], "failed");
     assert_eq!(done["error"]["code"], "installation_reconnect_required");
@@ -724,7 +873,7 @@ async fn cancels_once_and_the_engine_leaves_it_cancelled() {
 async fn lists_runs_within_their_workspace_and_organization() {
     let setup = setup().await;
     let first = setup.run("hello").await;
-    let second = setup.run("call send {}").await;
+    let second = setup.run(&setup.calling("send", "{}")).await;
     let list = |uri: String| setup.server.send(call("alice", Method::GET, uri).naming(&setup.org));
     let (status, body) = list(format!("/v1/workspaces/{}/runs?limit=1", setup.sandbox)).await;
     assert_eq!(status, StatusCode::OK);
@@ -881,14 +1030,15 @@ async fn offers_a_changed_tool_as_pinned_and_waits_for_approval() {
     });
     let mut state = setup.server.state.clone();
     state.provider = recording.clone();
-    let (status, run) = setup.start("alice", "call lookup {}").await;
+    let (status, run) = setup.start("alice", &setup.calling("lookup", "{}")).await;
     assert_eq!(status, StatusCode::CREATED);
     while run_engine::work_once(&state).await {}
     let run = id(&run["data"]).to_owned();
     let offered = recording.offered.lock().unwrap()[0].clone();
-    let lookup = offered.iter().find(|tool| tool.name == "lookup").unwrap();
+    let lookup = offered.iter().find(|tool| tool.name == setup.tool("lookup")).unwrap();
     assert_eq!(
-        lookup.description, "Look something up",
+        lookup.description,
+        format!("Tools, installation \"Main\" ({}). Look something up", setup.short_id),
         "the pinned definition, not the latest"
     );
     assert_eq!(lookup.input_schema, json!({ "type": "object" }));
@@ -963,7 +1113,10 @@ async fn decides_again_at_send_on_the_levels_in_force() {
     assert_eq!(setup.get(&waiting.to_string()).await["status"], "waiting_for_approval");
     let call = setup.call_of(waiting).await;
     assert_eq!(call.state, CallState::AwaitingApproval);
-    assert_eq!(call.decision.unwrap().verdict, "require_approval");
+    assert!(matches!(
+        call.decision.unwrap().verdict,
+        CallVerdict::RequireApproval { .. }
+    ));
     assert!(setup.server.providers.tool_calls().is_empty());
 }
 
@@ -1033,7 +1186,7 @@ async fn waits_for_approval_when_the_levels_cant_be_read() {
     let setup = setup().await;
     let mut state = setup.server.state.clone();
     state.policies = Arc::new(UnreadableLevels(setup.server.state.policies.clone()));
-    let (status, run) = setup.start("alice", "call lookup {}").await;
+    let (status, run) = setup.start("alice", &setup.calling("lookup", "{}")).await;
     assert_eq!(status, StatusCode::CREATED);
     while run_engine::work_once(&state).await {}
     let run = RunId::parse(id(&run["data"])).unwrap();
@@ -1080,7 +1233,7 @@ async fn fails_runs_at_once_without_a_model_provider() {
     let setup = setup().await;
     let mut state = setup.server.state.clone();
     state.provider = Arc::new(zupflow_basic::no_model::NoModelProvider);
-    let (status, run) = setup.start("alice", "call lookup {}").await;
+    let (status, run) = setup.start("alice", &setup.calling("lookup", "{}")).await;
     assert_eq!(status, StatusCode::CREATED);
     while run_engine::work_once(&state).await {}
     let failed = setup.get(id(&run["data"])).await;
@@ -1093,7 +1246,7 @@ async fn fails_runs_at_once_without_a_model_provider() {
 async fn gives_the_model_a_denials_reason_and_keeps_approvals_to_their_workspace() {
     let setup = setup().await;
     let key = api_key(&setup.server, &setup.org, "sandbox").await;
-    let run = setup.run("call send {}").await;
+    let run = setup.run(&setup.calling("send", "{}")).await;
     let call_id = setup.events(&run).await.last().unwrap()["data"]["call_id"]
         .as_str()
         .unwrap()
@@ -1148,4 +1301,395 @@ async fn gives_the_model_a_denials_reason_and_keeps_approvals_to_their_workspace
             .ends_with("Their reason: Not this week."),
         "{done}"
     );
+}
+
+/// The run store, except that reading a run fails from the moment a
+/// transition commits until the test lets reads through again: a database
+/// that answers the write and then stops answering.
+struct ReadsFailAfterCommit {
+    inner: Arc<dyn zupflow_core::runs::RunStore>,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+impl ReadsFailAfterCommit {
+    fn reads_fail(&self) -> bool {
+        self.failing.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn let_reads_through(&self) {
+        self.failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl zupflow_core::runs::RunStore for ReadsFailAfterCommit {
+    fn durability(&self) -> zupflow_core::runs::store::Durability {
+        self.inner.durability()
+    }
+
+    async fn apply(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        request: &zupflow_core::runs::transition::TransitionRequest,
+    ) -> Result<Applied, zupflow_core::runs::store::StoreError> {
+        let applied = self.inner.apply(organization_id, workspace_id, request).await;
+        if matches!(applied, Ok(Applied::Committed(_))) {
+            self.failing.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        applied
+    }
+
+    async fn find_snapshot(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+    ) -> Result<Option<zupflow_core::runs::state::Snapshot>, zupflow_core::runs::store::StoreError> {
+        if self.reads_fail() {
+            return Err(zupflow_core::runs::store::StoreError::Unavailable);
+        }
+        self.inner.find_snapshot(organization_id, workspace_id, run_id).await
+    }
+
+    async fn find_run(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+    ) -> Result<Option<zupflow_core::runs::Run>, zupflow_core::runs::store::StoreError> {
+        if self.reads_fail() {
+            return Err(zupflow_core::runs::store::StoreError::Unavailable);
+        }
+        self.inner.find_run(organization_id, workspace_id, run_id).await
+    }
+
+    async fn list_runs(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        filter: &zupflow_core::runs::RunFilter,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<zupflow_core::runs::Page<zupflow_core::runs::Run>, zupflow_core::runs::store::StoreError> {
+        self.inner
+            .list_runs(organization_id, workspace_id, filter, cursor, limit)
+            .await
+    }
+
+    async fn list_organization_runs(
+        &self,
+        organization_id: OrganizationId,
+        filter: &zupflow_core::runs::OrganizationRunFilter,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<zupflow_core::runs::Page<zupflow_core::runs::OrganizationRun>, zupflow_core::runs::store::StoreError>
+    {
+        self.inner
+            .list_organization_runs(organization_id, filter, cursor, limit)
+            .await
+    }
+
+    async fn list_events(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+        after: u64,
+    ) -> Result<Vec<zupflow_core::runs::RunEvent>, zupflow_core::runs::store::StoreError> {
+        self.inner
+            .list_events(organization_id, workspace_id, run_id, after)
+            .await
+    }
+
+    async fn agent_activity(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        since: Timestamp,
+    ) -> Result<Vec<zupflow_core::runs::AgentActivity>, zupflow_core::runs::store::StoreError> {
+        self.inner.agent_activity(organization_id, workspace_id, since).await
+    }
+
+    async fn usage(
+        &self,
+        organization_id: OrganizationId,
+        environment: zupflow_core::environment::Environment,
+        since: Timestamp,
+    ) -> Result<Vec<zupflow_core::runs::UsageDay>, zupflow_core::runs::store::StoreError> {
+        self.inner.usage(organization_id, environment, since).await
+    }
+
+    async fn abandoned_runs(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<(OrganizationId, WorkspaceId, RunId)>, zupflow_core::runs::store::StoreError> {
+        self.inner.abandoned_runs(limit).await
+    }
+}
+
+/// A start, a cancel and a decision answer with the run as their transition
+/// committed it, never with a read after the commit: the database failing
+/// to answer once the change committed can't turn it into a `503`, which
+/// the idempotency middleware never saves, so a retry with the same key
+/// replays the first answer instead of starting a second run or answering
+/// `409` for a cancel that worked.
+#[tokio::test]
+async fn answers_with_what_committed_even_when_reads_fail_after() {
+    let setup = setup().await;
+    let key = api_key(&setup.server, &setup.org, "sandbox").await;
+    let failing = Arc::new(ReadsFailAfterCommit {
+        inner: setup.server.state.runs.clone(),
+        failing: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut state = setup.server.state.clone();
+    state.runs = failing.clone();
+    let app = zupflow_server::app(state, zupflow_server::RequestGuard::default());
+    let send = |who: &str, uri: String, key: &str, body: Option<Value>| {
+        let app = app.clone();
+        let (who, key, org) = (who.to_owned(), key.to_owned(), setup.org.clone());
+        async move {
+            let mut request = call(&who, Method::POST, uri).naming(&org).idempotent(&key);
+            if let Some(body) = body {
+                request = request.body(body);
+            }
+            common::send_to(&app, request).await
+        }
+    };
+
+    let start = format!("/v1/workspaces/{}/agents/{}/runs", setup.sandbox, setup.agent);
+    let input = setup.calling("send", "{}");
+    let (status, started) = send("alice", start.clone(), "start-1", Some(json!({ "input": input }))).await;
+    assert_eq!(status, StatusCode::CREATED, "{started}");
+    assert_eq!(started["data"]["status"], "queued");
+    assert!(failing.reads_fail(), "reads fail once the start committed");
+    let (status, again) = send("alice", start, "start-1", Some(json!({ "input": input }))).await;
+    assert_eq!((status, &again), (StatusCode::CREATED, &started), "replayed");
+    failing.let_reads_through();
+    let (org, ws) = setup.scope();
+    let listed = setup
+        .server
+        .state
+        .runs
+        .list_runs(org, ws, &zupflow_core::runs::RunFilter::default(), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(listed.total, 1, "one run, however often it was asked for");
+
+    // Parked on `send`, then decided: the decision answers as it committed.
+    let run = id(&started["data"]).to_owned();
+    setup.work().await;
+    let call_id = setup.events(&run).await.last().unwrap()["data"]["call_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let approvals = format!("/v1/workspaces/{}/runs/{run}/approvals", setup.sandbox);
+    let decision = json!({ "call_id": call_id, "decision": "denied" });
+    let (status, decided) = send(&key, approvals.clone(), "decide-1", Some(decision.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{decided}");
+    assert_eq!(decided["data"]["status"], "running");
+    assert!(failing.reads_fail());
+    let (status, again) = send(&key, approvals, "decide-1", Some(decision)).await;
+    assert_eq!((status, &again), (StatusCode::OK, &decided), "replayed, not 409");
+    failing.let_reads_through();
+
+    // And a cancel.
+    let cancel = format!("/v1/workspaces/{}/runs/{run}/cancel", setup.sandbox);
+    let (status, cancelled) = send("alice", cancel.clone(), "cancel-1", None).await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+    assert_eq!(cancelled["data"]["status"], "cancelled");
+    assert!(cancelled["data"]["finished_at"].is_string());
+    assert!(failing.reads_fail());
+    let (status, again) = send("alice", cancel, "cancel-1", None).await;
+    assert_eq!(
+        (status, &again),
+        (StatusCode::OK, &cancelled),
+        "replayed, not run_finished"
+    );
+    failing.let_reads_through();
+    assert_eq!(
+        setup.get(&run).await,
+        cancelled["data"],
+        "what it answered is what the store holds"
+    );
+}
+
+impl Setup {
+    /// A run parked on `send`, waiting for approval; its ID and the call's.
+    async fn waiting_on_send(&self) -> (String, String) {
+        let run = self.run(&self.calling("send", "{}")).await;
+        assert_eq!(self.get(&run).await["status"], "waiting_for_approval");
+        let call_id = self.events(&run).await.last().unwrap()["data"]["call_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        (run, call_id)
+    }
+
+    /// Approves the call with an API key and works the run to its end: the
+    /// code the call failed with, from its timeline.
+    async fn approve_and_finish(&self, key: &str, run: &str, call_id: &str) -> String {
+        let (status, body) = self.resolve(key, run, call_id, "approved").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        self.work().await;
+        let done = self.get(run).await;
+        assert_eq!(done["status"], "completed", "the run goes on: {done}");
+        assert!(
+            done["output"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{} failed: ", self.tool("send"))),
+            "the model read why: {done}"
+        );
+        let events = self.events(run).await;
+        assert!(
+            !events.iter().any(|event| event["type"] == "tool_call.started"),
+            "never recorded as sent"
+        );
+        let failed = events
+            .iter()
+            .find(|event| event["type"] == "tool_call.failed" && event["data"]["call_id"] == call_id)
+            .unwrap();
+        assert_eq!(done["usage"]["tool_calls"], 0);
+        failed["data"]["error"]["code"].as_str().unwrap().to_owned()
+    }
+}
+
+#[tokio::test]
+async fn refuses_an_approved_call_whose_installation_was_deleted() {
+    let setup = setup().await;
+    let key = api_key(&setup.server, &setup.org, "sandbox").await;
+    let (run, call_id) = setup.waiting_on_send().await;
+    let (status, _) = setup
+        .server
+        .send(
+            call(
+                "alice",
+                Method::DELETE,
+                format!("/v1/workspaces/{}/installations/{}", setup.sandbox, setup.installation),
+            )
+            .naming(&setup.org),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        setup.approve_and_finish(&key, &run, &call_id).await,
+        "installation_removed"
+    );
+    assert!(setup.server.providers.tool_calls().is_empty(), "nothing sent");
+}
+
+#[tokio::test]
+async fn refuses_an_approved_call_whose_installation_was_disconnected() {
+    let setup = setup().await;
+    let key = api_key(&setup.server, &setup.org, "sandbox").await;
+    let (run, call_id) = setup.waiting_on_send().await;
+    let (status, body) = setup
+        .server
+        .send(
+            call(
+                "alice",
+                Method::POST,
+                format!(
+                    "/v1/workspaces/{}/installations/{}/disconnect",
+                    setup.sandbox, setup.installation
+                ),
+            )
+            .naming(&setup.org),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        setup.approve_and_finish(&key, &run, &call_id).await,
+        "installation_disconnected"
+    );
+    assert!(setup.server.providers.tool_calls().is_empty(), "nothing sent");
+}
+
+#[tokio::test]
+async fn refuses_an_approved_call_whose_tool_was_pinned_again() {
+    let setup = setup().await;
+    let key = api_key(&setup.server, &setup.org, "sandbox").await;
+    let (run, call_id) = setup.waiting_on_send().await;
+    // The server changes `send`, and an owner accepts the change: the pinned
+    // definition the approval was asked about is no longer the one in force.
+    setup.server.providers.serve_mcp(
+        MCP,
+        json!([
+            { "name": "lookup", "description": "Look something up", "inputSchema": { "type": "object" }, "annotations": { "readOnlyHint": true } },
+            { "name": "send", "description": "Send it to everyone", "inputSchema": { "type": "object" } },
+        ]),
+    );
+    let (org, ws) = setup.scope();
+    zupflow_server::discovery::enqueue(
+        &setup.server.state,
+        org,
+        ws,
+        InstallationId::parse(&setup.installation).unwrap(),
+    )
+    .await
+    .unwrap();
+    while zupflow_server::discovery::work_once(&setup.server.state).await {}
+    let tools = format!("/v1/workspaces/{}/installations/{}", setup.sandbox, setup.installation);
+    let (status, listed) = setup
+        .server
+        .send(call("alice", Method::GET, format!("{tools}/tools")).naming(&setup.org))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let latest = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "send")
+        .unwrap()["latest_hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, body) = setup
+        .server
+        .send(
+            call("alice", Method::POST, format!("{tools}/accept-tool-change"))
+                .naming(&setup.org)
+                .body(json!({ "name": "send", "latest_hash": latest })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(setup.approve_and_finish(&key, &run, &call_id).await, "tool_changed");
+    assert!(setup.server.providers.tool_calls().is_empty(), "nothing sent");
+}
+
+#[tokio::test]
+async fn refuses_a_call_whose_installation_cant_be_reached_as_set_up() {
+    let setup = setup().await;
+    // The app's Sandbox configuration no longer names a server.
+    let (status, body) = setup
+        .server
+        .send(
+            call(
+                "alice",
+                Method::PUT,
+                format!(
+                    "/v1/organizations/{}/apps/{}/environments/sandbox/configuration",
+                    setup.org, setup.app
+                ),
+            )
+            .body(json!({ "mcp_server_url": null })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let run = setup.run(&setup.calling("lookup", "{}")).await;
+    let done = setup.get(&run).await;
+    assert_eq!(done["status"], "completed", "the run goes on: {done}");
+    let failed = setup
+        .events(&run)
+        .await
+        .into_iter()
+        .find(|event| event["type"] == "tool_call.failed")
+        .unwrap();
+    assert_eq!(failed["data"]["error"]["code"], "tool_refused");
+    assert_eq!(
+        failed["data"]["error"]["message"],
+        "Main can't be used as it's set up: check its app's configuration, or reconnect it."
+    );
+    assert!(setup.server.providers.tool_calls().is_empty(), "nothing sent");
 }

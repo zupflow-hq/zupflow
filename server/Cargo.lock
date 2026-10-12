@@ -2990,6 +2990,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "url",
+ "uuid",
  "zupflow-basic",
  "zupflow-core",
  "zupflow-mcp",

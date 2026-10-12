@@ -66,7 +66,7 @@ use zupflow_core::keys::{EncryptionContext, seal};
 use zupflow_core::organizations::{INVITATION_TTL_MS, Member, MemberRole, Organization, OrganizationStore, User};
 use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse, Refusal};
 use zupflow_core::policy::{AppToolLevel, ToolLevel, ToolPolicyStore};
-use zupflow_core::runs::CallTarget;
+use zupflow_core::runs::digest::Sha256Digest;
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{ListedTool, ToolRegistry, ToolRevision};
 use zupflow_core::webhooks::{
@@ -1002,18 +1002,39 @@ async fn reset(path: &str) -> Result<(), String> {
             .await
             .map_err(|error| fail(label)(&error))?
             .ok_or_else(|| format!("installation {label}"))?;
-        let app_name = match installation.app {
+        let app = match installation.app {
             InstalledApp::Catalog(id) => apps.find_organization_app(organization, id).await,
             InstalledApp::Workspace(id) => apps.find_workspace_app(organization, workspace, id).await,
         }
         .map_err(|error| fail(label)(&error))?
-        .ok_or_else(|| format!("app of {label}"))?
-        .name;
-        let target = CallTarget {
+        .ok_or_else(|| format!("app of {label}"))?;
+        // The tool's pinned definition, where the installation's registry
+        // holds it; otherwise one of the fixture's own, by name.
+        let definition_sha256 = tools
+            .list_tools(
+                organization,
+                workspace,
+                installation_id,
+                None,
+                zupflow_core::tools::MAX_PAGE,
+            )
+            .await
+            .map_err(|error| fail(label)(&error))?
+            .items
+            .into_iter()
+            .find(|registered| registered.name == tool)
+            .map_or_else(
+                || Sha256Digest::of(tool.as_bytes()),
+                |registered| Sha256Digest::from_bytes(registered.pinned.hash),
+            );
+        let target = fixture_runs::Target {
             installation_id,
+            installation_short_id: installation.short_id.as_str().to_owned(),
             installation_label: label.to_owned(),
-            app_name,
+            app_key: app.key,
+            app_name: app.name,
             tool: tool.to_owned(),
+            definition_sha256,
         };
         fixture_runs::seed(&runs, organization, workspace, agent_id, model, target, waiting)
             .await

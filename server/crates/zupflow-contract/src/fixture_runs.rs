@@ -1,21 +1,123 @@
-//! The fixture's runs, recorded step by step through the run store as the
-//! run engine records them, so their timelines read like real ones.
+//! The fixture's runs, taken step by step through the reducer and the run
+//! store as a worker takes them (decision 0046), so their timelines, calls
+//! and records read like real ones. The model's answers are written here;
+//! nothing is sent to an app's server.
 
 use serde_json::{Map, Value, json};
-use zupflow_core::ids::{AgentId, OrganizationId, RunId, SessionId, ToolCallId, WorkspaceId};
-use zupflow_core::models::TokenUsage;
-use zupflow_core::runs::{
-    CallOutcome, CallState, CallTarget, Ending, NewRun, NewRunEvent, NewToolCall, NewTurn, RecordedDecision, RunError,
-    RunEventType, RunStore, RunTrigger,
+use uuid::Uuid;
+use zupflow_core::ids::{AgentId, InstallationId, OrganizationId, RunId, SessionId, ToolCallId, WorkspaceId};
+use zupflow_core::models::{Completion, ModelToolCall, Reply, TokenUsage};
+use zupflow_core::runs::digest::Sha256Digest;
+use zupflow_core::runs::names::{Candidate, build_offer};
+use zupflow_core::runs::reducer::{
+    Facts, InstallationCheck, Io, ModelAnswer, ModelResult, Plan, SendCheck, SendResult, admit, advance,
 };
+use zupflow_core::runs::state::{CallDecision, CallVerdict, ClaimantId, InvocationId, Snapshot};
+use zupflow_core::runs::store::{Applied, RunStore};
+use zupflow_core::runs::transition::SendOutcome;
+use zupflow_core::runs::{NewRun, RunTrigger};
 use zupflow_core::time::Timestamp;
 
-fn reference(call_id: ToolCallId, target: &CallTarget, more: &[(&str, Value)]) -> Value {
-    let mut data = zupflow_server::run_engine::reference(call_id, target);
-    for (key, value) in more {
-        data.insert((*key).to_owned(), value.clone());
+/// The installation and tool a fixture run calls.
+pub struct Target {
+    pub installation_id: InstallationId,
+    pub installation_short_id: String,
+    pub installation_label: String,
+    pub app_key: String,
+    pub app_name: String,
+    /// The tool's MCP name.
+    pub tool: String,
+    /// The SHA-256 of the tool's pinned definition.
+    pub definition_sha256: Sha256Digest,
+}
+
+/// One run of a fixture: the store, the run, and the worker's claim on it.
+struct Seeding<'a> {
+    runs: &'a dyn RunStore,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    run_id: RunId,
+    claimant: ClaimantId,
+    claim: Option<u64>,
+}
+
+impl Seeding<'_> {
+    async fn snapshot(&self) -> Result<Snapshot, String> {
+        self.runs
+            .find_snapshot(self.organization_id, self.workspace_id, self.run_id)
+            .await
+            .map_err(|error| format!("{error:?}"))?
+            .ok_or_else(|| "the run is gone".to_owned())
     }
-    Value::Object(data)
+
+    fn facts(&self) -> Facts {
+        Facts {
+            claimant: Some(self.claimant),
+            claim: self.claim,
+            ..Facts::at(Timestamp::now())
+        }
+    }
+
+    /// Plans one step with `facts`, applies it, and answers the I/O it allows.
+    async fn step(&mut self, facts: Facts) -> Result<Io, String> {
+        let snapshot = self.snapshot().await?;
+        let plan = advance(&snapshot, &facts).map_err(|error| format!("{error:?}"))?;
+        let Plan::Apply { request, then } = plan else {
+            return Err(format!("nothing to apply: {plan:?}"));
+        };
+        match self
+            .runs
+            .apply(self.organization_id, self.workspace_id, &request)
+            .await
+            .map_err(|error| format!("{error:?}"))?
+        {
+            Applied::Committed(_) => {}
+            Applied::Conflict(conflict) => return Err(format!("{conflict:?}")),
+        }
+        if let zupflow_core::runs::transition::Operation::Claim(claim) = request.operation() {
+            self.claim = Some(claim.epoch);
+        }
+        Ok(then)
+    }
+
+    /// Prepares the next model attempt with `offer`, then commits `reply` as
+    /// its answer, deciding each call `decision`.
+    async fn answer(
+        &mut self,
+        offer: &zupflow_core::runs::names::Offer,
+        reply: Reply,
+        usage: TokenUsage,
+        decision: &CallDecision,
+    ) -> Result<(), String> {
+        let Io::CallModel(asked) = self
+            .step(Facts {
+                offer: Some(offer.clone()),
+                ..self.facts()
+            })
+            .await?
+        else {
+            return Err("the model wasn't asked".to_owned());
+        };
+        let calls = match &reply {
+            Reply::ToolCalls { calls, .. } => calls.len(),
+            Reply::Text(_) => 0,
+        };
+        let decisions = (0..calls)
+            .map(|position| (u32::try_from(position).unwrap_or(u32::MAX), decision.clone()))
+            .collect();
+        self.step(Facts {
+            model: Some(ModelAnswer {
+                turn: asked.turn,
+                attempt: asked.attempt,
+                result: ModelResult::Answered(Completion { reply, usage }),
+            }),
+            decisions,
+            call_ids: (0..calls).map(|_| ToolCallId::generate()).collect(),
+            ..self.facts()
+        })
+        .await?;
+        Ok(())
+    }
 }
 
 /// A run of `agent_id` that called `target`'s tool once: finished, or
@@ -26,14 +128,12 @@ pub async fn seed(
     workspace_id: WorkspaceId,
     agent_id: AgentId,
     model: &str,
-    target: CallTarget,
+    target: Target,
     waiting: bool,
-) -> Result<(), RunError> {
+) -> Result<(), String> {
     let run_id = RunId::generate();
-    let job = zupflow_server::run_engine::job(run_id).ok_or(RunError::Unavailable)?;
-    let input = format!("Use {} to find this week's open items.", target.tool);
-    let now = Timestamp::now;
-    runs.create_run(
+    let tool = target.tool.clone();
+    let admission = admit(
         organization_id,
         workspace_id,
         run_id,
@@ -41,151 +141,124 @@ pub async fn seed(
             agent_id,
             session_id: SessionId::generate(),
             trigger: RunTrigger::Api,
-            input,
+            input: format!("Use {tool} to find this week's open items."),
             model: model.to_owned(),
             instructions: "Be brief.".to_owned(),
         },
-        &[NewRunEvent::new(RunEventType::RunQueued, json!({}))],
-        &job,
-        now(),
-    )
-    .await?;
-    runs.start_run(
+    );
+    runs.apply(organization_id, workspace_id, &admission)
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    let mut seeding = Seeding {
+        runs,
         organization_id,
         workspace_id,
         run_id,
-        &[NewRunEvent::new(RunEventType::RunStarted, json!({ "model": model }))],
-        now(),
-    )
-    .await?;
-    let call_id = ToolCallId::generate();
-    let arguments: Map<String, Value> = [("query".to_owned(), json!("open items"))].into_iter().collect();
-    let said = format!("Calling {}.", target.tool);
+        claimant: ClaimantId::from_uuid(Uuid::now_v7()),
+        claim: None,
+    };
+    seeding.step(seeding.facts()).await?;
+
+    let built = build_offer([Candidate {
+        installation_id: target.installation_id,
+        installation_short_id: target.installation_short_id,
+        installation_label: target.installation_label,
+        app_key: target.app_key,
+        app_name: target.app_name,
+        tool: tool.clone(),
+        description: format!("Use {tool}."),
+        input_schema: json!({ "type": "object" }),
+        definition_sha256: target.definition_sha256,
+    }]);
+    let offered = built
+        .offer
+        .tools()
+        .first()
+        .ok_or_else(|| format!("{tool} can't be offered"))?
+        .name
+        .clone();
     let decision = if waiting {
-        RecordedDecision {
-            verdict: "require_approval".to_owned(),
+        CallDecision {
+            verdict: CallVerdict::RequireApproval {
+                reason: format!("The agent's grant requires approval for {tool}."),
+            },
             policy: "configured".to_owned(),
             mode: Some("manual".to_owned()),
             rule: "grant_requires_approval".to_owned(),
-            reason: Some(format!("The agent's grant requires approval for {}.", target.tool)),
         }
     } else {
-        RecordedDecision {
-            verdict: "allow".to_owned(),
+        CallDecision {
+            verdict: CallVerdict::Allow,
             policy: "configured".to_owned(),
             mode: Some("manual".to_owned()),
             rule: "allowed".to_owned(),
-            reason: None,
         }
     };
-    let first = TokenUsage {
-        input_tokens: 420,
-        output_tokens: 18,
-    };
-    runs.record_turn(
-        organization_id,
-        workspace_id,
-        run_id,
-        0,
-        &NewTurn {
-            text: Some(said.clone()),
-            calls: vec![NewToolCall {
-                id: call_id,
-                model_call_id: "fixture-1".to_owned(),
-                name: target.tool.clone(),
-                target: Some(target.clone()),
-                arguments: arguments.clone(),
-                state: if waiting {
-                    CallState::AwaitingApproval
-                } else {
-                    CallState::Allowed
-                },
-                decision: Some(decision),
-                outcome: None,
-            }],
-            usage: first,
-            finish: None,
-        },
-        &[NewRunEvent::new(
-            RunEventType::MessageAssistant,
-            json!({ "text": said }),
-        )],
-        now(),
-    )
-    .await?;
-    if waiting {
-        runs.request_approval(
-            organization_id,
-            workspace_id,
-            run_id,
-            call_id,
-            &[NewRunEvent::new(
-                RunEventType::ApprovalRequested,
-                reference(call_id, &target, &[("arguments", Value::Object(arguments))]),
-            )],
-            now(),
+    let arguments: Map<String, Value> = [("query".to_owned(), json!("open items"))].into_iter().collect();
+    seeding
+        .answer(
+            &built.offer,
+            Reply::ToolCalls {
+                text: Some(format!("Calling {tool}.")),
+                calls: vec![ModelToolCall {
+                    id: "fixture-1".to_owned(),
+                    name: offered,
+                    arguments,
+                }],
+            },
+            TokenUsage {
+                input_tokens: 420,
+                output_tokens: 18,
+            },
+            &decision,
         )
         .await?;
+    let snapshot = seeding.snapshot().await?;
+    let call = snapshot.calls.first().ok_or("the call isn't recorded")?;
+    if waiting {
+        // Parks on the call: waiting for an API key's decision.
+        seeding.step(seeding.facts()).await?;
         return Ok(());
     }
-    runs.begin_call(
-        organization_id,
-        workspace_id,
-        run_id,
-        call_id,
-        &[NewRunEvent::new(
-            RunEventType::ToolCallStarted,
-            reference(call_id, &target, &[("arguments", Value::Object(arguments))]),
-        )],
-        now(),
-    )
-    .await?;
-    let result = json!({ "content": [{ "type": "text", "text": "3 open items" }] });
-    runs.settle_call(
-        organization_id,
-        workspace_id,
-        run_id,
-        call_id,
-        &[CallState::Started],
-        CallState::Completed,
-        &CallOutcome {
-            content: result.to_string(),
-            is_error: false,
-        },
-        &[NewRunEvent::new(
-            RunEventType::ToolCallCompleted,
-            reference(call_id, &target, &[("result", result), ("duration_ms", json!(640))]),
-        )],
-        now(),
-    )
-    .await?;
-    let output = format!("{}: 3 open items", target.tool);
-    let last = TokenUsage {
-        input_tokens: 510,
-        output_tokens: 12,
+    let Io::SendCall(send) = seeding
+        .step(Facts {
+            send_check: Some(SendCheck {
+                call_id: call.id,
+                installation: InstallationCheck::Usable,
+                definition_sha256: Some(target.definition_sha256),
+                decision: decision.clone(),
+            }),
+            invocation_id: Some(InvocationId::from_uuid(Uuid::now_v7())),
+            ..seeding.facts()
+        })
+        .await?
+    else {
+        return Err("the call wasn't authorized".to_owned());
     };
-    let usage = json!({
-        "input_tokens": first.input_tokens + last.input_tokens,
-        "output_tokens": first.output_tokens + last.output_tokens,
-        "tool_calls": 1,
-    });
-    runs.record_turn(
-        organization_id,
-        workspace_id,
-        run_id,
-        1,
-        &NewTurn {
-            text: Some(output.clone()),
-            calls: Vec::new(),
-            usage: last,
-            finish: Some(Ending::Completed { output: output.clone() }),
-        },
-        &[
-            NewRunEvent::new(RunEventType::MessageAssistant, json!({ "text": output })),
-            NewRunEvent::new(RunEventType::RunCompleted, json!({ "usage": usage })),
-        ],
-        now(),
-    )
-    .await?;
-    Ok(())
+    let result = json!({ "content": [{ "type": "text", "text": "3 open items" }] });
+    let Value::Object(result) = result else {
+        return Err("a result that isn't an object".to_owned());
+    };
+    seeding
+        .step(Facts {
+            sent: Some(SendResult {
+                call_id: send.call_id,
+                attempt: send.attempt,
+                invocation_id: send.invocation_id,
+                outcome: SendOutcome::Completed { result },
+            }),
+            ..seeding.facts()
+        })
+        .await?;
+    seeding
+        .answer(
+            &built.offer,
+            Reply::Text(format!("{tool}: 3 open items")),
+            TokenUsage {
+                input_tokens: 510,
+                output_tokens: 12,
+            },
+            &decision,
+        )
+        .await
 }
