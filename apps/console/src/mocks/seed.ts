@@ -29,6 +29,7 @@ import type {
   Db,
   GrantRow,
   InstallationRow,
+  InstallationShortIdRow,
   OrganizationRow,
   RunRow,
   WorkspaceRow,
@@ -36,10 +37,10 @@ import type {
 import { setLevels, suggestLevels } from "./policy";
 import { mulberry32, type Rng, uuid } from "./random";
 import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
-import { appIn, timelineOf } from "./scope";
+import { appIn, issueShortId, timelineOf } from "./scope";
 import { listedFrom, recordListing } from "./tools";
 
-export const DB_SCHEMA = 23;
+export const DB_SCHEMA = 24;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -159,7 +160,7 @@ export function seed(nowMs: number = Date.now()): Db {
       owner_workspace_id: owner?.id ?? null,
       kind: "mcp",
       name: entry.name,
-      slug: entry.slug,
+      key: entry.key,
       description: entry.description,
       icon: entry.icon,
       auth: entry.auth,
@@ -181,7 +182,7 @@ export function seed(nowMs: number = Date.now()): Db {
     updatedBy: User,
     updatedAgo: number,
   ) => {
-    const entry = Object.values(CATALOG).find((c) => c.slug === app.slug);
+    const entry = Object.values(CATALOG).find((c) => c.key === app.key);
     const oauth = app.auth.type === "oauth2";
     const has = state !== "unconfigured";
     const scopes = app.auth.type === "oauth2" ? app.auth.available_scopes.slice(0, 4).map((s) => s.name) : [];
@@ -234,6 +235,7 @@ export function seed(nowMs: number = Date.now()): Db {
   // --- Installations ----------------------------------------------------------
 
   const installations: InstallationRow[] = [];
+  const installationShortIds: InstallationShortIdRow[] = [];
   const install = (
     ws: WorkspaceRow,
     app: AppRow,
@@ -264,6 +266,7 @@ export function seed(nowMs: number = Date.now()): Db {
       organization_id: org.id,
       workspace_id: ws.id,
       app_id: app.id,
+      short_id: issueShortId(installationShortIds, { organization_id: org.id, workspace_id: ws.id }, rng),
       label,
       status,
       configuration_version: configuration?.version ?? 1,
@@ -463,6 +466,7 @@ export function seed(nowMs: number = Date.now()): Db {
     apps,
     configurations,
     installations,
+    installation_short_ids: installationShortIds,
     installation_tools: [],
     tool_refreshes: [],
     tool_policies: [],
@@ -788,7 +792,7 @@ function seedLevels(
   // Larkspur holds its grant inside its levels too.
   const larkspur = db.organizations.find((o) => o.slug === "larkspur");
   const owner = db.memberships.find((m) => m.organization_id === larkspur?.id && m.role === "owner");
-  const larkspurTaskboard = db.apps.find((a) => a.organization_id === larkspur?.id && a.slug === "taskboard");
+  const larkspurTaskboard = db.apps.find((a) => a.organization_id === larkspur?.id && a.key === "taskboard");
   if (!owner || !larkspurTaskboard) throw new Error("Larkspur's seed is missing");
   setLevels(
     db,
@@ -992,7 +996,7 @@ function seedLarkspur(db: Db, nowMs: number) {
     owner_workspace_id: null,
     kind: "mcp",
     name: entry.name,
-    slug: entry.slug,
+    key: entry.key,
     description: entry.description,
     icon: entry.icon,
     auth: entry.auth,
@@ -1037,6 +1041,7 @@ function seedLarkspur(db: Db, nowMs: number) {
     organization_id: org.id,
     workspace_id: harbor.id,
     app_id: app.id,
+    short_id: issueShortId(db.installation_short_ids, { organization_id: org.id, workspace_id: harbor.id }, rng),
     label: "Engineering",
     status: "connected",
     configuration_version: 1,
@@ -1111,7 +1116,7 @@ function seedLarkspur(db: Db, nowMs: number) {
     owner_workspace_id: harbor.id,
     kind: "mcp",
     name: "Harbor tools",
-    slug: "harbor-tools",
+    key: "harbor_tools",
     description: toolsEntry.description,
     icon: toolsEntry.icon,
     auth: toolsEntry.auth,

@@ -232,6 +232,12 @@ function InstallationPage() {
                   <Property label="Installation ID" className="sm:grid-cols-1 sm:gap-1">
                     <MonoValue value={i.id} />
                   </Property>
+                  <Property label="Short ID" className="sm:grid-cols-1 sm:gap-1">
+                    <MonoValue value={i.short_id} />
+                    <p className="text-xs text-muted-foreground">
+                      Names this installation to agents, with its app's key. Kept across reconnects and renames.
+                    </p>
+                  </Property>
                   <Property label="Workspace" className="sm:grid-cols-1 sm:gap-1">
                     <span className="flex items-center gap-2">
                       {ws.name} <EnvBadge environment={ws.environment} size="sm" />

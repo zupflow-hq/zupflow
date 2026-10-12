@@ -562,8 +562,8 @@ async fn reset(path: &str) -> Result<(), String> {
                 )
             })
             .await
-            .map_err(|error| fail(&app.slug)(&error))?;
-        seeded.push((organization, app.slug.clone(), InstalledApp::Catalog(created.id)));
+            .map_err(|error| fail(&app.key)(&error))?;
+        seeded.push((organization, app.key.clone(), InstalledApp::Catalog(created.id)));
         for (environment, configuration) in [(Environment::Sandbox, sandbox), (Environment::Production, production)] {
             let Some(configuration) = configuration else { continue };
             let changes = configuration
@@ -583,20 +583,20 @@ async fn reset(path: &str) -> Result<(), String> {
                 },
             )
             .await
-            .map_err(|error| fail(&app.slug)(&error))?;
+            .map_err(|error| fail(&app.key)(&error))?;
         }
     }
     for (organization, workspace, app) in [
         (
             northwind.id,
             "acme",
-            fixture_apps::publishing("Acme Publishing", "AP", "acme-publishing", "cms.acme.example")?,
+            fixture_apps::publishing("Acme Publishing", "AP", "acme_publishing", "cms.acme.example")?,
         ),
         (northwind.id, "qa-playground", fixture_apps::echo_server()?),
         (
             larkspur.id,
             "harbor",
-            fixture_apps::publishing("Harbor Publishing", "HP", "harbor-publishing", "cms.harbor.example")?,
+            fixture_apps::publishing("Harbor Publishing", "HP", "harbor_publishing", "cms.harbor.example")?,
         ),
     ] {
         let (workspace, environment) = workspace_id(workspace)?;
@@ -609,10 +609,11 @@ async fn reset(path: &str) -> Result<(), String> {
                 )
             })
             .await
-            .map_err(|error| fail(&app.slug)(&error))?;
-        seeded.push((organization, app.slug.clone(), InstalledApp::Workspace(created.id)));
+            .map_err(|error| fail(&app.key)(&error))?;
+        seeded.push((organization, app.key.clone(), InstalledApp::Workspace(created.id)));
         // Token apps: ready with a server alone.
-        let changes = ready(&format!("https://{}.example/mcp", app.slug), false)
+        // Hosts keep the hyphens a key can't have.
+        let changes = ready(&format!("https://{}.example/mcp", app.key.replace('_', "-")), false)
             .changes(&sealing, organization, Some(workspace), environment, created.id)
             .await?;
         apps.save_workspace_configuration(organization, workspace, created.id, &changes, &|_: &Configuration| {
@@ -623,7 +624,7 @@ async fn reset(path: &str) -> Result<(), String> {
             )
         })
         .await
-        .map_err(|error| fail(&app.slug)(&error))?;
+        .map_err(|error| fail(&app.key)(&error))?;
     }
 
     // Connected installations, each with its credential sealed as Connect seals it.
@@ -646,25 +647,25 @@ async fn reset(path: &str) -> Result<(), String> {
         }
     };
     let mut installed: Vec<(OrganizationId, WorkspaceId, InstallationId, &str)> = Vec::new();
-    for (organization, workspace, slug, label) in [
-        (northwind.id, "acme", "google-workspace", "Marketing"),
-        (northwind.id, "beta-labs", "google-workspace", "Google"),
+    for (organization, workspace, key, label) in [
+        (northwind.id, "acme", "google_workspace", "Marketing"),
+        (northwind.id, "beta-labs", "google_workspace", "Google"),
         (northwind.id, "acme-sandbox", "taskboard", "Engineering"),
-        (northwind.id, "qa-playground", "echo-server", "Echo"),
+        (northwind.id, "qa-playground", "echo_server", "Echo"),
         (larkspur.id, "harbor", "taskboard", "Harbor"),
     ] {
         let (workspace, environment) = workspace_id(workspace)?;
         let app = seeded
             .iter()
-            .find(|(owner, seeded, _)| *owner == organization && seeded == slug)
+            .find(|(owner, seeded, _)| *owner == organization && seeded == key)
             .map(|(_, _, app)| *app)
-            .ok_or_else(|| format!("app {slug}"))?;
+            .ok_or_else(|| format!("app {key}"))?;
         let found = match app {
             InstalledApp::Catalog(id) => apps.find_organization_app(organization, id).await,
             InstalledApp::Workspace(id) => apps.find_workspace_app(organization, workspace, id).await,
         }
-        .map_err(|error| fail(slug)(&error))?
-        .ok_or_else(|| format!("app {slug}"))?;
+        .map_err(|error| fail(key)(&error))?
+        .ok_or_else(|| format!("app {key}"))?;
         let installation_id = InstallationId::generate();
         let installation = fixture_apps::installation(
             &sealing,
@@ -756,10 +757,10 @@ async fn reset(path: &str) -> Result<(), String> {
     // `acme`'s grants hold stays inside them; `list_events` stays suggested.
     // Taskboard's confirmed levels exercise policy independently of hints;
     // no seeded grant includes its destructive delete_task tool.
-    for (organization, slug, writer, levels) in [
+    for (organization, key, writer, levels) in [
         (
             northwind.id,
-            "google-workspace",
+            "google_workspace",
             owner.id,
             &[
                 ("search_files", ToolLevel::Allow),
@@ -788,10 +789,10 @@ async fn reset(path: &str) -> Result<(), String> {
     ] {
         let Some(InstalledApp::Catalog(app)) = seeded
             .iter()
-            .find(|(owner, seeded, _)| *owner == organization && *seeded == slug)
+            .find(|(owner, seeded, _)| *owner == organization && *seeded == key)
             .map(|(_, _, app)| *app)
         else {
-            return Err(format!("catalog app {slug}"));
+            return Err(format!("catalog app {key}"));
         };
         let levels: Vec<(String, ToolLevel)> = levels
             .iter()
@@ -807,7 +808,7 @@ async fn reset(path: &str) -> Result<(), String> {
                 &|_: &Vec<AppToolLevel>| {
                     by_fixture(
                         AuditAction::AppToolLevelsUpdated,
-                        AuditTarget::new(AuditObject::App(app), slug),
+                        AuditTarget::new(AuditObject::App(app), key),
                         AuditPlace::Organization,
                     )
                 },
@@ -1051,17 +1052,17 @@ async fn reset(path: &str) -> Result<(), String> {
             .await
             .map_err(|error| fail("connect settings")(&error))?;
     }
-    for (organization, workspace, slug) in [
-        (northwind.id, "acme", "google-workspace"),
-        (northwind.id, "beta-labs", "google-workspace"),
+    for (organization, workspace, key) in [
+        (northwind.id, "acme", "google_workspace"),
+        (northwind.id, "beta-labs", "google_workspace"),
         (larkspur.id, "harbor", "taskboard"),
     ] {
         let (workspace, environment) = workspace_id(workspace)?;
         let app = seeded
             .iter()
-            .find(|(owner, seeded, _)| *owner == organization && seeded == slug)
+            .find(|(owner, seeded, _)| *owner == organization && seeded == key)
             .map(|(_, _, app)| *app)
-            .ok_or_else(|| format!("app {slug}"))?;
+            .ok_or_else(|| format!("app {key}"))?;
         let reference = Reference::generate().map_err(|error| fail("reference")(&error))?;
         connect
             .create_session(

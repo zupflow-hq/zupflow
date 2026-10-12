@@ -86,7 +86,8 @@ export interface AppRow {
   owner_workspace_id: WorkspaceId | null;
   kind: AppKind;
   name: string;
-  slug: string;
+  /** Snake case, fixed once created (decision 0047). */
+  key: string;
   description: string;
   icon: AppIcon;
   auth: AuthTemplate;
@@ -121,12 +122,21 @@ export interface InstallationRow {
   organization_id: OrganizationId;
   workspace_id: WorkspaceId;
   app_id: AppId;
+  /** Unique in its workspace, kept for the installation's life (decision 0047). */
+  short_id: string;
   label: string;
   status: InstallationStatus;
   configuration_version: number;
   connection: AccountConnection | null;
   created_at: string;
   updated_at: string;
+}
+
+/** A short ID issued in a workspace. Natural key (organization_id, workspace_id, short_id). */
+export interface InstallationShortIdRow {
+  organization_id: OrganizationId;
+  workspace_id: WorkspaceId;
+  short_id: string;
 }
 
 /**
@@ -348,6 +358,12 @@ export interface Db {
   apps: AppRow[];
   configurations: ConfigurationRow[];
   installations: InstallationRow[];
+  /**
+   * Every short ID an installation was ever given, under its workspace's full
+   * scope. Rows outlive their installation, so a short ID is never issued
+   * twice in a workspace.
+   */
+  installation_short_ids: InstallationShortIdRow[];
   /** Each installation's discovered tools, under the installation's full scope. */
   installation_tools: InstallationToolRow[];
   /** When each installation's tools may next be refreshed, under the installation's full scope. */

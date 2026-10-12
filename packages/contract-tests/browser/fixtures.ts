@@ -147,7 +147,7 @@ async function start(mode: Mode): Promise<{ stack: Stack; dispose(): Promise<voi
       const app = await owner.organizationApps.create(fixture.organization, {
         kind: "mcp",
         name: "Taskboard",
-        slug: "taskboard-live",
+        key: "taskboard_live",
         description: "Tasks for local browser tests.",
         auth_type: "mcp_oauth",
       });

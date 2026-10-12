@@ -113,8 +113,11 @@ function InstallationsPage() {
                       <div className="flex items-center gap-3">
                         <AppIcon icon={i.app.icon} />
                         <div className="min-w-0">
-                          <p className="truncate font-medium">{i.label}</p>
-                          <p className="text-xs text-muted-foreground">
+                          <p className="flex min-w-0 items-baseline gap-2">
+                            <span className="truncate font-medium">{i.label}</span>
+                            <span className="shrink-0 font-mono text-xs text-muted-foreground">{i.short_id}</span>
+                          </p>
+                          <p className="truncate text-xs text-muted-foreground">
                             {i.app.name}
                             {i.app.owner_scope === "workspace" ? " · workspace app" : ""}
                           </p>

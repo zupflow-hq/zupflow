@@ -10,26 +10,26 @@ use axum::http::{Method, StatusCode};
 use common::{Server, call, code};
 use serde_json::{Value, json};
 
-fn app(slug: &str, auth_type: &str) -> Value {
-    json!({ "kind": "mcp", "name": "Tools", "slug": slug, "description": "  Internal tools.  ", "auth_type": auth_type })
+fn app(key: &str, auth_type: &str) -> Value {
+    json!({ "kind": "mcp", "name": "Tools", "key": key, "description": "  Internal tools.  ", "auth_type": auth_type })
 }
 
 /// Creates a catalog app as `user`; its body.
-async fn catalog_app(server: &Server, user: &str, org: &str, slug: &str) -> Value {
+async fn catalog_app(server: &Server, user: &str, org: &str, key: &str) -> Value {
     let (status, body) = server
-        .send(call(user, Method::POST, format!("/v1/organizations/{org}/apps")).body(app(slug, "token")))
+        .send(call(user, Method::POST, format!("/v1/organizations/{org}/apps")).body(app(key, "token")))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     body["data"].clone()
 }
 
 /// Creates a workspace app as `user`; its body.
-async fn workspace_app(server: &Server, user: &str, org: &str, ws: &str, slug: &str) -> Value {
+async fn workspace_app(server: &Server, user: &str, org: &str, ws: &str, key: &str) -> Value {
     let (status, body) = server
         .send(
             call(user, Method::POST, format!("/v1/workspaces/{ws}/apps"))
                 .naming(org)
-                .body(app(slug, "token")),
+                .body(app(key, "token")),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -56,7 +56,7 @@ async fn keeps_a_catalog_of_apps_in_both_environments() {
         (&json!("organization"), &Value::Null)
     );
     assert_eq!(
-        (&created["kind"], &created["slug"], &created["description"]),
+        (&created["kind"], &created["key"], &created["description"]),
         (&json!("mcp"), &json!("linear"), &json!("Internal tools.")),
         "the description is trimmed"
     );
@@ -94,14 +94,14 @@ async fn keeps_a_catalog_of_apps_in_both_environments() {
         (
             &updated["data"]["name"],
             &updated["data"]["description"],
-            &updated["data"]["slug"]
+            &updated["data"]["key"]
         ),
         (&json!("Linear"), &json!(""), &json!("linear"))
     );
     let (_, untouched) = server.send(call("alice", Method::PATCH, &path).body(json!({}))).await;
     assert_eq!(untouched["data"]["name"], "Linear", "an empty update changes nothing");
 
-    catalog_app(&server, "alice", &org, "acme-tools").await;
+    catalog_app(&server, "alice", &org, "acme_tools").await;
     let (status, list) = server
         .send(call("alice", Method::GET, format!("/v1/organizations/{org}/apps")))
         .await;
@@ -110,15 +110,23 @@ async fn keeps_a_catalog_of_apps_in_both_environments() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|app| app["slug"].as_str().unwrap())
+        .map(|app| app["key"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["linear", "acme-tools"], "by name: Linear, then Tools");
+    assert_eq!(names, ["linear", "acme_tools"], "by name: Linear, then Tools");
 
     let (status, taken) = server
         .send(call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(app("linear", "token")))
         .await;
-    assert_eq!((status, code(&taken)), (StatusCode::CONFLICT, "slug_taken"));
-    assert_eq!(taken["error"]["fields"]["slug"], "Already used by another app here.");
+    assert_eq!((status, code(&taken)), (StatusCode::CONFLICT, "app_key_taken"));
+    assert_eq!(
+        taken["error"]["fields"]["key"],
+        "Already used by another app. Choose another."
+    );
+    // The key is fixed once created: the update input has none, and one sent anyway changes nothing.
+    let (status, kept) = server
+        .send(call("alice", Method::PATCH, &path).body(json!({ "key": "renamed" })))
+        .await;
+    assert_eq!((status, &kept["data"]["key"]), (StatusCode::OK, &json!("linear")));
 }
 
 #[tokio::test]
@@ -131,7 +139,7 @@ async fn checks_what_an_app_is_created_with() {
     assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "validation_failed"));
     let fields = body["error"]["fields"].as_object().unwrap();
     let named: Vec<&str> = fields.keys().map(String::as_str).collect();
-    assert_eq!(named, ["auth_type", "description", "kind", "name", "slug"]);
+    assert_eq!(named, ["auth_type", "description", "key", "kind", "name"]);
     assert_eq!(
         fields["auth_type"],
         "Choose OAuth, sign-in through the MCP server, or token."
@@ -139,14 +147,14 @@ async fn checks_what_an_app_is_created_with() {
 
     let mut wrong = app("ok", "basic");
     wrong["description"] = json!("x".repeat(281));
-    wrong["slug"] = json!("Not A Slug");
+    wrong["key"] = json!("Not A Key");
     let (_, body) = server.send(call("alice", Method::POST, &path).body(wrong)).await;
     assert_eq!(
         body["error"]["fields"],
         json!({
             "auth_type": "Choose OAuth, sign-in through the MCP server, or token.",
             "description": "Use 280 characters or fewer.",
-            "slug": "Use 1–40 lowercase letters, numbers and hyphens.",
+            "key": "Use lowercase letters, numbers and single underscores, starting with a letter.",
         })
     );
 
@@ -157,7 +165,48 @@ async fn checks_what_an_app_is_created_with() {
     assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "unsupported_app_kind"));
     assert_eq!(body["error"]["fields"]["kind"], "Only \"mcp\" is supported.");
 
-    let mut token = app("token-app", "token");
+    // Snake case, 1 to 24 characters, starting with a letter (decision 0047).
+    for (key, message) in [
+        (
+            "",
+            "Use lowercase letters, numbers and single underscores, starting with a letter.",
+        ),
+        (
+            "kebab-case",
+            "Use lowercase letters, numbers and single underscores, starting with a letter.",
+        ),
+        (
+            "_lead",
+            "Use lowercase letters, numbers and single underscores, starting with a letter.",
+        ),
+        (
+            "trail_",
+            "Use lowercase letters, numbers and single underscores, starting with a letter.",
+        ),
+        (
+            "two__parts",
+            "Use lowercase letters, numbers and single underscores, starting with a letter.",
+        ),
+        (
+            "9lives",
+            "Use lowercase letters, numbers and single underscores, starting with a letter.",
+        ),
+        ("abcdefghijklmnopqrstuvwxy", "Use 24 characters or fewer."),
+    ] {
+        let (status, body) = server
+            .send(call("alice", Method::POST, &path).body(app(key, "token")))
+            .await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::BAD_REQUEST, "validation_failed"),
+            "{key}"
+        );
+        assert_eq!(body["error"]["fields"], json!({ "key": message }), "{key}");
+    }
+    let longest = catalog_app(&server, "alice", &org, "abcdefghijklmnopqrstuvwx").await;
+    assert_eq!(longest["key"], "abcdefghijklmnopqrstuvwx");
+
+    let mut token = app("token_app", "token");
     token["name"] = json!("échos");
     let (status, body) = server.send(call("alice", Method::POST, &path).body(token)).await;
     assert_eq!(status, StatusCode::CREATED);
@@ -228,8 +277,8 @@ async fn lets_admins_manage_apps_and_every_member_read_them() {
             assert_eq!(status, StatusCode::OK, "{user} reads {path}");
         }
     }
-    catalog_app(&server, "dana", &org, "dana-tools").await;
-    workspace_app(&server, "dana", &org, ws, "dana-tools").await;
+    catalog_app(&server, "dana", &org, "dana_tools").await;
+    workspace_app(&server, "dana", &org, ws, "dana_own_tools").await;
 }
 
 #[tokio::test]
@@ -298,17 +347,37 @@ async fn keeps_workspace_apps_in_their_own_workspace() {
         .await;
     assert_eq!(listed(&in_catalog), [id(&catalog)]);
 
-    // Slugs are unique per owner: the catalog and the other workspace may reuse it.
-    workspace_app(&server, "alice", &org, two, "echo").await;
-    catalog_app(&server, "alice", &org, "echo").await;
-    let (status, body) = server
-        .send(
-            call("alice", Method::POST, format!("/v1/workspaces/{one}/apps"))
-                .naming(&org)
-                .body(app("echo", "token")),
-        )
+    // One key space for the whole organization (decision 0047): a key one
+    // workspace holds is taken in every other and in the catalog, and a
+    // catalog key in every workspace. The conflict never says where.
+    let create_in = |workspace: &str, key: &str| {
+        call("alice", Method::POST, format!("/v1/workspaces/{workspace}/apps"))
+            .naming(&org)
+            .body(app(key, "token"))
+    };
+    let mut refusals = Vec::new();
+    for (workspace, key) in [(one, "echo"), (two, "echo"), (two, "linear")] {
+        refusals.push(server.send(create_in(workspace, key)).await);
+    }
+    refusals.push(
+        server
+            .send(call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(app("echo", "token")))
+            .await,
+    );
+    for (status, body) in &refusals {
+        assert_eq!((*status, code(body)), (StatusCode::CONFLICT, "app_key_taken"));
+        assert_eq!(body["error"], refusals[0].1["error"], "every conflict reads the same");
+    }
+    let (_, in_two) = server
+        .send(call("alice", Method::GET, format!("/v1/workspaces/{two}/apps")).naming(&org))
         .await;
-    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "slug_taken"));
+    assert!(
+        in_two["data"].as_array().unwrap().is_empty(),
+        "nothing refused was kept"
+    );
+    // Another organization's keys never count.
+    let other = server.organization("riley", "larkspur").await;
+    catalog_app(&server, "riley", &other, "echo").await;
 }
 
 #[tokio::test]
@@ -483,15 +552,16 @@ async fn keeps_an_idempotency_key_to_its_workspace() {
     let org = server.organization("alice", "northwind").await;
     let one = server.workspace("alice", &org, "one", "sandbox").await;
     let two = server.workspace("alice", &org, "two", "sandbox").await;
-    let post = |ws: &str| {
+    // Keys are unique across the organization, so each workspace's app has its own.
+    let post = |ws: &str, key: &str| {
         call("alice", Method::POST, format!("/v1/workspaces/{ws}/apps"))
             .naming(&org)
             .idempotent("same-key")
-            .body(app("echo", "token"))
+            .body(app(key, "token"))
     };
     let (one, two) = (one["id"].as_str().unwrap(), two["id"].as_str().unwrap());
-    let first = server.send(post(one)).await;
-    let other = server.send(post(two)).await;
+    let first = server.send(post(one, "echo_one")).await;
+    let other = server.send(post(two, "echo_two")).await;
     assert_eq!((first.0, other.0), (StatusCode::CREATED, StatusCode::CREATED));
     assert_ne!(
         id(&first.1["data"]),
@@ -499,7 +569,7 @@ async fn keeps_an_idempotency_key_to_its_workspace() {
         "each workspace made its own"
     );
     assert_eq!(other.1["data"]["owner_workspace_id"], two);
-    let again = server.send(post(one)).await;
+    let again = server.send(post(one, "echo_one")).await;
     assert_eq!(again, first, "a replay in the first workspace");
 }
 

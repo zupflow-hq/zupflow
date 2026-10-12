@@ -32,7 +32,7 @@ async fn catalog_token_app(server: &Server, org: &str) -> String {
     let (_, created) = server
         .send(
             call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(json!({
-                "kind": "mcp", "name": "Tools", "slug": "tools", "description": "", "auth_type": "token",
+                "kind": "mcp", "name": "Tools", "key": "tools", "description": "", "auth_type": "token",
             })),
         )
         .await;
@@ -577,7 +577,7 @@ async fn refuses_a_second_refresh_within_a_minute() {
     assert_eq!(queued_discoveries(&server).await, 1, "only the first was queued");
 
     // Pacing is per installation: another one in the same workspace refreshes.
-    let app = catalog_token_app_named(&server, &org, "other-tools").await;
+    let app = catalog_token_app_named(&server, &org, "other_tools").await;
     let other = connect_token(&server, "alice", &org, &sandbox, &app, "tk_other_1234").await;
     let (status, body) = server
         .send(call("alice", Method::POST, refresh_path(&sandbox, &other)).naming(&org))
@@ -586,11 +586,11 @@ async fn refuses_a_second_refresh_within_a_minute() {
 }
 
 /// A second catalog token app, so a workspace can hold two installations.
-async fn catalog_token_app_named(server: &Server, org: &str, slug: &str) -> String {
+async fn catalog_token_app_named(server: &Server, org: &str, key: &str) -> String {
     let (_, created) = server
         .send(
             call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(json!({
-                "kind": "mcp", "name": "Other", "slug": slug, "description": "", "auth_type": "token",
+                "kind": "mcp", "name": "Other", "key": key, "description": "", "auth_type": "token",
             })),
         )
         .await;

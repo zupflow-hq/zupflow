@@ -14,8 +14,8 @@ use axum::response::Response;
 use axum::routing::get;
 use serde::Serialize;
 use zupflow_core::apps::{
-    App, AppChanges, AppError, AppIcon, AppKind, AuthTemplate, AuthType, Configuration, ConfigurationStatus, NewApp,
-    ToolDefinition,
+    APP_KEY_MAX, App, AppChanges, AppError, AppIcon, AppKind, AuthTemplate, AuthType, Configuration,
+    ConfigurationStatus, NewApp, ToolDefinition, is_app_key,
 };
 use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::environment::Environment;
@@ -28,7 +28,7 @@ use crate::auth::{Access, AppState, Caller, WorkspaceAccess};
 use crate::auth_templates::checked_auth_template;
 use crate::http::{Failure, envelope};
 use crate::input::{Body, Fields, Object};
-use crate::organizations::{checked_name, checked_slug};
+use crate::organizations::checked_name;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -88,7 +88,7 @@ pub(crate) struct AppView {
     owner_scope: OwnerScope,
     kind: AppKind,
     name: String,
-    slug: String,
+    key: String,
     description: String,
     icon: AppIcon,
     auth: AuthTemplate,
@@ -136,7 +136,7 @@ pub(crate) fn view(
         owner_workspace_id: app.owner_workspace_id,
         kind: app.kind,
         name: app.name,
-        slug: app.slug,
+        key: app.key,
         description: app.description,
         icon: app.icon,
         auth: app.auth,
@@ -211,9 +211,17 @@ pub(crate) fn app_failure(error: AppError) -> Failure {
             "The client secret changed while this request ran. Try again.",
         )
         .into(),
-        AppError::SlugTaken => {
-            let mut error = ApiError::new(409, "slug_taken", "That slug is already used by another app.");
-            error.fields = Some([("slug".to_owned(), "Already used by another app here.".to_owned())].into());
+        // One key space per organization (decision 0047): the answer never
+        // says whether the catalog or which workspace holds the key.
+        AppError::KeyTaken => {
+            let mut error = ApiError::new(409, "app_key_taken", "That key is already used by another app.");
+            error.fields = Some(
+                [(
+                    "key".to_owned(),
+                    "Already used by another app. Choose another.".to_owned(),
+                )]
+                .into(),
+            );
             error.into()
         }
         // The store has logged the cause.
@@ -243,6 +251,24 @@ fn checked_description(value: Option<String>, fields: &mut Fields) -> Option<Str
     }
 }
 
+/// An app's key (decision 0047): snake case, 1 to 24 characters, starting
+/// with a letter. It can't be changed later, so the update input has none.
+fn checked_key(value: Option<String>, fields: &mut Fields) -> Option<String> {
+    let key = value?;
+    if key.chars().count() > APP_KEY_MAX {
+        fields.invalid("key", "Use 24 characters or fewer.");
+        None
+    } else if !is_app_key(&key) {
+        fields.invalid(
+            "key",
+            "Use lowercase letters, numbers and single underscores, starting with a letter.",
+        );
+        None
+    } else {
+        Some(key)
+    }
+}
+
 /// What a missing or unknown `auth_type` is told.
 const AUTH_TYPES: &str = "Choose OAuth, sign-in through the MCP server, or token.";
 
@@ -252,7 +278,7 @@ fn new_app(body: &Object) -> Result<NewApp, Failure> {
     let mut fields = Fields::default();
     let kind = body.string("kind", &mut fields);
     let name = checked_name(body.string("name", &mut fields), &mut fields);
-    let slug = checked_slug(body.string("slug", &mut fields), &mut fields);
+    let key = checked_key(body.string("key", &mut fields), &mut fields);
     let description = checked_description(body.string("description", &mut fields), &mut fields);
     let auth_type = body.optional_string("auth_type", &mut fields).and_then(|value| {
         let parsed = AuthType::parse(&value);
@@ -265,8 +291,8 @@ fn new_app(body: &Object) -> Result<NewApp, Failure> {
         fields.invalid("auth_type", AUTH_TYPES);
     }
     fields.finish()?;
-    let (Some(kind), Some(name), Some(slug), Some(description), Some(auth_type)) =
-        (kind, name, slug, description, auth_type)
+    let (Some(kind), Some(name), Some(key), Some(description), Some(auth_type)) =
+        (kind, name, key, description, auth_type)
     else {
         return Err(ApiError::internal().into());
     };
@@ -279,7 +305,7 @@ fn new_app(body: &Object) -> Result<NewApp, Failure> {
         error.fields = Some([("kind".to_owned(), "Only \"mcp\" is supported.".to_owned())].into());
         return Err(error.into());
     }
-    Ok(NewApp::blank(name, slug, description, auth_type))
+    Ok(NewApp::blank(name, key, description, auth_type))
 }
 
 /// `UpdateAppInput`, checked against the app as it is: a name and a

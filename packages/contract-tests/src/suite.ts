@@ -15,8 +15,11 @@ import {
   type CreateConnectSessionInput,
   createClient,
   createHttpTransport,
+  type InstallationId,
   type MemberId,
   type OrganizationId,
+  type UpdateAppInput,
+  type UpdateInstallationInput,
   type WebhookDeliveryId,
   type WebhookDeliverySummary,
   type WebhookEndpoint,
@@ -140,7 +143,7 @@ export function contractSuite(target: Target) {
         await owner.workspaceApps.create(beta.id, {
           kind: "mcp",
           name: "Beta tools",
-          slug: "beta-tools",
+          key: "beta_tools",
           description: "",
           auth_type: "token",
         });
@@ -224,14 +227,14 @@ export function contractSuite(target: Target) {
         // Apps, at both levels, including OAuth apps that have no endpoints yet.
         const oauthApp = { kind: "mcp", description: "", auth_type: "oauth2" } as const;
         await owner.organizationApps.list(org);
-        const orgApp = await owner.organizationApps.create(org, { ...oauthApp, name: "Org OAuth", slug: "org-oauth" });
+        const orgApp = await owner.organizationApps.create(org, { ...oauthApp, name: "Org OAuth", key: "org_oauth" });
         await owner.organizationApps.get(org, orgApp.id);
         await owner.organizationApps.update(org, orgApp.id, { description: "Changed" });
         await owner.workspaceApps.list(workspace.id);
         const wsApp = await owner.workspaceApps.create(workspace.id, {
           ...oauthApp,
           name: "WS OAuth",
-          slug: "ws-oauth",
+          key: "ws_oauth",
         });
         await owner.workspaceApps.get(workspace.id, wsApp.id);
         await owner.workspaceApps.update(workspace.id, wsApp.id, { description: "Changed" });
@@ -783,12 +786,53 @@ export function contractSuite(target: Target) {
             // @ts-expect-error: the contract only accepts "mcp"
             kind: "openapi",
             name: "Other",
-            slug: "other",
+            key: "other",
             description: "",
             auth_type: "token",
           }),
         );
         expect(error.code).toBe("unsupported_app_kind");
+      });
+
+      it("takes a snake-case app key of 1 to 24 characters and never changes it", async () => {
+        const create = (key: string, workspace = false) => {
+          const input = { kind: "mcp", name: "Keyed", key, description: "", auth_type: "token" } as const;
+          return workspace
+            ? owner.workspaceApps.create(fx.workspaces.qaPlayground.id, input)
+            : owner.organizationApps.create(fx.organization, input);
+        };
+        for (const key of ["", "Keyed", "keyed-app", "_keyed", "keyed_", "keyed__app", "1keyed", "a".repeat(25)]) {
+          for (const workspace of [false, true]) {
+            const error = await failure(create(key, workspace));
+            expect([error.status, error.code, Object.keys(error.fields ?? {})], key).toEqual([
+              400,
+              "validation_failed",
+              ["key"],
+            ]);
+          }
+        }
+        const longest = await create(`k${"7".repeat(23)}`);
+        expect(longest.key).toBe(`k${"7".repeat(23)}`);
+        const catalog = await create("keyed_app2");
+        const own = await create("keyed_app3", true);
+        // The update input has no key: one sent anyway changes nothing.
+        const renamed = await owner.organizationApps.update(fx.organization, catalog.id, {
+          name: "Renamed",
+          key: "changed",
+        } as UpdateAppInput);
+        expect([renamed.name, renamed.key]).toEqual(["Renamed", "keyed_app2"]);
+        expect((await owner.organizationApps.get(fx.organization, catalog.id)).key).toBe("keyed_app2");
+        const ownRenamed = await owner.workspaceApps.update(fx.workspaces.qaPlayground.id, own.id, {
+          name: "Renamed",
+          key: "changed",
+        } as UpdateAppInput);
+        expect(ownRenamed.key).toBe("keyed_app3");
+        // Installations name their app by its key too.
+        const echo = must(
+          (await owner.installations.list(fx.workspaces.qaPlayground.id)).find((i) => i.app.id === fx.apps.echoServer),
+          "echo installation",
+        );
+        expect(echo.app.key).toBe("echo_server");
       });
 
       it("refuses an unknown environment filter on an app's installations", async () => {
@@ -872,11 +916,11 @@ export function contractSuite(target: Target) {
           available_scopes: [{ name: "read", description: "Read everything" }],
           pkce: true,
         };
-        const newOAuthApp = (slug: string) =>
+        const newOAuthApp = (key: string) =>
           owner.organizationApps.create(fx.organization, {
             kind: "mcp",
             name: "Provider",
-            slug,
+            key,
             description: "",
             auth_type: "oauth2",
           });
@@ -910,7 +954,7 @@ export function contractSuite(target: Target) {
         });
 
         it("refuses unsafe or ambiguous configured issuers without changing the app", async () => {
-          const app = await newOAuthApp("issuer-validation");
+          const app = await newOAuthApp("issuer_validation");
           for (const [issuer, status, code] of [
             ["", 400, "validation_failed"],
             ["not a URL", 400, "validation_failed"],
@@ -949,7 +993,7 @@ export function contractSuite(target: Target) {
         });
 
         it("validates an issuer's shape before scope conflicts and URL policy", async () => {
-          const app = await newOAuthApp("issuer-validation-order");
+          const app = await newOAuthApp("issuer_validation_order");
           await owner.organizationApps.update(fx.organization, app.id, { auth: oauthTemplate });
           await owner.organizationApps.updateConfiguration(fx.organization, app.id, "sandbox", {
             oauth_scopes: ["read"],
@@ -995,11 +1039,11 @@ export function contractSuite(target: Target) {
         it("keeps configured issuers inside their organization and workspace", async () => {
           const ws = fx.workspaces.qaPlayground.id;
           const sibling = fx.workspaces.acmeSandbox.id;
-          const catalog = await newOAuthApp("issuer-catalog");
+          const catalog = await newOAuthApp("issuer_catalog");
           const own = await owner.workspaceApps.create(ws, {
             kind: "mcp",
             name: "Provider",
-            slug: "issuer-workspace",
+            key: "issuer_workspace",
             description: "",
             auth_type: "oauth2",
           });
@@ -1029,7 +1073,7 @@ export function contractSuite(target: Target) {
           const app = await owner.workspaceApps.create(ws, {
             kind: "mcp",
             name: "Tools",
-            slug: "templated-tools",
+            key: "templated_tools",
             description: "",
             auth_type: "token",
           });
@@ -1092,7 +1136,7 @@ export function contractSuite(target: Target) {
           const app = await owner.workspaceApps.create(ws, {
             kind: "mcp",
             name: "Hosty",
-            slug: "hosty",
+            key: "hosty",
             description: "",
             auth_type: "token",
           });
@@ -1120,7 +1164,7 @@ export function contractSuite(target: Target) {
           const app = await owner.workspaceApps.create(ws, {
             kind: "mcp",
             name: "Patterned",
-            slug: "patterned",
+            key: "patterned",
             description: "",
             auth_type: "token",
           });
@@ -1179,9 +1223,9 @@ export function contractSuite(target: Target) {
           const catalog = await owner.organizationApps.create(fx.organization, {
             ...signIn,
             name: "Ledger",
-            slug: "ledger",
+            key: "ledger",
           });
-          const own = await owner.workspaceApps.create(ws, { ...signIn, name: "Ledger", slug: "ledger" });
+          const own = await owner.workspaceApps.create(ws, { ...signIn, name: "Ledger", key: "ledger_own" });
           for (const app of [catalog, own]) {
             expect(app.auth).toEqual({ type: "mcp_oauth", scopes: [], identity_url: null });
           }
@@ -1218,7 +1262,7 @@ export function contractSuite(target: Target) {
           const app = await owner.organizationApps.create(fx.organization, {
             ...signIn,
             name: "Ledger",
-            slug: "ledger-ready",
+            key: "ledger_ready",
           });
           const blank = await owner.organizationApps.getConfiguration(fx.organization, app.id, "sandbox");
           expect([blank.status, blank.missing, blank.oauth]).toEqual(["unconfigured", ["mcp_server_url"], null]);
@@ -1245,9 +1289,9 @@ export function contractSuite(target: Target) {
           const catalog = await owner.organizationApps.create(fx.organization, {
             ...signIn,
             name: "Ledger",
-            slug: "ledger-identity",
+            key: "ledger_identity",
           });
-          const own = await owner.workspaceApps.create(ws, { ...signIn, name: "Ledger", slug: "ledger-identity" });
+          const own = await owner.workspaceApps.create(ws, { ...signIn, name: "Ledger", key: "ledger_identity_own" });
           await owner.organizationApps.updateConfiguration(fx.organization, catalog.id, "sandbox", {
             mcp_server_url: "https://ledger.provider.example/mcp",
           });
@@ -1286,7 +1330,7 @@ export function contractSuite(target: Target) {
           const app = await owner.organizationApps.create(fx.organization, {
             ...signIn,
             name: "Ledger",
-            slug: "ledger-scopes",
+            key: "ledger_scopes",
           });
           await owner.organizationApps.update(fx.organization, app.id, {
             auth: {
@@ -1462,15 +1506,74 @@ export function contractSuite(target: Target) {
         ).toBe(404);
       });
 
-      it("keeps app slugs unique within their owner: the catalog or one workspace", async () => {
-        const app = { kind: "mcp", name: "Tools", slug: "shared-tools", description: "", auth_type: "token" } as const;
-        await owner.workspaceApps.create(fx.workspaces.qaPlayground.id, app);
-        // Another workspace, and the catalog, may use the same slug.
-        await owner.workspaceApps.create(fx.workspaces.acmeSandbox.id, app);
-        await owner.organizationApps.create(fx.organization, app);
-        const taken = await failure(owner.workspaceApps.create(fx.workspaces.qaPlayground.id, app));
-        expect(taken.status).toBe(409);
-        expect(taken.code).toBe("slug_taken");
+      it("keeps app keys unique across the organization, and every conflict the same", async () => {
+        const acme = await northwind();
+        const beta = await betaLabs();
+        const harbor = await larkspur();
+        const outsider = as("outsider");
+        const app = (key: string) =>
+          ({ kind: "mcp", name: "Scoped", key, description: "", auth_type: "token" }) as const;
+        const conflicts: ZupflowApiError[] = [];
+        const taken = async (promise: Promise<unknown>) => {
+          const error = await failure(promise);
+          conflicts.push(error);
+          return [error.status, error.code, Object.keys(error.fields ?? {})];
+        };
+        const refused = [409, "app_key_taken", ["key"]];
+
+        // Two workspaces: a key one workspace holds is taken in the other and in the catalog...
+        expect(await taken(owner.workspaceApps.create(beta.workspace.id, app(acme.workspaceApp.key)))).toEqual(refused);
+        expect(await taken(owner.workspaceApps.create(acme.workspace.id, app(acme.workspaceApp.key)))).toEqual(refused);
+        expect(await taken(owner.organizationApps.create(fx.organization, app(acme.workspaceApp.key)))).toEqual(
+          refused,
+        );
+        // ...whichever is created first.
+        const onlyInBeta = await owner.workspaceApps.create(beta.workspace.id, app("only_in_beta"));
+        expect(await taken(owner.organizationApps.create(fx.organization, app(onlyInBeta.key)))).toEqual(refused);
+        expect(await taken(owner.workspaceApps.create(acme.workspace.id, app(onlyInBeta.key)))).toEqual(refused);
+        // A catalog key is taken in the catalog and in every workspace.
+        const catalogOnly = await owner.organizationApps.create(fx.organization, app("catalog_only"));
+        expect(await taken(owner.organizationApps.create(fx.organization, app(catalogOnly.key)))).toEqual(refused);
+        expect(await taken(owner.workspaceApps.create(acme.workspace.id, app(catalogOnly.key)))).toEqual(refused);
+        expect(await taken(owner.workspaceApps.create(beta.workspace.id, app(catalogOnly.key)))).toEqual(refused);
+        // A conflict never says where the key is used.
+        for (const error of conflicts) {
+          expect([error.message, error.fields]).toEqual([conflicts[0]?.message, conflicts[0]?.fields]);
+        }
+        expect((await owner.workspaceApps.list(beta.workspace.id)).map((a) => a.key).sort()).toEqual(
+          [beta.workspaceApp.key, "only_in_beta"].sort(),
+        );
+
+        // Two organizations: the other's keys never count, in either direction.
+        expect((await owner.workspaceApps.create(acme.workspace.id, app(harbor.workspaceApp.key))).key).toBe(
+          harbor.workspaceApp.key,
+        );
+        expect((await outsider.workspaceApps.create(harbor.workspace.id, app(acme.workspaceApp.key))).key).toBe(
+          acme.workspaceApp.key,
+        );
+        expect((await outsider.organizationApps.create(harbor.org, app(onlyInBeta.key))).key).toBe(onlyInBeta.key);
+        expect((await outsider.organizationApps.create(harbor.org, app(catalogOnly.key))).key).toBe(catalogOnly.key);
+      });
+
+      it("keeps installation short IDs unique in their workspace and never finds an installation by one", async () => {
+        const tenants = [await northwind(), await betaLabs(), await larkspur()];
+        const clients = [owner, owner, as("outsider")];
+        for (const [index, t] of tenants.entries()) {
+          const client = must(clients[index], "client");
+          const listed = await client.installations.list(t.workspace.id);
+          expect(new Set(listed.map((i) => i.short_id)).size).toBe(listed.length);
+          for (const i of listed) expect(i.short_id).toMatch(/^[a-z2-7]{6}$/);
+        }
+        // A short ID is a label, never an identifier: no path takes one, in its own workspace or any other.
+        for (const t of tenants) {
+          for (const [index, other] of tenants.entries()) {
+            const client = must(clients[index], "client");
+            const error = await failure(
+              client.installations.get(other.workspace.id, t.installation.short_id as InstallationId),
+            );
+            expect([error.status, error.code]).toEqual([404, "not_found"]);
+          }
+        }
       });
 
       it("treats an invited member as not yet a member", async () => {
@@ -1504,15 +1607,15 @@ export function contractSuite(target: Target) {
       it("keeps uniqueness, settings and Connect rules inside each organization", async () => {
         const other = fx.otherOrganization;
         const r = as("outsider");
-        // Slugs another organization already uses are free here.
-        const appSlug = await r.organizationApps.create(other, {
+        // Keys and slugs another organization already uses are free here.
+        const appKey = await r.organizationApps.create(other, {
           kind: "mcp",
           name: "Google Workspace",
-          slug: "google-workspace",
+          key: "google_workspace",
           description: "",
           auth_type: "token",
         });
-        expect(appSlug.slug).toBe("google-workspace");
+        expect(appKey.key).toBe("google_workspace");
         const workspaceSlug = await r.workspaces.create(other, {
           name: "Acme",
           slug: "acme",
@@ -1527,7 +1630,7 @@ export function contractSuite(target: Target) {
         );
         const harborSandbox = (await larkspur()).sandbox.id;
         const taskboard = must(
-          (await r.organizationApps.list(other)).find((a) => a.slug === "taskboard"),
+          (await r.organizationApps.list(other)).find((a) => a.key === "taskboard"),
           "Larkspur's taskboard app",
         );
         const refused = await failure(
@@ -1784,7 +1887,7 @@ export function contractSuite(target: Target) {
         const qa = fx.workspaces.qaPlayground.id;
         const echo = must(
           (await owner.installations.list(qa)).find((i) => i.status === "connected" && i.app.id === fx.apps.echoServer),
-          "connected installation of echo-server in qa-playground",
+          "connected installation of echo_server in qa-playground",
         );
         const kept = await owner.agents.create(qa, { name: "Kept", description: "", model, instructions: "" });
         await owner.grants.create(qa, kept.id, { installation_id: echo.id, tools: ["echo"], approval_required: [] });
@@ -2050,7 +2153,7 @@ export function contractSuite(target: Target) {
       const google = async () =>
         must(
           (await owner.installations.list(fx.workspaces.acme.id)).find((i) => i.app.id === fx.apps.googleWorkspace),
-          "installation of google-workspace in acme",
+          "installation of google_workspace in acme",
         );
       const probe = async (workspace: WorkspaceId) =>
         owner.agents.create(workspace, {
@@ -2210,7 +2313,7 @@ export function contractSuite(target: Target) {
         const qa = fx.workspaces.qaPlayground.id;
         const echo = must(
           (await owner.installations.list(qa)).find((i) => i.app.id === fx.apps.echoServer),
-          "installation of echo-server in qa-playground",
+          "installation of echo_server in qa-playground",
         );
         await owner.toolPolicy.update(fx.organization, { mode: "manual", new_tool_level: "deny" });
         const agent = await probe(qa);
@@ -2278,6 +2381,36 @@ export function contractSuite(target: Target) {
           return_url: null,
           ...extra,
         });
+
+      it("gives each new installation a short ID kept across renames and reconnects", async () => {
+        const input = { values: { token: "short-id-token" } };
+        const first = (await owner.connect.submitCredentials(referenceOf(await create()), input)).installation;
+        expect(first.short_id).toMatch(/^[a-z2-7]{6}$/);
+        const renamed = await owner.installations.update(qa(), first.id, { label: "Echo renamed" });
+        expect([renamed.label, renamed.short_id]).toEqual(["Echo renamed", first.short_id]);
+        await owner.installations.disconnect(qa(), first.id);
+        expect((await owner.installations.get(qa(), first.id)).short_id).toBe(first.short_id);
+        const reconnect = await create({ intent: "reconnect", installation_id: first.id });
+        const reconnected = (await owner.connect.submitCredentials(referenceOf(reconnect), input)).installation;
+        expect([reconnected.id, reconnected.status, reconnected.short_id]).toEqual([
+          first.id,
+          "connected",
+          first.short_id,
+        ]);
+        // The update input has no short ID: one sent anyway changes nothing.
+        const kept = await owner.installations.update(qa(), first.id, {
+          label: "Echo kept",
+          short_id: "aaaaaa",
+        } as UpdateInstallationInput);
+        expect(kept.short_id).toBe(first.short_id);
+        // A deleted installation's short ID isn't issued again; a new installation gets its own.
+        await owner.installations.delete(qa(), first.id);
+        const second = (await owner.connect.submitCredentials(referenceOf(await create()), input)).installation;
+        expect(second.id).not.toBe(first.id);
+        expect(second.short_id).not.toBe(first.short_id);
+        const listed = await owner.installations.list(qa());
+        expect(new Set(listed.map((i) => i.short_id)).size).toBe(listed.length);
+      });
 
       it("records immutable Connect lifecycle events once, within the endpoint's scope", async () => {
         const events = [
@@ -2693,7 +2826,8 @@ export function contractSuite(target: Target) {
           const app = await client.workspaceApps.create(workspace.id, {
             kind: "mcp",
             name: "Backend tools",
-            slug: "backend-tools",
+            // Keys are unique across the organization: one per environment's workspace.
+            key: `backend_tools_${environment}`,
             description: "",
             auth_type: "token",
           });
@@ -3075,7 +3209,7 @@ export function contractSuite(target: Target) {
         const w = t.workspace.id;
         const sandbox = t.sandbox.id;
         const agentInput = { name: "x", description: "", instructions: "", model: t.agent.model };
-        const app = { kind: "mcp", name: "x", slug: "viewer-x", description: "", auth_type: "token" } as const;
+        const app = { kind: "mcp", name: "x", key: "viewer_x", description: "", auth_type: "token" } as const;
         return [
           ["updateOrganization", () => c.organizations.update(t.org, { name: "Viewed" })],
           ["inviteMember", () => c.members.invite(t.org, { email: "v@northwind.example", role: "developer" })],

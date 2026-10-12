@@ -38,7 +38,7 @@ async fn catalog_token_app(server: &Server, org: &str) -> String {
     let (_, created) = server
         .send(
             call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(json!({
-                "kind": "mcp", "name": "Tools", "slug": "tools", "description": "", "auth_type": "token",
+                "kind": "mcp", "name": "Tools", "key": "tools", "description": "", "auth_type": "token",
             })),
         )
         .await;

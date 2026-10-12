@@ -59,7 +59,7 @@ json() {
 }
 org=$(call GET /v1/me | json 'v.data.organizations.find((o) => o.slug === "northwind").id')
 app=$(call POST "/v1/organizations/$org/apps" \
-  '{"kind":"mcp","name":"Taskboard live","slug":"taskboard-live","description":"A fake task app for development.","auth_type":"mcp_oauth"}' |
+  '{"kind":"mcp","name":"Taskboard live","key":"taskboard_live","description":"A fake task app for development.","auth_type":"mcp_oauth"}' |
   json 'v.data.id')
 call PATCH "/v1/organizations/$org/apps/$app" "{\"auth\":{\"type\":\"mcp_oauth\",\"scopes\":[{\"name\":\"tasks:read\",\"description\":\"See tasks\"},{\"name\":\"tasks:write\",\"description\":\"Change tasks\"}],\"identity_url\":\"$taskboard/me\"}}" >/dev/null
 call PUT "/v1/organizations/$org/apps/$app/environments/sandbox/configuration" \

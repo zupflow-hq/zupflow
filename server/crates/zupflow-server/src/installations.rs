@@ -22,7 +22,7 @@ use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::{
-    AccountConnection, Installation, InstallationError, InstallationStatus, InstalledApp,
+    AccountConnection, Installation, InstallationError, InstallationStatus, InstalledApp, ShortId,
 };
 use zupflow_core::organizations::MemberRole;
 use zupflow_core::scope::{Name, Scope};
@@ -80,7 +80,7 @@ enum OwnerScope {
 pub(crate) struct InstallationAppView {
     id: AppId,
     name: String,
-    slug: String,
+    key: String,
     owner_scope: OwnerScope,
     icon: AppIcon,
     auth_type: &'static str,
@@ -92,6 +92,7 @@ pub(crate) struct InstallationView {
     id: InstallationId,
     workspace_id: WorkspaceId,
     app: InstallationAppView,
+    short_id: ShortId,
     label: String,
     status: InstallationStatus,
     configuration_version: u32,
@@ -107,7 +108,7 @@ pub(crate) fn installation_app_view(app: &App, installed: InstalledApp) -> Insta
     InstallationAppView {
         id: app.id,
         name: app.name.clone(),
-        slug: app.slug.clone(),
+        key: app.key.clone(),
         owner_scope: match installed {
             InstalledApp::Catalog(_) => OwnerScope::Organization,
             InstalledApp::Workspace(_) => OwnerScope::Workspace,
@@ -218,6 +219,7 @@ pub(crate) fn installation_view(app: &App, installation: Installation, grant_cou
         id: installation.id,
         workspace_id: installation.workspace_id,
         app: installation_app_view(app, installation.app),
+        short_id: installation.short_id,
         label: installation.label,
         status: installation.status,
         configuration_version: installation.configuration_version,

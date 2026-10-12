@@ -257,7 +257,7 @@ async fn tenant(stack: &Stack) -> Tenant {
             Method::POST,
             &format!("/v1/organizations/{org}/apps"),
             None,
-            Some(json!({ "kind": "mcp", "name": "Taskboard", "slug": "taskboard-live", "description": "Tasks, for testing.", "auth_type": "mcp_oauth" })),
+            Some(json!({ "kind": "mcp", "name": "Taskboard", "key": "taskboard_live", "description": "Tasks, for testing.", "auth_type": "mcp_oauth" })),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");

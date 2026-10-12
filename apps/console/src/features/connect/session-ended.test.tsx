@@ -7,7 +7,7 @@ import { SessionEnded } from "./session-ended";
 const app = {
   id: "app_0000000000000000000001",
   name: "Fieldnote",
-  slug: "fieldnote",
+  key: "fieldnote",
   owner_scope: "organization",
   icon: { glyph: "Fn", color: "#4D7C0F" },
   auth_type: "mcp_oauth",

@@ -19,8 +19,8 @@ use zupflow_sqlite::{Database, SqliteInstallationStore};
 
 const CREDENTIAL: &[u8] = b"lin_api_plaintext_77";
 
-fn app(slug: &str, auth_type: &str) -> Value {
-    json!({ "kind": "mcp", "name": slug.to_uppercase(), "slug": slug, "description": "", "auth_type": auth_type })
+fn app(key: &str, auth_type: &str) -> Value {
+    json!({ "kind": "mcp", "name": key.to_uppercase(), "key": key, "description": "", "auth_type": auth_type })
 }
 
 async fn created(server: &Server, user: &str, path: String, org: &str, body: Value) -> Value {
@@ -143,7 +143,7 @@ async fn shows_renames_disconnects_and_deletes_an_installation() {
     assert_eq!(
         shown["app"],
         json!({
-            "id": id(&t.catalog), "name": "LINEAR", "slug": "linear", "owner_scope": "organization",
+            "id": id(&t.catalog), "name": "LINEAR", "key": "linear", "owner_scope": "organization",
             "icon": t.catalog["icon"], "auth_type": "oauth2",
         })
     );
@@ -163,6 +163,16 @@ async fn shows_renames_disconnects_and_deletes_an_installation() {
         "no credential in a response"
     );
     assert_eq!(list["data"][0]["app"]["owner_scope"], "workspace");
+    // Each has a short ID of its own in the workspace (decision 0047), read-only.
+    let short_id = shown["short_id"].as_str().unwrap().to_owned();
+    assert!(
+        short_id.len() == 6
+            && short_id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)),
+        "{short_id}"
+    );
+    assert_ne!(list["data"][0]["short_id"], shown["short_id"]);
 
     let (status, renamed) = server
         .send(
@@ -173,6 +183,19 @@ async fn shows_renames_disconnects_and_deletes_an_installation() {
         .await;
     assert_eq!(status, StatusCode::OK, "{renamed}");
     assert_eq!(renamed["data"]["label"], "Platform");
+    assert_eq!(renamed["data"]["short_id"], short_id.as_str(), "kept across a rename");
+    let (status, kept) = server
+        .send(
+            call("alice", Method::PATCH, &path)
+                .naming(&t.org)
+                .body(json!({ "label": "Platform", "short_id": "aaaaaa" })),
+        )
+        .await;
+    assert_eq!(
+        (status, &kept["data"]["short_id"]),
+        (StatusCode::OK, &json!(short_id)),
+        "never set by a client"
+    );
     for (label, message) in [
         (json!(""), "Required."),
         (json!("x".repeat(41)), "Use 40 characters or fewer."),
@@ -233,6 +256,11 @@ async fn shows_renames_disconnects_and_deletes_an_installation() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(disconnected["data"]["status"], "disconnected");
+    assert_eq!(
+        disconnected["data"]["short_id"],
+        short_id.as_str(),
+        "kept across a disconnect"
+    );
     assert_eq!(disconnected["data"]["connection"]["account"]["external_id"], "4242");
     assert_eq!(
         store(&server)

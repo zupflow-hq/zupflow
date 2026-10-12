@@ -58,7 +58,7 @@ async fn catalog_app(server: &Server, org: &str, identity_url: Option<&str>) -> 
     let (status, created) = server
         .send(
             call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(json!({
-                "kind": "mcp", "name": "Ledger", "slug": "ledger", "description": "", "auth_type": "mcp_oauth",
+                "kind": "mcp", "name": "Ledger", "key": "ledger", "description": "", "auth_type": "mcp_oauth",
             })),
         )
         .await;
@@ -677,7 +677,7 @@ async fn registers_once_per_app_environment_and_issuer() {
             .send(
                 call("alice", Method::POST, format!("/v1/workspaces/{ws}/apps"))
                     .naming(&t.org)
-                    .body(json!({ "kind": "mcp", "name": "Ledger", "slug": "ledger", "description": "", "auth_type": "mcp_oauth" })),
+                    .body(json!({ "kind": "mcp", "name": "Ledger", "key": client.replace('-', "_"), "description": "", "auth_type": "mcp_oauth" })),
             )
             .await;
         assert_eq!(status, StatusCode::CREATED, "{created}");

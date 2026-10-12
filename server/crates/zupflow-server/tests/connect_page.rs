@@ -43,7 +43,7 @@ async fn tenant(server: &Server, origins: &[&str]) -> Tenant {
     let (status, body) = server
         .send(
             call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(json!({
-                "kind": "mcp", "name": HOSTILE, "slug": "tools", "description": "<b>bold</b>", "auth_type": "token",
+                "kind": "mcp", "name": HOSTILE, "key": "tools", "description": "<b>bold</b>", "auth_type": "token",
             })),
         )
         .await;
@@ -662,7 +662,7 @@ async fn oauth_app(server: &Server, t: &Tenant) -> String {
     let (status, created) = server
         .send(
             call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(json!({
-                "kind": "mcp", "name": HOSTILE, "slug": "tracker", "description": "", "auth_type": "oauth2",
+                "kind": "mcp", "name": HOSTILE, "key": "tracker", "description": "", "auth_type": "oauth2",
             })),
         )
         .await;

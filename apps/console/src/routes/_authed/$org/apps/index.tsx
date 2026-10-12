@@ -36,7 +36,7 @@ function CatalogPage() {
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
     return (apps.data ?? []).filter(
-      (a) => !q || a.name.toLowerCase().includes(q) || a.slug.includes(q) || a.description.toLowerCase().includes(q),
+      (a) => !q || a.name.toLowerCase().includes(q) || a.key.includes(q) || a.description.toLowerCase().includes(q),
     );
   }, [apps.data, query]);
 
@@ -126,7 +126,7 @@ function CatalogPage() {
                             <div className="min-w-0">
                               <p className="font-medium">{app.name}</p>
                               <p className="truncate text-xs text-muted-foreground">
-                                {app.description || <span className="font-mono">{app.slug}</span>}
+                                {app.description || <span className="font-mono">{app.key}</span>}
                               </p>
                             </div>
                           </div>

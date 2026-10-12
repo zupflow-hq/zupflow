@@ -10,7 +10,7 @@ async function tokenApp(stack: Stack, organization: OrganizationId, workspace: W
   const app = await client.workspaceApps.create(workspace, {
     kind: "mcp",
     name: "Echo test server",
-    slug: "browser-echo",
+    key: "browser_echo",
     description: "Local browser fixture",
     auth_type: "token",
   });
@@ -122,7 +122,7 @@ test("environment-scope", async ({ stack, flow }, info) => {
   const sandbox = workspaces.qaPlayground.id;
   const production = workspaces.acme.id;
   const app = must(
-    (await stack.owner.workspaceApps.list(production)).find((candidate) => candidate.slug === "acme-publishing"),
+    (await stack.owner.workspaceApps.list(production)).find((candidate) => candidate.key === "acme_publishing"),
     "Production app",
   );
   const sandboxKey = await stack.key(organization, "sandbox");

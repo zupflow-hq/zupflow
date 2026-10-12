@@ -17,8 +17,8 @@ use zupflow_core::keys::{self, EncryptionContext, KeyError, Sealed, WrappedKey};
 
 const SECRET: &str = "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k";
 
-fn app(slug: &str, auth_type: &str) -> Value {
-    json!({ "kind": "mcp", "name": slug.to_uppercase(), "slug": slug, "description": "", "auth_type": auth_type })
+fn app(key: &str, auth_type: &str) -> Value {
+    json!({ "kind": "mcp", "name": key.to_uppercase(), "key": key, "description": "", "auth_type": auth_type })
 }
 
 async fn created(server: &Server, user: &str, path: String, org: &str, body: Value) -> Value {
@@ -586,7 +586,7 @@ async fn offers_a_workspace_only_what_is_ready_in_its_environment() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|available| available["app"]["slug"].as_str().unwrap().to_owned())
+                .map(|available| available["app"]["key"].as_str().unwrap().to_owned())
                 .collect::<Vec<_>>()
         }
     };

@@ -622,7 +622,7 @@ mod tests {
                     .await
                     .unwrap();
                 sqlx::query(
-                    "INSERT INTO apps (id, organization_id, kind, name, slug, description, icon_glyph, icon_color, \
+                    "INSERT INTO apps (id, organization_id, kind, name, key, description, icon_glyph, icon_color, \
                      auth, tools, version, created_at, updated_at) \
                      VALUES (?, ?, 'mcp', 'Catalog', 'catalog', '', 'C', '#0E7490', '{\"type\":\"token\"}', '[]', 1, 0, 0)",
                 )
@@ -646,15 +646,17 @@ mod tests {
                     .await
                     .unwrap();
                     for installation in installations {
+                        let short_id = crate::installations::record_test_short_id(pool, org, workspace.uuid()).await;
                         sqlx::query(
-                            "INSERT INTO installations (id, organization_id, workspace_id, catalog_app_id, label, \
-                             status, configuration_version, granted_scopes, created_at, updated_at) \
-                             VALUES (?, ?, ?, ?, 'Main', 'disconnected', 0, '[]', 0, 0)",
+                            "INSERT INTO installations (id, organization_id, workspace_id, catalog_app_id, short_id, \
+                             label, status, configuration_version, granted_scopes, created_at, updated_at) \
+                             VALUES (?, ?, ?, ?, ?, 'Main', 'disconnected', 0, '[]', 0, 0)",
                         )
                         .bind(installation.uuid())
                         .bind(org)
                         .bind(workspace.uuid())
                         .bind(app)
+                        .bind(short_id)
                         .execute(pool)
                         .await
                         .unwrap();

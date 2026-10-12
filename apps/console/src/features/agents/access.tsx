@@ -206,7 +206,7 @@ function GrantCard({
             {installation.status !== "connected" ? <InstallationStatusPill status={installation.status} /> : null}
           </p>
           <p className="text-sm text-muted-foreground">
-            {installation.app.name}
+            {installation.app.name} · <span className="font-mono">{installation.short_id}</span>
             {installation.connection
               ? ` · ${installation.connection.account.email ?? installation.connection.account.display_name}`
               : ""}

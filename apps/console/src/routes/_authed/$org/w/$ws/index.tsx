@@ -208,7 +208,10 @@ function WorkspaceOverview() {
                     >
                       <AppIcon icon={i.app.icon} size="sm" />
                       <div className="min-w-0 flex-1">
-                        <p className="truncate text-sm font-medium">{i.label}</p>
+                        <p className="flex min-w-0 items-baseline gap-2">
+                          <span className="truncate text-sm font-medium">{i.label}</span>
+                          <span className="shrink-0 font-mono text-xs text-muted-foreground">{i.short_id}</span>
+                        </p>
                         <p className="truncate text-xs text-muted-foreground">{i.app.name}</p>
                       </div>
                       <span

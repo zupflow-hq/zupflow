@@ -66,3 +66,18 @@ export function slugify(value: string): string {
     .slice(0, 40)
     .replace(/-+$/g, "");
 }
+
+/**
+ * A suggested app key from an app's name (decision 0047): snake case, starting
+ * with a letter, at most 24 characters. Empty when the name has no letter.
+ */
+export function appKeyFrom(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^[^a-z]+/, "")
+    .slice(0, 24)
+    .replace(/_+$/g, "");
+}

@@ -21,12 +21,18 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { applyFieldErrors, toastError } from "@/lib/errors";
-import { slugify } from "@/lib/format";
+import { appKeyFrom } from "@/lib/format";
 
 const schema = z.object({
   kind: z.literal("mcp"),
   name: z.string().trim().min(1, "Name the app.").max(60),
-  slug: z.string().regex(/^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/, "Use lowercase letters, numbers and hyphens."),
+  key: z
+    .string()
+    .max(24, "Use 24 characters or fewer.")
+    .regex(
+      /^[a-z][a-z0-9]*(_[a-z0-9]+)*$/,
+      "Use lowercase letters, numbers and single underscores, starting with a letter.",
+    ),
   description: z.string().trim().max(280),
   auth_type: z.enum(["mcp_oauth", "oauth2", "token"], { message: "Choose how accounts authenticate." }),
 });
@@ -72,14 +78,14 @@ export function CreateAppDialog({
 }) {
   const form = useForm<Values>({
     resolver: zodResolver(schema),
-    defaultValues: { kind: "mcp", name: "", slug: "", description: "", auth_type: undefined },
+    defaultValues: { kind: "mcp", name: "", key: "", description: "", auth_type: undefined },
   });
   const name = form.watch("name");
-  const slugTouched = form.formState.dirtyFields.slug;
+  const keyTouched = form.formState.dirtyFields.key;
 
   useEffect(() => {
-    if (!slugTouched) form.setValue("slug", slugify(name));
-  }, [name, slugTouched, form]);
+    if (!keyTouched) form.setValue("key", appKeyFrom(name));
+  }, [name, keyTouched, form]);
 
   useEffect(() => {
     if (!open) form.reset();
@@ -155,13 +161,16 @@ export function CreateAppDialog({
             </div>
             <FormField
               control={form.control}
-              name="slug"
+              name="key"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Slug</FormLabel>
+                  <FormLabel>Key</FormLabel>
                   <FormControl>
-                    <Input className="font-mono text-sm" autoComplete="off" {...field} />
+                    <Input className="font-mono text-sm" autoComplete="off" maxLength={24} {...field} />
                   </FormControl>
+                  <FormDescription>
+                    Starts the names agents see for this app's tools. You can't change it later.
+                  </FormDescription>
                   <FormMessage />
                 </FormItem>
               )}

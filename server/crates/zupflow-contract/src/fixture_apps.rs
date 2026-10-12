@@ -59,7 +59,7 @@ fn app(definition: Value) -> Result<NewApp, String> {
     Ok(NewApp {
         kind: AppKind::Mcp,
         name: text("name")?,
-        slug: text("slug")?,
+        key: text("key")?,
         description: text("description")?,
         icon: AppIcon {
             glyph: definition["icon"][0].as_str().unwrap_or_default().to_owned(),
@@ -95,7 +95,7 @@ fn token_auth(label: &str, help: &str, placeholder: &str, verify_url: &str, inst
 pub fn google_workspace() -> Result<NewApp, String> {
     app(json!({
         "name": "Google Workspace",
-        "slug": "google-workspace",
+        "key": "google_workspace",
         "description": "Drive, Docs, Gmail and Calendar for the connected Google account.",
         "icon": ["G", "#3B6FD8"],
         "auth": {
@@ -128,7 +128,7 @@ pub fn google_workspace() -> Result<NewApp, String> {
 pub fn taskboard() -> Result<NewApp, String> {
     app(json!({
         "name": "Taskboard",
-        "slug": "taskboard",
+        "key": "taskboard",
         "description": "Tasks on the connected board, for development and testing.",
         "icon": ["T", "#0E7490"],
         "auth": {
@@ -159,7 +159,7 @@ pub fn taskboard() -> Result<NewApp, String> {
 pub fn notion() -> Result<NewApp, String> {
     app(json!({
         "name": "Notion",
-        "slug": "notion",
+        "key": "notion",
         "description": "Pages and databases shared with the integration.",
         "icon": ["N", "#2F3437"],
         "auth": {
@@ -178,10 +178,10 @@ pub fn notion() -> Result<NewApp, String> {
 }
 
 /// A workspace app: Acme's own CMS, or Harbor's.
-pub fn publishing(name: &str, glyph: &str, slug: &str, host: &str) -> Result<NewApp, String> {
+pub fn publishing(name: &str, glyph: &str, key: &str, host: &str) -> Result<NewApp, String> {
     app(json!({
         "name": name,
-        "slug": slug,
+        "key": key,
         "description": format!("{name}'s own CMS. Drafts, schedules and publishes blog posts."),
         "icon": [glyph, "#C2410C"],
         "auth": token_auth(
@@ -202,7 +202,7 @@ pub fn publishing(name: &str, glyph: &str, slug: &str, host: &str) -> Result<New
 pub fn echo_server() -> Result<NewApp, String> {
     app(json!({
         "name": "Echo test server",
-        "slug": "echo-server",
+        "key": "echo_server",
         "description": "Returns its input. For exercising grants and approvals in Sandbox.",
         "icon": ["E", "#0E7490"],
         "auth": token_auth(

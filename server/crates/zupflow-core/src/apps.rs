@@ -160,7 +160,8 @@ pub struct App {
     pub owner_workspace_id: Option<WorkspaceId>,
     pub kind: AppKind,
     pub name: String,
-    pub slug: String,
+    /// Fixed once the app is created (decision 0047); see [`is_app_key`].
+    pub key: String,
     pub description: String,
     pub icon: AppIcon,
     pub auth: AuthTemplate,
@@ -175,21 +176,41 @@ pub struct App {
 pub struct NewApp {
     pub kind: AppKind,
     pub name: String,
-    pub slug: String,
+    pub key: String,
     pub description: String,
     pub icon: AppIcon,
     pub auth: AuthTemplate,
     pub tools: Vec<ToolDefinition>,
 }
 
-/// The colors a new app's tile is drawn from, picked by its slug.
+/// The longest an app's key may be: the tool names a model sees start with
+/// it, and must fit 64 characters (decision 0047).
+pub const APP_KEY_MAX: usize = 24;
+
+/// Whether `value` is an app key (decision 0047): snake case, 1 to
+/// [`APP_KEY_MAX`] characters, `^[a-z][a-z0-9]*(_[a-z0-9]+)*$`.
+pub fn is_app_key(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let Some(first) = bytes.first() else {
+        return false;
+    };
+    bytes.len() <= APP_KEY_MAX
+        && first.is_ascii_lowercase()
+        && bytes.last().is_some_and(|last| *last != b'_')
+        && !value.contains("__")
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+
+/// The colors a new app's tile is drawn from, picked by its key.
 const ICON_COLORS: [&str; 5] = ["#0E7490", "#7C3AED", "#B45309", "#15803D", "#BE123C"];
 
 impl NewApp {
-    /// An app as the API creates it: a tile from its name and slug, an empty
+    /// An app as the API creates it: a tile from its name and key, an empty
     /// template of its authentication type, and no tools until its server is
     /// asked for them.
-    pub fn blank(name: String, slug: String, description: String, auth_type: AuthType) -> Self {
+    pub fn blank(name: String, key: String, description: String, auth_type: AuthType) -> Self {
         let glyph: String = name
             .chars()
             .next()
@@ -197,8 +218,8 @@ impl NewApp {
             .into_iter()
             .flatten()
             .collect();
-        // FNV-1a, so a slug gets the same color the mock gives it.
-        let hash = slug.bytes().fold(2_166_136_261_u32, |hash, byte| {
+        // FNV-1a, so a key gets the same color the mock gives it.
+        let hash = key.bytes().fold(2_166_136_261_u32, |hash, byte| {
             (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
         });
         let color = ICON_COLORS[(hash % 5) as usize].to_owned();
@@ -237,7 +258,7 @@ impl NewApp {
         Self {
             kind: AppKind::Mcp,
             name,
-            slug,
+            key,
             description,
             icon: AppIcon { glyph, color },
             auth,
@@ -259,9 +280,10 @@ pub struct AppChanges<'a> {
 pub enum AppError {
     #[error("the store is unavailable")]
     Unavailable,
-    /// Another app of the same owner (the catalog, or one workspace) uses the slug.
-    #[error("that slug is taken")]
-    SlugTaken,
+    /// Another app of the organization has the key: one in its catalog or in
+    /// any of its workspaces, which share one key space (decision 0047).
+    #[error("that key is taken")]
+    KeyTaken,
     #[error("not found")]
     NotFound,
     /// A secret was written under a version another write already took.
@@ -727,14 +749,42 @@ mod tests {
         assert!(matches!(auth, AuthTemplate::OAuth2 { issuer: None, .. }));
     }
 
-    /// The mock's FNV-1a over the slug picks the same tile color.
+    /// The mock's FNV-1a over the key picks the same tile color.
     #[test]
-    fn picks_the_mocks_color_for_a_slug() {
+    fn picks_the_mocks_color_for_a_key() {
         // As the mock computes them: "linear" hashes to 0xd00594c0 (3 of 5),
-        // "echo-server" to 0x5b050808 (2 of 5).
-        for (slug, color) in [("linear", "#15803D"), ("echo-server", "#B45309")] {
-            let app = NewApp::blank("A".into(), slug.into(), String::new(), AuthType::Token);
-            assert_eq!(app.icon.color, color, "{slug}");
+        // "echo_server" to 0x18618b86 (4 of 5).
+        for (key, color) in [("linear", "#15803D"), ("echo_server", "#BE123C")] {
+            let app = NewApp::blank("A".into(), key.into(), String::new(), AuthType::Token);
+            assert_eq!(app.icon.color, color, "{key}");
+        }
+    }
+
+    #[test]
+    fn takes_only_snake_case_keys_of_1_to_24_characters() {
+        for key in [
+            "a",
+            "taskboard",
+            "google_workspace",
+            "a1_b2",
+            "k7m2qd",
+            "abcdefghijklmnopqrstuvwx",
+        ] {
+            assert!(is_app_key(key), "{key}");
+        }
+        for key in [
+            "",
+            "Taskboard",
+            "google-workspace",
+            "_a",
+            "a_",
+            "a__b",
+            "1a",
+            "a b",
+            "é",
+            "abcdefghijklmnopqrstuvwxy",
+        ] {
+            assert!(!is_app_key(key), "{key}");
         }
     }
 }

@@ -35,7 +35,7 @@ async fn tenant(server: &Server, user: &str, slug: &str) -> Tenant {
         let (status, body) = server
             .send(
                 call(user, Method::POST, format!("/v1/organizations/{org}/apps")).body(json!({
-                    "kind": "mcp", "name": app_slug, "slug": app_slug, "description": "", "auth_type": "token",
+                    "kind": "mcp", "name": app_slug, "key": app_slug, "description": "", "auth_type": "token",
                 })),
             )
             .await;
@@ -1010,7 +1010,7 @@ async fn refuses_a_session_that_is_no_longer_pending_or_eligible() {
     let (_, oauth) = server
         .send(
             call("alice", Method::POST, format!("/v1/organizations/{}/apps", t.org)).body(json!({
-                "kind": "mcp", "name": "Docs", "slug": "docs", "description": "", "auth_type": "oauth2",
+                "kind": "mcp", "name": "Docs", "key": "docs", "description": "", "auth_type": "oauth2",
             })),
         )
         .await;
@@ -1081,7 +1081,7 @@ async fn oauth_app(server: &Server, org: &str) -> String {
     let (status, created) = server
         .send(
             call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(json!({
-                "kind": "mcp", "name": "Tracker", "slug": "tracker", "description": "", "auth_type": "oauth2",
+                "kind": "mcp", "name": "Tracker", "key": "tracker", "description": "", "auth_type": "oauth2",
             })),
         )
         .await;

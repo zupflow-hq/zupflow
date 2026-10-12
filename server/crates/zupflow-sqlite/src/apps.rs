@@ -46,14 +46,14 @@ fn failed(operation: &'static str) -> impl FnOnce(sqlx::Error) -> AppError {
     }
 }
 
-/// A unique violation is the slug: the ID is new, so only the slug can collide.
+/// A unique violation is the key: the ID is new, so only the key can collide.
 fn inserted(operation: &'static str) -> impl FnOnce(sqlx::Error) -> AppError {
     move |error| {
         if error
             .as_database_error()
             .is_some_and(|error| error.is_unique_violation())
         {
-            AppError::SlugTaken
+            AppError::KeyTaken
         } else {
             failed(operation)(error)
         }
@@ -69,7 +69,7 @@ fn read(error: impl std::fmt::Display) -> AppError {
 /// queries stay static strings.
 macro_rules! columns {
     () => {
-        "id, organization_id, kind, name, slug, description, icon_glyph, icon_color, auth, tools, \
+        "id, organization_id, kind, name, key, description, icon_glyph, icon_color, auth, tools, \
          version, created_at, updated_at"
     };
 }
@@ -91,7 +91,7 @@ fn app_from(row: &SqliteRow, owner_workspace_id: Option<WorkspaceId>) -> Result<
         owner_workspace_id,
         kind: AppKind::parse(&kind).ok_or(AppError::Unavailable)?,
         name: row.try_get("name").map_err(read)?,
-        slug: row.try_get("slug").map_err(read)?,
+        key: row.try_get("key").map_err(read)?,
         description: row.try_get("description").map_err(read)?,
         icon: zupflow_core::apps::AppIcon {
             glyph: row.try_get("icon_glyph").map_err(read)?,
@@ -130,7 +130,7 @@ fn created(
         owner_workspace_id: owner,
         kind: app.kind,
         name: app.name.clone(),
-        slug: app.slug.clone(),
+        key: app.key.clone(),
         description: app.description.clone(),
         icon: app.icon.clone(),
         auth: app.auth.clone(),
@@ -392,15 +392,20 @@ impl AppStore for SqliteAppStore {
         let (auth, tools) = encoded(app)?;
         let now = Timestamp::now();
         let mut transaction = self.immediate().await?;
-        sqlx::query(
-            "INSERT INTO apps (id, organization_id, kind, name, slug, description, icon_glyph, icon_color, \
-             auth, tools, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+        // One key space for the whole organization (decision 0047): the
+        // catalog's own keys are held unique by the table, and no workspace's
+        // app may have it either, checked here in the insert's transaction.
+        let inserted_rows = sqlx::query(
+            "INSERT INTO apps (id, organization_id, kind, name, key, description, icon_glyph, icon_color, \
+             auth, tools, version, created_at, updated_at) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ? \
+             WHERE NOT EXISTS (SELECT 1 FROM workspace_apps WHERE organization_id = ? AND key = ?)",
         )
         .bind(app_id.uuid())
         .bind(organization_id.uuid())
         .bind(app.kind.as_str())
         .bind(&app.name)
-        .bind(&app.slug)
+        .bind(&app.key)
         .bind(&app.description)
         .bind(&app.icon.glyph)
         .bind(&app.icon.color)
@@ -408,9 +413,14 @@ impl AppStore for SqliteAppStore {
         .bind(tools)
         .bind(now.millis())
         .bind(now.millis())
+        .bind(organization_id.uuid())
+        .bind(&app.key)
         .execute(&mut *transaction)
         .await
         .map_err(inserted("insert_organization_app"))?;
+        if inserted_rows.rows_affected() == 0 {
+            return Err(AppError::KeyTaken);
+        }
         let app = created(organization_id, None, app_id, app, now);
         crate::audit::record(&mut transaction, organization_id, &audit(&app))
             .await
@@ -512,11 +522,16 @@ impl AppStore for SqliteAppStore {
         let (auth, tools) = encoded(app)?;
         let now = Timestamp::now();
         let mut transaction = self.immediate().await?;
+        // One key space for the whole organization (decision 0047): the
+        // table holds a key unique across the organization's workspaces, and
+        // the catalog must not have it either, checked here in the insert's
+        // own transaction.
         let inserted_rows = sqlx::query(
-            "INSERT INTO workspace_apps (id, organization_id, workspace_id, kind, name, slug, description, \
+            "INSERT INTO workspace_apps (id, organization_id, workspace_id, kind, name, key, description, \
              icon_glyph, icon_color, auth, tools, version, created_at, updated_at) \
              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ? \
-             FROM workspaces WHERE organization_id = ? AND id = ?",
+             FROM workspaces WHERE organization_id = ? AND id = ? \
+             AND NOT EXISTS (SELECT 1 FROM apps WHERE organization_id = ? AND key = ?)",
         )
         .bind(app_id.uuid())
         // The scope from the trust context, never from the parent row; the
@@ -525,7 +540,7 @@ impl AppStore for SqliteAppStore {
         .bind(workspace_id.uuid())
         .bind(app.kind.as_str())
         .bind(&app.name)
-        .bind(&app.slug)
+        .bind(&app.key)
         .bind(&app.description)
         .bind(&app.icon.glyph)
         .bind(&app.icon.color)
@@ -535,11 +550,24 @@ impl AppStore for SqliteAppStore {
         .bind(now.millis())
         .bind(organization_id.uuid())
         .bind(workspace_id.uuid())
+        .bind(organization_id.uuid())
+        .bind(&app.key)
         .execute(&mut *transaction)
         .await
         .map_err(inserted("insert_workspace_app"))?;
         if inserted_rows.rows_affected() == 0 {
-            return Err(AppError::NotFound);
+            let workspace: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM workspaces WHERE organization_id = ? AND id = ?")
+                    .bind(organization_id.uuid())
+                    .bind(workspace_id.uuid())
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(failed("find_workspace"))?;
+            return Err(if workspace.is_some() {
+                AppError::KeyTaken
+            } else {
+                AppError::NotFound
+            });
         }
         let app = created(organization_id, Some(workspace_id), app_id, app, now);
         crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&app))
@@ -1186,15 +1214,15 @@ mod tests {
             );
         }
         let apps = SqliteAppStore::new(database);
-        let app = || NewApp::blank("Tools".into(), "tools".into(), String::new(), AuthType::Token);
+        let app = |key: &str| NewApp::blank("Tools".into(), key.into(), String::new(), AuthType::Token);
         let gone = apps
-            .create_workspace_app(org, ids[0], AppId::generate(), &app(), &|_| {
+            .create_workspace_app(org, ids[0], AppId::generate(), &app("gone_tools"), &|_| {
                 zupflow_conformance::audit_store::by_suite_in(ids[0])
             })
             .await
             .unwrap();
         let kept = apps
-            .create_workspace_app(org, ids[1], AppId::generate(), &app(), &|_| {
+            .create_workspace_app(org, ids[1], AppId::generate(), &app("kept_tools"), &|_| {
                 zupflow_conformance::audit_store::by_suite_in(ids[1])
             })
             .await
@@ -1203,7 +1231,7 @@ mod tests {
             .create_organization_app(
                 org,
                 AppId::generate(),
-                &app(),
+                &app("catalog_tools"),
                 &zupflow_conformance::audit_store::by_suite,
             )
             .await
@@ -1218,5 +1246,14 @@ mod tests {
             apps.find_organization_app(org, catalog.id).await.unwrap(),
             Some(catalog)
         );
+        // The deleted workspace's key is free again in the organization.
+        apps.create_organization_app(
+            org,
+            AppId::generate(),
+            &app("gone_tools"),
+            &zupflow_conformance::audit_store::by_suite,
+        )
+        .await
+        .unwrap();
     }
 }

@@ -438,7 +438,7 @@ usual `server/target` directory. Each starts from a fresh temporary database,
 uses the same reference fixture and stops its local processes afterwards.
 The fixture has two fictional organizations, sibling workspaces, both
 environments and owner, developer, viewer and outsider personas. IDs and
-secrets are fresh; tests find the same logical scenarios by slug. No provider
+secrets are fresh; tests find the same logical scenarios by slug (apps by key). No provider
 account or deployed service is needed.
 
 The reference task app is **Taskboard** (`taskboard`), with a static configured
@@ -447,7 +447,7 @@ deliberately incomplete in Northwind's Production environment. Its Sandbox
 registry includes a current `list_tasks`, changed text for `create_task`,
 changed hints for `delete_task`, and a synthetic historical `export_tasks`
 marked gone. These static records use sample credentials and tool schemas;
-live Taskboard journeys create a separate `mcp_oauth` app, `taskboard-live`.
+live Taskboard journeys create a separate `mcp_oauth` app, `taskboard_live`.
 
 Webhook fixtures include pending, succeeded, failed and skipped deliveries,
 plus a test event, with frozen attempt histories for repeatable filters and
@@ -545,7 +545,7 @@ CARGO_INCREMENTAL=0 scripts/taskboard-dev.sh
 
 It serves Taskboard (on port 7443, `TASKBOARD_PORT`) and the contract server
 for a Console at `http://localhost:5181` (`CONSOLE_ORIGIN`), with Taskboard
-already in Northwind's catalog as **Taskboard live** (`taskboard-live`), ready in
+already in Northwind's catalog as **Taskboard live** (`taskboard_live`), ready in
 Sandbox, and prints the command to start the Console. Your browser must reach
 `taskboard.example` at `127.0.0.1` and accept its certificate: the script prints a Chromium command that does
 both for a profile of its own (add `--no-proxy-server` if your browser goes

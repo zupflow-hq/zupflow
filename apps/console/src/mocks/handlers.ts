@@ -41,6 +41,7 @@ import { keyedDigest, newApiKeySecret } from "./credentials";
 import { cancelScheduledRun, db, resetDb, scheduleRun } from "./db";
 import {
   ADMINS,
+  APP_KEY_PATTERN,
   ApiFailure,
   announceLifecycle,
   announceSession,
@@ -106,7 +107,7 @@ import type {
 import { levelInForce, levelRowsOf, levelsInput, policyRowOf, setLevels, toAppToolLevel, toToolPolicy } from "./policy";
 import { hash, token } from "./random";
 import { cancelRun, enqueueRun, planRun, resolveApproval, runTarget } from "./runner";
-import { appIn, configurationOf, inWorkspace, runEventsKey, timelineOf } from "./scope";
+import { appIn, configurationOf, inWorkspace, issueShortId, runEventsKey, timelineOf } from "./scope";
 import {
   acceptChange,
   claimRefresh,
@@ -146,6 +147,10 @@ export const MOCK_SIGN_IN: SignInSettings = {
 };
 
 const slug = z.string().regex(SLUG_PATTERN, "Use 1–40 lowercase letters, numbers and hyphens.");
+const appKey = z
+  .string()
+  .max(24, "Use 24 characters or fewer.")
+  .regex(APP_KEY_PATTERN, "Use lowercase letters, numbers and single underscores, starting with a letter.");
 const environment = z.enum(ENVIRONMENTS, "Choose Sandbox or Production.");
 const name = (max = 60) => z.string().trim().min(1, "Required.").max(max, `Use ${max} characters or fewer.`);
 const MINUTE = 60_000;
@@ -430,7 +435,7 @@ function applyAppUpdate(app: AppRow, input: z.infer<typeof appUpdateInput>) {
 const appInput = z.object({
   kind: z.string(),
   name: name(),
-  slug,
+  key: appKey,
   description: z.string().trim().max(280),
   auth_type: z.enum(["oauth2", "mcp_oauth", "token"], "Choose OAuth, sign-in through the MCP server, or token."),
 });
@@ -441,12 +446,13 @@ function createApp(access: OrgAccess, input: z.infer<typeof appInput>, ownerWork
       kind: 'Only "mcp" is supported.',
     });
   }
-  const taken = db().apps.some(
-    (a) => a.organization_id === access.org.id && a.owner_workspace_id === ownerWorkspaceId && a.slug === input.slug,
-  );
+  // Decision 0047: one key space for the whole organization. The catalog and
+  // every workspace's apps share it, whichever was created first; a conflict
+  // reads the same wherever the key is used, so it never says where.
+  const taken = db().apps.some((a) => a.organization_id === access.org.id && a.key === input.key);
   if (taken) {
-    throw new ApiFailure(409, "slug_taken", "That slug is already used by another app.", {
-      slug: "Already used by another app here.",
+    throw new ApiFailure(409, "app_key_taken", "That key is already used by another app.", {
+      key: "Already used by another app. Choose another.",
     });
   }
   const now = new Date().toISOString();
@@ -456,11 +462,11 @@ function createApp(access: OrgAccess, input: z.infer<typeof appInput>, ownerWork
     owner_workspace_id: ownerWorkspaceId,
     kind: "mcp",
     name: input.name,
-    slug: input.slug,
+    key: input.key,
     description: input.description,
     icon: {
       glyph: input.name.trim().slice(0, 1).toUpperCase(),
-      color: ["#0E7490", "#7C3AED", "#B45309", "#15803D", "#BE123C"][hash(input.slug) % 5] ?? "#0E7490",
+      color: ["#0E7490", "#7C3AED", "#B45309", "#15803D", "#BE123C"][hash(input.key) % 5] ?? "#0E7490",
     },
     auth:
       input.auth_type === "oauth2"
@@ -669,6 +675,7 @@ function completeSession(
       organization_id: organizationId,
       workspace_id: workspaceId,
       app_id: app.id,
+      short_id: issueShortId(d.installation_short_ids, { organization_id: organizationId, workspace_id: workspaceId }),
       label: session.label,
       status: "connected",
       configuration_version: config?.version ?? 1,
@@ -1368,6 +1375,7 @@ export function createHandlers(apiBase: string) {
         d.grants = d.grants.filter((g) => !here(g));
         d.agents = d.agents.filter((a) => !here(a));
         d.installations = d.installations.filter((i) => !here(i));
+        d.installation_short_ids = d.installation_short_ids.filter((r) => !here(r));
         d.installation_tools = d.installation_tools.filter((t) => !here(t));
         d.tool_refreshes = d.tool_refreshes.filter((r) => !here(r));
         d.connect_sessions = d.connect_sessions.filter((s) => !here(s));

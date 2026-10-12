@@ -1,6 +1,8 @@
 //! The `AppStore` suite (decision 0031): catalog apps reached only through
 //! their organization, workspace apps only through their own workspace, never
-//! one through the other's methods, and slugs unique within their owner.
+//! one through the other's methods, and every key unique across its
+//! organization: catalog and workspace apps share one key space (decision
+//! 0047), whichever is created first.
 //!
 //! `prepare` makes an organization exist with the given workspaces in it, for
 //! a store whose apps reference them.
@@ -23,10 +25,10 @@ use crate::audit_store::{by_suite, by_suite_in};
 pub type Prepare =
     Arc<dyn Fn(OrganizationId, Vec<WorkspaceId>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-fn new(name: &str, slug: &str) -> NewApp {
+fn new(name: &str, key: &str) -> NewApp {
     NewApp::blank(
         name.to_owned(),
-        slug.to_owned(),
+        key.to_owned(),
         format!("{name}, for tests."),
         AuthType::Token,
     )
@@ -60,7 +62,7 @@ async fn workspace_app(store: &dyn AppStore, org: OrganizationId, workspace: Wor
 pub async fn run(store: &dyn AppStore, prepare: Prepare) {
     creates_and_finds_catalog_apps_within_their_organization(store, &prepare).await;
     creates_and_finds_workspace_apps_within_their_workspace(store, &prepare).await;
-    keeps_slugs_unique_within_their_owner(store, &prepare).await;
+    keeps_keys_unique_across_the_organization(store, &prepare).await;
     lists_by_name_and_only_the_owners_own(store, &prepare).await;
     updates_only_within_the_owner(store, &prepare).await;
     refuses_a_workspace_of_another_organization(store, &prepare).await;
@@ -135,10 +137,10 @@ async fn keeps_one_client_registration_per_owner_and_issuer(store: &dyn AppStore
     let (a, one, _) = organization(prepare).await;
     let (b, _, _) = organization(prepare).await;
     let sign_in =
-        |name: &str, slug: &str| NewApp::blank(name.to_owned(), slug.to_owned(), String::new(), AuthType::McpOAuth);
+        |name: &str, key: &str| NewApp::blank(name.to_owned(), key.to_owned(), String::new(), AuthType::McpOAuth);
     let app = catalog_app(store, a, sign_in("Ledger", "ledger")).await;
     let sibling = catalog_app(store, a, sign_in("Desk", "desk")).await;
-    let own = workspace_app(store, a, one, sign_in("Ledger", "ledger")).await;
+    let own = workspace_app(store, a, one, sign_in("Ledger", "own_ledger")).await;
     let sandbox = Environment::Sandbox;
 
     assert_eq!(
@@ -243,7 +245,7 @@ async fn keeps_the_first_of_concurrent_registrations(store: &dyn AppStore, prepa
         store,
         a,
         one,
-        NewApp::blank("Ledger".into(), "ledger".into(), String::new(), AuthType::McpOAuth),
+        NewApp::blank("Ledger".into(), "own_ledger".into(), String::new(), AuthType::McpOAuth),
     )
     .await;
     let (left, right) = (
@@ -269,10 +271,10 @@ async fn keeps_the_first_of_concurrent_registrations(store: &dyn AppStore, prepa
 async fn keeps_workspace_registrations_to_their_workspace(store: &dyn AppStore, prepare: &Prepare) {
     let (a, one, two) = organization(prepare).await;
     let (b, other, _) = organization(prepare).await;
-    let sign_in = || NewApp::blank("Ledger".into(), "ledger".into(), String::new(), AuthType::McpOAuth);
-    let own = workspace_app(store, a, one, sign_in()).await;
-    let neighbour = workspace_app(store, a, two, sign_in()).await;
-    let catalog = catalog_app(store, a, sign_in()).await;
+    let sign_in = |key: &str| NewApp::blank("Ledger".into(), key.into(), String::new(), AuthType::McpOAuth);
+    let own = workspace_app(store, a, one, sign_in("ledger_one")).await;
+    let neighbour = workspace_app(store, a, two, sign_in("ledger_two")).await;
+    let catalog = catalog_app(store, a, sign_in("ledger")).await;
 
     let first = registration(ISSUER, "client-1", None);
     let saved = store
@@ -350,12 +352,11 @@ fn requesting(scopes: &[&str]) -> ConfigurationChanges {
 /// write comes first; and only the app's own configurations count.
 async fn keeps_requested_scopes_offered(store: &dyn AppStore, prepare: &Prepare) {
     let (a, one, two) = organization(prepare).await;
-    let oauth =
-        |name: &str, slug: &str| NewApp::blank(name.to_owned(), slug.to_owned(), String::new(), AuthType::OAuth2);
+    let oauth = |name: &str, key: &str| NewApp::blank(name.to_owned(), key.to_owned(), String::new(), AuthType::OAuth2);
     let catalog = catalog_app(store, a, oauth("Tracker", "tracker")).await;
     let sibling = catalog_app(store, a, oauth("Other", "other")).await;
     let own = workspace_app(store, a, one, oauth("Crm", "crm")).await;
-    let neighbour = workspace_app(store, a, two, oauth("Crm", "crm")).await;
+    let neighbour = workspace_app(store, a, two, oauth("Crm", "crm_two")).await;
     let beside = workspace_app(store, a, one, oauth("Desk", "desk")).await;
     let read = oauth_template(&["read"]);
     for app in [catalog.id, sibling.id] {
@@ -776,27 +777,56 @@ async fn creates_and_finds_workspace_apps_within_their_workspace(store: &dyn App
     );
 }
 
-async fn keeps_slugs_unique_within_their_owner(store: &dyn AppStore, prepare: &Prepare) {
+async fn keeps_keys_unique_across_the_organization(store: &dyn AppStore, prepare: &Prepare) {
     let (a, one, two) = organization(prepare).await;
-    let (b, b_workspace, _) = organization(prepare).await;
-    catalog_app(store, a, new("Tools", "tools")).await;
-    // The same slug in a workspace, another workspace and another organization.
+    let (b, b_one, b_two) = organization(prepare).await;
+    let taken = |key: &str| new("Other", key);
+    let in_catalog = |org: OrganizationId, key: &str| {
+        let app = taken(key);
+        async move {
+            store
+                .create_organization_app(org, AppId::generate(), &app, &by_suite)
+                .await
+        }
+    };
+    let in_workspace = |org: OrganizationId, workspace: WorkspaceId, key: &str| {
+        let app = taken(key);
+        async move {
+            store
+                .create_workspace_app(org, workspace, AppId::generate(), &app, &|_| by_suite_in(workspace))
+                .await
+        }
+    };
+
+    // A key one workspace holds is taken in every other workspace and in the catalog.
     workspace_app(store, a, one, new("Tools", "tools")).await;
-    workspace_app(store, a, two, new("Tools", "tools")).await;
-    catalog_app(store, b, new("Tools", "tools")).await;
-    workspace_app(store, b, b_workspace, new("Tools", "tools")).await;
-    assert_eq!(
-        store
-            .create_organization_app(a, AppId::generate(), &new("Other", "tools"), &by_suite)
-            .await,
-        Err(AppError::SlugTaken)
-    );
-    assert_eq!(
-        store
-            .create_workspace_app(a, one, AppId::generate(), &new("Other", "tools"), &|_| by_suite_in(one))
-            .await,
-        Err(AppError::SlugTaken)
-    );
+    for (result, case) in [
+        (in_workspace(a, one, "tools").await, "the same workspace"),
+        (in_workspace(a, two, "tools").await, "another workspace"),
+        (in_catalog(a, "tools").await, "the catalog"),
+    ] {
+        assert_eq!(result, Err(AppError::KeyTaken), "{case}");
+    }
+    // A catalog key is taken in the catalog and in every workspace.
+    catalog_app(store, a, new("Catalog", "catalog_only")).await;
+    for (result, case) in [
+        (in_catalog(a, "catalog_only").await, "the catalog"),
+        (in_workspace(a, one, "catalog_only").await, "a workspace"),
+        (in_workspace(a, two, "catalog_only").await, "another workspace"),
+    ] {
+        assert_eq!(result, Err(AppError::KeyTaken), "{case}");
+    }
+    // Another organization's keys never count, in either direction.
+    workspace_app(store, b, b_one, new("Tools", "tools")).await;
+    catalog_app(store, b, new("Catalog", "catalog_only")).await;
+    workspace_app(store, b, b_two, new("Elsewhere", "only_in_b")).await;
+    catalog_app(store, a, new("Mine", "only_in_b")).await;
+    // A workspace outside the organization is not found, whatever its key.
+    assert_eq!(in_workspace(b, one, "fresh").await, Err(AppError::NotFound));
+    // Nothing refused was written.
+    assert_eq!(store.list_organization_apps(a).await.unwrap().len(), 2);
+    assert_eq!(store.list_workspace_apps(a, one).await.unwrap().len(), 1);
+    assert_eq!(store.list_workspace_apps(a, two).await.unwrap().len(), 0);
 }
 
 async fn lists_by_name_and_only_the_owners_own(store: &dyn AppStore, prepare: &Prepare) {
@@ -874,7 +904,7 @@ async fn updates_only_within_the_owner(store: &dyn AppStore, prepare: &Prepare) 
         (
             updated.name.as_str(),
             updated.description.as_str(),
-            updated.slug.as_str()
+            updated.key.as_str()
         ),
         ("Renamed", catalog.description.as_str(), "linear")
     );
@@ -970,7 +1000,7 @@ async fn forgets_only_the_failed_registration(store: &dyn AppStore, prepare: &Pr
         store,
         org,
         one,
-        NewApp::blank("Board".into(), "board".into(), String::new(), AuthType::McpOAuth),
+        NewApp::blank("Board".into(), "own_board".into(), String::new(), AuthType::McpOAuth),
     )
     .await;
     let mut original = registration(ISSUER, "first", None);

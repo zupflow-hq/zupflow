@@ -105,12 +105,51 @@ pub struct DiscoveredClient {
     pub resource: String,
 }
 
+/// An installation's short ID (decision 0047): six characters of lowercase
+/// base32 (`a-z`, `2-7`), given when the installation is created, kept across
+/// reconnects and renames, and never issued twice in its workspace. A label
+/// for people and models, never an identifier: nothing is found by it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ShortId(String);
+
+impl ShortId {
+    const ALPHABET: &'static [u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+
+    /// A short ID drawn from the operating system's random source.
+    pub fn generate() -> Result<Self, getrandom::Error> {
+        let mut bytes = [0u8; 4];
+        getrandom::fill(&mut bytes)?;
+        Ok(Self::from_bits(u32::from_le_bytes(bytes)))
+    }
+
+    /// The short ID the low 30 bits of `bits` spell, five bits a character.
+    pub fn from_bits(bits: u32) -> Self {
+        let spelled = (0..6)
+            .map(|index| char::from(Self::ALPHABET[((bits >> (5 * index)) & 31) as usize]))
+            .collect();
+        Self(spelled)
+    }
+
+    /// `value` if it is a short ID's form.
+    pub fn parse(value: &str) -> Option<Self> {
+        let valid = value.len() == 6 && value.bytes().all(|byte| Self::ALPHABET.contains(&byte));
+        valid.then(|| Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installation {
     pub id: InstallationId,
     pub organization_id: OrganizationId,
     pub workspace_id: WorkspaceId,
     pub app: InstalledApp,
+    /// Unique in the workspace, read-only (decision 0047).
+    pub short_id: ShortId,
     pub label: String,
     pub status: InstallationStatus,
     /// The app configuration's version it connected under.
@@ -294,4 +333,24 @@ pub trait InstallationStore: Send + Sync {
         organization_id: OrganizationId,
         environment: Option<Environment>,
     ) -> Result<Vec<(AppId, u64)>, InstallationError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShortId;
+
+    #[test]
+    fn spells_six_lowercase_base32_characters() {
+        assert_eq!(ShortId::from_bits(0).as_str(), "aaaaaa");
+        assert_eq!(ShortId::from_bits(u32::MAX).as_str(), "777777");
+        // Five bits a character, lowest first; the top two bits are unused.
+        assert_eq!(ShortId::from_bits(1 | (26 << 5) | (3 << 30)).as_str(), "b2aaaa");
+        for _ in 0..64 {
+            let drawn = ShortId::generate().expect("the OS has randomness");
+            assert_eq!(ShortId::parse(drawn.as_str()), Some(drawn.clone()));
+        }
+        for value in ["", "aaaaa", "aaaaaaa", "AAAAAA", "aaaa1a", "aaaa8a", "aaa-aa"] {
+            assert_eq!(ShortId::parse(value), None, "{value}");
+        }
+    }
 }

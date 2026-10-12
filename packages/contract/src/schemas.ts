@@ -429,6 +429,20 @@ export const ConfigurationSummary = named(
 );
 export type ConfigurationSummary = z.infer<typeof ConfigurationSummary>;
 
+/**
+ * An app's key: snake case, 1 to 24 characters, starting with a letter
+ * (`taskboard`, `google_workspace`).
+ */
+export const AppKey = named(
+  "AppKey",
+  z
+    .string()
+    .min(1)
+    .max(24)
+    .regex(/^[a-z][a-z0-9]*(_[a-z0-9]+)*$/),
+);
+export type AppKey = z.infer<typeof AppKey>;
+
 export const AppDefinition = named(
   "App",
   z.object({
@@ -439,7 +453,8 @@ export const AppDefinition = named(
     owner_scope: AppOwnerScope,
     kind: AppKind,
     name: z.string(),
-    slug: z.string(),
+    /** Fixed once the app is created. Starts every tool name a model is offered. */
+    key: AppKey,
     description: z.string(),
     icon: AppIcon,
     auth: AuthTemplate,
@@ -460,7 +475,12 @@ export type AppDefinition = z.infer<typeof AppDefinition>;
 export const CreateAppInput = z.object({
   kind: AppKind,
   name: z.string(),
-  slug: z.string(),
+  /**
+   * Unique across the organization: its catalog and every workspace's apps
+   * share one key space (`409 app_key_taken`, which never says where the key
+   * is used). It can't be changed later.
+   */
+  key: z.string(),
   description: z.string(),
   auth_type: AuthType,
 });
@@ -567,12 +587,16 @@ export const AccountConnection = named(
 );
 export type AccountConnection = z.infer<typeof AccountConnection>;
 
+/** An installation's short ID: six characters of lowercase base32 (`k7m2qd`). */
+export const InstallationShortId = named("InstallationShortId", z.string().regex(/^[a-z2-7]{6}$/));
+export type InstallationShortId = z.infer<typeof InstallationShortId>;
+
 export const InstallationApp = named(
   "InstallationApp",
   z.object({
     id: idSchema("app"),
     name: z.string(),
-    slug: z.string(),
+    key: AppKey,
     owner_scope: AppOwnerScope,
     icon: AppIcon,
     auth_type: AuthType,
@@ -586,6 +610,14 @@ export const Installation = named(
     id: idSchema("installation"),
     workspace_id: idSchema("workspace"),
     app: InstallationApp,
+    /**
+     * Six lowercase base32 characters naming the installation within its
+     * workspace, for people and models. Read-only: set when the installation
+     * is created, kept across reconnects and renames, never reused in the
+     * workspace. A label, not an identifier: the API never finds an
+     * installation by it.
+     */
+    short_id: InstallationShortId,
     label: z.string(),
     status: InstallationStatus,
     configuration_version: z.number().int(),

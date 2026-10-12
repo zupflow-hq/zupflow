@@ -48,6 +48,8 @@ const TABLES: &[(&str, Scoping)] = &[
     ("workspace_apps", Scoping::Workspace),
     ("app_configurations", Scoping::Organization),
     ("workspace_app_configurations", Scoping::Workspace),
+    // Every short ID issued in a workspace, kept after its installation goes.
+    ("installation_short_ids", Scoping::Workspace),
     ("installations", Scoping::Workspace),
     ("installation_credentials", Scoping::Workspace),
     ("connect_settings", Scoping::Organization),
@@ -364,4 +366,180 @@ async fn refuses_a_migration_changed_after_it_was_applied() {
         Database::open(&directory.file()).await,
         Err(crate::DatabaseError::Migrate(_))
     ));
+}
+
+/// Migration 0027 rebuilds `apps`, `workspace_apps` and `installations` with
+/// foreign keys off: what other tables hold for them stays, every slug
+/// becomes a key, and every installation gets a short ID, recorded in its
+/// workspace. Foreign keys are on again once it's done.
+#[tokio::test]
+async fn keeps_what_references_apps_and_installations_through_migration_0027() {
+    use std::str::FromStr;
+
+    use sqlx::sqlite::SqliteConnectOptions;
+
+    let directory = TemporaryDirectory::new();
+    let earlier = directory.0.join("migrations");
+    std::fs::create_dir(&earlier).unwrap();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.as_str() < "0027" {
+            std::fs::copy(&path, earlier.join(&name)).unwrap();
+        }
+    }
+    let options = SqliteConnectOptions::from_str("sqlite:")
+        .unwrap()
+        .filename(directory.file())
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+    sqlx::migrate::Migrator::new(earlier.as_path())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let blob = |n: u8| {
+        let mut id = [0u8; 16];
+        id[15] = n;
+        id.to_vec()
+    };
+    for statement in [
+        "INSERT INTO organizations (id, name, slug, created_at) VALUES (?1, 'Org', 'org', 0)",
+        "INSERT INTO workspaces (id, organization_id, environment, name, slug, created_at) \
+         VALUES (?2, ?1, 'sandbox', 'W', 'w', 0)",
+        "INSERT INTO apps (id, organization_id, kind, name, slug, description, icon_glyph, icon_color, auth, tools, \
+         version, created_at, updated_at) \
+         VALUES (?3, ?1, 'mcp', 'G', 'google-workspace', '', 'G', '#0E7490', '{}', '[]', 1, 0, 0)",
+        "INSERT INTO apps (id, organization_id, kind, name, slug, description, icon_glyph, icon_color, auth, tools, \
+         version, created_at, updated_at) \
+         VALUES (?4, ?1, 'mcp', 'N', '9-lives', '', 'N', '#0E7490', '{}', '[]', 1, 0, 0)",
+        "INSERT INTO workspace_apps (id, organization_id, workspace_id, kind, name, slug, description, icon_glyph, \
+         icon_color, auth, tools, version, created_at, updated_at) \
+         VALUES (?5, ?1, ?2, 'mcp', 'G', 'google-workspace', '', 'G', '#0E7490', '{}', '[]', 1, 0, 0)",
+        "INSERT INTO installations (id, organization_id, workspace_id, catalog_app_id, label, status, \
+         configuration_version, granted_scopes, created_at, updated_at) \
+         VALUES (?6, ?1, ?2, ?3, 'Main', 'disconnected', 1, '[]', 0, 0)",
+        "INSERT INTO installations (id, organization_id, workspace_id, workspace_app_id, label, status, \
+         configuration_version, granted_scopes, created_at, updated_at) \
+         VALUES (?7, ?1, ?2, ?5, 'Own', 'disconnected', 1, '[]', 0, 0)",
+        "INSERT INTO installation_credentials (id, organization_id, workspace_id, installation_id, version, key_id, \
+         wrapped_key, nonce, ciphertext, created_at) \
+         VALUES (?8, ?1, ?2, ?6, 1, 'k', x'00', x'000000000000000000000000', x'00', 0)",
+        "INSERT INTO app_tool_levels (id, organization_id, app_id, name, level, confirmed, destructive, updated_at) \
+         VALUES (?9, ?1, ?3, 'search', 'allow', 1, 0, 0)",
+        // Two workspaces held the same slug; the older keeps it as a key.
+        "INSERT INTO workspaces (id, organization_id, environment, name, slug, created_at) \
+         VALUES (?10, ?1, 'sandbox', 'V', 'v', 0)",
+        "INSERT INTO workspace_apps (id, organization_id, workspace_id, kind, name, slug, description, icon_glyph, \
+         icon_color, auth, tools, version, created_at, updated_at) \
+         VALUES (?11, ?1, ?2, 'mcp', 'T', 'tools', '', 'T', '#0E7490', '{}', '[]', 1, 1, 1)",
+        "INSERT INTO workspace_apps (id, organization_id, workspace_id, kind, name, slug, description, icon_glyph, \
+         icon_color, auth, tools, version, created_at, updated_at) \
+         VALUES (?12, ?1, ?10, 'mcp', 'T', 'tools', '', 'T', '#0E7490', '{}', '[]', 1, 2, 2)",
+        "INSERT INTO installations (id, organization_id, workspace_id, workspace_app_id, label, status, \
+         configuration_version, granted_scopes, created_at, updated_at) \
+         VALUES (?13, ?1, ?10, ?12, 'Other', 'disconnected', 1, '[]', 0, 0)",
+    ] {
+        sqlx::query(statement)
+            .bind(blob(1))
+            .bind(blob(2))
+            .bind(blob(3))
+            .bind(blob(4))
+            .bind(blob(5))
+            .bind(blob(6))
+            .bind(blob(7))
+            .bind(blob(8))
+            .bind(blob(9))
+            .bind(blob(10))
+            .bind(blob(11))
+            .bind(blob(12))
+            .bind(blob(13))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    pool.close().await;
+
+    let database = Database::open(&directory.file()).await.unwrap();
+    let pool = database.pool();
+    let catalog: Vec<String> = sqlx::query_scalar("SELECT key FROM apps ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert_eq!(catalog[0], "google_workspace", "hyphens become underscores");
+    assert!(
+        catalog[1].starts_with("app_") && zupflow_core::apps::is_app_key(&catalog[1]),
+        "a slug that makes no key gets one: {}",
+        catalog[1]
+    );
+    let own: Vec<String> = sqlx::query_scalar("SELECT key FROM workspace_apps ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        own[0],
+        format!("app_{}", &hex(&blob(5))[12..]),
+        "a workspace app never repeats a catalog key"
+    );
+    assert_eq!(own[1], "tools", "the oldest of a slug two workspaces held keeps it");
+    assert_eq!(
+        own[2],
+        format!("app_{}", &hex(&blob(12))[12..]),
+        "a younger one gets its own"
+    );
+    for key in &own {
+        assert!(zupflow_core::apps::is_app_key(key), "{key}");
+    }
+    // Short IDs follow each workspace's order, through a bijection, so none collide.
+    let short_ids: Vec<String> = sqlx::query_scalar("SELECT short_id FROM installations ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    let spelled = |n: u32| zupflow_core::installations::ShortId::from_bits(n.wrapping_mul(625_341_585) & 0x3FFF_FFFF);
+    assert_eq!(
+        short_ids,
+        [spelled(0).as_str(), spelled(1).as_str(), spelled(0).as_str()],
+        "first and second in one workspace, first in the other"
+    );
+    let recorded: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM installation_short_ids s JOIN installations i \
+         ON i.organization_id = s.organization_id AND i.workspace_id = s.workspace_id AND i.short_id = s.short_id",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(recorded, 3, "each short ID recorded in its workspace");
+    for (table, expected) in [("installation_credentials", 1), ("app_tool_levels", 1)] {
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(count, expected, "{table} keeps its rows");
+    }
+    let violations: i64 = sqlx::query_scalar("SELECT count(*) FROM pragma_foreign_key_check")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(violations, 0);
+    // Every connection enforces foreign keys again, the migrating one
+    // included: holding as many as the pool opens reaches each.
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let mut connection = pool.acquire().await.unwrap();
+        let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        assert_eq!(enabled, 1);
+        held.push(connection);
+    }
+    drop(held);
+    let removed = sqlx::query("DELETE FROM apps WHERE key = 'google_workspace'")
+        .execute(pool)
+        .await;
+    assert!(removed.is_err(), "an installation still references the app");
 }

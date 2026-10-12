@@ -466,6 +466,8 @@ export function audit(
 // Validation helpers
 
 export const SLUG_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
+/** An app's key (decision 0047): snake case, starting with a letter; 24 characters at most, checked apart. */
+export const APP_KEY_PATTERN = /^[a-z][a-z0-9]*(_[a-z0-9]+)*$/;
 export const RESERVED_ORG_SLUGS = new Set([
   "onboarding",
   "sign-in",
@@ -732,7 +734,7 @@ export function toApp(app: AppRow, visibleEnvironment?: Environment): AppDefinit
     owner_scope: app.owner_workspace_id ? "workspace" : "organization",
     kind: app.kind,
     name: app.name,
-    slug: app.slug,
+    key: app.key,
     description: app.description,
     icon: app.icon,
     auth: app.auth,
@@ -756,7 +758,7 @@ export function toInstallationApp(app: AppRow): InstallationApp {
   return {
     id: app.id,
     name: app.name,
-    slug: app.slug,
+    key: app.key,
     owner_scope: app.owner_workspace_id ? "workspace" : "organization",
     icon: app.icon,
     auth_type: app.auth.type,
@@ -782,11 +784,12 @@ export function toInstallation(i: InstallationRow): Installation {
       : {
           id: i.app_id,
           name: "Removed app",
-          slug: "removed",
+          key: "removed",
           owner_scope: "organization",
           icon: { glyph: "?", color: "#64748b" },
           auth_type: "token",
         },
+    short_id: i.short_id,
     label: i.label,
     status: i.status,
     configuration_version: i.configuration_version,
@@ -813,7 +816,7 @@ export function toConnectSession(s: ConnectSessionRow, withAuth = false): Connec
       : {
           id: s.app_id,
           name: "Removed app",
-          slug: "removed",
+          key: "removed",
           owner_scope: "organization",
           icon: { glyph: "?", color: "#64748b" },
           auth_type: "token",

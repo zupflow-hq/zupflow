@@ -293,8 +293,8 @@
           "name": {
             "type": "string"
           },
-          "slug": {
-            "type": "string"
+          "key": {
+            "$ref": "#/components/schemas/AppKey"
           },
           "description": {
             "type": "string"
@@ -341,7 +341,7 @@
           "owner_scope",
           "kind",
           "name",
-          "slug",
+          "key",
           "description",
           "icon",
           "auth",
@@ -386,6 +386,12 @@
           "installation",
           "workspace"
         ]
+      },
+      "AppKey": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 24,
+        "pattern": "^[a-z][a-z0-9]*(_[a-z0-9]+)*$"
       },
       "AppToolLevel": {
         "type": "object",
@@ -1429,6 +1435,9 @@
           "app": {
             "$ref": "#/components/schemas/InstallationApp"
           },
+          "short_id": {
+            "$ref": "#/components/schemas/InstallationShortId"
+          },
           "label": {
             "type": "string"
           },
@@ -1471,6 +1480,7 @@
           "id",
           "workspace_id",
           "app",
+          "short_id",
           "label",
           "status",
           "configuration_version",
@@ -1489,8 +1499,8 @@
           "name": {
             "type": "string"
           },
-          "slug": {
-            "type": "string"
+          "key": {
+            "$ref": "#/components/schemas/AppKey"
           },
           "owner_scope": {
             "type": "string",
@@ -1514,7 +1524,7 @@
         "required": [
           "id",
           "name",
-          "slug",
+          "key",
           "owner_scope",
           "icon",
           "auth_type"
@@ -1703,6 +1713,10 @@
           "workspace",
           "data"
         ]
+      },
+      "InstallationShortId": {
+        "type": "string",
+        "pattern": "^[a-z2-7]{6}$"
       },
       "InstallationTool": {
         "type": "object",
@@ -6176,7 +6190,7 @@
                   "name": {
                     "type": "string"
                   },
-                  "slug": {
+                  "key": {
                     "type": "string"
                   },
                   "description": {
@@ -6194,7 +6208,7 @@
                 "required": [
                   "kind",
                   "name",
-                  "slug",
+                  "key",
                   "description",
                   "auth_type"
                 ]
@@ -7186,7 +7200,7 @@
                   "name": {
                     "type": "string"
                   },
-                  "slug": {
+                  "key": {
                     "type": "string"
                   },
                   "description": {
@@ -7204,7 +7218,7 @@
                 "required": [
                   "kind",
                   "name",
-                  "slug",
+                  "key",
                   "description",
                   "auth_type"
                 ]

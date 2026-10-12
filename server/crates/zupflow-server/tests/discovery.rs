@@ -78,7 +78,7 @@ async fn catalog_token_app(server: &Server, org: &str) -> String {
     let (_, created) = server
         .send(
             call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(json!({
-                "kind": "mcp", "name": "Tools", "slug": "tools", "description": "", "auth_type": "token",
+                "kind": "mcp", "name": "Tools", "key": "tools", "description": "", "auth_type": "token",
             })),
         )
         .await;
@@ -314,9 +314,7 @@ async fn discovers_a_workspace_apps_tools() {
         .send(
             call("alice", Method::POST, format!("/v1/workspaces/{sandbox}/apps"))
                 .naming(&org)
-                .body(
-                    json!({ "kind": "mcp", "name": "Echo", "slug": "echo", "description": "", "auth_type": "token" }),
-                ),
+                .body(json!({ "kind": "mcp", "name": "Echo", "key": "echo", "description": "", "auth_type": "token" })),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
@@ -360,7 +358,7 @@ async fn connect_oauth() -> (Server, Installed) {
     let (_, created) = server
         .send(
             call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(json!({
-                "kind": "mcp", "name": "Tracker", "slug": "tracker", "description": "", "auth_type": "oauth2",
+                "kind": "mcp", "name": "Tracker", "key": "tracker", "description": "", "auth_type": "oauth2",
             })),
         )
         .await;

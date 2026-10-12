@@ -1,4 +1,4 @@
-/** Finds the reference fixture's objects through the API, by slug. */
+/** Finds the reference fixture's objects through the API: organizations and workspaces by slug, apps by key. */
 import type { AppId, OrganizationId, Workspace, ZupflowClient } from "@zupflow/sdk";
 import { OTHER_ORGANIZATION, REFERENCE_FIXTURE } from "./target";
 
@@ -54,16 +54,16 @@ export async function loadFixture(
   const loadApps = async (): Promise<Fixture["apps"]> => {
     const catalog = await client.organizationApps.list(organization);
     const own = await client.workspaceApps.list(qaPlayground.id);
-    const app = (apps: typeof catalog, slug: string) =>
+    const app = (apps: typeof catalog, key: string) =>
       must(
-        apps.find((a) => a.slug === slug),
-        `app ${slug}`,
+        apps.find((a) => a.key === key),
+        `app ${key}`,
       ).id;
     return {
-      googleWorkspace: app(catalog, "google-workspace"),
+      googleWorkspace: app(catalog, "google_workspace"),
       taskboard: app(catalog, "taskboard"),
       notion: app(catalog, "notion"),
-      echoServer: app(own, "echo-server"),
+      echoServer: app(own, "echo_server"),
     };
   };
   // Kept as a promise's outcome, so a case that never touches apps runs on a server without them.

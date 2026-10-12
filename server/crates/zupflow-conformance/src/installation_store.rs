@@ -3,7 +3,9 @@
 //! install, their credentials kept and returned exactly and gone once
 //! disconnected or deleted, and the catalog-wide list paged without repeats;
 //! reconnect required records its audit and outbox exactly once, only for
-//! the current credential in its own scope.
+//! the current credential in its own scope. Each installation has a short ID
+//! of its own in its workspace, kept while it is renamed or disconnected
+//! (decision 0047).
 //!
 //! `prepare` makes a [`Tenant`] exist: its organization, two Sandbox and a
 //! Production workspace, a catalog app, and an app of the Sandbox workspace's own.
@@ -22,7 +24,7 @@ use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::{
     ConnectedAccount, DiscoveredClient, Installation, InstallationError, InstallationStatus, InstallationStore,
-    InstalledApp, NewCredential, NewInstallation, TemplateSnapshot,
+    InstalledApp, NewCredential, NewInstallation, ShortId, TemplateSnapshot,
 };
 use zupflow_core::jobs::JobQueue;
 use zupflow_core::keys::{Sealed, WrappedKey};
@@ -156,6 +158,7 @@ pub async fn run(
 ) {
     serializes_refresh_and_guards_every_scope(store, audit, jobs, webhooks, &prepare).await;
     creates_and_finds_within_its_workspace(store, &prepare).await;
+    gives_each_installation_a_short_id_of_its_own(store, &prepare).await;
     refuses_an_app_the_workspace_cannot_install(store, &prepare).await;
     lists_its_own_workspace_newest_first(store, &prepare).await;
     changes_only_within_its_workspace(store, &prepare).await;
@@ -339,6 +342,72 @@ async fn lists_its_own_workspace_newest_first(store: &dyn InstallationStore, pre
         store.list_installations(b.organization_id, a.sandbox).await.unwrap(),
         []
     );
+}
+
+async fn gives_each_installation_a_short_id_of_its_own(store: &dyn InstallationStore, prepare: &Prepare) {
+    let a = tenant(prepare).await;
+    let b = tenant(prepare).await;
+    let mut issued: Vec<(WorkspaceId, ShortId)> = Vec::new();
+    for (tenant, workspace) in [(a, a.sandbox), (a, a.sibling), (b, b.sandbox)] {
+        let mut in_workspace = HashSet::new();
+        for _ in 0..12 {
+            let installation = install(store, &tenant, workspace, InstalledApp::Catalog(tenant.catalog_app)).await;
+            assert_eq!(
+                ShortId::parse(installation.short_id.as_str()),
+                Some(installation.short_id.clone()),
+                "six lowercase base32 characters"
+            );
+            assert!(
+                in_workspace.insert(installation.short_id.clone()),
+                "unique in its workspace"
+            );
+            issued.push((workspace, installation.short_id));
+        }
+        let listed: HashSet<ShortId> = store
+            .list_installations(tenant.organization_id, workspace)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|installation| installation.short_id)
+            .collect();
+        assert_eq!(listed, in_workspace, "read back as given");
+    }
+
+    // Kept while it is renamed and disconnected, and not issued again once
+    // it is deleted.
+    let installation = install(store, &a, a.sandbox, InstalledApp::Workspace(a.own_app)).await;
+    let renamed = store
+        .rename_installation(a.organization_id, a.sandbox, installation.id, "Renamed", &|_| {
+            by_suite_in(a.sandbox)
+        })
+        .await
+        .unwrap();
+    assert_eq!(renamed.short_id, installation.short_id);
+    let disconnected = store
+        .disconnect_installation(a.organization_id, a.sandbox, installation.id, &|_| {
+            by_suite_in(a.sandbox)
+        })
+        .await
+        .unwrap();
+    assert_eq!(disconnected.short_id, installation.short_id);
+    store
+        .delete_installation(a.organization_id, a.sandbox, installation.id, &|_| {
+            by_suite_in(a.sandbox)
+        })
+        .await
+        .unwrap();
+    for _ in 0..12 {
+        let next = install(store, &a, a.sandbox, InstalledApp::Catalog(a.catalog_app)).await;
+        assert_ne!(
+            next.short_id, installation.short_id,
+            "a deleted installation's short ID"
+        );
+        assert!(
+            !issued.contains(&(a.sandbox, next.short_id.clone())),
+            "issued once in its workspace"
+        );
+        issued.push((a.sandbox, next.short_id));
+    }
 }
 
 async fn changes_only_within_its_workspace(store: &dyn InstallationStore, prepare: &Prepare) {

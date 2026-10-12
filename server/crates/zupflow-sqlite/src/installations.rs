@@ -14,7 +14,7 @@ use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AppId, InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::{
     AccountConnection, AppInstallation, ConnectedAccount, Installation, InstallationError, InstallationStatus,
-    InstallationStore, InstalledApp, NewCredential, NewInstallation, RefreshClaim, TemplateSnapshot,
+    InstallationStore, InstalledApp, NewCredential, NewInstallation, RefreshClaim, ShortId, TemplateSnapshot,
 };
 use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::time::Timestamp;
@@ -57,7 +57,7 @@ fn read(error: impl std::fmt::Display) -> InstallationError {
 /// so queries stay static strings.
 macro_rules! columns {
     () => {
-        "i.id, i.organization_id, i.workspace_id, i.catalog_app_id, i.workspace_app_id, i.label, i.status, \
+        "i.id, i.organization_id, i.workspace_id, i.catalog_app_id, i.workspace_app_id, i.short_id, i.label, i.status, \
          i.configuration_version, i.account_external_id, i.account_display_name, i.account_email, \
          i.granted_scopes, i.credential_version, i.connected_at, i.expires_at, i.created_at, i.updated_at, \
          i.auth_template, i.app_version, i.oauth_client"
@@ -67,7 +67,7 @@ macro_rules! columns {
 /// The same columns, unqualified, for `RETURNING`.
 macro_rules! returning {
     () => {
-        "id, organization_id, workspace_id, catalog_app_id, workspace_app_id, label, status, \
+        "id, organization_id, workspace_id, catalog_app_id, workspace_app_id, short_id, label, status, \
          configuration_version, account_external_id, account_display_name, account_email, \
          granted_scopes, credential_version, connected_at, expires_at, created_at, updated_at, auth_template, \
          app_version, oauth_client"
@@ -83,6 +83,7 @@ fn installation_from(row: &SqliteRow) -> Result<Installation, InstallationError>
         _ => return Err(read("an installation of no app, or of two")),
     };
     let status: String = row.try_get("status").map_err(read)?;
+    let short_id: String = row.try_get("short_id").map_err(read)?;
     let configuration_version: i64 = row.try_get("configuration_version").map_err(read)?;
     let external_id: Option<String> = row.try_get("account_external_id").map_err(read)?;
     let connection = match external_id {
@@ -124,6 +125,7 @@ fn installation_from(row: &SqliteRow) -> Result<Installation, InstallationError>
         organization_id: OrganizationId::from_uuid(row.try_get("organization_id").map_err(read)?),
         workspace_id: WorkspaceId::from_uuid(row.try_get("workspace_id").map_err(read)?),
         app,
+        short_id: ShortId::parse(&short_id).ok_or_else(|| read("a malformed short ID"))?,
         label: row.try_get("label").map_err(read)?,
         status: InstallationStatus::parse(&status).ok_or_else(|| read("an unknown status"))?,
         configuration_version: u32::try_from(configuration_version).map_err(read)?,
@@ -134,8 +136,75 @@ fn installation_from(row: &SqliteRow) -> Result<Installation, InstallationError>
     })
 }
 
+/// How many short IDs an insert draws before giving up: with a billion of
+/// them, a workspace would need hundreds of millions of installations
+/// before one draw in two collided.
+const SHORT_ID_DRAWS: usize = 8;
+
+/// Issues a short ID in this workspace (decision 0047), inside the caller's
+/// transaction: the first of `draw`'s that was never issued here, recorded
+/// so it never is again. Its row outlives the installation.
+pub(crate) async fn issue_short_id(
+    transaction: &mut Transaction<'static, Sqlite>,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    draw: &mut (dyn FnMut() -> Result<ShortId, InstallationError> + Send),
+    now: i64,
+) -> Result<ShortId, InstallationError> {
+    for _ in 0..SHORT_ID_DRAWS {
+        let short_id = draw()?;
+        let issued = sqlx::query(
+            "INSERT INTO installation_short_ids (id, organization_id, workspace_id, short_id, created_at) \
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT (organization_id, workspace_id, short_id) DO NOTHING",
+        )
+        .bind(Uuid::now_v7())
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(short_id.as_str())
+        .bind(now)
+        .execute(&mut **transaction)
+        .await
+        .map_err(failed("issue_short_id"))?;
+        if issued.rows_affected() == 1 {
+            return Ok(short_id);
+        }
+    }
+    tracing::error!(event = "installations.short_ids_exhausted", draws = SHORT_ID_DRAWS);
+    Err(InstallationError::Unavailable)
+}
+
+/// For tests that write installations by hand: records the next short ID of
+/// a counter shared by the whole test process, so no two ever collide, and
+/// returns it.
+#[cfg(test)]
+pub(crate) async fn record_test_short_id(pool: &sqlx::SqlitePool, organization: Uuid, workspace: Uuid) -> String {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let short_id = ShortId::from_bits(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    sqlx::query(
+        "INSERT INTO installation_short_ids (id, organization_id, workspace_id, short_id, created_at) \
+         VALUES (?, ?, ?, ?, 0)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(organization)
+    .bind(workspace)
+    .bind(short_id.as_str())
+    .execute(pool)
+    .await
+    .expect("a test's short ID is new in its workspace");
+    short_id.as_str().to_owned()
+}
+
+/// A short ID from the operating system's random source.
+pub(crate) fn random_short_id() -> Result<ShortId, InstallationError> {
+    ShortId::generate().map_err(|_| {
+        tracing::error!(event = "installations.random_unavailable");
+        InstallationError::Unavailable
+    })
+}
+
 /// Inserts a connected installation and its credential, inside the caller's
-/// transaction. The caller has checked the app belongs to the scope.
+/// transaction, with a new short ID. The caller has checked the app belongs
+/// to the scope.
 pub(crate) async fn insert_connected(
     transaction: &mut Transaction<'static, Sqlite>,
     organization_id: OrganizationId,
@@ -157,12 +226,13 @@ pub(crate) async fn insert_connected(
         .transpose()
         .map_err(read)?;
     let now = Timestamp::now().millis();
+    let short_id = issue_short_id(transaction, organization_id, workspace_id, &mut random_short_id, now).await?;
     let row = sqlx::query(concat!(
-        "INSERT INTO installations (id, organization_id, workspace_id, catalog_app_id, workspace_app_id, label, \
-         status, configuration_version, account_external_id, account_display_name, account_email, \
+        "INSERT INTO installations (id, organization_id, workspace_id, catalog_app_id, workspace_app_id, short_id, \
+         label, status, configuration_version, account_external_id, account_display_name, account_email, \
          granted_scopes, credential_version, connected_at, expires_at, created_at, updated_at, auth_template, \
          app_version, oauth_client) \
-         VALUES (?, ?, ?, ?, ?, ?, 'connected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ",
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'connected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ",
         returning!()
     ))
     .bind(installation_id.uuid())
@@ -170,6 +240,7 @@ pub(crate) async fn insert_connected(
     .bind(workspace_id.uuid())
     .bind(catalog_app_id)
     .bind(workspace_app_id)
+    .bind(short_id.as_str())
     .bind(&installation.label)
     .bind(i64::from(installation.configuration_version))
     .bind(&installation.account.external_id)
@@ -842,7 +913,7 @@ mod tests {
                     .unwrap();
                 }
                 sqlx::query(
-                    "INSERT INTO apps (id, organization_id, kind, name, slug, description, icon_glyph, icon_color, \
+                    "INSERT INTO apps (id, organization_id, kind, name, key, description, icon_glyph, icon_color, \
                      auth, tools, version, created_at, updated_at) \
                      VALUES (?, ?, 'mcp', 'Catalog', 'catalog', '', 'C', '#0E7490', '{\"type\":\"token\"}', '[]', 1, 0, 0)",
                 )
@@ -852,7 +923,7 @@ mod tests {
                 .await
                 .unwrap();
                 sqlx::query(
-                    "INSERT INTO workspace_apps (id, organization_id, workspace_id, kind, name, slug, description, \
+                    "INSERT INTO workspace_apps (id, organization_id, workspace_id, kind, name, key, description, \
                      icon_glyph, icon_color, auth, tools, version, created_at, updated_at) \
                      VALUES (?, ?, ?, 'mcp', 'Own', 'own', '', 'O', '#0E7490', '{\"type\":\"token\"}', '[]', 1, 0, 0)",
                 )
@@ -880,6 +951,146 @@ mod tests {
             prepare(database),
         )
         .await;
+    }
+
+    /// The draws the store makes are random; these are chosen, to show a
+    /// short ID once issued in a workspace is never issued there again, even
+    /// after its installation is gone, while another workspace may have it.
+    #[tokio::test]
+    async fn never_issues_a_short_id_twice_in_a_workspace() {
+        let Temporary {
+            database,
+            directory: _directory,
+        } = temporary().await;
+        let tenant = Tenant {
+            organization_id: OrganizationId::generate(),
+            sandbox: WorkspaceId::generate(),
+            sibling: WorkspaceId::generate(),
+            production: WorkspaceId::generate(),
+            catalog_app: AppId::generate(),
+            own_app: AppId::generate(),
+        };
+        prepare(database.clone())(tenant).await;
+        let other = Tenant {
+            organization_id: OrganizationId::generate(),
+            ..tenant
+        };
+        let other = Tenant {
+            sandbox: WorkspaceId::generate(),
+            sibling: WorkspaceId::generate(),
+            production: WorkspaceId::generate(),
+            catalog_app: AppId::generate(),
+            own_app: AppId::generate(),
+            ..other
+        };
+        prepare(database.clone())(other).await;
+        let store = SqliteInstallationStore::new(database.clone());
+        let first = store
+            .create_installation(
+                tenant.organization_id,
+                tenant.sandbox,
+                InstallationId::generate(),
+                &NewInstallation {
+                    app: InstalledApp::Catalog(tenant.catalog_app),
+                    label: "Board".to_owned(),
+                    configuration_version: 1,
+                    account: ConnectedAccount {
+                        external_id: "one".to_owned(),
+                        display_name: "Robin".to_owned(),
+                        email: None,
+                    },
+                    granted_scopes: vec![],
+                    expires_at: None,
+                    credential: NewCredential {
+                        sealed: Sealed {
+                            wrapped_key: WrappedKey {
+                                key_id: "local".to_owned(),
+                                bytes: vec![1; 40],
+                            },
+                            nonce: [1; 12],
+                            ciphertext: vec![1; 16],
+                        },
+                        version: 1,
+                    },
+                    snapshot: zupflow_conformance::installation_store::snapshot(1),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .delete_installation(tenant.organization_id, tenant.sandbox, first.id, &|_| {
+                zupflow_conformance::audit_store::by_suite_in(tenant.sandbox)
+            })
+            .await
+            .unwrap();
+
+        let fresh = ShortId::parse("zz2277").unwrap();
+        let fresh = if fresh == first.short_id {
+            ShortId::parse("yy3366").unwrap()
+        } else {
+            fresh
+        };
+        let issue = |organization: OrganizationId, workspace: WorkspaceId, draws: Vec<ShortId>| {
+            let database = database.clone();
+            async move {
+                let mut draws = draws.into_iter();
+                let mut transaction = database.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+                let issued = issue_short_id(
+                    &mut transaction,
+                    organization,
+                    workspace,
+                    &mut || Ok(draws.next().expect("enough draws")),
+                    0,
+                )
+                .await;
+                transaction.commit().await.unwrap();
+                issued
+            }
+        };
+        // The deleted installation's short ID is drawn first and skipped.
+        assert_eq!(
+            issue(
+                tenant.organization_id,
+                tenant.sandbox,
+                vec![first.short_id.clone(), fresh.clone()]
+            )
+            .await,
+            Ok(fresh.clone())
+        );
+        // Drawing only taken ones gives up rather than reuse one.
+        assert_eq!(
+            issue(
+                tenant.organization_id,
+                tenant.sandbox,
+                vec![first.short_id.clone(); SHORT_ID_DRAWS]
+            )
+            .await,
+            Err(InstallationError::Unavailable)
+        );
+        // Another workspace, of this organization or another, has its own.
+        for (organization, workspace) in [
+            (tenant.organization_id, tenant.sibling),
+            (other.organization_id, other.sandbox),
+        ] {
+            assert_eq!(
+                issue(organization, workspace, vec![first.short_id.clone()]).await,
+                Ok(first.short_id.clone())
+            );
+        }
+        // The database refuses an installation whose short ID was never
+        // issued in its workspace.
+        let unissued = sqlx::query(
+            "INSERT INTO installations (id, organization_id, workspace_id, catalog_app_id, short_id, label, status, \
+             configuration_version, granted_scopes, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, 'aaaaaa', 'Main', 'disconnected', 1, '[]', 0, 0)",
+        )
+        .bind(InstallationId::generate().uuid())
+        .bind(tenant.organization_id.uuid())
+        .bind(tenant.production.uuid())
+        .bind(tenant.catalog_app.uuid())
+        .execute(database.pool())
+        .await;
+        assert!(unissued.is_err(), "a short ID not recorded in its workspace");
     }
 
     #[tokio::test]

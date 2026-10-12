@@ -41,7 +41,7 @@ import { announceLifecycle, grantorAllows, setLatency, withdrawUngrantable, with
 import { hashReference, isId, newId, newReference, uuidOf } from "./ids";
 import type { IdempotencyRow, MembershipRow } from "./model";
 import { mulberry32 } from "./random";
-import { runEventsKey, timelineOf } from "./scope";
+import { inWorkspace, issueShortId, runEventsKey, SHORT_ID_DRAWS, timelineOf } from "./scope";
 import { DEMO_USER_ID, seed } from "./seed";
 import { listedFrom, MAX_GONE, recordListing } from "./tools";
 
@@ -116,9 +116,9 @@ const ws = (slug: string) => {
   if (!w) throw new Error(`No workspace ${slug}`);
   return w;
 };
-const app = (slug: string) => {
-  const a = db().apps.find((x) => x.slug === slug);
-  if (!a) throw new Error(`No app ${slug}`);
+const app = (key: string) => {
+  const a = db().apps.find((x) => x.key === key);
+  if (!a) throw new Error(`No app ${key}`);
   return a;
 };
 
@@ -199,7 +199,7 @@ describe("Connect lifecycle snapshots", () => {
     async (scope) => {
       const workspace = ws("qa-playground");
       const session = await owner.connectSessions.create(workspace.id, {
-        app_id: app("echo-server").id,
+        app_id: app("echo_server").id,
         intent: "create",
         label: "Poisoned expiry",
         installation_id: null,
@@ -230,7 +230,7 @@ describe("Connect lifecycle snapshots", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
       const session = await owner.connectSessions.create(ws("qa-playground").id, {
-        app_id: app("echo-server").id,
+        app_id: app("echo_server").id,
         intent: "create",
         label: "Expired",
         installation_id: null,
@@ -258,7 +258,7 @@ describe("Connect lifecycle snapshots", () => {
 
   it("records only one terminal result when credentials race cancellation", async () => {
     const session = await owner.connectSessions.create(ws("qa-playground").id, {
-      app_id: app("echo-server").id,
+      app_id: app("echo_server").id,
       intent: "create",
       label: "Race",
       installation_id: null,
@@ -900,7 +900,7 @@ describe("configured OAuth issuer isolation", () => {
       const input = {
         kind: "mcp" as const,
         name: "Issuer isolation",
-        slug: "issuer-isolation",
+        key: "issuer_isolation",
         description: "",
         auth_type: "oauth2" as const,
       };
@@ -988,7 +988,7 @@ describe("idempotency store", () => {
 
   it("stores no Connect reference and no plain body digest", async () => {
     const session = await owner.connectSessions.create(ws("acme-sandbox").id, {
-      app_id: app("google-workspace").id,
+      app_id: app("google_workspace").id,
       intent: "create",
       label: "Stored OAuth",
       installation_id: null,
@@ -1048,7 +1048,7 @@ describe("idempotency store", () => {
       joined_at: new Date().toISOString(),
       last_active_at: null,
     });
-    const app = { kind: "mcp", name: "Both", slug: "both-orgs", description: "", auth_type: "token" } as const;
+    const app = { kind: "mcp", name: "Both", key: "both_orgs", description: "", auth_type: "token" } as const;
     const inNorthwind = await owner.organizationApps.create(must(northwindId()), app, { idempotencyKey: "store-orgs" });
     const asLarkspur = clientFor(DEMO_USER_ID, larkspur);
     const inLarkspur = await asLarkspur.organizationApps.create(larkspur(), app, { idempotencyKey: "store-orgs" });
@@ -1085,7 +1085,7 @@ describe("Connect (simulated consent)", () => {
         body: { decision: "approved", email: "reconnect@acme.example" },
       });
     const first = await owner.connectSessions.create(sandbox.id, {
-      app_id: app("google-workspace").id,
+      app_id: app("google_workspace").id,
       intent: "create",
       label: "Reconnect test",
       installation_id: null,
@@ -1116,7 +1116,7 @@ describe("Connect (simulated consent)", () => {
       (i) => i.workspace_id === sandbox.id && i.label === "Marketing (test)",
     );
     const session = await owner.connectSessions.create(sandbox.id, {
-      app_id: app("google-workspace").id,
+      app_id: app("google_workspace").id,
       intent: "reconnect",
       label: "ignored",
       installation_id: installation?.id ?? null,
@@ -1139,7 +1139,7 @@ describe("Connect (simulated consent)", () => {
     const created = await owner.organizationApps.create(org, {
       kind: "mcp",
       name: "Ledger",
-      slug: "ledger",
+      key: "ledger",
       description: "",
       auth_type: "mcp_oauth",
     });
@@ -1196,7 +1196,7 @@ describe("Connect (simulated consent)", () => {
     const created = await owner.organizationApps.create(org, {
       kind: "mcp",
       name: "Ledger",
-      slug: "ledger",
+      key: "ledger",
       description: "",
       auth_type: "mcp_oauth",
     });
@@ -1278,7 +1278,7 @@ describe("Connect (simulated consent)", () => {
       ).connect_sessions.find((s) => s.id === id);
 
     const denied = await owner.connectSessions.create(sandbox.id, {
-      app_id: app("google-workspace").id,
+      app_id: app("google_workspace").id,
       intent: "create",
       label: "Denied",
       installation_id: null,
@@ -1292,7 +1292,7 @@ describe("Connect (simulated consent)", () => {
       "Marketing (test)",
     );
     const other = await owner.connectSessions.create(sandbox.id, {
-      app_id: app("google-workspace").id,
+      app_id: app("google_workspace").id,
       intent: "reconnect",
       label: "ignored",
       installation_id: installation.id,
@@ -1332,7 +1332,7 @@ describe("Connect (simulated consent)", () => {
     const created = await owner.organizationApps.create(org, {
       kind: "mcp",
       name: "Ledger",
-      slug: "ledger",
+      key: "ledger",
       description: "",
       auth_type: "mcp_oauth",
     });
@@ -1350,7 +1350,7 @@ describe("Connect (simulated consent)", () => {
 
   it("starts no consent for an app without the provider's endpoints", async () => {
     const sandbox = ws("acme-sandbox");
-    const google = app("google-workspace");
+    const google = app("google_workspace");
     if (google.auth.type !== "oauth2") throw new Error("an OAuth app");
     google.auth.token_url = null;
     const session = await owner.connectSessions.create(sandbox.id, {
@@ -1625,7 +1625,7 @@ describe("identifiers", () => {
   it("keeps hosted Connect inside the session's own tenant, even for a corrupted session", async () => {
     // A session whose app belongs to another organization must not show or use that app.
     const foreignApp = {
-      ...structuredClone(app("echo-server")),
+      ...structuredClone(app("echo_server")),
       id: newId("app"),
       organization_id: newId("organization"),
       owner_workspace_id: null,
@@ -1656,7 +1656,7 @@ describe("identifiers", () => {
 
   it("refuses an expired session reached by its reference", async () => {
     const session = await owner.connectSessions.create(ws("qa-playground").id, {
-      app_id: app("echo-server").id,
+      app_id: app("echo_server").id,
       intent: "create",
       label: "Echo 7",
       installation_id: null,
@@ -1672,7 +1672,7 @@ describe("identifiers", () => {
   it("shows a link's session only while pending, or ended within its grace", async () => {
     const start = (label: string) =>
       owner.connectSessions.create(ws("qa-playground").id, {
-        app_id: app("echo-server").id,
+        app_id: app("echo_server").id,
         intent: "create",
         label,
         installation_id: null,
@@ -1704,13 +1704,96 @@ describe("identifiers", () => {
 
   it("stores only a hash of the Connect reference", async () => {
     const session = await owner.connectSessions.create(ws("qa-playground").id, {
-      app_id: app("echo-server").id,
+      app_id: app("echo_server").id,
       intent: "create",
       label: "Echo 6",
       installation_id: null,
       return_url: null,
     });
     expect(JSON.stringify(db())).not.toContain(referenceOf(session));
+  });
+});
+
+describe("installation short IDs", () => {
+  /** Draws exactly these characters from the short ID alphabet, in order. */
+  const drawing = (...shortIds: string[]) => {
+    const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+    const draws = shortIds.join("").split("");
+    return () => (alphabet.indexOf(must(draws.shift(), "a draw")) + 0.5) / alphabet.length;
+  };
+
+  it("never issues one twice in a workspace, even after its installation is deleted", async () => {
+    const qa = ws("qa-playground");
+    const session = await owner.connectSessions.create(qa.id, {
+      app_id: app("echo_server").id,
+      intent: "create",
+      label: "Short",
+      installation_id: null,
+      return_url: null,
+    });
+    const { installation } = await owner.connect.submitCredentials(referenceOf(session), {
+      values: { token: "short" },
+    });
+    await owner.installations.delete(qa.id, installation.id);
+    expect(db().installations.some((i) => i.id === installation.id)).toBe(false);
+    const scope = { organization_id: qa.organization_id, workspace_id: qa.id };
+    expect(db().installation_short_ids).toContainEqual({ ...scope, short_id: installation.short_id });
+
+    const next = installation.short_id === "zzzzzz" ? "yyyyyy" : "zzzzzz";
+    expect(issueShortId(db().installation_short_ids, scope, drawing(installation.short_id, next))).toBe(next);
+    // Drawing only taken ones gives up rather than reuse one.
+    const before = db().installation_short_ids.length;
+    expect(() =>
+      issueShortId(db().installation_short_ids, scope, drawing(...Array(SHORT_ID_DRAWS).fill(installation.short_id))),
+    ).toThrow();
+    expect(db().installation_short_ids).toHaveLength(before);
+    // Another workspace, of this organization or another, has its own short IDs.
+    const harbor = ws("harbor-sandbox");
+    for (const other of [ws("acme-sandbox"), harbor]) {
+      const otherScope = { organization_id: other.organization_id, workspace_id: other.id };
+      expect(issueShortId(db().installation_short_ids, otherScope, drawing(installation.short_id))).toBe(
+        installation.short_id,
+      );
+    }
+  });
+});
+
+describe("installation short IDs across scopes", () => {
+  const drawing = (...shortIds: string[]) => {
+    const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+    const draws = shortIds.join("").split("");
+    return () => (alphabet.indexOf(must(draws.shift(), "a draw")) + 0.5) / alphabet.length;
+  };
+
+  it("compares both the organization and the workspace", () => {
+    const qa = ws("qa-playground");
+    const larkspur = must(db().organizations.find((o) => o.slug === "larkspur")).id;
+    // A row naming this workspace's ID under another organization is not this workspace's.
+    db().installation_short_ids.push({ organization_id: larkspur, workspace_id: qa.id, short_id: "stray2" });
+    const scope = { organization_id: qa.organization_id, workspace_id: qa.id };
+    expect(issueShortId(db().installation_short_ids, scope, drawing("stray2"))).toBe("stray2");
+    // A row naming this organization under another workspace is not this workspace's either.
+    const sibling = ws("acme-sandbox");
+    db().installation_short_ids.push({
+      organization_id: qa.organization_id,
+      workspace_id: sibling.id,
+      short_id: "other2",
+    });
+    expect(issueShortId(db().installation_short_ids, scope, drawing("other2"))).toBe("other2");
+  });
+
+  it("deletes a workspace's short IDs with it, and only its own", async () => {
+    const doomed = ws("acme-sandbox");
+    const larkspur = must(db().organizations.find((o) => o.slug === "larkspur")).id;
+    const stray = { organization_id: larkspur, workspace_id: doomed.id, short_id: "stray2" };
+    db().installation_short_ids.push(stray);
+    const own = db().installation_short_ids.filter((r) => inWorkspace(r, doomed));
+    expect(own.length).toBeGreaterThan(0);
+    const others = db().installation_short_ids.filter((r) => !inWorkspace(r, doomed));
+    await owner.workspaces.delete(doomed.id);
+    expect(db().installation_short_ids.filter((r) => inWorkspace(r, doomed))).toEqual([]);
+    expect(db().installation_short_ids).toEqual(others);
+    expect(db().installation_short_ids).toContainEqual(stray);
   });
 });
 
@@ -1818,7 +1901,7 @@ describe("two organizations", () => {
     const sandbox = ws("acme-sandbox");
     const agent = must(db().agents.find((a) => a.workspace_id === acme.id && a.status === "active"));
     const run = must(db().runs.find((r) => r.workspace_id === acme.id));
-    const google = must(db().apps.find((a) => a.organization_id === org && a.slug === "google-workspace"));
+    const google = must(db().apps.find((a) => a.organization_id === org && a.key === "google_workspace"));
     const harborInstallation = must(db().installations.find((i) => i.workspace_id === harbor.id));
 
     const snapshot = async () => {
@@ -2007,7 +2090,7 @@ describe("two organizations", () => {
     // Rows created through the API, not only seeded ones.
     const qa = ws("qa-playground");
     const session = await owner.connectSessions.create(qa.id, {
-      app_id: app("echo-server").id,
+      app_id: app("echo_server").id,
       intent: "create",
       label: "Order check",
       installation_id: null,
@@ -2022,7 +2105,7 @@ describe("two organizations", () => {
       model: "claude-sonnet-5-5",
       instructions: "",
     });
-    const tool = must(app("echo-server").tools[0]).name;
+    const tool = must(app("echo_server").tools[0]).name;
     const grant = await owner.grants.create(qa.id, agent.id, {
       installation_id: installation.id,
       tools: [tool],
@@ -2033,7 +2116,7 @@ describe("two organizations", () => {
     const catalogApp = await owner.organizationApps.create(qa.organization_id, {
       kind: "mcp",
       name: "Order",
-      slug: "order-check",
+      key: "order_check",
       description: "",
       auth_type: "token",
     });
@@ -2510,7 +2593,7 @@ describe("two organizations", () => {
     // A hosted reconnect whose installation carries another organization's label finds nothing to reconnect.
     const sandbox = ws("acme-sandbox");
     const google = must(
-      db().apps.find((a) => a.organization_id === sandbox.organization_id && a.slug === "google-workspace"),
+      db().apps.find((a) => a.organization_id === sandbox.organization_id && a.key === "google_workspace"),
     );
     const real = must(db().installations.find((i) => i.workspace_id === sandbox.id && i.app_id === google.id));
     const stray = { ...structuredClone(real), id: newId("installation"), organization_id: larkspur };
@@ -2578,7 +2661,7 @@ describe("two organizations", () => {
     const sandbox = ws("acme-sandbox");
     const qa = ws("qa-playground");
     const org = sandbox.organization_id;
-    const google = must(db().apps.find((a) => a.organization_id === org && a.slug === "google-workspace"));
+    const google = must(db().apps.find((a) => a.organization_id === org && a.key === "google_workspace"));
     // A reconnect naming an installation of the organization's other workspace.
     const elsewhere = must(
       db().installations.find((i) => i.workspace_id === qa.id || i.workspace_id === ws("acme").id),
@@ -2609,7 +2692,7 @@ describe("two organizations", () => {
     );
     expect(consent.status).toBe(404);
     // A session naming the other workspace's own app is neither shown nor usable.
-    const echo = app("echo-server");
+    const echo = app("echo_server");
     expect(echo.owner_workspace_id).toBe(qa.id);
     const second = newReference();
     db().connect_sessions.push({
@@ -2640,23 +2723,28 @@ describe("two organizations", () => {
     ]) {
       expect((await failure(attempt())).status).toBe(404);
     }
-    // Slugs are unique per owner: the organization's catalog, or one workspace.
-    const inBeta = await owner.workspaceApps.create(ws("beta-labs").id, {
-      kind: "mcp",
-      name: "Publishing",
-      slug: publishing.slug,
-      description: "",
-      auth_type: "token",
-    });
-    expect(inBeta.slug).toBe(publishing.slug);
-    const inCatalog = await owner.organizationApps.create(org, {
-      kind: "mcp",
-      name: "Publishing",
-      slug: publishing.slug,
-      description: "",
-      auth_type: "token",
-    });
-    expect(inCatalog.slug).toBe(publishing.slug);
+    // One key space for the organization (decision 0047): another workspace
+    // and the catalog can't reuse a workspace app's key.
+    for (const attempt of [
+      () =>
+        owner.workspaceApps.create(ws("beta-labs").id, {
+          kind: "mcp",
+          name: "Publishing",
+          key: publishing.key,
+          description: "",
+          auth_type: "token",
+        }),
+      () =>
+        owner.organizationApps.create(org, {
+          kind: "mcp",
+          name: "Publishing",
+          key: publishing.key,
+          description: "",
+          auth_type: "token",
+        }),
+    ]) {
+      expect((await failure(attempt())).code).toBe("app_key_taken");
+    }
     // A workspace app's installations are counted in its own workspace only.
     const countOf = async () =>
       must((await owner.workspaceApps.list(ws("acme").id)).find((a) => a.id === publishing.id)).installation_count;
@@ -2685,7 +2773,7 @@ describe("two organizations", () => {
     const created = await owner.workspaceApps.create(acme.id, {
       kind: "mcp",
       name: "Ledger",
-      slug: "ledger",
+      key: "ledger",
       description: "",
       auth_type: "token",
     });
@@ -3073,7 +3161,7 @@ describe("installation tools", () => {
   const connectEcho = async () => {
     const qa = ws("qa-playground");
     const session = await owner.connectSessions.create(qa.id, {
-      app_id: app("echo-server").id,
+      app_id: app("echo_server").id,
       intent: "create",
       label: "Tools",
       installation_id: null,
@@ -3088,7 +3176,7 @@ describe("installation tools", () => {
   it("lists a new installation's tools from its app's definitions, pinned and current", async () => {
     const { qa, installation } = await connectEcho();
     const tools = await allTools(qa.id, installation.id);
-    const definitions = [...app("echo-server").tools].sort((a, b) => (a.name < b.name ? -1 : 1));
+    const definitions = [...app("echo_server").tools].sort((a, b) => (a.name < b.name ? -1 : 1));
     expect(tools.map((t) => [t.name, t.effect, t.status, t.pinned.title, t.pinned.description])).toEqual(
       definitions.map((d) => [d.name, d.effect, "current", d.title, d.description]),
     );
@@ -3098,7 +3186,7 @@ describe("installation tools", () => {
   it("keeps the pinned definition on refresh: a changed one waits beside it, a missing one is gone", async () => {
     const { qa, installation } = await connectEcho();
     const before = await allTools(qa.id, installation.id);
-    const echoApp = app("echo-server");
+    const echoApp = app("echo_server");
     const [first, ...rest] = echoApp.tools;
     const original = structuredClone(must(first));
     // The server now describes the first tool differently, as read-only, drops the rest and adds one.
@@ -3158,7 +3246,7 @@ describe("installation tools", () => {
       approval_required: ["echo_write"],
     });
     // The server stops listing echo_write.
-    const echoApp = app("echo-server");
+    const echoApp = app("echo_server");
     echoApp.tools = echoApp.tools.filter((t) => t.name !== "echo_write");
     await owner.installations.refreshTools(qa.id, installation.id);
     const tools = await allTools(qa.id, installation.id);
@@ -3185,7 +3273,7 @@ describe("installation tools", () => {
       instructions: "",
     });
     // The app defines a tool its server hasn't listed to this account yet: it isn't grantable.
-    app("echo-server").tools.push({
+    app("echo_server").tools.push({
       name: "echo_later",
       title: "Later",
       description: "Not listed yet.",
@@ -3438,10 +3526,10 @@ describe("tool policy", () => {
     const before = db().app_tool_levels.length;
     const qa = ws("qa-playground");
     const echo = must(db().installations.find((i) => i.workspace_id === qa.id && i.status === "connected"));
-    app("echo-server").tools.push({ name: "echo_twice", title: "Twice", description: "", effect: "read" });
+    app("echo_server").tools.push({ name: "echo_twice", title: "Twice", description: "", effect: "read" });
     await owner.installations.refreshTools(qa.id, echo.id);
     expect(db().app_tool_levels.length).toBe(before);
-    expect(db().app_tool_levels.some((l) => l.app_id === app("echo-server").id)).toBe(false);
+    expect(db().app_tool_levels.some((l) => l.app_id === app("echo_server").id)).toBe(false);
   });
 
   it("seeds levels that hold every grant in acme", () => {

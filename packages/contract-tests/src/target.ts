@@ -36,14 +36,14 @@ export interface Target {
 
 /**
  * The reference fixture every target loads on `reset`. The suite finds each
- * object by its slug, never by a fixed ID.
+ * object by its slug (an app by its key), never by a fixed ID.
  *
  * Organization `northwind`, with:
  * - Workspaces `acme` and `beta-labs` (Production), and `acme-sandbox` and
  *   `qa-playground` (Sandbox).
  * - In `acme` and `beta-labs` each: an agent with a grant and a finished run, an
  *   installation, a Connect session and a workspace app of its own (`acme`'s
- *   is `acme-publishing`; `beta-labs` has none at reset, and the suite makes
+ *   is `acme_publishing`; `beta-labs` has none at reset, and the suite makes
  *   one). In `acme-sandbox`: an active agent and an installation. Somewhere
  *   in the organization: a run waiting for approval in each environment; the
  *   Sandbox one belongs to `qa-playground` and waits on `echo_write`.
@@ -56,21 +56,21 @@ export interface Target {
  *   `acme` and `beta-labs` in Production, `acme-sandbox` and `qa-playground` in
  *   Sandbox. Pending rows have a next retry; terminal rows do not. No worker
  *   advances these fixture deliveries while the suite runs.
- * - Catalog apps `google-workspace` (OAuth, ready in Sandbox), `taskboard`
+ * - Catalog apps `google_workspace` (OAuth, ready in Sandbox), `taskboard`
  *   (configured OAuth, ready in Sandbox, incomplete in Production) and `notion`
  *   (configured in neither environment). The static Taskboard URLs use
- *   `https://taskboard.example`; live MCP OAuth journeys create `taskboard-live`.
+ *   `https://taskboard.example`; live MCP OAuth journeys create `taskboard_live`.
  * - `acme-sandbox`'s Taskboard registry has `list_tasks` current,
  *   `create_task` with changed text, and `delete_task` with changed hints.
  *   Synthetic historical `export_tasks` is gone; it is not a tool Taskboard serves.
- * - A workspace app `echo-server` owned by `qa-playground`, with token auth
+ * - A workspace app `echo_server` owned by `qa-playground`, with token auth
  *   through one input named `token`. Its provider accepts any token and
  *   rejects one containing `invalid`. Its tools include `echo`, which needs
  *   no approval, and `echo_write`, which does; `qa-playground` has a connected
  *   installation of it.
  * - At least one model in `GET /v1/models`.
  * - The default tool policy (never saved: `manual`, new tools at `approve`)
- *   and levels for its catalog apps' tools: in `google-workspace`, confirmed
+ *   and levels for its catalog apps' tools: in `google_workspace`, confirmed
  *   `allow` for `search_files`, `read_document` and `create_document`,
  *   `approve` for `send_email` and `deny` for `delete_file`, and
  *   `list_events` only suggested (`allow`, unconfirmed); in `taskboard`,
@@ -78,7 +78,7 @@ export interface Target {
  *   `delete_task`. No seeded grant includes `delete_task`; live journeys separately
  *   prove rejection of denied destructive calls. `acme`'s grants hold inside them
  *   (a grant elsewhere may not: tightening a level rewrites no grant), and `acme` has an installation
- *   of `google-workspace` that lists all six of its tools.
+ *   of `google_workspace` that lists all six of its tools.
  * - Runs in Sandbox as well as Production, at least one of them in
  *   `acme-sandbox`. At reset no run is queued or running; each is finished
  *   or waiting for approval, so nothing changes on its own during a test.

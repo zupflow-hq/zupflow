@@ -4,7 +4,8 @@
  * the HTTP layer.
  */
 import type { AppId, Environment, OrganizationId, WorkspaceId } from "@zupflow/sdk";
-import type { AppRow, ConfigurationRow, Db, RunEventRow, RunScope } from "./model";
+import type { AppRow, ConfigurationRow, Db, InstallationShortIdRow, RunEventRow, RunScope } from "./model";
+import type { Rng } from "./random";
 
 export type Scoped = { organization_id: OrganizationId; workspace_id: WorkspaceId };
 
@@ -59,4 +60,31 @@ export function runEventsKey(scope: RunScope) {
 /** A run's timeline: the rows under its scoped key that also carry its scope and ID. */
 export function timelineOf(db: Db, scope: RunScope): RunEventRow[] {
   return (db.run_events[runEventsKey(scope)] ?? []).filter((e) => sameWorkspace(e, scope) && e.run_id === scope.id);
+}
+
+const SHORT_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
+
+/** How many short IDs an issue draws before giving up, as the backend does. */
+export const SHORT_ID_DRAWS = 8;
+
+/**
+ * Issues a new installation short ID in one workspace (decision 0047): six
+ * lowercase base32 characters never issued there before, recorded under the
+ * workspace's full scope so it is never issued again, even after the
+ * installation is deleted. Gives up after `SHORT_ID_DRAWS` taken draws
+ * rather than reuse one.
+ */
+export function issueShortId(issued: InstallationShortIdRow[], scope: Scoped, rng: Rng = Math.random): string {
+  for (let draw = 0; draw < SHORT_ID_DRAWS; draw++) {
+    let shortId = "";
+    for (let i = 0; i < 6; i++) shortId += SHORT_ID_ALPHABET[Math.floor(rng() * SHORT_ID_ALPHABET.length)];
+    if (issued.some((row) => sameWorkspace(row, scope) && row.short_id === shortId)) continue;
+    issued.push({
+      organization_id: scope.organization_id,
+      workspace_id: scope.workspace_id,
+      short_id: shortId,
+    });
+    return shortId;
+  }
+  throw new Error("No new short ID could be issued in this workspace.");
 }

@@ -395,7 +395,7 @@ mod tests {
                     .unwrap();
                 for (app, slug) in [(tenant.catalog_app, "catalog"), (tenant.second_catalog_app, "second")] {
                     sqlx::query(
-                        "INSERT INTO apps (id, organization_id, kind, name, slug, description, icon_glyph, \
+                        "INSERT INTO apps (id, organization_id, kind, name, key, description, icon_glyph, \
                          icon_color, auth, tools, version, created_at, updated_at) \
                          VALUES (?, ?, 'mcp', 'Catalog', ?, '', 'C', '#0E7490', '{\"type\":\"token\"}', '[]', 1, 0, 0)",
                     )
@@ -417,7 +417,7 @@ mod tests {
                 .await
                 .unwrap();
                 sqlx::query(
-                    "INSERT INTO workspace_apps (id, organization_id, workspace_id, kind, name, slug, description, \
+                    "INSERT INTO workspace_apps (id, organization_id, workspace_id, kind, name, key, description, \
                      icon_glyph, icon_color, auth, tools, version, created_at, updated_at) \
                      VALUES (?, ?, ?, 'mcp', 'Own', 'own', '', 'O', '#0E7490', '{\"type\":\"token\"}', '[]', 1, 0, 0)",
                 )

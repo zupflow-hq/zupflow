@@ -236,8 +236,8 @@ function OverviewTab({ org, app }: { org: Organization; app: AppDefinition }) {
               <Property label="App ID" className="sm:grid-cols-1 sm:gap-1">
                 <MonoValue value={app.id} />
               </Property>
-              <Property label="Slug" className="sm:grid-cols-1 sm:gap-1">
-                <MonoValue value={app.slug} />
+              <Property label="Key" className="sm:grid-cols-1 sm:gap-1">
+                <MonoValue value={app.key} />
               </Property>
               <Property label="Created" className="sm:grid-cols-1 sm:gap-1">
                 <RelativeTime iso={app.created_at} />
@@ -342,6 +342,9 @@ function InstallationsTab({ org, appId, environment }: { org: Organization; appI
                     >
                       {installation.label}
                     </Link>
+                    <span className="ml-2 font-mono text-xs font-normal text-muted-foreground">
+                      {installation.short_id}
+                    </span>
                   </TableCell>
                   <TableCell>
                     <Link to="/$org/w/$ws" params={{ org: org.slug, ws: workspace.id }} className="hover:underline">

@@ -5,7 +5,7 @@
 import type { AuthTemplate, ToolDefinition } from "@zupflow/sdk";
 
 export interface CatalogEntry {
-  slug: string;
+  key: string;
   name: string;
   description: string;
   icon: { glyph: string; color: string };
@@ -15,7 +15,7 @@ export interface CatalogEntry {
 }
 
 const googleWorkspace: CatalogEntry = {
-  slug: "google-workspace",
+  key: "google_workspace",
   name: "Google Workspace",
   description: "Drive, Docs, Gmail and Calendar for the connected Google account.",
   icon: { glyph: "G", color: "#3B6FD8" },
@@ -86,7 +86,7 @@ const googleWorkspace: CatalogEntry = {
 
 /** Static reference fixture; live Taskboard journeys use MCP OAuth on a separate app. */
 const taskboard: CatalogEntry = {
-  slug: "taskboard",
+  key: "taskboard",
   name: "Taskboard",
   description: "Tasks on the connected board, for development and testing.",
   icon: { glyph: "T", color: "#0E7490" },
@@ -127,7 +127,7 @@ const taskboard: CatalogEntry = {
 };
 
 const linear: CatalogEntry = {
-  slug: "linear",
+  key: "linear",
   name: "Linear",
   description: "Issues, projects and cycles in the connected Linear workspace.",
   icon: { glyph: "L", color: "#5E6AD2" },
@@ -167,7 +167,7 @@ const linear: CatalogEntry = {
 };
 
 const notion: CatalogEntry = {
-  slug: "notion",
+  key: "notion",
   name: "Notion",
   description: "Pages and databases shared with the integration.",
   icon: { glyph: "N", color: "#2F3437" },
@@ -197,7 +197,7 @@ const notion: CatalogEntry = {
 };
 
 const stripe: CatalogEntry = {
-  slug: "stripe",
+  key: "stripe",
   name: "Stripe",
   description: "Read customers, invoices and subscriptions with a restricted key.",
   icon: { glyph: "S", color: "#635BFF" },
@@ -243,7 +243,7 @@ const stripe: CatalogEntry = {
 };
 
 const github: CatalogEntry = {
-  slug: "github",
+  key: "github",
   name: "GitHub",
   description: "Repositories, issues and pull requests the account can reach.",
   icon: { glyph: "GH", color: "#24292F" },
@@ -282,7 +282,7 @@ const github: CatalogEntry = {
 };
 
 const acmePublishing: CatalogEntry = {
-  slug: "acme-publishing",
+  key: "acme_publishing",
   name: "Acme Publishing",
   description: "Acme's own CMS. Drafts, schedules and publishes blog posts.",
   icon: { glyph: "AP", color: "#C2410C" },
@@ -328,7 +328,7 @@ const acmePublishing: CatalogEntry = {
 
 /** Signs in through its MCP server, with no identity URL: its accounts can't be checked on reconnect. */
 const fieldnote: CatalogEntry = {
-  slug: "fieldnote",
+  key: "fieldnote",
   name: "Fieldnote",
   description: "Shared notes and field reports. People sign in through its MCP server.",
   icon: { glyph: "Fn", color: "#4D7C0F" },
@@ -348,7 +348,7 @@ const fieldnote: CatalogEntry = {
 };
 
 const echoServer: CatalogEntry = {
-  slug: "echo-server",
+  key: "echo_server",
   name: "Echo test server",
   description: "Returns its input. For exercising grants and approvals in Sandbox.",
   icon: { glyph: "E", color: "#0E7490" },
