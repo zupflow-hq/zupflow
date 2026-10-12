@@ -133,6 +133,7 @@ async fn main() -> ExitCode {
         }
     };
     let state = AppState {
+        clock: Arc::new(zupflow_core::time::SystemClock),
         identity,
         organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
         workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),

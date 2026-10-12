@@ -271,6 +271,17 @@ is failed `run_unavailable` by the worker's periodic sweep.
 Each event is announced on the in-process event bus, to the workspace and to
 its environment.
 
+The run engine is tested under faults too (`server/crates/zupflow-server/tests/run_faults.rs`,
+with the kit in `tests/common/faults.rs`): real workers are stopped or crashed
+at named points around every run-store write, the model's answer and the
+outbound `tools/call`; a test clock runs leases out; two workers race on one
+run. What happened is read from the fake MCP server's own ledger of the
+requests it received (with the credential each carried) and the answers the
+model produced, never only from the runtime's records. Tests marked
+`#[ignore = "…"]` reproduce holes today's engine still has, each failing on
+the assertion that names it: `cargo test -p zupflow-server --test run_faults
+-- --ignored`.
+
 Usage is served too: runs, failed runs and tool calls per UTC day in one
 environment (`?environment=`, required; `days` 1 to 90, 14 by default), every
 day listed; an API key reads its own environment's only. A workspace's

@@ -65,6 +65,7 @@ async fn setup() -> Setup {
     })
     .unwrap();
     let state = AppState {
+        clock: Arc::new(zupflow_core::time::SystemClock),
         identity: Arc::new(identity),
         organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
         workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),

@@ -80,6 +80,9 @@ pub struct AppState {
     /// How the Console signs in, as `GET /v1/sign-in-settings` tells it:
     /// the same mode `identity` verifies.
     pub sign_in: crate::sign_in::SignInSettings,
+    /// The time the run engine works by: the system's, except in tests that
+    /// move it themselves.
+    pub clock: Arc<dyn zupflow_core::time::Clock>,
 }
 
 /// A store failure the caller can do nothing about: the database is a

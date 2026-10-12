@@ -60,6 +60,7 @@ impl Server {
         std::fs::create_dir(&directory).unwrap();
         let database = Database::open(&directory.join("zupflow.sqlite")).await.unwrap();
         let state = AppState {
+            clock: Arc::new(zupflow_core::time::SystemClock),
             identity: Arc::new(TestIdentity),
             organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
             workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),

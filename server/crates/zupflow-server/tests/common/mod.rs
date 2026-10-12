@@ -68,6 +68,21 @@ impl Recorded {
     }
 }
 
+/// One request an MCP server physically received, as it arrived: its URL,
+/// its JSON-RPC method, the tool and arguments of a `tools/call`, and the
+/// credential it carried. Kept by the fake server itself, apart from
+/// anything the runtime records, so a request the runtime lost track of
+/// still shows here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Received {
+    pub url: String,
+    pub method: String,
+    pub tool: Option<String>,
+    pub arguments: Value,
+    /// The credential's header and value.
+    pub credential: Option<(String, String)>,
+}
+
 /// Stands in for every provider: records what it's sent and answers what
 /// the test chose, `200` until told otherwise, or what it scripted for a URL.
 pub struct Providers {
@@ -89,6 +104,8 @@ pub struct Providers {
     pub tool_status: Mutex<u16>,
     /// Every request, with its headers, in order.
     pub requests: Mutex<Vec<Recorded>>,
+    /// The MCP servers' ledger: every request one of them received, in order.
+    pub ledger: Mutex<Vec<Received>>,
 }
 
 impl Providers {
@@ -146,6 +163,19 @@ impl Providers {
     pub fn sent(&self) -> Vec<Sent> {
         self.sent.lock().unwrap().clone()
     }
+
+    /// Every request the MCP servers received, in order.
+    pub fn ledger(&self) -> Vec<Received> {
+        self.ledger.lock().unwrap().clone()
+    }
+
+    /// The `tools/call` requests the MCP servers received, in order.
+    pub fn received_calls(&self) -> Vec<Received> {
+        self.ledger()
+            .into_iter()
+            .filter(|received| received.method == "tools/call")
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -177,6 +207,23 @@ impl OutboundHttp for Providers {
             .iter()
             .find(|(url, _)| *url == request.url)
             .map(|(_, tools)| tools.clone());
+        if mcp.is_some() {
+            let message: Value = request
+                .body
+                .as_deref()
+                .and_then(|body| serde_json::from_slice(body).ok())
+                .unwrap_or_default();
+            self.ledger.lock().unwrap().push(Received {
+                url: request.url.clone(),
+                method: message["method"].as_str().unwrap_or_default().to_owned(),
+                tool: message["params"]["name"].as_str().map(str::to_owned),
+                arguments: message["params"]["arguments"].clone(),
+                credential: request
+                    .credential
+                    .as_ref()
+                    .map(|credential| (credential.header.clone(), credential.value.to_string())),
+            });
+        }
         let challenge = self
             .challenges
             .lock()
@@ -264,6 +311,8 @@ pub struct Server {
     pub state: AppState,
     pub directory: PathBuf,
     pub providers: Arc<Providers>,
+    /// The database the stores share, for a test that builds another store over it.
+    pub database: Database,
 }
 
 impl Drop for Server {
@@ -330,8 +379,10 @@ impl Server {
             tool_calls: Mutex::new(Vec::new()),
             tool_status: Mutex::new(200),
             requests: Mutex::new(Vec::new()),
+            ledger: Mutex::new(Vec::new()),
         });
         let state = AppState {
+            clock: Arc::new(zupflow_core::time::SystemClock),
             identity,
             organizations: Arc::new(SqliteOrganizationStore::new(database.clone())),
             workspaces: Arc::new(SqliteWorkspaceStore::new(database.clone())),
@@ -359,7 +410,7 @@ impl Server {
             api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),
             webhooks: Arc::new(zupflow_sqlite::SqliteWebhookStore::new(database.clone())),
             audit: Arc::new(zupflow_sqlite::SqliteAuditStore::new(database.clone())),
-            idempotency: Arc::new(zupflow_sqlite::SqliteIdempotencyStore::new(database)),
+            idempotency: Arc::new(zupflow_sqlite::SqliteIdempotencyStore::new(database.clone())),
             fingerprinter: Arc::new(zupflow_core::idempotency::Fingerprinter::new([7; 32])),
             api_key_hasher: Arc::new(zupflow_core::api_keys::ApiKeyHasher::new([7; 32])),
         };
@@ -368,38 +419,46 @@ impl Server {
             state,
             directory,
             providers,
+            database,
         }
     }
 
     pub async fn send(&self, call: Call<'_>) -> (StatusCode, Value) {
-        let mut request = Request::builder()
-            .method(call.method)
-            .uri(call.uri)
-            .header("Authorization", bearer(call.user));
-        if let Some(organization) = call.organization {
-            request = request.header("Zupflow-Organization", organization);
-        }
-        if let Some(key) = call.idempotency_key {
-            request = request.header("Idempotency-Key", key);
-        }
-        let request = match call.body {
-            Some(body) => request
-                .header("Content-Type", "application/json")
-                .body(Body::from(body.to_string())),
-            None => request.body(Body::empty()),
-        }
-        .unwrap();
-        let response = self.app.clone().oneshot(request).await.unwrap();
-        let status = response.status();
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let json = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap()
-        };
-        (status, json)
+        send_to(&self.app, call).await
     }
+}
 
+/// Sends `call` to `app`: the status and the JSON body, if any.
+pub async fn send_to(app: &axum::Router, call: Call<'_>) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method(call.method)
+        .uri(call.uri)
+        .header("Authorization", bearer(call.user));
+    if let Some(organization) = call.organization {
+        request = request.header("Zupflow-Organization", organization);
+    }
+    if let Some(key) = call.idempotency_key {
+        request = request.header("Idempotency-Key", key);
+    }
+    let request = match call.body {
+        Some(body) => request
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string())),
+        None => request.body(Body::empty()),
+    }
+    .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, json)
+}
+
+impl Server {
     /// A browser arriving at `uri` with no credential, as a provider's
     /// redirect sends it: the status, the `Location` it's sent on to, and
     /// the body.

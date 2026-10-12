@@ -271,6 +271,7 @@ async fn serve(path: &str, serving: Serving) -> Result<(), String> {
     let port = listener.local_addr().map_err(|error| error.to_string())?.port();
     let public_url = format!("http://localhost:{port}");
     let state = AppState {
+        clock: Arc::new(zupflow_core::time::SystemClock),
         identity: Arc::new(PersonaIdentity {
             signed_out_as_owner: console.is_some(),
         }),

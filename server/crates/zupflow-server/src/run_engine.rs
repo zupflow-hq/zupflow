@@ -42,7 +42,6 @@ use zupflow_core::runs::{
     RecordedDecision, RunError, RunEvent, RunEventType, RunProgress, RunStatus, RunToolCall, RunUsage,
 };
 use zupflow_core::scope::{Name, Scope};
-use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{RegisteredTool, ToolError};
 use zupflow_mcp::CallError;
 
@@ -57,7 +56,7 @@ pub const EVENTS_TOPIC: &str = "run_events";
 
 /// How long a claim holds a run; renewed before every step, and longer than
 /// any one step (a model turn, a tool call).
-const LEASE: Duration = Duration::from_secs(5 * 60);
+pub const LEASE: Duration = Duration::from_secs(5 * 60);
 
 const IDLE: Duration = Duration::from_secs(1);
 
@@ -358,7 +357,7 @@ impl Engine<'_> {
                 self.workspace_id,
                 self.run_id,
                 &[started],
-                Timestamp::now(),
+                self.state.clock.now(),
             )
             .await
         {
@@ -409,7 +408,7 @@ impl Engine<'_> {
                 to,
                 &outcome,
                 &events,
-                Timestamp::now(),
+                self.state.clock.now(),
             )
             .await
         {
@@ -424,7 +423,7 @@ impl Engine<'_> {
     async fn settle_unknown(&self, call: &RunToolCall) -> Step {
         let duration = call
             .started_at
-            .map_or(0, |started| Timestamp::now().millis() - started.millis());
+            .map_or(0, |started| self.state.clock.now().millis() - started.millis());
         let events = call
             .target
             .as_ref()
@@ -475,7 +474,7 @@ impl Engine<'_> {
                 self.run_id,
                 call.id,
                 &[requested],
-                Timestamp::now(),
+                self.state.clock.now(),
             )
             .await
         {
@@ -525,7 +524,7 @@ impl Engine<'_> {
                 turns,
                 &Ending::Failed(failure),
                 &[event],
-                Timestamp::now(),
+                self.state.clock.now(),
             )
             .await
         {
@@ -572,7 +571,7 @@ impl Engine<'_> {
                 &recorded(decision),
                 outcome.as_ref(),
                 &events,
-                Timestamp::now(),
+                self.state.clock.now(),
             )
             .await
         {
@@ -688,14 +687,14 @@ impl Engine<'_> {
                 self.run_id,
                 call.id,
                 &[started],
-                Timestamp::now(),
+                self.state.clock.now(),
             )
             .await
         {
             Ok(events) => self.publish(&events).await,
             Err(error) => return retry(error),
         }
-        let began = Timestamp::now();
+        let began = self.state.clock.now();
         let answer = mcp_access::call_tool(
             self.state,
             self.organization_id,
@@ -706,7 +705,7 @@ impl Engine<'_> {
             &call.arguments,
         )
         .await;
-        let duration = Timestamp::now().millis() - began.millis();
+        let duration = self.state.clock.now().millis() - began.millis();
         let from = [CallState::Started];
         let failed = |code: &str, message: &str| {
             let failure = Failure::new(code, message);
@@ -1155,7 +1154,7 @@ impl Engine<'_> {
                 index,
                 &turn,
                 &events,
-                Timestamp::now(),
+                self.state.clock.now(),
             )
             .await
         {
@@ -1262,7 +1261,7 @@ impl Engine<'_> {
                 index,
                 &turn,
                 &events,
-                Timestamp::now(),
+                self.state.clock.now(),
             )
             .await
         {

@@ -7,6 +7,7 @@
 //! cross-tenant statement, in [`SqliteJobQueue::claim_next`] and the sweep
 //! beside it.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -19,16 +20,30 @@ use zupflow_core::jobs::{
     MIN_LEASE, Retry,
 };
 use zupflow_core::scope::{Name, Scope};
+use zupflow_core::time::{Clock, SystemClock};
 
 use crate::database::{Database, duration_millis, millis};
 
 pub struct SqliteJobQueue {
     database: Database,
+    clock: Arc<dyn Clock>,
 }
 
 impl SqliteJobQueue {
     pub fn new(database: Database) -> Self {
-        Self { database }
+        Self::with_clock(database, Arc::new(SystemClock))
+    }
+
+    /// A queue whose leases and delays run on `clock`: the system's in a
+    /// deployment, one a test moves itself to expire a lease exactly.
+    /// Jobs the stores queue with their changes still take the system's
+    /// time as theirs.
+    pub fn with_clock(database: Database, clock: Arc<dyn Clock>) -> Self {
+        Self { database, clock }
+    }
+
+    fn now(&self) -> i64 {
+        self.clock.now().millis()
     }
 }
 
@@ -85,13 +100,24 @@ pub(crate) async fn insert_job<'e, E: sqlx::Executor<'e, Database = Sqlite>>(
     payload: Vec<u8>,
     options: JobOptions,
 ) -> Result<JobId, JobError> {
+    insert_job_at(executor, scope, kind, payload, options, millis(SystemTime::now())).await
+}
+
+/// [`insert_job`], at `now` (milliseconds).
+async fn insert_job_at<'e, E: sqlx::Executor<'e, Database = Sqlite>>(
+    executor: E,
+    scope: &Scope,
+    kind: &Name,
+    payload: Vec<u8>,
+    options: JobOptions,
+    now: i64,
+) -> Result<JobId, JobError> {
     if payload.len() > MAX_JOB_BYTES {
         return Err(JobError::TooLarge);
     }
     let id = JobId::generate();
     let scope = columns(scope);
-    let now = SystemTime::now();
-    let run_at = millis(now).saturating_add(duration_millis(options.delay));
+    let run_at = now.saturating_add(duration_millis(options.delay));
     sqlx::query(
         "INSERT INTO jobs (id, organization_id, workspace_id, environment, kind, payload, state, attempts, \
          max_attempts, run_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)",
@@ -104,7 +130,7 @@ pub(crate) async fn insert_job<'e, E: sqlx::Executor<'e, Database = Sqlite>>(
     .bind(payload)
     .bind(options.max_attempts.clamp(1, MAX_ATTEMPTS))
     .bind(run_at)
-    .bind(millis(now))
+    .bind(now)
     .execute(executor)
     .await
     .map_err(failed("enqueue"))?;
@@ -120,7 +146,7 @@ impl JobQueue for SqliteJobQueue {
         payload: Vec<u8>,
         options: JobOptions,
     ) -> Result<JobId, JobError> {
-        insert_job(self.database.pool(), scope, kind, payload, options).await
+        insert_job_at(self.database.pool(), scope, kind, payload, options, self.now()).await
     }
 
     /// **Cross-tenant**, by design: a worker serves every organization. It
@@ -130,7 +156,7 @@ impl JobQueue for SqliteJobQueue {
             return Ok(None);
         }
         let kinds = &kinds[..kinds.len().min(MAX_CLAIM_KINDS)];
-        let now = millis(SystemTime::now());
+        let now = self.now();
         let token = LeaseToken::generate()?;
         let expires_at = now.saturating_add(duration_millis(lease_duration(lease)));
 
@@ -205,7 +231,7 @@ impl JobQueue for SqliteJobQueue {
         .bind(scope.environment)
         .bind(id.uuid())
         .bind(lease.as_bytes().to_vec())
-        .bind(millis(SystemTime::now()))
+        .bind(self.now())
         .execute(self.database.pool())
         .await
         .map_err(failed("complete"))?;
@@ -224,7 +250,7 @@ impl JobQueue for SqliteJobQueue {
         reason: &Name,
     ) -> Result<Retry, JobError> {
         let scope = columns(scope);
-        let run_at = millis(SystemTime::now()).saturating_add(duration_millis(after));
+        let run_at = self.now().saturating_add(duration_millis(after));
         let state: Option<String> = sqlx::query_scalar(
             "UPDATE jobs SET \
                state = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END, \
@@ -241,7 +267,7 @@ impl JobQueue for SqliteJobQueue {
         .bind(scope.environment)
         .bind(id.uuid())
         .bind(lease.as_bytes().to_vec())
-        .bind(millis(SystemTime::now()))
+        .bind(self.now())
         .fetch_optional(self.database.pool())
         .await
         .map_err(failed("retry"))?;
@@ -254,7 +280,7 @@ impl JobQueue for SqliteJobQueue {
 
     async fn postpone(&self, scope: &Scope, id: JobId, lease: &LeaseToken, after: Duration) -> Result<(), JobError> {
         let scope = columns(scope);
-        let now = millis(SystemTime::now());
+        let now = self.now();
         // The claim's attempt is given back: the next claim is the same attempt.
         let postponed = sqlx::query(
             "UPDATE jobs SET state = 'queued', attempts = attempts - 1, run_at = ?, reason = NULL, \
@@ -291,7 +317,7 @@ impl JobQueue for SqliteJobQueue {
         .bind(scope.environment)
         .bind(id.uuid())
         .bind(lease.as_bytes().to_vec())
-        .bind(millis(SystemTime::now()))
+        .bind(self.now())
         .execute(self.database.pool())
         .await
         .map_err(failed("bury"))?;
@@ -309,7 +335,7 @@ impl JobQueue for SqliteJobQueue {
         lease: Duration,
     ) -> Result<(), JobError> {
         let scope = columns(scope);
-        let expires_at = millis(SystemTime::now()).saturating_add(duration_millis(lease_duration(lease)));
+        let expires_at = self.now().saturating_add(duration_millis(lease_duration(lease)));
         let extended = sqlx::query(
             "UPDATE jobs SET lease_expires_at = ? \
              WHERE organization_id = ? AND workspace_id IS ? AND environment IS ? AND id = ? \
@@ -321,7 +347,7 @@ impl JobQueue for SqliteJobQueue {
         .bind(scope.environment)
         .bind(id.uuid())
         .bind(lease_token.as_bytes().to_vec())
-        .bind(millis(SystemTime::now()))
+        .bind(self.now())
         .execute(self.database.pool())
         .await
         .map_err(failed("extend"))?;
@@ -472,5 +498,45 @@ mod tests {
         let queue = SqliteJobQueue::new(Database::open(&path).await.unwrap());
         let job = queue.claim_next(&[kind()], MIN_LEASE).await.unwrap().unwrap();
         assert_eq!((job.scope, job.payload), (scope, b"kept".to_vec()));
+    }
+
+    /// A clock that moves only when the test says.
+    struct StillClock(std::sync::atomic::AtomicI64);
+
+    impl Clock for StillClock {
+        fn now(&self) -> zupflow_core::time::Timestamp {
+            zupflow_core::time::Timestamp::from_millis(self.0.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    /// Leases run out exactly when the queue's clock says, whatever the
+    /// wall clock does.
+    #[tokio::test]
+    async fn runs_its_leases_on_its_clock() {
+        let Temporary {
+            database,
+            directory: _directory,
+        } = temporary().await;
+        let start = zupflow_core::time::Timestamp::now().millis() + 3_600_000;
+        let clock = Arc::new(StillClock(std::sync::atomic::AtomicI64::new(start)));
+        let queue = SqliteJobQueue::with_clock(database.clone(), clock.clone());
+        let scope = Scope::Workspace(OrganizationId::generate(), WorkspaceId::generate());
+        insert_scope(&database, scope).await;
+        queue
+            .enqueue(&scope, &kind(), Vec::new(), JobOptions::default())
+            .await
+            .unwrap();
+        let first = queue.claim_next(&[kind()], MIN_LEASE).await.unwrap().unwrap();
+        let lease = i64::try_from(MIN_LEASE.as_millis()).unwrap();
+        clock.0.store(start + lease - 1, std::sync::atomic::Ordering::SeqCst);
+        assert!(queue.claim_next(&[kind()], MIN_LEASE).await.unwrap().is_none());
+        clock.0.store(start + lease, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            queue.complete(&first.scope, first.id, &first.lease).await,
+            Err(JobError::LeaseLost),
+            "a lease that ran out reaches nothing"
+        );
+        let second = queue.claim_next(&[kind()], MIN_LEASE).await.unwrap().unwrap();
+        assert_eq!((second.id, second.attempt), (first.id, 2));
     }
 }

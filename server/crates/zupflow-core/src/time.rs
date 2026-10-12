@@ -29,6 +29,23 @@ impl Timestamp {
     }
 }
 
+/// Where the time comes from. Every deployment reads the system's clock;
+/// tests bring one they move themselves, so leases and delays expire exactly
+/// when a test says.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> Timestamp;
+}
+
+/// The system's clock: [`Timestamp::now`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Timestamp {
+        Timestamp::now()
+    }
+}
+
 /// Days since 1970-01-01 to a civil date (proleptic Gregorian), after
 /// Howard Hinnant's `civil_from_days`.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
