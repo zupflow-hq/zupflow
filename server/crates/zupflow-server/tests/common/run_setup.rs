@@ -136,7 +136,7 @@ async fn helper(server: &Server, user: &str, org: &str, ws: &str) -> String {
         .send(
             call(user, Method::POST, format!("/v1/workspaces/{ws}/agents"))
                 .naming(org)
-                .body(json!({ "name": "Helper", "description": "", "model": "model-a", "instructions": "Be brief." })),
+                .body(json!({ "name": "Helper", "description": "", "instructions": "Be brief." })),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{agent}");

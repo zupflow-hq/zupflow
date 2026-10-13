@@ -21,6 +21,8 @@ import type {
   Invitation,
   Member,
   MemberRole,
+  Model,
+  ModelConnection,
   Organization,
   OrganizationId,
   Run,
@@ -53,11 +55,14 @@ import type {
   GrantRow,
   InstallationRow,
   MembershipRow,
+  ModelConnectionRow,
+  ModelRow,
   OrganizationRow,
   RunEventRow,
   RunRow,
   WorkspaceRow,
 } from "./model";
+import { agentsUsing, defaultModelOf } from "./model-scope";
 import { appIn, configurationOf, inWorkspace, sameWorkspace } from "./scope";
 
 export const MOCK_SESSION_KEY = "zupflow.mock.session";
@@ -853,7 +858,7 @@ export function toAgent(a: AgentRow): Agent {
     workspace_id: a.workspace_id,
     name: a.name,
     description: a.description,
-    model: a.model,
+    model_id: a.model_id,
     instructions: a.instructions,
     status: a.status,
     grant_count: d.grants.filter((g) => sameWorkspace(g, a) && g.agent_id === a.id).length,
@@ -870,7 +875,8 @@ export function toAgent(a: AgentRow): Agent {
 /** A stored run as the API returns it: no plan, and no organization (known from the request). */
 export function toRun(r: RunRow): Run {
   const agent = db().agents.find((a) => sameWorkspace(a, r) && a.id === r.agent_id);
-  const { plan: _plan, organization_id: _organization, ...rest } = r;
+  // The run's model shows in its `run.started` event, not on the run.
+  const { plan: _plan, organization_id: _organization, model: _model, ...rest } = r;
   return { ...rest, agent_name: agent?.name ?? "Deleted agent" };
 }
 
@@ -891,5 +897,49 @@ export function toApiKey(k: ApiKeyRow): ApiKey {
     created_at: k.created_at,
     last_used_at: k.last_used_at,
     revoked_at: k.revoked_at,
+  };
+}
+
+/** A connection as the API shows it: whether its key is set and its last four characters, never the key. */
+export function toModelConnection(c: ModelConnectionRow): ModelConnection {
+  return {
+    id: c.id,
+    organization_id: c.organization_id,
+    environment: c.environment,
+    kind: c.kind,
+    label: c.label,
+    api_key: { set: true, last4: c.key_last4, updated_at: c.key_updated_at },
+    key_version: c.key_version,
+    status: c.status,
+    model_count: db().models.filter(
+      (m) => m.organization_id === c.organization_id && m.environment === c.environment && m.connection_id === c.id,
+    ).length,
+    created_at: c.created_at,
+    updated_at: c.updated_at,
+  };
+}
+
+/** A model with its route: the connection it's reached through, found within its organization and environment. */
+export function toModel(m: ModelRow): Model {
+  const d = db();
+  const connection = d.model_connections.find(
+    (c) => c.organization_id === m.organization_id && c.environment === m.environment && c.id === m.connection_id,
+  );
+  if (!connection) throw new Error("A model outlives its connection only inside the deleting transaction");
+  return {
+    id: m.id,
+    organization_id: m.organization_id,
+    environment: m.environment,
+    route: { connection_id: connection.id, kind: connection.kind, label: connection.label },
+    provider_model_id: m.provider_model_id,
+    name: m.name,
+    author: m.author,
+    context_window: m.context_window,
+    supports_tools: m.supports_tools,
+    status: m.status,
+    is_default: defaultModelOf(d, m.organization_id, m.environment)?.id === m.id,
+    agent_count: agentsUsing(d, m.organization_id, m.environment, new Set([m.id])).length,
+    created_at: m.created_at,
+    updated_at: m.updated_at,
   };
 }

@@ -86,6 +86,10 @@ kinds! {
     WebhookEvent, WebhookEventId => "webhook_event", "evt";
     WebhookDelivery, WebhookDeliveryId => "webhook_delivery", "whd";
     AuditEvent, AuditEventId => "audit_event", "aud";
+    /// One organization's account with a model provider, in one environment.
+    ModelConnection, ModelConnectionId => "model_connection", "mcn";
+    /// A model an organization added from one of its model connections.
+    Model, ModelId => "model", "mdl";
 }
 
 /// An object's identifier, typed by its kind.

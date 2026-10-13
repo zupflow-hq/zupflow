@@ -1022,7 +1022,10 @@ async fn walks_a_run_through_every_step(stores: &Stores<'_>, a: Tenant, agent_a:
     let who = claimant();
     let (plan, started) = step(stores, at, &facts(stores, who, None)).await;
     assert_eq!(kinds(&started), [RunEventType::RunStarted]);
-    assert_eq!(started.events[0].data, json!({ "model": "model-a" }));
+    assert_eq!(
+        started.events[0].data,
+        json!({ "model": "model-a", "model_id": null, "connection_id": null })
+    );
     assert_eq!(started.events[0].sequence, 2);
     assert_eq!(started.status, RunStatus::Running);
     assert_eq!(

@@ -91,7 +91,7 @@ async fn agent(server: &Server, org: &str, ws: &str, installation: &str) -> Stri
         .send(
             call("alice", Method::POST, format!("/v1/workspaces/{ws}/agents"))
                 .naming(org)
-                .body(json!({ "name": "Helper", "description": "", "model": "model-a", "instructions": "Be brief." })),
+                .body(json!({ "name": "Helper", "description": "", "instructions": "Be brief." })),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{agent}");
@@ -489,7 +489,10 @@ async fn answers_from_the_conversation_alone() {
         ["run.queued", "run.started", "message.assistant", "run.completed"]
     );
     let events = setup.events(id(run)).await;
-    assert_eq!(events[1]["data"], json!({ "model": "model-a" }));
+    assert_eq!(
+        events[1]["data"],
+        json!({ "model": "model-a", "model_id": null, "connection_id": null })
+    );
     assert_eq!(events[3]["data"]["usage"], done["usage"]);
     let sequences: Vec<u64> = events.iter().map(|event| event["sequence"].as_u64().unwrap()).collect();
     assert_eq!(sequences, [1, 2, 3, 4]);

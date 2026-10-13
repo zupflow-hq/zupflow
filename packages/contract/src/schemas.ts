@@ -801,7 +801,12 @@ export const Agent = named(
     workspace_id: idSchema("workspace"),
     name: z.string(),
     description: z.string(),
-    model: z.string(),
+    /**
+     * The model this agent overrides its environment's default with: one the
+     * organization added in the agent's workspace's environment. `null` runs
+     * on the environment's default model.
+     */
+    model_id: idSchema("model").nullable(),
     instructions: z.string(),
     status: AgentStatus,
     grant_count: z.number().int(),
@@ -813,17 +818,23 @@ export const Agent = named(
 );
 export type Agent = z.infer<typeof Agent>;
 
+/**
+ * `model_id` names a model of the same organization, added in the
+ * workspace's environment (`422 unknown_model`, `fields.model_id`, for any
+ * other); omitted or `null`, the agent runs on the environment's default.
+ */
 export const CreateAgentInput = z.object({
   name: z.string(),
   description: z.string(),
-  model: z.string(),
+  model_id: idSchema("model").nullable().optional(),
   instructions: z.string(),
 });
 export type CreateAgentInput = z.infer<typeof CreateAgentInput>;
 export const UpdateAgentInput = z.object({
   name: z.string().optional(),
   description: z.string().optional(),
-  model: z.string().optional(),
+  /** As for creating; `null` goes back to the environment's default. Omitted keeps the agent's. */
+  model_id: idSchema("model").nullable().optional(),
   instructions: z.string().optional(),
   status: AgentStatus.optional(),
 });
@@ -846,11 +857,224 @@ export type CreateGrantInput = z.infer<typeof CreateGrantInput>;
 export const UpdateGrantInput = z.object({ tools: z.array(z.string()), approval_required: z.array(z.string()) });
 export type UpdateGrantInput = z.infer<typeof UpdateGrantInput>;
 
-export const ModelOption = named(
-  "Model",
-  z.object({ id: z.string(), name: z.string(), provider: z.string(), description: z.string() }),
+// ---------------------------------------------------------------------------
+// Model providers: bring your own key (decisions 0049, 0050)
+
+/**
+ * The providers a model connection can reach. A registry: adding one is an
+ * entry here (and an adapter on the server). `routes_to_others` marks a
+ * provider that serves other authors' models, shown "via" it.
+ */
+export const MODEL_PROVIDER_KINDS = ["openai", "anthropic", "openrouter"] as const;
+export const ModelProviderKind = named("ModelProviderKind", z.enum(MODEL_PROVIDER_KINDS));
+export type ModelProviderKind = z.infer<typeof ModelProviderKind>;
+
+export interface ModelProviderInfo {
+  /** The provider's name, as people know it. */
+  name: string;
+  /** Serves other authors' models: a model added through it is shown "via" it. */
+  routes_to_others: boolean;
+  /** Where its API keys are made, for people adding a connection. */
+  keys_url: string;
+}
+
+export const MODEL_PROVIDERS: Record<ModelProviderKind, ModelProviderInfo> = {
+  openai: { name: "OpenAI", routes_to_others: false, keys_url: "https://platform.openai.com/api-keys" },
+  anthropic: { name: "Anthropic", routes_to_others: false, keys_url: "https://console.anthropic.com/settings/keys" },
+  openrouter: { name: "OpenRouter", routes_to_others: true, keys_url: "https://openrouter.ai/settings/keys" },
+};
+
+/** `invalid_key`: the provider refused the key; replace it to use the connection's models again. */
+export const ModelConnectionStatus = z.enum(["active", "invalid_key"]);
+export type ModelConnectionStatus = z.infer<typeof ModelConnectionStatus>;
+
+/**
+ * One organization's account with one provider, in one environment: its
+ * models are added in that environment only, and Sandbox and Production never
+ * share a connection or a key. Several per organization, several of one kind
+ * too. The API key is write-only: responses say whether it's set and its last
+ * four characters, never the key.
+ */
+export const ModelConnection = named(
+  "ModelConnection",
+  z.object({
+    id: idSchema("model_connection"),
+    organization_id: idSchema("organization"),
+    environment: Environment,
+    kind: ModelProviderKind,
+    label: z.string(),
+    api_key: SecretState,
+    /** Raised each time the key is replaced. A model attempt records the version it used. */
+    key_version: z.number().int(),
+    status: ModelConnectionStatus,
+    /** Models the organization added from it. */
+    model_count: z.number().int(),
+    created_at: instant,
+    updated_at: instant,
+  }),
 );
-export type ModelOption = z.infer<typeof ModelOption>;
+export type ModelConnection = z.infer<typeof ModelConnection>;
+
+export const ModelConnectionListQuery = z.object({
+  environment: Environment.optional().describe(
+    "Only this environment's connections. An API key reads its own environment's; naming another is `422 environment_mismatch`.",
+  ),
+});
+export type ModelConnectionListQuery = z.infer<typeof ModelConnectionListQuery>;
+
+/**
+ * The key is checked with the provider (by listing its models) before
+ * anything is saved: a key it refuses is `422 invalid_api_key`, `fields.api_key`.
+ */
+export const CreateModelConnectionInput = z.object({
+  environment: Environment,
+  kind: ModelProviderKind,
+  label: z.string(),
+  /** Write-only. */
+  api_key: z.string(),
+});
+export type CreateModelConnectionInput = z.infer<typeof CreateModelConnectionInput>;
+
+export const UpdateModelConnectionInput = z.object({ label: z.string() });
+export type UpdateModelConnectionInput = z.infer<typeof UpdateModelConnectionInput>;
+
+/**
+ * Replaces the key with a new version, checked like a new connection's. A key
+ * the provider refuses is `422 invalid_api_key` and the connection keeps its
+ * key. A key that works makes an `invalid_key` connection `active` again.
+ */
+export const ReplaceModelConnectionKeyInput = z.object({ api_key: z.string() });
+export type ReplaceModelConnectionKeyInput = z.infer<typeof ReplaceModelConnectionKeyInput>;
+
+/** Dollars per million tokens, as the provider lists them. */
+export const ModelPricing = named(
+  "ModelPricing",
+  z.object({ input_per_million_usd: z.number(), output_per_million_usd: z.number() }),
+);
+export type ModelPricing = z.infer<typeof ModelPricing>;
+
+/**
+ * A model the provider lists for a connection's key, searched on the server
+ * (the server keeps the provider's list for about ten minutes). Only a model
+ * that can call tools can be added: an agent's work is calling tools.
+ */
+export const ProviderModel = named(
+  "ProviderModel",
+  z.object({
+    /** The provider's own ID, sent to it as is: `gpt-5`, `claude-sonnet-4-5`, `openai/gpt-5`. */
+    provider_model_id: z.string(),
+    name: z.string(),
+    /** Who made it (`openai`, `anthropic`, `google`…), whoever serves it. */
+    author: z.string(),
+    /** Tokens; `null` when the provider doesn't say. */
+    context_window: z.number().int().nullable(),
+    supports_tools: z.boolean(),
+    /** `null` when the provider doesn't list prices. */
+    pricing: ModelPricing.nullable(),
+    /** The model already added from this connection, if any. */
+    added_model_id: idSchema("model").nullable(),
+  }),
+);
+export type ProviderModel = z.infer<typeof ProviderModel>;
+
+export const ProviderModelListQuery = PageQuery.extend({
+  /** Matches the provider's model ID, name or author. */
+  q: z.string().optional(),
+});
+export type ProviderModelListQuery = z.infer<typeof ProviderModelListQuery>;
+
+/** `unavailable`: the provider stopped serving it (it answered `404` for it). */
+export const ModelStatus = z.enum(["available", "unavailable"]);
+export type ModelStatus = z.infer<typeof ModelStatus>;
+
+/** The connection a model is reached through: its route. */
+export const ModelRoute = named(
+  "ModelRoute",
+  z.object({ connection_id: idSchema("model_connection"), kind: ModelProviderKind, label: z.string() }),
+);
+export type ModelRoute = z.infer<typeof ModelRoute>;
+
+/**
+ * A model the organization added from one of its connections, in that
+ * connection's environment. The route is its identity: GPT-5 through an
+ * OpenAI connection and `openai/gpt-5` through OpenRouter are two models,
+ * never swapped for each other.
+ */
+export const Model = named(
+  "Model",
+  z.object({
+    id: idSchema("model"),
+    organization_id: idSchema("organization"),
+    environment: Environment,
+    route: ModelRoute,
+    provider_model_id: z.string(),
+    /** Shown to people; the organization may rename it. */
+    name: z.string(),
+    author: z.string(),
+    context_window: z.number().int().nullable(),
+    supports_tools: z.boolean(),
+    status: ModelStatus,
+    /** The environment's default model. */
+    is_default: z.boolean(),
+    /** Agents that override the default with it, across the environment's workspaces. */
+    agent_count: z.number().int(),
+    created_at: instant,
+    updated_at: instant,
+  }),
+);
+export type Model = z.infer<typeof Model>;
+
+export const ModelListQuery = PageQuery.extend({
+  environment: Environment.optional().describe(
+    "Only this environment's models. An API key reads its own environment's; naming another is `422 environment_mismatch`.",
+  ),
+  connection_id: idSchema("model_connection")
+    .optional()
+    .describe("Only this connection's models. A malformed or unknown ID matches nothing."),
+  /** Matches the name, the provider's model ID or the author. */
+  q: z.string().optional(),
+});
+export type ModelListQuery = z.infer<typeof ModelListQuery>;
+
+/**
+ * Adds a model the connection's provider lists (`422 unknown_provider_model`
+ * otherwise) and that can call tools (`422 tools_unsupported`). The same
+ * provider model twice on one connection is `409 model_exists`.
+ */
+export const CreateModelInput = z.object({
+  connection_id: idSchema("model_connection"),
+  provider_model_id: z.string(),
+  /** Defaults to the provider's name for it. */
+  name: z.string().optional(),
+});
+export type CreateModelInput = z.infer<typeof CreateModelInput>;
+
+export const UpdateModelInput = z.object({ name: z.string() });
+export type UpdateModelInput = z.infer<typeof UpdateModelInput>;
+
+/**
+ * The model agents in one environment run on unless they override it. Until
+ * one is chosen, `model` is `null`, and a run of an agent with no override is
+ * refused (`422 model_not_configured`), never given a model silently.
+ */
+export const DefaultModel = named(
+  "DefaultModel",
+  z.object({
+    environment: Environment,
+    model: Model.nullable(),
+    updated_at: instant.nullable(),
+    /** Who last changed it: null before anyone did or when an API key did; "Former member" once they are gone. */
+    updated_by: User.nullable(),
+  }),
+);
+export type DefaultModel = z.infer<typeof DefaultModel>;
+
+/**
+ * A model of this organization in this environment (`422 unknown_model`,
+ * `fields.model_id`, otherwise), or `null` to have none.
+ */
+export const UpdateDefaultModelInput = z.object({ model_id: idSchema("model").nullable() });
+export type UpdateDefaultModelInput = z.infer<typeof UpdateDefaultModelInput>;
 
 // ---------------------------------------------------------------------------
 // Tool permissions (decision 0040)
@@ -1021,7 +1245,21 @@ export const RunEvent = named(
   "RunEvent",
   z.discriminatedUnion("type", [
     runEvent("run.queued", z.object({})),
-    runEvent("run.started", z.object({ model: z.string() })),
+    runEvent(
+      "run.started",
+      z.object({
+        /** The provider's model ID the run calls. */
+        model: z.string(),
+        /**
+         * The organization's model and the connection it's reached through,
+         * fixed when the run starts: two connections can serve the same
+         * provider model ID. `null` only from a server that doesn't hold
+         * organizations' models yet.
+         */
+        model_id: idSchema("model").nullable(),
+        connection_id: idSchema("model_connection").nullable(),
+      }),
+    ),
     runEvent("message.assistant", z.object({ text: z.string() })),
     runEvent("tool_call.started", ToolCallRef.extend({ arguments: z.unknown() })),
     runEvent("tool_call.completed", ToolCallRef.extend({ result: z.unknown(), duration_ms: z.number() })),

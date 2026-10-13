@@ -10,12 +10,16 @@ import {
   type AppInstallationRef,
   type AvailableApp,
   type ConnectResult,
+  type DefaultModel,
   ENVIRONMENTS,
   type Environment,
   type Id,
   type IdKind,
   MemberRole,
-  type ModelOption,
+  MODEL_PROVIDER_KINDS,
+  MODEL_PROVIDERS,
+  type ModelId,
+  type ModelProviderKind,
   type OrganizationId,
   RemoveMemberQuery,
   ResolveApprovalInput,
@@ -50,7 +54,6 @@ import {
   audit,
   authenticate,
   body,
-  callerOf,
   configurationStatus,
   consoleOnly,
   consoleOrgAccess,
@@ -81,6 +84,8 @@ import {
   toInstallation,
   toInvitation,
   toMember,
+  toModel,
+  toModelConnection,
   toOrganization,
   toRun,
   toRunEvent,
@@ -100,11 +105,15 @@ import type {
   GrantRow,
   InstallationRow,
   MembershipRow,
+  ModelConnectionRow,
+  ModelRow,
   OrganizationRow,
   RunRow,
   WebhookDeliveryRow,
 } from "./model";
+import { agentsUsing, defaultModelOf, modelIn, runModelFor } from "./model-scope";
 import { levelInForce, levelRowsOf, levelsInput, policyRowOf, setLevels, toAppToolLevel, toToolPolicy } from "./policy";
+import { matchesProviderModel, providerAcceptsKey, providerCatalog, providerModel } from "./providers";
 import { hash, token } from "./random";
 import { cancelRun, enqueueRun, planRun, refuseWaitingOn, resolveApproval, runTarget } from "./runner";
 import { appIn, configurationOf, inWorkspace, issueShortId, runEventsKey, timelineOf } from "./scope";
@@ -117,27 +126,6 @@ import {
   toInstallationTool,
   toolsOf,
 } from "./tools";
-
-const MODELS: ModelOption[] = [
-  {
-    id: "claude-sonnet-5-5",
-    name: "Claude Sonnet 5.5",
-    provider: "Anthropic",
-    description: "Balanced default for tool-heavy work.",
-  },
-  {
-    id: "claude-opus-5-5",
-    name: "Claude Opus 5.5",
-    provider: "Anthropic",
-    description: "Most capable. Long, multi-step tasks.",
-  },
-  {
-    id: "claude-haiku-4-5-20251001",
-    name: "Claude Haiku 4.5",
-    provider: "Anthropic",
-    description: "Fast and inexpensive. Simple lookups.",
-  },
-];
 
 /** What the mock says about sign-in: a fictional provider, never one it reaches. */
 export const MOCK_SIGN_IN: SignInSettings = {
@@ -201,6 +189,8 @@ const ID_PARAMS = {
   key: ["api_key", "API key"],
   hook: ["webhook_endpoint", "Webhook endpoint"],
   delivery: ["webhook_delivery", "Webhook delivery"],
+  connection: ["model_connection", "Model connection"],
+  model: ["model", "Model"],
 } as const satisfies Record<string, readonly [IdKind, string]>;
 
 /**
@@ -883,6 +873,117 @@ function webhookCursor<T extends z.ZodType>(cursor: string | null, scope: string
 
 const nextWebhookCursor = (scope: string, position: unknown) => encodeToolCursor(JSON.stringify({ scope, position }));
 
+const ENVIRONMENT_NAME: Record<Environment, string> = { sandbox: "Sandbox", production: "Production" };
+
+/**
+ * An agent's model override: a model of the agent's organization, added in
+ * its workspace's environment, or `null` for the environment's default. Any
+ * other ID, another organization's or the other environment's included, is
+ * the same `422`.
+ */
+function agentModel(access: WorkspaceAccess, modelId: ModelId | null): ModelId | null {
+  if (modelId === null) return null;
+  const model = modelIn(db(), access.org.id, access.workspace.environment, modelId);
+  if (!model) {
+    const env = ENVIRONMENT_NAME[access.workspace.environment];
+    throw new ApiFailure(422, "unknown_model", `Choose a model added in ${env}.`, {
+      model_id: `Choose a model added in ${env}, or the default.`,
+    });
+  }
+  return model.id;
+}
+
+/** A model provider key as pasted: trimmed, one unbroken token. */
+const providerKey = z
+  .string()
+  .trim()
+  .min(20, "Paste the whole key.")
+  .max(500, "Use 500 characters or fewer.")
+  .regex(/^\S+$/, "A key has no spaces.");
+
+/** The provider checks a key before it's saved, by listing its models with it. */
+function assertProviderAccepts(kind: ModelProviderKind, key: string) {
+  if (!providerAcceptsKey(kind, key)) {
+    throw new ApiFailure(
+      422,
+      "invalid_api_key",
+      `${MODEL_PROVIDERS[kind].name} refused this key. Check it was copied whole and is still active.`,
+      { api_key: `${MODEL_PROVIDERS[kind].name} refused this key.` },
+    );
+  }
+}
+
+/** A connection of this organization; an API key finds only its own environment's. */
+function findModelConnection(access: OrgAccess, connectionId: string): ModelConnectionRow {
+  const own = keyEnvironment(access);
+  const row = db().model_connections.find(
+    (c) => c.organization_id === access.org.id && c.id === connectionId && (!own || c.environment === own),
+  );
+  if (!row) throw notFound("Model connection");
+  return row;
+}
+
+/** A model of this organization; an API key finds only its own environment's. */
+function findModel(access: OrgAccess, modelId: string): ModelRow {
+  const own = keyEnvironment(access);
+  const row = db().models.find(
+    (m) => m.organization_id === access.org.id && m.id === modelId && (!own || m.environment === own),
+  );
+  if (!row) throw notFound("Model");
+  return row;
+}
+
+/** An `environment` query parameter: one of the two, or absent. */
+function environmentQuery(url: URL): Environment | null {
+  const value = url.searchParams.get("environment");
+  if (value === null || value === "") return null;
+  const parsed = environment.safeParse(value);
+  if (!parsed.success) {
+    throw new ApiFailure(400, "validation_failed", "Unknown environment.", { environment: "Unknown environment." });
+  }
+  return parsed.data;
+}
+
+/** How many names a refusal lists before it counts the rest. */
+const NAMED_BLOCKERS = 5;
+
+/**
+ * Refuses removing models still in use: the environment's default, or an
+ * agent's override. Names what holds them, so the person knows what to change
+ * first; never another organization's or environment's.
+ */
+function assertModelsUnused(organizationId: OrganizationId, env: Environment, models: ModelRow[], what: string) {
+  const ids = new Set(models.map((m) => m.id));
+  const fallback = defaultModelOf(db(), organizationId, env);
+  const isDefault = fallback !== undefined && ids.has(fallback.id);
+  const agents = agentsUsing(db(), organizationId, env, ids);
+  if (!isDefault && agents.length === 0) return;
+  const names = agents.slice(0, NAMED_BLOCKERS).map(({ agent, workspace }) => `${agent.name} (${workspace.name})`);
+  if (agents.length > NAMED_BLOCKERS) names.push(`${agents.length - NAMED_BLOCKERS} more`);
+  const reasons: string[] = [];
+  const fields: Record<string, string> = {};
+  if (isDefault && fallback) {
+    reasons.push(`${fallback.name} is ${ENVIRONMENT_NAME[env]}'s default model; choose another default first`);
+    fields.default_model = fallback.name;
+  }
+  if (names.length > 0) {
+    reasons.push(`agents use it: ${names.join(", ")}; choose another model for them first`);
+    fields.agents = names.join(", ");
+  }
+  throw new ApiFailure(409, "model_in_use", `Can't remove ${what}: ${reasons.join(". ")}.`, fields);
+}
+
+function toDefaultModel(organizationId: OrganizationId, env: Environment): DefaultModel {
+  const row = db().default_models.find((d) => d.organization_id === organizationId && d.environment === env);
+  const model = defaultModelOf(db(), organizationId, env);
+  return {
+    environment: env,
+    model: model ? toModel(model) : null,
+    updated_at: row?.updated_at ?? null,
+    updated_by: row?.updated_by_user_id ? toUser(row.updated_by_user_id) : null,
+  };
+}
+
 export function createHandlers(apiBase: string) {
   const u = (path: string) => `${apiBase.replace(/\/$/, "")}${path}`;
 
@@ -968,14 +1069,6 @@ export function createHandlers(apiBase: string) {
           name: user.email,
         });
         return noContent();
-      }),
-    ),
-
-    http.get(
-      u("/v1/models"),
-      route(({ request }) => {
-        callerOf(request);
-        return ok(MODELS);
       }),
     ),
 
@@ -2186,7 +2279,7 @@ export function createHandlers(apiBase: string) {
           z.object({
             name: name(),
             description: z.string().trim().max(280),
-            model: z.string().refine((m) => MODELS.some((x) => x.id === m), "Choose a model."),
+            model_id: idOf("model").nullable().optional(),
             instructions: z.string().max(20_000),
           }),
         );
@@ -2195,7 +2288,10 @@ export function createHandlers(apiBase: string) {
           id: newId("agent"),
           organization_id: access.org.id,
           workspace_id: access.workspace.id,
-          ...input,
+          name: input.name,
+          description: input.description,
+          model_id: agentModel(access, input.model_id ?? null),
+          instructions: input.instructions,
           status: "active",
           created_at: now,
           updated_at: now,
@@ -2225,15 +2321,14 @@ export function createHandlers(apiBase: string) {
           z.object({
             name: name().optional(),
             description: z.string().trim().max(280).optional(),
-            model: z
-              .string()
-              .refine((m) => MODELS.some((x) => x.id === m), "Choose a model.")
-              .optional(),
+            model_id: idOf("model").nullable().optional(),
             instructions: z.string().max(20_000).optional(),
             status: z.enum(["active", "paused"]).optional(),
           }),
         );
-        Object.assign(row, Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined)));
+        const { model_id: modelId, ...rest } = input;
+        if (modelId !== undefined) row.model_id = agentModel(access, modelId);
+        Object.assign(row, Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== undefined)));
         row.updated_at = new Date().toISOString();
         audit(
           access,
@@ -2473,6 +2568,15 @@ export function createHandlers(apiBase: string) {
             input: z.string().trim().min(1, "Write a message.").max(8000),
           }),
         );
+        // Resolved once, now: the run keeps this model even if the default changes before it starts.
+        const model = runModelFor(db(), agent);
+        if (!model) {
+          throw new ApiFailure(
+            422,
+            "model_not_configured",
+            `${agent.name} has no model and ${ENVIRONMENT_NAME[access.workspace.environment]} has no default model. Choose a default model under Model providers, or a model for the agent.`,
+          );
+        }
         const run: RunRow = {
           id: newId("run"),
           organization_id: access.org.id,
@@ -2488,6 +2592,7 @@ export function createHandlers(apiBase: string) {
           created_at: new Date().toISOString(),
           started_at: null,
           finished_at: null,
+          model,
           plan: [],
         };
         run.plan = planRun(db(), run);
@@ -2576,6 +2681,348 @@ export function createHandlers(apiBase: string) {
         );
         scheduleRun(run);
         return ok(toRun(run));
+      }),
+    ),
+
+    // --- Model providers (decisions 0049, 0050) -----------------------------------------
+    // Organization-scoped and environment-bound: a connection, its models and
+    // the default live in one environment, and nothing falls back to the other.
+    http.get(
+      u("/v1/organizations/:org/model-connections"),
+      route(({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        const env = requireEnvironment(access, environmentQuery(new URL(request.url)));
+        return ok(
+          db()
+            .model_connections.filter((c) => c.organization_id === access.org.id && (!env || c.environment === env))
+            .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id))
+            .map(toModelConnection),
+        );
+      }),
+    ),
+
+    http.post(
+      u("/v1/organizations/:org/model-connections"),
+      route(async ({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        requireRole(access, ADMINS, "connect model providers");
+        const input = await body(
+          request,
+          z.object({
+            environment,
+            kind: z.enum(MODEL_PROVIDER_KINDS, "Choose a provider."),
+            label: name(),
+            api_key: providerKey,
+          }),
+        );
+        requireEnvironment(access, input.environment);
+        assertProviderAccepts(input.kind, input.api_key);
+        const now = new Date().toISOString();
+        const row: ModelConnectionRow = {
+          id: newId("model_connection"),
+          organization_id: access.org.id,
+          environment: input.environment,
+          kind: input.kind,
+          label: input.label,
+          // Only what responses show. The key itself is never kept by the mock.
+          key_last4: input.api_key.slice(-4),
+          key_version: 1,
+          key_updated_at: now,
+          status: "active",
+          created_at: now,
+          updated_at: now,
+        };
+        db().model_connections.push(row);
+        audit(
+          access,
+          "model_connection.created",
+          { type: "model_connection", id: row.id, name: row.label },
+          { environment: row.environment },
+        );
+        return created(toModelConnection(row));
+      }),
+    ),
+
+    http.get(
+      u("/v1/organizations/:org/model-connections/:connection"),
+      route(({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        return ok(toModelConnection(findModelConnection(access, idParam(params, "connection"))));
+      }),
+    ),
+
+    http.patch(
+      u("/v1/organizations/:org/model-connections/:connection"),
+      route(async ({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        requireRole(access, ADMINS, "rename model provider connections");
+        const row = findModelConnection(access, idParam(params, "connection"));
+        const input = await body(request, z.object({ label: name() }));
+        row.label = input.label;
+        row.updated_at = new Date().toISOString();
+        audit(
+          access,
+          "model_connection.updated",
+          { type: "model_connection", id: row.id, name: row.label },
+          { environment: row.environment },
+        );
+        return ok(toModelConnection(row));
+      }),
+    ),
+
+    http.put(
+      u("/v1/organizations/:org/model-connections/:connection/api-key"),
+      route(async ({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        requireRole(access, ADMINS, "replace model provider keys");
+        const row = findModelConnection(access, idParam(params, "connection"));
+        const input = await body(request, z.object({ api_key: providerKey }));
+        // A refused key changes nothing: the connection keeps the key it had.
+        assertProviderAccepts(row.kind, input.api_key);
+        const now = new Date().toISOString();
+        row.key_last4 = input.api_key.slice(-4);
+        row.key_version += 1;
+        row.key_updated_at = now;
+        row.status = "active";
+        row.updated_at = now;
+        audit(
+          access,
+          "model_connection.key_replaced",
+          { type: "model_connection", id: row.id, name: row.label },
+          { environment: row.environment },
+        );
+        return ok(toModelConnection(row));
+      }),
+    ),
+
+    http.delete(
+      u("/v1/organizations/:org/model-connections/:connection"),
+      route(({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        requireRole(access, ADMINS, "delete model provider connections");
+        const row = findModelConnection(access, idParam(params, "connection"));
+        const d = db();
+        const own = (m: ModelRow) =>
+          m.organization_id === access.org.id && m.environment === row.environment && m.connection_id === row.id;
+        assertModelsUnused(
+          access.org.id,
+          row.environment,
+          d.models.filter(own),
+          `${row.label} while its models are in use`,
+        );
+        d.models = d.models.filter((m) => !own(m));
+        d.model_connections = d.model_connections.filter((c) => c !== row);
+        audit(
+          access,
+          "model_connection.deleted",
+          { type: "model_connection", id: row.id, name: row.label },
+          { environment: row.environment },
+        );
+        return noContent();
+      }),
+    ),
+
+    http.get(
+      u("/v1/organizations/:org/model-connections/:connection/provider-models"),
+      route(({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        const row = findModelConnection(access, idParam(params, "connection"));
+        if (row.status === "invalid_key") {
+          throw new ApiFailure(
+            422,
+            "invalid_api_key",
+            `${MODEL_PROVIDERS[row.kind].name} refused this connection's key. Replace the key to search its models.`,
+          );
+        }
+        const url = new URL(request.url);
+        const q = url.searchParams.get("q") ?? "";
+        const added = new Map(
+          db()
+            .models.filter(
+              (m) =>
+                m.organization_id === access.org.id && m.environment === row.environment && m.connection_id === row.id,
+            )
+            .map((m) => [m.provider_model_id, m.id]),
+        );
+        const matches = providerCatalog(row.kind).filter((m) => matchesProviderModel(m, q));
+        const { page, meta } = paginate(matches, url.searchParams.get("cursor"), clampedInt(url, "limit", 25, 100));
+        return ok(
+          page.map((m) => ({ ...m, added_model_id: added.get(m.provider_model_id) ?? null })),
+          { meta },
+        );
+      }),
+    ),
+
+    http.get(
+      u("/v1/organizations/:org/models"),
+      route(({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        const url = new URL(request.url);
+        const env = requireEnvironment(access, environmentQuery(url));
+        const connectionId = url.searchParams.get("connection_id");
+        const q = (url.searchParams.get("q") ?? "").trim().toLowerCase();
+        const rows = db()
+          .models.filter(
+            (m) =>
+              m.organization_id === access.org.id &&
+              (!env || m.environment === env) &&
+              (!connectionId || m.connection_id === connectionId) &&
+              (!q || [m.name, m.provider_model_id, m.author].some((v) => v.toLowerCase().includes(q))),
+          )
+          .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+        const { page, meta } = paginate(rows, url.searchParams.get("cursor"), clampedInt(url, "limit", 25, 100));
+        return ok(page.map(toModel), { meta });
+      }),
+    ),
+
+    http.post(
+      u("/v1/organizations/:org/models"),
+      route(async ({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        requireRole(access, ADMINS, "add models");
+        const input = await body(
+          request,
+          z.object({
+            connection_id: idOf("model_connection"),
+            provider_model_id: z.string().trim().min(1, "Choose a model."),
+            name: name().optional(),
+          }),
+        );
+        const connection = findModelConnection(access, input.connection_id);
+        const provider = MODEL_PROVIDERS[connection.kind].name;
+        if (connection.status === "invalid_key") {
+          throw new ApiFailure(
+            422,
+            "invalid_api_key",
+            `${provider} refused this connection's key. Replace the key before adding models.`,
+          );
+        }
+        const listed = providerModel(connection.kind, input.provider_model_id);
+        if (!listed) {
+          throw new ApiFailure(422, "unknown_provider_model", `${provider} doesn't list that model for this key.`, {
+            provider_model_id: `${provider} doesn't list this model.`,
+          });
+        }
+        if (!listed.supports_tools) {
+          throw new ApiFailure(422, "tools_unsupported", `${listed.name} can't call tools, so an agent can't use it.`, {
+            provider_model_id: "This model can't call tools.",
+          });
+        }
+        const d = db();
+        if (
+          d.models.some(
+            (m) =>
+              m.organization_id === access.org.id &&
+              m.environment === connection.environment &&
+              m.connection_id === connection.id &&
+              m.provider_model_id === listed.provider_model_id,
+          )
+        ) {
+          throw new ApiFailure(409, "model_exists", `${listed.name} is already added from ${connection.label}.`, {
+            provider_model_id: "Already added from this connection.",
+          });
+        }
+        const now = new Date().toISOString();
+        const row: ModelRow = {
+          id: newId("model"),
+          organization_id: access.org.id,
+          environment: connection.environment,
+          connection_id: connection.id,
+          provider_model_id: listed.provider_model_id,
+          name: input.name ?? listed.name,
+          author: listed.author,
+          context_window: listed.context_window,
+          supports_tools: listed.supports_tools,
+          status: "available",
+          created_at: now,
+          updated_at: now,
+        };
+        d.models.push(row);
+        audit(access, "model.created", { type: "model", id: row.id, name: row.name }, { environment: row.environment });
+        return created(toModel(row));
+      }),
+    ),
+
+    http.get(
+      u("/v1/organizations/:org/models/:model"),
+      route(({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        return ok(toModel(findModel(access, idParam(params, "model"))));
+      }),
+    ),
+
+    http.patch(
+      u("/v1/organizations/:org/models/:model"),
+      route(async ({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        requireRole(access, ADMINS, "rename models");
+        const row = findModel(access, idParam(params, "model"));
+        const input = await body(request, z.object({ name: name() }));
+        row.name = input.name;
+        row.updated_at = new Date().toISOString();
+        audit(access, "model.updated", { type: "model", id: row.id, name: row.name }, { environment: row.environment });
+        return ok(toModel(row));
+      }),
+    ),
+
+    http.delete(
+      u("/v1/organizations/:org/models/:model"),
+      route(({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        requireRole(access, ADMINS, "remove models");
+        const row = findModel(access, idParam(params, "model"));
+        assertModelsUnused(access.org.id, row.environment, [row], row.name);
+        const d = db();
+        d.models = d.models.filter((m) => m !== row);
+        audit(access, "model.deleted", { type: "model", id: row.id, name: row.name }, { environment: row.environment });
+        return noContent();
+      }),
+    ),
+
+    http.get(
+      u("/v1/organizations/:org/default-models/:env"),
+      route(({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        const env = environment.safeParse(param(params, "env"));
+        if (!env.success) throw notFound("Environment");
+        requireEnvironment(access, env.data);
+        return ok(toDefaultModel(access.org.id, env.data));
+      }),
+    ),
+
+    http.put(
+      u("/v1/organizations/:org/default-models/:env"),
+      route(async ({ request, params }) => {
+        const access = orgAccess(request, param(params, "org"));
+        requireRole(access, ADMINS, "choose the default model");
+        const env = environment.safeParse(param(params, "env"));
+        if (!env.success) throw notFound("Environment");
+        requireEnvironment(access, env.data);
+        const input = await body(request, z.object({ model_id: idOf("model").nullable() }));
+        const model = input.model_id === null ? null : modelIn(db(), access.org.id, env.data, input.model_id);
+        if (model === undefined) {
+          const name = ENVIRONMENT_NAME[env.data];
+          throw new ApiFailure(422, "unknown_model", `Choose a model added in ${name}.`, {
+            model_id: `Choose a model added in ${name}.`,
+          });
+        }
+        const d = db();
+        const now = new Date().toISOString();
+        const row = d.default_models.find((r) => r.organization_id === access.org.id && r.environment === env.data);
+        const fields = {
+          model_id: model?.id ?? null,
+          updated_at: now,
+          updated_by_user_id: access.kind === "console" ? access.user.id : null,
+        };
+        if (row) Object.assign(row, fields);
+        else d.default_models.push({ organization_id: access.org.id, environment: env.data, ...fields });
+        audit(
+          access,
+          "default_model.updated",
+          { type: "default_model", id: model?.id ?? null, name: model?.name ?? "None" },
+          { environment: env.data },
+        );
+        return ok(toDefaultModel(access.org.id, env.data));
       }),
     ),
 

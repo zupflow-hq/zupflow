@@ -26,10 +26,13 @@ import type {
   CreatedConnectSession,
   CreatedWebhookEndpoint,
   CreateGrantInput,
+  CreateModelConnectionInput,
+  CreateModelInput,
   CreateOrganizationInput,
   CreateRunInput,
   CreateWebhookEndpointInput,
   CreateWorkspaceInput,
+  DefaultModel,
   Environment,
   GrantId,
   Installation,
@@ -39,13 +42,21 @@ import type {
   InviteMemberInput,
   Member,
   MemberId,
-  ModelOption,
+  Model,
+  ModelConnection,
+  ModelConnectionId,
+  ModelConnectionListQuery,
+  ModelId,
+  ModelListQuery,
   Organization,
   OrganizationId,
   OrganizationRun,
   OrganizationRunListQuery,
   PageQuery,
+  ProviderModel,
+  ProviderModelListQuery,
   RemoveMemberQuery,
+  ReplaceModelConnectionKeyInput,
   ResolveApprovalInput,
   Run,
   RunEvent,
@@ -59,9 +70,12 @@ import type {
   UpdateAppToolLevelsInput,
   UpdateConfigurationInput,
   UpdateConnectSettingsInput,
+  UpdateDefaultModelInput,
   UpdateGrantInput,
   UpdateInstallationInput,
   UpdateMemberInput,
+  UpdateModelConnectionInput,
+  UpdateModelInput,
   UpdateOrganizationInput,
   UpdateToolPolicyInput,
   UpdateWebhookEndpointInput,
@@ -141,10 +155,6 @@ export function createClient(transport: Transport) {
         post<Organization>(`/v1/me/invitations/${enc(invitationId)}/accept`, undefined, options),
       decline: (invitationId: MemberId, options?: PostOptions) =>
         post<void>(`/v1/me/invitations/${enc(invitationId)}/decline`, undefined, options),
-    },
-
-    models: {
-      list: () => get<ModelOption[]>("/v1/models"),
     },
 
     organizations: {
@@ -332,6 +342,57 @@ export function createClient(transport: Transport) {
        */
       resolveApproval: (workspaceId: WorkspaceId, runId: RunId, input: ResolveApprovalInput, options?: PostOptions) =>
         post<Run>(`${ws(workspaceId)}/runs/${enc(runId)}/approvals`, input, options),
+    },
+
+    /**
+     * The organization's model provider connections, each in one environment.
+     * API keys are write-only: a connection shows whether its key is set and
+     * its last four characters.
+     */
+    modelConnections: {
+      list: (organizationId: OrganizationId, query: ModelConnectionListQuery = {}) =>
+        get<ModelConnection[]>(`${org(organizationId)}/model-connections`, { ...query }),
+      create: (organizationId: OrganizationId, input: CreateModelConnectionInput, options?: PostOptions) =>
+        post<ModelConnection>(`${org(organizationId)}/model-connections`, input, options),
+      get: (organizationId: OrganizationId, connectionId: ModelConnectionId) =>
+        get<ModelConnection>(`${org(organizationId)}/model-connections/${enc(connectionId)}`),
+      update: (organizationId: OrganizationId, connectionId: ModelConnectionId, input: UpdateModelConnectionInput) =>
+        send<ModelConnection>("PATCH", `${org(organizationId)}/model-connections/${enc(connectionId)}`, input),
+      /** Replace the key with a new version; the provider checks it first, and a refused key keeps the old one. */
+      replaceKey: (
+        organizationId: OrganizationId,
+        connectionId: ModelConnectionId,
+        input: ReplaceModelConnectionKeyInput,
+      ) => send<ModelConnection>("PUT", `${org(organizationId)}/model-connections/${enc(connectionId)}/api-key`, input),
+      delete: (organizationId: OrganizationId, connectionId: ModelConnectionId) =>
+        send<void>("DELETE", `${org(organizationId)}/model-connections/${enc(connectionId)}`),
+      /** Search the models the provider lists for this connection's key, a page at a time. */
+      providerModels: (
+        organizationId: OrganizationId,
+        connectionId: ModelConnectionId,
+        query: ProviderModelListQuery = {},
+      ) =>
+        getPage<ProviderModel>(`${org(organizationId)}/model-connections/${enc(connectionId)}/provider-models`, {
+          ...query,
+        }),
+    },
+
+    /** Models the organization added from its connections, and each environment's default. */
+    models: {
+      list: (organizationId: OrganizationId, query: ModelListQuery = {}) =>
+        getPage<Model>(`${org(organizationId)}/models`, { ...query }),
+      create: (organizationId: OrganizationId, input: CreateModelInput, options?: PostOptions) =>
+        post<Model>(`${org(organizationId)}/models`, input, options),
+      get: (organizationId: OrganizationId, modelId: ModelId) =>
+        get<Model>(`${org(organizationId)}/models/${enc(modelId)}`),
+      update: (organizationId: OrganizationId, modelId: ModelId, input: UpdateModelInput) =>
+        send<Model>("PATCH", `${org(organizationId)}/models/${enc(modelId)}`, input),
+      delete: (organizationId: OrganizationId, modelId: ModelId) =>
+        send<void>("DELETE", `${org(organizationId)}/models/${enc(modelId)}`),
+      getDefault: (organizationId: OrganizationId, environment: Environment) =>
+        get<DefaultModel>(`${org(organizationId)}/default-models/${environment}`),
+      setDefault: (organizationId: OrganizationId, environment: Environment, input: UpdateDefaultModelInput) =>
+        send<DefaultModel>("PUT", `${org(organizationId)}/default-models/${environment}`, input),
     },
 
     connectSettings: {

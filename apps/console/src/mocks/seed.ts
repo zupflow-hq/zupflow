@@ -10,6 +10,8 @@ import type {
   AuditEvent,
   Environment,
   IdKind,
+  ModelId,
+  ModelProviderKind,
   OrganizationId,
   ToolLevel,
   User,
@@ -30,17 +32,21 @@ import type {
   GrantRow,
   InstallationRow,
   InstallationShortIdRow,
+  ModelConnectionRow,
+  ModelRow,
   OrganizationRow,
   RunRow,
   WorkspaceRow,
 } from "./model";
+import { runModelFor } from "./model-scope";
 import { setLevels, suggestLevels } from "./policy";
+import { providerModel } from "./providers";
 import { mulberry32, type Rng, uuid } from "./random";
 import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 import { appIn, issueShortId, timelineOf } from "./scope";
 import { listedFrom, recordListing } from "./tools";
 
-export const DB_SCHEMA = 24;
+export const DB_SCHEMA = 26;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -330,7 +336,6 @@ export function seed(nowMs: number = Date.now()): Db {
     name: string,
     description: string,
     instructions: string,
-    model: string,
     createdAgo: number,
     status: AgentRow["status"] = "active",
   ) => {
@@ -340,7 +345,8 @@ export function seed(nowMs: number = Date.now()): Db {
       workspace_id: ws.id,
       name,
       description,
-      model,
+      // Overrides are set once the organization's models are seeded; until then, the environment's default.
+      model_id: null,
       instructions,
       status,
       created_at: ago(createdAgo),
@@ -374,7 +380,6 @@ export function seed(nowMs: number = Date.now()): Db {
     "Publishing assistant",
     "Drafts and publishes blog posts from Marketing's Drive.",
     publishingInstructions,
-    "claude-sonnet-5-5",
     28 * DAY,
   );
   grant(acmePublisher, acmeMarketing, ["search_files", "read_document", "create_document"]);
@@ -385,7 +390,6 @@ export function seed(nowMs: number = Date.now()): Db {
     "Finance reporter",
     "Weekly revenue and invoice summaries.",
     "Summarize open invoices and revenue for the finance team. Read-only: never change billing data.",
-    "claude-sonnet-5-5",
     23 * DAY,
   );
   grant(acmeReporter, acmeFinance, ["search_files", "read_document", "send_email"], ["send_email"]);
@@ -396,7 +400,6 @@ export function seed(nowMs: number = Date.now()): Db {
     "Engineering triage",
     "Finds related code and pull requests for incoming bug reports.",
     "Given a bug report, search the codebase and open pull requests, then summarize likely causes.",
-    "claude-haiku-4-5-20251001",
     13 * DAY,
   );
   grant(acmeTriage, acmeEng, ["search_code", "list_pull_requests", "create_issue"], ["create_issue"]);
@@ -406,7 +409,6 @@ export function seed(nowMs: number = Date.now()): Db {
     "Support concierge",
     "Answers customer questions. Not yet granted any installations.",
     "Answer support questions politely and briefly.",
-    "claude-haiku-4-5-20251001",
     4 * DAY,
     "paused",
   );
@@ -416,7 +418,6 @@ export function seed(nowMs: number = Date.now()): Db {
     "Ops assistant",
     "Keeps Beta Labs' calendar and documents in order.",
     "Help the operations team with scheduling and documents.",
-    "claude-sonnet-5-5",
     25 * DAY,
   );
   grant(betaOps, betaGoogle, ["list_events", "search_files", "read_document", "send_email"], ["send_email"]);
@@ -426,7 +427,6 @@ export function seed(nowMs: number = Date.now()): Db {
     "Publishing assistant",
     "Sandbox twin of the production publishing agent.",
     publishingInstructions,
-    "claude-sonnet-5-5",
     33 * DAY,
   );
   grant(
@@ -440,7 +440,6 @@ export function seed(nowMs: number = Date.now()): Db {
     "Product scribe",
     "Turns meeting notes into Taskboard tasks.",
     "Turn notes into well-scoped Taskboard tasks. Ask before creating more than three.",
-    "claude-sonnet-5-5",
     27 * DAY,
   );
   grant(sandboxPm, sandboxTaskboard, ["list_tasks", "create_task"]);
@@ -450,7 +449,6 @@ export function seed(nowMs: number = Date.now()): Db {
     "Echo bot",
     "Exercises grants and approvals against the echo server.",
     "Call echo with the user's message, then echo_write.",
-    "claude-haiku-4-5-20251001",
     10 * DAY,
   );
   grant(echoBot, qaEcho, ["echo", "echo_write"], ["echo_write"]);
@@ -472,6 +470,9 @@ export function seed(nowMs: number = Date.now()): Db {
     tool_policies: [],
     app_tool_levels: [],
     connect_sessions: [],
+    model_connections: [],
+    models: [],
+    default_models: [],
     agents,
     grants,
     runs: [],
@@ -594,6 +595,72 @@ export function seed(nowMs: number = Date.now()): Db {
       last_delivery: { status_code: 503, delivered_at: ago(2 * HOUR) },
     },
   );
+
+  // Each environment has its own connections, models and default; a few agents override the default.
+  const model = seedModels(db, nowMs, org.id, jordan.id, 20261013, [
+    {
+      environment: "sandbox",
+      kind: "openrouter",
+      label: "OpenRouter",
+      last4: "q7Rk",
+      createdAgo: 32 * DAY,
+      models: ["anthropic/claude-sonnet-4.5", "openai/gpt-5", "google/gemini-2.5-flash"],
+    },
+    {
+      environment: "sandbox",
+      kind: "anthropic",
+      label: "Anthropic",
+      last4: "Xc2d",
+      createdAgo: 31 * DAY,
+      models: ["claude-haiku-4-5"],
+    },
+    {
+      environment: "production",
+      kind: "anthropic",
+      label: "Anthropic",
+      last4: "pL9w",
+      createdAgo: 30 * DAY,
+      models: ["claude-sonnet-4-5", "claude-haiku-4-5"],
+    },
+    {
+      environment: "production",
+      kind: "openai",
+      label: "OpenAI",
+      last4: "Zt4m",
+      createdAgo: 22 * DAY,
+      models: ["gpt-5"],
+    },
+    {
+      environment: "production",
+      kind: "openrouter",
+      label: "OpenRouter (old key)",
+      last4: "8Hnv",
+      createdAgo: 40 * DAY,
+      status: "invalid_key",
+      models: ["google/gemini-2.5-pro"],
+    },
+  ]);
+  db.default_models.push(
+    {
+      organization_id: org.id,
+      environment: "sandbox",
+      model_id: model("sandbox", "OpenRouter", "anthropic/claude-sonnet-4.5"),
+      updated_at: ago(32 * DAY),
+      updated_by_user_id: jordan.id,
+    },
+    {
+      organization_id: org.id,
+      environment: "production",
+      model_id: model("production", "Anthropic", "claude-sonnet-4-5"),
+      updated_at: ago(30 * DAY),
+      updated_by_user_id: jordan.id,
+    },
+  );
+  acmeTriage.model_id = model("production", "Anthropic", "claude-haiku-4-5");
+  echoBot.model_id = model("sandbox", "Anthropic", "claude-haiku-4-5");
+  sandboxPm.model_id = model("sandbox", "OpenRouter", "openai/gpt-5");
+  const concierge = agents.find((a) => a.workspace_id === acme.id && a.status === "paused");
+  if (concierge) concierge.model_id = model("production", "OpenAI", "gpt-5");
 
   seedRuns(db, rng, nowMs, [
     { agent: acmePublisher, count: 46, prompts: PUBLISHING_PROMPTS, waiting: true },
@@ -1063,7 +1130,7 @@ function seedLarkspur(db: Db, nowMs: number) {
     workspace_id: harbor.id,
     name: "Triage assistant",
     description: "Creates and summarizes board tasks.",
-    model: "claude-sonnet-5-5",
+    model_id: null,
     instructions: "Keep task titles short and notes clear.",
     status: "active",
     created_at: ago(16 * DAY),
@@ -1170,6 +1237,32 @@ function seedLarkspur(db: Db, nowMs: number) {
     action: "workspace.created",
     target: { type: "workspace", id: harbor.id, name: harbor.name },
     created_at: ago(19 * DAY),
+  });
+
+  const larkspurModel = seedModels(db, nowMs, org.id, rowan.id, 20261014, [
+    {
+      environment: "production",
+      kind: "anthropic",
+      label: "Anthropic",
+      last4: "Lk5s",
+      createdAgo: 18 * DAY,
+      models: ["claude-sonnet-4-5"],
+    },
+    {
+      environment: "sandbox",
+      kind: "openai",
+      label: "OpenAI",
+      last4: "Wd7e",
+      createdAgo: 18 * DAY,
+      models: ["gpt-5-mini"],
+    },
+  ]);
+  db.default_models.push({
+    organization_id: org.id,
+    environment: "production",
+    model_id: larkspurModel("production", "Anthropic", "claude-sonnet-4-5"),
+    updated_at: ago(18 * DAY),
+    updated_by_user_id: rowan.id,
   });
 
   seedRuns(db, rng, nowMs, [
@@ -1353,6 +1446,8 @@ function seedRuns(db: Db, rng: Rng, nowMs: number, specs: RunSeed[]) {
       const back = Math.floor(rng() ** 1.6 * 13.5 * DAY) + 6 * MINUTE + i * 1000;
       const leaveWaiting = spec.waiting === true && i === 0;
       const createdMs = leaveWaiting ? nowMs - 9 * MINUTE : nowMs - back;
+      const model = runModelFor(db, spec.agent);
+      if (!model) throw new Error(`The seed runs ${spec.agent.name}, which needs a model.`);
       const run: RunRow = {
         id: newId("run", { rng, at: createdMs }),
         organization_id: spec.agent.organization_id,
@@ -1368,6 +1463,7 @@ function seedRuns(db: Db, rng: Rng, nowMs: number, specs: RunSeed[]) {
         created_at: new Date(createdMs).toISOString(),
         started_at: null,
         finished_at: null,
+        model,
         plan: [],
       };
       if (leaveWaiting) run.input = "Publish the autumn release notes";
@@ -1553,4 +1649,87 @@ function seedAudit(
     ws.acme,
   );
   db.audit.sort((a, b) => b.created_at.localeCompare(a.created_at));
+}
+
+interface ConnectionSeed {
+  environment: Environment;
+  kind: ModelProviderKind;
+  label: string;
+  last4: string;
+  createdAgo: number;
+  status?: ModelConnectionRow["status"];
+  /** Provider model IDs to add, each listed by the provider's fixture. */
+  models: string[];
+}
+
+/**
+ * An organization's model connections and the models added from them, with
+ * their own randomness so the rest of the seed stays as it was. Returns a
+ * lookup by environment, connection label and provider model ID.
+ */
+function seedModels(
+  db: Db,
+  nowMs: number,
+  organizationId: OrganizationId,
+  addedBy: UserId,
+  seed: number,
+  connections: ConnectionSeed[],
+): (environment: Environment, label: string, providerModelId: string) => ModelId {
+  const rng = mulberry32(seed);
+  const ago = (ms: number) => new Date(nowMs - ms).toISOString();
+  const added: { environment: Environment; label: string; row: ModelRow }[] = [];
+  for (const spec of connections) {
+    const connection: ModelConnectionRow = {
+      id: newId("model_connection", { rng, at: nowMs - spec.createdAgo }),
+      organization_id: organizationId,
+      environment: spec.environment,
+      kind: spec.kind,
+      label: spec.label,
+      key_last4: spec.last4,
+      key_version: 1,
+      key_updated_at: ago(spec.createdAgo),
+      status: spec.status ?? "active",
+      created_at: ago(spec.createdAgo),
+      updated_at: ago(spec.createdAgo),
+    };
+    db.model_connections.push(connection);
+    db.audit.push({
+      id: newId("audit_event", { rng, at: nowMs - spec.createdAgo }),
+      organization_id: organizationId,
+      workspace_id: null,
+      environment: spec.environment,
+      actor: { type: "user", id: addedBy, name: db.users.find((u) => u.id === addedBy)?.name ?? "Former member" },
+      action: "model_connection.created",
+      target: { type: "model_connection", id: connection.id, name: connection.label },
+      created_at: ago(spec.createdAgo),
+    });
+    spec.models.forEach((providerModelId, i) => {
+      const listed = providerModel(spec.kind, providerModelId);
+      if (!listed) throw new Error(`${spec.kind} lists no ${providerModelId}`);
+      const at = nowMs - spec.createdAgo + (i + 1) * MINUTE;
+      const row: ModelRow = {
+        id: newId("model", { rng, at }),
+        organization_id: organizationId,
+        environment: spec.environment,
+        connection_id: connection.id,
+        provider_model_id: listed.provider_model_id,
+        name: listed.name,
+        author: listed.author,
+        context_window: listed.context_window,
+        supports_tools: listed.supports_tools,
+        status: "available",
+        created_at: new Date(at).toISOString(),
+        updated_at: new Date(at).toISOString(),
+      };
+      db.models.push(row);
+      added.push({ environment: spec.environment, label: spec.label, row });
+    });
+  }
+  return (environment, label, providerModelId) => {
+    const found = added.find(
+      (a) => a.environment === environment && a.label === label && a.row.provider_model_id === providerModelId,
+    );
+    if (!found) throw new Error(`No seeded model ${providerModelId} from ${label} in ${environment}`);
+    return found.row.id;
+  };
 }

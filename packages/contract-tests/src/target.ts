@@ -68,7 +68,14 @@ export interface Target {
  *   rejects one containing `invalid`. Its tools include `echo`, which needs
  *   no approval, and `echo_write`, which does; `qa-playground` has a connected
  *   installation of it.
- * - At least one model in `GET /v1/models`.
+ * - Model providers in both environments, each with a default model. In
+ *   Sandbox: an active OpenRouter connection and an active Anthropic one. In
+ *   Production: active Anthropic and OpenAI connections, and an OpenRouter
+ *   connection whose key the provider refused (`invalid_key`). Providers
+ *   accept any key of the right shape (20 to 500 characters, no spaces) and
+ *   refuse one containing `invalid`. OpenAI and OpenRouter each list, among
+ *   their first 100 models, at least one that can't call tools.
+ *   At least one agent in each environment overrides the default.
  * - The default tool policy (never saved: `manual`, new tools at `approve`)
  *   and levels for its catalog apps' tools: in `google_workspace`, confirmed
  *   `allow` for `search_files`, `read_document` and `create_document`,
@@ -90,8 +97,9 @@ export interface Target {
  * (Production) and `harbor-sandbox` (Sandbox). In `harbor`: an agent with a
  * grant and a finished run, an installation, a Connect session and a workspace
  * app of its own; in the organization: a catalog app `taskboard`, ready in Sandbox,
- * an API key, a webhook endpoint and Sandbox Connect settings that do not
- * allow Northwind's return URL, and an invitation for the viewer, sent more
+ * an API key, a webhook endpoint, Sandbox Connect settings that do not
+ * allow Northwind's return URL, a model connection with a model in each
+ * environment (Production's is its default; Sandbox has none), and an invitation for the viewer, sent more
  * than `INVITATION_TTL_DAYS` ago: expired. Each organization's real IDs are
  * aimed at the other.
  * The Production webhook has the same five delivery scenarios, all non-test

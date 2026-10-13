@@ -361,7 +361,7 @@ async fn holds_grants_inside_the_levels() {
         .send(
             call("alice", Method::POST, format!("/v1/workspaces/{sandbox}/agents"))
                 .naming(&org)
-                .body(json!({ "name": "Held", "description": "", "model": "model-a", "instructions": "" })),
+                .body(json!({ "name": "Held", "description": "", "instructions": "" })),
         )
         .await;
     let grants = format!("/v1/workspaces/{sandbox}/agents/{}/grants", id(&agent["data"]));

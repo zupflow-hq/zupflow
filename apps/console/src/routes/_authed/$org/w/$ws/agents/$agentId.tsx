@@ -23,10 +23,11 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentAccess } from "@/features/agents/access";
-import { AgentFields, useAgentForm } from "@/features/agents/agent-form";
+import { AgentFields, agentInput, useAgentForm } from "@/features/agents/agent-form";
 import { StartRunSheet } from "@/features/agents/start-run-sheet";
 import { canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
-import { useAgent, useDeleteAgent, useModels, useRuns, useUpdateAgent } from "@/features/queries";
+import { AgentModelName } from "@/features/models/agent-model";
+import { useAgent, useDeleteAgent, useRuns, useUpdateAgent } from "@/features/queries";
 import { RunTable } from "@/features/runs/run-table";
 import { useDetailCrumb } from "@/lib/crumbs";
 import { applyFieldErrors, toastError } from "@/lib/errors";
@@ -49,7 +50,6 @@ function AgentPage() {
   const agent = useAgent(ws.id, agentId);
   const update = useUpdateAgent(ws.id, agentId);
   const remove = useDeleteAgent(ws.id);
-  const models = useModels();
   const [deleting, setDeleting] = useState(false);
   useDetailCrumb(agent.data?.name);
   useDocumentTitle(agent.data?.name, "Agents", ws.name);
@@ -84,7 +84,8 @@ function AgentPage() {
                 <AgentStatusPill status={a.status} />
               </div>
               <p className="text-sm text-muted-foreground">
-                {a.description || "No description"} · {models.data?.find((m) => m.id === a.model)?.name ?? a.model}
+                {a.description || "No description"} ·{" "}
+                <AgentModelName org={org} environment={ws.environment} modelId={a.model_id} />
               </p>
             </>
           ) : (
@@ -179,7 +180,7 @@ function AgentPage() {
       {a ? (
         <>
           <StartRunSheet
-            orgSlug={org.slug}
+            org={org}
             workspace={ws}
             agent={a}
             open={Boolean(runOpen) && !runBlocked}
@@ -278,7 +279,7 @@ function ConfigurationTab({ workspace, agent, readOnly }: { workspace: Workspace
         <form
           className="space-y-6 p-5"
           onSubmit={form.handleSubmit((values) =>
-            update.mutate(values, {
+            update.mutate(agentInput(values), {
               onSuccess: () => toast.success("Saved configuration"),
               onError: (error) => {
                 if (!applyFieldErrors(form, error)) toastError(error, "Couldn't save");
@@ -286,7 +287,7 @@ function ConfigurationTab({ workspace, agent, readOnly }: { workspace: Workspace
             }),
           )}
         >
-          <AgentFields form={form} readOnly={readOnly} />
+          <AgentFields form={form} environment={workspace.environment} readOnly={readOnly} />
           {readOnly ? (
             <p className="border-t pt-5 text-xs text-muted-foreground">
               You can view this configuration. Owners, admins and developers can change it.

@@ -710,7 +710,7 @@ async fn connects_grants_and_runs_against_a_fake_mcp_app() {
             Method::POST,
             &format!("/v1/workspaces/{}/agents", t.ws),
             Some(&t.org),
-            Some(json!({ "name": "Planner", "description": "", "model": "model-balanced", "instructions": "Keep the board tidy." })),
+            Some(json!({ "name": "Planner", "description": "", "instructions": "Keep the board tidy." })),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{agent}");
@@ -1342,7 +1342,7 @@ async fn history_run(stack: &Stack, who: &str, org: &str, slug: &str, environmen
             Method::POST,
             &format!("/v1/workspaces/{ws}/agents"),
             Some(org),
-            Some(json!({ "name": "Webhook trial", "description": "", "model": "model-balanced", "instructions": "Answer briefly." })),
+            Some(json!({ "name": "Webhook trial", "description": "", "instructions": "Answer briefly." })),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{agent}");

@@ -1,4 +1,4 @@
-import type { Environment, RunListQuery, WebhookDeliveryListQuery } from "@zupflow/sdk";
+import type { Environment, ModelListQuery, RunListQuery, WebhookDeliveryListQuery } from "@zupflow/sdk";
 
 /**
  * Every workspace-scoped key starts with `["ws", workspaceId]`, so invalidating
@@ -8,7 +8,6 @@ export const qk = {
   viewer: ["viewer"] as const,
   /** The signed-in person's own invitations: not an organization's. */
   invitations: ["invitations"] as const,
-  models: ["models"] as const,
 
   org: (orgId: string) => ["org", orgId] as const,
   usage: (orgId: string, env: Environment) => ["org", orgId, "usage", env] as const,
@@ -30,6 +29,16 @@ export const qk = {
     ["org", orgId, "webhooks", endpointId, env, "delivery", deliveryId] as const,
   webhookAttempts: (orgId: string, endpointId: string, env: Environment, deliveryId?: string) =>
     ["org", orgId, "webhooks", endpointId, env, "delivery", deliveryId, "attempts"] as const,
+  /** Model providers: connections, their models and each environment's default. One prefix, so a change refreshes all three. */
+  modelProviders: (orgId: string) => ["org", orgId, "model-providers"] as const,
+  modelConnections: (orgId: string, env: Environment) => ["org", orgId, "model-providers", "connections", env] as const,
+  modelConnection: (orgId: string, connectionId: string) =>
+    ["org", orgId, "model-providers", "connection", connectionId] as const,
+  providerModels: (orgId: string, connectionId: string, q: string) =>
+    ["org", orgId, "model-providers", "connection", connectionId, "provider-models", q] as const,
+  models: (orgId: string, query: Omit<ModelListQuery, "cursor">) =>
+    ["org", orgId, "model-providers", "models", query] as const,
+  defaultModel: (orgId: string, env: Environment) => ["org", orgId, "model-providers", "default", env] as const,
   audit: (orgId: string, workspaceId?: string) => ["org", orgId, "audit", workspaceId ?? "all"] as const,
 
   workspace: (wsId: string) => ["ws", wsId] as const,

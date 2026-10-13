@@ -1223,7 +1223,11 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
                 return Err(refused("a claim that starts a run that isn't queued"));
             }
             if *starts {
-                writer.event(RunEventType::RunStarted, json!({ "model": snapshot.model }));
+                // The run's model is still the deployment's: no organization model or connection names it yet.
+                writer.event(
+                    RunEventType::RunStarted,
+                    json!({ "model": snapshot.model, "model_id": null, "connection_id": null }),
+                );
             }
             Ok(Effects {
                 row: RowChange {

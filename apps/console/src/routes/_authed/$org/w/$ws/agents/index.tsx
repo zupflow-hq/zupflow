@@ -8,9 +8,10 @@ import { AgentStatusPill } from "@/components/app/status";
 import { Button } from "@/components/ui/button";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { CreateAgentDialog } from "@/features/agents/agent-form";
+import { agentInput, CreateAgentDialog } from "@/features/agents/agent-form";
 import { canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
-import { useAgents, useCreateAgent, useModels } from "@/features/queries";
+import { AgentModelName } from "@/features/models/agent-model";
+import { useAgents, useCreateAgent } from "@/features/queries";
 import { applyFieldErrors, toastError } from "@/lib/errors";
 
 export const Route = createFileRoute("/_authed/$org/w/$ws/agents/")({
@@ -25,10 +26,8 @@ function AgentsPage() {
   const navigate = useNavigate({ from: Route.fullPath });
   const { create } = Route.useSearch();
   const agents = useAgents(ws.id);
-  const models = useModels();
   const createAgent = useCreateAgent(ws.id);
   const setCreate = (open: boolean) => navigate({ search: open ? { create: true } : {}, replace: true });
-  const modelName = (id: string) => models.data?.find((m) => m.id === id)?.name ?? id;
   const mayChange = canChange(org);
 
   return (
@@ -104,7 +103,9 @@ function AgentsPage() {
                         {a.description || "No description"}
                       </p>
                     </TableCell>
-                    <TableCell className="hidden text-muted-foreground lg:table-cell">{modelName(a.model)}</TableCell>
+                    <TableCell className="hidden text-muted-foreground lg:table-cell">
+                      <AgentModelName org={org} environment={ws.environment} modelId={a.model_id} />
+                    </TableCell>
                     <TableCell>
                       <AgentStatusPill status={a.status} />
                     </TableCell>
@@ -128,7 +129,7 @@ function AgentsPage() {
         onOpenChange={setCreate}
         pending={createAgent.isPending}
         onCreate={(values, form) =>
-          createAgent.mutate(values, {
+          createAgent.mutate(agentInput(values), {
             onSuccess: (agent) => {
               toast.success(`Created ${agent.name}`);
               void navigate({

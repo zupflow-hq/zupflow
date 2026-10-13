@@ -1,5 +1,14 @@
 import { useNavigate } from "@tanstack/react-router";
-import { ActivityIcon, BlocksIcon, BoxesIcon, KeyRoundIcon, PlugIcon, SearchIcon, WebhookIcon } from "lucide-react";
+import {
+  ActivityIcon,
+  BlocksIcon,
+  BoxesIcon,
+  KeyRoundIcon,
+  PlugIcon,
+  SearchIcon,
+  SparklesIcon,
+  WebhookIcon,
+} from "lucide-react";
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
@@ -17,6 +26,7 @@ const PAGES = [
   { label: "Runs", to: "/$org/runs", icon: ActivityIcon },
   { label: "App catalog", to: "/$org/apps", icon: BlocksIcon },
   { label: "Connect", to: "/$org/connect", icon: PlugIcon },
+  { label: "Model providers", to: "/$org/model-providers", icon: SparklesIcon },
   { label: "API keys", to: "/$org/api-keys", icon: KeyRoundIcon },
   { label: "Webhooks", to: "/$org/webhooks", icon: WebhookIcon },
 ] as const;

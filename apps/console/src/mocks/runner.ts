@@ -8,6 +8,7 @@ import type { ApiKeyId, RunError, RunEvent, RunEventType, ToolCallId } from "@zu
 import { sampleToolCall } from "./catalog";
 import { newId } from "./ids";
 import type { Db, PlannedCall, RunEventRow, RunRow, RunStep } from "./model";
+import { runRoute } from "./model-scope";
 import { type Rng, rngFor } from "./random";
 import { appIn, runEventsKey, sameWorkspace, timelineOf } from "./scope";
 
@@ -190,21 +191,51 @@ export function enqueueRun(db: Db, run: RunRow) {
 export type StepOutcome = "continue" | "paused" | "finished";
 
 /**
+ * Why the run's model can't be called when it starts, if it can't: the model
+ * or its connection was removed, or the provider refused the connection's key.
+ */
+function modelRefusal(db: Db, run: RunRow): RunError | null {
+  const route = runRoute(db, run);
+  if (!route) {
+    return { code: "model_unavailable", message: "The run's model was removed before it started." };
+  }
+  if (route.connection.status === "invalid_key") {
+    return {
+      code: "model_key_invalid",
+      message: `The model provider refused ${route.connection.label}'s key. Replace it under Model providers.`,
+    };
+  }
+  return null;
+}
+
+/**
  * Execute the next step. Returns `paused` when the run waits for a human and
  * `finished` when it reached a terminal state.
  */
 export function advanceRun(db: Db, run: RunRow, at: string, rng: Rng): StepOutcome {
   const step = run.plan.shift();
   if (!step) return "finished";
-  const agent = db.agents.find((a) => sameWorkspace(a, run) && a.id === run.agent_id);
 
   switch (step.kind) {
-    case "start":
+    case "start": {
       run.status = "running";
       run.started_at = at;
-      pushEvent(db, run, at, "run.started", { model: agent?.model ?? "unknown" });
+      // The model recorded when the run was created, never the default as it is now.
+      pushEvent(db, run, at, "run.started", {
+        model: run.model.provider_model_id,
+        model_id: run.model.model_id,
+        connection_id: run.model.connection_id,
+      });
+      const refusal = modelRefusal(db, run);
+      if (refusal) {
+        run.plan = [];
+        finish(db, run, at, refusal);
+        return "finished";
+      }
+      run.model.key_version = runRoute(db, run)?.connection.key_version ?? null;
       run.usage.input_tokens += 900 + Math.floor(rng() * 2600);
       return "continue";
+    }
 
     case "message":
       pushEvent(db, run, at, "message.assistant", { text: step.text });

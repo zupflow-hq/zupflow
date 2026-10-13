@@ -25,6 +25,11 @@ import type {
   MemberId,
   MemberRole,
   MemberStatus,
+  ModelConnectionId,
+  ModelConnectionStatus,
+  ModelId,
+  ModelProviderKind,
+  ModelStatus,
   NewToolLevel,
   OrganizationId,
   RunError,
@@ -228,11 +233,61 @@ export interface AgentRow {
   workspace_id: WorkspaceId;
   name: string;
   description: string;
-  model: string;
+  /** An override: a model of the same organization, in the workspace's environment. Null runs on the default. */
+  model_id: ModelId | null;
   instructions: string;
   status: AgentStatus;
   created_at: string;
   updated_at: string;
+}
+
+/**
+ * One organization's account with a model provider in one environment
+ * (decision 0050). Organization-scoped and environment-bound. The API key is
+ * never stored by the mock, not even sealed: only what responses show (its
+ * last four characters) and its version.
+ */
+export interface ModelConnectionRow {
+  id: ModelConnectionId;
+  organization_id: OrganizationId;
+  environment: Environment;
+  kind: ModelProviderKind;
+  label: string;
+  key_last4: string;
+  key_version: number;
+  key_updated_at: string;
+  status: ModelConnectionStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * A model the organization added from one of its connections. Natural key
+ * (organization_id, connection_id, provider_model_id); its environment is its
+ * connection's.
+ */
+export interface ModelRow {
+  id: ModelId;
+  organization_id: OrganizationId;
+  environment: Environment;
+  connection_id: ModelConnectionId;
+  provider_model_id: string;
+  name: string;
+  author: string;
+  context_window: number | null;
+  supports_tools: boolean;
+  status: ModelStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+/** An environment's default model, once someone chose one (or none). Natural key (organization_id, environment). */
+export interface DefaultModelRow {
+  organization_id: OrganizationId;
+  environment: Environment;
+  model_id: ModelId | null;
+  updated_at: string;
+  updated_by_user_id: UserId | null;
 }
 
 /** A tool call decided when the run was planned. */
@@ -279,8 +334,19 @@ export interface RunRow {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  /** The model the run calls, fixed when it's created: a queued run never switches to a later default. */
+  model: RunModelRow;
   /** Remaining simulation steps for live runs. Empty once terminal. */
   plan: RunStep[];
+}
+
+/** A run's model and its route, as resolved when the run was created. */
+export interface RunModelRow {
+  model_id: ModelId;
+  connection_id: ModelConnectionId;
+  provider_model_id: string;
+  /** The connection's key version the run called with; null until it starts. */
+  key_version: number | null;
 }
 
 export interface ConnectSettingsRow {
@@ -379,6 +445,12 @@ export interface Db {
   /** Each run's timeline, keyed by the run's full scope (`runEventsKey`); every event carries it too. */
   run_events: Record<string, RunEventRow[]>;
   connect_settings: ConnectSettingsRow[];
+  /** Each organization's model provider connections, each in one environment. */
+  model_connections: ModelConnectionRow[];
+  /** Models each organization added from its connections. */
+  models: ModelRow[];
+  /** Each organization's chosen default model per environment. */
+  default_models: DefaultModelRow[];
   api_keys: ApiKeyRow[];
   webhooks: WebhookEndpoint[];
   webhook_events: WebhookEventRow[];

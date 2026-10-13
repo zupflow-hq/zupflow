@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useNavigate } from "@tanstack/react-router";
-import type { Agent, Workspace } from "@zupflow/sdk";
+import type { Agent, Organization, Workspace } from "@zupflow/sdk";
 import { AlertTriangleIcon } from "lucide-react";
 import { useEffect } from "react";
 import { useForm } from "react-hook-form";
@@ -11,6 +11,7 @@ import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "
 import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
+import { NoModelNotice, useModelSetup } from "@/features/models/model-setup";
 import { useCreateRun } from "@/features/queries";
 import { applyFieldErrors, toastError } from "@/lib/errors";
 
@@ -19,13 +20,13 @@ const schema = z.object({
 });
 
 export function StartRunSheet({
-  orgSlug,
+  org,
   workspace,
   agent,
   open,
   onOpenChange,
 }: {
-  orgSlug: string;
+  org: Organization;
   workspace: Workspace;
   agent: Agent;
   open: boolean;
@@ -33,6 +34,9 @@ export function StartRunSheet({
 }) {
   const navigate = useNavigate();
   const create = useCreateRun(workspace.id, agent.id);
+  const setup = useModelSetup(org, workspace.environment);
+  // With no model of its own and no default, a run is refused; say so before anyone types a message.
+  const noModel = !agent.model_id && !setup.isPending && !setup.isError && !setup.defaultModel;
   const form = useForm<z.infer<typeof schema>>({
     resolver: zodResolver(schema),
     defaultValues: { input: "" },
@@ -62,7 +66,7 @@ export function StartRunSheet({
                     onOpenChange(false);
                     void navigate({
                       to: "/$org/w/$ws/runs/$runId",
-                      params: { org: orgSlug, ws: workspace.id, runId: run.id },
+                      params: { org: org.slug, ws: workspace.id, runId: run.id },
                     });
                   },
                   onError: (error) => {
@@ -72,6 +76,13 @@ export function StartRunSheet({
               ),
             )}
           >
+            {noModel ? (
+              <NoModelNotice
+                org={org}
+                environment={workspace.environment}
+                reason={setup.empty ? "empty" : "no_default"}
+              />
+            ) : null}
             {workspace.environment === "production" ? (
               <p className="flex gap-2 rounded-lg border border-production/40 bg-production-soft/50 p-3 text-sm">
                 <AlertTriangleIcon className="mt-0.5 size-4 shrink-0 text-production-ink" />
@@ -108,7 +119,7 @@ export function StartRunSheet({
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button type="submit" form="start-run" disabled={create.isPending}>
+          <Button type="submit" form="start-run" disabled={create.isPending || noModel}>
             {create.isPending ? <Spinner /> : null}
             Start run
           </Button>

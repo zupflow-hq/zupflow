@@ -130,8 +130,15 @@
           "description": {
             "type": "string"
           },
-          "model": {
-            "type": "string"
+          "model_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelId"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "instructions": {
             "type": "string"
@@ -175,7 +182,7 @@
           "workspace_id",
           "name",
           "description",
-          "model",
+          "model_id",
           "instructions",
           "status",
           "grant_count",
@@ -191,7 +198,7 @@
       },
       "AnyId": {
         "type": "string",
-        "pattern": "^(org|ws|usr|mem|app|inst|cs|agt|grt|run|rev|call|ses|key|we|evt|whd|aud)_[0-9A-Za-z]{22}$"
+        "pattern": "^(org|ws|usr|mem|app|inst|cs|agt|grt|run|rev|call|ses|key|we|evt|whd|aud|mcn|mdl)_[0-9A-Za-z]{22}$"
       },
       "ApiKey": {
         "type": "object",
@@ -1335,6 +1342,50 @@
           "signing_secret"
         ]
       },
+      "DefaultModel": {
+        "type": "object",
+        "properties": {
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Model"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updated_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/User"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "environment",
+          "model",
+          "updated_at",
+          "updated_by"
+        ]
+      },
       "Environment": {
         "type": "string",
         "enum": [
@@ -2050,23 +2101,187 @@
         "type": "object",
         "properties": {
           "id": {
+            "$ref": "#/components/schemas/ModelId"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "route": {
+            "$ref": "#/components/schemas/ModelRoute"
+          },
+          "provider_model_id": {
             "type": "string"
           },
           "name": {
             "type": "string"
           },
-          "provider": {
+          "author": {
             "type": "string"
           },
-          "description": {
-            "type": "string"
+          "context_window": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "supports_tools": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "unavailable"
+            ]
+          },
+          "is_default": {
+            "type": "boolean"
+          },
+          "agent_count": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Instant"
           }
         },
         "required": [
           "id",
+          "organization_id",
+          "environment",
+          "route",
+          "provider_model_id",
           "name",
-          "provider",
-          "description"
+          "author",
+          "context_window",
+          "supports_tools",
+          "status",
+          "is_default",
+          "agent_count",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "ModelConnection": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ModelConnectionId"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ModelProviderKind"
+          },
+          "label": {
+            "type": "string"
+          },
+          "api_key": {
+            "$ref": "#/components/schemas/SecretState"
+          },
+          "key_version": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "invalid_key"
+            ]
+          },
+          "model_count": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Instant"
+          }
+        },
+        "required": [
+          "id",
+          "organization_id",
+          "environment",
+          "kind",
+          "label",
+          "api_key",
+          "key_version",
+          "status",
+          "model_count",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "ModelConnectionId": {
+        "type": "string",
+        "pattern": "^mcn_[0-9A-Za-z]{22}$"
+      },
+      "ModelId": {
+        "type": "string",
+        "pattern": "^mdl_[0-9A-Za-z]{22}$"
+      },
+      "ModelPricing": {
+        "type": "object",
+        "properties": {
+          "input_per_million_usd": {
+            "type": "number"
+          },
+          "output_per_million_usd": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "input_per_million_usd",
+          "output_per_million_usd"
+        ]
+      },
+      "ModelProviderKind": {
+        "type": "string",
+        "enum": [
+          "openai",
+          "anthropic",
+          "openrouter"
+        ]
+      },
+      "ModelRoute": {
+        "type": "object",
+        "properties": {
+          "connection_id": {
+            "$ref": "#/components/schemas/ModelConnectionId"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ModelProviderKind"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "connection_id",
+          "kind",
+          "label"
         ]
       },
       "OAuthAuthTemplate": {
@@ -2379,6 +2594,64 @@
           "total"
         ]
       },
+      "ProviderModel": {
+        "type": "object",
+        "properties": {
+          "provider_model_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "author": {
+            "type": "string"
+          },
+          "context_window": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "supports_tools": {
+            "type": "boolean"
+          },
+          "pricing": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelPricing"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "added_model_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "provider_model_id",
+          "name",
+          "author",
+          "context_window",
+          "supports_tools",
+          "pricing",
+          "added_model_id"
+        ]
+      },
       "Run": {
         "type": "object",
         "properties": {
@@ -2683,10 +2956,32 @@
                 "properties": {
                   "model": {
                     "type": "string"
+                  },
+                  "model_id": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ModelId"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "connection_id": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ModelConnectionId"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
                   }
                 },
                 "required": [
-                  "model"
+                  "model",
+                  "model_id",
+                  "connection_id"
                 ]
               }
             },
@@ -4754,66 +5049,6 @@
         "responses": {
           "204": {
             "description": "Done"
-          },
-          "default": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/v1/models": {
-      "get": {
-        "operationId": "listModels",
-        "summary": "Models an agent can use",
-        "security": [
-          {
-            "consoleSession": []
-          },
-          {
-            "apiKey": []
-          }
-        ],
-        "x-zupflow-callers": [
-          "console",
-          "api_key"
-        ],
-        "parameters": [],
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "required": [
-                    "data",
-                    "meta",
-                    "error"
-                  ],
-                  "properties": {
-                    "data": {
-                      "type": "array",
-                      "items": {
-                        "$ref": "#/components/schemas/Model"
-                      }
-                    },
-                    "meta": {
-                      "anyOf": [
-                        {
-                          "$ref": "#/components/schemas/Meta"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ]
-                    },
-                    "error": {
-                      "type": "null"
-                    }
-                  }
-                }
-              }
-            }
           },
           "default": {
             "$ref": "#/components/responses/Error"
@@ -8992,8 +9227,15 @@
                   "description": {
                     "type": "string"
                   },
-                  "model": {
-                    "type": "string"
+                  "model_id": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ModelId"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
                   },
                   "instructions": {
                     "type": "string"
@@ -9002,7 +9244,6 @@
                 "required": [
                   "name",
                   "description",
-                  "model",
                   "instructions"
                 ]
               }
@@ -9174,8 +9415,15 @@
                   "description": {
                     "type": "string"
                   },
-                  "model": {
-                    "type": "string"
+                  "model_id": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ModelId"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
                   },
                   "instructions": {
                     "type": "string"
@@ -9600,7 +9848,7 @@
     "/v1/workspaces/{ws}/agents/{agent}/runs": {
       "post": {
         "operationId": "startRun",
-        "summary": "Start a run",
+        "summary": "Start a run on the agent's model, or its environment's default. With neither, `422 model_not_configured`",
         "security": [
           {
             "consoleSession": [],
@@ -10148,6 +10396,1174 @@
                 "required": [
                   "call_id",
                   "decision"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{org}/model-connections": {
+      "get": {
+        "operationId": "listModelConnections",
+        "summary": "The organization's model provider connections, oldest first",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "environment",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Only this environment's connections. An API key reads its own environment's; naming another is `422 environment_mismatch`.",
+              "$ref": "#/components/schemas/Environment"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ModelConnection"
+                      }
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createModelConnection",
+        "summary": "Connect a model provider in one environment with an API key, checked with the provider first (`422 invalid_api_key`)",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ModelConnection"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "environment": {
+                    "$ref": "#/components/schemas/Environment"
+                  },
+                  "kind": {
+                    "$ref": "#/components/schemas/ModelProviderKind"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "api_key": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "environment",
+                  "kind",
+                  "label",
+                  "api_key"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{org}/model-connections/{connection}": {
+      "get": {
+        "operationId": "getModelConnection",
+        "summary": "A model provider connection",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "connection",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ModelConnectionId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ModelConnection"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "updateModelConnection",
+        "summary": "Rename a model provider connection",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "connection",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ModelConnectionId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ModelConnection"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "label": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "label"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteModelConnection",
+        "summary": "Delete a connection, its key and its models. Refused while one of its models is the environment's default or an agent's (`409 model_in_use`, naming them)",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "connection",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ModelConnectionId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Done"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{org}/model-connections/{connection}/api-key": {
+      "put": {
+        "operationId": "replaceModelConnectionKey",
+        "summary": "Replace a connection's API key with a new version, checked with the provider first (`422 invalid_api_key`, keeping the old one)",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "connection",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ModelConnectionId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ModelConnection"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "api_key": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "api_key"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{org}/model-connections/{connection}/provider-models": {
+      "get": {
+        "operationId": "listProviderModels",
+        "summary": "Search the models the connection's provider lists for its key, a page at a time. `422 invalid_api_key` when the provider refuses the key",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "connection",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ModelConnectionId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Page size, 1 to 100 (default 25); values outside are clamped, and a non-integer means the default.",
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ProviderModel"
+                      }
+                    },
+                    "meta": {
+                      "$ref": "#/components/schemas/Meta"
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{org}/models": {
+      "get": {
+        "operationId": "listModels",
+        "summary": "Models the organization added, by name, searched and paged on the server",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Page size, 1 to 100 (default 25); values outside are clamped, and a non-integer means the default.",
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          },
+          {
+            "name": "environment",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Only this environment's models. An API key reads its own environment's; naming another is `422 environment_mismatch`.",
+              "$ref": "#/components/schemas/Environment"
+            }
+          },
+          {
+            "name": "connection_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Only this connection's models. A malformed or unknown ID matches nothing.",
+              "$ref": "#/components/schemas/ModelConnectionId"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Model"
+                      }
+                    },
+                    "meta": {
+                      "$ref": "#/components/schemas/Meta"
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createModel",
+        "summary": "Add a model from a connection, in the connection's environment",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Model"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "connection_id": {
+                    "$ref": "#/components/schemas/ModelConnectionId"
+                  },
+                  "provider_model_id": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "connection_id",
+                  "provider_model_id"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{org}/models/{model}": {
+      "get": {
+        "operationId": "getModel",
+        "summary": "A model",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ModelId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Model"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "updateModel",
+        "summary": "Rename a model",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ModelId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Model"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteModel",
+        "summary": "Remove a model. Refused while it is the environment's default or an agent's (`409 model_in_use`, naming them)",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ModelId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Done"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{org}/default-models/{env}": {
+      "get": {
+        "operationId": "getDefaultModel",
+        "summary": "The model agents in one environment run on unless they override it",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Environment"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/DefaultModel"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "operationId": "updateDefaultModel",
+        "summary": "Choose an environment's default model, or none",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Environment"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/DefaultModel"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "model_id": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ModelId"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "model_id"
                 ]
               }
             }

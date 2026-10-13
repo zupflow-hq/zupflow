@@ -853,18 +853,18 @@ describe("API-key storage", () => {
     expect(saved.state).toBe("completed");
     expect(saved.body === null).toBe(true);
     const keyed = createClient(createHttpTransport({ baseUrl: API, getToken: async () => created.secret }));
-    await keyed.models.list();
+    await keyed.models.list(organization);
     const used = row.last_used_at;
     expect(used).not.toBeNull();
-    await keyed.models.list();
+    await keyed.models.list(organization);
     expect(row.last_used_at).toBe(used);
     row.last_used_at = new Date(Date.now() - 60_000).toISOString();
     const previous = row.last_used_at;
-    await keyed.models.list();
+    await keyed.models.list(organization);
     expect(Date.parse(must(row.last_used_at))).toBeGreaterThan(Date.parse(previous));
     // Revocation remains authoritative even though the stored hash still matches.
     await owner.apiKeys.revoke(organization, row.id);
-    expect(await failure(keyed.models.list())).toMatchObject({ status: 401, code: "unauthenticated" });
+    expect(await failure(keyed.models.list(organization))).toMatchObject({ status: 401, code: "unauthenticated" });
   });
 
   it("never treats historical key display metadata as a usable credential", async () => {
@@ -875,7 +875,7 @@ describe("API-key storage", () => {
     expect(historical.secret_hash).toBeNull();
     const guessed = `${historical.prefix}${"0".repeat(36)}${historical.last4}`;
     const client = createClient(createHttpTransport({ baseUrl: API, getToken: async () => guessed }));
-    expect(await failure(client.models.list())).toMatchObject({ status: 401, code: "unauthenticated" });
+    expect(await failure(client.models.list(organization))).toMatchObject({ status: 401, code: "unauthenticated" });
   });
 });
 
@@ -945,7 +945,7 @@ describe("configured OAuth issuer isolation", () => {
 describe("idempotency store", () => {
   // Black-box idempotency is in the shared suite. These plant the states a request can't reach on its own.
   const qa = () => ws("qa-playground").id;
-  const input = { name: "Stored", description: "", instructions: "", model: "claude-haiku-4-5-20251001" };
+  const input = { name: "Stored", description: "", instructions: "" };
   const rowFor = (key: string) =>
     must(
       db().idempotency_keys.find((r) => r.key === key),
@@ -2227,7 +2227,6 @@ describe("two organizations", () => {
     const agent = await owner.agents.create(qa.id, {
       name: "Order",
       description: "",
-      model: "claude-sonnet-5-5",
       instructions: "",
     });
     const tool = must(app("echo_server").tools[0]).name;
@@ -2593,7 +2592,8 @@ describe("two organizations", () => {
     expect((await owner.runs.get(acme.id, run.id)).agent_name).toBe("Deleted agent");
     const events = timelineOf(db(), run);
     const started = events.find((e) => e.type === "run.started");
-    expect(started?.type === "run.started" ? started.data.model : null).toBe("unknown");
+    // The run's model was fixed when it was created, never looked up through the mislabelled agent.
+    expect(started?.type === "run.started" ? started.data.model_id : null).toBe(run.model.model_id);
     expect(events.some((e) => e.type === "tool_call.completed")).toBe(false);
     expect(run.status).toBe("failed");
   });
@@ -3358,11 +3358,9 @@ describe("installation tools", () => {
 
   it("leaves a grant alone when its tool goes, and refuses to grant the gone tool again", async () => {
     const { qa, installation } = await connectEcho();
-    const models = await owner.models.list();
     const agent = await owner.agents.create(qa.id, {
       name: "Echo probe",
       description: "",
-      model: must(models[0]).id,
       instructions: "",
     });
     const grant = await owner.grants.create(qa.id, agent.id, {
@@ -3394,7 +3392,6 @@ describe("installation tools", () => {
     const agent = await owner.agents.create(qa.id, {
       name: "Registry only",
       description: "",
-      model: must((await owner.models.list())[0]).id,
       instructions: "",
     });
     // The app defines a tool its server hasn't listed to this account yet: it isn't grantable.
@@ -3615,7 +3612,6 @@ describe("tool policy", () => {
     owner.agents.create(workspaceId, {
       name: "Policy probe",
       description: "",
-      model: must((await owner.models.list())[0]).id,
       instructions: "",
     });
 
@@ -3737,5 +3733,247 @@ describe("tool policy", () => {
       .slice(0, 2)
       .map((e) => e.action);
     expect(actions).toEqual(["app.tool_levels_updated", "tool_policy.updated"]);
+  });
+});
+
+describe("model providers", () => {
+  const northwind = () => must(northwindId(), "Northwind");
+  const larkspur = () => must(db().organizations.find((o) => o.slug === "larkspur")?.id, "Larkspur");
+  const sandboxDefault = () =>
+    must(db().default_models.find((d) => d.organization_id === northwind() && d.environment === "sandbox"));
+
+  it("seeds every agent's model and default within its own organization and environment", () => {
+    const d = db();
+    for (const agent of d.agents) {
+      if (!agent.model_id) continue;
+      const workspace = must(
+        d.workspaces.find((w) => w.organization_id === agent.organization_id && w.id === agent.workspace_id),
+      );
+      const model = must(
+        d.models.find((m) => m.id === agent.model_id),
+        `model of ${agent.name}`,
+      );
+      expect([model.organization_id, model.environment], agent.name).toEqual([
+        agent.organization_id,
+        workspace.environment,
+      ]);
+    }
+    for (const row of d.default_models) {
+      if (!row.model_id) continue;
+      const model = must(d.models.find((m) => m.id === row.model_id));
+      expect([model.organization_id, model.environment]).toEqual([row.organization_id, row.environment]);
+    }
+    for (const model of d.models) {
+      const connection = must(d.model_connections.find((c) => c.id === model.connection_id));
+      expect([connection.organization_id, connection.environment]).toEqual([model.organization_id, model.environment]);
+    }
+    // Both environments of the demo organization have a default; its runs started on one.
+    expect(d.default_models.filter((r) => r.organization_id === northwind() && r.model_id)).toHaveLength(2);
+  });
+
+  it("never keeps a provider key: not in the database, storage or idempotency records", async () => {
+    const secret = "sk-mock-never-kept-Zq81";
+    const replacement = "sk-mock-never-kept-Yw22";
+    const connection = await owner.modelConnections.create(
+      northwind(),
+      { environment: "sandbox", kind: "openai", label: "Kept nowhere", api_key: secret },
+      { idempotencyKey: "model-key-storage" },
+    );
+    await owner.modelConnections.replaceKey(northwind(), connection.id, { api_key: replacement });
+    for (const value of [secret, replacement]) {
+      expect(JSON.stringify(db()).includes(value)).toBe(false);
+      expect(localStorage.getItem("zupflow.mock.db")?.includes(value)).toBe(false);
+    }
+    const row = must(db().model_connections.find((c) => c.organization_id === northwind() && c.id === connection.id));
+    expect([row.key_last4, row.key_version]).toEqual(["Yw22", 2]);
+  });
+
+  it("never falls back to the other environment's default", async () => {
+    const qa = ws("qa-playground");
+    const agent = await owner.agents.create(qa.id, { name: "No fallback", description: "", instructions: "" });
+    // Production has a default; Sandbox loses its own.
+    sandboxDefault().model_id = null;
+    expect(
+      db().default_models.some(
+        (d) => d.organization_id === northwind() && d.environment === "production" && d.model_id,
+      ),
+    ).toBe(true);
+    const refused = await failure(owner.runs.create(qa.id, agent.id, { input: "hi" }));
+    expect([refused.status, refused.code]).toEqual([422, "model_not_configured"]);
+  });
+
+  it("finds a model only under its own organization, whatever rows share its ID", async () => {
+    const qa = ws("qa-playground");
+    const model = must(db().models.find((m) => m.organization_id === northwind() && m.environment === "sandbox"));
+    // A row with the same ID, mislabelled into another organization, ahead of the real one.
+    db().models.unshift({ ...structuredClone(model), organization_id: larkspur(), name: "Poisoned organization" });
+    expect((await owner.models.get(northwind(), model.id)).name).toBe(model.name);
+    const agent = await owner.agents.create(qa.id, {
+      name: "Scoped",
+      description: "",
+      instructions: "",
+      model_id: model.id,
+    });
+    expect(agent.model_id).toBe(model.id);
+    const names = (await owner.models.list(northwind(), { environment: "sandbox", limit: 100 })).items.map(
+      (m) => m.name,
+    );
+    expect(names).toContain(model.name);
+    expect(names.filter((name) => name.startsWith("Poisoned"))).toEqual([]);
+    expect((await owner.models.getDefault(northwind(), "sandbox")).model?.name).not.toMatch(/^Poisoned/);
+  });
+
+  it("starts a run on its agent's model, and fails it when the provider refuses the connection's key", async () => {
+    const { advanceRun } = await import("./runner");
+    const qa = ws("qa-playground");
+    const model = must(
+      db().models.find(
+        (m) =>
+          m.organization_id === northwind() &&
+          m.environment === "sandbox" &&
+          m.provider_model_id === "claude-haiku-4-5",
+      ),
+    );
+    const agent = await owner.agents.create(qa.id, {
+      name: "Haiku",
+      description: "",
+      instructions: "",
+      model_id: model.id,
+    });
+    const drive = (runId: string) => {
+      const run = must(
+        db().runs.find((r) => r.organization_id === northwind() && r.workspace_id === qa.id && r.id === runId),
+      );
+      for (let i = 0; i < 40 && !["completed", "failed", "cancelled"].includes(run.status); i++) {
+        advanceRun(db(), run, new Date().toISOString(), () => 0.5);
+      }
+      return run;
+    };
+    const ran = drive((await owner.runs.create(qa.id, agent.id, { input: "hi" })).id);
+    const started = timelineOf(db(), ran).find((e) => e.type === "run.started");
+    expect(started?.type === "run.started" ? started.data.model : null).toBe("claude-haiku-4-5");
+    const connection = must(
+      db().model_connections.find((c) => c.organization_id === northwind() && c.id === model.connection_id),
+    );
+    connection.status = "invalid_key";
+    const failed = drive((await owner.runs.create(qa.id, agent.id, { input: "hi" })).id);
+    expect([failed.status, failed.error?.code]).toEqual(["failed", "model_key_invalid"]);
+    // Replacing the key makes the connection usable again.
+    const replaced = await owner.modelConnections.replaceKey(northwind(), connection.id, {
+      api_key: "sk-mock-fresh-replacement-0000",
+    });
+    expect(replaced.status).toBe("active");
+    const search = await failure(
+      owner.modelConnections.providerModels(
+        northwind(),
+        must(db().model_connections.find((c) => c.organization_id === northwind() && c.status === "invalid_key")).id,
+      ),
+    );
+    expect([search.status, search.code]).toEqual([422, "invalid_api_key"]);
+  });
+
+  it("keeps a queued run on the model it was created with, told apart from another route to the same model", async () => {
+    const { advanceRun } = await import("./runner");
+    const qa = ws("qa-playground");
+    const first = must(
+      db().models.find(
+        (m) =>
+          m.organization_id === northwind() && m.environment === "sandbox" && m.provider_model_id === "openai/gpt-5",
+      ),
+    );
+    // A second OpenRouter connection serving the same provider model ID.
+    const other = await owner.modelConnections.create(
+      northwind(),
+      { environment: "sandbox", kind: "openrouter", label: "Team OpenRouter", api_key: "sk-or-second-team-key-0001" },
+      { idempotencyKey: "second-route" },
+    );
+    const second = await owner.models.create(
+      northwind(),
+      { connection_id: other.id, provider_model_id: "openai/gpt-5" },
+      { idempotencyKey: "second-route-model" },
+    );
+    await owner.models.setDefault(northwind(), "sandbox", { model_id: first.id });
+    const agent = await owner.agents.create(qa.id, { name: "Default user", description: "", instructions: "" });
+    const queued = await owner.runs.create(qa.id, agent.id, { input: "hi" });
+    // The default changes while the first run is still queued.
+    await owner.models.setDefault(northwind(), "sandbox", { model_id: second.id });
+    const later = await owner.runs.create(qa.id, agent.id, { input: "hi" });
+    const drive = (runId: string) => {
+      const run = must(
+        db().runs.find((r) => r.organization_id === northwind() && r.workspace_id === qa.id && r.id === runId),
+      );
+      for (let i = 0; i < 40 && !["completed", "failed", "cancelled"].includes(run.status); i++) {
+        advanceRun(db(), run, new Date().toISOString(), () => 0.5);
+      }
+      return run;
+    };
+    const startedOn = (runId: string) => {
+      const run = drive(runId);
+      const started = timelineOf(db(), run).find((e) => e.type === "run.started");
+      return started?.type === "run.started" ? { ...started.data, key_version: run.model.key_version } : null;
+    };
+    expect(startedOn(queued.id)).toEqual({
+      model: "openai/gpt-5",
+      model_id: first.id,
+      connection_id: first.connection_id,
+      key_version: 1,
+    });
+    expect(startedOn(later.id)).toEqual({
+      model: "openai/gpt-5",
+      model_id: second.id,
+      connection_id: other.id,
+      key_version: 1,
+    });
+  });
+
+  it("never starts a run as an unknown model: one whose model went before it started fails", async () => {
+    const { advanceRun } = await import("./runner");
+    const qa = ws("qa-playground");
+    const agent = await owner.agents.create(qa.id, { name: "Orphan", description: "", instructions: "" });
+    const queued = await owner.runs.create(qa.id, agent.id, { input: "hi" });
+    const run = must(db().runs.find((r) => r.organization_id === northwind() && r.id === queued.id));
+    // The model is removed underneath the queued run (the API refuses this while it's the default).
+    db().models = db().models.filter((m) => !(m.organization_id === northwind() && m.id === run.model.model_id));
+    for (let i = 0; i < 40 && !["completed", "failed", "cancelled"].includes(run.status); i++) {
+      advanceRun(db(), run, new Date().toISOString(), () => 0.5);
+    }
+    expect([run.status, run.error?.code]).toEqual(["failed", "model_unavailable"]);
+    const started = timelineOf(db(), run).find((e) => e.type === "run.started");
+    expect(started?.type === "run.started" ? started.data.model : null).not.toBe("unknown");
+  });
+
+  it("refuses viewers and developers every change, and records each change in the audit log", async () => {
+    const developer = clientFor(must(db().users.find((u) => u.email === "sam@northwind.example")).id);
+    const viewer = clientFor(must(db().users.find((u) => u.email === "alex@northwind.example")).id);
+    const input = {
+      environment: "sandbox" as const,
+      kind: "anthropic" as const,
+      label: "Refused",
+      api_key: "sk-test-long-mock-0000-xx",
+    };
+    for (const client of [developer, viewer]) {
+      const error = await failure(client.modelConnections.create(northwind(), input));
+      expect(`${error.status} ${error.code}`).toBe("403 forbidden");
+    }
+    const before = db().audit.length;
+    const connection = await owner.modelConnections.create(northwind(), input);
+    const model = await owner.models.create(northwind(), {
+      connection_id: connection.id,
+      provider_model_id: "claude-sonnet-4-5",
+    });
+    await owner.models.update(northwind(), model.id, { name: "Renamed" });
+    await owner.models.delete(northwind(), model.id);
+    await owner.modelConnections.delete(northwind(), connection.id);
+    expect(
+      db()
+        .audit.slice(0, db().audit.length - before)
+        .map((e) => [e.action, e.environment]),
+    ).toEqual([
+      ["model_connection.deleted", "sandbox"],
+      ["model.deleted", "sandbox"],
+      ["model.updated", "sandbox"],
+      ["model.created", "sandbox"],
+      ["model_connection.created", "sandbox"],
+    ]);
   });
 });

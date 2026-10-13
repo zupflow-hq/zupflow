@@ -1,7 +1,7 @@
 //! Agents and grants through the API (decision 0040): any member reads them,
 //! developers and stricter change them, an API key acts in its own
 //! organization and environment; a grant names only tools its installation's
-//! registry holds and doesn't hold as gone; models come from the catalog.
+//! registry holds and doesn't hold as gone; an agent names no model yet.
 
 #![allow(clippy::unwrap_used)]
 
@@ -231,28 +231,23 @@ async fn create_agent(server: &Server, user: &str, org: &str, ws: &str, name: &s
         .send(
             call(user, Method::POST, agents_path(ws))
                 .naming(org)
-                .body(json!({ "name": name, "description": "", "model": "model-a", "instructions": "" })),
+                .body(json!({ "name": name, "description": "", "instructions": "" })),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     body["data"].clone()
 }
 
+/// The deployment-wide model list left the contract (decision 0050): models
+/// are each organization's own now.
 #[tokio::test]
-async fn lists_the_configured_models_to_any_caller() {
+async fn no_longer_lists_deployment_models() {
     let server = Server::new().await;
     let org = server.organization("alice", "northwind").await;
     let key = api_key(&server, "alice", &org, "sandbox").await;
-    for who in ["alice", "bob", key.as_str()] {
+    for who in ["alice", key.as_str()] {
         let (status, body) = server.send(call(who, Method::GET, "/v1/models")).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(
-            body["data"],
-            json!([
-                { "id": "model-a", "name": "Model A", "provider": "Example", "description": "The default." },
-                { "id": "model-b", "name": "Model B", "provider": "Example", "description": "" },
-            ])
-        );
+        assert_eq!((status, code(&body)), (StatusCode::NOT_FOUND, "not_found"), "{body}");
     }
 }
 
@@ -264,7 +259,7 @@ async fn creates_reads_changes_and_deletes_agents() {
     let ws = id(&server.workspace("alice", &org, "acme", "production").await).to_owned();
     let (status, body) = server
         .send(call("alice", Method::POST, agents_path(&ws)).naming(&org).body(json!({
-            "name": "  Publisher  ", "description": " Drafts posts. ", "model": "model-b", "instructions": "  Be brief.\n",
+            "name": "  Publisher  ", "description": " Drafts posts. ", "model_id": null, "instructions": "  Be brief.\n",
         })))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -276,14 +271,14 @@ async fn creates_reads_changes_and_deletes_agents() {
             &agent["workspace_id"],
             &agent["name"],
             &agent["description"],
-            &agent["model"],
+            &agent["model_id"],
             &agent["instructions"],
         ),
         (
             &json!(ws),
             &json!("Publisher"),
             &json!("Drafts posts."),
-            &json!("model-b"),
+            &Value::Null,
             &json!("  Be brief.\n"),
         ),
         "names and descriptions trimmed, instructions kept as written"
@@ -352,25 +347,17 @@ async fn checks_every_field_and_the_model() {
             .unwrap_or_default()
     };
     for (body, invalid) in [
-        (json!({}), vec!["description", "instructions", "model", "name"]),
+        (json!({}), vec!["description", "instructions", "name"]),
         (
-            json!({ "name": "   ", "description": "", "model": "model-a", "instructions": "" }),
+            json!({ "name": "   ", "description": "", "instructions": "" }),
             vec!["name"],
         ),
         (
-            json!({ "name": "x".repeat(61), "description": "d".repeat(281), "model": "model-a", "instructions": "i".repeat(20_001) }),
+            json!({ "name": "x".repeat(61), "description": "d".repeat(281), "instructions": "i".repeat(20_001) }),
             vec!["description", "instructions", "name"],
         ),
         (
-            json!({ "name": "A", "description": "", "model": "model-c", "instructions": "" }),
-            vec!["model"],
-        ),
-        (
-            json!({ "name": "A", "description": "", "model": " model-a", "instructions": "" }),
-            vec!["model"],
-        ),
-        (
-            json!({ "name": 1, "description": null, "model": "model-a", "instructions": "" }),
+            json!({ "name": 1, "description": null, "instructions": "" }),
             vec!["description", "name"],
         ),
     ] {
@@ -394,7 +381,6 @@ async fn checks_every_field_and_the_model() {
     let agent = create_agent(&server, "alice", &org, &ws, "Valid").await;
     let path = format!("{}/{}", agents_path(&ws), id(&agent));
     for (body, invalid) in [
-        (json!({ "model": "model-c" }), "model"),
         (json!({ "status": "archived" }), "status"),
         (json!({ "name": "" }), "name"),
     ] {
@@ -408,20 +394,53 @@ async fn checks_every_field_and_the_model() {
         );
     }
 
-    // With no models configured, no agent can be created, with the same refusal.
+    // No organization has models here yet: naming one is refused, on create
+    // and on change, and the agent keeps the environment's default.
+    let unknown =
+        json!({ "name": "A", "description": "", "instructions": "", "model_id": "mdl_0000000000000000000000" });
+    for (method, target, body) in [
+        (Method::POST, agents_path(&ws), unknown.clone()),
+        (
+            Method::PATCH,
+            path.clone(),
+            json!({ "model_id": "mdl_0000000000000000000000" }),
+        ),
+        (Method::PATCH, path.clone(), json!({ "model_id": "not-an-id" })),
+    ] {
+        let (status, answer) = server
+            .send(call("alice", method, &target).naming(&org).body(body.clone()))
+            .await;
+        assert_eq!(
+            (status, code(&answer), fields_of(&answer)),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unknown_model",
+                vec!["model_id".to_owned()]
+            ),
+            "{body}"
+        );
+    }
+    let (status, answer) = server
+        .send(
+            call("alice", Method::PATCH, &path)
+                .naming(&org)
+                .body(json!({ "model_id": null })),
+        )
+        .await;
+    assert_eq!((status, &answer["data"]["model_id"]), (StatusCode::OK, &Value::Null));
+
+    // With no deployment models, no agent could run: none is created.
     let mut state = server.state.clone();
     state.models = Arc::new(zupflow_basic::configured_models::ConfiguredModels::none());
     server.app = zupflow_server::app(state, RequestGuard::default());
-    let (status, models) = server.send(call("alice", Method::GET, "/v1/models")).await;
-    assert_eq!((status, &models["data"]), (StatusCode::OK, &json!([])));
     let (status, answer) = server
         .send(call("alice", Method::POST, agents_path(&ws)).naming(&org).body(json!({
-            "name": "A", "description": "", "model": "model-a", "instructions": "",
+            "name": "A", "description": "", "instructions": "",
         })))
         .await;
     assert_eq!(
-        (status, code(&answer), fields_of(&answer)),
-        (StatusCode::BAD_REQUEST, "validation_failed", vec!["model".to_owned()])
+        (status, code(&answer)),
+        (StatusCode::UNPROCESSABLE_ENTITY, "model_not_configured")
     );
 }
 
@@ -764,14 +783,14 @@ async fn keeps_agents_and_grants_to_their_organization_workspace_and_environment
     let other_key = api_key(&server, "riley", &other_org, "sandbox").await;
     let (status, created) = server
         .send(call(&sandbox_key, Method::POST, agents_path(&sandbox)).body(json!({
-            "name": "By a key", "description": "", "model": "model-a", "instructions": "",
+            "name": "By a key", "description": "", "instructions": "",
         })))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
     let (status, _) = server
         .send(
             call(&production_key, Method::POST, agents_path(&production)).body(json!({
-                "name": "Live", "description": "", "model": "model-a", "instructions": "",
+                "name": "Live", "description": "", "instructions": "",
             })),
         )
         .await;
@@ -810,7 +829,7 @@ async fn replays_a_created_agent_for_the_same_idempotency_key() {
         call("alice", Method::POST, agents_path(&ws))
             .naming(&org)
             .idempotent("agent-1")
-            .body(json!({ "name": "Once", "description": "", "model": "model-a", "instructions": "" }))
+            .body(json!({ "name": "Once", "description": "", "instructions": "" }))
     };
     let (first_status, first) = server.send(request()).await;
     let (again_status, again) = server.send(request()).await;

@@ -16,6 +16,8 @@ import {
   type CreatedApiKey,
   type CreatedWebhookEndpoint,
   type CreateGrantInput,
+  type CreateModelConnectionInput,
+  type CreateModelInput,
   type CreateOrganizationInput,
   type CreateRunInput,
   type CreateWebhookEndpointInput,
@@ -27,6 +29,9 @@ import {
   type Member,
   type MemberId,
   type MemberRole,
+  type ModelConnectionId,
+  type ModelId,
+  type ModelListQuery,
   type OrganizationId,
   type OrganizationRunListQuery,
   type RunEvent,
@@ -39,6 +44,7 @@ import {
   type UpdateConfigurationInput,
   type UpdateConnectSettingsInput,
   type UpdateGrantInput,
+  type UpdateModelConnectionInput,
   type UpdateOrganizationInput,
   type UpdateToolPolicyInput,
   type UpdateWebhookEndpointInput,
@@ -71,10 +77,6 @@ export const viewerQuery = {
 
 export function useViewer() {
   return useQuery(viewerQuery);
-}
-
-export function useModels() {
-  return useQuery({ queryKey: qk.models, queryFn: () => api.models.list(), staleTime: Infinity });
 }
 
 export function useCreateOrganization() {
@@ -492,6 +494,11 @@ export function useAgent(wsId: WorkspaceId, id: AgentId) {
   return useQuery({ queryKey: qk.agent(wsId, id), queryFn: () => api.agents.get(wsId, id) });
 }
 
+/** An agent's model choice changes models' agent counts, in whichever organization the workspace is. */
+const modelProviderQueries = {
+  predicate: (query: { queryKey: readonly unknown[] }) => query.queryKey[2] === "model-providers",
+};
+
 export function useCreateAgent(wsId: WorkspaceId) {
   const qc = useQueryClient();
   return useMutation({
@@ -499,6 +506,7 @@ export function useCreateAgent(wsId: WorkspaceId) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.workspace(wsId) });
       qc.invalidateQueries({ queryKey: qk.viewer });
+      qc.invalidateQueries({ queryKey: ["org"], ...modelProviderQueries });
     },
   });
 }
@@ -510,6 +518,7 @@ export function useUpdateAgent(wsId: WorkspaceId, id: AgentId) {
     onSuccess: (agent) => {
       qc.setQueryData(qk.agent(wsId, id), agent);
       qc.invalidateQueries({ queryKey: qk.agents(wsId), exact: true });
+      qc.invalidateQueries({ queryKey: ["org"], ...modelProviderQueries });
     },
   });
 }
@@ -521,6 +530,7 @@ export function useDeleteAgent(wsId: WorkspaceId) {
     onSuccess: (_, id) => {
       qc.removeQueries({ queryKey: qk.agent(wsId, id) });
       qc.invalidateQueries({ queryKey: qk.workspace(wsId) });
+      qc.invalidateQueries({ queryKey: ["org"], ...modelProviderQueries });
     },
   });
 }
@@ -663,6 +673,157 @@ export function useOrganizationRuns(orgId: OrganizationId, query: Omit<Organizat
     getNextPageParam: (last) => last.pagination.next_cursor,
     refetchInterval: (q) =>
       q.state.data?.pages[0]?.items.some((r) => !TERMINAL_RUN_STATUSES.includes(r.status)) ? 3000 : false,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Model providers: connections, the models added from them, and each
+// environment's default. Every key names the organization; every list names
+// the environment, so Sandbox and Production never mix.
+
+export function useModelConnections(orgId: OrganizationId, env: Environment) {
+  return useQuery({
+    queryKey: qk.modelConnections(orgId, env),
+    queryFn: () => api.modelConnections.list(orgId, { environment: env }),
+  });
+}
+
+export function useModelConnection(orgId: OrganizationId, id: ModelConnectionId) {
+  return useQuery({
+    queryKey: qk.modelConnection(orgId, id),
+    queryFn: () => api.modelConnections.get(orgId, id),
+  });
+}
+
+/** Refreshes connections, models and defaults together: each shows counts of the others. */
+function useInvalidateModelProviders(orgId: OrganizationId) {
+  const qc = useQueryClient();
+  return () => {
+    void qc.invalidateQueries({ queryKey: qk.modelProviders(orgId) });
+    void qc.invalidateQueries({ queryKey: qk.audit(orgId) });
+  };
+}
+
+export function useCreateModelConnection(orgId: OrganizationId) {
+  const invalidate = useInvalidateModelProviders(orgId);
+  return useMutation({
+    // The key leaves with the request. Its dialog resets the mutation on
+    // close, and with no observer left nothing keeps the request's variables;
+    // responses show only the key's last four.
+    gcTime: 0,
+    mutationFn: (input: CreateModelConnectionInput) => api.modelConnections.create(orgId, input),
+    onSuccess: invalidate,
+  });
+}
+
+export function useUpdateModelConnection(orgId: OrganizationId, id: ModelConnectionId) {
+  const invalidate = useInvalidateModelProviders(orgId);
+  return useMutation({
+    mutationFn: (input: UpdateModelConnectionInput) => api.modelConnections.update(orgId, id, input),
+    onSuccess: invalidate,
+  });
+}
+
+export function useReplaceModelConnectionKey(orgId: OrganizationId, id: ModelConnectionId) {
+  const invalidate = useInvalidateModelProviders(orgId);
+  return useMutation({
+    gcTime: 0,
+    mutationFn: (apiKey: string) => api.modelConnections.replaceKey(orgId, id, { api_key: apiKey }),
+    onSuccess: invalidate,
+  });
+}
+
+export function useDeleteModelConnection(orgId: OrganizationId) {
+  const qc = useQueryClient();
+  const invalidate = useInvalidateModelProviders(orgId);
+  return useMutation({
+    mutationFn: (id: ModelConnectionId) => api.modelConnections.delete(orgId, id),
+    onSuccess: (_, id) => {
+      qc.removeQueries({ queryKey: qk.modelConnection(orgId, id) });
+      invalidate();
+    },
+  });
+}
+
+/** The provider's models for this connection's key, searched on the server a page at a time. */
+export function useProviderModels(orgId: OrganizationId, id: ModelConnectionId, q: string, enabled = true) {
+  return useInfiniteQuery({
+    queryKey: qk.providerModels(orgId, id, q),
+    queryFn: ({ pageParam }) =>
+      api.modelConnections.providerModels(orgId, id, { q: q || undefined, cursor: pageParam ?? undefined }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.pagination.next_cursor,
+    placeholderData: (previous) => previous,
+    enabled,
+    retry: false,
+  });
+}
+
+/** Models, a page at a time, filtered on the server. */
+export function useModelList(orgId: OrganizationId, query: Omit<ModelListQuery, "cursor">) {
+  return useInfiniteQuery({
+    queryKey: qk.models(orgId, query),
+    queryFn: ({ pageParam }) => api.models.list(orgId, { ...query, cursor: pageParam ?? undefined }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.pagination.next_cursor,
+    placeholderData: (previous) => previous,
+  });
+}
+
+/** One page of models, searched on the server: pickers query as people type, never load them all. */
+export function useModelPage(orgId: OrganizationId, query: Omit<ModelListQuery, "cursor">, enabled = true) {
+  return useQuery({
+    queryKey: [...qk.models(orgId, query), "page"],
+    queryFn: () => api.models.list(orgId, query),
+    placeholderData: (previous) => previous,
+    enabled,
+  });
+}
+
+export function useModel(orgId: OrganizationId, id: ModelId | null) {
+  return useQuery({
+    queryKey: [...qk.modelProviders(orgId), "model", id ?? "none"],
+    queryFn: () => api.models.get(orgId, required(id)),
+    enabled: Boolean(id),
+  });
+}
+
+export function useCreateModel(orgId: OrganizationId) {
+  const invalidate = useInvalidateModelProviders(orgId);
+  return useMutation({
+    mutationFn: (input: CreateModelInput) => api.models.create(orgId, input),
+    onSuccess: invalidate,
+  });
+}
+
+export function useRenameModel(orgId: OrganizationId) {
+  const invalidate = useInvalidateModelProviders(orgId);
+  return useMutation({
+    mutationFn: ({ id, name }: { id: ModelId; name: string }) => api.models.update(orgId, id, { name }),
+    onSuccess: invalidate,
+  });
+}
+
+export function useDeleteModel(orgId: OrganizationId) {
+  const invalidate = useInvalidateModelProviders(orgId);
+  return useMutation({
+    mutationFn: (id: ModelId) => api.models.delete(orgId, id),
+    onSuccess: invalidate,
+  });
+}
+
+export function useDefaultModel(orgId: OrganizationId, env: Environment) {
+  return useQuery({
+    queryKey: qk.defaultModel(orgId, env),
+    queryFn: () => api.models.getDefault(orgId, env),
+  });
+}
+
+export function useSetDefaultModel(orgId: OrganizationId, env: Environment) {
+  const invalidate = useInvalidateModelProviders(orgId);
+  return useMutation({
+    mutationFn: (modelId: ModelId | null) => api.models.setDefault(orgId, env, { model_id: modelId }),
+    onSuccess: invalidate,
   });
 }
 

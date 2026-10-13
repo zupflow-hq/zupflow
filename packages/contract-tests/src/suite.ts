@@ -17,6 +17,7 @@ import {
   createHttpTransport,
   type InstallationId,
   type MemberId,
+  type ModelConnectionId,
   type OrganizationId,
   type UpdateAppInput,
   type UpdateInstallationInput,
@@ -105,8 +106,6 @@ export function contractSuite(target: Target) {
     /** A Console session naming `organization` in every request, whatever the persona belongs to. */
     const naming = (persona: Persona, organization: () => OrganizationId | null): ZupflowClient =>
       createClient(transportFor(persona, organization));
-    /** A model the server offers, rather than one the suite assumes. */
-    const anyModel = async () => must((await owner.models.list())[0], "model").id;
     /** A workspace of the reference organization, found by slug. */
     const workspaceBySlug = async (slug: string) =>
       must(
@@ -305,44 +304,27 @@ export function contractSuite(target: Target) {
           levels: [{ tool: "search_files", level: "allow" }],
         });
 
-        // Models, agents and their grants.
-        await owner.models.list();
-        const agent = must(
-          (await owner.agents.list(acme.id)).find((a) => a.status === "active"),
-          "active agent in acme",
-        );
-        const newAgent = await owner.agents.create(acme.id, {
-          name: "Contract",
-          description: "",
-          instructions: "Be brief.",
-          model: agent.model,
-        });
-        await owner.agents.get(acme.id, newAgent.id);
-        await owner.agents.update(acme.id, newAgent.id, { name: "Contract 2" });
-        const grant = must((await owner.grants.list(acme.id, agent.id))[0], "grant in acme");
-        await owner.grants.update(acme.id, agent.id, grant.id, {
+        // Grants, of an agent found through its runs.
+        const run = must((await owner.runs.list(acme.id)).items[0], "run in acme");
+        const grant = must((await owner.grants.list(acme.id, run.agent_id))[0], "grant of the agent of acme's run");
+        await owner.grants.update(acme.id, run.agent_id, grant.id, {
           tools: grant.tools,
           approval_required: grant.approval_required,
         });
-        // The new agent has no grants yet, so the existing grant's installation is free for it.
-        const newGrant = await owner.grants.create(acme.id, newAgent.id, {
+        // Revoked, then granted again: the same tools of the same installation.
+        await owner.grants.delete(acme.id, run.agent_id, grant.id);
+        await owner.grants.create(acme.id, run.agent_id, {
           installation_id: grant.installation_id,
-          tools: grant.tools.slice(0, 1),
-          approval_required: [],
+          tools: grant.tools,
+          approval_required: grant.approval_required,
         });
-        await owner.grants.delete(acme.id, newAgent.id, newGrant.id);
-        await owner.agents.delete(acme.id, newAgent.id);
 
         // Runs, then the rest of the API.
         await owner.organizationRuns.list(org, { environment: "production" });
-        const run = must((await owner.runs.list(acme.id)).items[0], "run in acme");
         await owner.runs.get(acme.id, run.id);
         await owner.runs.events(acme.id, run.id);
-        const sandboxAgent = must(
-          (await owner.agents.list(sandbox.id)).find((a) => a.status === "active"),
-          "active agent in acme-sandbox",
-        );
-        const started = await owner.runs.create(sandbox.id, sandboxAgent.id, { input: "Hello" });
+        const sandboxRun = must((await owner.runs.list(sandbox.id)).items[0], "run in acme-sandbox");
+        const started = await owner.runs.create(sandbox.id, sandboxRun.agent_id, { input: "Hello" });
         await owner.runs.cancel(sandbox.id, started.id);
         await owner.organizations.usage(org, "production");
 
@@ -364,6 +346,54 @@ export function contractSuite(target: Target) {
         await owner.webhooks.delete(org, hook.endpoint.id);
         await owner.audit.list(org);
         await owner.workspaces.delete(workspace.id);
+
+        // Agents, on the environment's default model.
+        await owner.agents.list(acme.id);
+        const agent = await owner.agents.create(sandbox.id, {
+          name: "Contract",
+          description: "",
+          instructions: "Be brief.",
+        });
+        await owner.agents.get(sandbox.id, agent.id);
+        await owner.agents.update(sandbox.id, agent.id, { name: "Contract 2", model_id: null });
+        await owner.agents.delete(sandbox.id, agent.id);
+
+        // Model providers last: a server may not serve them yet. Then an agent names a model of its own.
+        await owner.modelConnections.list(org, { environment: "sandbox" });
+        const connection = await owner.modelConnections.create(org, {
+          environment: "sandbox",
+          kind: "openai",
+          label: "Contract",
+          api_key: "sk-test-long-contract-0001-xx",
+        });
+        await owner.modelConnections.get(org, connection.id);
+        await owner.modelConnections.update(org, connection.id, { label: "Contract 2" });
+        await owner.modelConnections.replaceKey(org, connection.id, { api_key: "sk-test-long-contract-0002-xx" });
+        const offered = must(
+          (await owner.modelConnections.providerModels(org, connection.id, { limit: 100 })).items.find(
+            (m) => m.supports_tools,
+          ),
+          "a model that calls tools",
+        );
+        const model = await owner.models.create(org, {
+          connection_id: connection.id,
+          provider_model_id: offered.provider_model_id,
+        });
+        await owner.models.list(org, { environment: "sandbox" });
+        await owner.models.get(org, model.id);
+        await owner.models.update(org, model.id, { name: "Contract model" });
+        const previous = await owner.models.getDefault(org, "sandbox");
+        await owner.models.setDefault(org, "sandbox", { model_id: model.id });
+        await owner.models.setDefault(org, "sandbox", { model_id: previous.model?.id ?? null });
+        const modelled = await owner.agents.create(sandbox.id, {
+          name: "Contract model user",
+          description: "",
+          instructions: "Be brief.",
+          model_id: model.id,
+        });
+        await owner.agents.delete(sandbox.id, modelled.id);
+        await owner.models.delete(org, model.id);
+        await owner.modelConnections.delete(org, connection.id);
       }
     });
 
@@ -1731,7 +1761,6 @@ export function contractSuite(target: Target) {
         const agent = await owner.agents.create(qa, {
           name: "Probe",
           description: "",
-          model: await anyModel(),
           instructions: "",
         });
         const installation = must(
@@ -1790,7 +1819,6 @@ export function contractSuite(target: Target) {
         const agent = await developer.agents.create(sandbox, {
           name: "Registry probe",
           description: "",
-          model: await anyModel(),
           instructions: "",
         });
         const goneGrant = await failure(
@@ -1866,11 +1894,9 @@ export function contractSuite(target: Target) {
           ),
           "current tool",
         ).name;
-        const model = await anyModel();
         const agent = await owner.agents.create(sandbox, {
           name: "Short-lived",
           description: "",
-          model,
           instructions: "",
         });
         await owner.grants.create(sandbox, agent.id, {
@@ -1889,7 +1915,7 @@ export function contractSuite(target: Target) {
           (await owner.installations.list(qa)).find((i) => i.status === "connected" && i.app.id === fx.apps.echoServer),
           "connected installation of echo_server in qa-playground",
         );
-        const kept = await owner.agents.create(qa, { name: "Kept", description: "", model, instructions: "" });
+        const kept = await owner.agents.create(qa, { name: "Kept", description: "", instructions: "" });
         await owner.grants.create(qa, kept.id, { installation_id: echo.id, tools: ["echo"], approval_required: [] });
         expect((await owner.agents.get(qa, kept.id)).grant_count).toBe(1);
         await owner.installations.delete(qa, echo.id);
@@ -1931,34 +1957,74 @@ export function contractSuite(target: Target) {
         expect(await owner.grants.list(acme, agent.id)).toContainEqual(grant);
       });
 
-      it("creates and changes agents only with a model the server offers", async () => {
+      it("creates agents on the environment's default, and refuses a model that names nothing", async () => {
         const qa = fx.workspaces.qaPlayground.id;
-        const models = await owner.models.list();
-        expect(models.length).toBeGreaterThan(0);
-        const input = { name: "  Modelled  ", description: "", model: "not-a-model", instructions: "" };
-        const refused = await failure(owner.agents.create(qa, input));
+        const input = { name: "  Defaulted  ", description: "", instructions: "" };
+        const refused = await failure(owner.agents.create(qa, { ...input, model_id: "mdl_0000000000000000000000" }));
         expect([refused.status, refused.code, Object.keys(refused.fields ?? {})]).toEqual([
-          400,
-          "validation_failed",
-          ["model"],
+          422,
+          "unknown_model",
+          ["model_id"],
         ]);
-        const agent = await owner.agents.create(qa, { ...input, model: must(models[0], "model").id });
-        expect([agent.name, agent.status, agent.grant_count, agent.runs_last_24h, agent.last_run_at]).toEqual([
-          "Modelled",
+        const agent = await owner.agents.create(qa, { ...input, model_id: null });
+        expect([agent.name, agent.model_id, agent.status, agent.grant_count, agent.last_run_at]).toEqual([
+          "Defaulted",
+          null,
           "active",
-          0,
           0,
           null,
         ]);
-        const change = await failure(owner.agents.update(qa, agent.id, { model: "not-a-model" }));
-        expect([change.status, change.code, Object.keys(change.fields ?? {})]).toEqual([
-          400,
-          "validation_failed",
-          ["model"],
-        ]);
+        const change = await failure(owner.agents.update(qa, agent.id, { model_id: "mdl_0000000000000000000000" }));
+        expect([change.status, change.code]).toEqual([422, "unknown_model"]);
         const paused = await owner.agents.update(qa, agent.id, { status: "paused" });
-        expect([paused.status, paused.model, paused.name]).toEqual(["paused", agent.model, "Modelled"]);
+        expect([paused.status, paused.model_id, paused.name]).toEqual(["paused", null, "Defaulted"]);
         expect((await owner.agents.list(qa)).find((a) => a.id === agent.id)).toEqual(paused);
+      });
+
+      it("creates and changes agents only with a model of their organization and environment", async () => {
+        const qa = fx.workspaces.qaPlayground.id;
+        const sandboxModel = must(
+          (await owner.models.list(fx.organization, { environment: "sandbox", limit: 1 })).items[0],
+          "Sandbox model",
+        );
+        const productionModel = must(
+          (await owner.models.list(fx.organization, { environment: "production", limit: 1 })).items[0],
+          "Production model",
+        );
+        const foreignModel = must(
+          (await as("outsider").models.list(fx.otherOrganization, { limit: 1 })).items[0],
+          "the other organization's model",
+        );
+        const input = { name: "  Modelled  ", description: "", instructions: "" };
+        // The other environment's model, another organization's, and an ID that names nothing: one answer.
+        for (const model_id of [productionModel.id, foreignModel.id, "mdl_0000000000000000000000" as const]) {
+          const refused = await failure(owner.agents.create(qa, { ...input, model_id }));
+          expect([refused.status, refused.code, Object.keys(refused.fields ?? {})], model_id).toEqual([
+            422,
+            "unknown_model",
+            ["model_id"],
+          ]);
+        }
+        const agent = await owner.agents.create(qa, input);
+        expect([agent.name, agent.model_id, agent.status, agent.grant_count, agent.last_run_at]).toEqual([
+          "Modelled",
+          null,
+          "active",
+          0,
+          null,
+        ]);
+        const chosen = await owner.agents.update(qa, agent.id, { model_id: sandboxModel.id });
+        expect(chosen.model_id).toBe(sandboxModel.id);
+        expect((await owner.models.get(fx.organization, sandboxModel.id)).agent_count).toBe(
+          sandboxModel.agent_count + 1,
+        );
+        const change = await failure(owner.agents.update(qa, agent.id, { model_id: productionModel.id }));
+        expect([change.status, change.code]).toEqual([422, "unknown_model"]);
+        // Omitted keeps the model; null goes back to the default.
+        const paused = await owner.agents.update(qa, agent.id, { status: "paused" });
+        expect([paused.status, paused.model_id, paused.name]).toEqual(["paused", sandboxModel.id, "Modelled"]);
+        expect((await owner.agents.list(qa)).find((a) => a.id === agent.id)).toEqual(paused);
+        expect((await owner.agents.update(qa, agent.id, { model_id: null })).model_id).toBeNull();
       });
 
       it("does not read another workspace's run through this workspace's path", async () => {
@@ -1971,7 +2037,6 @@ export function contractSuite(target: Target) {
         const agent = await owner.agents.create(qa, {
           name: "Paused",
           description: "",
-          model: await anyModel(),
           instructions: "",
         });
         await owner.agents.update(qa, agent.id, { status: "paused" });
@@ -2159,7 +2224,6 @@ export function contractSuite(target: Target) {
         owner.agents.create(workspace, {
           name: "Policy probe",
           description: "",
-          model: await anyModel(),
           instructions: "",
         });
       const refusal = async (promise: Promise<unknown>) => {
@@ -2594,7 +2658,7 @@ export function contractSuite(target: Target) {
           expect(listed).toEqual([key]);
           expect(JSON.stringify(listed).includes(secret)).toBe(false);
           expect(JSON.stringify(listed).includes("secret_hash")).toBe(false);
-          await withKey(secret).models.list();
+          await withKey(secret).toolPolicy.get(fx.organization);
           const used = must(
             (await owner.apiKeys.list(fx.organization)).find((row) => row.id === key.id),
             "used key",
@@ -2611,7 +2675,7 @@ export function contractSuite(target: Target) {
           for (const bearer of [secret, changed, `zf_${label}_`]) {
             const client = withKey(bearer);
             for (const attempt of [
-              () => client.models.list(),
+              () => client.toolPolicy.get(fx.organization),
               () => client.me.get(),
               () => client.workspaces.list(fx.organization),
             ]) {
@@ -2850,7 +2914,6 @@ export function contractSuite(target: Target) {
             name: "Backend agent",
             description: "",
             instructions: "",
-            model: await anyModel(),
           });
           const run = await client.runs.create(workspace.id, agent.id, { input: "Hello" });
           expect(run).toMatchObject({ workspace_id: workspace.id, trigger: "api" });
@@ -2888,7 +2951,7 @@ export function contractSuite(target: Target) {
         const a = withKey(first.secret);
         const b = withKey(second.secret);
         const workspace = fx.workspaces.qaPlayground.id;
-        const input = { name: "Same request", description: "", instructions: "", model: await anyModel() };
+        const input = { name: "Same request", description: "", instructions: "" };
         const options = { idempotencyKey: "shared-by-credentials" };
         const own = await a.agents.create(workspace, input, options);
         expect(await a.agents.create(workspace, input, options)).toEqual(own);
@@ -3008,7 +3071,6 @@ export function contractSuite(target: Target) {
         name,
         description: "",
         instructions: "Be brief.",
-        model: await anyModel(),
       });
 
       it("replays a repeated POST instead of running it twice", async () => {
@@ -3155,6 +3217,328 @@ export function contractSuite(target: Target) {
       });
     });
 
+    describe("model providers", () => {
+      const org = () => fx.organization;
+      /** A fresh Sandbox connection, so a case never depends on the fixture's own. */
+      const connect = (
+        kind: "openai" | "anthropic" | "openrouter" = "openrouter",
+        api_key = "sk-test-long-suite-0000-xx",
+      ) => owner.modelConnections.create(org(), { environment: "sandbox", kind, label: "Suite", api_key });
+      const toolModel = async (connectionId: ModelConnectionId) =>
+        must(
+          (await owner.modelConnections.providerModels(org(), connectionId, { limit: 100 })).items.find(
+            (m) => m.supports_tools,
+          ),
+          "a model that calls tools",
+        );
+      const firstModel = async (environment: "sandbox" | "production") =>
+        must((await owner.models.list(org(), { environment, limit: 1 })).items[0], `${environment} model`);
+
+      it("connects a provider in one environment, and never shows its key", async () => {
+        const secret = "sk-suite-first-key-7Qx9";
+        const created = await owner.modelConnections.create(org(), {
+          environment: "sandbox",
+          kind: "openrouter",
+          label: "  Suite  ",
+          api_key: secret,
+        });
+        expect(created).toMatchObject({
+          organization_id: org(),
+          environment: "sandbox",
+          kind: "openrouter",
+          label: "Suite",
+          status: "active",
+          key_version: 1,
+          model_count: 0,
+          api_key: { set: true, last4: "7Qx9" },
+        });
+        const sandbox = await owner.modelConnections.list(org(), { environment: "sandbox" });
+        expect(sandbox.map((c) => c.id)).toContain(created.id);
+        expect(sandbox.every((c) => c.environment === "sandbox")).toBe(true);
+        const production = await owner.modelConnections.list(org(), { environment: "production" });
+        expect(production.map((c) => c.id)).not.toContain(created.id);
+        expect(production.every((c) => c.environment === "production")).toBe(true);
+        const second = "sk-suite-second-K2pa";
+        const replaced = await owner.modelConnections.replaceKey(org(), created.id, { api_key: second });
+        expect([replaced.key_version, replaced.api_key.last4, replaced.status]).toEqual([2, "K2pa", "active"]);
+        const renamed = await owner.modelConnections.update(org(), created.id, { label: "Suite 2" });
+        expect([renamed.label, renamed.key_version]).toEqual(["Suite 2", 2]);
+        const everything = JSON.stringify([
+          created,
+          replaced,
+          renamed,
+          await owner.modelConnections.get(org(), created.id),
+          await owner.modelConnections.list(org()),
+          await owner.audit.list(org(), { limit: 100 }),
+        ]);
+        expect(everything.includes(secret)).toBe(false);
+        expect(everything.includes(second)).toBe(false);
+      });
+
+      it("refuses a key the provider refuses, and keeps the key it had", async () => {
+        const before = await owner.modelConnections.list(org());
+        const submitted = "sk-test-long-invalid-0000";
+        const refused = await failure(connect("openai", submitted));
+        expect([refused.status, refused.code, Object.keys(refused.fields ?? {})]).toEqual([
+          422,
+          "invalid_api_key",
+          ["api_key"],
+        ]);
+        // The refusal never repeats the key: not in its message, nor in a field's.
+        expect(JSON.stringify({ ...refused, message: refused.message }).includes(submitted)).toBe(false);
+        expect(await owner.modelConnections.list(org())).toEqual(before);
+        const connection = await connect("openai", "sk-suite-kept-key-Ab12");
+        const kept = await failure(
+          owner.modelConnections.replaceKey(org(), connection.id, { api_key: "sk-test-long-invalid-1111-xx" }),
+        );
+        expect([kept.status, kept.code]).toEqual([422, "invalid_api_key"]);
+        expect(JSON.stringify({ ...kept, message: kept.message }).includes("sk-test-long-invalid-1111-xx")).toBe(false);
+        expect(await owner.modelConnections.get(org(), connection.id)).toEqual(connection);
+      });
+
+      it("searches the provider's models on the server, a page at a time", async () => {
+        const connection = await connect();
+        const all = (await owner.modelConnections.providerModels(org(), connection.id, { limit: 100 })).items;
+        expect(all.length).toBeGreaterThan(1);
+        expect(all.every((m) => m.added_model_id === null)).toBe(true);
+        const first = await owner.modelConnections.providerModels(org(), connection.id, { limit: 1 });
+        expect(first.items).toEqual(all.slice(0, 1));
+        const next = await owner.modelConnections.providerModels(org(), connection.id, {
+          limit: 1,
+          cursor: must(first.pagination.next_cursor, "next page"),
+        });
+        expect(next.items).toEqual(all.slice(1, 2));
+        const name = must(all[1], "second model").name;
+        const found = (await owner.modelConnections.providerModels(org(), connection.id, { q: name, limit: 100 }))
+          .items;
+        expect(found.map((m) => m.provider_model_id)).toContain(must(all[1], "second model").provider_model_id);
+        expect(found.length).toBeLessThan(all.length);
+        const offered = await toolModel(connection.id);
+        const model = await owner.models.create(org(), {
+          connection_id: connection.id,
+          provider_model_id: offered.provider_model_id,
+        });
+        const listed = (await owner.modelConnections.providerModels(org(), connection.id, { limit: 100 })).items;
+        expect(listed.find((m) => m.provider_model_id === offered.provider_model_id)?.added_model_id).toBe(model.id);
+      });
+
+      it("adds a model once per connection, from what the provider lists, and only one that calls tools", async () => {
+        const connection = await connect();
+        const offered = await toolModel(connection.id);
+        const model = await owner.models.create(org(), {
+          connection_id: connection.id,
+          provider_model_id: offered.provider_model_id,
+        });
+        expect(model).toMatchObject({
+          organization_id: org(),
+          environment: "sandbox",
+          route: { connection_id: connection.id, kind: connection.kind, label: connection.label },
+          provider_model_id: offered.provider_model_id,
+          name: offered.name,
+          author: offered.author,
+          supports_tools: true,
+          status: "available",
+          is_default: false,
+          agent_count: 0,
+        });
+        expect((await owner.modelConnections.get(org(), connection.id)).model_count).toBe(1);
+        const again = await failure(
+          owner.models.create(org(), { connection_id: connection.id, provider_model_id: offered.provider_model_id }),
+        );
+        expect([again.status, again.code]).toEqual([409, "model_exists"]);
+        const unknown = await failure(
+          owner.models.create(org(), { connection_id: connection.id, provider_model_id: "no-such-model" }),
+        );
+        expect([unknown.status, unknown.code, Object.keys(unknown.fields ?? {})]).toEqual([
+          422,
+          "unknown_provider_model",
+          ["provider_model_id"],
+        ]);
+        // The reference fixture's OpenRouter lists a model that can't call tools.
+        const toolless = must(
+          (await owner.modelConnections.providerModels(org(), connection.id, { limit: 100 })).items.find(
+            (m) => !m.supports_tools,
+          ),
+          "a listed model that can't call tools",
+        );
+        const refused = await failure(
+          owner.models.create(org(), { connection_id: connection.id, provider_model_id: toolless.provider_model_id }),
+        );
+        expect([refused.status, refused.code]).toEqual([422, "tools_unsupported"]);
+        // The route is the model's identity: the same provider model through another connection is another model.
+        const other = await connect();
+        const twin = await owner.models.create(org(), {
+          connection_id: other.id,
+          provider_model_id: offered.provider_model_id,
+        });
+        expect(twin.id).not.toBe(model.id);
+        expect(twin.route.connection_id).toBe(other.id);
+        const renamed = await owner.models.update(org(), model.id, { name: "Suite model" });
+        expect(renamed.name).toBe("Suite model");
+        const mine = await owner.models.list(org(), { connection_id: connection.id });
+        expect(mine.items.map((m) => m.id)).toEqual([model.id]);
+        expect((await owner.models.list(org(), { q: "Suite model" })).items.map((m) => m.id)).toContain(model.id);
+      });
+
+      it("keeps each environment's default to its own models", async () => {
+        const sandbox = await firstModel("sandbox");
+        const production = await firstModel("production");
+        const foreign = must(
+          (await as("outsider").models.list(fx.otherOrganization, { limit: 1 })).items[0],
+          "the other organization's model",
+        );
+        const productionDefault = await owner.models.getDefault(org(), "production");
+        for (const model_id of [production.id, foreign.id]) {
+          const refused = await failure(owner.models.setDefault(org(), "sandbox", { model_id }));
+          expect([refused.status, refused.code, Object.keys(refused.fields ?? {})]).toEqual([
+            422,
+            "unknown_model",
+            ["model_id"],
+          ]);
+        }
+        const chosen = await owner.models.setDefault(org(), "sandbox", { model_id: sandbox.id });
+        expect([chosen.environment, chosen.model?.id, chosen.model?.is_default]).toEqual(["sandbox", sandbox.id, true]);
+        expect(chosen.updated_at).not.toBeNull();
+        expect(await owner.models.getDefault(org(), "sandbox")).toEqual(chosen);
+        expect(await owner.models.getDefault(org(), "production")).toEqual(productionDefault);
+        const cleared = await owner.models.setDefault(org(), "sandbox", { model_id: null });
+        expect(cleared.model).toBeNull();
+      });
+
+      it("refuses a run with neither the agent's model nor a default, and never picks one", async () => {
+        const qa = fx.workspaces.qaPlayground.id;
+        const agent = await owner.agents.create(qa, { name: "Unmodelled", description: "", instructions: "" });
+        await owner.models.setDefault(org(), "sandbox", { model_id: null });
+        const refused = await failure(owner.runs.create(qa, agent.id, { input: "hi" }));
+        expect([refused.status, refused.code]).toEqual([422, "model_not_configured"]);
+        expect((await owner.runs.list(qa, { agent_id: agent.id })).items).toEqual([]);
+        // An override is enough, and so is a default.
+        const model = await firstModel("sandbox");
+        await owner.agents.update(qa, agent.id, { model_id: model.id });
+        await owner.runs.cancel(qa, (await owner.runs.create(qa, agent.id, { input: "hi" })).id);
+        await owner.agents.update(qa, agent.id, { model_id: null });
+        await owner.models.setDefault(org(), "sandbox", { model_id: model.id });
+        await owner.runs.cancel(qa, (await owner.runs.create(qa, agent.id, { input: "hi" })).id);
+      });
+
+      it("refuses removing a model or a connection in use, naming what holds it", async () => {
+        const qa = fx.workspaces.qaPlayground.id;
+        const connection = await connect();
+        const offered = await toolModel(connection.id);
+        const model = await owner.models.create(org(), {
+          connection_id: connection.id,
+          provider_model_id: offered.provider_model_id,
+        });
+        const agent = await owner.agents.create(qa, {
+          name: "Holds the model",
+          description: "",
+          instructions: "",
+          model_id: model.id,
+        });
+        expect((await owner.models.get(org(), model.id)).agent_count).toBe(1);
+        for (const remove of [
+          () => owner.models.delete(org(), model.id),
+          () => owner.modelConnections.delete(org(), connection.id),
+        ]) {
+          const held = await failure(remove());
+          expect([held.status, held.code]).toEqual([409, "model_in_use"]);
+          expect(held.message).toContain("Holds the model");
+        }
+        await owner.agents.update(qa, agent.id, { model_id: null });
+        const previous = await owner.models.getDefault(org(), "sandbox");
+        await owner.models.setDefault(org(), "sandbox", { model_id: model.id });
+        const asDefault = await failure(owner.models.delete(org(), model.id));
+        expect([asDefault.status, asDefault.code]).toEqual([409, "model_in_use"]);
+        expect(asDefault.message).toContain(model.name);
+        await owner.models.setDefault(org(), "sandbox", { model_id: previous.model?.id ?? null });
+        // Free again: deleting the connection takes its models with it.
+        await owner.modelConnections.delete(org(), connection.id);
+        const gone = await failure(owner.models.get(org(), model.id));
+        expect(`${gone.status} ${gone.code}`).toBe("404 not_found");
+        expect((await owner.models.list(org(), { connection_id: connection.id })).items).toEqual([]);
+        const missing = await failure(owner.modelConnections.get(org(), connection.id));
+        expect(`${missing.status} ${missing.code}`).toBe("404 not_found");
+      });
+
+      it("keeps one organization's models out of another's agents and defaults", async () => {
+        const outsider = as("outsider");
+        const model = await firstModel("sandbox");
+        const connection = must(
+          (await owner.modelConnections.list(org(), { environment: "sandbox" }))[0],
+          "connection",
+        );
+        for (const attempt of [
+          () => outsider.models.get(fx.otherOrganization, model.id),
+          () => outsider.models.update(fx.otherOrganization, model.id, { name: "Owned" }),
+          () => outsider.modelConnections.get(fx.otherOrganization, connection.id),
+          () =>
+            outsider.models.create(fx.otherOrganization, {
+              connection_id: connection.id,
+              provider_model_id: model.provider_model_id,
+            }),
+        ]) {
+          const error = await failure(attempt());
+          expect(`${error.status} ${error.code}`).toBe("404 not_found");
+        }
+        const harbor = must(
+          (await outsider.workspaces.list(fx.otherOrganization, { environment: "sandbox", limit: 100 })).items[0],
+          "the other organization's Sandbox workspace",
+        );
+        const agent = await failure(
+          outsider.agents.create(harbor.id, { name: "x", description: "", instructions: "", model_id: model.id }),
+        );
+        expect([agent.status, agent.code]).toEqual([422, "unknown_model"]);
+        const fallback = await failure(
+          outsider.models.setDefault(fx.otherOrganization, "sandbox", { model_id: model.id }),
+        );
+        expect([fallback.status, fallback.code]).toEqual([422, "unknown_model"]);
+        expect(JSON.stringify(await outsider.models.list(fx.otherOrganization, { limit: 100 }))).not.toContain(
+          model.id,
+        );
+      });
+
+      it("binds an API key to its own environment's connections, models and default", async () => {
+        const { secret } = await owner.apiKeys.create(org(), { name: "Models", environment: "sandbox" });
+        const key = withKey(secret);
+        const production = await firstModel("production");
+        const productionConnection = production.route.connection_id;
+        expect((await key.modelConnections.list(org())).every((c) => c.environment === "sandbox")).toBe(true);
+        expect((await key.models.list(org(), { limit: 100 })).items.every((m) => m.environment === "sandbox")).toBe(
+          true,
+        );
+        for (const attempt of [
+          () => key.modelConnections.get(org(), productionConnection),
+          () => key.modelConnections.providerModels(org(), productionConnection),
+          () => key.models.get(org(), production.id),
+          () => key.models.delete(org(), production.id),
+        ]) {
+          const error = await failure(attempt());
+          expect(`${error.status} ${error.code}`).toBe("404 not_found");
+        }
+        for (const attempt of [
+          () => key.modelConnections.list(org(), { environment: "production" }),
+          () => key.models.getDefault(org(), "production"),
+          () =>
+            key.modelConnections.create(org(), {
+              environment: "production",
+              kind: "openai",
+              label: "x",
+              api_key: "sk-test-long-suite-0000-xx",
+            }),
+        ]) {
+          const error = await failure(attempt());
+          expect(`${error.status} ${error.code}`).toBe("422 environment_mismatch");
+        }
+        const own = await key.modelConnections.create(org(), {
+          environment: "sandbox",
+          kind: "anthropic",
+          label: "From a key",
+          api_key: "sk-test-long-suite-key-0000-xx",
+        });
+        expect(own.environment).toBe("sandbox");
+      });
+    });
+
     describe("the viewer role", () => {
       it("reads what a developer reads", async () => {
         const reads = (c: ZupflowClient) => async () => {
@@ -3188,6 +3572,10 @@ export function contractSuite(target: Target) {
               settled(c.workspaceApps.list(acme)),
               settled(c.workspaceApps.available(fx.workspaces.acmeSandbox.id)),
               settled(c.apiKeys.list(fx.organization)),
+              // Model providers where the target serves them; left out, not the whole case, otherwise.
+              ...(serves("listModelConnections") ? [settled(c.modelConnections.list(fx.organization))] : []),
+              ...(serves("listModels") ? [settled(c.models.list(fx.organization, { limit: 100 }))] : []),
+              ...(serves("getDefaultModel") ? [settled(c.models.getDefault(fx.organization, "sandbox"))] : []),
               settled(c.webhooks.list(fx.organization)),
               settled(c.connectSettings.get(fx.organization, "sandbox")),
               settled(c.toolPolicy.get(fx.organization)),
@@ -3208,9 +3596,12 @@ export function contractSuite(target: Target) {
       const changesBy = (c: ZupflowClient, t: Tenant, sandboxKey: ApiKeyId): [string, () => Promise<unknown>][] => {
         const w = t.workspace.id;
         const sandbox = t.sandbox.id;
-        const agentInput = { name: "x", description: "", instructions: "", model: t.agent.model };
+        const agentInput = { name: "x", description: "", instructions: "", model_id: t.agent.model_id };
         const app = { kind: "mcp", name: "x", key: "viewer_x", description: "", auth_type: "token" } as const;
-        return [
+        // Read only by the model provider changes, which are dropped when the target doesn't serve them.
+        const connection = () => must(t.connection, "model connection");
+        const model = () => must(t.model, "model");
+        const changes: [string, () => Promise<unknown>][] = [
           ["updateOrganization", () => c.organizations.update(t.org, { name: "Viewed" })],
           ["inviteMember", () => c.members.invite(t.org, { email: "v@northwind.example", role: "developer" })],
           ["updateMember", () => c.members.update(t.org, t.member.id, { role: "viewer" })],
@@ -3291,6 +3682,30 @@ export function contractSuite(target: Target) {
             "updateConnectSettings",
             () => c.connectSettings.update(t.org, "sandbox", { return_urls: [], allowed_origins: [] }),
           ],
+          [
+            "createModelConnection",
+            () =>
+              c.modelConnections.create(t.org, {
+                environment: "sandbox",
+                kind: "anthropic",
+                label: "x",
+                api_key: "sk-test-long-viewer-0000-xx",
+              }),
+          ],
+          ["updateModelConnection", () => c.modelConnections.update(t.org, connection().id, { label: "Viewed" })],
+          [
+            "replaceModelConnectionKey",
+            () => c.modelConnections.replaceKey(t.org, connection().id, { api_key: "sk-test-long-viewer-0000-xx" }),
+          ],
+          [
+            "createModel",
+            () =>
+              c.models.create(t.org, { connection_id: connection().id, provider_model_id: model().provider_model_id }),
+          ],
+          ["updateModel", () => c.models.update(t.org, model().id, { name: "Viewed" })],
+          ["updateDefaultModel", () => c.models.setDefault(t.org, model().environment, { model_id: null })],
+          ["deleteModel", () => c.models.delete(t.org, model().id)],
+          ["deleteModelConnection", () => c.modelConnections.delete(t.org, connection().id)],
           ["createApiKey", () => c.apiKeys.create(t.org, { name: "x", environment: "sandbox" })],
           ["revokeApiKey", () => c.apiKeys.revoke(t.org, sandboxKey)],
           [
@@ -3318,6 +3733,8 @@ export function contractSuite(target: Target) {
             },
           ],
         ];
+        // What the target doesn't serve yet is left out, not the whole sweep.
+        return changes.filter(([operationId]) => serves(operationId));
       };
 
       /**
@@ -3328,7 +3745,8 @@ export function contractSuite(target: Target) {
       /** Every change a Console member could make: the route table's, minus the person's own. */
       const MUTATING = routes
         .filter((r) => r.method !== "get" && r.callers.includes("console") && !OWN_CHANGES.has(r.operationId))
-        .map((r) => r.operationId);
+        .map((r) => r.operationId)
+        .filter(serves);
       /** A Sandbox key, so a developer's revoke isn't refused for being Production's. */
       const sandboxKey = async () =>
         (await owner.apiKeys.create(fx.organization, { name: "Revocable", environment: "sandbox" })).key.id;
@@ -3368,6 +3786,14 @@ export function contractSuite(target: Target) {
           "updateToolPolicy",
           "updateAppToolLevels",
           "updateConnectSettings",
+          "createModelConnection",
+          "updateModelConnection",
+          "replaceModelConnectionKey",
+          "deleteModelConnection",
+          "createModel",
+          "updateModel",
+          "deleteModel",
+          "updateDefaultModel",
           "createWebhook",
           "updateWebhook",
           "rollWebhookSecret",
@@ -3407,7 +3833,7 @@ export function contractSuite(target: Target) {
         expect((await owner.members.update(fx.organization, developer.id, { role: "viewer" })).role).toBe("viewer");
         const qa = fx.workspaces.qaPlayground.id;
         const error = await failure(
-          as("developer").agents.create(qa, { name: "x", description: "", instructions: "", model: await anyModel() }),
+          as("developer").agents.create(qa, { name: "x", description: "", instructions: "" }),
         );
         expect(`${error.status} ${error.code}`).toBe("403 forbidden");
       });

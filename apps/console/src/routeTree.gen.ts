@@ -21,6 +21,7 @@ import { Route as AuthedOrgAppsRouteImport } from "./routes/_authed/$org/apps"
 import { Route as AuthedOrgAuditLogRouteImport } from "./routes/_authed/$org/audit-log"
 import { Route as AuthedOrgConnectRouteImport } from "./routes/_authed/$org/connect"
 import { Route as AuthedOrgMembersRouteImport } from "./routes/_authed/$org/members"
+import { Route as AuthedOrgModelProvidersRouteImport } from "./routes/_authed/$org/model-providers"
 import { Route as AuthedOrgRunsRouteImport } from "./routes/_authed/$org/runs"
 import { Route as AuthedOrgSettingsRouteImport } from "./routes/_authed/$org/settings"
 import { Route as AuthedOrgWebhooksRouteImport } from "./routes/_authed/$org/webhooks"
@@ -29,6 +30,8 @@ import { Route as ConnectReferenceIndexRouteImport } from "./routes/connect/$ref
 import { Route as ConnectReferenceSimulatedConsentRouteImport } from "./routes/connect/$reference/simulated-consent"
 import { Route as AuthedOrgAppsIndexRouteImport } from "./routes/_authed/$org/apps/index"
 import { Route as AuthedOrgAppsAppIdRouteImport } from "./routes/_authed/$org/apps/$appId"
+import { Route as AuthedOrgModelProvidersIndexRouteImport } from "./routes/_authed/$org/model-providers/index"
+import { Route as AuthedOrgModelProvidersConnectionIdRouteImport } from "./routes/_authed/$org/model-providers/$connectionId"
 import { Route as AuthedOrgWWsRouteImport } from "./routes/_authed/$org/w/$ws"
 import { Route as AuthedOrgWebhooksIndexRouteImport } from "./routes/_authed/$org/webhooks/index"
 import { Route as AuthedOrgWebhooksHookIdRouteImport } from "./routes/_authed/$org/webhooks/$hookId"
@@ -107,6 +110,11 @@ const AuthedOrgMembersRoute = AuthedOrgMembersRouteImport.update({
   path: "/members",
   getParentRoute: () => AuthedOrgRoute,
 } as any)
+const AuthedOrgModelProvidersRoute = AuthedOrgModelProvidersRouteImport.update({
+  id: "/model-providers",
+  path: "/model-providers",
+  getParentRoute: () => AuthedOrgRoute,
+} as any)
 const AuthedOrgRunsRoute = AuthedOrgRunsRouteImport.update({
   id: "/runs",
   path: "/runs",
@@ -148,6 +156,18 @@ const AuthedOrgAppsAppIdRoute = AuthedOrgAppsAppIdRouteImport.update({
   path: "/$appId",
   getParentRoute: () => AuthedOrgAppsRoute,
 } as any)
+const AuthedOrgModelProvidersIndexRoute =
+  AuthedOrgModelProvidersIndexRouteImport.update({
+    id: "/",
+    path: "/",
+    getParentRoute: () => AuthedOrgModelProvidersRoute,
+  } as any)
+const AuthedOrgModelProvidersConnectionIdRoute =
+  AuthedOrgModelProvidersConnectionIdRouteImport.update({
+    id: "/$connectionId",
+    path: "/$connectionId",
+    getParentRoute: () => AuthedOrgModelProvidersRoute,
+  } as any)
 const AuthedOrgWWsRoute = AuthedOrgWWsRouteImport.update({
   id: "/w/$ws",
   path: "/w/$ws",
@@ -255,6 +275,7 @@ export interface FileRoutesByFullPath {
   "/$org/audit-log": typeof AuthedOrgAuditLogRoute
   "/$org/connect": typeof AuthedOrgConnectRoute
   "/$org/members": typeof AuthedOrgMembersRoute
+  "/$org/model-providers": typeof AuthedOrgModelProvidersRouteWithChildren
   "/$org/runs": typeof AuthedOrgRunsRoute
   "/$org/settings": typeof AuthedOrgSettingsRoute
   "/$org/webhooks": typeof AuthedOrgWebhooksRouteWithChildren
@@ -263,9 +284,11 @@ export interface FileRoutesByFullPath {
   "/$org/": typeof AuthedOrgIndexRoute
   "/connect/$reference/": typeof ConnectReferenceIndexRoute
   "/$org/apps/$appId": typeof AuthedOrgAppsAppIdRoute
+  "/$org/model-providers/$connectionId": typeof AuthedOrgModelProvidersConnectionIdRoute
   "/$org/w/$ws": typeof AuthedOrgWWsRouteWithChildren
   "/$org/webhooks/$hookId": typeof AuthedOrgWebhooksHookIdRoute
   "/$org/apps/": typeof AuthedOrgAppsIndexRoute
+  "/$org/model-providers/": typeof AuthedOrgModelProvidersIndexRoute
   "/$org/webhooks/": typeof AuthedOrgWebhooksIndexRoute
   "/$org/w/$ws/agents": typeof AuthedOrgWWsAgentsRouteWithChildren
   "/$org/w/$ws/apps": typeof AuthedOrgWWsAppsRouteWithChildren
@@ -299,8 +322,10 @@ export interface FileRoutesByTo {
   "/$org": typeof AuthedOrgIndexRoute
   "/connect/$reference": typeof ConnectReferenceIndexRoute
   "/$org/apps/$appId": typeof AuthedOrgAppsAppIdRoute
+  "/$org/model-providers/$connectionId": typeof AuthedOrgModelProvidersConnectionIdRoute
   "/$org/webhooks/$hookId": typeof AuthedOrgWebhooksHookIdRoute
   "/$org/apps": typeof AuthedOrgAppsIndexRoute
+  "/$org/model-providers": typeof AuthedOrgModelProvidersIndexRoute
   "/$org/webhooks": typeof AuthedOrgWebhooksIndexRoute
   "/$org/w/$ws/connect-sessions": typeof AuthedOrgWWsConnectSessionsRoute
   "/$org/w/$ws/settings": typeof AuthedOrgWWsSettingsRoute
@@ -327,6 +352,7 @@ export interface FileRoutesById {
   "/_authed/$org/audit-log": typeof AuthedOrgAuditLogRoute
   "/_authed/$org/connect": typeof AuthedOrgConnectRoute
   "/_authed/$org/members": typeof AuthedOrgMembersRoute
+  "/_authed/$org/model-providers": typeof AuthedOrgModelProvidersRouteWithChildren
   "/_authed/$org/runs": typeof AuthedOrgRunsRoute
   "/_authed/$org/settings": typeof AuthedOrgSettingsRoute
   "/_authed/$org/webhooks": typeof AuthedOrgWebhooksRouteWithChildren
@@ -335,9 +361,11 @@ export interface FileRoutesById {
   "/_authed/$org/": typeof AuthedOrgIndexRoute
   "/connect/$reference/": typeof ConnectReferenceIndexRoute
   "/_authed/$org/apps/$appId": typeof AuthedOrgAppsAppIdRoute
+  "/_authed/$org/model-providers/$connectionId": typeof AuthedOrgModelProvidersConnectionIdRoute
   "/_authed/$org/w/$ws": typeof AuthedOrgWWsRouteWithChildren
   "/_authed/$org/webhooks/$hookId": typeof AuthedOrgWebhooksHookIdRoute
   "/_authed/$org/apps/": typeof AuthedOrgAppsIndexRoute
+  "/_authed/$org/model-providers/": typeof AuthedOrgModelProvidersIndexRoute
   "/_authed/$org/webhooks/": typeof AuthedOrgWebhooksIndexRoute
   "/_authed/$org/w/$ws/agents": typeof AuthedOrgWWsAgentsRouteWithChildren
   "/_authed/$org/w/$ws/apps": typeof AuthedOrgWWsAppsRouteWithChildren
@@ -368,6 +396,7 @@ export interface FileRouteTypes {
     | "/$org/audit-log"
     | "/$org/connect"
     | "/$org/members"
+    | "/$org/model-providers"
     | "/$org/runs"
     | "/$org/settings"
     | "/$org/webhooks"
@@ -376,9 +405,11 @@ export interface FileRouteTypes {
     | "/$org/"
     | "/connect/$reference/"
     | "/$org/apps/$appId"
+    | "/$org/model-providers/$connectionId"
     | "/$org/w/$ws"
     | "/$org/webhooks/$hookId"
     | "/$org/apps/"
+    | "/$org/model-providers/"
     | "/$org/webhooks/"
     | "/$org/w/$ws/agents"
     | "/$org/w/$ws/apps"
@@ -412,8 +443,10 @@ export interface FileRouteTypes {
     | "/$org"
     | "/connect/$reference"
     | "/$org/apps/$appId"
+    | "/$org/model-providers/$connectionId"
     | "/$org/webhooks/$hookId"
     | "/$org/apps"
+    | "/$org/model-providers"
     | "/$org/webhooks"
     | "/$org/w/$ws/connect-sessions"
     | "/$org/w/$ws/settings"
@@ -439,6 +472,7 @@ export interface FileRouteTypes {
     | "/_authed/$org/audit-log"
     | "/_authed/$org/connect"
     | "/_authed/$org/members"
+    | "/_authed/$org/model-providers"
     | "/_authed/$org/runs"
     | "/_authed/$org/settings"
     | "/_authed/$org/webhooks"
@@ -447,9 +481,11 @@ export interface FileRouteTypes {
     | "/_authed/$org/"
     | "/connect/$reference/"
     | "/_authed/$org/apps/$appId"
+    | "/_authed/$org/model-providers/$connectionId"
     | "/_authed/$org/w/$ws"
     | "/_authed/$org/webhooks/$hookId"
     | "/_authed/$org/apps/"
+    | "/_authed/$org/model-providers/"
     | "/_authed/$org/webhooks/"
     | "/_authed/$org/w/$ws/agents"
     | "/_authed/$org/w/$ws/apps"
@@ -563,6 +599,13 @@ declare module "@tanstack/react-router" {
       preLoaderRoute: typeof AuthedOrgMembersRouteImport
       parentRoute: typeof AuthedOrgRoute
     }
+    "/_authed/$org/model-providers": {
+      id: "/_authed/$org/model-providers"
+      path: "/model-providers"
+      fullPath: "/$org/model-providers"
+      preLoaderRoute: typeof AuthedOrgModelProvidersRouteImport
+      parentRoute: typeof AuthedOrgRoute
+    }
     "/_authed/$org/runs": {
       id: "/_authed/$org/runs"
       path: "/runs"
@@ -618,6 +661,20 @@ declare module "@tanstack/react-router" {
       fullPath: "/$org/apps/$appId"
       preLoaderRoute: typeof AuthedOrgAppsAppIdRouteImport
       parentRoute: typeof AuthedOrgAppsRoute
+    }
+    "/_authed/$org/model-providers/": {
+      id: "/_authed/$org/model-providers/"
+      path: "/"
+      fullPath: "/$org/model-providers/"
+      preLoaderRoute: typeof AuthedOrgModelProvidersIndexRouteImport
+      parentRoute: typeof AuthedOrgModelProvidersRoute
+    }
+    "/_authed/$org/model-providers/$connectionId": {
+      id: "/_authed/$org/model-providers/$connectionId"
+      path: "/$connectionId"
+      fullPath: "/$org/model-providers/$connectionId"
+      preLoaderRoute: typeof AuthedOrgModelProvidersConnectionIdRouteImport
+      parentRoute: typeof AuthedOrgModelProvidersRoute
     }
     "/_authed/$org/w/$ws": {
       id: "/_authed/$org/w/$ws"
@@ -762,6 +819,23 @@ const AuthedOrgAppsRouteWithChildren = AuthedOrgAppsRoute._addFileChildren(
   AuthedOrgAppsRouteChildren,
 )
 
+interface AuthedOrgModelProvidersRouteChildren {
+  AuthedOrgModelProvidersConnectionIdRoute: typeof AuthedOrgModelProvidersConnectionIdRoute
+  AuthedOrgModelProvidersIndexRoute: typeof AuthedOrgModelProvidersIndexRoute
+}
+
+const AuthedOrgModelProvidersRouteChildren: AuthedOrgModelProvidersRouteChildren =
+  {
+    AuthedOrgModelProvidersConnectionIdRoute:
+      AuthedOrgModelProvidersConnectionIdRoute,
+    AuthedOrgModelProvidersIndexRoute: AuthedOrgModelProvidersIndexRoute,
+  }
+
+const AuthedOrgModelProvidersRouteWithChildren =
+  AuthedOrgModelProvidersRoute._addFileChildren(
+    AuthedOrgModelProvidersRouteChildren,
+  )
+
 interface AuthedOrgWebhooksRouteChildren {
   AuthedOrgWebhooksHookIdRoute: typeof AuthedOrgWebhooksHookIdRoute
   AuthedOrgWebhooksIndexRoute: typeof AuthedOrgWebhooksIndexRoute
@@ -861,6 +935,7 @@ interface AuthedOrgRouteChildren {
   AuthedOrgAuditLogRoute: typeof AuthedOrgAuditLogRoute
   AuthedOrgConnectRoute: typeof AuthedOrgConnectRoute
   AuthedOrgMembersRoute: typeof AuthedOrgMembersRoute
+  AuthedOrgModelProvidersRoute: typeof AuthedOrgModelProvidersRouteWithChildren
   AuthedOrgRunsRoute: typeof AuthedOrgRunsRoute
   AuthedOrgSettingsRoute: typeof AuthedOrgSettingsRoute
   AuthedOrgWebhooksRoute: typeof AuthedOrgWebhooksRouteWithChildren
@@ -875,6 +950,7 @@ const AuthedOrgRouteChildren: AuthedOrgRouteChildren = {
   AuthedOrgAuditLogRoute: AuthedOrgAuditLogRoute,
   AuthedOrgConnectRoute: AuthedOrgConnectRoute,
   AuthedOrgMembersRoute: AuthedOrgMembersRoute,
+  AuthedOrgModelProvidersRoute: AuthedOrgModelProvidersRouteWithChildren,
   AuthedOrgRunsRoute: AuthedOrgRunsRoute,
   AuthedOrgSettingsRoute: AuthedOrgSettingsRoute,
   AuthedOrgWebhooksRoute: AuthedOrgWebhooksRouteWithChildren,

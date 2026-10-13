@@ -28,6 +28,8 @@ export const ID_PREFIXES = {
   webhook_event: "evt",
   webhook_delivery: "whd",
   audit_event: "aud",
+  model_connection: "mcn",
+  model: "mdl",
 } as const;
 
 export type IdKind = keyof typeof ID_PREFIXES;
@@ -57,6 +59,8 @@ export type WebhookEndpointId = Id<"webhook_endpoint">;
 export type WebhookEventId = Id<"webhook_event">;
 export type WebhookDeliveryId = Id<"webhook_delivery">;
 export type AuditEventId = Id<"audit_event">;
+export type ModelConnectionId = Id<"model_connection">;
+export type ModelId = Id<"model">;
 
 /** The 22-character base62 body every ID shares. */
 const BODY = /^[0-9A-Za-z]{22}$/;

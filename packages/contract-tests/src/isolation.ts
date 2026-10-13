@@ -8,6 +8,17 @@ import { TERMINAL_RUN_STATUSES } from "@zupflow/contract";
 import { ENVIRONMENTS, type OrganizationId, ZupflowApiError, type ZupflowClient } from "@zupflow/sdk";
 import { expect } from "vitest";
 import { must } from "./fixture";
+import { notServedIn } from "./served";
+
+/** What `read` answers, or undefined from a target that doesn't serve its operation yet. */
+async function ifServed<T>(read: () => Promise<T>): Promise<T | undefined> {
+  try {
+    return await read();
+  } catch (error) {
+    if (notServedIn(error)) return undefined;
+    throw error;
+  }
+}
 
 /** One workspace's real objects, read through the API by a member of its organization. */
 export async function loadTenant(
@@ -56,6 +67,9 @@ export async function loadTenant(
       `workspace app of ${workspaceSlug}`,
     ),
     key: must((await client.apiKeys.list(org))[0], "API key"),
+    // Model providers, where the target serves them; their attempts are left out otherwise.
+    connection: await ifServed(async () => must((await client.modelConnections.list(org))[0], "model connection")),
+    model: await ifServed(async () => must((await client.models.list(org, { limit: 1 })).items[0], "model")),
     hook: must((await client.webhooks.list(org))[0], "webhook"),
     member: must((await client.members.list(org))[0], "member"),
   };
@@ -100,6 +114,9 @@ export async function snapshotOf(client: ZupflowClient, t: Tenant): Promise<stri
     await client.toolPolicy.get(t.org),
     await Promise.all(orgApps.map((a) => client.toolPolicy.levels(t.org, a.id, { limit: 100 }))),
     await client.apiKeys.list(t.org),
+    await ifServed(() => client.modelConnections.list(t.org)),
+    await ifServed(() => client.models.list(t.org, { limit: 100 })),
+    await ifServed(() => Promise.all(ENVIRONMENTS.map((env) => client.models.getDefault(t.org, env)))),
     await client.webhooks.list(t.org),
     await client.audit.list(t.org, { limit: 100 }),
   ]);
@@ -110,6 +127,69 @@ export function attempts(r: ZupflowClient, own: Tenant, victim: Tenant): [string
   const v = victim;
   const w = v.workspace.id;
   const callId = "call_031DCp7XSYxLgDmAT3Dc7r" as const;
+  // Model providers, only where the target serves them (loadTenant found them then).
+  const { connection, model } = v;
+  const victimModelAttempts: [string, () => Promise<unknown>][] =
+    connection && model
+      ? [
+          ["[victim org] list model connections", () => r.modelConnections.list(v.org)],
+          [
+            "[victim org] connect a model provider",
+            () =>
+              r.modelConnections.create(v.org, {
+                environment: "sandbox",
+                kind: "openai",
+                label: "x",
+                api_key: "sk-test-long-attacker-0000-xx",
+              }),
+          ],
+          ["[victim org] get model connection", () => r.modelConnections.get(v.org, connection.id)],
+          [
+            "[victim org] rename model connection",
+            () => r.modelConnections.update(v.org, connection.id, { label: "x" }),
+          ],
+          [
+            "[victim org] replace model key",
+            () => r.modelConnections.replaceKey(v.org, connection.id, { api_key: "sk-test-long-attacker-0000-xx" }),
+          ],
+          ["[victim org] delete model connection", () => r.modelConnections.delete(v.org, connection.id)],
+          ["[victim org] provider models", () => r.modelConnections.providerModels(v.org, connection.id)],
+          ["[victim org] list models", () => r.models.list(v.org)],
+          [
+            "[victim org] add model",
+            () => r.models.create(v.org, { connection_id: connection.id, provider_model_id: model.provider_model_id }),
+          ],
+          ["[victim org] get model", () => r.models.get(v.org, model.id)],
+          ["[victim org] rename model", () => r.models.update(v.org, model.id, { name: "Owned" })],
+          ["[victim org] remove model", () => r.models.delete(v.org, model.id)],
+          ["[victim org] default model", () => r.models.getDefault(v.org, model.environment)],
+          ["[victim org] set default model", () => r.models.setDefault(v.org, model.environment, { model_id: null })],
+        ]
+      : [];
+  const ownModelAttempts: [string, () => Promise<unknown>][] =
+    connection && model
+      ? [
+          ["[own org] model connection via own org", () => r.modelConnections.get(own.org, connection.id)],
+          [
+            "[own org] rename model connection via own org",
+            () => r.modelConnections.update(own.org, connection.id, { label: "Owned" }),
+          ],
+          [
+            "[own org] replace model key via own org",
+            () => r.modelConnections.replaceKey(own.org, connection.id, { api_key: "sk-test-long-attacker-0000-xx" }),
+          ],
+          ["[own org] delete model connection via own org", () => r.modelConnections.delete(own.org, connection.id)],
+          ["[own org] provider models via own org", () => r.modelConnections.providerModels(own.org, connection.id)],
+          [
+            "[own org] add model from victim connection",
+            () =>
+              r.models.create(own.org, { connection_id: connection.id, provider_model_id: model.provider_model_id }),
+          ],
+          ["[own org] model via own org", () => r.models.get(own.org, model.id)],
+          ["[own org] rename model via own org", () => r.models.update(own.org, model.id, { name: "Owned" })],
+          ["[own org] remove model via own org", () => r.models.delete(own.org, model.id)],
+        ]
+      : [];
   return [
     // The victim's workspace.
     ["[victim workspace] get workspace", () => r.workspaces.get(w)],
@@ -118,7 +198,7 @@ export function attempts(r: ZupflowClient, own: Tenant, victim: Tenant): [string
     ["[victim workspace] list agents", () => r.agents.list(w)],
     [
       "[victim workspace] create agent",
-      () => r.agents.create(w, { name: "x", description: "", model: v.agent.model, instructions: "" }),
+      () => r.agents.create(w, { name: "x", description: "", model_id: v.agent.model_id, instructions: "" }),
     ],
     ["[victim workspace] get agent", () => r.agents.get(w, v.agent.id)],
     ["[victim workspace] pause agent", () => r.agents.update(w, v.agent.id, { status: "paused" })],
@@ -218,6 +298,7 @@ export function attempts(r: ZupflowClient, own: Tenant, victim: Tenant): [string
     ["[victim org] update webhook", () => r.webhooks.update(v.org, v.hook.id, { enabled: false })],
     ["[victim org] test webhook", () => r.webhooks.sendTest(v.org, v.hook.id)],
     ["[victim org] delete webhook", () => r.webhooks.delete(v.org, v.hook.id)],
+    ...victimModelAttempts,
     // The victim's child IDs, through the attacker's own organization and workspace.
     ["[own org] org app via own org", () => r.organizationApps.get(own.org, v.orgApp.id)],
     [
@@ -239,6 +320,7 @@ export function attempts(r: ZupflowClient, own: Tenant, victim: Tenant): [string
       "[own org] set tool levels of victim app via own org",
       () => r.toolPolicy.setLevels(own.org, v.orgApp.id, { levels: [{ tool: "x", level: "allow" }] }),
     ],
+    ...ownModelAttempts,
     ["[own org] member via own org", () => r.members.update(own.org, v.member.id, { role: "owner" })],
     ["[own org] remove member via own org", () => r.members.remove(own.org, v.member.id)],
     ["[own workspace] agent via own workspace", () => r.agents.get(own.workspace.id, v.agent.id)],

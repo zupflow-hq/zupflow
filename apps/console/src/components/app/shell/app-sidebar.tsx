@@ -13,6 +13,7 @@ import {
   PlusIcon,
   ScrollTextIcon,
   SettingsIcon,
+  SparklesIcon,
   UsersIcon,
   WebhookIcon,
 } from "lucide-react";
@@ -164,6 +165,7 @@ export function AppSidebar() {
   ];
   const developerItems: NavItem[] = [
     { label: "Connect", icon: PlugIcon, to: "/$org/connect", params: o },
+    { label: "Model providers", icon: SparklesIcon, to: "/$org/model-providers", params: o },
     { label: "API keys", icon: KeyRoundIcon, to: "/$org/api-keys", params: o },
     { label: "Webhooks", icon: WebhookIcon, to: "/$org/webhooks", params: o },
   ];

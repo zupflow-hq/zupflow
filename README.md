@@ -213,8 +213,7 @@ tab, a completed session sends the person to its return URL, told
 `zupflow_session` (replacing any it carried), only while that URL is still on
 the allowlist.
 
-It also serves the models an agent can use,
-and agents and their grants: a grant names tools of one installation of the
+It also serves agents and their grants: a grant names tools of one installation of the
 same workspace, and only tools that installation's registry holds and doesn't
 hold as gone (`422 unknown_tool`, `422 tool_gone`); a tool that goes later
 stays in the grant, refused when called.
@@ -241,11 +240,25 @@ naming who made it (a member, an API key, or Connect), what changed and where;
 never a secret. A deleted workspace's events stay (decision: keep history);
 they go only with their organization.
 
-The models are the deployment's to list, in `ZUPFLOW_MODELS`: a JSON array
+Model providers (decisions 0049 and 0050) are in the contract and the mock,
+not yet in the backend: an organization connects its own OpenAI, Anthropic
+or OpenRouter accounts per environment, adds models from them and chooses a
+default model per environment (see the mock section below). Until the
+backend serves them, its agents already take the contract's shape: every
+agent answers `model_id: null` (the environment's default), naming a model
+is `422 unknown_model`, and `run.started` names no `model_id` or
+`connection_id` (`null`). The deployment-wide `GET /v1/models` is gone.
+Against the backend, the shared suite skips only the cases that need a model
+provider operation: the nine "model providers" cases and the agent case that
+chooses one of the organization's models. The isolation sweeps, the role
+sweeps and the viewer's reads leave out just their model provider attempts.
+
+Internally, runs still use the deployment's model list, in `ZUPFLOW_MODELS`: a JSON array
 of `{"id", "name", "provider", "description"}` objects in the order to offer
 them (`description` optional; IDs of letters, digits and `. - _ : / @`, each
-once; any other field refused). Unset, or `[]`, offers none, and creating an
-agent is refused until one is listed. No model provider ships with Zupflow
+once; any other field refused). A new agent's runs use the first one listed.
+Unset, or `[]`, lists none, and creating an agent is refused
+(`422 model_not_configured`) until one is listed. No model provider ships with Zupflow
 (`ModelProvider` is a trait, with a conformance suite), and none answers runs
 unless one is configured: by default every run fails `model_unavailable`.
 For local work, `ZUPFLOW_MODEL_PROVIDER=scripted` answers runs with the
@@ -712,6 +725,22 @@ The reference fixture has a pending approval in each environment; Sandbox's is
 the `qa-playground` Echo bot waiting on `echo_write`. Approving or denying it
 through an API key resumes the mock's existing simulated execution. The Console
 continues to observe approvals.
+
+Model providers are served by the mock in full. A connection (`mcn_`) is one
+organization's account with one provider in one environment; its key is
+checked with the provider before it's saved (a key is 20 to 500 characters
+with no spaces; the backend must hold keys to the same shape), then kept
+write-only (responses show `set` and `last4`). The mock never keeps the key, and its providers are
+fixtures (`src/mocks/providers.ts`): each accepts any key of the right shape
+and refuses one containing `invalid`. Models (`mdl_`) are added from a
+connection's provider list, searched on the server, and only models that can
+call tools are added. Each environment has its own default model, and an
+agent either chooses one of its environment's models or uses the default;
+with neither, starting a run is refused (`422 model_not_configured`), and a
+model or connection that the default or an agent uses can't be removed
+(`409 model_in_use`). Owners and admins manage all of it; API keys read and
+manage their own environment's. In the Console it is **Model providers**,
+under Developers.
 
 The mock keeps two local-development simulations, labelled as such in the UI:
 
