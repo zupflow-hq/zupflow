@@ -2,7 +2,6 @@
 //! real and supported, not test doubles: a single-node Zupflow runs on them.
 //! Each passes its trait's conformance suite.
 
-pub mod configured_models;
 pub mod configured_policy;
 pub mod in_process_events;
 pub mod in_process_metrics;
@@ -14,4 +13,6 @@ pub mod local_identity;
 pub mod local_keys;
 pub mod memory_cache;
 pub mod no_model;
+pub mod no_providers;
 pub mod scripted_model;
+pub mod scripted_providers;

@@ -21,11 +21,11 @@ packages/
 server/           The Rust backend — a Cargo workspace
   crates/zupflow-core/        Shared types and the external-resource traits: typed IDs, API errors, scopes,
                               KeyService, Cache, ObjectStore, EventBus, JobQueue, Metrics, Identity,
-                              ModelCatalog, the organizations, workspaces, API key, app, installation, tool,
-                              agent, run and webhook stores
+                              ModelProvider, ModelProviderCatalog, the organizations, workspaces, API key,
+                              app, installation, tool, agent, model, run and webhook stores
   crates/zupflow-basic/       The basic implementations: local keys, an in-memory cache, local files,
-                              an in-process event bus, in-process metrics, local sign-in, the configured
-                              model catalog
+                              an in-process event bus, in-process metrics, local sign-in, the scripted
+                              model and model providers (development and tests only)
   crates/zupflow-sqlite/      The basic database: SQLite, its migrations, the stores, the job queue
   crates/zupflow-oidc/        Console sign-in through any OpenID Connect provider
   crates/zupflow-outbound/    The safe outbound HTTP path: public HTTPS only, no redirects, bounded
@@ -116,7 +116,7 @@ Requires Rust (the version is pinned in `server/rust-toolchain.toml`; rustup
 picks it up).
 
 ```bash
-pnpm --filter @zupflow/server dev   # or: cd server && ZUPFLOW_IDENTITY=local cargo run --bin zupflow
+pnpm --filter @zupflow/server dev   # or: cd server && ZUPFLOW_IDENTITY=local ZUPFLOW_MODEL_PROVIDER=scripted cargo run --bin zupflow
 ```
 
 It listens on `127.0.0.1:8080` (`ZUPFLOW_LISTEN`), keeps its data in one
@@ -125,9 +125,9 @@ owner only) and logs JSON (`ZUPFLOW_LOG`, a tracing filter). An invalid, empty
 or non-UTF-8 value stops startup rather than falling back.
 
 `ZUPFLOW_IDENTITY` is required: there's no default, and unset stops startup.
-The `dev` script sets `ZUPFLOW_IDENTITY=local`, for one person on their own
-machine: no sign-in, every Console request is one built-in owner
-(`owner@local.invalid`). It exists only in a build with the `local-identity`
+The `dev` script sets `ZUPFLOW_IDENTITY=local` (and the scripted model
+providers, below), for one person on their own machine: no sign-in, every
+Console request is one built-in owner (`owner@local.invalid`). It exists only in a build with the `local-identity`
 feature (on by default; a build without it refuses `local`). Because that trusts
 anyone who can reach the port, the server refuses to start with it on
 anything but a loopback address, and answers only requests addressed to
@@ -240,33 +240,48 @@ naming who made it (a member, an API key, or Connect), what changed and where;
 never a secret. A deleted workspace's events stay (decision: keep history);
 they go only with their organization.
 
-Model providers (decisions 0049 and 0050) are in the contract and the mock,
-not yet in the backend: an organization connects its own OpenAI, Anthropic
-or OpenRouter accounts per environment, adds models from them and chooses a
-default model per environment (see the mock section below). Until the
-backend serves them, its agents already take the contract's shape: every
-agent answers `model_id: null` (the environment's default), naming a model
-is `422 unknown_model`, and `run.started` names no `model_id` or
-`connection_id` (`null`). The deployment-wide `GET /v1/models` is gone.
-Against the backend, the shared suite skips only the cases that need a model
-provider operation: the nine "model providers" cases and the agent case that
-chooses one of the organization's models. The isolation sweeps, the role
-sweeps and the viewer's reads leave out just their model provider attempts.
+Model providers (decisions 0049 and 0050) are served: an organization
+connects its own OpenAI, Anthropic or OpenRouter accounts per environment,
+adds models from them and chooses a default model per environment (see the
+mock section below for the rules, which the backend holds to the same codes).
+Owners, admins and the organization's API keys manage them; an API key reaches
+only its own environment's (another's is `404`, naming it `422
+environment_mismatch`). A connection's key is checked with its provider before
+it's saved, then sealed (`keys::seal`, under the connection's
+`model_provider_key` context, one value per key version) and opened only to
+ask the provider again; responses, errors, logs, idempotency records and the
+audit log show only whether it's set and its last four characters. Removing a
+model or connection the default or an agent uses is `409 model_in_use`,
+checked in the transaction that removes it; of two key replacements at once,
+the later one is `409 key_changed`.
 
-Internally, runs still use the deployment's model list, in `ZUPFLOW_MODELS`: a JSON array
-of `{"id", "name", "provider", "description"}` objects in the order to offer
-them (`description` optional; IDs of letters, digits and `. - _ : / @`, each
-once; any other field refused). A new agent's runs use the first one listed.
-Unset, or `[]`, lists none, and creating an agent is refused
-(`422 model_not_configured`) until one is listed. No model provider ships with Zupflow
-(`ModelProvider` is a trait, with a conformance suite), and none answers runs
-unless one is configured: by default every run fails `model_unavailable`.
-For local work, `ZUPFLOW_MODEL_PROVIDER=scripted` answers runs with the
-scripted model in `zupflow-basic`, which serves the listed IDs and calls a
-tool for each line `call <tool> <json-object>` of a run's input (otherwise it
-answers `You said: …`), so runs are deterministic. Never use it in a
+An agent's `model_id` is a model of its workspace's environment (`422
+unknown_model` otherwise), or `null` for the environment's default. A run
+records its model, connection and provider model when it starts (`422
+model_not_configured` with neither an override nor a default), names them in
+`run.started`, and checks before every model call that both are still there
+(else it fails `model_unavailable`) and that the provider hasn't refused the
+key (`model_key_invalid`); each model attempt records the key version used.
+A run admitted before organizations had models fails `model_unavailable`
+when a worker takes it up, rather than asking a provider for a deployment's
+model.
+
+What checks keys and lists a provider's models is `ModelProviderCatalog`, a
+trait with a conformance suite; what answers runs is `ModelProvider`. No
+provider implementation ships with Zupflow. Unset, `ZUPFLOW_MODEL_PROVIDER`
+configures none: connecting a provider, replacing a key or listing a
+provider's models answers `501 model_providers_not_configured`, and every run
+fails `model_unavailable`. `ZUPFLOW_MODELS`, the deployment-wide model list of
+earlier versions, is no longer read: set, it stops startup. For local work and tests,
+`ZUPFLOW_MODEL_PROVIDER=scripted` uses the scripted providers in
+`zupflow-basic` (the mock's provider fixtures: any key of the right shape is
+accepted, one containing `invalid` refused) and answers runs with the
+scripted model, which serves every listed model that can call tools and calls
+a tool for each line `call <tool> <json-object>` of a run's input (otherwise
+it answers `You said: …`), so runs are deterministic. Never use it in a
 deployment: it turns what a run's input says into tool calls. Any other value
-stops startup; the server logs which applies.
+stops startup; the server logs which applies. `pnpm --filter @zupflow/server
+dev` sets it.
 
 Runs are served: started (`403 console_read_only_in_production` for a
 Console session in Production, `422 agent_paused`), listed per workspace and
@@ -478,8 +493,9 @@ CARGO_INCREMENTAL=0 pnpm contract:backend
 Runs the shared contract suite (the same cases the mock passes) against the
 backend: it builds the development-only `zupflow-contract-server`, restores
 the reference fixture into a throwaway database, serves it on loopback and
-points the suite at it. Cases that need an operation the backend doesn't serve
-yet are skipped, each naming the operation. CI runs it after `pnpm check`.
+points the suite at it. The backend serves every operation the suite calls, so
+nothing is skipped; a case that needs an operation a server doesn't serve is
+skipped, naming the operation. CI runs it after `pnpm check`.
 
 For the shared suite, Taskboard journeys and hosted Connect browser tests in
 one command (install Chromium as described below first):
@@ -729,7 +745,7 @@ continues to observe approvals.
 Model providers are served by the mock in full. A connection (`mcn_`) is one
 organization's account with one provider in one environment; its key is
 checked with the provider before it's saved (a key is 20 to 500 characters
-with no spaces; the backend must hold keys to the same shape), then kept
+with no spaces, in the backend too), then kept
 write-only (responses show `set` and `last4`). The mock never keeps the key, and its providers are
 fixtures (`src/mocks/providers.ts`): each accepts any key of the right shape
 and refuses one containing `invalid`. Models (`mdl_`) are added from a

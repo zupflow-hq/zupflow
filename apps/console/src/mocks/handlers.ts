@@ -2776,9 +2776,19 @@ export function createHandlers(apiBase: string) {
         const access = orgAccess(request, param(params, "org"));
         requireRole(access, ADMINS, "replace model provider keys");
         const row = findModelConnection(access, idParam(params, "connection"));
+        const replacing = row.key_version;
         const input = await body(request, z.object({ api_key: providerKey }));
         // A refused key changes nothing: the connection keeps the key it had.
         assertProviderAccepts(row.kind, input.api_key);
+        // Another request replaced the key while this one's body arrived:
+        // saving this one would silently undo that one.
+        if (row.key_version !== replacing) {
+          throw new ApiFailure(
+            409,
+            "key_changed",
+            "The key was replaced at the same time. Check the connection, then try again.",
+          );
+        }
         const now = new Date().toISOString();
         row.key_last4 = input.api_key.slice(-4);
         row.key_version += 1;

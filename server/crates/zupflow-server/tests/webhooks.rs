@@ -88,7 +88,14 @@ async fn work(server: &Server) {
     }
 }
 
+/// An agent in `ws`, whose environment gets a default model.
 async fn agent(server: &Server, who: &str, org: &str, ws: &str) -> String {
+    let (status, workspace) = server
+        .send(call(who, Method::GET, format!("/v1/workspaces/{ws}")).naming(org))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{workspace}");
+    let environment = workspace["data"]["environment"].as_str().unwrap();
+    server.default_model(who, org, environment).await;
     let (status, agent) = server
         .send(
             call(who, Method::POST, format!("/v1/workspaces/{ws}/agents"))

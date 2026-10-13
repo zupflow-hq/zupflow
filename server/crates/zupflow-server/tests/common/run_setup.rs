@@ -50,6 +50,7 @@ pub async fn setup(installations: &[(&str, &str)]) -> Setup {
     );
     let org = server.organization("alice", "northwind").await;
     let ws = id(&server.workspace("alice", &org, "sandbox", "sandbox").await).to_owned();
+    server.default_model("alice", &org, "sandbox").await;
     let app = tools_app(&server, "alice", &org).await;
     let mut connected = Vec::new();
     for (label, token) in installations {
@@ -602,6 +603,7 @@ impl Setup {
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let key = self.api_key_in("production").await;
+        self.server.default_model("alice", &self.org, "production").await;
         self.tenant(&key, self.org.clone(), ws, self.app.clone(), false, token)
             .await
     }
@@ -611,6 +613,7 @@ impl Setup {
         let org = self.server.organization(user, slug).await;
         let ws = id(&self.server.workspace(user, &org, "sandbox", "sandbox").await).to_owned();
         let app = tools_app(&self.server, user, &org).await;
+        self.server.default_model(user, &org, "sandbox").await;
         self.tenant(user, org, ws, app, true, token).await
     }
 

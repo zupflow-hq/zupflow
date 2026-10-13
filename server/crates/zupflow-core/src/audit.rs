@@ -23,8 +23,8 @@ use uuid::Uuid;
 
 use crate::environment::Environment;
 use crate::ids::{
-    AgentId, ApiKeyId, AppId, AuditEventId, InstallationId, MemberId, OrganizationId, RunId, UserId, WebhookDeliveryId,
-    WebhookEndpointId, WorkspaceId,
+    AgentId, ApiKeyId, AppId, AuditEventId, InstallationId, MemberId, ModelConnectionId, ModelId, OrganizationId,
+    RunId, UserId, WebhookDeliveryId, WebhookEndpointId, WorkspaceId,
 };
 use crate::time::Timestamp;
 use crate::workspaces::Page;
@@ -125,6 +125,11 @@ pub enum AuditObject {
     Webhook(WebhookEndpointId),
     WebhookDelivery(WebhookDeliveryId),
     Run(RunId),
+    ModelConnection(ModelConnectionId),
+    Model(ModelId),
+    /// An environment's default model, named by the model chosen; `None`
+    /// when it was cleared.
+    DefaultModel(Option<ModelId>),
     /// The organization's tool policy, which has no ID.
     ToolPolicy,
     /// An environment's Connect settings, which have no ID.
@@ -145,6 +150,9 @@ impl AuditObject {
             Self::Webhook(_) => "webhook",
             Self::WebhookDelivery(_) => "webhook_delivery",
             Self::Run(_) => "run",
+            Self::ModelConnection(_) => "model_connection",
+            Self::Model(_) => "model",
+            Self::DefaultModel(_) => "default_model",
             Self::ToolPolicy => "tool_policy",
             Self::ConnectSettings => "connect_settings",
         }
@@ -163,6 +171,9 @@ impl AuditObject {
             Self::Webhook(id) => Some(id.uuid()),
             Self::WebhookDelivery(id) => Some(id.uuid()),
             Self::Run(id) => Some(id.uuid()),
+            Self::ModelConnection(id) => Some(id.uuid()),
+            Self::Model(id) => Some(id.uuid()),
+            Self::DefaultModel(id) => id.map(|id| id.uuid()),
             Self::ToolPolicy | Self::ConnectSettings => None,
         }
     }
@@ -180,6 +191,9 @@ impl AuditObject {
             ("webhook", Some(uuid)) => Self::Webhook(WebhookEndpointId::from_uuid(uuid)),
             ("webhook_delivery", Some(uuid)) => Self::WebhookDelivery(WebhookDeliveryId::from_uuid(uuid)),
             ("run", Some(uuid)) => Self::Run(RunId::from_uuid(uuid)),
+            ("model_connection", Some(uuid)) => Self::ModelConnection(ModelConnectionId::from_uuid(uuid)),
+            ("model", Some(uuid)) => Self::Model(ModelId::from_uuid(uuid)),
+            ("default_model", uuid) => Self::DefaultModel(uuid.map(ModelId::from_uuid)),
             ("tool_policy", None) => Self::ToolPolicy,
             ("connect_settings", None) => Self::ConnectSettings,
             _ => return None,
@@ -235,6 +249,9 @@ impl Serialize for AuditTarget {
             AuditObject::Webhook(id) => target.serialize_field("id", id)?,
             AuditObject::WebhookDelivery(id) => target.serialize_field("id", id)?,
             AuditObject::Run(id) => target.serialize_field("id", id)?,
+            AuditObject::ModelConnection(id) => target.serialize_field("id", id)?,
+            AuditObject::Model(id) => target.serialize_field("id", id)?,
+            AuditObject::DefaultModel(id) => target.serialize_field("id", id)?,
             AuditObject::ToolPolicy | AuditObject::ConnectSettings => target.serialize_field("id", &None::<()>)?,
         }
         target.serialize_field("name", &self.name)?;
@@ -316,6 +333,16 @@ actions! {
     /// A decision on a call a run waited for, recorded by an API key.
     ApprovalResolved => "approval.resolved",
     RunCancelled => "run.cancelled",
+    ModelConnectionCreated => "model_connection.created",
+    /// Renamed.
+    ModelConnectionUpdated => "model_connection.updated",
+    ModelConnectionKeyReplaced => "model_connection.key_replaced",
+    ModelConnectionDeleted => "model_connection.deleted",
+    ModelCreated => "model.created",
+    /// Renamed.
+    ModelUpdated => "model.updated",
+    ModelDeleted => "model.deleted",
+    DefaultModelUpdated => "default_model.updated",
 }
 
 impl Serialize for AuditAction {
@@ -473,6 +500,10 @@ mod tests {
             AuditObject::Webhook(WebhookEndpointId::from_uuid(uuid)),
             AuditObject::WebhookDelivery(WebhookDeliveryId::from_uuid(uuid)),
             AuditObject::Run(RunId::from_uuid(uuid)),
+            AuditObject::ModelConnection(ModelConnectionId::from_uuid(uuid)),
+            AuditObject::Model(ModelId::from_uuid(uuid)),
+            AuditObject::DefaultModel(Some(ModelId::from_uuid(uuid))),
+            AuditObject::DefaultModel(None),
             AuditObject::ToolPolicy,
             AuditObject::ConnectSettings,
         ] {

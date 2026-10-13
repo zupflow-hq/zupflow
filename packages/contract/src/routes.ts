@@ -764,7 +764,7 @@ export const routes: readonly Route[] = [
     method: "post",
     path: "/v1/organizations/{org}/model-connections",
     summary:
-      "Connect a model provider in one environment with an API key, checked with the provider first (`422 invalid_api_key`)",
+      "Connect a model provider in one environment with an API key, checked with the provider first (`422 invalid_api_key`; `501 model_providers_not_configured` when the deployment reaches no model providers)",
     callers: both,
     params: org,
     body: s.CreateModelConnectionInput,
@@ -794,7 +794,7 @@ export const routes: readonly Route[] = [
     method: "put",
     path: "/v1/organizations/{org}/model-connections/{connection}/api-key",
     summary:
-      "Replace a connection's API key with a new version, checked with the provider first (`422 invalid_api_key`, keeping the old one)",
+      "Replace a connection's API key with a new version, checked with the provider first (`422 invalid_api_key`, keeping the old one; `501 model_providers_not_configured` when the deployment reaches no model providers). `409 key_changed` when another request replaced the key meanwhile: nothing changes, and the connection shows the newer key",
     callers: both,
     params: { ...org, connection: idSchema("model_connection") },
     body: s.ReplaceModelConnectionKeyInput,
@@ -815,7 +815,7 @@ export const routes: readonly Route[] = [
     method: "get",
     path: "/v1/organizations/{org}/model-connections/{connection}/provider-models",
     summary:
-      "Search the models the connection's provider lists for its key, a page at a time. `422 invalid_api_key` when the provider refuses the key",
+      "Search the models the connection's provider lists for its key, a page at a time. `422 invalid_api_key` when the provider refuses the key; `501 model_providers_not_configured` when the deployment reaches no model providers",
     callers: both,
     params: { ...org, connection: idSchema("model_connection") },
     query: s.ProviderModelListQuery,

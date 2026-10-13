@@ -74,6 +74,12 @@ const TABLES: &[(&str, Scoping)] = &[
     ("webhook_events", Scoping::Organization),
     ("webhook_deliveries", Scoping::Organization),
     ("webhook_delivery_attempts", Scoping::Organization),
+    // Model providers: an organization's connections, their sealed keys, the
+    // models added from them and each environment's default.
+    ("model_connections", Scoping::Organization),
+    ("model_connection_credentials", Scoping::Organization),
+    ("models", Scoping::Organization),
+    ("default_models", Scoping::Organization),
     // A deleted workspace's events stay in the log.
     ("audit_events", Scoping::History),
 ];
@@ -546,4 +552,137 @@ async fn keeps_what_references_apps_and_installations_through_migration_0027() {
         .execute(pool)
         .await;
     assert!(removed.is_err(), "an installation still references the app");
+}
+
+#[tokio::test]
+async fn keeps_agents_and_their_grants_through_migration_0031() {
+    use std::str::FromStr;
+
+    use sqlx::sqlite::SqliteConnectOptions;
+
+    let directory = TemporaryDirectory::new();
+    let earlier = directory.0.join("migrations");
+    std::fs::create_dir(&earlier).unwrap();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.as_str() < "0031" {
+            std::fs::copy(&path, earlier.join(&name)).unwrap();
+        }
+    }
+    let options = SqliteConnectOptions::from_str("sqlite:")
+        .unwrap()
+        .filename(directory.file())
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+    sqlx::migrate::Migrator::new(earlier.as_path())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    let blob = |n: u8| {
+        let mut id = [0u8; 16];
+        id[15] = n;
+        id.to_vec()
+    };
+    for statement in [
+        "INSERT INTO organizations (id, name, slug, created_at) VALUES (?1, 'Org', 'org', 0)",
+        "INSERT INTO workspaces (id, organization_id, environment, name, slug, created_at) \
+         VALUES (?2, ?1, 'sandbox', 'W', 'w', 0)",
+        "INSERT INTO apps (id, organization_id, kind, name, key, description, icon_glyph, icon_color, auth, tools, \
+         version, created_at, updated_at) \
+         VALUES (?3, ?1, 'mcp', 'T', 'tools', '', 'T', '#0E7490', '{}', '[]', 1, 0, 0)",
+        "INSERT INTO installation_short_ids (id, organization_id, workspace_id, short_id, created_at) \
+         VALUES (?4, ?1, ?2, 'abcdef', 0)",
+        "INSERT INTO installations (id, organization_id, workspace_id, catalog_app_id, short_id, label, status, \
+         configuration_version, granted_scopes, created_at, updated_at) \
+         VALUES (?5, ?1, ?2, ?3, 'abcdef', 'Main', 'disconnected', 1, '[]', 0, 0)",
+        // An agent on a deployment's model, by the ID it was listed under.
+        "INSERT INTO agents (id, organization_id, workspace_id, name, description, model, instructions, status, \
+         created_at, updated_at) \
+         VALUES (?6, ?1, ?2, 'Helper', 'Helps.', 'model-balanced', 'Be brief.', 'paused', 1, 2)",
+        "INSERT INTO agent_grants (id, organization_id, workspace_id, agent_id, installation_id, tools, \
+         approval_required, created_at, updated_at) \
+         VALUES (?7, ?1, ?2, ?6, ?5, '[\"lookup\"]', '[]', 0, 0)",
+    ] {
+        sqlx::query(statement)
+            .bind(blob(1))
+            .bind(blob(2))
+            .bind(blob(3))
+            .bind(blob(4))
+            .bind(blob(5))
+            .bind(blob(6))
+            .bind(blob(7))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    pool.close().await;
+
+    let database = Database::open(&directory.file()).await.unwrap();
+    let pool = database.pool();
+    type AgentRow = (Vec<u8>, String, String, Option<Vec<u8>>, String, String, i64, i64);
+    let agent: AgentRow = sqlx::query_as(
+        "SELECT id, name, description, model_id, instructions, status, created_at, updated_at FROM agents",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        agent,
+        (
+            blob(6),
+            "Helper".to_owned(),
+            "Helps.".to_owned(),
+            None,
+            "Be brief.".to_owned(),
+            "paused".to_owned(),
+            1,
+            2
+        ),
+        "kept as it was, on its environment's default"
+    );
+    let grants: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_grants")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(grants, 1, "the grant survives the rebuilt table");
+    let violations: i64 = sqlx::query_scalar("SELECT count(*) FROM pragma_foreign_key_check")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(violations, 0);
+    let mut indexes: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_index_list('agents') WHERE origin = 'c'")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    indexes.sort();
+    assert_eq!(indexes, ["agents_by_model", "agents_by_name"]);
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let mut connection = pool.acquire().await.unwrap();
+        let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        assert_eq!(enabled, 1);
+        held.push(connection);
+    }
+    drop(held);
+    // The agent's grants still go with it, and the agent with its workspace.
+    sqlx::query("DELETE FROM agents WHERE organization_id = ? AND id = ?")
+        .bind(blob(1))
+        .bind(blob(6))
+        .execute(pool)
+        .await
+        .unwrap();
+    let grants: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_grants")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(grants, 0, "a grant goes with its agent");
 }

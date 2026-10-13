@@ -1336,13 +1336,26 @@ async fn history_run(stack: &Stack, who: &str, org: &str, slug: &str, environmen
         .await;
     assert_eq!(status, StatusCode::CREATED, "{workspace}");
     let ws = id(data(&workspace));
+    // The agent runs on one of the environment's models: Larkspur's Sandbox
+    // has models but no default.
+    let (status, models) = stack
+        .api(
+            who,
+            Method::GET,
+            &format!("/v1/organizations/{org}/models?environment={environment}"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{models}");
+    let model = id(&data(&models)[0]);
     let (status, agent) = stack
         .api(
             who,
             Method::POST,
             &format!("/v1/workspaces/{ws}/agents"),
             Some(org),
-            Some(json!({ "name": "Webhook trial", "description": "", "instructions": "Answer briefly." })),
+            Some(json!({ "name": "Webhook trial", "description": "", "instructions": "Answer briefly.", "model_id": model })),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{agent}");

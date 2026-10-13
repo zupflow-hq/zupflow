@@ -68,7 +68,7 @@ fn new_agent(name: &str) -> NewAgent {
     NewAgent {
         name: name.to_owned(),
         description: format!("{name}, described"),
-        model: "model-a".to_owned(),
+        model_id: None,
         instructions: "Be brief.".to_owned(),
     }
 }
@@ -167,11 +167,11 @@ async fn creates_reads_changes_and_deletes_agents(stores: &Stores<'_>, prepare: 
         [
             beta.name.as_str(),
             beta.description.as_str(),
-            beta.model.as_str(),
             beta.instructions.as_str()
         ],
-        ["Beta", "Beta, described", "model-a", "Be brief."]
+        ["Beta", "Beta, described", "Be brief."]
     );
+    assert_eq!(beta.model_id, None, "on the environment's default");
     assert_eq!(
         (beta.status, beta.grant_count),
         (AgentStatus::Active, 0),
@@ -202,8 +202,8 @@ async fn creates_reads_changes_and_deletes_agents(stores: &Stores<'_>, prepare: 
         .await
         .unwrap();
     assert_eq!(
-        (paused.status, paused.name.as_str(), paused.model.as_str()),
-        (AgentStatus::Paused, "Beta", "model-a"),
+        (paused.status, paused.name.as_str(), paused.model_id),
+        (AgentStatus::Paused, "Beta", None),
         "an update changes only what it names"
     );
     assert!(paused.updated_at >= beta.updated_at);
@@ -216,7 +216,7 @@ async fn creates_reads_changes_and_deletes_agents(stores: &Stores<'_>, prepare: 
             &AgentChanges {
                 name: Some("Gamma".to_owned()),
                 description: Some(String::new()),
-                model: Some("model-b".to_owned()),
+                model_id: Some(None),
                 instructions: Some("Be thorough.".to_owned()),
                 status: Some(AgentStatus::Active),
             },
@@ -228,10 +228,9 @@ async fn creates_reads_changes_and_deletes_agents(stores: &Stores<'_>, prepare: 
         [
             renamed.name.as_str(),
             renamed.description.as_str(),
-            renamed.model.as_str(),
             renamed.instructions.as_str()
         ],
-        ["Gamma", "", "model-b", "Be thorough."]
+        ["Gamma", "", "Be thorough."]
     );
     assert_eq!(renamed.status, AgentStatus::Active);
     assert_eq!(store.find_agent(org, ws, beta.id).await.unwrap(), Some(renamed));
@@ -248,6 +247,22 @@ async fn creates_reads_changes_and_deletes_agents(stores: &Stores<'_>, prepare: 
     assert_eq!(
         store
             .update_agent(org, ws, alpha.id, &AgentChanges::default(), &|_| by_suite_in(ws))
+            .await,
+        Err(AgentError::AgentNotFound)
+    );
+    // Missing before anything about the change: even a model that isn't there.
+    assert_eq!(
+        store
+            .update_agent(
+                org,
+                ws,
+                alpha.id,
+                &AgentChanges {
+                    model_id: Some(Some(zupflow_core::ids::ModelId::generate())),
+                    ..AgentChanges::default()
+                },
+                &|_| by_suite_in(ws)
+            )
             .await,
         Err(AgentError::AgentNotFound)
     );

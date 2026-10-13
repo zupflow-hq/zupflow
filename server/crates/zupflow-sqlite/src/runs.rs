@@ -32,7 +32,8 @@ use uuid::Uuid;
 use zupflow_core::audit::{AuditAction, AuditActor, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{
-    AgentId, ApiKeyId, InstallationId, OrganizationId, RunEventId, RunId, SessionId, ToolCallId, WorkspaceId,
+    AgentId, ApiKeyId, InstallationId, ModelConnectionId, ModelId, OrganizationId, RunEventId, RunId, SessionId,
+    ToolCallId, WorkspaceId,
 };
 use zupflow_core::runs::digest::{Sha256Digest, call_digest};
 use zupflow_core::runs::names::Offer;
@@ -184,6 +185,8 @@ struct RunRow {
     job_id: Uuid,
     agent_id: AgentId,
     model: String,
+    model_id: Option<Uuid>,
+    model_connection_id: Option<Uuid>,
     instructions: String,
     input: String,
     usage: RunUsage,
@@ -197,7 +200,8 @@ async fn run_row(
 ) -> Result<Option<RunRow>, StoreError> {
     let row = sqlx::query(
         "SELECT status, continuation, revision, owner_epoch, owner_claimant, lease_until, cancel_requested_at, \
-         execution_version, job_id, agent_id, model, instructions, input, input_tokens, output_tokens, tool_calls \
+         execution_version, job_id, agent_id, model, model_id, model_connection_id, instructions, input, \
+         input_tokens, output_tokens, tool_calls \
          FROM runs WHERE organization_id = ? AND workspace_id = ? AND id = ?",
     )
     .bind(organization_id.uuid())
@@ -220,6 +224,8 @@ async fn run_row(
         job_id: row.try_get("job_id").map_err(unreadable)?,
         agent_id: AgentId::from_uuid(row.try_get("agent_id").map_err(unreadable)?),
         model: row.try_get("model").map_err(unreadable)?,
+        model_id: row.try_get("model_id").map_err(unreadable)?,
+        model_connection_id: row.try_get("model_connection_id").map_err(unreadable)?,
         instructions: row.try_get("instructions").map_err(unreadable)?,
         input: row.try_get("input").map_err(unreadable)?,
         usage: RunUsage {
@@ -457,6 +463,8 @@ async fn load(
                 execution_version: row.execution_version,
             },
             model: row.model,
+            model_id: row.model_id.map(ModelId::from_uuid),
+            connection_id: row.model_connection_id.map(ModelConnectionId::from_uuid),
             instructions: row.instructions,
             input: row.input,
             turns,
@@ -1223,10 +1231,15 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
                 return Err(refused("a claim that starts a run that isn't queued"));
             }
             if *starts {
-                // The run's model is still the deployment's: no organization model or connection names it yet.
+                // The model the run was admitted with; `null` IDs only for a run
+                // admitted before organizations had models.
                 writer.event(
                     RunEventType::RunStarted,
-                    json!({ "model": snapshot.model, "model_id": null, "connection_id": null }),
+                    json!({
+                        "model": snapshot.model,
+                        "model_id": snapshot.model_id,
+                        "connection_id": snapshot.connection_id,
+                    }),
                 );
             }
             Ok(Effects {
@@ -1243,7 +1256,11 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
             abandons,
             request_digest,
             offer,
+            key_version,
         }) => {
+            if key_version.is_some() != snapshot.model_id.is_some() {
+                return Err(refused("a model attempt without the key version of the run's model"));
+            }
             let fits = match control.continuation {
                 Continuation::NeedModel { turn: next } => next == *turn && abandons.is_none(),
                 Continuation::AwaitModel {
@@ -1277,7 +1294,8 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
             let offer = serde_json::to_string(offer).map_err(|_| refused("an offer that isn't JSON"))?;
             sqlx::query(
                 "INSERT INTO run_model_attempts (id, organization_id, workspace_id, run_id, turn, attempt, state, \
-                 request_digest, offer, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?)",
+                 request_digest, offer, key_version, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?)",
             )
             .bind(Uuid::now_v7())
             .bind(org)
@@ -1287,11 +1305,26 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
             .bind(i64::from(*attempt))
             .bind(request_digest.to_string())
             .bind(offer)
+            .bind(key_version.map(i64::from))
             .bind(now.millis())
             .bind(now.millis())
             .execute(&mut *writer.connection)
             .await
             .map_err(failed("prepare_model"))?;
+            // The key version the run first used, kept as it started.
+            if let Some(key_version) = key_version {
+                sqlx::query(
+                    "UPDATE runs SET model_key_version = coalesce(model_key_version, ?) \
+                     WHERE organization_id = ? AND workspace_id = ? AND id = ?",
+                )
+                .bind(i64::from(*key_version))
+                .bind(org)
+                .bind(ws)
+                .bind(run)
+                .execute(&mut *writer.connection)
+                .await
+                .map_err(failed("prepare_model"))?;
+            }
             Ok(Effects::job(JobAction::Keep))
         }
         Operation::CommitTurn(CommitTurn {
@@ -2131,8 +2164,9 @@ async fn admit(
     let continuation = Continuation::NeedModel { turn: 0 };
     sqlx::query(
         "INSERT INTO runs (id, organization_id, workspace_id, agent_id, session_id, trigger, job_id, status, input, \
-         model, instructions, input_tokens, output_tokens, tool_calls, created_at, execution_version, \
-         revision, continuation) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, 0, 0, 0, ?, ?, 1, ?)",
+         model, model_id, model_connection_id, instructions, input_tokens, output_tokens, tool_calls, created_at, \
+         execution_version, revision, continuation) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, 1, ?)",
     )
     .bind(run_id.uuid())
     .bind(organization_id.uuid())
@@ -2143,6 +2177,8 @@ async fn admit(
     .bind(job_id)
     .bind(&admit.input)
     .bind(&admit.model)
+    .bind(admit.model_id.uuid())
+    .bind(admit.connection_id.uuid())
     .bind(&admit.instructions)
     .bind(now.millis())
     .bind(i64::from(admit.execution_version))
@@ -2742,7 +2778,7 @@ mod tests {
                 &NewAgent {
                     name: "A".to_owned(),
                     description: String::new(),
-                    model: "m".to_owned(),
+                    model_id: None,
                     instructions: String::new(),
                 },
                 &|_| zupflow_conformance::audit_store::by_suite_in(tenant.workspace),
@@ -2759,7 +2795,11 @@ mod tests {
                 session_id: zupflow_core::ids::SessionId::generate(),
                 trigger: RunTrigger::Console,
                 input: "hi".to_owned(),
-                model: "m".to_owned(),
+                model: zupflow_core::model_store::RunModel {
+                    model_id: ModelId::generate(),
+                    connection_id: ModelConnectionId::generate(),
+                    provider_model_id: "m".to_owned(),
+                },
                 instructions: String::new(),
             },
         );

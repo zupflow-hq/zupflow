@@ -1,6 +1,6 @@
 //! Envelope encryption for the secrets Zupflow holds (OAuth client secrets,
 //! installation credentials, a Connect session's pending OAuth authorization,
-//! webhook signing secrets).
+//! webhook signing secrets, model provider keys).
 //!
 //! Each secret is encrypted with its own random data key, and the data key is
 //! wrapped by a [`KeyService`]: a local key in the open-source build, a managed
@@ -22,7 +22,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::apps::ClientRegistrationId;
 use crate::environment::Environment;
-use crate::ids::{AppId, ConnectSessionId, InstallationId, OrganizationId, WebhookEndpointId, WorkspaceId};
+use crate::ids::{
+    AppId, ConnectSessionId, InstallationId, ModelConnectionId, OrganizationId, WebhookEndpointId, WorkspaceId,
+};
 
 /// What a secret is for, implied by the constructor that built its context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +33,7 @@ enum Purpose {
     InstallationCredential,
     ConnectAuthorization,
     WebhookSigningSecret,
+    ModelProviderKey,
 }
 
 impl Purpose {
@@ -40,6 +43,7 @@ impl Purpose {
             Self::InstallationCredential => "installation_credential",
             Self::ConnectAuthorization => "connect_authorization",
             Self::WebhookSigningSecret => "webhook_signing_secret",
+            Self::ModelProviderKey => "model_provider_key",
         }
     }
 }
@@ -172,6 +176,26 @@ impl EncryptionContext {
             purpose: Purpose::WebhookSigningSecret,
             app_id: None,
             object: endpoint_id.to_string(),
+            version,
+        }
+    }
+
+    /// A model connection's provider API key (decision 0049), one value per
+    /// key version. A connection belongs to one organization and one
+    /// environment, and no workspace or app.
+    pub fn model_provider_key(
+        organization_id: OrganizationId,
+        environment: Environment,
+        connection_id: ModelConnectionId,
+        version: u32,
+    ) -> Self {
+        Self {
+            organization_id,
+            workspace_id: None,
+            environment,
+            purpose: Purpose::ModelProviderKey,
+            app_id: None,
+            object: connection_id.to_string(),
             version,
         }
     }
@@ -398,6 +422,11 @@ mod tests {
             format!(
                 "zupflow.v1;org={org};ws=-;env=production;purpose=webhook_signing_secret;app=-;object={we};version=2"
             )
+        );
+        let mc = ModelConnectionId::generate();
+        assert_eq!(
+            EncryptionContext::model_provider_key(org, Environment::Sandbox, mc, 5).canonical(),
+            format!("zupflow.v1;org={org};ws=-;env=sandbox;purpose=model_provider_key;app=-;object={mc};version=5")
         );
         let registration = ClientRegistrationId::generate();
         assert_eq!(

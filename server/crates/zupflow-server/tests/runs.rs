@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use zupflow_core::ids::{AppId, InstallationId, OrganizationId, RunId, ToolCallId, UserId, WorkspaceId};
+use zupflow_core::model_store::RouteState;
 use zupflow_core::models::TokenUsage;
 use zupflow_core::models::{Completion, ModelProvider, ProviderError, ToolSpec, Turn};
 use zupflow_core::policy::{
@@ -53,6 +54,8 @@ struct Setup {
     short_id: String,
     agent: String,
     production_agent: String,
+    /// Sandbox's default model.
+    sandbox_model: String,
 }
 
 async fn connect(server: &Server, who: &str, org: &str, ws: &str, app: &str) -> String {
@@ -125,6 +128,8 @@ async fn setup() -> Setup {
     let org = server.organization("alice", "northwind").await;
     let sandbox = id(&server.workspace("alice", &org, "sandbox", "sandbox").await).to_owned();
     let production = id(&server.workspace("alice", &org, "production", "production").await).to_owned();
+    let sandbox_model = server.default_model("alice", &org, "sandbox").await;
+    server.default_model("alice", &org, "production").await;
     let (_, created) = server
         .send(
             call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(json!({
@@ -186,6 +191,7 @@ async fn setup() -> Setup {
         short_id,
         agent,
         production_agent,
+        sandbox_model,
     }
 }
 
@@ -369,6 +375,7 @@ impl Setup {
         let facts = |claim: Option<u64>, more: Facts| Facts {
             claimant: Some(claimant),
             claim,
+            model_route: Some(RouteState::Usable { key_version: 1 }),
             ..more
         };
         let step = |facts: Facts| async move {
@@ -489,10 +496,11 @@ async fn answers_from_the_conversation_alone() {
         ["run.queued", "run.started", "message.assistant", "run.completed"]
     );
     let events = setup.events(id(run)).await;
-    assert_eq!(
-        events[1]["data"],
-        json!({ "model": "model-a", "model_id": null, "connection_id": null })
-    );
+    // The run names the provider's model, the organization's model and the
+    // connection it went through.
+    assert_eq!(events[1]["data"]["model"], common::DEFAULT_MODEL);
+    assert_eq!(events[1]["data"]["model_id"], setup.sandbox_model);
+    assert!(events[1]["data"]["connection_id"].as_str().unwrap().starts_with("mcn_"));
     assert_eq!(events[3]["data"]["usage"], done["usage"]);
     let sequences: Vec<u64> = events.iter().map(|event| event["sequence"].as_u64().unwrap()).collect();
     assert_eq!(sequences, [1, 2, 3, 4]);
@@ -1028,7 +1036,7 @@ async fn offers_a_changed_tool_as_pinned_and_waits_for_approval() {
     .unwrap();
     while zupflow_server::discovery::work_once(&setup.server.state).await {}
     let recording = Arc::new(Recording {
-        inner: zupflow_basic::scripted_model::ScriptedModel::serving(["model-a"]),
+        inner: zupflow_basic::scripted_model::ScriptedModel::serving([common::DEFAULT_MODEL]),
         offered: Mutex::new(Vec::new()),
     });
     let mut state = setup.server.state.clone();
@@ -1771,6 +1779,7 @@ async fn elsewhere(setup: &Setup) -> Elsewhere {
     let server = &setup.server;
     let org = server.organization("alice", "larkspur").await;
     let ws = id(&server.workspace("alice", &org, "sandbox", "sandbox").await).to_owned();
+    server.default_model("alice", &org, "sandbox").await;
     let (status, created) = server
         .send(
             call("alice", Method::POST, format!("/v1/organizations/{org}/apps")).body(json!({

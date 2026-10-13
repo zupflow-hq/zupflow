@@ -5,8 +5,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use zupflow_basic::configured_models::ConfiguredModels;
-
 #[derive(Debug, Clone)]
 pub struct Config {
     /// `ZUPFLOW_LISTEN`: where to listen. Defaults to loopback only.
@@ -38,22 +36,23 @@ pub struct Config {
     /// server at, like `https://zupflow.example`; OAuth redirect URIs are
     /// built on it (decision 0033). Defaults to `http://localhost:{port}`.
     pub public_url: String,
-    /// `ZUPFLOW_MODELS`: the models agents can use, a JSON array like
-    /// `[{"id":"model-a","name":"Model A","provider":"Example","description":"…"}]`
-    /// (see `ConfiguredModels`). Unset offers none, so no agent can be created.
-    pub models: ConfiguredModels,
-    /// `ZUPFLOW_MODEL_PROVIDER`: what answers runs. Unset, none does: every
-    /// run fails `model_unavailable`. `scripted` is the deterministic model
-    /// for local work and tests, never a deployment's: it answers from a
-    /// script, and turns `call <tool> {…}` lines of a run's input into calls.
+    /// `ZUPFLOW_MODEL_PROVIDER`: what checks organizations' provider keys,
+    /// lists their models and answers runs. Unset, nothing does: connecting a
+    /// provider answers `503`, and every run fails `model_unavailable`.
+    /// `scripted` is the deterministic stand-in for local work and tests,
+    /// never a deployment's: its providers list fixed catalogs and refuse a
+    /// key containing `invalid`, and its model answers from a script, turning
+    /// `call <tool> {…}` lines of a run's input into calls. Which models an
+    /// organization can use is its own: connections and models are added
+    /// through the API, never configured here.
     pub model_provider: ModelProviderMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelProviderMode {
-    /// No provider: runs fail `model_unavailable`.
+    /// No provider: connecting one answers `503`, and runs fail `model_unavailable`.
     None,
-    /// The scripted model in `zupflow-basic`, serving `ZUPFLOW_MODELS`.
+    /// The scripted providers and model in `zupflow-basic`.
     Scripted,
 }
 
@@ -84,6 +83,10 @@ pub enum ConfigError {
     /// orphan every API key.
     #[error("{old} is now {new}; rename it")]
     Renamed { old: &'static str, new: &'static str },
+    /// A variable an earlier version read and none reads now: silently
+    /// ignoring it would leave its operator believing it still applies.
+    #[error("{name} is no longer read: {instead}; unset it")]
+    Retired { name: &'static str, instead: &'static str },
     #[error("ZUPFLOW_SECRET_KEY must be 32 bytes, base64-encoded: generate one with `openssl rand -base64 32`")]
     InvalidSecretKey,
     #[error(
@@ -97,8 +100,6 @@ pub enum ConfigError {
     InvalidPublicUrl,
     #[error("ZUPFLOW_CONSOLE_ORIGIN must be one origin like https://console.zupflow.example, with no path")]
     InvalidConsoleOrigin,
-    #[error("ZUPFLOW_MODELS {0}")]
-    InvalidModels(zupflow_basic::configured_models::ModelsConfigError),
     #[error("ZUPFLOW_MODEL_PROVIDER must be `scripted`, or unset for none")]
     UnknownModelProvider,
     #[error("ZUPFLOW_IDENTITY must be `local` or `oidc`")]
@@ -174,6 +175,12 @@ impl Config {
                 new: "ZUPFLOW_SECRET_KEY",
             });
         }
+        if get("ZUPFLOW_MODELS")?.is_some() {
+            return Err(ConfigError::Retired {
+                name: "ZUPFLOW_MODELS",
+                instead: "organizations add their own models under Model providers",
+            });
+        }
         let secret_key = match set("ZUPFLOW_SECRET_KEY")? {
             Some(value) => {
                 use base64::Engine;
@@ -192,10 +199,6 @@ impl Config {
         let console_origin = set("ZUPFLOW_CONSOLE_ORIGIN")?
             .map(|value| public_origin(value.trim()).ok_or(ConfigError::InvalidConsoleOrigin))
             .transpose()?;
-        let models = match set("ZUPFLOW_MODELS")? {
-            Some(value) => ConfiguredModels::parse(&value).map_err(ConfigError::InvalidModels)?,
-            None => ConfiguredModels::none(),
-        };
         let model_provider = match set("ZUPFLOW_MODEL_PROVIDER")?.as_deref() {
             None => ModelProviderMode::None,
             Some("scripted") => ModelProviderMode::Scripted,
@@ -210,7 +213,6 @@ impl Config {
             allowed_origins,
             console_origin,
             public_url,
-            models,
             model_provider,
         })
     }
@@ -461,29 +463,27 @@ mod tests {
     }
 
     #[test]
-    fn offers_the_models_it_is_given_and_stops_on_a_mistyped_list() {
-        let models = |value: &'static str| oidc_with(&[("ZUPFLOW_MODELS", value)]);
-        assert_eq!(
-            oidc_with(&[]).expect("defaults").models,
-            ConfiguredModels::none(),
-            "none unless configured"
-        );
-        assert_eq!(models("[]").expect("an empty list").models, ConfiguredModels::none());
-        assert_eq!(
-            models(r#"[{"id":"model-a","name":"Model A","provider":"Example"}]"#)
-                .expect("a model")
-                .models,
-            ConfiguredModels::parse(r#"[{"id":"model-a","name":"Model A","provider":"Example","description":""}]"#)
-                .expect("the same model")
-        );
-        for bad in [
-            "model-a",
-            r#"[{"id":"model-a"}]"#,
-            r#"{"id":"model-a","name":"A","provider":"P"}"#,
-        ] {
-            assert!(matches!(models(bad), Err(ConfigError::InvalidModels(_))), "{bad}");
+    fn refuses_the_retired_model_list() {
+        for value in ["[]", r#"[{"id":"model-a","name":"A","provider":"Example"}]"#, ""] {
+            let refused = oidc_with(&[("ZUPFLOW_MODELS", value)]);
+            assert!(
+                matches!(
+                    refused,
+                    Err(ConfigError::Retired {
+                        name: "ZUPFLOW_MODELS",
+                        ..
+                    })
+                ),
+                "{value:?}"
+            );
+            assert_eq!(
+                refused.err().map(|error| error.to_string()).as_deref(),
+                Some(
+                    "ZUPFLOW_MODELS is no longer read: organizations add their own models under Model providers; \
+                     unset it"
+                )
+            );
         }
-        assert!(matches!(models(""), Err(ConfigError::Empty { name: "ZUPFLOW_MODELS" })));
     }
 
     #[test]

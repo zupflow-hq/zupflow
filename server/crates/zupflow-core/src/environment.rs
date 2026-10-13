@@ -26,6 +26,14 @@ impl Environment {
             Self::Production => "production",
         }
     }
+
+    /// The environment as people read it: `Sandbox`, `Production`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sandbox => "Sandbox",
+            Self::Production => "Production",
+        }
+    }
 }
 
 impl fmt::Display for Environment {

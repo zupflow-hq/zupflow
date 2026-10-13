@@ -44,8 +44,11 @@ pub struct AppState {
     pub agents: Arc<dyn zupflow_core::agents::AgentStore>,
     /// The organization's tool policy and its levels (decision 0040).
     pub policies: Arc<dyn zupflow_core::policy::ToolPolicyStore>,
-    /// The models agents can use.
-    pub models: Arc<dyn zupflow_core::models::ModelCatalog>,
+    /// Organizations' model provider connections, models and default models
+    /// (decisions 0049, 0050).
+    pub model_store: Arc<dyn zupflow_core::model_store::ModelStore>,
+    /// Checks a connection's key and lists its provider's models.
+    pub model_catalog: Arc<dyn zupflow_core::model_providers::ModelProviderCatalog>,
     pub connect: Arc<dyn ConnectStore>,
     /// Seals the secrets Zupflow holds (decision 0033).
     pub keys: Arc<dyn KeyService>,

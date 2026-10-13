@@ -42,6 +42,7 @@ use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AgentId, InstallationId, OrganizationId, RunId, ToolCallId, WorkspaceId};
 use zupflow_core::installations::{Installation, InstallationStatus, InstalledApp};
 use zupflow_core::jobs::{Job, JobId, LeaseToken, Retry};
+use zupflow_core::model_store::RouteState;
 use zupflow_core::models::{ProviderError, validate_completion};
 use zupflow_core::policy::{CallApp, Decision, GrantedAs, OrganizationLevel, ToolCall, Verdict, floor};
 use zupflow_core::runs::digest::{Sha256Digest, call_digest};
@@ -452,9 +453,15 @@ impl<P: ToolPort> Driver<'_, P> {
             return Ok(facts);
         }
         match control.continuation {
-            Continuation::NeedModel { .. } => facts.offer = Some(self.offer().await?),
+            Continuation::NeedModel { .. } => {
+                facts.offer = Some(self.offer().await?);
+                facts.model_route = self.model_route(snapshot).await?;
+            }
             Continuation::AwaitModel { .. } => match model.map(|answer| &answer.result) {
-                None => facts.offer = Some(self.offer().await?),
+                None => {
+                    facts.offer = Some(self.offer().await?);
+                    facts.model_route = self.model_route(snapshot).await?;
+                }
                 Some(ModelResult::Answered(completion)) => {
                     let wanted = calls_to_decide(snapshot, completion, &self.limits).map_err(|_| "run_inconsistent")?;
                     for (position, tool) in wanted {
@@ -483,6 +490,21 @@ impl<P: ToolPort> Driver<'_, P> {
             Continuation::AwaitApproval { .. } | Continuation::AwaitCall { .. } | Continuation::Done => {}
         }
         Ok(facts)
+    }
+
+    /// Whether the run's model can be called now: its model and connection,
+    /// found in the run's own organization and workspace's environment.
+    /// `None` for a run admitted before organizations had models.
+    async fn model_route(&self, snapshot: &Snapshot) -> Result<Option<RouteState>, &'static str> {
+        let (Some(model_id), Some(connection_id)) = (snapshot.model_id, snapshot.connection_id) else {
+            return Ok(None);
+        };
+        self.state
+            .model_store
+            .route_state(self.organization_id, self.workspace_id, model_id, connection_id)
+            .await
+            .map(Some)
+            .map_err(|_| "store_unavailable")
     }
 
     /// Asks the model; what came of it, for the step that commits it.

@@ -608,6 +608,24 @@ async fn start_run(
     let Some(input) = input else {
         return Err(ApiError::internal().into());
     };
+    // Resolved once, now: the agent's model, or else its environment's
+    // default. The run keeps it even if either changes before it starts.
+    let model = state
+        .model_store
+        .run_model(organization_id, workspace_id, agent.model_id)
+        .await
+        .map_err(|_| unavailable())?
+        .ok_or_else(|| {
+            Failure(ApiError::new(
+                422,
+                "model_not_configured",
+                format!(
+                    "{} has no model and {} has no default model. Choose a default model under Model providers, or a model for the agent.",
+                    agent.name,
+                    access.workspace.environment.name()
+                ),
+            ))
+        })?;
     let run_id = RunId::generate();
     let request = reducer::admit(
         organization_id,
@@ -618,7 +636,7 @@ async fn start_run(
             session_id: SessionId::generate(),
             trigger,
             input,
-            model: agent.model,
+            model,
             instructions: agent.instructions,
         },
     );

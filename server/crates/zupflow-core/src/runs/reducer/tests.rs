@@ -8,7 +8,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::*;
-use crate::ids::{AgentId, SessionId};
+use crate::ids::{AgentId, ModelConnectionId, ModelId, SessionId};
+use crate::model_store::{RouteState, RunModel};
 use crate::models::TokenUsage;
 use crate::runs::names::{Candidate, build_offer};
 use crate::runs::state::{CallAttempt, CommittedTurn, ModelAttempt, RequestId, RunControl};
@@ -145,6 +146,8 @@ fn fresh() -> Snapshot {
             execution_version: EXECUTION_VERSION,
         },
         model: "model-a".to_owned(),
+        model_id: Some(model_id()),
+        connection_id: Some(connection_id()),
         instructions: "Be brief.".to_owned(),
         input: "Make a task.".to_owned(),
         turns: Vec::new(),
@@ -246,10 +249,19 @@ fn sending(lease_ms: i64) -> Snapshot {
     )
 }
 
+fn model_id() -> ModelId {
+    ModelId::from_uuid(Uuid::from_u128(30))
+}
+
+fn connection_id() -> ModelConnectionId {
+    ModelConnectionId::from_uuid(Uuid::from_u128(31))
+}
+
 fn facts() -> Facts {
     Facts {
         claimant: Some(claimant(1)),
         offer: Some(offer()),
+        model_route: Some(RouteState::Usable { key_version: 3 }),
         ..Facts::at(at(0))
     }
 }
@@ -580,6 +592,7 @@ fn need_model_prepares_an_attempt_with_the_offer_frozen() {
             abandons: None,
             request_digest: request.digest(),
             offer: offer(),
+            key_version: Some(3),
         })
     );
     assert_eq!(guards(&plan), keeps(1));
@@ -599,6 +612,100 @@ fn need_model_prepares_an_attempt_with_the_offer_frozen() {
             .description
             .starts_with("Taskboard, installation \"Personal\" (p3x7ta).")
     );
+}
+
+#[test]
+fn calls_the_model_only_while_its_route_is_usable() {
+    let snapshot = running(Continuation::NeedModel { turn: 0 });
+    let gone = Facts {
+        model_route: Some(RouteState::Removed),
+        ..claimed()
+    };
+    let plan = planned(&snapshot, &gone);
+    assert_eq!(failure_code(&plan), MODEL_UNAVAILABLE);
+    assert!(matches!(plan.io(), Io::Nothing));
+    let refused = Facts {
+        model_route: Some(RouteState::KeyInvalid {
+            connection_label: "Anthropic".to_owned(),
+        }),
+        ..claimed()
+    };
+    let plan = planned(&snapshot, &refused);
+    assert_eq!(failure_code(&plan), MODEL_KEY_INVALID);
+    let Operation::Finish(Finish {
+        ending: RunEnding::Failed { error },
+        ..
+    }) = operation(&plan)
+    else {
+        panic!("fails");
+    };
+    assert_eq!(
+        error.message,
+        "The model provider refused Anthropic's key. Replace it under Model providers."
+    );
+    // Without the route, nothing is planned.
+    let unread = Facts {
+        model_route: None,
+        ..claimed()
+    };
+    assert_eq!(
+        advance(&snapshot, &unread),
+        Err(AdvanceError::MissingFact("model_route"))
+    );
+    // A run admitted before organizations had models has none to call: it
+    // fails rather than sending a deployment's model ID to a provider.
+    let mut legacy = snapshot.clone();
+    legacy.model_id = None;
+    legacy.connection_id = None;
+    let plan = planned(&legacy, &unread);
+    assert_eq!(failure_code(&plan), MODEL_UNAVAILABLE);
+    assert!(matches!(plan.io(), Io::Nothing));
+    let Operation::Finish(Finish {
+        ending: RunEnding::Failed { error },
+        ..
+    }) = operation(&plan)
+    else {
+        panic!("fails");
+    };
+    assert!(
+        error.message.contains("admitted before organizations had models"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn fails_an_awaited_model_call_whose_route_went() {
+    // The worker that asked the model stopped; the next one finds the model
+    // gone and fails the run, abandoning the attempt, instead of asking again.
+    let snapshot = awaiting_model();
+    let gone = Facts {
+        model_route: Some(RouteState::Removed),
+        ..claimed()
+    };
+    let plan = planned(&snapshot, &gone);
+    assert_eq!(failure_code(&plan), MODEL_UNAVAILABLE);
+    assert!(matches!(plan.io(), Io::Nothing));
+    let Operation::Finish(Finish {
+        ending: RunEnding::Failed { error },
+        abandons,
+        ..
+    }) = operation(&plan)
+    else {
+        panic!("fails");
+    };
+    assert_eq!(
+        error.message,
+        "The run's model was removed while the run was under way."
+    );
+    assert_eq!(*abandons, Some(ModelAttemptRef { turn: 0, attempt: 1 }));
+    let refused = Facts {
+        model_route: Some(RouteState::KeyInvalid {
+            connection_label: "OpenAI".to_owned(),
+        }),
+        ..claimed()
+    };
+    assert_eq!(failure_code(&planned(&snapshot, &refused)), MODEL_KEY_INVALID);
 }
 
 #[test]
@@ -1681,7 +1788,11 @@ fn admit_starts_every_run_the_same_way() {
         session_id: SessionId::from_uuid(Uuid::from_u128(21)),
         trigger: RunTrigger::Api,
         input: "Make a task.".to_owned(),
-        model: "model-a".to_owned(),
+        model: RunModel {
+            model_id: model_id(),
+            connection_id: connection_id(),
+            provider_model_id: "model-a".to_owned(),
+        },
         instructions: "Be brief.".to_owned(),
     };
     let request = admit(organization(), workspace(), run_id(), &run);
@@ -1692,6 +1803,10 @@ fn admit_starts_every_run_the_same_way() {
         panic!("admits");
     };
     assert_eq!(admitted.execution_version, EXECUTION_VERSION);
+    assert_eq!(
+        (admitted.model.as_str(), admitted.model_id, admitted.connection_id),
+        ("model-a", model_id(), connection_id())
+    );
     assert_eq!(request.operation().status_after(RunStatus::Queued), RunStatus::Queued);
     assert_eq!(
         request.operation().continuation_after(Continuation::Done),
@@ -2085,6 +2200,7 @@ fn every_operation_says_where_it_leaves_the_run() {
                 abandons: None,
                 request_digest: Sha256Digest::of(b""),
                 offer: Offer::default(),
+                key_version: None,
             }),
             RunStatus::Queued,
             Continuation::AwaitModel { turn: 1, attempt: 2 },

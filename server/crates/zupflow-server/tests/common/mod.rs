@@ -17,11 +17,10 @@ use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundReques
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{Database, SqliteApiKeyStore, SqliteOrganizationStore, SqliteWorkspaceStore};
 
-/// The models a test server offers, as `ZUPFLOW_MODELS` would list them.
-pub const MODELS: &str = r#"[
-    {"id":"model-a","name":"Model A","provider":"Example","description":"The default."},
-    {"id":"model-b","name":"Model B","provider":"Example"}
-]"#;
+/// A key the scripted providers accept, and the model a test environment's
+/// default routes to through it.
+pub const PROVIDER_KEY: &str = "sk-test-0123456789abcdefWXYZ";
+pub const DEFAULT_MODEL: &str = "gpt-5-mini";
 
 pub struct TestIdentity;
 
@@ -403,15 +402,16 @@ impl Server {
             agents: Arc::new(zupflow_sqlite::SqliteAgentStore::new(database.clone())),
             policies: Arc::new(zupflow_sqlite::SqliteToolPolicyStore::new(database.clone())),
             runs: Arc::new(zupflow_sqlite::SqliteRunStore::new(database.clone())),
-            provider: Arc::new(zupflow_basic::scripted_model::ScriptedModel::serving([
-                "model-a", "model-b",
-            ])),
+            provider: Arc::new(zupflow_basic::scripted_model::ScriptedModel::serving(
+                zupflow_basic::scripted_providers::ScriptedProviders::tool_models(),
+            )),
             approvals: Arc::new(zupflow_basic::configured_policy::ConfiguredPolicy::new(Arc::new(
                 zupflow_sqlite::SqliteToolPolicyStore::new(database.clone()),
             ))),
             events: Arc::new(zupflow_basic::in_process_events::InProcessEventBus::default()),
             metrics: Arc::new(zupflow_basic::in_process_metrics::InProcessMetrics::default()),
-            models: Arc::new(zupflow_basic::configured_models::ConfiguredModels::parse(MODELS).unwrap()),
+            model_store: Arc::new(zupflow_sqlite::SqliteModelStore::new(database.clone())),
+            model_catalog: Arc::new(zupflow_basic::scripted_providers::ScriptedProviders),
             connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
             jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
             tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),
@@ -510,6 +510,41 @@ impl Server {
             .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         body["data"].clone()
+    }
+
+    /// Connects OpenAI in `org`'s `environment` with [`PROVIDER_KEY`], adds
+    /// [`DEFAULT_MODEL`] from it and makes it the environment's default, so
+    /// runs there have a model. Returns the model's ID.
+    pub async fn default_model(&self, user: &str, org: &str, environment: &str) -> String {
+        let (status, connection) = self
+            .send(
+                call(user, Method::POST, format!("/v1/organizations/{org}/model-connections")).body(json!({
+                    "environment": environment, "kind": "openai", "label": "OpenAI", "api_key": PROVIDER_KEY,
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{connection}");
+        let (status, model) = self
+            .send(
+                call(user, Method::POST, format!("/v1/organizations/{org}/models")).body(json!({
+                    "connection_id": connection["data"]["id"], "provider_model_id": DEFAULT_MODEL,
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{model}");
+        let model_id = model["data"]["id"].as_str().unwrap().to_owned();
+        let (status, body) = self
+            .send(
+                call(
+                    user,
+                    Method::PUT,
+                    format!("/v1/organizations/{org}/default-models/{environment}"),
+                )
+                .body(json!({ "model_id": model_id })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        model_id
     }
 
     /// Makes `user` an active member of `org` with `role`: invited by `owner`,

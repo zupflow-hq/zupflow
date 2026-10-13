@@ -7,8 +7,6 @@
 
 mod common;
 
-use std::sync::Arc;
-
 use axum::http::{Method, StatusCode};
 use common::{Server, call, code};
 use serde_json::{Value, json};
@@ -16,7 +14,6 @@ use zupflow_core::apps::ToolEffect;
 use zupflow_core::ids::{InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{ListedTool, ToolRevision};
-use zupflow_server::RequestGuard;
 use zupflow_server::discovery::work_once;
 
 const MCP: &str = "https://tools.example/mcp";
@@ -337,7 +334,7 @@ async fn creates_reads_changes_and_deletes_agents() {
 
 #[tokio::test]
 async fn checks_every_field_and_the_model() {
-    let mut server = Server::new().await;
+    let server = Server::new().await;
     let org = server.organization("alice", "northwind").await;
     let ws = id(&server.workspace("alice", &org, "acme-sandbox", "sandbox").await).to_owned();
     let fields_of = |body: &Value| -> Vec<String> {
@@ -429,18 +426,59 @@ async fn checks_every_field_and_the_model() {
         .await;
     assert_eq!((status, &answer["data"]["model_id"]), (StatusCode::OK, &Value::Null));
 
-    // With no deployment models, no agent could run: none is created.
-    let mut state = server.state.clone();
-    state.models = Arc::new(zupflow_basic::configured_models::ConfiguredModels::none());
-    server.app = zupflow_server::app(state, RequestGuard::default());
+    // A model added in Sandbox is the agent's to use; one added in
+    // Production isn't, here, and nothing falls back to it.
+    let sandbox_model = server.default_model("alice", &org, "sandbox").await;
+    let production_model = server.default_model("alice", &org, "production").await;
     let (status, answer) = server
-        .send(call("alice", Method::POST, agents_path(&ws)).naming(&org).body(json!({
-            "name": "A", "description": "", "instructions": "",
-        })))
+        .send(
+            call("alice", Method::PATCH, &path)
+                .naming(&org)
+                .body(json!({ "model_id": production_model })),
+        )
         .await;
     assert_eq!(
         (status, code(&answer)),
-        (StatusCode::UNPROCESSABLE_ENTITY, "model_not_configured")
+        (StatusCode::UNPROCESSABLE_ENTITY, "unknown_model")
+    );
+    let (status, answer) = server
+        .send(
+            call("alice", Method::PATCH, &path)
+                .naming(&org)
+                .body(json!({ "model_id": sandbox_model })),
+        )
+        .await;
+    assert_eq!(
+        (status, &answer["data"]["model_id"]),
+        (StatusCode::OK, &json!(sandbox_model))
+    );
+    let (status, answer) = server
+        .send(call("alice", Method::POST, agents_path(&ws)).naming(&org).body(json!({
+            "name": "B", "description": "", "instructions": "", "model_id": sandbox_model,
+        })))
+        .await;
+    assert_eq!(
+        (status, &answer["data"]["model_id"]),
+        (StatusCode::CREATED, &json!(sandbox_model))
+    );
+
+    // The model an agent holds stays until the agent lets it go.
+    server
+        .send(
+            call(
+                "alice",
+                Method::PUT,
+                format!("/v1/organizations/{org}/default-models/sandbox"),
+            )
+            .body(json!({ "model_id": null })),
+        )
+        .await;
+    let model_path = format!("/v1/organizations/{org}/models/{sandbox_model}");
+    let (status, answer) = server.send(call("alice", Method::DELETE, &model_path)).await;
+    assert_eq!(
+        (status, code(&answer)),
+        (StatusCode::CONFLICT, "model_in_use"),
+        "{answer}"
     );
 }
 

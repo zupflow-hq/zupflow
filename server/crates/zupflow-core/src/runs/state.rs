@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
-use crate::ids::{ApiKeyId, InstallationId, OrganizationId, RunId, ToolCallId, WorkspaceId};
+use crate::ids::{
+    ApiKeyId, InstallationId, ModelConnectionId, ModelId, OrganizationId, RunId, ToolCallId, WorkspaceId,
+};
 use crate::models::TokenUsage;
 use crate::policy::{Decision, Verdict};
 use crate::runs::digest::Sha256Digest;
@@ -350,8 +352,13 @@ pub struct Snapshot {
     pub workspace_id: WorkspaceId,
     pub run_id: RunId,
     pub control: RunControl,
-    /// The agent's model and instructions as the run started.
+    /// The provider's model ID, and the agent's instructions, as the run
+    /// was admitted.
     pub model: String,
+    /// The organization's model and its connection, as the run was
+    /// admitted; `None` for a run admitted before organizations had models.
+    pub model_id: Option<ModelId>,
+    pub connection_id: Option<ModelConnectionId>,
     pub instructions: String,
     pub input: String,
     /// In order: `turns[n].turn == n`.

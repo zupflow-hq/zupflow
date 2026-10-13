@@ -50,8 +50,12 @@ use uuid::Uuid;
 use zupflow_core::agents::{AgentStore, NewAgent};
 use zupflow_core::audit::{AuditAction, AuditActor, AuditFilter, AuditObject, AuditStore};
 use zupflow_core::environment::Environment;
-use zupflow_core::ids::{AgentId, ApiKeyId, InstallationId, OrganizationId, RunId, SessionId, ToolCallId, WorkspaceId};
+use zupflow_core::ids::{
+    AgentId, ApiKeyId, InstallationId, ModelConnectionId, ModelId, OrganizationId, RunId, SessionId, ToolCallId,
+    WorkspaceId,
+};
 use zupflow_core::jobs::{Job, JobError, JobQueue};
+use zupflow_core::model_store::{RouteState, RunModel};
 use zupflow_core::models::{Completion, ModelToolCall, Reply, TokenUsage};
 use zupflow_core::runs::digest::{Sha256Digest, call_digest};
 use zupflow_core::runs::names::{Candidate, Offer, build_offer};
@@ -189,7 +193,7 @@ async fn agent(stores: &Stores<'_>, organization_id: OrganizationId, workspace: 
             &NewAgent {
                 name: name.to_owned(),
                 description: String::new(),
-                model: "model-a".to_owned(),
+                model_id: None,
                 instructions: "Be brief.".to_owned(),
             },
             &|_| by_suite_in(workspace),
@@ -199,13 +203,23 @@ async fn agent(stores: &Stores<'_>, organization_id: OrganizationId, workspace: 
         .id
 }
 
+/// The organization's model every suite run is admitted with. The run store
+/// keeps it as the run's own record; it references no model.
+fn run_model() -> RunModel {
+    RunModel {
+        model_id: ModelId::from_uuid(Uuid::from_u128(0x5eed_0001)),
+        connection_id: ModelConnectionId::from_uuid(Uuid::from_u128(0x5eed_0002)),
+        provider_model_id: "model-a".to_owned(),
+    }
+}
+
 fn new_run(agent_id: AgentId, input: &str) -> NewRun {
     NewRun {
         agent_id,
         session_id: SessionId::generate(),
         trigger: RunTrigger::Api,
         input: input.to_owned(),
-        model: "model-a".to_owned(),
+        model: run_model(),
         instructions: "Be brief.".to_owned(),
     }
 }
@@ -391,6 +405,9 @@ fn facts(stores: &Stores<'_>, who: ClaimantId, epoch: Option<u64>) -> Facts {
 async fn plan(stores: &Stores<'_>, at: At, facts: &Facts) -> Plan {
     let snapshot = snapshot(stores, at).await;
     let mut facts = facts.clone();
+    if facts.model_route.is_none() {
+        facts.model_route = Some(RouteState::Usable { key_version: 1 });
+    }
     if facts.send_check.is_none() {
         facts.send_check = parking_check(&snapshot, InstallationCheck::Usable);
     }
@@ -1024,7 +1041,12 @@ async fn walks_a_run_through_every_step(stores: &Stores<'_>, a: Tenant, agent_a:
     assert_eq!(kinds(&started), [RunEventType::RunStarted]);
     assert_eq!(
         started.events[0].data,
-        json!({ "model": "model-a", "model_id": null, "connection_id": null })
+        json!({
+            "model": "model-a",
+            "model_id": run_model().model_id,
+            "connection_id": run_model().connection_id,
+        }),
+        "the model the run was admitted with"
     );
     assert_eq!(started.events[0].sequence, 2);
     assert_eq!(started.status, RunStatus::Running);
@@ -1428,6 +1450,7 @@ async fn refuses_a_stale_or_expired_owner(stores: &Stores<'_>, a: Tenant, agent_
                 abandons: None,
                 request_digest: Sha256Digest::of(b"request"),
                 offer: offer(),
+                key_version: Some(1),
             }),
         )
     };
@@ -1539,6 +1562,7 @@ async fn refuses_steps_without_their_guards(stores: &Stores<'_>, a: Tenant, agen
         abandons: None,
         request_digest: Sha256Digest::of(b"request"),
         offer: offer(),
+        key_version: Some(1),
     });
     for (guards, why) in [
         (Guards::default(), "a worker's step without its owner"),
@@ -1568,6 +1592,7 @@ async fn refuses_steps_without_their_guards(stores: &Stores<'_>, a: Tenant, agen
             abandons: None,
             request_digest: Sha256Digest::of(b"request"),
             offer: offer(),
+            key_version: Some(1),
         }),
     )
     .await;

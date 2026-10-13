@@ -3771,6 +3771,50 @@ describe("model providers", () => {
     expect(d.default_models.filter((r) => r.organization_id === northwind() && r.model_id)).toHaveLength(2);
   });
 
+  it("refuses a key replacement another one overtook, keeping the newer key", async () => {
+    const connection = await owner.modelConnections.create(
+      northwind(),
+      { environment: "sandbox", kind: "openai", label: "Raced", api_key: "sk-mock-raced-original-0001" },
+      { idempotencyKey: "raced-connection" },
+    );
+    // The first replacement's body arrives only after a second one saved.
+    let send = (_: string) => {};
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        send = (text) => {
+          controller.enqueue(new TextEncoder().encode(text));
+          controller.close();
+        };
+      },
+    });
+    // Straight to the handlers: a request with a streamed body, sent through
+    // fetch, isn't intercepted.
+    const request = new Request(`${API}/v1/organizations/${northwind()}/model-connections/${connection.id}/api-key`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer mock_${DEMO_USER_ID}`, "Content-Type": "application/json" },
+      body: stream,
+      duplex: "half",
+    } as RequestInit);
+    const slow = (async () => {
+      for (const handler of createHandlers(API)) {
+        const result = await handler.run({ request, requestId: "raced" });
+        if (result?.response) return result.response;
+      }
+      throw new Error("no handler answered");
+    })();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const fast = await owner.modelConnections.replaceKey(northwind(), connection.id, {
+      api_key: "sk-mock-raced-faster-0002",
+    });
+    expect(fast.key_version).toBe(2);
+    send(JSON.stringify({ api_key: "sk-mock-raced-slower-0003" }));
+    const answer = await slow;
+    const refused = await answer.json();
+    expect([answer.status, refused.error.code]).toEqual([409, "key_changed"]);
+    const row = must(db().model_connections.find((c) => c.organization_id === northwind() && c.id === connection.id));
+    expect([row.key_version, row.key_last4]).toEqual([2, "0002"]);
+  });
+
   it("never keeps a provider key: not in the database, storage or idempotency records", async () => {
     const secret = "sk-mock-never-kept-Zq81";
     const replacement = "sk-mock-never-kept-Yw22";

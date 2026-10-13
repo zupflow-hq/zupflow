@@ -925,6 +925,8 @@ export type ModelConnectionListQuery = z.infer<typeof ModelConnectionListQuery>;
 /**
  * The key is checked with the provider (by listing its models) before
  * anything is saved: a key it refuses is `422 invalid_api_key`, `fields.api_key`.
+ * A deployment that reaches no model providers can't check it:
+ * `501 model_providers_not_configured`, which retrying doesn't change.
  */
 export const CreateModelConnectionInput = z.object({
   environment: Environment,
@@ -942,6 +944,8 @@ export type UpdateModelConnectionInput = z.infer<typeof UpdateModelConnectionInp
  * Replaces the key with a new version, checked like a new connection's. A key
  * the provider refuses is `422 invalid_api_key` and the connection keeps its
  * key. A key that works makes an `invalid_key` connection `active` again.
+ * Two replacements at once: the one that saves second finds the key it
+ * replaced gone and is `409 key_changed`, saving nothing.
  */
 export const ReplaceModelConnectionKeyInput = z.object({ api_key: z.string() });
 export type ReplaceModelConnectionKeyInput = z.infer<typeof ReplaceModelConnectionKeyInput>;

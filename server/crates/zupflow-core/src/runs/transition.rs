@@ -16,7 +16,10 @@ use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 
 use crate::audit::AuditActor;
-use crate::ids::{AgentId, ApiKeyId, InstallationId, OrganizationId, RunId, SessionId, ToolCallId, WorkspaceId};
+use crate::ids::{
+    AgentId, ApiKeyId, InstallationId, ModelConnectionId, ModelId, OrganizationId, RunId, SessionId, ToolCallId,
+    WorkspaceId,
+};
 use crate::runs::digest::{Sha256Digest, digest_json};
 use crate::runs::names::Offer;
 use crate::runs::state::{BoundTarget, CallDecision, ClaimantId, Continuation, InvocationId, RequestId, Usage, ser};
@@ -157,7 +160,11 @@ pub struct Admit {
     pub session_id: SessionId,
     pub trigger: RunTrigger,
     pub input: String,
+    /// The provider's model ID the run calls.
     pub model: String,
+    /// The organization's model and the connection it's reached through.
+    pub model_id: ModelId,
+    pub connection_id: ModelConnectionId,
     pub instructions: String,
     pub execution_version: u32,
 }
@@ -186,6 +193,10 @@ pub struct PrepareModel {
     pub abandons: Option<u32>,
     pub request_digest: Sha256Digest,
     pub offer: Offer,
+    /// The version of the connection's key the attempt uses; `None` for a
+    /// run admitted before organizations had models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_version: Option<u32>,
 }
 
 /// A call as a turn records it.

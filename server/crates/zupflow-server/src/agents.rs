@@ -3,11 +3,10 @@
 //! them; every change needs a developer or stricter.
 //!
 //! An agent's model is its `model_id` (decision 0050): one of its
-//! organization's models in its environment, or none for the environment's
-//! default. Organizations can't add models here yet, so every agent answers
-//! `model_id: null` and naming one is `422 unknown_model`. Until model
-//! providers are served, runs use the deployment's first listed model
-//! (`ZUPFLOW_MODELS`), kept as the agent's internal model.
+//! organization's models, added in its workspace's environment, or `null`
+//! for the environment's default. Any other ID, another organization's or
+//! the other environment's included, is the same `422 unknown_model`,
+//! checked by the store in the transaction that writes the agent.
 //!
 //! A grant names tools in its installation's registry: one that isn't there,
 //! or is gone, is refused with a field error, checked by the store in the
@@ -29,9 +28,9 @@ use serde::Serialize;
 use serde_json::Value;
 use zupflow_core::agents::{Agent, AgentChanges, AgentError, AgentStatus, Grant, GrantTools, NewAgent};
 use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
+use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
-use zupflow_core::ids::{AgentId, GrantId, InstallationId, WorkspaceId};
-use zupflow_core::models::ModelError;
+use zupflow_core::ids::{AgentId, GrantId, InstallationId, ModelId, WorkspaceId};
 use zupflow_core::organizations::MemberRole;
 use zupflow_core::runs::AgentActivity;
 use zupflow_core::time::Timestamp;
@@ -68,8 +67,8 @@ struct AgentView {
     workspace_id: WorkspaceId,
     name: String,
     description: String,
-    /// Always `null` until organizations can add models: the environment's default.
-    model_id: Option<String>,
+    /// `null`: the environment's default.
+    model_id: Option<ModelId>,
     instructions: String,
     status: AgentStatus,
     grant_count: u64,
@@ -102,7 +101,7 @@ fn agent_view(agent: Agent, activity: &HashMap<AgentId, AgentActivity>) -> Agent
         workspace_id: agent.workspace_id,
         name: agent.name,
         description: agent.description,
-        model_id: None,
+        model_id: agent.model_id,
         instructions: agent.instructions,
         status: agent.status,
         grant_count: agent.grant_count,
@@ -162,6 +161,12 @@ fn agent_failure(error: AgentError, installation: &str) -> Failure {
     match error {
         AgentError::AgentNotFound => ApiError::not_found("Agent").into(),
         AgentError::GrantNotFound => ApiError::not_found("Grant").into(),
+        AgentError::UnknownModel => ApiError::new(
+            422,
+            "unknown_model",
+            "Choose a model added in this workspace's environment.",
+        )
+        .into(),
         AgentError::InstallationNotFound => ApiError::not_found("Installation").into(),
         AgentError::GrantExists => ApiError::new(
             409,
@@ -204,8 +209,13 @@ fn agent_failure(error: AgentError, installation: &str) -> Failure {
     }
 }
 
-fn models_unavailable(_: ModelError) -> Failure {
-    unavailable()
+/// An agent's change refused: a model of another environment or
+/// organization, or any other refusal.
+fn model_failure(error: AgentError, environment: Environment) -> Failure {
+    match error {
+        AgentError::UnknownModel => unknown_model(environment),
+        other => agent_failure(other, "this installation"),
+    }
 }
 
 /// An agent ID from the path; anything else is the same `404` as an agent that isn't there.
@@ -294,39 +304,39 @@ fn checked_instructions(value: String, fields: &mut Fields) -> Option<String> {
     }
 }
 
-/// `model_id`: absent or `null` (the environment's default) is all this server
-/// accepts until organizations can add models; any model named is unknown.
-fn checked_model_id(body: &Object) -> Result<(), Failure> {
-    match body.0.get("model_id") {
-        None | Some(Value::Null) => Ok(()),
-        Some(_) => Err(ApiError {
-            fields: Some(BTreeMap::from([(
-                "model_id".to_owned(),
-                "Choose a model added in this environment.".to_owned(),
-            )])),
-            ..ApiError::new(
-                422,
-                "unknown_model",
-                "That model isn't one of this organization's models in this environment.",
-            )
-        }
-        .into()),
+/// `model_id` names no model of the organization in this environment.
+fn unknown_model(environment: Environment) -> Failure {
+    let name = environment.name();
+    ApiError {
+        fields: Some(BTreeMap::from([(
+            "model_id".to_owned(),
+            format!("Choose a model added in {name}, or the default."),
+        )])),
+        ..ApiError::new(422, "unknown_model", format!("Choose a model added in {name}."))
     }
+    .into()
 }
 
-/// The model a new agent's runs use until model providers are served: the
-/// deployment's first listed one. With none listed no agent could run, so
-/// none is created (`422 model_not_configured`, as a run without a model is).
-async fn deployment_model(state: &AppState) -> Result<String, Failure> {
-    let models = state.models.list_models().await.map_err(models_unavailable)?;
-    models.into_iter().next().map(|model| model.id).ok_or_else(|| {
-        ApiError::new(
-            422,
-            "model_not_configured",
-            "This deployment lists no models yet (ZUPFLOW_MODELS), so no agent can run. List one, then create the agent.",
-        )
-        .into()
-    })
+/// `model_id`: absent keeps the agent's (`None`); `null` is the
+/// environment's default. An ID that can't be one of the organization's
+/// models is refused as one that isn't: the store checks the rest.
+fn checked_model_id(
+    body: &Object,
+    environment: Environment,
+    fields: &mut Fields,
+) -> Result<Option<Option<ModelId>>, Failure> {
+    match body.0.get("model_id") {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(id)) => match ModelId::parse(id) {
+            Ok(id) => Ok(Some(Some(id))),
+            Err(_) => Err(unknown_model(environment)),
+        },
+        Some(_) => {
+            fields.invalid("model_id", "Must be a string.");
+            Ok(None)
+        }
+    }
 }
 
 async fn create_agent(
@@ -349,12 +359,13 @@ async fn create_agent(
     let instructions = body
         .string("instructions", &mut fields)
         .and_then(|instructions| checked_instructions(instructions, &mut fields));
+    let environment = access.workspace.environment;
+    let model_id = checked_model_id(&body, environment, &mut fields);
     fields.finish()?;
-    checked_model_id(&body)?;
+    let model_id = model_id?.flatten();
     let (Some(name), Some(description), Some(instructions)) = (name, description, instructions) else {
         return Err(ApiError::internal().into());
     };
-    let model = deployment_model(&state).await?;
     let agent = state
         .agents
         .create_agent(
@@ -364,7 +375,7 @@ async fn create_agent(
             &NewAgent {
                 name,
                 description,
-                model,
+                model_id,
                 instructions,
             },
             &|agent: &Agent| {
@@ -377,7 +388,7 @@ async fn create_agent(
             },
         )
         .await
-        .map_err(|error| agent_failure(error, "this installation"))?;
+        .map_err(|error| model_failure(error, environment))?;
     // A new agent has run nothing.
     Ok(envelope(StatusCode::CREATED, agent_view(agent, &HashMap::new())))
 }
@@ -410,8 +421,10 @@ async fn update_agent(
         }
         parsed
     });
+    let environment = access.workspace.environment;
+    let model_id = checked_model_id(&body, environment, &mut fields);
     fields.finish()?;
-    checked_model_id(&body)?;
+    let model_id = model_id?;
     // As the Console reads it: a status sent pauses or resumes the agent.
     let action = match status {
         Some(AgentStatus::Paused) => AuditAction::AgentPaused,
@@ -427,8 +440,7 @@ async fn update_agent(
             &AgentChanges {
                 name,
                 description,
-                // The internal model stays as it is until model providers are served.
-                model: None,
+                model_id,
                 instructions,
                 status,
             },
@@ -442,7 +454,7 @@ async fn update_agent(
             },
         )
         .await
-        .map_err(|error| agent_failure(error, "this installation"))?;
+        .map_err(|error| model_failure(error, environment))?;
     let activity = activity(&state, &access).await?;
     Ok(envelope(StatusCode::OK, agent_view(updated, &activity)))
 }

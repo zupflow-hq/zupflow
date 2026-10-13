@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use zupflow_core::identity::Identity;
-use zupflow_core::models::{ModelCatalog, ModelProvider};
+use zupflow_core::model_providers::ModelProviderCatalog;
+use zupflow_core::models::ModelProvider;
 use zupflow_core::runs::store::Durability;
 use zupflow_oidc::{OidcConfig, OidcIdentity};
 
@@ -22,8 +23,6 @@ use crate::{AppState, RequestGuard};
 pub enum BootstrapError {
     #[error("can't set up Console sign-in: {0}")]
     Identity(#[source] zupflow_oidc::OidcConfigError),
-    #[error("can't list the configured models")]
-    Models,
     #[error("can't build the outbound HTTP client: {0}")]
     Outbound(String),
     /// A run's transitions must survive a power cut once applied (decision
@@ -98,32 +97,38 @@ pub fn guard(config: &Config) -> RequestGuard {
 }
 
 /// What answers runs. No model provider ships with Zupflow (decision 0014):
-/// without one, every run fails `model_unavailable`; the scripted model is
+/// without one, every run fails `model_unavailable`; the scripted model, which
+/// serves every model the scripted providers list that can call tools, is
 /// for local work only.
-pub async fn model_provider(config: &Config) -> Result<Arc<dyn ModelProvider>, BootstrapError> {
+pub fn model_provider(config: &Config) -> Arc<dyn ModelProvider> {
     match config.model_provider {
         ModelProviderMode::None => {
             tracing::warn!(
                 event = "server.no_model_provider",
                 "No model provider is configured (ZUPFLOW_MODEL_PROVIDER): every run fails model_unavailable"
             );
-            Ok(Arc::new(zupflow_basic::no_model::NoModelProvider))
+            Arc::new(zupflow_basic::no_model::NoModelProvider)
         }
         ModelProviderMode::Scripted => {
-            let served: Vec<String> = config
-                .models
-                .list_models()
-                .await
-                .map_err(|_| BootstrapError::Models)?
-                .into_iter()
-                .map(|model| model.id)
-                .collect();
             tracing::warn!(
                 event = "server.scripted_model",
                 "Runs are answered by the scripted model (ZUPFLOW_MODEL_PROVIDER=scripted): for local work only"
             );
-            Ok(Arc::new(zupflow_basic::scripted_model::ScriptedModel::serving(served)))
+            Arc::new(zupflow_basic::scripted_model::ScriptedModel::serving(
+                zupflow_basic::scripted_providers::ScriptedProviders::tool_models(),
+            ))
         }
+    }
+}
+
+/// What checks organizations' provider keys and lists their models
+/// (decision 0049). A deployment brings adapters that reach providers
+/// through `OutboundHttp`; this repository ships only the scripted
+/// providers, for local work, and without them no connection can be made.
+pub fn model_catalog(config: &Config) -> Arc<dyn ModelProviderCatalog> {
+    match config.model_provider {
+        ModelProviderMode::None => Arc::new(zupflow_basic::no_providers::NoProviders),
+        ModelProviderMode::Scripted => Arc::new(zupflow_basic::scripted_providers::ScriptedProviders),
     }
 }
 

@@ -63,13 +63,8 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let provider = match bootstrap::model_provider(&config).await {
-        Ok(provider) => provider,
-        Err(error) => {
-            tracing::error!(event = "server.models_failed", %error);
-            return ExitCode::FAILURE;
-        }
-    };
+    let provider = bootstrap::model_provider(&config);
+    let model_catalog = bootstrap::model_catalog(&config);
     let runs = Arc::new(zupflow_sqlite::SqliteRunStore::new(database.clone()));
     let state = AppState {
         clock: Arc::new(zupflow_core::time::SystemClock),
@@ -87,7 +82,8 @@ async fn main() -> ExitCode {
         ))),
         events: Arc::new(zupflow_basic::in_process_events::InProcessEventBus::default()),
         metrics: Arc::new(zupflow_basic::in_process_metrics::InProcessMetrics::default()),
-        models: Arc::new(config.models.clone()),
+        model_store: Arc::new(zupflow_sqlite::SqliteModelStore::new(database.clone())),
+        model_catalog,
         connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
         jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
         tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),

@@ -173,9 +173,10 @@ pub struct NewRun {
     pub session_id: SessionId,
     pub trigger: RunTrigger,
     pub input: String,
-    /// The agent's model and instructions as the run starts: a later change
-    /// to the agent doesn't change a run under way.
-    pub model: String,
+    /// The model resolved when the run was admitted (the agent's override,
+    /// or its environment's default) and the agent's instructions: a later
+    /// change to either doesn't change a run under way.
+    pub model: crate::model_store::RunModel,
     pub instructions: String,
 }
 

@@ -17,7 +17,9 @@
 //! - [`idempotency`]: idempotency keys for `POST`, and their store.
 //! - [`identity`]: Console sign-in, the [`identity::Identity`] trait.
 //! - [`installations`]: connected accounts, their sealed credentials and their store.
-//! - [`models`]: the models agents can use and calling them: [`models::ModelCatalog`] and [`models::ModelProvider`].
+//! - [`models`]: calling a model: [`models::ModelProvider`].
+//! - [`model_providers`]: the providers organizations bring keys for, and what they list: [`model_providers::ModelProviderCatalog`].
+//! - [`model_store`]: organizations' connections, models and default models, and their store.
 //! - [`outbound`]: the one path every outbound call takes, and which addresses are public.
 //! - [`policy`]: tool permissions: the organization's levels and the [`policy::ApprovalPolicy`] trait.
 //! - [`organizations`]: organizations, members and users, and their store.
@@ -42,6 +44,8 @@ pub mod installations;
 pub mod jobs;
 pub mod keys;
 pub mod metrics;
+pub mod model_providers;
+pub mod model_store;
 pub mod models;
 pub mod organizations;
 pub mod outbound;

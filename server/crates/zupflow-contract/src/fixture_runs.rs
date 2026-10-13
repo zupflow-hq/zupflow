@@ -6,6 +6,7 @@
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 use zupflow_core::ids::{AgentId, InstallationId, OrganizationId, RunId, SessionId, ToolCallId, WorkspaceId};
+use zupflow_core::model_store::{FIRST_KEY_VERSION, RouteState, RunModel};
 use zupflow_core::models::{Completion, ModelToolCall, Reply, TokenUsage};
 use zupflow_core::runs::digest::Sha256Digest;
 use zupflow_core::runs::names::{Candidate, build_offer};
@@ -54,6 +55,9 @@ impl Seeding<'_> {
         Facts {
             claimant: Some(self.claimant),
             claim: self.claim,
+            model_route: Some(RouteState::Usable {
+                key_version: FIRST_KEY_VERSION,
+            }),
             ..Facts::at(Timestamp::now())
         }
     }
@@ -127,7 +131,7 @@ pub async fn seed(
     organization_id: OrganizationId,
     workspace_id: WorkspaceId,
     agent_id: AgentId,
-    model: &str,
+    model: RunModel,
     target: Target,
     waiting: bool,
 ) -> Result<(), String> {
@@ -142,7 +146,7 @@ pub async fn seed(
             session_id: SessionId::generate(),
             trigger: RunTrigger::Api,
             input: format!("Use {tool} to find this week's open items."),
-            model: model.to_owned(),
+            model,
             instructions: "Be brief.".to_owned(),
         },
     );

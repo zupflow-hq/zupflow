@@ -24,7 +24,7 @@
 use async_trait::async_trait;
 
 use crate::audit::Audit;
-use crate::ids::{AgentId, GrantId, InstallationId, OrganizationId, WorkspaceId};
+use crate::ids::{AgentId, GrantId, InstallationId, ModelId, OrganizationId, WorkspaceId};
 use crate::policy::{GrantLevels, LevelRefusal, level_refusal};
 use crate::time::Timestamp;
 
@@ -59,8 +59,10 @@ pub struct Agent {
     pub workspace_id: WorkspaceId,
     pub name: String,
     pub description: String,
-    /// A model ID the catalog offered when it was set.
-    pub model: String,
+    /// The model it overrides its environment's default with: one of the
+    /// organization's, added in the workspace's environment. `None` runs on
+    /// the default.
+    pub model_id: Option<ModelId>,
     pub instructions: String,
     pub status: AgentStatus,
     /// How many grants it holds, counted when read.
@@ -74,7 +76,8 @@ pub struct Agent {
 pub struct NewAgent {
     pub name: String,
     pub description: String,
-    pub model: String,
+    /// Held to the same rule as [`Agent::model_id`] by the store.
+    pub model_id: Option<ModelId>,
     pub instructions: String,
 }
 
@@ -83,7 +86,8 @@ pub struct NewAgent {
 pub struct AgentChanges {
     pub name: Option<String>,
     pub description: Option<String>,
-    pub model: Option<String>,
+    /// `Some(None)` goes back to the environment's default.
+    pub model_id: Option<Option<ModelId>>,
     pub instructions: Option<String>,
     pub status: Option<AgentStatus>,
 }
@@ -117,6 +121,9 @@ pub enum AgentError {
     /// The agent isn't in this scope.
     #[error("agent not found")]
     AgentNotFound,
+    /// The model named isn't one of the organization's in the workspace's environment.
+    #[error("not a model of this workspace's environment")]
+    UnknownModel,
     /// The grant isn't the agent's, in this scope.
     #[error("grant not found")]
     GrantNotFound,
@@ -162,7 +169,9 @@ pub trait AgentStore: Send + Sync {
     ) -> Result<Option<Agent>, AgentError>;
 
     /// Creates an active agent in a workspace the caller has resolved in its
-    /// organization.
+    /// organization. Its model, if it names one, must be the organization's,
+    /// added in the workspace's environment (`UnknownModel`), checked in the
+    /// transaction that writes the agent.
     async fn create_agent(
         &self,
         organization_id: OrganizationId,
@@ -172,6 +181,8 @@ pub trait AgentStore: Send + Sync {
         audit: &Audit<'_, Agent>,
     ) -> Result<Agent, AgentError>;
 
+    /// Changes what `changes` names; a model is held to the rule
+    /// [`AgentStore::create_agent`] holds it to, in the same transaction.
     async fn update_agent(
         &self,
         organization_id: OrganizationId,

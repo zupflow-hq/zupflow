@@ -33,6 +33,7 @@
 //! answers runs, and no background work runs.
 
 mod fixture_apps;
+mod fixture_models;
 mod fixture_runs;
 mod fixture_webhooks;
 
@@ -48,8 +49,8 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
-use zupflow_basic::configured_models::ConfiguredModels;
 use zupflow_basic::local_keys::LocalKeyService;
+use zupflow_basic::scripted_providers::ScriptedProviders;
 use zupflow_core::agents::{Agent, AgentStore, Grant, GrantTools, NewAgent};
 use zupflow_core::api_keys::{ApiKey, ApiKeyHasher, ApiKeyStore, NewApiKey, NewSecret};
 use zupflow_core::apps::{App, AppStore, Configuration, ToolEffect};
@@ -59,10 +60,12 @@ use zupflow_core::environment::Environment;
 use zupflow_core::idempotency::Fingerprinter;
 use zupflow_core::identity::{Identity, IdentityError, Profile, VerifiedIdentity};
 use zupflow_core::ids::{
-    AgentId, ApiKeyId, AppId, ConnectSessionId, GrantId, InstallationId, OrganizationId, WebhookEndpointId, WorkspaceId,
+    AgentId, ApiKeyId, AppId, ConnectSessionId, GrantId, InstallationId, ModelId, OrganizationId, WebhookEndpointId,
+    WorkspaceId,
 };
 use zupflow_core::installations::{InstallationStore, InstalledApp, TemplateSnapshot};
 use zupflow_core::keys::{EncryptionContext, seal};
+use zupflow_core::model_store::ModelStore;
 use zupflow_core::organizations::{INVITATION_TTL_MS, Member, MemberRole, Organization, OrganizationStore, User};
 use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse, Refusal};
 use zupflow_core::policy::{AppToolLevel, ToolLevel, ToolPolicyStore};
@@ -77,8 +80,8 @@ use zupflow_server::sign_in::SignInSettings;
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{
     Database, SqliteAgentStore, SqliteApiKeyStore, SqliteAppStore, SqliteConnectStore, SqliteIdempotencyStore,
-    SqliteInstallationStore, SqliteOrganizationStore, SqliteRunStore, SqliteToolPolicyStore, SqliteToolRegistry,
-    SqliteWebhookStore, SqliteWorkspaceStore,
+    SqliteInstallationStore, SqliteModelStore, SqliteOrganizationStore, SqliteRunStore, SqliteToolPolicyStore,
+    SqliteToolRegistry, SqliteWebhookStore, SqliteWorkspaceStore,
 };
 
 /// The personas, with the address each signs in with: people's names, as in
@@ -90,14 +93,6 @@ const PERSONAS: [(&str, &str); 4] = [
     ("viewer", "sam@northwind.example"),
     ("outsider", "riley@larkspur.example"),
 ];
-
-/// The models the server offers, as `ZUPFLOW_MODELS` lists them. Fictional:
-/// the suite takes whichever model the server lists first.
-const MODELS: &str = r#"[
-    {"id":"model-balanced","name":"Balanced","provider":"Example","description":"Balanced default for tool-heavy work."},
-    {"id":"model-capable","name":"Capable","provider":"Example","description":"Most capable. Long, multi-step tasks."},
-    {"id":"model-fast","name":"Fast","provider":"Example","description":"Fast and inexpensive. Simple lookups."}
-]"#;
 
 /// Signs in `Bearer contract:{persona}` as that persona; anything else is
 /// 401, except that with `signed_out_as_owner` (a browser run, where the
@@ -248,15 +243,12 @@ async fn serve(path: &str, serving: Serving) -> Result<(), String> {
     let console = serving.console.as_deref();
     let live = serving.live();
     let outbound = serving.outbound()?;
-    let models = ConfiguredModels::parse(MODELS).map_err(|error| error.to_string())?;
+    // Runs call the scripted model, which answers for every model the
+    // scripted providers list that can call tools.
     let provider: Arc<dyn zupflow_core::models::ModelProvider> = if live {
-        let served: Vec<String> = zupflow_core::models::ModelCatalog::list_models(&models)
-            .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|model| model.id)
-            .collect();
-        Arc::new(zupflow_basic::scripted_model::ScriptedModel::serving(served))
+        Arc::new(zupflow_basic::scripted_model::ScriptedModel::serving(
+            ScriptedProviders::tool_models(),
+        ))
     } else {
         Arc::new(zupflow_basic::no_model::NoModelProvider)
     };
@@ -288,7 +280,8 @@ async fn serve(path: &str, serving: Serving) -> Result<(), String> {
         ))),
         events: Arc::new(zupflow_basic::in_process_events::InProcessEventBus::default()),
         metrics: Arc::new(zupflow_basic::in_process_metrics::InProcessMetrics::default()),
-        models: Arc::new(models),
+        model_store: Arc::new(SqliteModelStore::new(database.clone())),
+        model_catalog: Arc::new(ScriptedProviders),
         connect: Arc::new(SqliteConnectStore::new(database.clone())),
         jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
         tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),
@@ -523,6 +516,116 @@ async fn reset(path: &str) -> Result<(), String> {
         .await
         .map_err(|error| error.to_string())?;
     let sealing = LocalKeyService::from_server_secret(&secret_key);
+
+    // Model providers, as the mock seeds them: each environment its own
+    // connections, models and default; a few agents (below) override it.
+    let model_store = SqliteModelStore::new(database.clone());
+    let northwind_models = {
+        use fixture_models::ConnectionSeed;
+        use zupflow_core::model_providers::ProviderKind;
+        fixture_models::seed(
+            &model_store,
+            &sealing,
+            northwind.id,
+            owner_member.id,
+            &[
+                ConnectionSeed {
+                    environment: Environment::Sandbox,
+                    kind: ProviderKind::OpenRouter,
+                    label: "OpenRouter",
+                    last4: "q7Rk",
+                    refused: false,
+                    models: &["anthropic/claude-sonnet-4.5", "openai/gpt-5", "google/gemini-2.5-flash"],
+                },
+                ConnectionSeed {
+                    environment: Environment::Sandbox,
+                    kind: ProviderKind::Anthropic,
+                    label: "Anthropic",
+                    last4: "Xc2d",
+                    refused: false,
+                    models: &["claude-haiku-4-5"],
+                },
+                ConnectionSeed {
+                    environment: Environment::Production,
+                    kind: ProviderKind::Anthropic,
+                    label: "Anthropic",
+                    last4: "pL9w",
+                    refused: false,
+                    models: &["claude-sonnet-4-5", "claude-haiku-4-5"],
+                },
+                ConnectionSeed {
+                    environment: Environment::Production,
+                    kind: ProviderKind::OpenAi,
+                    label: "OpenAI",
+                    last4: "Zt4m",
+                    refused: false,
+                    models: &["gpt-5"],
+                },
+                ConnectionSeed {
+                    environment: Environment::Production,
+                    kind: ProviderKind::OpenRouter,
+                    label: "OpenRouter (old key)",
+                    last4: "8Hnv",
+                    refused: true,
+                    models: &["google/gemini-2.5-pro"],
+                },
+            ],
+        )
+        .await?
+    };
+    for (environment, label, provider_model_id) in [
+        (Environment::Sandbox, "OpenRouter", "anthropic/claude-sonnet-4.5"),
+        (Environment::Production, "Anthropic", "claude-sonnet-4-5"),
+    ] {
+        fixture_models::set_default(
+            &model_store,
+            northwind.id,
+            environment,
+            owner_member.id,
+            owner.id,
+            northwind_models.model(environment, label, provider_model_id)?,
+        )
+        .await?;
+    }
+    let larkspur_models = {
+        use fixture_models::ConnectionSeed;
+        use zupflow_core::model_providers::ProviderKind;
+        fixture_models::seed(
+            &model_store,
+            &sealing,
+            larkspur.id,
+            outsider_member.id,
+            &[
+                ConnectionSeed {
+                    environment: Environment::Production,
+                    kind: ProviderKind::Anthropic,
+                    label: "Anthropic",
+                    last4: "Lk5s",
+                    refused: false,
+                    models: &["claude-sonnet-4-5"],
+                },
+                ConnectionSeed {
+                    environment: Environment::Sandbox,
+                    kind: ProviderKind::OpenAi,
+                    label: "OpenAI",
+                    last4: "Wd7e",
+                    refused: false,
+                    models: &["gpt-5-mini"],
+                },
+            ],
+        )
+        .await?
+    };
+    // Larkspur's Sandbox has no default.
+    fixture_models::set_default(
+        &model_store,
+        larkspur.id,
+        Environment::Production,
+        outsider_member.id,
+        outsider.id,
+        larkspur_models.model(Environment::Production, "Anthropic", "claude-sonnet-4-5")?,
+    )
+    .await?;
     let ready = |url: &str, oauth: bool| fixture_apps::Ready {
         mcp_server_url: url.to_owned(),
         oauth,
@@ -829,37 +932,38 @@ async fn reset(path: &str) -> Result<(), String> {
             .copied()
             .ok_or_else(|| format!("installation {label}"))
     };
-    let mut seeded_agents: Vec<(&str, OrganizationId, WorkspaceId, InstallationId, AgentId, &str)> = Vec::new();
-    for (label, name, model, granted, approval) in [
+    let mut seeded_agents: Vec<(&str, OrganizationId, WorkspaceId, InstallationId, AgentId)> = Vec::new();
+    // An agent's own model, where it overrides its environment's default.
+    let override_of = |label: &str| -> Result<Option<ModelId>, String> {
+        match label {
+            "Marketing" => northwind_models
+                .model(Environment::Production, "Anthropic", "claude-haiku-4-5")
+                .map(Some),
+            "Engineering" => northwind_models
+                .model(Environment::Sandbox, "OpenRouter", "openai/gpt-5")
+                .map(Some),
+            "Echo" => northwind_models
+                .model(Environment::Sandbox, "Anthropic", "claude-haiku-4-5")
+                .map(Some),
+            _ => Ok(None),
+        }
+    };
+    for (label, name, granted, approval) in [
         (
             "Marketing",
             "Publishing assistant",
-            "model-balanced",
             &["search_files", "read_document", "create_document"][..],
             &[][..],
         ),
         (
             "Google",
             "Ops assistant",
-            "model-balanced",
             &["list_events", "search_files", "read_document", "send_email"],
             &["send_email"],
         ),
-        (
-            "Engineering",
-            "Product scribe",
-            "model-balanced",
-            &["list_tasks", "create_task"],
-            &[],
-        ),
-        (
-            "Echo",
-            "Echo bot",
-            "model-fast",
-            &["echo", "echo_write"],
-            &["echo_write"],
-        ),
-        ("Harbor", "Harbor assistant", "model-balanced", &["list_tasks"], &[]),
+        ("Engineering", "Product scribe", &["list_tasks", "create_task"], &[]),
+        ("Echo", "Echo bot", &["echo", "echo_write"], &["echo_write"]),
+        ("Harbor", "Harbor assistant", &["list_tasks"], &[]),
     ] {
         let (organization, workspace, installation_id, _) = installation_of(label)?;
         let agent = agents
@@ -870,7 +974,7 @@ async fn reset(path: &str) -> Result<(), String> {
                 &NewAgent {
                     name: name.to_owned(),
                     description: format!("{name}, for the contract suite."),
-                    model: model.to_owned(),
+                    model_id: override_of(label)?,
                     instructions: "Be brief.".to_owned(),
                 },
                 &|created: &Agent| {
@@ -883,7 +987,7 @@ async fn reset(path: &str) -> Result<(), String> {
             )
             .await
             .map_err(|error| fail(name)(&error))?;
-        seeded_agents.push((label, organization, workspace, installation_id, agent.id, model));
+        seeded_agents.push((label, organization, workspace, installation_id, agent.id));
         let names = |tools: &[&str]| tools.iter().map(|tool| (*tool).to_owned()).collect::<Vec<_>>();
         if label == "Google" {
             // Made before its levels were set: `list_events` is only
@@ -944,7 +1048,7 @@ async fn reset(path: &str) -> Result<(), String> {
             &NewAgent {
                 name: "Support concierge".to_owned(),
                 description: "Not granted any installations yet.".to_owned(),
-                model: "model-fast".to_owned(),
+                model_id: Some(northwind_models.model(Environment::Production, "OpenAI", "gpt-5")?),
                 instructions: "Answer support questions briefly.".to_owned(),
             },
             &|created: &Agent| {
@@ -993,7 +1097,7 @@ async fn reset(path: &str) -> Result<(), String> {
         ("Echo", "echo_write", true),
         ("Harbor", "list_tasks", false),
     ] {
-        let (_, organization, workspace, installation_id, agent_id, model) = seeded_agents
+        let (_, organization, workspace, installation_id, agent_id) = seeded_agents
             .iter()
             .find(|seeded| seeded.0 == label)
             .copied()
@@ -1037,6 +1141,16 @@ async fn reset(path: &str) -> Result<(), String> {
             tool: tool.to_owned(),
             definition_sha256,
         };
+        let agent = agents
+            .find_agent(organization, workspace, agent_id)
+            .await
+            .map_err(|error| fail(label)(&error))?
+            .ok_or_else(|| format!("agent of {label}"))?;
+        let model = model_store
+            .run_model(organization, workspace, agent.model_id)
+            .await
+            .map_err(|error| fail(label)(&error))?
+            .ok_or_else(|| format!("model of {label}"))?;
         fixture_runs::seed(&runs, organization, workspace, agent_id, model, target, waiting)
             .await
             .map_err(|error| fail(label)(&error))?;

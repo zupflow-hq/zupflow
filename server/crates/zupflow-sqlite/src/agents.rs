@@ -20,7 +20,7 @@ use zupflow_core::agents::{
     levels_refusal,
 };
 use zupflow_core::audit::Audit;
-use zupflow_core::ids::{AgentId, AppId, GrantId, InstallationId, OrganizationId, WorkspaceId};
+use zupflow_core::ids::{AgentId, AppId, GrantId, InstallationId, ModelId, OrganizationId, WorkspaceId};
 use zupflow_core::policy::{AppToolLevel, GrantLevels, NewToolLevel, PolicySettings, ToolLevel};
 use zupflow_core::time::Timestamp;
 
@@ -61,7 +61,7 @@ fn read(error: impl std::fmt::Display) -> AgentError {
 /// stay static strings.
 macro_rules! agent_select {
     () => {
-        "SELECT a.id, a.organization_id, a.workspace_id, a.name, a.description, a.model, a.instructions, \
+        "SELECT a.id, a.organization_id, a.workspace_id, a.name, a.description, a.model_id, a.instructions, \
          a.status, a.created_at, a.updated_at, \
          (SELECT count(*) FROM agent_grants g \
           WHERE g.organization_id = ?1 AND g.workspace_id = ?2 AND g.agent_id = a.id) AS grant_count \
@@ -71,6 +71,11 @@ macro_rules! agent_select {
 
 const LIST_AGENTS: &str = concat!(agent_select!(), " ORDER BY lower(a.name), a.name, a.id");
 const FIND_AGENT: &str = concat!(agent_select!(), " AND a.id = ?3");
+/// A model of the organization in the workspace's environment: the
+/// organization, then the workspace, then the model.
+const MODEL_OF_WORKSPACE: &str = "SELECT 1 FROM models m JOIN workspaces w \
+                                  ON w.organization_id = m.organization_id AND w.environment = m.environment \
+                                  WHERE m.organization_id = ?1 AND w.organization_id = ?1 AND w.id = ?2 AND m.id = ?3";
 const AGENT_EXISTS: &str = "SELECT 1 FROM agents WHERE organization_id = ? AND workspace_id = ? AND id = ?";
 const INSTALLATION_EXISTS: &str =
     "SELECT 1 FROM installations WHERE organization_id = ? AND workspace_id = ? AND id = ?";
@@ -126,7 +131,10 @@ fn agent_from(row: &SqliteRow) -> Result<Agent, AgentError> {
         workspace_id: WorkspaceId::from_uuid(row.try_get("workspace_id").map_err(read)?),
         name: row.try_get("name").map_err(read)?,
         description: row.try_get("description").map_err(read)?,
-        model: row.try_get("model").map_err(read)?,
+        model_id: row
+            .try_get::<Option<uuid::Uuid>, _>("model_id")
+            .map_err(read)?
+            .map(ModelId::from_uuid),
         instructions: row.try_get("instructions").map_err(read)?,
         status: AgentStatus::parse(&status).ok_or_else(|| read("an unknown agent status"))?,
         grant_count: u64::try_from(grant_count).map_err(read)?,
@@ -151,6 +159,29 @@ fn grant_from(row: &SqliteRow) -> Result<Grant, AgentError> {
         created_at: Timestamp::from_millis(row.try_get("created_at").map_err(read)?),
         updated_at: Timestamp::from_millis(row.try_get("updated_at").map_err(read)?),
     })
+}
+
+/// Holds an agent's model to its organization and its workspace's
+/// environment, inside the caller's transaction.
+async fn check_model(
+    transaction: &mut Transaction<'static, Sqlite>,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    model_id: Option<ModelId>,
+) -> Result<(), AgentError> {
+    let Some(model_id) = model_id else { return Ok(()) };
+    let found: Option<i64> = sqlx::query_scalar(MODEL_OF_WORKSPACE)
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(model_id.uuid())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(failed("check_model"))?;
+    if found.is_some() {
+        Ok(())
+    } else {
+        Err(AgentError::UnknownModel)
+    }
 }
 
 async fn agent_exists(
@@ -306,8 +337,9 @@ impl AgentStore for SqliteAgentStore {
     ) -> Result<Agent, AgentError> {
         let now = Timestamp::now().millis();
         let mut transaction = self.immediate("create_agent").await?;
+        check_model(&mut transaction, organization_id, workspace_id, agent.model_id).await?;
         sqlx::query(
-            "INSERT INTO agents (id, organization_id, workspace_id, name, description, model, instructions, status, \
+            "INSERT INTO agents (id, organization_id, workspace_id, name, description, model_id, instructions, status, \
              created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
         )
         .bind(agent_id.uuid())
@@ -315,7 +347,7 @@ impl AgentStore for SqliteAgentStore {
         .bind(workspace_id.uuid())
         .bind(&agent.name)
         .bind(&agent.description)
-        .bind(&agent.model)
+        .bind(agent.model_id.map(|id| id.uuid()))
         .bind(&agent.instructions)
         .bind(now)
         .bind(now)
@@ -346,14 +378,22 @@ impl AgentStore for SqliteAgentStore {
         audit: &Audit<'_, Agent>,
     ) -> Result<Agent, AgentError> {
         let mut transaction = self.immediate("update_agent").await?;
+        // A missing agent is missing, whatever model the change names.
+        if !agent_exists(&mut transaction, organization_id, workspace_id, agent_id).await? {
+            return Err(AgentError::AgentNotFound);
+        }
+        if let Some(model_id) = changes.model_id {
+            check_model(&mut transaction, organization_id, workspace_id, model_id).await?;
+        }
         let updated = sqlx::query(
             "UPDATE agents SET name = coalesce(?, name), description = coalesce(?, description), \
-             model = coalesce(?, model), instructions = coalesce(?, instructions), status = coalesce(?, status), \
-             updated_at = ? WHERE organization_id = ? AND workspace_id = ? AND id = ?",
+             model_id = CASE WHEN ? THEN ? ELSE model_id END, instructions = coalesce(?, instructions), \
+             status = coalesce(?, status), updated_at = ? WHERE organization_id = ? AND workspace_id = ? AND id = ?",
         )
         .bind(changes.name.as_deref())
         .bind(changes.description.as_deref())
-        .bind(changes.model.as_deref())
+        .bind(changes.model_id.is_some())
+        .bind(changes.model_id.flatten().map(|id| id.uuid()))
         .bind(changes.instructions.as_deref())
         .bind(changes.status.map(AgentStatus::as_str))
         .bind(Timestamp::now().millis())
@@ -710,7 +750,7 @@ mod tests {
         let new = NewAgent {
             name: "A".to_owned(),
             description: String::new(),
-            model: "m".to_owned(),
+            model_id: None,
             instructions: String::new(),
         };
         let here = store

@@ -32,6 +32,7 @@ use serde_json::{Map, Value, json};
 
 use crate::audit::AuditActor;
 use crate::ids::{ApiKeyId, InstallationId, OrganizationId, RunId, ToolCallId, WorkspaceId};
+use crate::model_store::RouteState;
 use crate::models::{Completion, Message, ModelToolCall, Reply, ToolSpec, Turn, validate_completion, validate_turn};
 use crate::runs::digest::{Sha256Digest, call_digest, digest_json};
 use crate::runs::names::{Offer, OfferedTool};
@@ -64,6 +65,9 @@ pub const RECONNECT_REQUIRED: &str = "installation_reconnect_required";
 /// The failure code of a run whose model gave no answer on its job's last
 /// attempt.
 pub const MODEL_UNAVAILABLE: &str = "model_unavailable";
+
+/// The run's model can't be called: the provider refused its connection's key.
+pub const MODEL_KEY_INVALID: &str = "model_key_invalid";
 
 /// The failure code of a call whose installation was deleted (decision
 /// 0047): refused, and the run goes on.
@@ -212,6 +216,9 @@ pub struct Facts {
     /// The tools to offer the next model attempt, built by
     /// [`super::names::build_offer`].
     pub offer: Option<Offer>,
+    /// Whether the run's model can be called now, read with the offer for a
+    /// run that names an organization's model.
+    pub model_route: Option<RouteState>,
     pub model: Option<ModelAnswer>,
     /// The policy's decision on each call of the answer that needs one, by
     /// position ([`calls_to_decide`]).
@@ -239,6 +246,7 @@ impl Facts {
             steps: 0,
             limits: Limits::default(),
             offer: None,
+            model_route: None,
             model: None,
             decisions: Vec::new(),
             call_ids: Vec::new(),
@@ -992,6 +1000,38 @@ impl Worker<'_> {
 
     fn prepare(&self, turn: u32, abandons: Option<u32>) -> Result<Plan, AdvanceError> {
         let offer = self.facts.offer.as_ref().ok_or(AdvanceError::MissingFact("offer"))?;
+        // A run of an organization's model calls it only while the model and
+        // its connection are there and the provider takes the key.
+        let key_version = match self.snapshot.model_id {
+            // Admitted before organizations had models (migration 0031): it
+            // names only a deployment's model, which nothing serves now.
+            None => {
+                return Ok(self.fail(
+                    MODEL_UNAVAILABLE,
+                    "The run was admitted before organizations had models, so it has none to call. Start it again.",
+                ));
+            }
+            Some(_) => match self.facts.model_route.as_ref() {
+                None => return Err(AdvanceError::MissingFact("model_route")),
+                Some(RouteState::Usable { key_version }) => Some(*key_version),
+                Some(RouteState::Removed) => {
+                    let message = if self.snapshot.turns.is_empty() && self.snapshot.model_attempts.is_empty() {
+                        "The run's model was removed before it started."
+                    } else {
+                        "The run's model was removed while the run was under way."
+                    };
+                    return Ok(self.fail(MODEL_UNAVAILABLE, message));
+                }
+                Some(RouteState::KeyInvalid { connection_label }) => {
+                    return Ok(self.fail(
+                        MODEL_KEY_INVALID,
+                        format!(
+                            "The model provider refused {connection_label}'s key. Replace it under Model providers."
+                        ),
+                    ));
+                }
+            },
+        };
         let attempt = next_u32(
             self.snapshot
                 .model_attempts
@@ -1009,6 +1049,7 @@ impl Worker<'_> {
             abandons,
             request_digest: request.digest(),
             offer: offer.clone(),
+            key_version,
         });
         Ok(self.apply(self.keeps(), operation, Io::CallModel(request)))
     }
@@ -1408,7 +1449,9 @@ pub fn admit(
             session_id: run.session_id,
             trigger: run.trigger,
             input: run.input.clone(),
-            model: run.model.clone(),
+            model: run.model.provider_model_id.clone(),
+            model_id: run.model.model_id,
+            connection_id: run.model.connection_id,
             instructions: run.instructions.clone(),
             execution_version: EXECUTION_VERSION,
         }),

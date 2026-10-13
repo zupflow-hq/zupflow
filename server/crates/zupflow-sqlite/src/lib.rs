@@ -9,6 +9,7 @@
 //! - [`SqliteIdempotencyStore`]: idempotency keys for `POST`.
 //! - [`SqliteInstallationStore`]: installations and their sealed credentials.
 //! - [`SqliteJobQueue`]: the job queue, in the same database.
+//! - [`SqliteModelStore`]: model provider connections and their sealed keys, models and default models.
 //! - [`SqliteOrganizationStore`]: organizations, members and users.
 //! - [`SqliteRunStore`]: runs, their timelines and their tool calls, one
 //!   transition at a time.
@@ -30,6 +31,7 @@ mod database;
 mod idempotency;
 mod installations;
 mod job_queue;
+mod models;
 mod organizations;
 mod runs;
 #[cfg(test)]
@@ -48,6 +50,7 @@ pub use database::{Database, DatabaseError};
 pub use idempotency::SqliteIdempotencyStore;
 pub use installations::SqliteInstallationStore;
 pub use job_queue::SqliteJobQueue;
+pub use models::SqliteModelStore;
 pub use organizations::SqliteOrganizationStore;
 pub use runs::SqliteRunStore;
 pub use tool_policy::SqliteToolPolicyStore;

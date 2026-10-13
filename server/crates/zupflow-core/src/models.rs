@@ -1,47 +1,10 @@
-//! The models an agent can be set to use, as a deployment offers them.
-//!
-//! The list ([`ModelCatalog`]): an agent names a model by its ID, and
-//! creating or changing one is refused for an ID the catalog doesn't offer.
-//!
-//! Calling one ([`ModelProvider`]): a turn of a conversation, with the tools
-//! the agent may call, in; text or tool calls out, with the tokens it took.
-//! Which providers serve which models, and their keys, is a deployment's
-//! own adapter; this repository ships only a scripted model.
+//! Calling a model ([`ModelProvider`]): a turn of a conversation, with the
+//! tools the agent may call, in; text or tool calls out, with the tokens it
+//! took. Which models an organization can use, through which connection and
+//! key, is [`crate::model_store`]; calling a real provider is a deployment's
+//! own adapter, and this repository ships only a scripted model.
 
 use async_trait::async_trait;
-use serde::Serialize;
-
-/// The longest model ID kept.
-pub const MAX_ID: usize = 100;
-
-/// A model an agent can use: the contract's `Model`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Model {
-    /// What an agent stores in `model`.
-    pub id: String,
-    pub name: String,
-    /// Who serves it, as people know them.
-    pub provider: String,
-    pub description: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ModelError {
-    #[error("the model catalog is unavailable")]
-    Unavailable,
-}
-
-#[async_trait]
-pub trait ModelCatalog: Send + Sync {
-    /// Every model offered, in the order the deployment lists them. Empty
-    /// when it offers none: then no agent can be created.
-    async fn list_models(&self) -> Result<Vec<Model>, ModelError>;
-
-    /// Whether `id` is one of [`ModelCatalog::list_models`], exactly.
-    async fn offers(&self, id: &str) -> Result<bool, ModelError> {
-        Ok(self.list_models().await?.iter().any(|model| model.id == id))
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Calling a model
@@ -101,7 +64,7 @@ pub enum Message {
 /// One turn: everything a model is sent.
 #[derive(Debug, Clone, Copy)]
 pub struct Turn<'a> {
-    /// A model ID the catalog offers.
+    /// The provider's own model ID, as the run's model names it.
     pub model: &'a str,
     /// The agent's instructions, as written.
     pub instructions: &'a str,
