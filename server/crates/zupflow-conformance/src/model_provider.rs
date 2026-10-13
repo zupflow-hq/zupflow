@@ -2,15 +2,18 @@
 //! serves. A turn without tools gets text, never a call; any answer passes
 //! `validate_completion`; a conversation continues once every call is
 //! answered; tokens are counted; a model it doesn't serve is `UnknownModel`;
-//! and a turn that breaks the conversation rules is refused as
+//! a key the provider refuses is `KeyRefused`; nothing it answers repeats
+//! the key; and a turn that breaks the conversation rules is refused as
 //! `InvalidTurn`, never sent on.
 //!
 //! The suite reaches the provider only through the trait, so a provider
 //! adapter runs it against its real service (opt-in, as provider tests are).
 
 use serde_json::json;
+use zupflow_core::model_providers::ProviderKey;
 use zupflow_core::models::{
-    Message, ModelProvider, ModelToolCall, ProviderError, Reply, ToolSpec, Turn, validate_completion,
+    Completion, Message, ModelProvider, ModelToolCall, ProviderAccess, ProviderError, Reply, ToolSpec, Turn,
+    validate_completion,
 };
 
 fn tools() -> Vec<ToolSpec> {
@@ -41,13 +44,21 @@ fn turn<'a>(model: &'a str, messages: &'a [Message], tools: &'a [ToolSpec]) -> T
     }
 }
 
-/// `model`: an ID the provider serves.
-pub async fn run(provider: &dyn ModelProvider, model: &str) {
+/// Whether anything of the answer repeats `key`.
+fn repeats(completion: &Completion, key: &ProviderKey) -> bool {
+    format!("{completion:?}").contains(key.expose())
+}
+
+/// `access`: a provider and a key it accepts; `refused`: a key it refuses;
+/// `model`: an ID it serves.
+pub async fn run(provider: &dyn ModelProvider, access: &ProviderAccess<'_>, refused: &ProviderKey, model: &str) {
     assert!(!provider.name().is_empty(), "a provider has a name");
+    let key = access.key;
 
     // No tools: text.
     let plain = [user("Say hello.")];
-    let answer = provider.complete(&turn(model, &plain, &[])).await.unwrap();
+    let answer = provider.complete(access, &turn(model, &plain, &[])).await.unwrap();
+    assert!(!repeats(&answer, key), "an answer never repeats the key");
     assert!(
         matches!(answer.reply, Reply::Text(_)),
         "without tools, never a call: {answer:?}"
@@ -61,7 +72,8 @@ pub async fn run(provider: &dyn ModelProvider, model: &str) {
         "call echo {\"text\": \"hello\"}\nRepeat the word hello with the echo tool.",
     )];
     let first_turn = turn(model, &asked, &tools);
-    let first = provider.complete(&first_turn).await.unwrap();
+    let first = provider.complete(access, &first_turn).await.unwrap();
+    assert!(!repeats(&first, key), "an answer never repeats the key");
     assert_eq!(
         validate_completion(&first_turn, &first),
         Ok(()),
@@ -81,7 +93,7 @@ pub async fn run(provider: &dyn ModelProvider, model: &str) {
             });
         }
         let next_turn = turn(model, &conversation, &tools);
-        let next = provider.complete(&next_turn).await.unwrap();
+        let next = provider.complete(access, &next_turn).await.unwrap();
         assert_eq!(
             validate_completion(&next_turn, &next),
             Ok(()),
@@ -89,9 +101,26 @@ pub async fn run(provider: &dyn ModelProvider, model: &str) {
         );
     }
 
+    // A key it refuses.
+    assert_eq!(
+        provider
+            .complete(
+                &ProviderAccess {
+                    kind: access.kind,
+                    key: refused,
+                },
+                &turn(model, &plain, &[])
+            )
+            .await,
+        Err(ProviderError::KeyRefused),
+        "a key it refuses"
+    );
+
     // A model it doesn't serve.
     assert_eq!(
-        provider.complete(&turn("not-a-served-model-0", &plain, &tools)).await,
+        provider
+            .complete(access, &turn("not-a-served-model-0", &plain, &tools))
+            .await,
         Err(ProviderError::UnknownModel),
         "a model it doesn't serve"
     );
@@ -130,7 +159,7 @@ pub async fn run(provider: &dyn ModelProvider, model: &str) {
     for (what, messages, tools) in invalid {
         assert!(
             matches!(
-                provider.complete(&turn(model, &messages, tools)).await,
+                provider.complete(access, &turn(model, &messages, tools)).await,
                 Err(ProviderError::InvalidTurn(_))
             ),
             "refuses {what}"

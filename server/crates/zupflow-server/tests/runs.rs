@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use zupflow_core::ids::{AppId, InstallationId, OrganizationId, RunId, ToolCallId, UserId, WorkspaceId};
 use zupflow_core::model_store::RouteState;
 use zupflow_core::models::TokenUsage;
-use zupflow_core::models::{Completion, ModelProvider, ProviderError, ToolSpec, Turn};
+use zupflow_core::models::{Completion, ModelProvider, ProviderAccess, ProviderError, ToolSpec, Turn};
 use zupflow_core::policy::{
     AppToolLevel, LevelPage, PolicyError, PolicySettings, ToolLevel, ToolPolicy, ToolPolicyStore,
 };
@@ -1008,9 +1008,9 @@ impl ModelProvider for Recording {
         "recording"
     }
 
-    async fn complete(&self, turn: &Turn<'_>) -> Result<Completion, ProviderError> {
+    async fn complete(&self, access: &ProviderAccess<'_>, turn: &Turn<'_>) -> Result<Completion, ProviderError> {
         self.offered.lock().unwrap().push(turn.tools.to_vec());
-        self.inner.complete(turn).await
+        self.inner.complete(access, turn).await
     }
 }
 

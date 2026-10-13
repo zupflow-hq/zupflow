@@ -31,7 +31,9 @@ use tokio::task::JoinHandle;
 use zupflow_basic::in_process_metrics::InProcessMetrics;
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{InstallationId, OrganizationId, RunId, WorkspaceId};
-use zupflow_core::models::{Completion, Message, ModelProvider, ProviderError, TokenUsage, ToolSpec, Turn};
+use zupflow_core::models::{
+    Completion, Message, ModelProvider, ProviderAccess, ProviderError, TokenUsage, ToolSpec, Turn,
+};
 use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse};
 use zupflow_core::runs::state::{CallRecord, CommittedTurn, ModelAttempt, Snapshot};
 use zupflow_core::runs::store::{Applied, Durability, RunStore, StoreError};
@@ -458,9 +460,9 @@ impl ModelProvider for FaultyModel {
         self.inner.name()
     }
 
-    async fn complete(&self, turn: &Turn<'_>) -> Result<Completion, ProviderError> {
+    async fn complete(&self, access: &ProviderAccess<'_>, turn: &Turn<'_>) -> Result<Completion, ProviderError> {
         self.faults.pass(self.worker, Point::BeforeModel).await;
-        let completion = self.inner.complete(turn).await;
+        let completion = self.inner.complete(access, turn).await;
         if let Ok(completion) = &completion {
             self.faults.answers.lock().unwrap().push(Answer {
                 worker: self.worker,

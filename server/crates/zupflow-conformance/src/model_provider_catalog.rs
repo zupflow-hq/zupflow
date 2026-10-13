@@ -12,43 +12,53 @@ use std::collections::HashSet;
 use zupflow_core::model_providers::{CatalogError, ModelProviderCatalog, ProviderKey, ProviderKind};
 
 pub async fn run(catalog: &dyn ModelProviderCatalog, accepted: &ProviderKey, refused: &ProviderKey) {
-    assert!(!catalog.name().is_empty(), "named, for failures");
     for kind in ProviderKind::ALL {
-        let models = catalog.list_models(kind, accepted).await.unwrap();
+        run_kind(catalog, kind, accepted, refused).await;
+    }
+}
+
+/// The suite for one kind: what a live test with one provider's key runs.
+pub async fn run_kind(
+    catalog: &dyn ModelProviderCatalog,
+    kind: ProviderKind,
+    accepted: &ProviderKey,
+    refused: &ProviderKey,
+) {
+    assert!(!catalog.name().is_empty(), "named, for failures");
+    let models = catalog.list_models(kind, accepted).await.unwrap();
+    assert!(
+        !models.is_empty(),
+        "{} lists models for a key it accepts",
+        kind.as_str()
+    );
+    let mut seen = HashSet::new();
+    for model in &models {
+        assert!(!model.provider_model_id.is_empty(), "every model has an ID");
+        assert!(!model.name.is_empty(), "{} has a name", model.provider_model_id);
         assert!(
-            !models.is_empty(),
-            "{} lists models for a key it accepts",
-            kind.as_str()
+            seen.insert(model.provider_model_id.as_str()),
+            "{} is listed once",
+            model.provider_model_id
         );
-        let mut seen = HashSet::new();
-        for model in &models {
-            assert!(!model.provider_model_id.is_empty(), "every model has an ID");
-            assert!(!model.name.is_empty(), "{} has a name", model.provider_model_id);
+        if let Some(pricing) = model.pricing {
             assert!(
-                seen.insert(model.provider_model_id.as_str()),
-                "{} is listed once",
+                pricing.input_per_million_usd >= 0.0 && pricing.output_per_million_usd >= 0.0,
+                "{}'s prices aren't negative",
                 model.provider_model_id
             );
-            if let Some(pricing) = model.pricing {
-                assert!(
-                    pricing.input_per_million_usd >= 0.0 && pricing.output_per_million_usd >= 0.0,
-                    "{}'s prices aren't negative",
-                    model.provider_model_id
-                );
-            }
-            let shown = serde_json::to_string(model).unwrap();
-            assert!(!shown.contains(accepted.expose()), "a listing never repeats the key");
         }
-        assert_eq!(
-            catalog.list_models(kind, accepted).await.unwrap(),
-            models,
-            "the same list, in the same order"
-        );
-        assert_eq!(
-            catalog.list_models(kind, refused).await,
-            Err(CatalogError::KeyRefused),
-            "{} refuses a key it refuses",
-            kind.as_str()
-        );
+        let shown = serde_json::to_string(model).unwrap();
+        assert!(!shown.contains(accepted.expose()), "a listing never repeats the key");
     }
+    assert_eq!(
+        catalog.list_models(kind, accepted).await.unwrap(),
+        models,
+        "the same list, in the same order"
+    );
+    assert_eq!(
+        catalog.list_models(kind, refused).await,
+        Err(CatalogError::KeyRefused),
+        "{} refuses a key it refuses",
+        kind.as_str()
+    );
 }

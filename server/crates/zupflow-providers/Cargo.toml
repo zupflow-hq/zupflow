@@ -1,0 +1,31 @@
+[package]
+name = "zupflow-providers"
+description = "Model provider adapters over the safe outbound path: OpenAI-compatible chat completions (OpenAI, OpenRouter) and Anthropic Messages, with each provider's model list."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# `fake` builds `fake::FakeProviders`, an in-process stand-in for the three
+# providers' HTTP APIs that tests reach through `OutboundHttp`. Test-only:
+# only dev-dependencies turn it on.
+[features]
+fake = ["dep:zupflow-basic"]
+
+[dependencies]
+async-trait.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+zupflow-basic = { workspace = true, optional = true }
+zupflow-core.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+zupflow-basic.workspace = true
+zupflow-conformance.workspace = true
+zupflow-outbound.workspace = true

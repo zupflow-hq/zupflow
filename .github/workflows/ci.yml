@@ -48,6 +48,14 @@ jobs:
               exit 1
             fi
           done
+          # The faked model providers are for tests: only dev-dependencies turn them on,
+          # in the server's tree or any workspace crate's.
+          for tree in "-p zupflow-server" "--workspace"; do
+            if cargo tree $tree -e normal,build,features --locked | grep -F 'feature "fake"'; then
+              echo "cargo tree $tree has zupflow-providers' test-only fake feature" >&2
+              exit 1
+            fi
+          done
       - run: pnpm check
       # The shared contract suite against the backend, on a fixture of its own.
       - run: pnpm contract:backend

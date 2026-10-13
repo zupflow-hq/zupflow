@@ -61,8 +61,8 @@ use zupflow_core::runs::digest::{Sha256Digest, call_digest};
 use zupflow_core::runs::names::{Candidate, Offer, build_offer};
 use zupflow_core::runs::reducer::{
     Approval, Facts, Gone, INSTALLATION_DISCONNECTED, INSTALLATION_REMOVED, InstallationCheck, Io, ModelAnswer,
-    ModelResult, Plan, SendCheck, SendRequest, SendResult, admit, advance, calls_to_decide, cancel, fail_abandoned,
-    refuse_waiting, resolve_approval,
+    ModelResult, Plan, SendCheck, SendRequest, SendResult, Unanswered, UnansweredWhy, admit, advance, calls_to_decide,
+    cancel, fail_abandoned, refuse_waiting, resolve_approval,
 };
 use zupflow_core::runs::state::{
     CallDecision, CallVerdict, ClaimantId, Continuation, EXECUTION_VERSION, InvocationId, ModelAttemptState, RequestId,
@@ -656,6 +656,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     abandons_a_model_attempt_a_stopped_worker_left(&stores, a, agent_a).await;
     yields_without_using_an_attempt(&stores, a, agent_a).await;
     fails_a_run_whose_model_stays_silent(&stores, a, agent_a).await;
+    waits_as_the_provider_says_and_stops_at_a_second_timeout(&stores, a, agent_a).await;
     refuses_another_runs_calls(&stores, a, b, agent_a, agent_sibling, agent_b).await;
     writes_all_or_nothing(&stores, a, agent_a).await;
     finds_and_fails_abandoned_runs(&stores, a, agent_a).await;
@@ -2118,7 +2119,7 @@ async fn fails_a_run_whose_model_stays_silent(stores: &Stores<'_>, a: Tenant, ag
         silent.model = Some(ModelAnswer {
             turn,
             attempt,
-            result: ModelResult::Unavailable,
+            result: ModelResult::Unavailable(Unanswered::because(UnansweredWhy::NoAnswer)),
         });
         let (_, receipt) = step(stores, at, &silent).await;
         if expected < RUN_JOB_ATTEMPTS {
@@ -2147,6 +2148,56 @@ async fn fails_a_run_whose_model_stays_silent(stores: &Stores<'_>, a: Tenant, ag
             .contains(&(at.org, at.ws, at.run)),
         "nothing left for the sweep"
     );
+}
+
+/// A provider's `Retry-After` sets when the job is tried again, in place
+/// of the usual step; an attempt that timed out is recorded as one, and the
+/// turn's next timing out too fails the run `model_failed`.
+async fn waits_as_the_provider_says_and_stops_at_a_second_timeout(stores: &Stores<'_>, a: Tenant, agent_a: AgentId) {
+    let at = admitted(stores, a.organization_id, a.workspace, agent_a, "Slow").await;
+    let unanswered = |turn, attempt, why, retry_after| ModelAnswer {
+        turn,
+        attempt,
+        result: ModelResult::Unavailable(Unanswered { why, retry_after }),
+    };
+    let mut answers = [
+        unanswered(0, 1, UnansweredWhy::TimedOut, Some(Duration::from_secs(40))),
+        unanswered(0, 2, UnansweredWhy::TimedOut, None),
+    ]
+    .into_iter();
+    for expected in 1..=2 {
+        if expected > 1 {
+            stores.clock.advance(Duration::from_secs(39));
+            assert!(run_job(stores, at).await.is_none(), "not before the provider's wait");
+            stores.clock.advance(Duration::from_secs(1));
+        }
+        let job = run_job(stores, at).await.expect("tried again");
+        let who = claimant();
+        let epoch = claim(stores, at, who).await;
+        prepare(stores, at, who, epoch).await;
+        let mut slow = facts(stores, who, Some(epoch));
+        slow.model = answers.next();
+        let (_, receipt) = step(stores, at, &slow).await;
+        if expected == 1 {
+            assert_eq!(receipt.continuation, Continuation::NeedModel { turn: 0 });
+            let attempts = snapshot(stores, at).await.model_attempts;
+            assert_eq!(
+                attempts
+                    .iter()
+                    .map(|attempt| (attempt.state, attempt.timed_out))
+                    .collect::<Vec<_>>(),
+                [(ModelAttemptState::Unanswered, true)]
+            );
+            continue;
+        }
+        assert_eq!(kinds(&receipt), [RunEventType::RunFailed]);
+        assert_eq!(receipt.events[0].data["error"]["code"], json!("model_failed"));
+        assert_eq!(
+            stores.jobs.complete(&job.scope, job.id, &job.lease).await,
+            Err(JobError::LeaseLost),
+            "its job goes with it"
+        );
+    }
 }
 
 /// A run with a call sent, wherever it lives: `(at, send)`.
@@ -2992,7 +3043,7 @@ async fn yields_without_using_an_attempt(stores: &Stores<'_>, a: Tenant, agent_a
     silent.model = Some(ModelAnswer {
         turn: 1,
         attempt: 1,
-        result: ModelResult::Unavailable,
+        result: ModelResult::Unavailable(Unanswered::because(UnansweredWhy::NoAnswer)),
     });
     let (_, retried) = step(stores, at, &silent).await;
     assert_eq!(retried.continuation, Continuation::NeedModel { turn: 1 });

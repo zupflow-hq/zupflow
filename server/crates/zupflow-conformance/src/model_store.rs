@@ -27,8 +27,8 @@ use zupflow_core::ids::{AgentId, ApiKeyId, MemberId, ModelConnectionId, ModelId,
 use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::model_providers::ProviderKind;
 use zupflow_core::model_store::{
-    ConnectionStatus, KeyReplacement, Model, ModelConnection, ModelFilter, ModelManager, ModelStore, ModelStoreError,
-    NewConnection, NewModel, RouteState, SealedKey,
+    ConnectionStatus, KeyReplacement, Model, ModelConnection, ModelFilter, ModelManager, ModelStatus, ModelStore,
+    ModelStoreError, NewConnection, NewModel, RouteState, SealedKey,
 };
 use zupflow_core::time::Timestamp;
 
@@ -1041,6 +1041,39 @@ async fn resolves_a_runs_model(stores: &Stores<'_>, prepare: &Prepare) {
             connection_label: "Claude".to_owned()
         }
     );
+
+    // What the provider answers for a model is recorded, in its own
+    // environment only, as an observation: no person's change.
+    let status = |model_id: ModelId| async move {
+        let model = models
+            .find_model(org, Some(Environment::Sandbox), model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        (model.status, model.updated_at)
+    };
+    let (before, updated_at) = status(sonnet.id).await;
+    assert_eq!(before, ModelStatus::Available);
+    models
+        .record_model_status(org, Environment::Production, sonnet.id, ModelStatus::Unavailable)
+        .await
+        .unwrap();
+    assert_eq!(
+        status(sonnet.id).await.0,
+        ModelStatus::Available,
+        "another environment's"
+    );
+    models
+        .record_model_status(org, Environment::Sandbox, sonnet.id, ModelStatus::Unavailable)
+        .await
+        .unwrap();
+    assert_eq!(status(sonnet.id).await, (ModelStatus::Unavailable, updated_at));
+    assert_eq!(status(haiku.id).await.0, ModelStatus::Available, "only that model");
+    models
+        .record_model_status(org, Environment::Sandbox, sonnet.id, ModelStatus::Available)
+        .await
+        .unwrap();
+    assert_eq!(status(sonnet.id).await, (ModelStatus::Available, updated_at));
     models
         .delete_model(
             org,
@@ -1303,6 +1336,10 @@ async fn keeps_organizations_apart(stores: &Stores<'_>, prepare: &Prepare) {
         .mark_key_refused(other, Environment::Sandbox, connection.id, 1)
         .await
         .unwrap();
+    models
+        .record_model_status(other, Environment::Sandbox, model.id, ModelStatus::Unavailable)
+        .await
+        .unwrap();
     assert_eq!(
         models
             .delete_connection(
@@ -1395,5 +1432,8 @@ async fn keeps_organizations_apart(stores: &Stores<'_>, prepare: &Prepare) {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!((kept.name.as_str(), kept.is_default), ("GPT-5", true));
+    assert_eq!(
+        (kept.name.as_str(), kept.is_default, kept.status),
+        ("GPT-5", true, ModelStatus::Available)
+    );
 }

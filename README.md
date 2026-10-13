@@ -30,6 +30,8 @@ server/           The Rust backend — a Cargo workspace
   crates/zupflow-oidc/        Console sign-in through any OpenID Connect provider
   crates/zupflow-outbound/    The safe outbound HTTP path: public HTTPS only, no redirects, bounded
   crates/zupflow-mcp/         A minimal MCP client: lists a server's tools through the safe path
+  crates/zupflow-providers/   The model provider adapters: OpenAI-compatible chat completions (OpenAI,
+                              OpenRouter) and Anthropic Messages, and each provider's model list
   crates/zupflow-contract/    Development only: the server and fixture the contract suite runs against
   crates/zupflow-taskboard/   Development only: Taskboard, a fake MCP app with its own OAuth, for end-to-end runs
   crates/zupflow-conformance/ The suites every implementation of a trait must pass
@@ -267,12 +269,69 @@ when a worker takes it up, rather than asking a provider for a deployment's
 model.
 
 What checks keys and lists a provider's models is `ModelProviderCatalog`, a
-trait with a conformance suite; what answers runs is `ModelProvider`. No
-provider implementation ships with Zupflow. Unset, `ZUPFLOW_MODEL_PROVIDER`
-configures none: connecting a provider, replacing a key or listing a
-provider's models answers `501 model_providers_not_configured`, and every run
-fails `model_unavailable`. `ZUPFLOW_MODELS`, the deployment-wide model list of
-earlier versions, is no longer read: set, it stops startup. For local work and tests,
+trait with a conformance suite; what answers runs is `ModelProvider`.
+`ZUPFLOW_MODEL_PROVIDER=providers`, a deployment's setting, uses the adapters
+in `zupflow-providers` (decision 0049): plain HTTP to each provider's own API
+through the safe outbound path, no vendor SDK. OpenAI
+(`api.openai.com`) and OpenRouter (`openrouter.ai/api`) get chat completions
+with function tools; Anthropic (`api.anthropic.com`) gets Messages, with
+`anthropic-version: 2023-06-01` and the key in `x-api-key`. Every request
+names exactly one model ID, the run's, and never `models` or
+`openrouter/auto`: through OpenRouter any host of that model may serve it,
+but never another model. Every turn caps its output at 16,000 tokens
+(`max_completion_tokens` to OpenAI, `max_tokens` to the others). A run's
+conversation (its input, the model's text and calls, each call's result, an
+error result flagged as one) is written in each protocol and read back with
+its stop reason and token counts; a Claude model's thinking isn't kept
+between turns.
+
+A key is checked by listing models, so it must be allowed to: an OpenAI
+restricted key needs read access to Models (OpenRouter's list is public, so
+its `/api/v1/key` is asked first). OpenAI lists IDs only, so names are made
+from them and whether a model calls tools is judged from its family
+(`gpt-`, `o<n>`, less embeddings, images, audio, speech, search, moderation,
+completions and the models of other APIs; a fine-tuned `ft:` model by its
+base), while Anthropic gives context windows and OpenRouter prices, context
+and `supported_parameters`. A model that writes fewer tokens than the cap
+(`gpt-3.5`, `gpt-4`, the Claude 3 models before 3.7, an OpenRouter model
+whose `max_completion_tokens` is below it) isn't offered for tools, and
+neither, through OpenRouter, are Google's Gemini models: they expect their
+`reasoning_details` sent back with each tool call, which a run's conversation
+doesn't keep yet. Model calls run under their own limits (120 seconds, 4
+MiB), listing under tighter ones (20 seconds).
+
+Each turn opens its connection's sealed key in the run's own organization and
+environment, at the key version its model attempt was prepared with, only
+for that call; the outbound path injects it last and scrubs it from what
+comes back, and the adapter scrubs it again before reading anything. What a
+provider answers is classified by status, never by its words, which go
+nowhere:
+
+- `401` marks the connection `invalid_key` and fails the run
+  `model_key_invalid`, unless the key was replaced while the turn was in
+  flight: then the next attempt takes the new one.
+- `402` and `403` fail the run `model_failed`, saying the account is out of
+  credits or the provider refused the request (a region, a permission, a
+  moderation flag), and mark nothing.
+- `404`, or OpenRouter's `400` naming the model not a valid model ID, marks
+  the model `unavailable` (an answer marks it `available` again) and fails
+  the run `model_unavailable`.
+- `408`, `409`, `425`, `429`, `5xx` and no connection are tried again through
+  the run job's attempts, after the provider's `Retry-After` (at most 60
+  seconds) when it gives one, the run failing `model_unavailable` when they
+  run out.
+- A timeout is tried again once: the provider may have worked on the turn,
+  and billed it, all the same, so a second fails the run `model_failed`.
+- Anything else fails the run `model_failed`.
+
+Each answer is logged as `runs.model_answered`, with its outcome and latency,
+never what was said.
+
+Unset, `ZUPFLOW_MODEL_PROVIDER` configures none: connecting a provider,
+replacing a key or listing a provider's models answers `501
+model_providers_not_configured`, and every run fails `model_unavailable`.
+`ZUPFLOW_MODELS`, the deployment-wide model list of earlier versions, is no
+longer read: set, it stops startup. For local work and tests,
 `ZUPFLOW_MODEL_PROVIDER=scripted` uses the scripted providers in
 `zupflow-basic` (the mock's provider fixtures: any key of the right shape is
 accepted, one containing `invalid` refused) and answers runs with the
@@ -282,6 +341,19 @@ it answers `You said: …`), so runs are deterministic. Never use it in a
 deployment: it turns what a run's input says into tool calls. Any other value
 stops startup; the server logs which applies. `pnpm --filter @zupflow/server
 dev` sets it.
+
+No test reaches a real provider. `zupflow_providers::fake` fakes the three
+providers' APIs in process, behind the same `OutboundHttp` seam, reading each
+request as its provider would and answering in its format; it can refuse a
+key, drop a model, fail turns with a status or a timeout, and repeat the key
+it received in everything it answers, which proves the key never reaches a
+run, its events, the audit log, the API or the logs
+(`server/crates/zupflow-server/tests/model_calls.rs`). Live tests against the
+real providers are opt-in: `ZUPFLOW_LIVE_OPENAI_KEY`,
+`ZUPFLOW_LIVE_ANTHROPIC_KEY` or `ZUPFLOW_LIVE_OPENROUTER_KEY` (and optionally
+`ZUPFLOW_LIVE_<KIND>_MODEL`) run the catalog and model suites with
+`cargo test -p zupflow-providers --test live`; unset, they ask nothing. Never
+set them in CI.
 
 Runs are served: started (`403 console_read_only_in_production` for a
 Console session in Production, `422 agent_paused`), listed per workspace and
@@ -355,7 +427,8 @@ change that closes it; none is open today.
 Usage is served too: runs, failed runs and tool calls per UTC day in one
 environment (`?environment=`, required; `days` 1 to 90, 14 by default), every
 day listed; an API key reads its own environment's only. A workspace's
-`runs_last_24h` counts the runs started in it in the last 24 hours.
+`runs_last_24h` counts the runs started in it in the last 24 hours. Usage
+isn't split per model yet, though each run records its model and tokens.
 
 Webhook endpoints are served (decision 0017): every member and the
 organization's API keys list them; owners, admins and API keys add, change,

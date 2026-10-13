@@ -3067,6 +3067,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "zupflow-providers"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "zeroize",
+ "zupflow-basic",
+ "zupflow-conformance",
+ "zupflow-core",
+ "zupflow-outbound",
+]
+
+[[package]]
 name = "zupflow-server"
 version = "0.0.0"
 dependencies = [
@@ -3095,6 +3110,7 @@ dependencies = [
  "zupflow-mcp",
  "zupflow-oidc",
  "zupflow-outbound",
+ "zupflow-providers",
  "zupflow-sqlite",
 ]
 

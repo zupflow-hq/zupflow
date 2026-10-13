@@ -40,7 +40,12 @@ pub struct Setup {
 }
 
 pub async fn setup(installations: &[(&str, &str)]) -> Setup {
-    let server = Server::new().await;
+    setup_on(Server::new().await, installations).await
+}
+
+/// [`setup`] on `server`: one reaching the model providers through their
+/// adapters, say.
+pub async fn setup_on(server: Server, installations: &[(&str, &str)]) -> Setup {
     server.providers.serve_mcp(
         MCP,
         json!([

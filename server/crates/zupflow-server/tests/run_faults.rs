@@ -27,7 +27,9 @@ use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use zupflow_core::ids::RunId;
-use zupflow_core::models::{Completion, Message, ModelProvider, ModelToolCall, ProviderError, Reply, TokenUsage, Turn};
+use zupflow_core::models::{
+    Completion, Message, ModelProvider, ModelToolCall, ProviderAccess, ProviderError, Reply, TokenUsage, Turn,
+};
 use zupflow_core::runs::CallState;
 use zupflow_core::runs::state::ModelAttemptState;
 use zupflow_server::run_engine;
@@ -479,7 +481,7 @@ impl ModelProvider for ClosingTurn {
         "closing-turn"
     }
 
-    async fn complete(&self, turn: &Turn<'_>) -> Result<Completion, ProviderError> {
+    async fn complete(&self, access: &ProviderAccess<'_>, turn: &Turn<'_>) -> Result<Completion, ProviderError> {
         let closing = turn
             .messages
             .iter()
@@ -489,7 +491,7 @@ impl ModelProvider for ClosingTurn {
             Closing::SilentOnce(silent) if closing && !silent.swap(true, Ordering::SeqCst) => {
                 Err(ProviderError::Unavailable)
             }
-            _ => self.inner.complete(turn).await,
+            _ => self.inner.complete(access, turn).await,
         }
     }
 }
@@ -863,7 +865,7 @@ impl ModelProvider for Busy {
         "busy"
     }
 
-    async fn complete(&self, turn: &Turn<'_>) -> Result<Completion, ProviderError> {
+    async fn complete(&self, _: &ProviderAccess<'_>, turn: &Turn<'_>) -> Result<Completion, ProviderError> {
         let asked = turn
             .messages
             .iter()

@@ -39,17 +39,18 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 use zupflow_core::environment::Environment;
-use zupflow_core::ids::{AgentId, InstallationId, OrganizationId, RunId, ToolCallId, WorkspaceId};
+use zupflow_core::ids::{AgentId, InstallationId, ModelId, OrganizationId, RunId, ToolCallId, WorkspaceId};
 use zupflow_core::installations::{Installation, InstallationStatus, InstalledApp};
 use zupflow_core::jobs::{Job, JobId, LeaseToken, Retry};
-use zupflow_core::model_store::RouteState;
-use zupflow_core::models::{ProviderError, validate_completion};
+use zupflow_core::model_store::{ModelStatus, RouteState};
+use zupflow_core::models::{ProviderAccess, ProviderError, validate_completion};
 use zupflow_core::policy::{CallApp, Decision, GrantedAs, OrganizationLevel, ToolCall, Verdict, floor};
 use zupflow_core::runs::digest::{Sha256Digest, call_digest};
 use zupflow_core::runs::names::{Candidate, Offer, OfferedTool, build_offer};
 use zupflow_core::runs::reducer::{
-    Facts, Gone, Idle, InstallationCheck, Io, Limits, ModelAnswer, ModelRequest, ModelResult, Plan, SendCheck,
-    SendRequest, SendResult, advance, calls_to_decide, fail_abandoned, may_park_on, refuse_waiting,
+    Facts, Gone, Idle, InstallationCheck, Io, Limits, MODEL_FAILED, MODEL_KEY_INVALID, MODEL_UNAVAILABLE, ModelAnswer,
+    ModelRequest, ModelResult, Plan, SendCheck, SendRequest, SendResult, Unanswered, UnansweredWhy, advance,
+    calls_to_decide, fail_abandoned, may_park_on, refuse_waiting,
 };
 use zupflow_core::runs::state::{CallDecision, CallRecord, CallVerdict, ClaimantId, InvocationId, RequestId, Snapshot};
 use zupflow_core::runs::store::{
@@ -63,6 +64,7 @@ use zupflow_mcp::CallError;
 
 use crate::auth::AppState;
 use crate::mcp_access::{self, Unreachable};
+use crate::model_access::{self, Unopened};
 use crate::run_observe;
 
 /// The job kind: [`RUN_JOB`].
@@ -386,7 +388,7 @@ impl<P: ToolPort> Driver<'_, P> {
                 .owner
                 .is_some_and(|owner| owner.renew_lease_ms.is_none());
             match then {
-                Io::CallModel(asked) => model = Some(self.ask(&asked).await),
+                Io::CallModel(asked) => model = Some(self.ask(&snapshot, &asked).await),
                 Io::SendCall(send) => {
                     let started = std::time::Instant::now();
                     let outcome = match reach.take() {
@@ -508,39 +510,210 @@ impl<P: ToolPort> Driver<'_, P> {
     }
 
     /// Asks the model; what came of it, for the step that commits it.
-    async fn ask(&self, asked: &ModelRequest) -> ModelAnswer {
-        let turn = asked.as_turn();
-        let result = match self.state.provider.complete(&turn).await {
-            Ok(completion) => {
-                if let Err(why) = validate_completion(&turn, &completion) {
-                    tracing::error!(event = "runs.model_answer_invalid", provider = self.state.provider.name(), run_id = %self.run_id, why);
-                }
-                ModelResult::Answered(completion)
-            }
-            Err(ProviderError::Unavailable) => ModelResult::Unavailable,
-            Err(ProviderError::NotConfigured) => ModelResult::Failed(Failure::new(
-                "model_unavailable",
-                "No model provider is configured for this deployment, so the run can't be answered.",
-            )),
-            Err(ProviderError::UnknownModel) => ModelResult::Failed(Failure::new(
-                "model_unavailable",
-                format!(
-                    "The model {} isn't available. Choose another model for the agent and start a new run.",
-                    asked.model
-                ),
-            )),
-            Err(error) => {
-                tracing::error!(event = "runs.model_failed", provider = self.state.provider.name(), organization_id = %self.organization_id, workspace_id = %self.workspace_id, run_id = %self.run_id, %error);
-                ModelResult::Failed(Failure::new(
-                    "model_failed",
-                    "The model provider couldn't answer this run. Start it again.",
-                ))
-            }
-        };
+    async fn ask(&self, snapshot: &Snapshot, asked: &ModelRequest) -> ModelAnswer {
+        let started = std::time::Instant::now();
+        let (result, outcome) = self.answer(snapshot, asked).await;
+        tracing::info!(
+            event = "runs.model_answered",
+            organization_id = %self.organization_id,
+            workspace_id = %self.workspace_id,
+            environment = self.environment.as_str(),
+            run_id = %self.run_id,
+            turn = asked.turn,
+            attempt = asked.attempt,
+            outcome,
+            latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
         ModelAnswer {
             turn: asked.turn,
             attempt: asked.attempt,
             result,
+        }
+    }
+
+    /// The model's answer through the run's connection, with its key opened
+    /// for this turn alone, and what came of it, for the log. A key the
+    /// provider refuses marks the connection `invalid_key`, a model it no
+    /// longer serves marks the model `unavailable`; both fail the run. No
+    /// answer is worth asking again, through the job's attempts.
+    async fn answer(&self, snapshot: &Snapshot, asked: &ModelRequest) -> (ModelResult, &'static str) {
+        let (Some(model_id), Some(connection_id), Some(key_version)) =
+            (snapshot.model_id, snapshot.connection_id, asked.key_version)
+        else {
+            // The reducer never asks for a run without an organization's model.
+            return (
+                ModelResult::Failed(Failure::new(
+                    MODEL_UNAVAILABLE,
+                    "The run was admitted before organizations had models, so it has none to call. Start it again.",
+                )),
+                "no_route",
+            );
+        };
+        let reach = match model_access::open(
+            self.state,
+            self.organization_id,
+            self.environment,
+            connection_id,
+            key_version,
+        )
+        .await
+        {
+            Ok(reach) => reach,
+            // Models go with their connection.
+            Err(Unopened::ConnectionGone) => {
+                return (
+                    ModelResult::Failed(Failure::new(
+                        MODEL_UNAVAILABLE,
+                        "The run's model was removed while the run was under way.",
+                    )),
+                    "connection_gone",
+                );
+            }
+            // The next attempt is prepared with the new key.
+            Err(Unopened::KeyReplaced) => {
+                return (
+                    ModelResult::Unavailable(Unanswered::because(UnansweredWhy::KeyReplaced)),
+                    "key_replaced",
+                );
+            }
+            Err(unopened @ Unopened::Unavailable(_)) => {
+                return (
+                    ModelResult::Unavailable(Unanswered::because(UnansweredWhy::Internal)),
+                    unopened.why(),
+                );
+            }
+        };
+        let turn = asked.as_turn();
+        let access = ProviderAccess {
+            kind: reach.kind,
+            key: &reach.key,
+        };
+        let answered = self.state.provider.complete(&access, &turn).await;
+        let model_store = &self.state.model_store;
+        let failed = |code: &str, message: String, outcome: &'static str| {
+            (ModelResult::Failed(Failure::new(code, message)), outcome)
+        };
+        let unanswered = |why, retry_after| ModelResult::Unavailable(Unanswered { why, retry_after });
+        match answered {
+            Ok(completion) => {
+                if let Err(why) = validate_completion(&turn, &completion) {
+                    tracing::error!(event = "runs.model_answer_invalid", provider = self.state.provider.name(), run_id = %self.run_id, why);
+                }
+                self.answered_by(model_id).await;
+                (ModelResult::Answered(completion), "answered")
+            }
+            Err(ProviderError::Unavailable) => (unanswered(UnansweredWhy::NoAnswer, None), "unavailable"),
+            Err(ProviderError::RetryAfter(after)) => (unanswered(UnansweredWhy::NoAnswer, Some(after)), "retry_after"),
+            Err(ProviderError::TimedOut) => (unanswered(UnansweredWhy::TimedOut, None), "timed_out"),
+            Err(ProviderError::KeyRefused) => {
+                // A key replaced while the turn was in flight was refused as
+                // the old one: the next attempt takes the new one.
+                match model_store
+                    .connection_key(self.organization_id, self.environment, connection_id)
+                    .await
+                {
+                    Ok(Some(current)) if current.version != key_version => {
+                        return (unanswered(UnansweredWhy::KeyReplaced, None), "key_replaced");
+                    }
+                    Ok(_) => {}
+                    Err(_) => return (unanswered(UnansweredWhy::Internal, None), "store_unavailable"),
+                }
+                if let Err(error) = model_store
+                    .mark_key_refused(self.organization_id, self.environment, connection_id, key_version)
+                    .await
+                {
+                    tracing::error!(event = "runs.mark_key_refused_failed", organization_id = %self.organization_id, %connection_id, %error);
+                }
+                failed(
+                    MODEL_KEY_INVALID,
+                    format!(
+                        "The model provider refused {}'s key. Replace it under Model providers.",
+                        reach.label
+                    ),
+                    "key_refused",
+                )
+            }
+            // The key is fine: this request wasn't. Nothing is marked.
+            Err(ProviderError::Forbidden) => failed(
+                MODEL_FAILED,
+                format!(
+                    "{} refused this request with {}'s key: the model may not be available in its region or to \
+                     its account, or the provider flagged the conversation. Check the account with {}, or choose \
+                     another model.",
+                    reach.kind.name(),
+                    reach.label,
+                    reach.kind.name()
+                ),
+                "forbidden",
+            ),
+            Err(ProviderError::OutOfCredits) => failed(
+                MODEL_FAILED,
+                format!(
+                    "The {} account behind {}'s key is out of credits. Add credits with {}, then start the run \
+                     again.",
+                    reach.kind.name(),
+                    reach.label,
+                    reach.kind.name()
+                ),
+                "out_of_credits",
+            ),
+            Err(ProviderError::UnknownModel) => {
+                if let Err(error) = model_store
+                    .record_model_status(
+                        self.organization_id,
+                        self.environment,
+                        model_id,
+                        ModelStatus::Unavailable,
+                    )
+                    .await
+                {
+                    tracing::error!(event = "runs.model_status_failed", organization_id = %self.organization_id, %model_id, %error);
+                }
+                failed(
+                    MODEL_UNAVAILABLE,
+                    format!(
+                        "The model {} isn't available. Choose another model for the agent and start a new run.",
+                        asked.model
+                    ),
+                    "unknown_model",
+                )
+            }
+            Err(ProviderError::NotConfigured) => failed(
+                MODEL_UNAVAILABLE,
+                "No model provider is configured for this deployment, so the run can't be answered.".to_owned(),
+                "not_configured",
+            ),
+            Err(error) => {
+                tracing::error!(event = "runs.model_failed", provider = self.state.provider.name(), organization_id = %self.organization_id, workspace_id = %self.workspace_id, run_id = %self.run_id, %error);
+                failed(
+                    MODEL_FAILED,
+                    "The model provider couldn't answer this run. Start it again.".to_owned(),
+                    "failed",
+                )
+            }
+        }
+    }
+
+    /// A model that answers is served, whatever was seen before: marked
+    /// available again, written only when it wasn't.
+    async fn answered_by(&self, model_id: ModelId) {
+        let model_store = &self.state.model_store;
+        match model_store
+            .find_model(self.organization_id, Some(self.environment), model_id)
+            .await
+        {
+            Ok(Some(model)) if model.status != ModelStatus::Available => {
+                if let Err(error) = model_store
+                    .record_model_status(self.organization_id, self.environment, model_id, ModelStatus::Available)
+                    .await
+                {
+                    tracing::warn!(event = "runs.model_status_failed", organization_id = %self.organization_id, %model_id, %error);
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(event = "runs.model_status_failed", organization_id = %self.organization_id, %model_id, %error);
+            }
         }
     }
 

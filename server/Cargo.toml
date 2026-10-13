@@ -13,6 +13,7 @@ default-members = [
     "crates/zupflow-mcp",
     "crates/zupflow-oidc",
     "crates/zupflow-outbound",
+    "crates/zupflow-providers",
     "crates/zupflow-server",
     "crates/zupflow-sqlite",
 ]
@@ -62,6 +63,7 @@ zupflow-core = { path = "crates/zupflow-core" }
 zupflow-mcp = { path = "crates/zupflow-mcp" }
 zupflow-oidc = { path = "crates/zupflow-oidc" }
 zupflow-outbound = { path = "crates/zupflow-outbound" }
+zupflow-providers = { path = "crates/zupflow-providers" }
 zupflow-sqlite = { path = "crates/zupflow-sqlite" }
 
 # Test-only

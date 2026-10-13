@@ -47,7 +47,8 @@ pub struct AppState {
     /// Organizations' model provider connections, models and default models
     /// (decisions 0049, 0050).
     pub model_store: Arc<dyn zupflow_core::model_store::ModelStore>,
-    /// Checks a connection's key and lists its provider's models.
+    /// Checks a connection's key and lists its provider's models: the
+    /// provider adapters, or the scripted providers for local work.
     pub model_catalog: Arc<dyn zupflow_core::model_providers::ModelProviderCatalog>,
     pub connect: Arc<dyn ConnectStore>,
     /// Seals the secrets Zupflow holds (decision 0033).
@@ -69,8 +70,8 @@ pub struct AppState {
     pub fingerprinter: Arc<Fingerprinter>,
     /// Runs, their timelines and their calls (milestone 4).
     pub runs: Arc<dyn zupflow_core::runs::RunStore>,
-    /// Answers each turn of a run: the scripted model, unless a deployment
-    /// brings another.
+    /// Answers each turn of a run, with the key of its connection: the
+    /// provider adapters, or the scripted model for local work.
     pub provider: Arc<dyn zupflow_core::models::ModelProvider>,
     /// Decides each tool call, inside the floor (decision 0040).
     pub approvals: Arc<dyn zupflow_core::policy::ApprovalPolicy>,

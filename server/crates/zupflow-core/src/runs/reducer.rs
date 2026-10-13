@@ -22,11 +22,13 @@
 //! | any other, no claim held | `Claim` under a fresh claimant, or idle while another lease or a send claim is live |
 //! | a call failed for a reconnect | `Finish` failed |
 //! | `NeedModel` | `PrepareModel` + call the model; `Finish` past the turn limit; `Yield` past the step budget |
-//! | `AwaitModel` with its answer | `CommitTurn`; `Finish` failed; `Yield` when the model is unavailable, `Finish` failed `model_unavailable` on the job's last attempt |
+//! | `AwaitModel` with its answer | `CommitTurn`; `Finish` failed; `Yield` when the model is unavailable, `Finish` failed on the job's last attempt, or on a turn's second timeout |
 //! | `AwaitModel` without one | `PrepareModel` of a new attempt, the old one abandoned |
 //! | `NeedCall` | `Park`, or `AuthorizeCall` refusing a call waiting for approval whose installation went away; `AuthorizeCall` (send or refuse) + send; `Yield` past the step budget |
 //! | `AwaitCall`, send lease live | `Yield` until it lapses (the store reads when, from its own records) |
 //! | `AwaitCall`, send lease lapsed | `SettleUnknown` |
+
+use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
@@ -154,10 +156,43 @@ pub struct ModelAnswer {
 pub enum ModelResult {
     Answered(Completion),
     /// No answer, or not yet: nothing is committed, the job tries later.
-    Unavailable,
+    Unavailable(Unanswered),
     /// The provider can't answer this run: it fails with this.
     Failed(Failure),
 }
+
+/// Why a model attempt got no answer, and when the provider said to try
+/// again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unanswered {
+    pub why: UnansweredWhy,
+    /// The provider's `Retry-After`, already bounded.
+    pub retry_after: Option<Duration>,
+}
+
+impl Unanswered {
+    pub const fn because(why: UnansweredWhy) -> Self {
+        Self { why, retry_after: None }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnansweredWhy {
+    /// The provider didn't answer: a rate limit, a `5xx`, no connection.
+    NoAnswer,
+    /// The turn was sent and no answer came in time. It may have been
+    /// worked on and billed: a turn is tried again after one of these at
+    /// most once.
+    TimedOut,
+    /// The connection's key was replaced since the attempt was prepared:
+    /// the next attempt takes the new one.
+    KeyReplaced,
+    /// Our own store or key service didn't answer.
+    Internal,
+}
+
+/// The failure code of a turn the provider refused or answered unusably.
+pub const MODEL_FAILED: &str = "model_failed";
 
 /// An installation as a send finds it, read again however long the run was
 /// parked (decision 0047).
@@ -263,6 +298,11 @@ impl Facts {
 pub struct ModelRequest {
     pub turn: u32,
     pub attempt: u32,
+    /// The connection's key version the attempt was prepared with, recorded
+    /// with it: the key is opened at this version, or not at all. `None`
+    /// only for a run from before organizations had models, which is never
+    /// asked. Not part of what the model is sent, nor of the digest.
+    pub key_version: Option<u32>,
     pub model: String,
     pub instructions: String,
     pub messages: Vec<Message>,
@@ -711,10 +751,17 @@ fn conversation(snapshot: &Snapshot) -> Result<Vec<Message>, AdvanceError> {
     Ok(messages)
 }
 
-fn model_request(snapshot: &Snapshot, turn: u32, attempt: u32, offer: &Offer) -> Result<ModelRequest, AdvanceError> {
+fn model_request(
+    snapshot: &Snapshot,
+    turn: u32,
+    attempt: u32,
+    key_version: Option<u32>,
+    offer: &Offer,
+) -> Result<ModelRequest, AdvanceError> {
     Ok(ModelRequest {
         turn,
         attempt,
+        key_version,
         model: snapshot.model.clone(),
         instructions: snapshot.instructions.clone(),
         messages: conversation(snapshot)?,
@@ -1041,7 +1088,7 @@ impl Worker<'_> {
                 .max()
                 .unwrap_or(0),
         )?;
-        let request = model_request(self.snapshot, turn, attempt, offer)?;
+        let request = model_request(self.snapshot, turn, attempt, key_version, offer)?;
         validate_turn(&request.as_turn()).map_err(|_| AdvanceError::InvalidFact("a model request no model takes"))?;
         let operation = Operation::PrepareModel(PrepareModel {
             turn,
@@ -1052,6 +1099,14 @@ impl Worker<'_> {
             key_version,
         });
         Ok(self.apply(self.keeps(), operation, Io::CallModel(request)))
+    }
+
+    /// Whether an earlier attempt of `turn` than `attempt` timed out.
+    fn timed_out_before(&self, turn: u32, attempt: u32) -> bool {
+        self.snapshot
+            .model_attempts
+            .iter()
+            .any(|earlier| earlier.turn == turn && earlier.attempt < attempt && earlier.timed_out)
     }
 
     fn await_model(&self, turn: u32, attempt: u32) -> Result<Plan, AdvanceError> {
@@ -1075,24 +1130,57 @@ impl Worker<'_> {
         if (answer.turn, answer.attempt) != (turn, attempt) {
             return Err(AdvanceError::InvalidFact("an answer to another model attempt"));
         }
-        let request = model_request(self.snapshot, turn, attempt, &prepared.offer)?;
+        // Only its digest is compared: the key version isn't in it.
+        let request = model_request(self.snapshot, turn, attempt, None, &prepared.offer)?;
         if request.digest() != prepared.request_digest {
             return Err(AdvanceError::InvalidSnapshot(
                 "the conversation changed under a prepared model attempt",
             ));
         }
         let completion = match &answer.result {
-            // On the job's last attempt the run fails now, as it always has.
-            ModelResult::Unavailable if self.facts.last_attempt => {
-                return Ok(self.fail(MODEL_UNAVAILABLE, "The model provider did not respond in time."));
+            // A second timeout of the same turn fails the run: each may
+            // have been billed.
+            ModelResult::Unavailable(Unanswered {
+                why: UnansweredWhy::TimedOut,
+                ..
+            }) if self.timed_out_before(turn, attempt) => {
+                return Ok(self.fail(
+                    MODEL_FAILED,
+                    "The model provider took too long to answer twice in a row, so the run stopped rather than \
+                     pay for a third try. Start it again, or choose a faster model.",
+                ));
+            }
+            // On the job's last attempt the run fails now, with why.
+            ModelResult::Unavailable(unanswered) if self.facts.last_attempt => {
+                let (code, message) = match unanswered.why {
+                    UnansweredWhy::NoAnswer | UnansweredWhy::TimedOut => {
+                        (MODEL_UNAVAILABLE, "The model provider did not respond in time.")
+                    }
+                    UnansweredWhy::KeyReplaced => (
+                        MODEL_UNAVAILABLE,
+                        "The model provider's key was replaced on every try while the run waited. Start it again.",
+                    ),
+                    UnansweredWhy::Internal => (
+                        "run_unavailable",
+                        "The model provider's key couldn't be read on any try. Start the run again.",
+                    ),
+                };
+                return Ok(self.fail(code, message));
             }
             // Release the claim at once, so the retry doesn't wait out the
             // lease, and record that nothing answered.
-            ModelResult::Unavailable => {
+            ModelResult::Unavailable(unanswered) => {
                 return Ok(self.apply(
                     self.releases(),
                     Operation::Yield(Yield {
-                        why: YieldReason::ModelUnavailable { turn, attempt },
+                        why: YieldReason::ModelUnavailable {
+                            turn,
+                            attempt,
+                            timed_out: unanswered.why == UnansweredWhy::TimedOut,
+                            retry_after_secs: unanswered
+                                .retry_after
+                                .map(|after| u32::try_from(after.as_secs()).unwrap_or(u32::MAX)),
+                        },
                     }),
                     Io::Nothing,
                 ));
@@ -1104,7 +1192,7 @@ impl Worker<'_> {
         };
         if validate_completion(&request.as_turn(), completion).is_err() {
             return Ok(self.fail(
-                "model_failed",
+                MODEL_FAILED,
                 "The model provider couldn't answer this run. Start it again.",
             ));
         }

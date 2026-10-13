@@ -746,6 +746,29 @@ impl ModelStore for SqliteModelStore {
         Ok(())
     }
 
+    async fn record_model_status(
+        &self,
+        organization_id: OrganizationId,
+        environment: Environment,
+        model_id: ModelId,
+        status: ModelStatus,
+    ) -> Result<(), ModelStoreError> {
+        // Only a change writes: a model answering as before costs a read.
+        sqlx::query(
+            "UPDATE models SET status = ? \
+             WHERE organization_id = ? AND environment = ? AND id = ? AND status <> ?",
+        )
+        .bind(status.as_str())
+        .bind(organization_id.uuid())
+        .bind(environment.as_str())
+        .bind(model_id.uuid())
+        .bind(status.as_str())
+        .execute(self.database.pool())
+        .await
+        .map_err(failed("record_model_status"))?;
+        Ok(())
+    }
+
     async fn delete_connection(
         &self,
         organization_id: OrganizationId,

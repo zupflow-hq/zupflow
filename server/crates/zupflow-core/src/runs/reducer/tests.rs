@@ -171,13 +171,16 @@ fn running(continuation: Continuation) -> Snapshot {
 /// Turn 0 prepared as attempt 1, awaiting its answer.
 fn awaiting_model() -> Snapshot {
     let mut snapshot = running(Continuation::AwaitModel { turn: 0, attempt: 1 });
-    let digest = model_request(&snapshot, 0, 1, &offer()).expect("a request").digest();
+    let digest = model_request(&snapshot, 0, 1, None, &offer())
+        .expect("a request")
+        .digest();
     snapshot.model_attempts.push(ModelAttempt {
         turn: 0,
         attempt: 1,
         state: ModelAttemptState::Prepared,
         request_digest: digest,
         offer: offer(),
+        timed_out: false,
     });
     snapshot
 }
@@ -217,13 +220,16 @@ fn record(n: u128, position: u32, name: &str, state: CallState) -> CallRecord {
 fn with_calls(continuation: Continuation, calls: Vec<CallRecord>) -> Snapshot {
     let mut snapshot = running(continuation);
     snapshot.turns.push(CommittedTurn { turn: 0, text: None });
-    let digest = model_request(&fresh(), 0, 1, &offer()).expect("a request").digest();
+    let digest = model_request(&fresh(), 0, 1, None, &offer())
+        .expect("a request")
+        .digest();
     snapshot.model_attempts.push(ModelAttempt {
         turn: 0,
         attempt: 1,
         state: ModelAttemptState::Answered,
         request_digest: digest,
         offer: offer(),
+        timed_out: false,
     });
     snapshot.calls = calls;
     snapshot
@@ -597,6 +603,11 @@ fn need_model_prepares_an_attempt_with_the_offer_frozen() {
     );
     assert_eq!(guards(&plan), keeps(1));
     assert_eq!((request.turn, request.attempt), (0, 1));
+    assert_eq!(
+        request.key_version,
+        Some(3),
+        "the key is opened at the version recorded"
+    );
     assert_eq!(request.model, "model-a");
     assert_eq!(request.instructions, "Be brief.");
     assert_eq!(
@@ -983,7 +994,9 @@ fn only_the_frozen_offer_names_tools() {
     let mut snapshot = awaiting_model();
     let frozen = build_offer([candidate(work(), "k7m2qd", "Work", "list_tasks")]).offer;
     snapshot.model_attempts[0].offer = frozen.clone();
-    snapshot.model_attempts[0].request_digest = model_request(&snapshot, 0, 1, &frozen).expect("a request").digest();
+    snapshot.model_attempts[0].request_digest = model_request(&snapshot, 0, 1, None, &frozen)
+        .expect("a request")
+        .digest();
     let facts = Facts {
         model: Some(answered(0, 1, asks(&[("a", WORK_CREATE)]))),
         call_ids: vec![call_id(1)],
@@ -997,13 +1010,112 @@ fn only_the_frozen_offer_names_tools() {
 }
 
 #[test]
+fn a_turn_that_times_out_twice_fails_and_says_why_the_last_attempt_went_unanswered() {
+    let answer = |why, retry_after, attempt| Facts {
+        model: Some(ModelAnswer {
+            turn: 0,
+            attempt,
+            result: ModelResult::Unavailable(Unanswered { why, retry_after }),
+        }),
+        ..claimed()
+    };
+    // A first timeout yields like any unanswered attempt, marked as one,
+    // and a provider's wait goes with it.
+    let snapshot = awaiting_model();
+    let first = answer(UnansweredWhy::TimedOut, None, 1);
+    assert_eq!(
+        operation(&planned(&snapshot, &first)),
+        &Operation::Yield(Yield {
+            why: YieldReason::ModelUnavailable {
+                turn: 0,
+                attempt: 1,
+                timed_out: true,
+                retry_after_secs: None
+            },
+        })
+    );
+    assert_eq!(
+        operation(&planned(
+            &snapshot,
+            &answer(UnansweredWhy::NoAnswer, Some(Duration::from_secs(30)), 1)
+        )),
+        &Operation::Yield(Yield {
+            why: YieldReason::ModelUnavailable {
+                turn: 0,
+                attempt: 1,
+                timed_out: false,
+                retry_after_secs: Some(30)
+            },
+        })
+    );
+
+    // The next attempt of the same turn timing out too fails the run, not
+    // retried again: each may have been billed.
+    let mut run = snapshot.clone();
+    step(&mut run, &first);
+    assert!(run.model_attempts[0].timed_out);
+    step(&mut run, &facts());
+    step(
+        &mut run,
+        &Facts {
+            claim: Some(2),
+            ..facts()
+        },
+    );
+    assert_eq!(
+        run.control.continuation,
+        Continuation::AwaitModel { turn: 0, attempt: 2 }
+    );
+    let second = Facts {
+        claim: Some(2),
+        ..answer(UnansweredWhy::TimedOut, None, 2)
+    };
+    let plan = planned(&run, &second);
+    assert_eq!(failure_code(&plan), MODEL_FAILED);
+    // Another kind of no answer after a timeout is tried again as usual.
+    assert!(matches!(
+        operation(&planned(
+            &run,
+            &Facts {
+                claim: Some(2),
+                ..answer(UnansweredWhy::NoAnswer, None, 2)
+            }
+        )),
+        Operation::Yield(_)
+    ));
+
+    // On the job's last attempt, the failure says what went wrong.
+    for (why, code, says) in [
+        (UnansweredWhy::NoAnswer, MODEL_UNAVAILABLE, "did not respond in time"),
+        (UnansweredWhy::TimedOut, MODEL_UNAVAILABLE, "did not respond in time"),
+        (UnansweredWhy::KeyReplaced, MODEL_UNAVAILABLE, "key was replaced"),
+        (UnansweredWhy::Internal, "run_unavailable", "key couldn't be read"),
+    ] {
+        let last = Facts {
+            last_attempt: true,
+            ..answer(why, None, 1)
+        };
+        let plan = planned(&snapshot, &last);
+        let Operation::Finish(Finish {
+            ending: RunEnding::Failed { error },
+            ..
+        }) = operation(&plan)
+        else {
+            panic!("{why:?} fails the run");
+        };
+        assert_eq!(error.code, code, "{why:?}");
+        assert!(error.message.contains(says), "{why:?}: {}", error.message);
+    }
+}
+
+#[test]
 fn a_failed_or_unusable_answer_fails_the_run_and_an_unavailable_one_yields() {
     let snapshot = awaiting_model();
     let unavailable = Facts {
         model: Some(ModelAnswer {
             turn: 0,
             attempt: 1,
-            result: ModelResult::Unavailable,
+            result: ModelResult::Unavailable(Unanswered::because(UnansweredWhy::NoAnswer)),
         }),
         ..claimed()
     };
@@ -1011,7 +1123,12 @@ fn a_failed_or_unusable_answer_fails_the_run_and_an_unavailable_one_yields() {
     assert_eq!(
         operation(&plan),
         &Operation::Yield(Yield {
-            why: YieldReason::ModelUnavailable { turn: 0, attempt: 1 },
+            why: YieldReason::ModelUnavailable {
+                turn: 0,
+                attempt: 1,
+                timed_out: false,
+                retry_after_secs: None
+            },
         })
     );
     // The claim is released at once, and the run asks this turn again.
@@ -2307,7 +2424,12 @@ fn every_operation_says_where_it_leaves_the_run() {
         ),
         (
             Operation::Yield(Yield {
-                why: YieldReason::ModelUnavailable { turn: 2, attempt: 1 },
+                why: YieldReason::ModelUnavailable {
+                    turn: 2,
+                    attempt: 1,
+                    timed_out: false,
+                    retry_after_secs: None,
+                },
             }),
             RunStatus::Queued,
             Continuation::NeedModel { turn: 2 },
@@ -2440,6 +2562,7 @@ fn commit(snapshot: &mut Snapshot, request: &TransitionRequest, now: Timestamp) 
                 state: ModelAttemptState::Prepared,
                 request_digest: prepare.request_digest,
                 offer: prepare.offer.clone(),
+                timed_out: false,
             });
         }
         Operation::CommitTurn(commit) => {
@@ -2563,12 +2686,19 @@ fn commit(snapshot: &mut Snapshot, request: &TransitionRequest, now: Timestamp) 
             snapshot.control.cancel_requested_at = Some(now);
         }
         Operation::Yield(Yield {
-            why: YieldReason::ModelUnavailable { turn, attempt },
+            why:
+                YieldReason::ModelUnavailable {
+                    turn,
+                    attempt,
+                    timed_out,
+                    ..
+                },
         }) => {
             for recorded in &mut snapshot.model_attempts {
                 if (recorded.turn, recorded.attempt) == (*turn, *attempt) {
                     assert_eq!(recorded.state, ModelAttemptState::Prepared);
                     recorded.state = ModelAttemptState::Unanswered;
+                    recorded.timed_out = *timed_out;
                 }
             }
         }
@@ -3202,7 +3332,9 @@ fn long_floats_in_a_frozen_offer_survive_storage() {
     long.input_schema = schema;
     let frozen = build_offer([long]).offer;
     let mut snapshot = running(Continuation::AwaitModel { turn: 0, attempt: 1 });
-    let digest = model_request(&snapshot, 0, 1, &frozen).expect("a request").digest();
+    let digest = model_request(&snapshot, 0, 1, None, &frozen)
+        .expect("a request")
+        .digest();
     // The store keeps the offer as JSON and reads it back.
     let read_back: Offer =
         serde_json::from_value(stored(&serde_json::to_value(&frozen).expect("writes"))).expect("reads back");
@@ -3212,6 +3344,7 @@ fn long_floats_in_a_frozen_offer_survive_storage() {
         state: ModelAttemptState::Prepared,
         request_digest: digest,
         offer: read_back,
+        timed_out: false,
     });
     let facts = Facts {
         model: Some(answered(0, 1, Reply::Text("Paid.".to_owned()))),

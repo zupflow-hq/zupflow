@@ -24,6 +24,7 @@ pub mod input;
 pub mod installations;
 pub mod invitations;
 pub mod mcp_access;
+pub mod model_access;
 pub mod model_providers;
 mod oauth_refresh;
 pub mod organizations;

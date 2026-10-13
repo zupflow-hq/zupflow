@@ -3,7 +3,7 @@
 //! fails rather than being answered by something that isn't a model.
 
 use async_trait::async_trait;
-use zupflow_core::models::{Completion, ModelProvider, ProviderError, Turn};
+use zupflow_core::models::{Completion, ModelProvider, ProviderAccess, ProviderError, Turn};
 
 /// Recorded with failures.
 pub const NAME: &str = "none";
@@ -17,7 +17,7 @@ impl ModelProvider for NoModelProvider {
         NAME
     }
 
-    async fn complete(&self, _: &Turn<'_>) -> Result<Completion, ProviderError> {
+    async fn complete(&self, _: &ProviderAccess<'_>, _: &Turn<'_>) -> Result<Completion, ProviderError> {
         Err(ProviderError::NotConfigured)
     }
 }
@@ -35,6 +35,14 @@ mod tests {
             messages: &messages,
             tools: &[],
         };
-        assert_eq!(NoModelProvider.complete(&turn).await, Err(ProviderError::NotConfigured));
+        let key = zupflow_core::model_providers::ProviderKey::new("sk-test-long-suite-0000-xx".to_owned());
+        let access = ProviderAccess {
+            kind: zupflow_core::model_providers::ProviderKind::OpenAi,
+            key: &key,
+        };
+        assert_eq!(
+            NoModelProvider.complete(&access, &turn).await,
+            Err(ProviderError::NotConfigured)
+        );
     }
 }

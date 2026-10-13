@@ -1,10 +1,16 @@
 //! Calling a model ([`ModelProvider`]): a turn of a conversation, with the
 //! tools the agent may call, in; text or tool calls out, with the tokens it
 //! took. Which models an organization can use, through which connection and
-//! key, is [`crate::model_store`]; calling a real provider is a deployment's
-//! own adapter, and this repository ships only a scripted model.
+//! key, is [`crate::model_store`]; each turn goes to the run's connection's
+//! provider with its key, opened for that call alone ([`ProviderAccess`]).
+//! The adapters for OpenAI, Anthropic and OpenRouter are `zupflow-providers`
+//! (decision 0049); `zupflow-basic` has a scripted model for tests.
+
+use std::time::Duration;
 
 use async_trait::async_trait;
+
+use crate::model_providers::{ProviderKey, ProviderKind};
 
 // ---------------------------------------------------------------------------
 // Calling a model
@@ -72,6 +78,15 @@ pub struct Turn<'a> {
     pub tools: &'a [ToolSpec],
 }
 
+/// Where a turn goes: the run's connection's provider and its key, opened
+/// for this call and dropped (wiped) after it. An adapter sends the key as
+/// the provider's credential and nowhere else.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderAccess<'a> {
+    pub kind: ProviderKind,
+    pub key: &'a ProviderKey,
+}
+
 /// Tokens a turn took, as the provider counts them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
@@ -97,16 +112,39 @@ pub struct Completion {
     pub usage: TokenUsage,
 }
 
+/// The longest wait a provider's `Retry-After` is taken at: a longer one is
+/// cut to this, so a run is never parked for long on a provider's word.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ProviderError {
-    /// No answer, or not yet (a timeout, a rate limit, a `5xx`): worth
+    /// No answer, or not yet (a rate limit, a `5xx`, no connection): worth
     /// trying again later. Nothing a model is sent acts on anything, so a
     /// turn is safe to repeat.
     #[error("the model provider is unavailable")]
     Unavailable,
-    /// The provider doesn't serve this model.
+    /// As `Unavailable`, and the provider said when to try again (its
+    /// `Retry-After`, at most [`MAX_RETRY_AFTER`]).
+    #[error("the model provider asked to wait")]
+    RetryAfter(Duration),
+    /// The turn was sent and no answer came in time. The provider may have
+    /// worked on it, and billed it, all the same: tried again at most once.
+    #[error("the model provider timed out")]
+    TimedOut,
+    /// The provider doesn't serve this model (it answered `404`, or said so
+    /// in a way its kind is known to).
     #[error("the model isn't served")]
     UnknownModel,
+    /// The provider refused the key (it answered `401`).
+    #[error("the provider refused the key")]
+    KeyRefused,
+    /// The provider knows the key but refused this request with it (`403`):
+    /// a moderation flag, a region, a permission. The key stays as it is.
+    #[error("the provider refused the request")]
+    Forbidden,
+    /// The provider account behind the key can't pay for the turn (`402`).
+    #[error("the provider account is out of credits")]
+    OutOfCredits,
     /// This deployment has no model provider: no run can be answered.
     #[error("no model provider is configured")]
     NotConfigured,
@@ -120,20 +158,22 @@ pub enum ProviderError {
 }
 
 /// Calls a model: one turn of a conversation in, text or tool calls out,
-/// with the tokens it took. Replaceable whole; the basic implementation is a
-/// scripted model, and a deployment brings adapters for real providers
-/// (decision 0014): no provider, key or vendor configuration lives in this
-/// repository.
+/// with the tokens it took. Replaceable whole: the provider adapters
+/// (`zupflow-providers`) reach each kind of provider through `OutboundHttp`;
+/// the scripted model answers tests and local work. No key or vendor
+/// configuration lives in this repository: keys are organizations' own.
 ///
 /// Every implementation refuses a turn [`validate_turn`] refuses
 /// (`InvalidTurn`), and answers a [`Completion`] that
-/// [`validate_completion`] accepts.
+/// [`validate_completion`] accepts; a key the provider refuses is
+/// `KeyRefused` and a model it doesn't serve `UnknownModel`; and the key
+/// is never in what it answers or logs.
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     /// Recorded with failures; never shown to the model.
     fn name(&self) -> &'static str;
 
-    async fn complete(&self, turn: &Turn<'_>) -> Result<Completion, ProviderError>;
+    async fn complete(&self, access: &ProviderAccess<'_>, turn: &Turn<'_>) -> Result<Completion, ProviderError>;
 }
 
 fn valid_tool_name(name: &str) -> bool {

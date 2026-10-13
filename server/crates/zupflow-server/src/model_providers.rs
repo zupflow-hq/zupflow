@@ -298,7 +298,8 @@ fn catalog_unavailable(kind: ProviderKind, error: CatalogError) -> Failure {
             ),
         )
         .into(),
-        CatalogError::KeyRefused | CatalogError::Unavailable => ApiError::new(
+        // A refused key is answered by its own error before it gets here.
+        CatalogError::KeyRefused | CatalogError::Forbidden | CatalogError::Unavailable => ApiError::new(
             503,
             "unavailable",
             format!("{} didn't answer. Try again shortly.", kind.name()),
@@ -321,6 +322,13 @@ async fn check_key(state: &AppState, kind: ProviderKind, key: &ProviderKey) -> R
             ),
             "api_key",
             format!("{} refused this key.", kind.name()),
+        )),
+        Err(CatalogError::Forbidden) => Err(field_error(
+            422,
+            "invalid_api_key",
+            cannot_list(kind),
+            "api_key",
+            format!("{} won't list models with this key.", kind.name()),
         )),
         Err(error) => {
             tracing::warn!(event = "model_providers.check_failed", catalog = state.model_catalog.name(), kind = kind.as_str(), %error);
@@ -409,11 +417,25 @@ async fn provider_models(state: &AppState, connection: &ModelConnection) -> Resu
             }
             Err(ListFailure::Refused)
         }
+        // The key works, but not for listing: nothing to mark.
+        Err(CatalogError::Forbidden) => Err(ListFailure::Failed(
+            ApiError::new(422, "invalid_api_key", cannot_list(connection.kind)).into(),
+        )),
         Err(error) => {
             tracing::warn!(event = "model_providers.list_failed", catalog = state.model_catalog.name(), kind = connection.kind.as_str(), %error);
             Err(ListFailure::Failed(catalog_unavailable(connection.kind, error)))
         }
     }
+}
+
+/// A key its provider accepts but won't list models with: every key must
+/// be able to, since that's how a key is checked and models are added.
+fn cannot_list(kind: ProviderKind) -> String {
+    format!(
+        "{} accepted this key but won't list models with it. Use a key that may read models \
+         (an OpenAI restricted key needs read access to Models).",
+        kind.name()
+    )
 }
 
 /// The connection's key was refused: `then` says what to do about it.

@@ -418,7 +418,22 @@ pub enum YieldReason {
     /// the others, the job is retried, using one of its attempts, so a model
     /// that stays unavailable still fails the run when they run out, as
     /// today.
-    ModelUnavailable { turn: u32, attempt: u32 },
+    ///
+    /// `timed_out` marks the attempt as one sent and not answered in time
+    /// (a second fails the turn); `retry_after_secs` is the provider's own
+    /// wait, which the job keeps instead of its usual step.
+    ModelUnavailable {
+        turn: u32,
+        attempt: u32,
+        #[serde(skip_serializing_if = "is_false")]
+        timed_out: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retry_after_secs: Option<u32>,
+    },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The claim released at a safe boundary; the job postponed, not retried.

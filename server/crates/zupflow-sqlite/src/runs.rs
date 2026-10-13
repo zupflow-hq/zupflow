@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -35,6 +36,7 @@ use zupflow_core::ids::{
     AgentId, ApiKeyId, InstallationId, ModelConnectionId, ModelId, OrganizationId, RunEventId, RunId, SessionId,
     ToolCallId, WorkspaceId,
 };
+use zupflow_core::models::MAX_RETRY_AFTER;
 use zupflow_core::runs::digest::{Sha256Digest, call_digest};
 use zupflow_core::runs::names::Offer;
 use zupflow_core::runs::reducer::{INSTALLATION_DISCONNECTED, INSTALLATION_REMOVED};
@@ -424,7 +426,7 @@ async fn load(
     }
 
     let model_attempts = sqlx::query(
-        "SELECT turn, attempt, state, request_digest, offer FROM run_model_attempts \
+        "SELECT turn, attempt, state, request_digest, offer, timed_out FROM run_model_attempts \
          WHERE organization_id = ? AND workspace_id = ? AND run_id = ? ORDER BY turn, attempt",
     )
     .bind(scope.0)
@@ -443,6 +445,7 @@ async fn load(
             state: parse_model_attempt_state(&state).ok_or_else(|| corrupt("a model attempt state"))?,
             request_digest: digest(row, "request_digest")?.ok_or_else(|| corrupt("a request digest"))?,
             offer: serde_json::from_str::<Offer>(&offer).map_err(unreadable)?,
+            timed_out: row.try_get::<i64, _>("timed_out").map_err(unreadable)? != 0,
         })
     })
     .collect::<Result<Vec<_>, StoreError>>()?;
@@ -616,8 +619,9 @@ enum JobAction {
     Queue,
     /// Due at this time, its attempt given back.
     Postpone(Timestamp),
-    /// Tried again later, using its attempt: dead once they run out.
-    RetryModel,
+    /// Tried again later (after the provider's own wait, if it gave one),
+    /// using its attempt: dead once they run out.
+    RetryModel(Option<Duration>),
     /// Due now, if it waits for later.
     BringForward,
     /// Finished: no worker needs it.
@@ -855,6 +859,28 @@ impl Writer<'_> {
         Ok(())
     }
 
+    /// Records that an unanswered model attempt was sent and timed out.
+    async fn mark_timed_out(&mut self, turn: u32, attempt: u32) -> Result<(), StoreError> {
+        let (org, ws, run) = self.scope();
+        let changed = sqlx::query(
+            "UPDATE run_model_attempts SET timed_out = 1 \
+             WHERE organization_id = ? AND workspace_id = ? AND run_id = ? AND turn = ? AND attempt = ? \
+             AND state = 'unanswered'",
+        )
+        .bind(org)
+        .bind(ws)
+        .bind(run)
+        .bind(i64::from(turn))
+        .bind(i64::from(attempt))
+        .execute(&mut *self.connection)
+        .await
+        .map_err(failed("mark_model_attempt_timed_out"))?;
+        if changed.rows_affected() != 1 {
+            return Err(StoreError::Refused("a model attempt that isn't where the request says"));
+        }
+        Ok(())
+    }
+
     /// Marks the prepared attempt the run waits on abandoned: its answer will
     /// never be committed. It must be the one the run waits on.
     async fn abandon(&mut self, snapshot: &Snapshot, abandons: Option<ModelAttemptRef>) -> Result<(), StoreError> {
@@ -996,17 +1022,20 @@ impl Writer<'_> {
                     self.queue_job(at).await
                 }
             }
-            JobAction::RetryModel => {
+            JobAction::RetryModel(after) => {
                 let step = i64::try_from(MODEL_RETRY_STEP.as_millis()).unwrap_or(i64::MAX);
+                // The provider's own wait replaces the growing step.
+                let after = after.map(|after| i64::try_from(after.as_millis()).unwrap_or(i64::MAX));
                 let retried = sqlx::query(
                     "UPDATE jobs SET \
                        state = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END, \
                        reason = CASE WHEN attempts >= max_attempts THEN 'model_unavailable' ELSE NULL END, \
-                       run_at = ? + ? * max(attempts, 1), lease_token = NULL, lease_expires_at = NULL \
+                       run_at = ? + coalesce(?, ? * max(attempts, 1)), lease_token = NULL, lease_expires_at = NULL \
                      WHERE organization_id = ? AND workspace_id = ? AND environment IS NULL AND id = ? \
                      AND state = 'running'",
                 )
                 .bind(now)
+                .bind(after)
                 .bind(step)
                 .bind(org)
                 .bind(ws)
@@ -1017,7 +1046,8 @@ impl Writer<'_> {
                 if retried.rows_affected() == 1 || self.job_waits(job_id).await? {
                     Ok(job_id)
                 } else {
-                    self.queue_job(Timestamp::from_millis(now.saturating_add(step))).await
+                    self.queue_job(Timestamp::from_millis(now.saturating_add(after.unwrap_or(step))))
+                        .await
                 }
             }
             JobAction::BringForward => {
@@ -1817,7 +1847,12 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
                         .ok_or(refused("a yield for a send that isn't recorded"))?;
                     JobAction::Postpone(until)
                 }
-                YieldReason::ModelUnavailable { turn, attempt } => {
+                YieldReason::ModelUnavailable {
+                    turn,
+                    attempt,
+                    timed_out,
+                    retry_after_secs,
+                } => {
                     if control.continuation != (Continuation::AwaitModel { turn, attempt }) {
                         return Err(refused("a yield for a model attempt the run doesn't wait on"));
                     }
@@ -1830,7 +1865,11 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
                             None,
                         )
                         .await?;
-                    JobAction::RetryModel
+                    if timed_out {
+                        writer.mark_timed_out(turn, attempt).await?;
+                    }
+                    let after = retry_after_secs.map(|secs| Duration::from_secs(u64::from(secs)).min(MAX_RETRY_AFTER));
+                    JobAction::RetryModel(after)
                 }
             };
             Ok(Effects::job(job))

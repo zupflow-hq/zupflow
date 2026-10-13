@@ -10,14 +10,18 @@
 //! - Given its calls' results, it answers in text, one line per call:
 //!   `<tool>: <result>`, or `<tool> failed: <reason>`.
 //!
-//! It serves the model IDs it's made with and no others. Tokens are counted
-//! as words, so usage is deterministic too.
+//! It serves the model IDs it's made with and no others, and refuses a key
+//! the scripted providers refuse (one containing `invalid`), whatever the
+//! provider kind. Tokens are counted as words, so usage is deterministic too.
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use zupflow_core::models::{
-    Completion, Message, ModelProvider, ModelToolCall, ProviderError, Reply, TokenUsage, Turn, validate_turn,
+    Completion, Message, ModelProvider, ModelToolCall, ProviderAccess, ProviderError, Reply, TokenUsage, Turn,
+    validate_turn,
 };
+
+use crate::scripted_providers::ScriptedProviders;
 
 /// Recorded with failures.
 pub const NAME: &str = "scripted";
@@ -168,7 +172,10 @@ impl ModelProvider for ScriptedModel {
         NAME
     }
 
-    async fn complete(&self, turn: &Turn<'_>) -> Result<Completion, ProviderError> {
+    async fn complete(&self, access: &ProviderAccess<'_>, turn: &Turn<'_>) -> Result<Completion, ProviderError> {
+        if !ScriptedProviders::accepts(access.key) {
+            return Err(ProviderError::KeyRefused);
+        }
         if !self.models.iter().any(|model| model == turn.model) {
             return Err(ProviderError::UnknownModel);
         }
@@ -187,9 +194,14 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use serde_json::json;
+    use zupflow_core::model_providers::{ProviderKey, ProviderKind};
     use zupflow_core::models::ToolSpec;
 
     use super::*;
+
+    fn key() -> ProviderKey {
+        ProviderKey::new("sk-test-long-suite-0000-xx".to_owned())
+    }
 
     fn tools() -> Vec<ToolSpec> {
         ["echo", "search"]
@@ -204,12 +216,18 @@ mod tests {
 
     async fn complete(model: &ScriptedModel, messages: &[Message]) -> Completion {
         model
-            .complete(&Turn {
-                model: "scripted-a",
-                instructions: "Be brief.",
-                messages,
-                tools: &tools(),
-            })
+            .complete(
+                &ProviderAccess {
+                    kind: ProviderKind::OpenAi,
+                    key: &key(),
+                },
+                &Turn {
+                    model: "scripted-a",
+                    instructions: "Be brief.",
+                    messages,
+                    tools: &tools(),
+                },
+            )
             .await
             .unwrap()
     }
@@ -217,8 +235,12 @@ mod tests {
     #[tokio::test]
     async fn passes_the_conformance_suite() {
         let model = ScriptedModel::serving(["scripted-a", "scripted-b"]);
-        zupflow_conformance::model_provider::run(&model, "scripted-a").await;
-        zupflow_conformance::model_provider::run(&model, "scripted-b").await;
+        let refused = ProviderKey::new("sk-test-long-INVALID-0000".to_owned());
+        for kind in ProviderKind::ALL {
+            let access = ProviderAccess { kind, key: &key() };
+            zupflow_conformance::model_provider::run(&model, &access, &refused, "scripted-a").await;
+            zupflow_conformance::model_provider::run(&model, &access, &refused, "scripted-b").await;
+        }
     }
 
     #[tokio::test]

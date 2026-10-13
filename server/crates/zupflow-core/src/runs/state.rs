@@ -336,6 +336,8 @@ pub struct ModelAttempt {
     pub request_digest: Sha256Digest,
     /// The tools offered, frozen.
     pub offer: Offer,
+    /// Unanswered because it was sent and no answer came in time.
+    pub timed_out: bool,
 }
 
 /// One committed model answer.

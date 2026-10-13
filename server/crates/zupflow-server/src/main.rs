@@ -56,15 +56,15 @@ async fn main() -> ExitCode {
             }
         },
     };
-    let outbound = match bootstrap::outbound() {
-        Ok(client) => client,
+    let outbound: Arc<dyn zupflow_core::outbound::OutboundHttp> = match bootstrap::outbound() {
+        Ok(client) => Arc::new(client),
         Err(error) => {
             tracing::error!(event = "server.outbound_failed", %error);
             return ExitCode::FAILURE;
         }
     };
-    let provider = bootstrap::model_provider(&config);
-    let model_catalog = bootstrap::model_catalog(&config);
+    let provider = bootstrap::model_provider(&config, &outbound);
+    let model_catalog = bootstrap::model_catalog(&config, &outbound);
     let runs = Arc::new(zupflow_sqlite::SqliteRunStore::new(database.clone()));
     let state = AppState {
         clock: Arc::new(zupflow_core::time::SystemClock),
@@ -91,7 +91,7 @@ async fn main() -> ExitCode {
         keys: Arc::new(zupflow_basic::local_keys::LocalKeyService::from_server_secret(
             &secret_key,
         )),
-        outbound: Arc::new(outbound),
+        outbound,
         public_url: config.public_url.clone(),
         sign_in,
         api_keys: Arc::new(SqliteApiKeyStore::new(database.clone())),

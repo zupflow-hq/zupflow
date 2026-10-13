@@ -37,8 +37,11 @@ pub struct Config {
     /// built on it (decision 0033). Defaults to `http://localhost:{port}`.
     pub public_url: String,
     /// `ZUPFLOW_MODEL_PROVIDER`: what checks organizations' provider keys,
-    /// lists their models and answers runs. Unset, nothing does: connecting a
-    /// provider answers `503`, and every run fails `model_unavailable`.
+    /// lists their models and answers runs. `providers`, a deployment's
+    /// setting, reaches OpenAI, Anthropic and OpenRouter with each
+    /// organization's own keys, through the safe outbound path. Unset,
+    /// nothing does: connecting a provider answers `501`, and every run
+    /// fails `model_unavailable`.
     /// `scripted` is the deterministic stand-in for local work and tests,
     /// never a deployment's: its providers list fixed catalogs and refuse a
     /// key containing `invalid`, and its model answers from a script, turning
@@ -50,8 +53,10 @@ pub struct Config {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelProviderMode {
-    /// No provider: connecting one answers `503`, and runs fail `model_unavailable`.
+    /// No provider: connecting one answers `501`, and runs fail `model_unavailable`.
     None,
+    /// The provider adapters in `zupflow-providers`: the real providers.
+    Providers,
     /// The scripted providers and model in `zupflow-basic`.
     Scripted,
 }
@@ -100,7 +105,7 @@ pub enum ConfigError {
     InvalidPublicUrl,
     #[error("ZUPFLOW_CONSOLE_ORIGIN must be one origin like https://console.zupflow.example, with no path")]
     InvalidConsoleOrigin,
-    #[error("ZUPFLOW_MODEL_PROVIDER must be `scripted`, or unset for none")]
+    #[error("ZUPFLOW_MODEL_PROVIDER must be `providers`, `scripted` (local work only), or unset for none")]
     UnknownModelProvider,
     #[error("ZUPFLOW_IDENTITY must be `local` or `oidc`")]
     UnknownIdentity,
@@ -201,6 +206,7 @@ impl Config {
             .transpose()?;
         let model_provider = match set("ZUPFLOW_MODEL_PROVIDER")?.as_deref() {
             None => ModelProviderMode::None,
+            Some("providers") => ModelProviderMode::Providers,
             Some("scripted") => ModelProviderMode::Scripted,
             Some(_) => return Err(ConfigError::UnknownModelProvider),
         };
@@ -498,7 +504,11 @@ mod tests {
             provider("scripted").expect("scripted").model_provider,
             ModelProviderMode::Scripted
         );
-        for bad in ["Scripted", "openai", "none"] {
+        assert_eq!(
+            provider("providers").expect("providers").model_provider,
+            ModelProviderMode::Providers
+        );
+        for bad in ["Scripted", "openai", "none", "Providers", "provider", " providers"] {
             assert!(matches!(provider(bad), Err(ConfigError::UnknownModelProvider)), "{bad}");
         }
         assert!(matches!(

@@ -322,6 +322,9 @@ pub struct Server {
     pub state: AppState,
     pub directory: PathBuf,
     pub providers: Arc<Providers>,
+    /// The model providers' APIs, faked: what the provider adapters reach
+    /// in a server made [`Server::with_model_providers`].
+    pub models: Arc<zupflow_providers::fake::FakeProviders>,
     /// The database the stores share, for a test that builds another store over it.
     pub database: Database,
 }
@@ -375,8 +378,19 @@ impl Server {
         Self::with_identity(Arc::new(TestIdentity)).await
     }
 
+    /// A server whose runs and model connections reach the model providers
+    /// through the real adapters, over [`Server::models`]: the providers'
+    /// APIs faked, so no real one is ever reached.
+    pub async fn with_model_providers() -> Self {
+        Self::build(Arc::new(TestIdentity), true).await
+    }
+
     /// A server signing Console users in through `identity`.
     pub async fn with_identity(identity: Arc<dyn Identity>) -> Self {
+        Self::build(identity, false).await
+    }
+
+    async fn build(identity: Arc<dyn Identity>, adapters: bool) -> Self {
         let directory = std::env::temp_dir().join(format!("zupflow-ws-{}", uuid::Uuid::now_v7().simple()));
         std::fs::create_dir(&directory).unwrap();
         let database = Database::open(&directory.join("zupflow.sqlite")).await.unwrap();
@@ -392,6 +406,23 @@ impl Server {
             requests: Mutex::new(Vec::new()),
             ledger: Mutex::new(Vec::new()),
         });
+        let models = Arc::new(zupflow_providers::fake::FakeProviders::new());
+        let (provider, model_catalog): (
+            Arc<dyn zupflow_core::models::ModelProvider>,
+            Arc<dyn zupflow_core::model_providers::ModelProviderCatalog>,
+        ) = if adapters {
+            (
+                Arc::new(zupflow_providers::HttpModelProvider::new(models.clone())),
+                Arc::new(zupflow_providers::HttpProviderCatalog::new(models.clone())),
+            )
+        } else {
+            (
+                Arc::new(zupflow_basic::scripted_model::ScriptedModel::serving(
+                    zupflow_basic::scripted_providers::ScriptedProviders::tool_models(),
+                )),
+                Arc::new(zupflow_basic::scripted_providers::ScriptedProviders),
+            )
+        };
         let state = AppState {
             clock: Arc::new(zupflow_core::time::SystemClock),
             identity,
@@ -402,16 +433,14 @@ impl Server {
             agents: Arc::new(zupflow_sqlite::SqliteAgentStore::new(database.clone())),
             policies: Arc::new(zupflow_sqlite::SqliteToolPolicyStore::new(database.clone())),
             runs: Arc::new(zupflow_sqlite::SqliteRunStore::new(database.clone())),
-            provider: Arc::new(zupflow_basic::scripted_model::ScriptedModel::serving(
-                zupflow_basic::scripted_providers::ScriptedProviders::tool_models(),
-            )),
+            provider,
             approvals: Arc::new(zupflow_basic::configured_policy::ConfiguredPolicy::new(Arc::new(
                 zupflow_sqlite::SqliteToolPolicyStore::new(database.clone()),
             ))),
             events: Arc::new(zupflow_basic::in_process_events::InProcessEventBus::default()),
             metrics: Arc::new(zupflow_basic::in_process_metrics::InProcessMetrics::default()),
             model_store: Arc::new(zupflow_sqlite::SqliteModelStore::new(database.clone())),
-            model_catalog: Arc::new(zupflow_basic::scripted_providers::ScriptedProviders),
+            model_catalog,
             connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
             jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
             tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),
@@ -432,6 +461,7 @@ impl Server {
             state,
             directory,
             providers,
+            models,
             database,
         }
     }

@@ -378,6 +378,19 @@ pub trait ModelStore: Send + Sync {
         key_version: u32,
     ) -> Result<(), ModelStoreError>;
 
+    /// Records whether the provider serves the model now: `Unavailable`
+    /// once it answered `404` for it, `Available` again once it answered.
+    /// What Zupflow observed, not a person's change: no audit, and its
+    /// `updated_at` stays. A model not of this organization and environment
+    /// is left alone.
+    async fn record_model_status(
+        &self,
+        organization_id: OrganizationId,
+        environment: Environment,
+        model_id: ModelId,
+        status: ModelStatus,
+    ) -> Result<(), ModelStoreError>;
+
     /// Deletes the connection with its keys and models, as one, recording
     /// `audit` of it as it was. `InUse` while one of its models is the
     /// default or an agent's.

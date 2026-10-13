@@ -335,12 +335,21 @@ fn about(operation: &Operation) -> (Level, About) {
                     ..About::default()
                 },
             ),
-            YieldReason::ModelUnavailable { turn, attempt } => (
+            YieldReason::ModelUnavailable {
+                turn,
+                attempt,
+                timed_out,
+                ..
+            } => (
                 Level::Warn,
                 About {
                     turn: Some(turn),
                     attempt: Some(attempt),
-                    detail: Some("model_unavailable"),
+                    detail: Some(if timed_out {
+                        "model_timed_out"
+                    } else {
+                        "model_unavailable"
+                    }),
                     ..About::default()
                 },
             ),

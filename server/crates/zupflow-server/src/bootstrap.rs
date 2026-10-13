@@ -12,6 +12,7 @@ use tokio::net::TcpListener;
 use zupflow_core::identity::Identity;
 use zupflow_core::model_providers::ModelProviderCatalog;
 use zupflow_core::models::ModelProvider;
+use zupflow_core::outbound::OutboundHttp;
 use zupflow_core::runs::store::Durability;
 use zupflow_oidc::{OidcConfig, OidcIdentity};
 
@@ -96,11 +97,12 @@ pub fn guard(config: &Config) -> RequestGuard {
     }
 }
 
-/// What answers runs. No model provider ships with Zupflow (decision 0014):
-/// without one, every run fails `model_unavailable`; the scripted model, which
-/// serves every model the scripted providers list that can call tools, is
-/// for local work only.
-pub fn model_provider(config: &Config) -> Arc<dyn ModelProvider> {
+/// What answers runs (decision 0049): the provider adapters, through
+/// `outbound`, each turn with its run's connection's key; or the scripted
+/// model, which serves every model the scripted providers list that can
+/// call tools, for local work only; or, unset, nothing: every run fails
+/// `model_unavailable`.
+pub fn model_provider(config: &Config, outbound: &Arc<dyn OutboundHttp>) -> Arc<dyn ModelProvider> {
     match config.model_provider {
         ModelProviderMode::None => {
             tracing::warn!(
@@ -108,6 +110,13 @@ pub fn model_provider(config: &Config) -> Arc<dyn ModelProvider> {
                 "No model provider is configured (ZUPFLOW_MODEL_PROVIDER): every run fails model_unavailable"
             );
             Arc::new(zupflow_basic::no_model::NoModelProvider)
+        }
+        ModelProviderMode::Providers => {
+            tracing::info!(
+                event = "server.model_providers",
+                "Runs are answered by organizations' model providers (ZUPFLOW_MODEL_PROVIDER=providers)"
+            );
+            Arc::new(zupflow_providers::HttpModelProvider::new(outbound.clone()))
         }
         ModelProviderMode::Scripted => {
             tracing::warn!(
@@ -122,12 +131,13 @@ pub fn model_provider(config: &Config) -> Arc<dyn ModelProvider> {
 }
 
 /// What checks organizations' provider keys and lists their models
-/// (decision 0049). A deployment brings adapters that reach providers
-/// through `OutboundHttp`; this repository ships only the scripted
-/// providers, for local work, and without them no connection can be made.
-pub fn model_catalog(config: &Config) -> Arc<dyn ModelProviderCatalog> {
+/// (decision 0049): the provider adapters through `outbound`, the scripted
+/// providers for local work, or, unset, nothing, so no connection can be
+/// made.
+pub fn model_catalog(config: &Config, outbound: &Arc<dyn OutboundHttp>) -> Arc<dyn ModelProviderCatalog> {
     match config.model_provider {
         ModelProviderMode::None => Arc::new(zupflow_basic::no_providers::NoProviders),
+        ModelProviderMode::Providers => Arc::new(zupflow_providers::HttpProviderCatalog::new(outbound.clone())),
         ModelProviderMode::Scripted => Arc::new(zupflow_basic::scripted_providers::ScriptedProviders),
     }
 }

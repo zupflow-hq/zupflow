@@ -3,9 +3,10 @@
 //!
 //! [`ModelProviderCatalog`] asks a provider, with a connection's opened key,
 //! for the models it lists. That is also how a key is checked before it's
-//! saved: a provider that refuses to list is refusing the key. A deployment's
-//! adapters reach providers through `OutboundHttp`; this repository ships
-//! only a scripted catalog (`zupflow-basic`), which calls nothing.
+//! saved: a provider that refuses to list is refusing the key. The adapters
+//! in `zupflow-providers` reach each provider through `OutboundHttp`
+//! (decision 0049); `zupflow-basic` has a scripted catalog, which calls
+//! nothing, for tests and local work.
 //!
 //! A key is held as a [`ProviderKey`]: wiped on drop, never printed, and
 //! given to an adapter only to send.
@@ -132,9 +133,14 @@ impl ProviderModel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum CatalogError {
-    /// The provider refused the key (it answered `401` or `403`).
+    /// The provider refused the key (it answered `401`).
     #[error("the provider refused the key")]
     KeyRefused,
+    /// The provider knows the key but won't list models with it (`403`): a
+    /// restricted key without permission to read models, say. The key
+    /// isn't marked refused.
+    #[error("the key may not list models")]
+    Forbidden,
     /// No answer, or not one worth reading: worth trying again later.
     #[error("the provider is unavailable")]
     Unavailable,
@@ -143,9 +149,9 @@ pub enum CatalogError {
     NotConfigured,
 }
 
-/// Asks a provider what it lists for a key. Replaceable whole: a deployment
-/// brings one adapter per kind, each through `OutboundHttp`; the basic
-/// implementation is scripted.
+/// Asks a provider what it lists for a key. Replaceable whole: the adapters
+/// reach each kind through `OutboundHttp`; the basic implementation is
+/// scripted.
 ///
 /// Every implementation lists the same models, in the same order, for the
 /// same kind and an accepted key; refuses a key the provider refuses

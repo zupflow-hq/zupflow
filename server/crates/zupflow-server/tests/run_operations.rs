@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use tracing_subscriber::fmt::MakeWriter;
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{OrganizationId, RunId, WorkspaceId};
-use zupflow_core::models::{Completion, ModelProvider, ProviderError, Turn};
+use zupflow_core::models::{Completion, ModelProvider, ProviderAccess, ProviderError, Turn};
 use zupflow_core::runs::CallState;
 use zupflow_server::run_engine;
 
@@ -197,11 +197,11 @@ impl ModelProvider for FailsAfterFirstTurn {
         "fails-after-first-turn"
     }
 
-    async fn complete(&self, turn: &Turn<'_>) -> Result<Completion, ProviderError> {
+    async fn complete(&self, access: &ProviderAccess<'_>, turn: &Turn<'_>) -> Result<Completion, ProviderError> {
         if turn.messages.len() > 1 {
             return Err(ProviderError::Failed("scripted failure"));
         }
-        self.0.complete(turn).await
+        self.0.complete(access, turn).await
     }
 }
 
