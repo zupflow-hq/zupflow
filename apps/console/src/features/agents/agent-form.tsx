@@ -58,13 +58,13 @@ export function AgentFields({
 }) {
   const models = useModels();
   return (
-    <fieldset disabled={disabled} className="space-y-5">
+    <fieldset disabled={disabled} className="min-w-0 space-y-5">
       <div className="grid gap-4 sm:grid-cols-2">
         <FormField
           control={form.control}
           name="name"
           render={({ field }) => (
-            <FormItem>
+            <FormItem className="min-w-0">
               <FormLabel>Name</FormLabel>
               <FormControl>
                 <Input placeholder="Publishing assistant" autoComplete="off" readOnly={readOnly} {...field} />
@@ -77,19 +77,27 @@ export function AgentFields({
           control={form.control}
           name="model"
           render={({ field }) => (
-            <FormItem>
+            <FormItem className="min-w-0">
               <FormLabel>Model</FormLabel>
-              <Select value={field.value} onValueChange={field.onChange} disabled={disabled || readOnly}>
+              {/* Radix's hidden native select reports "" when the form fills in a saved agent, which cleared
+                  its model; a model is required, so "" is never a choice. */}
+              <Select
+                value={field.value}
+                onValueChange={(value) => {
+                  if (value) field.onChange(value);
+                }}
+                disabled={disabled || readOnly}
+              >
                 <FormControl>
-                  <SelectTrigger className="w-full">
+                  <SelectTrigger className="w-full min-w-0">
                     <SelectValue placeholder={models.isPending ? "Loading models…" : "Choose a model"} />
                   </SelectTrigger>
                 </FormControl>
                 <SelectContent>
                   {models.data?.map((m) => (
                     <SelectItem key={m.id} value={m.id}>
-                      <span>{m.name}</span>
-                      <span className="text-xs text-muted-foreground">{m.description}</span>
+                      <span className="shrink-0">{m.name}</span>
+                      <span className="min-w-0 truncate text-xs text-muted-foreground">{m.description}</span>
                     </SelectItem>
                   ))}
                 </SelectContent>
