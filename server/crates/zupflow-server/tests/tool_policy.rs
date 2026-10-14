@@ -547,3 +547,78 @@ async fn accepts_a_changed_tool_exactly_as_reviewed() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// A changed tool whose definition is exactly at the registry's limit is
+/// accepted, and the answer is saved for its idempotency key like any other.
+#[tokio::test]
+async fn accepts_a_changed_tool_at_the_definition_limit() {
+    use zupflow_core::tools::MAX_DEFINITION_BYTES;
+
+    let Setup {
+        server,
+        org,
+        sandbox,
+        installation,
+        ..
+    } = setup().await;
+    // The canonical definition sorts its keys: description, inputSchema, name.
+    let wrapper = r#"{"description":"","inputSchema":{"type":"object"},"name":"send"}"#.len();
+    let description = "x".repeat(MAX_DEFINITION_BYTES - wrapper);
+    server.providers.serve_mcp(
+        MCP,
+        json!([
+            { "name": "search", "inputSchema": { "type": "object" }, "annotations": { "readOnlyHint": true } },
+            { "name": "send", "description": description, "inputSchema": { "type": "object" } },
+            { "name": "drop", "inputSchema": { "type": "object" }, "annotations": { "destructiveHint": true } },
+        ]),
+    );
+    let (status, _) = server
+        .send(
+            call(
+                "alice",
+                Method::POST,
+                format!("/v1/workspaces/{sandbox}/installations/{installation}/refresh-tools"),
+            )
+            .naming(&org),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    while work_once(&server.state).await {}
+    let tools_path = format!("/v1/workspaces/{sandbox}/installations/{installation}/tools");
+    let (_, tools) = server.send(call("vic", Method::GET, tools_path).naming(&org)).await;
+    let send = tools["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "send")
+        .cloned()
+        .unwrap();
+    assert_eq!(send["status"], "changed");
+    assert_eq!(
+        send["latest"]["description"].as_str().map(str::len),
+        Some(description.len())
+    );
+    let latest = send["latest_hash"].as_str().unwrap().to_owned();
+
+    let accept = || {
+        call(
+            "ada",
+            Method::POST,
+            format!("/v1/workspaces/{sandbox}/installations/{installation}/accept-tool-change"),
+        )
+        .naming(&org)
+        .idempotent("accept-at-the-limit")
+        .body(json!({ "name": "send", "latest_hash": latest }))
+    };
+    let (status, accepted) = server.send(accept()).await;
+    assert_eq!(status, StatusCode::OK, "{}", code(&accepted));
+    assert_eq!(accepted["data"]["status"], "current");
+    assert_eq!(accepted["data"]["pinned_hash"], json!(latest));
+    assert_eq!(
+        accepted["data"]["pinned"]["description"].as_str().map(str::len),
+        Some(description.len())
+    );
+    let (status, replayed) = server.send(accept()).await;
+    assert_eq!(status, StatusCode::OK, "the saved answer is replayed");
+    assert_eq!(replayed, accepted);
+}

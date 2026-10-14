@@ -41,8 +41,16 @@ pub const SHOWS_SECRET_ONCE: [&str; 5] = [
 /// The same limit the routes read bodies with.
 const MAX_BODY_BYTES: usize = 64 << 10;
 
-/// Responses are small JSON; anything bigger is a bug, not something to save.
-const MAX_RESPONSE_BYTES: usize = 1 << 20;
+/// The largest answer saved. Answers are small JSON, except where they carry
+/// a tool's definition: accepting a changed tool answers with the tool and
+/// its newly pinned definition, so the cap follows the registry's limit (twice
+/// over, for a view that holds a pinned and a latest one, plus room for the
+/// rest of the answer). Anything bigger is a bug, not something to save.
+const MAX_RESPONSE_BYTES: usize = {
+    let floor = 1 << 20;
+    let tool = 2 * zupflow_core::tools::MAX_DEFINITION_BYTES + (64 << 10);
+    if tool > floor { tool } else { floor }
+};
 
 fn unavailable() -> Response {
     Failure(ApiError::new(

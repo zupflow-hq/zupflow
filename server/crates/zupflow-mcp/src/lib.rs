@@ -45,6 +45,23 @@ const MAX_PAGES: usize = 20;
 /// The longest session ID kept.
 const MAX_SESSION_ID: usize = 256;
 
+/// The largest answer a listing reads, per request. Most servers answer
+/// `tools/list` in one page, so this bounds a whole listing, not one tool:
+/// eight definitions at the registry's limit, so one at the limit fits even
+/// with every character escaped (`\u0061` is six bytes for one), and a
+/// listing of several large tools fits beside it. Never less than the
+/// outbound path's default. A page larger than this still refuses the
+/// listing whole.
+pub const MAX_LISTING_RESPONSE_BYTES: usize = {
+    let room = 8 * MAX_DEFINITION_BYTES;
+    let floor = Limits::DEFAULT_MAX_RESPONSE_BYTES;
+    if room > floor { room } else { floor }
+};
+
+// One definition at the limit, every byte escaped as six, plus the JSON-RPC
+// envelope around it.
+const _: () = assert!(MAX_LISTING_RESPONSE_BYTES >= 6 * MAX_DEFINITION_BYTES + (64 << 10));
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum McpError {
     /// The server refused the credential (`401`): the installation
@@ -104,7 +121,10 @@ pub async fn list_tools(
         id: None,
         protocol_version: None,
         next_request: 1,
-        limits: Limits::default(),
+        limits: Limits {
+            max_response_bytes: MAX_LISTING_RESPONSE_BYTES,
+            ..Limits::default()
+        },
     };
     session.initialize().await?;
     let mut tools: Vec<ListedTool> = Vec::new();
@@ -548,6 +568,7 @@ mod tests {
         body: Value,
         headers: Vec<(String, String)>,
         credential: Option<(String, String)>,
+        limits: Limits,
     }
 
     /// Answers each request with the next scripted response.
@@ -571,8 +592,9 @@ mod tests {
 
     #[async_trait]
     impl OutboundHttp for Server {
-        async fn send(&self, request: OutboundRequest, _: Limits) -> Result<OutboundResponse, OutboundError> {
+        async fn send(&self, request: OutboundRequest, limits: Limits) -> Result<OutboundResponse, OutboundError> {
             self.sent.lock().unwrap().push(Sent {
+                limits,
                 body: serde_json::from_slice(request.body.as_deref().unwrap()).unwrap(),
                 headers: request.headers,
                 credential: request
@@ -808,6 +830,41 @@ mod tests {
         assert_eq!(
             list_tools(&server, "https://tools.example/mcp", None).await,
             Err(McpError::Protocol("more tools than a listing keeps"))
+        );
+    }
+
+    /// A tool whose definition is far past 64 KiB is kept up to the
+    /// registry's limit, read with room for it; one byte over refuses the
+    /// listing whole.
+    #[tokio::test]
+    async fn keeps_definitions_up_to_the_registry_limit() {
+        let wrapper = canonical(&json!({ "description": "", "name": "large" })).len();
+        let large = json!({ "name": "large", "description": "x".repeat(MAX_DEFINITION_BYTES - wrapper) });
+        let server = Server::new(vec![
+            initialized(1),
+            status(202),
+            page(2, json!([large, { "name": "small" }]), None),
+        ]);
+        let tools = list_tools(&server, "https://tools.example/mcp", None).await.unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].revision.definition.len(), MAX_DEFINITION_BYTES);
+        for sent in server.sent() {
+            assert_eq!(
+                sent.limits.max_response_bytes, MAX_LISTING_RESPONSE_BYTES,
+                "every request of a listing reads up to the listing's limit"
+            );
+            assert_eq!(sent.limits.timeout, Limits::default().timeout);
+        }
+
+        let over = json!({ "name": "large", "description": "x".repeat(MAX_DEFINITION_BYTES - wrapper + 1) });
+        let server = Server::new(vec![
+            initialized(1),
+            status(202),
+            page(2, json!([over, { "name": "small" }]), None),
+        ]);
+        assert_eq!(
+            list_tools(&server, "https://tools.example/mcp", None).await,
+            Err(McpError::Protocol("a tool definition larger than kept"))
         );
     }
 

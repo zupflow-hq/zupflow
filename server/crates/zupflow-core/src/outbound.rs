@@ -57,11 +57,16 @@ pub struct Limits {
     pub max_response_bytes: usize,
 }
 
+impl Limits {
+    /// The default answer's limit.
+    pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 1 << 20;
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(10),
-            max_response_bytes: 1 << 20,
+            max_response_bytes: Self::DEFAULT_MAX_RESPONSE_BYTES,
         }
     }
 }

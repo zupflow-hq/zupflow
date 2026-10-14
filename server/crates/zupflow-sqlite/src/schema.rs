@@ -686,3 +686,146 @@ async fn keeps_agents_and_their_grants_through_migration_0031() {
         .unwrap();
     assert_eq!(grants, 0, "a grant goes with its agent");
 }
+
+#[tokio::test]
+async fn keeps_tools_through_migration_0033_and_holds_definitions_to_the_ceiling() {
+    use std::str::FromStr;
+
+    use sqlx::sqlite::SqliteConnectOptions;
+    use zupflow_core::tools::MAX_DEFINITION_BYTES_CEILING;
+
+    let directory = TemporaryDirectory::new();
+    let earlier = directory.0.join("migrations");
+    std::fs::create_dir(&earlier).unwrap();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.as_str() < "0033" {
+            std::fs::copy(&path, earlier.join(&name)).unwrap();
+        }
+    }
+    let options = SqliteConnectOptions::from_str("sqlite:")
+        .unwrap()
+        .filename(directory.file())
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+    sqlx::migrate::Migrator::new(earlier.as_path())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    let blob = |n: u8| {
+        let mut id = [0u8; 16];
+        id[15] = n;
+        id.to_vec()
+    };
+    let hash = |n: u8| vec![n; 32];
+    for statement in [
+        "INSERT INTO organizations (id, name, slug, created_at) VALUES (?1, 'Org', 'org', 0)",
+        "INSERT INTO workspaces (id, organization_id, environment, name, slug, created_at) \
+         VALUES (?2, ?1, 'sandbox', 'W', 'w', 0)",
+        "INSERT INTO apps (id, organization_id, kind, name, key, description, icon_glyph, icon_color, auth, tools, \
+         version, created_at, updated_at) \
+         VALUES (?3, ?1, 'mcp', 'T', 'tools', '', 'T', '#0E7490', '{}', '[]', 1, 0, 0)",
+        "INSERT INTO installation_short_ids (id, organization_id, workspace_id, short_id, created_at) \
+         VALUES (?4, ?1, ?2, 'abcdef', 0)",
+        "INSERT INTO installations (id, organization_id, workspace_id, catalog_app_id, short_id, label, status, \
+         configuration_version, granted_scopes, created_at, updated_at) \
+         VALUES (?5, ?1, ?2, ?3, 'abcdef', 'Main', 'connected', 1, '[]', 0, 0)",
+        "INSERT INTO installation_tools (id, organization_id, workspace_id, installation_id, name, effect, \
+         pinned_definition, pinned_hash, latest_definition, latest_hash, first_seen_at, seen_at, changed_at, gone_at) \
+         VALUES (?6, ?1, ?2, ?5, 'lookup', 'read', '{\"name\":\"lookup\"}', ?7, \
+         '{\"description\":\"v2\",\"name\":\"lookup\"}', ?8, 1, 2, 3, NULL)",
+    ] {
+        sqlx::query(statement)
+            .bind(blob(1))
+            .bind(blob(2))
+            .bind(blob(3))
+            .bind(blob(4))
+            .bind(blob(5))
+            .bind(blob(6))
+            .bind(hash(7))
+            .bind(hash(8))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    pool.close().await;
+
+    let database = Database::open(&directory.file()).await.unwrap();
+    let pool = database.pool();
+    type ToolRow = (
+        Vec<u8>,
+        String,
+        String,
+        String,
+        Vec<u8>,
+        Option<String>,
+        Option<Vec<u8>>,
+        i64,
+        i64,
+        Option<i64>,
+    );
+    let tool: ToolRow = sqlx::query_as(
+        "SELECT id, name, effect, pinned_definition, pinned_hash, latest_definition, latest_hash, first_seen_at, \
+         seen_at, changed_at FROM installation_tools",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        tool,
+        (
+            blob(6),
+            "lookup".to_owned(),
+            "read".to_owned(),
+            r#"{"name":"lookup"}"#.to_owned(),
+            hash(7),
+            Some(r#"{"description":"v2","name":"lookup"}"#.to_owned()),
+            Some(hash(8)),
+            1,
+            2,
+            Some(3),
+        ),
+        "a tool is kept as it was"
+    );
+    assert!(foreign_keys(&database, "installation_tools").await.len() >= 2);
+
+    // The store holds definitions to `MAX_DEFINITION_BYTES`; the table only
+    // to the ceiling, counted in bytes, so the limit can rise without a
+    // migration.
+    let definition = |bytes: usize| {
+        let wrapper = r#"{"description":""}"#.len();
+        // A two-byte character, so a check counting characters would let this past.
+        format!(r#"{{"description":"{}"}}"#, "é".repeat((bytes - wrapper) / 2))
+    };
+    let insert = |name: &'static str, definition: String| {
+        sqlx::query(
+            "INSERT INTO installation_tools (id, organization_id, workspace_id, installation_id, name, effect, \
+             pinned_definition, pinned_hash, first_seen_at, seen_at) VALUES (?1, ?2, ?3, ?4, ?5, 'read', ?6, ?7, 0, 0)",
+        )
+        .bind(uuid::Uuid::now_v7().as_bytes().to_vec())
+        .bind(blob(1))
+        .bind(blob(2))
+        .bind(blob(5))
+        .bind(name)
+        .bind(definition)
+        .bind(hash(9))
+        .execute(pool)
+    };
+    let at_ceiling = definition(MAX_DEFINITION_BYTES_CEILING);
+    assert_eq!(at_ceiling.len(), MAX_DEFINITION_BYTES_CEILING);
+    insert("at_ceiling", at_ceiling)
+        .await
+        .expect("a definition at the ceiling is kept");
+    let over = definition(MAX_DEFINITION_BYTES_CEILING + 2);
+    assert!(over.len() > MAX_DEFINITION_BYTES_CEILING);
+    assert!(over.chars().count() < MAX_DEFINITION_BYTES_CEILING);
+    assert!(
+        insert("over", over).await.is_err(),
+        "a definition over the ceiling is refused"
+    );
+}

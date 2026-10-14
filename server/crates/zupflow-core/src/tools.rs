@@ -30,8 +30,20 @@ pub const MAX_TOOLS: usize = 500;
 /// The longest tool name kept.
 pub const MAX_NAME: usize = 128;
 
-/// The largest definition kept, in bytes of canonical JSON.
-pub const MAX_DEFINITION_BYTES: usize = 64 << 10;
+/// The largest definition kept, in bytes of canonical JSON. Servers ship
+/// tools whose descriptions and schemas run well past 64 KiB, and one tool
+/// over the limit refuses its whole listing, so this is generous. It's the one
+/// place to change it: the SQLite store holds only a far higher backstop
+/// ([`MAX_DEFINITION_BYTES_CEILING`]) and the MCP client's page limit follows
+/// from it.
+pub const MAX_DEFINITION_BYTES: usize = 1 << 20;
+
+/// What no store may keep, whatever [`MAX_DEFINITION_BYTES`] says: the
+/// SQLite store's check is this, so raising the limit needs no migration up
+/// to here.
+pub const MAX_DEFINITION_BYTES_CEILING: usize = 16 << 20;
+
+const _: () = assert!(MAX_DEFINITION_BYTES <= MAX_DEFINITION_BYTES_CEILING);
 
 /// The most gone tools an installation keeps: beyond it, a listing deletes
 /// those gone longest, so a server can't grow the registry without bound.

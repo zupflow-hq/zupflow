@@ -24,8 +24,8 @@ use zupflow_core::policy::{AppToolLevel, ToolLevel, ToolPolicyStore};
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{
-    ListedTool, ListingChanges, MAX_GONE, MAX_PAGE, MAX_TOOLS, RegisteredTool, ToolError, ToolRegistry, ToolRevision,
-    ToolStatus,
+    ListedTool, ListingChanges, MAX_DEFINITION_BYTES, MAX_GONE, MAX_PAGE, MAX_TOOLS, RegisteredTool, ToolError,
+    ToolRegistry, ToolRevision, ToolStatus,
 };
 use zupflow_core::webhooks::{ANNOUNCE, Announcement, Subject, WebhookEventType};
 
@@ -118,6 +118,22 @@ fn listed(name: &str, version: u8, effect: ToolEffect) -> ListedTool {
     }
 }
 
+/// A definition of exactly `bytes` bytes of JSON.
+fn sized(name: &str, version: u8, bytes: usize) -> ListedTool {
+    let wrapper = format!(r#"{{"description":"","name":"{name}"}}"#).len() + 1;
+    let filler = bytes.checked_sub(wrapper).expect("room for the wrapper");
+    let definition = format!(r#"{{"description":"{version}{}","name":"{name}"}}"#, "x".repeat(filler));
+    assert_eq!(definition.len(), bytes);
+    ListedTool {
+        name: name.to_owned(),
+        revision: ToolRevision {
+            definition,
+            hash: [version; 32],
+        },
+        effect: ToolEffect::Read,
+    }
+}
+
 fn names(tools: &[RegisteredTool]) -> Vec<(&str, ToolStatus)> {
     tools.iter().map(|tool| (tool.name.as_str(), tool.status())).collect()
 }
@@ -134,6 +150,7 @@ pub async fn run(registry: &dyn ToolRegistry, jobs: &dyn JobQueue, policy: &dyn 
     pins_the_first_definition_and_holds_changes(registry, &prepare).await;
     marks_missing_tools_gone_until_listed_again(registry, &prepare).await;
     records_an_invalid_listing_not_at_all(registry, policy, &prepare).await;
+    keeps_definitions_up_to_the_limit(registry, &prepare).await;
     pages_by_name(registry, &prepare).await;
     keeps_a_bounded_number_of_gone_tools(registry, &prepare).await;
     accepts_exactly_the_change_reviewed(registry, &prepare).await;
@@ -541,14 +558,7 @@ async fn records_an_invalid_listing_not_at_all(
     let too_many: Vec<ListedTool> = (0..=MAX_TOOLS)
         .map(|index| listed(&format!("tool_{index}"), 1, ToolEffect::Read))
         .collect();
-    let oversized = ListedTool {
-        name: "big".to_owned(),
-        revision: ToolRevision {
-            definition: format!(r#"{{"description":"{}"}}"#, "x".repeat(64 << 10)),
-            hash: [1; 32],
-        },
-        effect: ToolEffect::Read,
-    };
+    let oversized = sized("big", 1, MAX_DEFINITION_BYTES + 1);
     for invalid in [
         too_many,
         vec![
@@ -569,6 +579,27 @@ async fn records_an_invalid_listing_not_at_all(
         names(&list(registry, owner).await.unwrap()),
         [("kept", ToolStatus::Current)],
         "an invalid listing marks nothing gone"
+    );
+}
+
+async fn keeps_definitions_up_to_the_limit(registry: &dyn ToolRegistry, prepare: &Prepare) {
+    let a = tenant(prepare).await;
+    let owner = a.at();
+    let first = sized("large", 1, MAX_DEFINITION_BYTES);
+    record(registry, owner, std::slice::from_ref(&first), Timestamp::now())
+        .await
+        .expect("a definition at the limit is kept");
+    let changed = sized("large", 2, MAX_DEFINITION_BYTES);
+    record(registry, owner, std::slice::from_ref(&changed), Timestamp::now())
+        .await
+        .expect("a changed definition at the limit is kept");
+    let tools = list(registry, owner).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].pinned, first.revision, "the pinned definition is kept exactly");
+    assert_eq!(
+        tools[0].latest.as_ref(),
+        Some(&changed.revision),
+        "the latest definition is kept exactly"
     );
 }
 
