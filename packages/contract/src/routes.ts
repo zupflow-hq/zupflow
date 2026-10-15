@@ -136,7 +136,7 @@ export const routes: readonly Route[] = [
     operationId: "getUsage",
     method: "get",
     path: "/v1/organizations/{org}/usage",
-    summary: "Runs, failures and tool calls per UTC day",
+    summary: "Runs, failures, tool calls and tokens per UTC day",
     callers: both,
     params: org,
     query: z.object({

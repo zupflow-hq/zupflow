@@ -517,6 +517,8 @@ async fn answer_request(
         usage: TokenUsage {
             input_tokens: 10,
             output_tokens: 3,
+            cache_read_input_tokens: 6,
+            cache_write_input_tokens: 2,
         },
     };
     let mut facts = facts(stores, who, Some(epoch));
@@ -1137,6 +1139,11 @@ async fn walks_a_run_through_every_step(stores: &Stores<'_>, a: Tenant, agent_a:
     );
     let run = stores.runs.find_run(org, a.workspace, at.run).await.unwrap().unwrap();
     assert_eq!((run.usage.input_tokens, run.usage.output_tokens), (10, 3));
+    assert_eq!(
+        (run.usage.cache_read_input_tokens, run.usage.cache_write_input_tokens),
+        (6, 2),
+        "the parts of the input read from and written to the provider's cache"
+    );
 
     // The read: authorized, sent, recorded.
     let send = authorize(stores, at, who, epoch, allow()).await;
@@ -1264,7 +1271,13 @@ async fn walks_a_run_through_every_step(stores: &Stores<'_>, a: Tenant, agent_a:
     );
     assert_eq!(
         done.events[1].data,
-        json!({ "usage": { "input_tokens": 20, "output_tokens": 6, "tool_calls": 2 } }),
+        json!({ "usage": {
+            "input_tokens": 20,
+            "output_tokens": 6,
+            "cache_read_input_tokens": 12,
+            "cache_write_input_tokens": 4,
+            "tool_calls": 2,
+        } }),
         "the run's totals"
     );
     assert_eq!(
@@ -3477,14 +3490,13 @@ async fn counts_usage_per_day(
             UsageDay {
                 day,
                 runs: 2,
-                failed_runs: 0,
-                tool_calls: 0
+                ..UsageDay::default()
             },
             UsageDay {
                 day: day + 2,
                 runs: 1,
                 failed_runs: 1,
-                tool_calls: 0
+                ..UsageDay::default()
             },
         ],
         "runs per UTC day, in order, of the environment's workspaces only; a day without runs left out"

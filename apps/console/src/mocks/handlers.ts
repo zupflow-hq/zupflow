@@ -143,6 +143,29 @@ const environment = z.enum(ENVIRONMENTS, "Choose Sandbox or Production.");
 const name = (max = 60) => z.string().trim().min(1, "Required.").max(max, `Use ${max} characters or fewer.`);
 const MINUTE = 60_000;
 
+/** The token counts a run's usage sums into the usage report. */
+const RUN_USAGE_FIELDS = [
+  "tool_calls",
+  "input_tokens",
+  "output_tokens",
+  "cache_read_input_tokens",
+  "cache_write_input_tokens",
+] as const;
+const USAGE_COUNT_FIELDS = ["runs", "failed_runs", ...RUN_USAGE_FIELDS] as const;
+type UsageCounts = Omit<UsageReport["days"][number], "date">;
+
+function emptyUsageCounts(): UsageCounts {
+  return {
+    runs: 0,
+    failed_runs: 0,
+    tool_calls: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_input_tokens: 0,
+    cache_write_input_tokens: 0,
+  };
+}
+
 /** How long past its link's expiry a used link still shows its outcome. */
 export const OUTCOME_GRACE_MS = 5 * MINUTE;
 
@@ -1171,7 +1194,7 @@ export function createHandlers(apiBase: string) {
         today.setUTCHours(0, 0, 0, 0);
         for (let i = days - 1; i >= 0; i--) {
           const date = new Date(today.getTime() - i * 86_400_000).toISOString().slice(0, 10);
-          buckets.set(date, { date, runs: 0, failed_runs: 0, tool_calls: 0 });
+          buckets.set(date, { date, ...emptyUsageCounts() });
         }
         for (const run of db().runs) {
           if (run.organization_id !== access.org.id || !workspaceIds.has(run.workspace_id)) continue;
@@ -1179,18 +1202,14 @@ export function createHandlers(apiBase: string) {
           if (!bucket) continue;
           bucket.runs += 1;
           if (run.status === "failed") bucket.failed_runs += 1;
-          bucket.tool_calls += run.usage.tool_calls;
+          for (const field of RUN_USAGE_FIELDS) bucket[field] += run.usage[field];
         }
         const list = [...buckets.values()];
-        const report: UsageReport = {
-          environment: env.data,
-          days: list,
-          totals: {
-            runs: list.reduce((n, d) => n + d.runs, 0),
-            failed_runs: list.reduce((n, d) => n + d.failed_runs, 0),
-            tool_calls: list.reduce((n, d) => n + d.tool_calls, 0),
-          },
-        };
+        const totals = emptyUsageCounts();
+        for (const day of list) {
+          for (const field of USAGE_COUNT_FIELDS) totals[field] += day[field];
+        }
+        const report: UsageReport = { environment: env.data, days: list, totals };
         return ok(report);
       }),
     ),
@@ -2587,7 +2606,14 @@ export function createHandlers(apiBase: string) {
           status: "queued",
           input: input.input,
           output: null,
-          usage: { input_tokens: 0, output_tokens: 0, tool_calls: 0 },
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            tool_calls: 0,
+          },
+          prompt_tokens: 0,
           error: null,
           created_at: new Date().toISOString(),
           started_at: null,

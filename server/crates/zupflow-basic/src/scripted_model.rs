@@ -7,8 +7,11 @@
 //!   named that it was given, in order. A line naming a tool it wasn't given
 //!   is answered in text instead. Without such lines it answers
 //!   `You said: <what they wrote>`.
-//! - Given its calls' results, it answers in text, one line per call:
-//!   `<tool>: <result>`, or `<tool> failed: <reason>`.
+//! - A line `then` ends a round of calls: given the results of one round,
+//!   it makes the next round's calls, as a model working step by step
+//!   would.
+//! - Given its last round's results, it answers in text, one line per
+//!   call: `<tool>: <result>`, or `<tool> failed: <reason>`.
 //!
 //! It serves the model IDs it's made with and no others, and refuses a key
 //! the scripted providers refuse (one containing `invalid`), whatever the
@@ -47,8 +50,21 @@ fn words(text: &str) -> u64 {
     text.split_whitespace().count() as u64
 }
 
+/// A round of calls: each tool's name and arguments.
+type Round = Vec<(String, Option<Map<String, Value>>)>;
+
+/// The rounds of a message's `call` lines, split by `then` lines.
+fn rounds(text: &str) -> Vec<Round> {
+    text.split('\n')
+        .collect::<Vec<_>>()
+        .split(|line| line.trim() == "then")
+        .map(|lines| directives(&lines.join("\n")))
+        .filter(|round| !round.is_empty())
+        .collect()
+}
+
 /// The `call` lines of a message: each tool's name and arguments.
-fn directives(text: &str) -> Vec<(String, Option<Map<String, Value>>)> {
+fn directives(text: &str) -> Round {
     text.lines()
         .filter_map(|line| {
             let rest = line.trim().strip_prefix("call ")?.trim();
@@ -78,10 +94,37 @@ fn preview(text: &str) -> String {
 }
 
 fn answer_user(turn: &Turn<'_>, text: &str) -> Reply {
-    let asked = directives(text);
-    if asked.is_empty() {
-        return Reply::Text(format!("You said: {}", text.trim()));
+    match rounds(text).into_iter().next() {
+        Some(asked) => call(turn, asked),
+        None => Reply::Text(format!("You said: {}", text.trim())),
     }
+}
+
+/// The next round's calls when the user's last message asked for more
+/// than were made since, else one line per call of the last round.
+fn answer_results(turn: &Turn<'_>) -> Reply {
+    let Some(asked) = turn
+        .messages
+        .iter()
+        .rposition(|message| matches!(message, Message::User { .. }))
+    else {
+        return report(turn);
+    };
+    let Message::User { text } = &turn.messages[asked] else {
+        return report(turn);
+    };
+    let made = turn.messages[asked..]
+        .iter()
+        .filter(|message| matches!(message, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty()))
+        .count();
+    match rounds(text).into_iter().nth(made) {
+        Some(next) => call(turn, next),
+        None => report(turn),
+    }
+}
+
+/// Calls the tools of `asked` it was given, numbered by the answers so far.
+fn call(turn: &Turn<'_>, asked: Round) -> Reply {
     let round = turn
         .messages
         .iter()
@@ -116,7 +159,7 @@ fn answer_user(turn: &Turn<'_>, text: &str) -> Reply {
 }
 
 /// One line per call of the last assistant message, from its results.
-fn answer_results(turn: &Turn<'_>) -> Reply {
+fn report(turn: &Turn<'_>) -> Reply {
     let Some(asked) = turn.messages.iter().rev().find_map(|message| match message {
         Message::Assistant { tool_calls, .. } => Some(tool_calls),
         _ => None,
@@ -160,10 +203,7 @@ fn usage(turn: &Turn<'_>, reply: &Reply) -> TokenUsage {
         Reply::Text(text) => words(text),
         Reply::ToolCalls { text, calls } => text.as_deref().map_or(0, words) + calls.len() as u64,
     };
-    TokenUsage {
-        input_tokens: read.max(1),
-        output_tokens: written.max(1),
-    }
+    TokenUsage::new(read.max(1), written.max(1), 0, 0)
 }
 
 #[async_trait]
@@ -226,6 +266,7 @@ mod tests {
                     instructions: "Be brief.",
                     messages,
                     tools: &tools(),
+                    cache_key: None,
                 },
             )
             .await
@@ -293,6 +334,33 @@ mod tests {
         );
         assert_eq!(complete(&model, &conversation).await, second, "the same every time");
         assert!(second.usage.input_tokens > first.usage.input_tokens);
+    }
+
+    #[tokio::test]
+    async fn makes_its_calls_round_by_round() {
+        let model = ScriptedModel::serving(["scripted-a"]);
+        let mut conversation = vec![Message::User {
+            text: "call echo {\"text\": \"one\"}\nthen\ncall search\ncall echo".to_owned(),
+        }];
+        let mut rounds = Vec::new();
+        loop {
+            let answer = complete(&model, &conversation).await;
+            let Reply::ToolCalls { text, calls } = answer.reply else {
+                assert_eq!(answer.reply, Reply::Text("search: found\necho: found".to_owned()));
+                break;
+            };
+            rounds.push(calls.iter().map(|call| call.id.clone()).collect::<Vec<_>>());
+            conversation.push(Message::Assistant {
+                text,
+                tool_calls: calls.clone(),
+            });
+            conversation.extend(calls.iter().map(|call| Message::ToolResult {
+                call_id: call.id.clone(),
+                content: "found".to_owned(),
+                is_error: false,
+            }));
+        }
+        assert_eq!(rounds, [vec!["scripted-0-1"], vec!["scripted-1-1", "scripted-1-2"]]);
     }
 
     #[tokio::test]

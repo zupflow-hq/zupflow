@@ -188,18 +188,31 @@ internal_id! {
     ClaimantId
 }
 
-/// Tokens one model answer took.
+/// Tokens one model answer took ([`TokenUsage`] says what each counts).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cache_write_input_tokens: u64,
 }
 
 impl From<TokenUsage> for Usage {
     fn from(usage: TokenUsage) -> Self {
+        // Kept within the input, as `TokenUsage::new` builds it.
+        let usage = TokenUsage::new(
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_input_tokens,
+            usage.cache_write_input_tokens,
+        );
         Self {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_write_input_tokens: usage.cache_write_input_tokens,
         }
     }
 }

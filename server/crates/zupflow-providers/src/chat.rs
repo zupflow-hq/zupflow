@@ -7,6 +7,21 @@
 //!   call's outcome a `tool` message naming its `tool_call_id`, an error
 //!   outcome led by `Error: `, since the protocol has no flag for it.
 //! - Tools are `function` tools, offered with `tool_choice: auto`.
+//! - Caching: OpenAI caches a prompt's prefix on its own, and OpenRouter
+//!   does for most hosts; both are sent the turn's `prompt_cache_key`
+//!   (OpenAI routes by it, OpenRouter keeps a key's turns on one host), so
+//!   an agent's runs reach the same cache. Claude through OpenRouter
+//!   (`anthropic/` models) caches only at breakpoints, as Messages does
+//!   ([`crate::messages`]): its system, user and tool messages go as `text`
+//!   parts, and `cache_control` marks the system part, the last part of the
+//!   last message and the last part of the message before the latest
+//!   answer, where the turn before put its last one. Two gaps against
+//!   Messages: tools are never marked (OpenRouter documents breakpoints on
+//!   content parts only), so an agent without instructions gets no
+//!   breakpoint shared across its runs; and empty text stays a string,
+//!   unmarked, since Messages refuses an empty `text` block, so a turn
+//!   ending with an empty tool result leaves that breakpoint out and the
+//!   next turn reads only what an earlier breakpoint cached.
 //! - The request names exactly one model, the run's, and never `models`
 //!   or `openrouter/auto`: through OpenRouter it may be served by any host
 //!   of that model, never by another model.
@@ -16,7 +31,9 @@
 //! - The answer is `choices[0]`: its `tool_calls`, else its text.
 //!   `finish_reason` `length` or `content_filter` fails the turn (a cut-off
 //!   call or answer isn't one), `error` (OpenRouter) is worth trying again.
-//!   Tokens are `usage.prompt_tokens` and `usage.completion_tokens`.
+//!   Tokens are `usage.prompt_tokens` (which counts those read from and
+//!   written to a cache: `prompt_tokens_details.cached_tokens` and, from
+//!   OpenRouter, `cache_write_tokens`) and `usage.completion_tokens`.
 
 use crate::MAX_OUTPUT_TOKENS;
 use serde_json::{Map, Value, json};
@@ -38,9 +55,20 @@ pub fn names_an_unknown_model(body: &[u8]) -> bool {
 /// What an error outcome is led by, for a model to tell it from a result.
 pub const ERROR_PREFIX: &str = "Error: ";
 
-fn message(message: &Message) -> Value {
+/// A message's text as `content`: a string, or one `text` part when the
+/// model caches at breakpoints, which mark parts. Empty text stays a
+/// string: Messages refuses an empty `text` block.
+fn content(text: &str, parts: bool) -> Value {
+    if parts && !text.is_empty() {
+        json!([{ "type": "text", "text": text }])
+    } else {
+        json!(text)
+    }
+}
+
+fn message(message: &Message, parts: bool) -> Value {
     match message {
-        Message::User { text } => json!({ "role": "user", "content": text }),
+        Message::User { text } => json!({ "role": "user", "content": content(text, parts) }),
         Message::Assistant { text, tool_calls } => {
             let mut out = Map::new();
             out.insert("role".to_owned(), json!("assistant"));
@@ -68,26 +96,71 @@ fn message(message: &Message) -> Value {
         }
         Message::ToolResult {
             call_id,
-            content,
+            content: text,
             is_error,
         } => {
-            let content = if *is_error {
-                format!("{ERROR_PREFIX}{content}")
+            let text = if *is_error {
+                format!("{ERROR_PREFIX}{text}")
             } else {
-                content.clone()
+                text.clone()
             };
-            json!({ "role": "tool", "tool_call_id": call_id, "content": content })
+            json!({ "role": "tool", "tool_call_id": call_id, "content": content(&text, parts) })
         }
+    }
+}
+
+/// Whether a model takes cache breakpoints on its messages' parts: Claude,
+/// through OpenRouter.
+fn caches_at_breakpoints(kind: ProviderKind, model: &str) -> bool {
+    kind == ProviderKind::OpenRouter && model.starts_with("anthropic/")
+}
+
+/// Marks a message's last part as a cache breakpoint, unless it has no
+/// parts or its text is empty.
+fn mark(message: &mut Value) {
+    let Some(part) = message
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|parts| parts.last_mut())
+    else {
+        return;
+    };
+    if part
+        .get("text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.is_empty())
+        && let Value::Object(part) = part
+    {
+        part.insert("cache_control".to_owned(), json!({ "type": "ephemeral" }));
     }
 }
 
 /// The request body for a turn, to `kind`.
 pub fn request(kind: ProviderKind, turn: &Turn<'_>) -> Value {
+    let breakpoints = caches_at_breakpoints(kind, turn.model);
     let mut messages = Vec::with_capacity(turn.messages.len() + 1);
     if !turn.instructions.is_empty() {
-        messages.push(json!({ "role": "system", "content": turn.instructions }));
+        messages.push(json!({ "role": "system", "content": content(turn.instructions, breakpoints) }));
     }
-    messages.extend(turn.messages.iter().map(message));
+    messages.extend(turn.messages.iter().map(|each| message(each, breakpoints)));
+    if breakpoints {
+        if !turn.instructions.is_empty()
+            && let Some(system) = messages.first_mut()
+        {
+            mark(system);
+        }
+        if let Some(answered) = messages
+            .iter()
+            .rposition(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+            && let Some(before) = answered.checked_sub(1)
+            && let Some(message) = messages.get_mut(before)
+        {
+            mark(message);
+        }
+        if let Some(last) = messages.last_mut() {
+            mark(last);
+        }
+    }
     let mut body = Map::new();
     body.insert("model".to_owned(), json!(turn.model));
     body.insert("messages".to_owned(), Value::Array(messages));
@@ -114,6 +187,14 @@ pub fn request(kind: ProviderKind, turn: &Turn<'_>) -> Value {
         ProviderKind::OpenAi | ProviderKind::Anthropic => "max_completion_tokens",
     };
     body.insert(cap.to_owned(), json!(MAX_OUTPUT_TOKENS));
+    match kind {
+        ProviderKind::OpenAi | ProviderKind::OpenRouter => {
+            if let Some(key) = turn.cache_key {
+                body.insert("prompt_cache_key".to_owned(), json!(key));
+            }
+        }
+        ProviderKind::Anthropic => {}
+    }
     Value::Object(body)
 }
 
@@ -197,10 +278,13 @@ pub fn completion(body: &[u8]) -> Result<Completion, ProviderError> {
         });
     }
     let usage = answer.get("usage").unwrap_or(&Value::Null);
-    let usage = TokenUsage {
-        input_tokens: tokens(usage.get("prompt_tokens").unwrap_or(&Value::Null)),
-        output_tokens: tokens(usage.get("completion_tokens").unwrap_or(&Value::Null)),
-    };
+    let details = usage.get("prompt_tokens_details").unwrap_or(&Value::Null);
+    let usage = TokenUsage::new(
+        tokens(usage.get("prompt_tokens").unwrap_or(&Value::Null)),
+        tokens(usage.get("completion_tokens").unwrap_or(&Value::Null)),
+        tokens(details.get("cached_tokens").unwrap_or(&Value::Null)),
+        tokens(details.get("cache_write_tokens").unwrap_or(&Value::Null)),
+    );
     let reply = if !calls.is_empty() {
         Reply::ToolCalls { text, calls }
     } else {

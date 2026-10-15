@@ -1161,10 +1161,31 @@ export type UpdateAppToolLevelsInput = z.infer<typeof UpdateAppToolLevelsInput>;
 // ---------------------------------------------------------------------------
 // Runs
 
-export const RunUsage = named(
-  "RunUsage",
-  z.object({ input_tokens: z.number().int(), output_tokens: z.number().int(), tool_calls: z.number().int() }),
-);
+/**
+ * The tokens a run's model read and wrote, as its provider counted them, and
+ * the calls it sent. `input_tokens` is every token the model read, those
+ * served from the provider's prompt cache and those written to it included,
+ * whichever provider served the run; the two cache counts are parts of it.
+ */
+const tokenFields = {
+  input_tokens: z
+    .number()
+    .int()
+    .describe("Every token the model read, those read from or written to the provider's prompt cache included."),
+  output_tokens: z.number().int().describe("Every token the model wrote."),
+  cache_read_input_tokens: z
+    .number()
+    .int()
+    .describe("The part of `input_tokens` the provider served from its prompt cache."),
+  cache_write_input_tokens: z
+    .number()
+    .int()
+    .describe(
+      "The part of `input_tokens` the provider wrote to its prompt cache. Providers that cache on their own report none.",
+    ),
+};
+
+export const RunUsage = named("RunUsage", z.object({ ...tokenFields, tool_calls: z.number().int() }));
 export type RunUsage = z.infer<typeof RunUsage>;
 
 export const RunError = named("RunError", z.object({ code: z.string(), message: z.string() }));
@@ -1660,15 +1681,15 @@ export const AuditListQuery = z.object({
 });
 export type AuditListQuery = z.infer<typeof AuditListQuery>;
 
-export const UsageDay = named(
-  "UsageDay",
-  z.object({
-    date: z.iso.date(),
-    runs: z.number().int(),
-    failed_runs: z.number().int(),
-    tool_calls: z.number().int(),
-  }),
-);
+const usageCounts = {
+  runs: z.number().int(),
+  failed_runs: z.number().int(),
+  tool_calls: z.number().int(),
+  ...tokenFields,
+};
+
+/** One UTC day of runs created that day, with their calls and tokens. */
+export const UsageDay = named("UsageDay", z.object({ date: z.iso.date(), ...usageCounts }));
 export type UsageDay = z.infer<typeof UsageDay>;
 
 export const UsageReport = named(
@@ -1676,7 +1697,7 @@ export const UsageReport = named(
   z.object({
     environment: Environment,
     days: z.array(UsageDay),
-    totals: z.object({ runs: z.number().int(), failed_runs: z.number().int(), tool_calls: z.number().int() }),
+    totals: z.object(usageCounts),
   }),
 );
 export type UsageReport = z.infer<typeof UsageReport>;

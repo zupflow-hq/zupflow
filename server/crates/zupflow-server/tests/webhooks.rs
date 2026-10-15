@@ -997,10 +997,25 @@ async fn counts_usage_and_recent_runs_from_runs() {
     );
     let today = zupflow_core::time::Timestamp::now().to_string();
     assert_eq!(days[2]["date"], &today[..10]);
+    let totals = &report["data"]["totals"];
     assert_eq!(
-        report["data"]["totals"],
-        json!({ "runs": 2, "failed_runs": 0, "tool_calls": 0 })
+        [&totals["runs"], &totals["failed_runs"], &totals["tool_calls"]],
+        [&json!(2), &json!(0), &json!(0)],
+        "{totals}"
     );
+    // Tokens as the runs counted them, each day's summed into the totals;
+    // the scripted model has no prompt cache.
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_write_input_tokens",
+    ] {
+        let summed: u64 = days.iter().map(|day| day[field].as_u64().unwrap()).sum();
+        assert_eq!(totals[field], summed, "{field}");
+    }
+    assert!(totals["input_tokens"].as_u64().unwrap() > 0 && totals["output_tokens"].as_u64().unwrap() > 0);
+    assert_eq!(totals["cache_read_input_tokens"], 0);
     assert_eq!(report["data"]["environment"], "sandbox");
 
     let (_, report) = usage("alice", "?environment=sandbox").await;

@@ -42,7 +42,7 @@ use zupflow_core::runs::names::Offer;
 use zupflow_core::runs::reducer::{INSTALLATION_DISCONNECTED, INSTALLATION_REMOVED};
 use zupflow_core::runs::state::{
     BoundTarget, CallAttempt, CallDecision, CallRecord, CallVerdict, ClaimantId, CommittedTurn, Continuation,
-    EXECUTION_VERSION, InvocationId, ModelAttempt, ModelAttemptState, RunControl, Snapshot, supports,
+    EXECUTION_VERSION, InvocationId, ModelAttempt, ModelAttemptState, RunControl, Snapshot, Usage, supports,
 };
 use zupflow_core::runs::store::{Applied, Durability, MODEL_RETRY_STEP, Receipt, RunStore, StoreError, run_job};
 use zupflow_core::runs::transition::{
@@ -203,7 +203,7 @@ async fn run_row(
     let row = sqlx::query(
         "SELECT status, continuation, revision, owner_epoch, owner_claimant, lease_until, cancel_requested_at, \
          execution_version, job_id, agent_id, model, model_id, model_connection_id, instructions, input, \
-         input_tokens, output_tokens, tool_calls \
+         input_tokens, output_tokens, cache_read_input_tokens, cache_write_input_tokens, tool_calls \
          FROM runs WHERE organization_id = ? AND workspace_id = ? AND id = ?",
     )
     .bind(organization_id.uuid())
@@ -230,11 +230,7 @@ async fn run_row(
         model_connection_id: row.try_get("model_connection_id").map_err(unreadable)?,
         instructions: row.try_get("instructions").map_err(unreadable)?,
         input: row.try_get("input").map_err(unreadable)?,
-        usage: RunUsage {
-            input_tokens: uint(&row, "input_tokens")?,
-            output_tokens: uint(&row, "output_tokens")?,
-            tool_calls: uint(&row, "tool_calls")?,
-        },
+        usage: run_usage(&row)?,
     }))
 }
 
@@ -639,8 +635,8 @@ fn ended(sending: Option<Timestamp>) -> JobAction {
 struct RowChange {
     started: bool,
     ending: Option<RunEnding>,
-    add_input_tokens: u64,
-    add_output_tokens: u64,
+    /// The tokens of the turn this transition commits.
+    add_usage: Usage,
     add_tool_calls: u64,
 }
 
@@ -832,17 +828,20 @@ impl Writer<'_> {
         attempt: u32,
         from: ModelAttemptState,
         to: ModelAttemptState,
-        tokens: Option<(u64, u64)>,
+        tokens: Option<Usage>,
     ) -> Result<(), StoreError> {
         let (org, ws, run) = self.scope();
-        let (input, output) = tokens.map_or((None, None), |(input, output)| (Some(input), Some(output)));
+        let count = |of: fn(&Usage) -> u64| tokens.as_ref().map(|usage| int(of(usage))).transpose();
         let changed = sqlx::query(
-            "UPDATE run_model_attempts SET state = ?, input_tokens = ?, output_tokens = ?, updated_at = ? \
+            "UPDATE run_model_attempts SET state = ?, input_tokens = ?, output_tokens = ?, \
+             cache_read_input_tokens = ?, cache_write_input_tokens = ?, updated_at = ? \
              WHERE organization_id = ? AND workspace_id = ? AND run_id = ? AND turn = ? AND attempt = ? AND state = ?",
         )
         .bind(model_attempt_state(to))
-        .bind(input.map(int).transpose()?)
-        .bind(output.map(int).transpose()?)
+        .bind(count(|usage| usage.input_tokens)?)
+        .bind(count(|usage| usage.output_tokens)?)
+        .bind(count(|usage| usage.cache_read_input_tokens)?)
+        .bind(count(|usage| usage.cache_write_input_tokens)?)
         .bind(self.now.millis())
         .bind(org)
         .bind(ws)
@@ -1404,13 +1403,14 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
                     *attempt,
                     ModelAttemptState::Prepared,
                     ModelAttemptState::Answered,
-                    Some((usage.input_tokens, usage.output_tokens)),
+                    Some(*usage),
                 )
                 .await?;
             let (org, ws, run) = writer.scope();
             sqlx::query(
                 "INSERT INTO run_turns (id, organization_id, workspace_id, run_id, turn, model_attempt, text, \
-                 input_tokens, output_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 input_tokens, output_tokens, cache_read_input_tokens, cache_write_input_tokens, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(Uuid::now_v7())
             .bind(org)
@@ -1421,6 +1421,8 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
             .bind(text.as_deref())
             .bind(int(usage.input_tokens)?)
             .bind(int(usage.output_tokens)?)
+            .bind(int(usage.cache_read_input_tokens)?)
+            .bind(int(usage.cache_write_input_tokens)?)
             .bind(now.millis())
             .execute(&mut *writer.connection)
             .await
@@ -1433,8 +1435,7 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
             }
             let row = RowChange {
                 ending: ending.clone(),
-                add_input_tokens: usage.input_tokens,
-                add_output_tokens: usage.output_tokens,
+                add_usage: *usage,
                 ..RowChange::default()
             };
             let job = if ending.is_some() {
@@ -2059,11 +2060,23 @@ async fn earlier(
     )))
 }
 
+/// A run's usage, from its row.
+fn run_usage(row: &SqliteRow) -> Result<RunUsage, StoreError> {
+    Ok(RunUsage {
+        input_tokens: uint(row, "input_tokens")?,
+        output_tokens: uint(row, "output_tokens")?,
+        cache_read_input_tokens: uint(row, "cache_read_input_tokens")?,
+        cache_write_input_tokens: uint(row, "cache_write_input_tokens")?,
+        tool_calls: uint(row, "tool_calls")?,
+    })
+}
+
 /// A run's columns and its agent's name, from `runs r`.
 macro_rules! run_columns {
     () => {
         "r.id, r.organization_id, r.workspace_id, r.agent_id, a.name AS agent_name, r.session_id, r.trigger, \
-         r.status, r.input, r.output, r.input_tokens, r.output_tokens, r.tool_calls, r.error_code, r.error_message, \
+         r.status, r.input, r.output, r.input_tokens, r.output_tokens, r.cache_read_input_tokens, \
+         r.cache_write_input_tokens, r.tool_calls, r.error_code, r.error_message, \
          r.created_at, r.started_at, r.finished_at"
     };
 }
@@ -2097,11 +2110,7 @@ fn run_from(row: &SqliteRow) -> Result<Run, StoreError> {
         status: RunStatus::parse(&status).ok_or_else(|| corrupt("a run status"))?,
         input: row.try_get("input").map_err(unreadable)?,
         output: row.try_get("output").map_err(unreadable)?,
-        usage: RunUsage {
-            input_tokens: uint(row, "input_tokens")?,
-            output_tokens: uint(row, "output_tokens")?,
-            tool_calls: uint(row, "tool_calls")?,
-        },
+        usage: run_usage(row)?,
         error: match (error_code, error_message) {
             (Some(code), Some(message)) => Some(Failure { code, message }),
             _ => None,
@@ -2314,9 +2323,18 @@ impl SqliteRunStore {
 
         // The run.completed or run.failed event carries the run's totals.
         let row = effects.row;
+        let added = row.add_usage;
         let usage = RunUsage {
-            input_tokens: loaded.usage.input_tokens.saturating_add(row.add_input_tokens),
-            output_tokens: loaded.usage.output_tokens.saturating_add(row.add_output_tokens),
+            input_tokens: loaded.usage.input_tokens.saturating_add(added.input_tokens),
+            output_tokens: loaded.usage.output_tokens.saturating_add(added.output_tokens),
+            cache_read_input_tokens: loaded
+                .usage
+                .cache_read_input_tokens
+                .saturating_add(added.cache_read_input_tokens),
+            cache_write_input_tokens: loaded
+                .usage
+                .cache_write_input_tokens
+                .saturating_add(added.cache_write_input_tokens),
             tool_calls: loaded.usage.tool_calls.saturating_add(row.add_tool_calls),
         };
         let (output, error) = match &row.ending {
@@ -2341,7 +2359,8 @@ impl SqliteRunStore {
              lease_until = ?, cancel_requested_at = ?, started_at = coalesce(started_at, ?), \
              finished_at = coalesce(finished_at, ?), output = coalesce(output, ?), \
              error_code = coalesce(error_code, ?), error_message = coalesce(error_message, ?), \
-             input_tokens = ?, output_tokens = ?, tool_calls = ?, job_id = ? \
+             input_tokens = ?, output_tokens = ?, cache_read_input_tokens = ?, cache_write_input_tokens = ?, \
+             tool_calls = ?, job_id = ? \
              WHERE organization_id = ? AND workspace_id = ? AND id = ? AND revision = ?",
         )
         .bind(status.as_str())
@@ -2358,6 +2377,8 @@ impl SqliteRunStore {
         .bind(error.map(|error| error.message.as_str()))
         .bind(int(usage.input_tokens)?)
         .bind(int(usage.output_tokens)?)
+        .bind(int(usage.cache_read_input_tokens)?)
+        .bind(int(usage.cache_write_input_tokens)?)
         .bind(int(usage.tool_calls)?)
         .bind(job_id)
         .bind(org)
@@ -2655,7 +2676,9 @@ impl RunStore for SqliteRunStore {
     ) -> Result<Vec<UsageDay>, StoreError> {
         let rows = sqlx::query(
             "SELECT r.created_at / 86400000 AS day, count(*) AS runs, sum(r.status = 'failed') AS failed_runs, \
-             sum(r.tool_calls) AS tool_calls FROM runs r \
+             sum(r.tool_calls) AS tool_calls, sum(r.input_tokens) AS input_tokens, \
+             sum(r.output_tokens) AS output_tokens, sum(r.cache_read_input_tokens) AS cache_read_input_tokens, \
+             sum(r.cache_write_input_tokens) AS cache_write_input_tokens FROM runs r \
              JOIN workspaces w ON w.organization_id = r.organization_id AND w.id = r.workspace_id \
              WHERE r.organization_id = ? AND w.organization_id = ? AND w.environment = ? AND r.created_at >= ? \
              GROUP BY day ORDER BY day",
@@ -2674,6 +2697,10 @@ impl RunStore for SqliteRunStore {
                     runs: uint(row, "runs")?,
                     failed_runs: uint(row, "failed_runs")?,
                     tool_calls: uint(row, "tool_calls")?,
+                    input_tokens: uint(row, "input_tokens")?,
+                    output_tokens: uint(row, "output_tokens")?,
+                    cache_read_input_tokens: uint(row, "cache_read_input_tokens")?,
+                    cache_write_input_tokens: uint(row, "cache_write_input_tokens")?,
                 })
             })
             .collect()
@@ -3155,5 +3182,131 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(violations, 0);
+    }
+
+    /// The contract's `RunUsage` fields, as `openapi.json` requires them.
+    fn run_usage_fields() -> Vec<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packages/contract/openapi.json");
+        let document: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        document["components"]["schemas"]["RunUsage"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// Whether `usage` holds every field `RunUsage` requires, as integers.
+    fn is_run_usage(usage: &Value) -> bool {
+        run_usage_fields().iter().all(|field| usage[field.as_str()].is_u64())
+    }
+
+    #[tokio::test]
+    async fn serves_usage_stored_before_migration_0034_as_the_contract_reads_it() {
+        use std::str::FromStr;
+
+        use sqlx::sqlite::SqliteConnectOptions;
+
+        use crate::schema::TemporaryDirectory;
+
+        let directory = TemporaryDirectory::new();
+        let earlier = directory.0.join("migrations");
+        std::fs::create_dir(&earlier).unwrap();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if name.as_str() < "0034" {
+                std::fs::copy(&path, earlier.join(&name)).unwrap();
+            }
+        }
+        let options = SqliteConnectOptions::from_str("sqlite:")
+            .unwrap()
+            .filename(directory.file())
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+        sqlx::migrate::Migrator::new(earlier.as_path())
+            .await
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
+        let (org, ws, run) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let old_usage = r#"{"input_tokens":3,"output_tokens":4,"tool_calls":1}"#;
+        let completed = format!(r#"{{"usage":{old_usage}}}"#);
+        let saved = format!(r#"{{"data":{{"id":"run_x","status":"cancelled","usage":{old_usage}}}}}"#);
+        for statement in [
+            "INSERT INTO organizations (id, name, slug, created_at) VALUES (?1, 'Org', 'org', 0)",
+            "INSERT INTO workspaces (id, organization_id, environment, name, slug, created_at) \
+             VALUES (?2, ?1, 'sandbox', 'W', 'w', 0)",
+            "INSERT INTO runs (id, organization_id, workspace_id, agent_id, session_id, trigger, job_id, status, input, \
+             output, model, instructions, input_tokens, output_tokens, tool_calls, created_at, started_at, \
+             finished_at) VALUES (?3, ?1, ?2, ?3, ?3, 'api', ?3, 'completed', 'hi', 'Done.', 'm', '', 3, 4, 1, \
+             0, 0, 5)",
+            "INSERT INTO run_events (id, organization_id, workspace_id, run_id, sequence, type, data, created_at) \
+             VALUES (?6, ?1, ?2, ?3, 1, 'run.queued', '{}', 0)",
+            "INSERT INTO run_events (id, organization_id, workspace_id, run_id, sequence, type, data, created_at) \
+             VALUES (?7, ?1, ?2, ?3, 2, 'run.completed', ?4, 5)",
+            "INSERT INTO idempotency_keys (id, organization_id, workspace_id, caller_kind, caller_id, \
+             caller_environment, key, fingerprint, state, status, body, created_at) \
+             VALUES (?8, ?1, ?2, 'member', ?8, NULL, 'k1', 'f', 'completed', 200, CAST(?5 AS BLOB), 0)",
+            "INSERT INTO idempotency_keys (id, organization_id, workspace_id, caller_kind, caller_id, \
+             caller_environment, key, fingerprint, state, status, body, created_at) \
+             VALUES (?6, ?1, ?2, 'member', ?6, NULL, 'k2', 'f', 'completed', 204, NULL, 0)",
+        ] {
+            sqlx::query(statement)
+                .bind(org)
+                .bind(ws)
+                .bind(run)
+                .bind(&completed)
+                .bind(&saved)
+                .bind(Uuid::now_v7())
+                .bind(Uuid::now_v7())
+                .bind(Uuid::now_v7())
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("{statement}: {error}"));
+        }
+        pool.close().await;
+
+        let database = Database::open(&directory.file()).await.unwrap();
+        let store = SqliteRunStore::new(database.clone());
+        let (org, ws, run) = (
+            OrganizationId::from_uuid(org),
+            WorkspaceId::from_uuid(ws),
+            RunId::from_uuid(run),
+        );
+        let events = store.list_events(org, ws, run, 0).await.unwrap();
+        let completed = events
+            .iter()
+            .find(|event| event.kind == RunEventType::RunCompleted)
+            .unwrap();
+        assert!(is_run_usage(&completed.data["usage"]), "{}", completed.data);
+        assert_eq!(
+            completed.data["usage"],
+            serde_json::json!({
+                "input_tokens": 3, "output_tokens": 4, "cache_read_input_tokens": 0,
+                "cache_write_input_tokens": 0, "tool_calls": 1,
+            }),
+            "its counts kept, the new ones none"
+        );
+        let found = store.find_run(org, ws, run).await.unwrap().unwrap();
+        assert!(is_run_usage(&serde_json::to_value(found.usage).unwrap()));
+        let bodies: Vec<Option<Vec<u8>>> = sqlx::query_scalar(
+            "SELECT body FROM idempotency_keys WHERE organization_id = ? AND workspace_id = ? ORDER BY key",
+        )
+        .bind(org.uuid())
+        .bind(ws.uuid())
+        .fetch_all(database.pool())
+        .await
+        .unwrap();
+        let saved: Value = serde_json::from_slice(bodies[0].as_deref().unwrap()).unwrap();
+        assert!(
+            is_run_usage(&saved["data"]["usage"]),
+            "a saved answer replays as the contract reads it: {saved}"
+        );
+        assert_eq!(saved["data"]["status"], "cancelled", "the rest of it kept");
+        assert_eq!(bodies[1], None, "a body without a run is left alone");
     }
 }

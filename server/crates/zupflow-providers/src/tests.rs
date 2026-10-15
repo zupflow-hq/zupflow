@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use zupflow_basic::scripted_providers::catalog;
 use zupflow_core::model_providers::{CatalogError, ModelProviderCatalog, ProviderKey, ProviderKind};
 use zupflow_core::models::{
-    Message, ModelProvider, ModelToolCall, ProviderAccess, ProviderError, Reply, ToolSpec, Turn,
+    Message, ModelProvider, ModelToolCall, ProviderAccess, ProviderError, Reply, TokenUsage, ToolSpec, Turn,
 };
 use zupflow_core::outbound::Method;
 
@@ -83,15 +83,28 @@ async fn ask(
     kind: ProviderKind,
     messages: &[Message],
 ) -> Result<Completion, ProviderError> {
+    ask_model(provider, kind, model(kind), messages).await
+}
+
+/// The prompt cache key the tests send.
+const CACHE_KEY: &str = "zf_0123456789abcdef0123456789abcdef";
+
+async fn ask_model(
+    provider: &HttpModelProvider,
+    kind: ProviderKind,
+    model: &str,
+    messages: &[Message],
+) -> Result<Completion, ProviderError> {
     let tools = tools();
     provider
         .complete(
             &ProviderAccess { kind, key: &key() },
             &Turn {
-                model: model(kind),
+                model,
                 instructions: "Be brief.",
                 messages,
                 tools: &tools,
+                cache_key: Some(CACHE_KEY),
             },
         )
         .await
@@ -214,6 +227,10 @@ async fn sends_chat_completions_as_openai_reads_them() {
     let body = sent.body;
     assert_eq!(body["messages"][0], json!({ "role": "system", "content": "Be brief." }));
     assert_eq!(
+        body["prompt_cache_key"], CACHE_KEY,
+        "routes the agent's turns to one cache"
+    );
+    assert_eq!(
         body["messages"][2]["tool_calls"][0]["function"]["arguments"],
         json!("{\"title\":\"Ship\"}")
     );
@@ -277,7 +294,12 @@ async fn sends_messages_as_anthropic_reads_them() {
             .any(|(name, value)| name == "anthropic-version" && value == ANTHROPIC_VERSION)
     );
     let body = sent.body;
-    assert_eq!(body["system"], "Be brief.");
+    assert_eq!(
+        body["system"],
+        json!([{ "type": "text", "text": "Be brief.", "cache_control": { "type": "ephemeral" } }]),
+        "the tools and instructions every run of the agent shares, cached"
+    );
+    assert_eq!(body.get("prompt_cache_key"), None, "Messages takes no key");
     assert_eq!(body["max_tokens"], json!(crate::MAX_OUTPUT_TOKENS));
     let roles: Vec<&str> = body["messages"]
         .as_array()
@@ -292,7 +314,13 @@ async fn sends_messages_as_anthropic_reads_them() {
     );
     assert_eq!(
         body["messages"][2]["content"][2],
-        json!({ "type": "text", "text": "Thanks" })
+        json!({ "type": "text", "text": "Thanks", "cache_control": { "type": "ephemeral" } }),
+        "the last message, cached for the next turn"
+    );
+    assert_eq!(
+        body["messages"][0]["content"][0],
+        json!({ "type": "text", "text": "call work_create_task {\"title\": \"Ship\"}", "cache_control": { "type": "ephemeral" } }),
+        "where the turn before put its last breakpoint"
     );
     assert_eq!(
         body["messages"][1]["content"][0],
@@ -431,10 +459,14 @@ fn reads_what_isnt_an_answer_as_a_failure() {
     ));
     let no_arguments = chat(json!({
         "choices": [{ "message": { "content": null, "tool_calls": [{ "id": "c", "type": "function", "function": { "name": "t", "arguments": "" } }] }, "finish_reason": "tool_calls" }],
-        "usage": { "prompt_tokens": 7, "completion_tokens": 2 },
+        "usage": { "prompt_tokens": 7, "completion_tokens": 2, "prompt_tokens_details": { "cached_tokens": 4, "cache_write_tokens": 2 } },
     }))
     .unwrap();
-    assert_eq!(no_arguments.usage.input_tokens, 7);
+    assert_eq!(
+        no_arguments.usage,
+        TokenUsage::new(7, 2, 4, 2),
+        "the cache's parts within the prompt's"
+    );
     assert!(matches!(no_arguments.reply, Reply::ToolCalls { text: None, .. }));
 
     let messages = |value: Value| messages::completion(value.to_string().as_bytes());
@@ -452,7 +484,11 @@ fn reads_what_isnt_an_answer_as_a_failure() {
         "usage": { "input_tokens": 10, "cache_creation_input_tokens": 5, "cache_read_input_tokens": 20, "output_tokens": 3 },
     }))
     .unwrap();
-    assert_eq!(thought.usage.input_tokens, 35, "cached tokens were read too");
+    assert_eq!(
+        thought.usage,
+        TokenUsage::new(35, 3, 20, 5),
+        "tokens read from and written to the cache were read too"
+    );
     let Reply::ToolCalls { text, calls } = thought.reply else {
         panic!("a call");
     };
@@ -640,4 +676,187 @@ fn classifies_statuses() {
     for refused in [301, 400, 413, 422] {
         assert_eq!(classify(refused), Status::Refused, "{refused}");
     }
+}
+
+/// A fixed turn, as each path writes it: the bytes on the wire. A change
+/// here (a field's order, a number's format, a value that differs from one
+/// call to the next) changes every cached prefix, so it must be deliberate.
+#[tokio::test]
+async fn writes_a_turn_as_the_same_bytes_every_time() {
+    const OPENAI: &str = r#"{"max_completion_tokens":16000,"messages":[{"content":"Be brief.","role":"system"},{"content":"call work_create_task {\"title\": \"Ship\"}","role":"user"},{"content":"On it.","role":"assistant","tool_calls":[{"function":{"arguments":"{\"title\":\"Ship\"}","name":"work_create_task"},"id":"call_a","type":"function"},{"function":{"arguments":"{\"title\":\"Ship\"}","name":"work_create_task"},"id":"call_b","type":"function"}]},{"content":"Created.","role":"tool","tool_call_id":"call_a"},{"content":"Error: A person denied this call.","role":"tool","tool_call_id":"call_b"}],"model":"gpt-5-mini","prompt_cache_key":"zf_0123456789abcdef0123456789abcdef","tool_choice":"auto","tools":[{"function":{"description":"Creates a task.","name":"work_create_task","parameters":{"properties":{"title":{"type":"string"}},"type":"object"}},"type":"function"}]}"#;
+    const OPENROUTER: &str = r#"{"max_tokens":16000,"messages":[{"content":"Be brief.","role":"system"},{"content":"call work_create_task {\"title\": \"Ship\"}","role":"user"},{"content":"On it.","role":"assistant","tool_calls":[{"function":{"arguments":"{\"title\":\"Ship\"}","name":"work_create_task"},"id":"call_a","type":"function"},{"function":{"arguments":"{\"title\":\"Ship\"}","name":"work_create_task"},"id":"call_b","type":"function"}]},{"content":"Created.","role":"tool","tool_call_id":"call_a"},{"content":"Error: A person denied this call.","role":"tool","tool_call_id":"call_b"}],"model":"openai/gpt-5-mini","prompt_cache_key":"zf_0123456789abcdef0123456789abcdef","tool_choice":"auto","tools":[{"function":{"description":"Creates a task.","name":"work_create_task","parameters":{"properties":{"title":{"type":"string"}},"type":"object"}},"type":"function"}]}"#;
+    const OPENROUTER_CLAUDE: &str = r#"{"max_tokens":16000,"messages":[{"content":[{"cache_control":{"type":"ephemeral"},"text":"Be brief.","type":"text"}],"role":"system"},{"content":[{"cache_control":{"type":"ephemeral"},"text":"call work_create_task {\"title\": \"Ship\"}","type":"text"}],"role":"user"},{"content":"On it.","role":"assistant","tool_calls":[{"function":{"arguments":"{\"title\":\"Ship\"}","name":"work_create_task"},"id":"call_a","type":"function"},{"function":{"arguments":"{\"title\":\"Ship\"}","name":"work_create_task"},"id":"call_b","type":"function"}]},{"content":[{"text":"Created.","type":"text"}],"role":"tool","tool_call_id":"call_a"},{"content":[{"cache_control":{"type":"ephemeral"},"text":"Error: A person denied this call.","type":"text"}],"role":"tool","tool_call_id":"call_b"}],"model":"anthropic/claude-sonnet-4.5","prompt_cache_key":"zf_0123456789abcdef0123456789abcdef","tool_choice":"auto","tools":[{"function":{"description":"Creates a task.","name":"work_create_task","parameters":{"properties":{"title":{"type":"string"}},"type":"object"}},"type":"function"}]}"#;
+    const ANTHROPIC: &str = r#"{"max_tokens":16000,"messages":[{"content":[{"cache_control":{"type":"ephemeral"},"text":"call work_create_task {\"title\": \"Ship\"}","type":"text"}],"role":"user"},{"content":[{"text":"On it.","type":"text"},{"id":"call_a","input":{"title":"Ship"},"name":"work_create_task","type":"tool_use"},{"id":"call_b","input":{"title":"Ship"},"name":"work_create_task","type":"tool_use"}],"role":"assistant"},{"content":[{"content":"Created.","tool_use_id":"call_a","type":"tool_result"},{"cache_control":{"type":"ephemeral"},"content":"A person denied this call.","is_error":true,"tool_use_id":"call_b","type":"tool_result"}],"role":"user"}],"model":"claude-sonnet-4-5","system":[{"cache_control":{"type":"ephemeral"},"text":"Be brief.","type":"text"}],"tools":[{"description":"Creates a task.","input_schema":{"properties":{"title":{"type":"string"}},"type":"object"},"name":"work_create_task"}]}"#;
+    let (fake, provider, _) = fake();
+    for (kind, model, golden) in [
+        (ProviderKind::OpenAi, "gpt-5-mini", OPENAI),
+        (ProviderKind::OpenRouter, "openai/gpt-5-mini", OPENROUTER),
+        (
+            ProviderKind::OpenRouter,
+            "anthropic/claude-sonnet-4.5",
+            OPENROUTER_CLAUDE,
+        ),
+        (ProviderKind::Anthropic, "claude-sonnet-4-5", ANTHROPIC),
+    ] {
+        for _ in 0..2 {
+            ask_model(&provider, kind, model, &answered()).await.unwrap();
+            let sent = fake.turns().pop().unwrap();
+            assert_eq!(String::from_utf8(sent.raw).unwrap(), golden, "{kind:?} {model}");
+        }
+    }
+}
+
+/// Each path, three turns of one conversation: each turn's prompt
+/// continues the one before, its breakpoints sit where the provider looks
+/// for them, and from the second turn on the provider reads what the turn
+/// before sent from its cache.
+#[tokio::test]
+async fn caches_each_turn_for_the_next_on_every_path() {
+    use crate::fake::prompt::{check_prefix, markers};
+
+    for (kind, model) in [
+        (ProviderKind::OpenAi, "gpt-5-mini"),
+        (ProviderKind::OpenRouter, "openai/gpt-5-mini"),
+        (ProviderKind::OpenRouter, "anthropic/claude-sonnet-4.5"),
+        (ProviderKind::Anthropic, "claude-sonnet-4-5"),
+    ] {
+        let (fake, provider, _) = fake();
+        let mut conversation = vec![Message::User {
+            text: "call work_create_task {\"title\": \"Ship\"}\ncall work_create_task {\"title\": \"Test\"}".to_owned(),
+        }];
+        let mut usages = Vec::new();
+        for round in 0..3 {
+            let answer = ask_model(&provider, kind, model, &conversation).await.unwrap();
+            usages.push(answer.usage);
+            match answer.reply {
+                Reply::ToolCalls { text, calls } => {
+                    conversation.push(Message::Assistant {
+                        text,
+                        tool_calls: calls.clone(),
+                    });
+                    for call in calls {
+                        conversation.push(Message::ToolResult {
+                            call_id: call.id,
+                            content: format!("Done in round {round}."),
+                            is_error: false,
+                        });
+                    }
+                }
+                Reply::Text(text) => {
+                    conversation.push(Message::Assistant {
+                        text: Some(text),
+                        tool_calls: Vec::new(),
+                    });
+                    conversation.push(Message::User {
+                        text: "call work_create_task {\"title\": \"More\"}".to_owned(),
+                    });
+                }
+            }
+        }
+        let turns = fake.turns();
+        assert_eq!(turns.len(), 3);
+        for pair in turns.windows(2) {
+            check_prefix(kind, &pair[0].body, &pair[1].body).unwrap_or_else(|why| panic!("{kind:?} {model}: {why}"));
+        }
+        let marked: Vec<Vec<String>> = turns.iter().map(|turn| markers(kind, &turn.body).unwrap()).collect();
+        let expected: Vec<Vec<&str>> = match (kind, model.starts_with("anthropic/")) {
+            (ProviderKind::Anthropic, _) => vec![
+                vec!["system[0]", "messages[0].content[0]"],
+                vec!["system[0]", "messages[0].content[0]", "messages[2].content[1]"],
+                vec!["system[0]", "messages[2].content[1]", "messages[4].content[0]"],
+            ],
+            (ProviderKind::OpenRouter, true) => vec![
+                vec!["system[0]", "messages[0].content[0]"],
+                vec!["system[0]", "messages[0].content[0]", "messages[3].content[0]"],
+                vec!["system[0]", "messages[3].content[0]", "messages[5].content[0]"],
+            ],
+            _ => vec![Vec::new(), Vec::new(), Vec::new()],
+        };
+        assert_eq!(marked, expected, "{kind:?} {model}");
+        let caches = |usage: &TokenUsage| (usage.cache_read_input_tokens, usage.cache_write_input_tokens);
+        assert_eq!(caches(&usages[0]).0, 0, "{kind:?} {model}: nothing cached yet");
+        for (turn, usage) in usages.iter().enumerate().skip(1) {
+            let previous = &usages[turn - 1];
+            assert!(
+                usage.cache_read_input_tokens >= previous.input_tokens * 9 / 10,
+                "{kind:?} {model}: turn {turn} read the turn before from the cache: {usages:?}"
+            );
+            assert!(usage.cache_read_input_tokens < usage.input_tokens, "{usages:?}");
+        }
+        let writes = usages.iter().map(|usage| caches(usage).1).collect::<Vec<_>>();
+        if at_breakpoints(kind, model) {
+            assert!(writes.iter().all(|written| *written > 0), "{kind:?}: {usages:?}");
+        } else {
+            assert_eq!(writes, [0, 0, 0], "{kind:?}: caches on its own, writes nothing");
+        }
+    }
+}
+
+fn at_breakpoints(kind: ProviderKind, model: &str) -> bool {
+    crate::fake::prompt::at_breakpoints(kind, model)
+}
+
+/// The fake refuses breakpoints where providers do, so an adapter that
+/// sends one wrong fails here rather than in production.
+#[tokio::test]
+async fn refuses_a_breakpoint_where_the_provider_would() {
+    use crate::fake::prompt::Prompt;
+
+    let marked = json!({ "type": "ephemeral" });
+    let chat = |model: &str, part: Value| {
+        json!({
+            "model": model, "max_tokens": 10,
+            "messages": [{ "role": "user", "content": [part] }],
+        })
+    };
+    let text = json!({ "type": "text", "text": "Hi", "cache_control": marked });
+    assert!(
+        Prompt::read(ProviderKind::OpenAi, &chat("gpt-5-mini", text.clone())).is_err(),
+        "OpenAI takes none"
+    );
+    assert!(
+        Prompt::read(
+            ProviderKind::OpenRouter,
+            &chat("anthropic/claude-sonnet-4.5", text.clone())
+        )
+        .is_ok()
+    );
+    let empty = json!({ "type": "text", "text": "", "cache_control": marked });
+    assert!(Prompt::read(ProviderKind::OpenRouter, &chat("anthropic/claude-sonnet-4.5", empty)).is_err());
+    let lasting = json!({ "type": "text", "text": "Hi", "cache_control": { "type": "persistent" } });
+    assert!(Prompt::read(ProviderKind::OpenRouter, &chat("anthropic/claude-sonnet-4.5", lasting)).is_err());
+    let five: Vec<Value> = (0..5)
+        .map(|n| json!({ "type": "text", "text": format!("Part {n}"), "cache_control": marked }))
+        .collect();
+    let messages = json!({
+        "model": "claude-sonnet-4-5", "max_tokens": 10,
+        "messages": [{ "role": "user", "content": five }],
+    });
+    assert!(
+        Prompt::read(ProviderKind::Anthropic, &messages).is_err(),
+        "four at most"
+    );
+    let blank = json!({ "type": "text", "text": "" });
+    assert!(Prompt::read(ProviderKind::OpenRouter, &chat("anthropic/claude-sonnet-4.5", blank)).is_err());
+
+    // So an empty result goes to Claude through OpenRouter as a string, unmarked.
+    let tools = tools();
+    let mut conversation = answered();
+    conversation[3] = Message::ToolResult {
+        call_id: "call_b".to_owned(),
+        content: String::new(),
+        is_error: false,
+    };
+    let body = chat::request(
+        ProviderKind::OpenRouter,
+        &Turn {
+            model: "anthropic/claude-sonnet-4.5",
+            instructions: "Be brief.",
+            messages: &conversation,
+            tools: &tools,
+            cache_key: None,
+        },
+    );
+    assert_eq!(body["messages"][4]["content"], "");
+    assert!(Prompt::read(ProviderKind::OpenRouter, &body).is_ok());
 }

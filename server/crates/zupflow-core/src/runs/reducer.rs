@@ -21,7 +21,7 @@
 //! | `AwaitApproval` | idle: waiting for a person |
 //! | any other, no claim held | `Claim` under a fresh claimant, or idle while another lease or a send claim is live |
 //! | a call failed for a reconnect | `Finish` failed |
-//! | `NeedModel` | `PrepareModel` + call the model; `Finish` past the turn limit; `Yield` past the step budget |
+//! | `NeedModel` | `PrepareModel` (offering the tools frozen at the run's first attempt, [`frozen_offer`]) + call the model; `Finish` past the turn limit; `Yield` past the step budget |
 //! | `AwaitModel` with its answer | `CommitTurn`; `Finish` failed; `Yield` when the model is unavailable, `Finish` failed on the job's last attempt, or on a turn's second timeout |
 //! | `AwaitModel` without one | `PrepareModel` of a new attempt, the old one abandoned |
 //! | `NeedCall` | `Park`, or `AuthorizeCall` refusing a call waiting for approval whose installation went away; `AuthorizeCall` (send or refuse) + send; `Yield` past the step budget |
@@ -248,8 +248,9 @@ pub struct Facts {
     /// Steps this claim has taken.
     pub steps: u32,
     pub limits: Limits,
-    /// The tools to offer the next model attempt, built by
-    /// [`super::names::build_offer`].
+    /// The tools to offer the run's first model attempt, built by
+    /// [`super::names::build_offer`]. Needed only while the run has none
+    /// ([`frozen_offer`]): every later attempt offers the same tools.
     pub offer: Option<Offer>,
     /// Whether the run's model can be called now, read with the offer for a
     /// run that names an organization's model.
@@ -317,6 +318,7 @@ impl ModelRequest {
             instructions: &self.instructions,
             messages: &self.messages,
             tools: &self.tools,
+            cache_key: None,
         }
     }
 
@@ -751,6 +753,27 @@ fn conversation(snapshot: &Snapshot) -> Result<Vec<Message>, AdvanceError> {
     Ok(messages)
 }
 
+/// The tools the run offers its model, frozen at its first model attempt:
+/// the offer its latest attempt recorded, which every attempt since the
+/// first carried on. `None` before the first attempt, when the driver
+/// builds one ([`Facts::offer`]).
+///
+/// A run's tools, their names, descriptions and schemas never change
+/// mid-run, so every turn's request starts with the one before it and the
+/// provider's prompt cache keeps it (the plan's cache rules). A tool denied,
+/// gone or disconnected since stays offered, and a call to it is refused
+/// when it would be made: the floor and the policy decide every call when
+/// the model asks for it and again just before it's sent, on what holds
+/// then, and a send checks its installation and the tool's pinned
+/// definition again. A tool granted since waits for the next run.
+pub fn frozen_offer(snapshot: &Snapshot) -> Option<&Offer> {
+    snapshot
+        .model_attempts
+        .iter()
+        .max_by_key(|attempt| (attempt.turn, attempt.attempt))
+        .map(|attempt| &attempt.offer)
+}
+
 fn model_request(
     snapshot: &Snapshot,
     turn: u32,
@@ -1046,7 +1069,11 @@ impl Worker<'_> {
     }
 
     fn prepare(&self, turn: u32, abandons: Option<u32>) -> Result<Plan, AdvanceError> {
-        let offer = self.facts.offer.as_ref().ok_or(AdvanceError::MissingFact("offer"))?;
+        // Frozen at the first attempt: a fresh offer is for that one only.
+        let offer = match frozen_offer(self.snapshot) {
+            Some(frozen) => frozen,
+            None => self.facts.offer.as_ref().ok_or(AdvanceError::MissingFact("offer"))?,
+        };
         // A run of an organization's model calls it only while the model and
         // its connection are there and the provider takes the key.
         let key_version = match self.snapshot.model_id {
@@ -1433,7 +1460,16 @@ impl Worker<'_> {
                 &call.arguments,
             )
         });
-        if still.is_none() || still != call.call_digest {
+        // The run offers the definition it started with: one gone or
+        // changed since (a change accepted mid-run, say) is no longer
+        // there for it to call, whenever the change came.
+        if check.definition_sha256 != Some(target.definition_sha256) {
+            return refuse(
+                "tool_changed",
+                format!("{} is no longer available in this run.", target.tool),
+            );
+        }
+        if still != call.call_digest {
             return refuse(
                 "tool_changed",
                 format!(

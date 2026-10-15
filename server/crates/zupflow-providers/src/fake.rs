@@ -27,8 +27,17 @@
 //! or careless provider might, and it never scrubs anything: whatever
 //! leaves the adapters must already be clean.
 //!
-//! Every request is kept in its ledger ([`Received`]), with where the key
-//! was found.
+//! Every request is kept in its ledger ([`Received`]), its body's bytes as
+//! sent, with where the key was found.
+//!
+//! Each kind's prompt cache is faked too ([`prompt`]): breakpoints are
+//! checked where the provider checks them, and every answer's usage counts
+//! a token per four bytes of the prompt, with what was read from the cache
+//! (the part shared with an earlier request) and written to it, in the
+//! kind's own fields: Anthropic's `cache_read_input_tokens` and
+//! `cache_creation_input_tokens` beside an `input_tokens` that leaves them
+//! out, chat's `prompt_tokens_details.cached_tokens` (and, from OpenRouter,
+//! `cache_write_tokens`) within `prompt_tokens`.
 
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
@@ -46,6 +55,10 @@ use zupflow_core::models::{
 use zupflow_core::outbound::{Limits, Method, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse};
 
 use crate::{ANTHROPIC_VERSION, endpoint};
+
+pub mod prompt;
+
+use prompt::{CacheUse, Caches, Prompt};
 
 /// How many models a page of Anthropic's list holds here.
 pub const ANTHROPIC_PAGE: usize = 3;
@@ -79,6 +92,8 @@ pub struct Received {
     pub limits: Limits,
     /// The JSON body, or `Null`.
     pub body: Value,
+    /// The body's bytes, exactly as sent.
+    pub raw: Vec<u8>,
     /// The status answered, or `None` for a fault without one.
     pub status: Option<u16>,
 }
@@ -100,6 +115,7 @@ struct State {
     before_next_turn: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     /// Headers the answer being made carries besides its content type.
     headers: Vec<(String, String)>,
+    caches: Caches,
 }
 
 pub struct FakeProviders {
@@ -271,6 +287,7 @@ impl OutboundHttp for FakeProviders {
             key_elsewhere,
             limits,
             body: body.clone(),
+            raw: request.body.as_deref().unwrap_or_default().to_vec(),
             status: None,
         };
         let answer = self.answer(&request, routed, key.as_deref(), &body).await;
@@ -488,6 +505,10 @@ impl FakeProviders {
             Ok(read) => read,
             Err(why) => return error(kind, 400, why),
         };
+        let prompt = match Prompt::read(kind, body) {
+            Ok(prompt) => prompt,
+            Err(why) => return error(kind, 400, &why),
+        };
         if self.state().removed.contains(&(kind, model.clone())) {
             return match kind {
                 ProviderKind::OpenRouter => error(kind, 400, &format!("{model} is not a valid model ID")),
@@ -502,6 +523,7 @@ impl FakeProviders {
             instructions: &instructions,
             messages: &messages,
             tools: &tools,
+            cache_key: None,
         };
         let completion = match self.model.complete(&ProviderAccess { kind, key: &key }, &turn).await {
             Ok(completion) => completion,
@@ -509,7 +531,8 @@ impl FakeProviders {
             Err(ProviderError::KeyRefused) => return error(kind, 401, "Invalid API key."),
             Err(_) => return error(kind, 400, "That conversation can't be continued."),
         };
-        (200, write_answer(kind, &model, &completion))
+        let cached = self.state().caches.answer(kind, body, &prompt);
+        (200, write_answer(kind, &model, &completion, cached))
     }
 }
 
@@ -522,6 +545,41 @@ pub fn max_output(model: &str) -> u64 {
         64_000
     }
 }
+
+/// A chat message's text: a string, or `text` parts, never none.
+fn text_content(content: Option<&Value>) -> Option<String> {
+    match content? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) if !parts.is_empty() => parts
+            .iter()
+            .map(|part| {
+                (part.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| part.get("text").and_then(Value::as_str))
+                    .flatten()
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
+/// What Messages takes at the top of a request; anything else is refused.
+const MESSAGES_FIELDS: &[&str] = &[
+    "model",
+    "max_tokens",
+    "system",
+    "messages",
+    "tools",
+    "tool_choice",
+    "metadata",
+    "stop_sequences",
+    "temperature",
+    "top_p",
+    "top_k",
+    "thinking",
+    "stream",
+    "service_tier",
+    "cache_control",
+];
 
 /// A chat completions request, as OpenAI reads it.
 fn read_chat(kind: ProviderKind, body: &Value) -> Result<(String, Vec<Message>, Vec<ToolSpec>), &'static str> {
@@ -542,6 +600,11 @@ fn read_chat(kind: ProviderKind, body: &Value) -> Result<(String, Vec<Message>, 
     if body.get(cap).and_then(Value::as_u64).is_none_or(|max| max == 0) {
         return Err("an output cap: required here");
     }
+    if let Some(key) = body.get("prompt_cache_key")
+        && key.as_str().is_none_or(|key| key.is_empty() || key.len() > 64)
+    {
+        return Err("prompt_cache_key: a string of at most 64 characters");
+    }
     let mut instructions = String::new();
     let mut messages = Vec::new();
     let mut open: Vec<String> = Vec::new();
@@ -553,14 +616,14 @@ fn read_chat(kind: ProviderKind, body: &Value) -> Result<(String, Vec<Message>, 
         let content = message.get("content");
         match message.get("role").and_then(Value::as_str) {
             Some("system" | "developer") => {
-                instructions.push_str(content.and_then(Value::as_str).ok_or("system: content")?);
+                instructions.push_str(&text_content(content).ok_or("system: content")?);
             }
             Some("user") => {
                 if !open.is_empty() {
                     return Err("messages: tool calls must be answered by tool messages");
                 }
                 messages.push(Message::User {
-                    text: content.and_then(Value::as_str).ok_or("user: content")?.to_owned(),
+                    text: text_content(content).ok_or("user: content")?,
                 });
             }
             Some("assistant") => {
@@ -613,7 +676,7 @@ fn read_chat(kind: ProviderKind, body: &Value) -> Result<(String, Vec<Message>, 
                     return Err("tool: answers no tool call before it");
                 };
                 open.remove(position);
-                let content = content.and_then(Value::as_str).ok_or("tool: content")?;
+                let content = text_content(content).ok_or("tool: content")?;
                 let (content, is_error) = match content.strip_prefix(crate::chat::ERROR_PREFIX) {
                     Some(reason) => (reason.to_owned(), true),
                     None => (content.to_owned(), false),
@@ -664,10 +727,28 @@ fn read_messages(body: &Value) -> Result<(String, Vec<Message>, Vec<ToolSpec>), 
     {
         return Err("max_tokens: required");
     }
+    if let Value::Object(fields) = body
+        && fields.keys().any(|field| !MESSAGES_FIELDS.contains(&field.as_str()))
+    {
+        return Err("Extra inputs are not permitted");
+    }
     let instructions = match body.get("system") {
         None => String::new(),
         Some(Value::String(system)) => system.clone(),
-        Some(_) => return Err("system: a string"),
+        Some(Value::Array(blocks)) if !blocks.is_empty() => {
+            let mut system = String::new();
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) != Some("text") {
+                    return Err("system: text blocks");
+                }
+                match block.get("text").and_then(Value::as_str) {
+                    Some(text) if !text.is_empty() => system.push_str(text),
+                    _ => return Err("text content blocks must be non-empty"),
+                }
+            }
+            system
+        }
+        Some(_) => return Err("system: a string or text blocks"),
     };
     let mut messages = Vec::new();
     let mut expected = "user";
@@ -793,7 +874,7 @@ fn read_messages(body: &Value) -> Result<(String, Vec<Message>, Vec<ToolSpec>), 
     Ok((instructions, messages, tools))
 }
 
-fn write_answer(kind: ProviderKind, model: &str, completion: &Completion) -> Value {
+fn write_answer(kind: ProviderKind, model: &str, completion: &Completion, cached: CacheUse) -> Value {
     let (text, calls) = match &completion.reply {
         Reply::Text(text) => (Some(text.clone()), Vec::new()),
         Reply::ToolCalls { text, calls } => (text.clone(), calls.clone()),
@@ -819,14 +900,20 @@ fn write_answer(kind: ProviderKind, model: &str, completion: &Completion) -> Val
                 "stop_reason": if calls.is_empty() { "end_turn" } else { "tool_use" },
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": usage.input_tokens,
+                    "input_tokens": cached.input - cached.read - cached.written,
                     "output_tokens": usage.output_tokens,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": cached.written,
+                    "cache_read_input_tokens": cached.read,
                 },
             })
         }
         ProviderKind::OpenAi | ProviderKind::OpenRouter => {
+            let details = match kind {
+                ProviderKind::OpenRouter => {
+                    json!({ "cached_tokens": cached.read, "cache_write_tokens": cached.written })
+                }
+                ProviderKind::OpenAi | ProviderKind::Anthropic => json!({ "cached_tokens": cached.read }),
+            };
             let mut message = Map::new();
             message.insert("role".to_owned(), json!("assistant"));
             message.insert("content".to_owned(), text.map_or(Value::Null, Value::String));
@@ -861,9 +948,10 @@ fn write_answer(kind: ProviderKind, model: &str, completion: &Completion) -> Val
                     "finish_reason": if calls.is_empty() { "stop" } else { "tool_calls" },
                 }],
                 "usage": {
-                    "prompt_tokens": usage.input_tokens,
+                    "prompt_tokens": cached.input,
                     "completion_tokens": usage.output_tokens,
-                    "total_tokens": usage.input_tokens + usage.output_tokens,
+                    "total_tokens": cached.input + usage.output_tokens,
+                    "prompt_tokens_details": details,
                 },
             })
         }

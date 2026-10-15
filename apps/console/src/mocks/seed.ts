@@ -46,7 +46,7 @@ import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 import { appIn, issueShortId, timelineOf } from "./scope";
 import { listedFrom, recordListing } from "./tools";
 
-export const DB_SCHEMA = 26;
+export const DB_SCHEMA = 27;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -1458,7 +1458,14 @@ function seedRuns(db: Db, rng: Rng, nowMs: number, specs: RunSeed[]) {
         status: "queued",
         input: spec.prompts[Math.floor(rng() * spec.prompts.length)] ?? "Hello",
         output: null,
-        usage: { input_tokens: 0, output_tokens: 0, tool_calls: 0 },
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_write_input_tokens: 0,
+          tool_calls: 0,
+        },
+        prompt_tokens: 0,
         error: null,
         created_at: new Date(createdMs).toISOString(),
         started_at: null,

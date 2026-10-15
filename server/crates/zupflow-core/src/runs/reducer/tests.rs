@@ -319,6 +319,8 @@ fn completion(reply: Reply) -> Completion {
         usage: TokenUsage {
             input_tokens: 10,
             output_tokens: 5,
+            cache_read_input_tokens: 4,
+            cache_write_input_tokens: 2,
         },
     }
 }
@@ -867,6 +869,8 @@ fn a_final_answer_completes_the_run_with_its_turn() {
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 5,
+                cache_read_input_tokens: 4,
+                cache_write_input_tokens: 2,
             },
             calls: Vec::new(),
             next: Continuation::Done,
@@ -985,6 +989,50 @@ fn a_turn_whose_calls_are_all_refused_moves_to_the_next_turn() {
         panic!("commits the turn");
     };
     assert_eq!(commit.next, Continuation::NeedModel { turn: 1 });
+}
+
+#[test]
+fn every_later_attempt_offers_the_tools_frozen_at_the_first() {
+    // Turn 0 offered only Work's list_tasks. Since then, a grant was edited
+    // and the installation renamed: the driver's offer now differs, and the
+    // next turn still offers exactly what the first did.
+    let frozen = build_offer([candidate(work(), "k7m2qd", "Work", "list_tasks")]).offer;
+    let mut snapshot = with_calls(
+        Continuation::NeedModel { turn: 1 },
+        vec![record(1, 0, WORK_LIST, CallState::Completed)],
+    );
+    snapshot.model_attempts[0].offer = frozen.clone();
+    let changed = build_offer([
+        candidate(work(), "k7m2qd", "Renamed", "create_task"),
+        candidate(personal(), "p3x7ta", "Personal", "create_task"),
+    ])
+    .offer;
+    for offer in [Some(changed), None] {
+        let facts = Facts { offer, ..claimed() };
+        let plan = planned(&snapshot, &facts);
+        let Io::CallModel(request) = plan.io() else {
+            panic!("calls the model");
+        };
+        assert_eq!(request.tools, frozen.specs());
+        let Operation::PrepareModel(prepare) = operation(&plan) else {
+            panic!("prepares an attempt");
+        };
+        assert_eq!((prepare.turn, prepare.attempt), (1, 1));
+        assert_eq!(prepare.offer, frozen, "recorded again with the attempt");
+    }
+    // An attempt asked again after its worker stopped offers its own tools.
+    let snapshot = awaiting_model();
+    let facts = Facts {
+        offer: Some(build_offer([candidate(personal(), "p3x7ta", "Personal", "create_task")]).offer),
+        ..claimed()
+    };
+    let Operation::PrepareModel(prepare) = operation(&planned(&snapshot, &facts)).clone() else {
+        panic!("prepares a new attempt");
+    };
+    assert_eq!((prepare.attempt, prepare.abandons), (2, Some(1)));
+    assert_eq!(prepare.offer, offer());
+    assert_eq!(frozen_offer(&snapshot), Some(&offer()));
+    assert_eq!(frozen_offer(&fresh()), None, "built for the first attempt");
 }
 
 #[test]
@@ -1557,6 +1605,36 @@ fn a_call_is_refused_at_send_with_its_reason() {
         panic!("refuses");
     };
     assert_eq!(outcome.content, "Work was removed, so this call wasn't made.");
+
+    // A definition changed or gone since the run offered the tool (a change
+    // accepted mid-run, say): the tool is no longer there for this run, a
+    // fixed message the model has no reason to try again on.
+    for send_check in [
+        SendCheck {
+            definition_sha256: Some(Sha256Digest::of(b"changed")),
+            ..check(&call, allow())
+        },
+        SendCheck {
+            definition_sha256: None,
+            ..check(&call, allow())
+        },
+    ] {
+        let facts = Facts {
+            send_check: Some(send_check),
+            invocation_id: Some(invocation(1)),
+            ..claimed()
+        };
+        let plan = planned(&snapshot, &facts);
+        let Operation::AuthorizeCall(AuthorizeCall {
+            authorization: Authorization::Refuse { outcome, failure },
+            ..
+        }) = operation(&plan)
+        else {
+            panic!("refuses");
+        };
+        assert_eq!(failure.code, "tool_changed");
+        assert_eq!(outcome.content, "create_task is no longer available in this run.");
+    }
 }
 
 #[test]

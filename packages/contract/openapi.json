@@ -3579,12 +3579,26 @@
           "input_tokens": {
             "type": "integer",
             "minimum": -9007199254740991,
-            "maximum": 9007199254740991
+            "maximum": 9007199254740991,
+            "description": "Every token the model read, those read from or written to the provider's prompt cache included."
           },
           "output_tokens": {
             "type": "integer",
             "minimum": -9007199254740991,
-            "maximum": 9007199254740991
+            "maximum": 9007199254740991,
+            "description": "Every token the model wrote."
+          },
+          "cache_read_input_tokens": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991,
+            "description": "The part of `input_tokens` the provider served from its prompt cache."
+          },
+          "cache_write_input_tokens": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991,
+            "description": "The part of `input_tokens` the provider wrote to its prompt cache. Providers that cache on their own report none."
           },
           "tool_calls": {
             "type": "integer",
@@ -3595,6 +3609,8 @@
         "required": [
           "input_tokens",
           "output_tokens",
+          "cache_read_input_tokens",
+          "cache_write_input_tokens",
           "tool_calls"
         ]
       },
@@ -3974,13 +3990,41 @@
             "type": "integer",
             "minimum": -9007199254740991,
             "maximum": 9007199254740991
+          },
+          "input_tokens": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991,
+            "description": "Every token the model read, those read from or written to the provider's prompt cache included."
+          },
+          "output_tokens": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991,
+            "description": "Every token the model wrote."
+          },
+          "cache_read_input_tokens": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991,
+            "description": "The part of `input_tokens` the provider served from its prompt cache."
+          },
+          "cache_write_input_tokens": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991,
+            "description": "The part of `input_tokens` the provider wrote to its prompt cache. Providers that cache on their own report none."
           }
         },
         "required": [
           "date",
           "runs",
           "failed_runs",
-          "tool_calls"
+          "tool_calls",
+          "input_tokens",
+          "output_tokens",
+          "cache_read_input_tokens",
+          "cache_write_input_tokens"
         ]
       },
       "UsageReport": {
@@ -4012,12 +4056,40 @@
                 "type": "integer",
                 "minimum": -9007199254740991,
                 "maximum": 9007199254740991
+              },
+              "input_tokens": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991,
+                "description": "Every token the model read, those read from or written to the provider's prompt cache included."
+              },
+              "output_tokens": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991,
+                "description": "Every token the model wrote."
+              },
+              "cache_read_input_tokens": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991,
+                "description": "The part of `input_tokens` the provider served from its prompt cache."
+              },
+              "cache_write_input_tokens": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991,
+                "description": "The part of `input_tokens` the provider wrote to its prompt cache. Providers that cache on their own report none."
               }
             },
             "required": [
               "runs",
               "failed_runs",
-              "tool_calls"
+              "tool_calls",
+              "input_tokens",
+              "output_tokens",
+              "cache_read_input_tokens",
+              "cache_write_input_tokens"
             ]
           }
         },
@@ -5280,7 +5352,7 @@
     "/v1/organizations/{org}/usage": {
       "get": {
         "operationId": "getUsage",
-        "summary": "Runs, failures and tool calls per UTC day",
+        "summary": "Runs, failures, tool calls and tokens per UTC day",
         "security": [
           {
             "consoleSession": []

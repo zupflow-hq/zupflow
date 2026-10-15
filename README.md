@@ -285,6 +285,21 @@ error result flagged as one) is written in each protocol and read back with
 its stop reason and token counts; a Claude model's thinking isn't kept
 between turns.
 
+Each turn's request starts with the one before it exactly (the same tools
+and instructions, then the earlier messages as sent) so providers serve it
+from their prompt cache. Anthropic, and Claude through OpenRouter
+(`anthropic/` models, sent with `text` parts), cache only at breakpoints:
+`cache_control` marks the instructions (the last tool without them), the
+last message and the message before the latest answer, where the turn before
+put its last one (three of the four allowed, five-minute lifetime); through
+OpenRouter tools aren't marked and an empty text isn't either. OpenAI
+and OpenRouter cache on their own and get a `prompt_cache_key`: `zf_` and a
+digest of the organization, workspace, agent and tool list, so an agent's
+runs share it and it names nothing. Token counts keep what a turn read from
+the cache and wrote to it as parts of its input tokens
+(`cache_read_input_tokens`, `cache_write_input_tokens`), on each model
+attempt, turn and run and in usage.
+
 A key is checked by listing models, so it must be allowed to: an OpenAI
 restricted key needs read access to Models (OpenRouter's list is public, so
 its `/api/v1/key` is asked first). OpenAI lists IDs only, so names are made
@@ -336,8 +351,9 @@ longer read: set, it stops startup. For local work and tests,
 `zupflow-basic` (the mock's provider fixtures: any key of the right shape is
 accepted, one containing `invalid` refused) and answers runs with the
 scripted model, which serves every listed model that can call tools and calls
-a tool for each line `call <tool> <json-object>` of a run's input (otherwise
-it answers `You said: …`), so runs are deterministic. Never use it in a
+a tool for each line `call <tool> <json-object>` of a run's input, a line
+`then` starting the next round of calls once the round before is answered
+(otherwise it answers `You said: …`), so runs are deterministic. Never use it in a
 deployment: it turns what a run's input says into tool calls. Any other value
 stops startup; the server logs which applies. `pnpm --filter @zupflow/server
 dev` sets it.
@@ -348,7 +364,12 @@ request as its provider would and answering in its format; it can refuse a
 key, drop a model, fail turns with a status or a timeout, and repeat the key
 it received in everything it answers, which proves the key never reaches a
 run, its events, the audit log, the API or the logs
-(`server/crates/zupflow-server/tests/model_calls.rs`). Live tests against the
+(`server/crates/zupflow-server/tests/model_calls.rs`). It keeps each
+request's bytes, checks breakpoints as each provider does, and fakes each
+provider's prompt cache, so tests check that every turn of a run continues
+the one before and reads it from the cache on every provider path, through
+tool calls, an approval pause, a worker restart, a retry and a key rotation
+(`tests/prompt_cache.rs`); each adapter also has a golden test of its bytes. Live tests against the
 real providers are opt-in: `ZUPFLOW_LIVE_OPENAI_KEY`,
 `ZUPFLOW_LIVE_ANTHROPIC_KEY` or `ZUPFLOW_LIVE_OPENROUTER_KEY` (and optionally
 `ZUPFLOW_LIVE_<KIND>_MODEL`) run the catalog and model suites with
@@ -362,12 +383,19 @@ in the same process takes each run forward as an explicit state machine
 (decision 0046): a pure reducer plans each step from the run as committed,
 the run store commits it in one transaction with its events, webhook
 announcements, audit rows and jobs, and only then does the worker make the
-one call the step allows. Every turn, the model is offered the agent's
-granted tools that neither the floor nor the policy refuses, each named
+one call the step allows. The model is offered the agent's granted tools
+that neither the floor nor the policy refuses, each named
 `<app_key>_<short_id>_<tool_name>` after its app's key and its
 installation's short ID and described with the installation's label
-(`taskboard_k7m2qd_create_task`, decision 0047), frozen for that model
-request; a name the model uses is looked up in that offer, never parsed.
+(`taskboard_k7m2qd_create_task`, decision 0047), read once for the run's
+first model attempt and frozen for the whole run, so every turn offers the
+same list and the provider's prompt cache holds; a name the model uses is
+looked up in that offer, never parsed. A grant narrowed, a policy changed,
+a tool gone or an installation renamed, disconnected or removed meanwhile
+leaves the list as it was: a call to a tool no longer allowed is refused when
+it's decided or sent, one to a tool whose definition changed since (a change
+accepted mid-run) as no longer available in this run, and a tool granted since
+waits for the next run.
 Each call it asks for is decided (floor, then policy) and recorded with its
 policy, mode and rule; allowed calls go only to their own installation's MCP
 server through the safe outbound path, with its credential injected last. A
@@ -424,7 +452,8 @@ failing on the assertion that names it (`cargo test -p zupflow-server --test
 run_faults -- --ignored`), or as a seed in the races' regressions, until the
 change that closes it; none is open today.
 
-Usage is served too: runs, failed runs and tool calls per UTC day in one
+Usage is served too: runs, failed runs, tool calls and tokens (input, output,
+and the input's parts read from and written to a prompt cache) per UTC day in one
 environment (`?environment=`, required; `days` 1 to 90, 14 by default), every
 day listed; an API key reads its own environment's only. A workspace's
 `runs_last_24h` counts the runs started in it in the last 24 hours. Usage

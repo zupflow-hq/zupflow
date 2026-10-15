@@ -111,11 +111,16 @@ impl RunTrigger {
     }
 }
 
-/// The contract's `RunUsage`.
+/// The contract's `RunUsage`: the run's committed turns' tokens, summed
+/// ([`crate::models::TokenUsage`] says what each counts), and its calls.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct RunUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// The part of `input_tokens` read from the provider's prompt cache.
+    pub cache_read_input_tokens: u64,
+    /// The part of `input_tokens` written to the provider's prompt cache.
+    pub cache_write_input_tokens: u64,
     /// Calls sent to an app's server.
     pub tool_calls: u64,
 }
@@ -382,7 +387,7 @@ pub struct AgentActivity {
 }
 
 /// Runs started on one UTC day, as usage counts them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UsageDay {
     /// Days since 1970-01-01.
     pub day: i64,
@@ -390,6 +395,11 @@ pub struct UsageDay {
     pub failed_runs: u64,
     /// Calls sent to an app's server, as each run counted them.
     pub tool_calls: u64,
+    /// The runs' tokens, as each run counted them ([`RunUsage`]).
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
 }
 
 /// The day an instant falls on, in days since 1970-01-01, UTC.

@@ -680,6 +680,7 @@ mod tests {
             instructions: "",
             messages: &messages,
             tools: &specs,
+            cache_key: None,
         };
         assert_eq!(crate::models::validate_turn(&turn), Ok(()));
     }

@@ -10,10 +10,21 @@
 //! and workspace: the store's clock time, a claimant of this worker's own,
 //! IDs for the calls and the send claim, the tools offered to the model
 //! (each granted tool of each installation, named
-//! `<app_key>_<short_id>_<tool_name>` and frozen with the model attempt,
-//! decision 0047), the floor's and the [`ApprovalPolicy`]'s decision on
-//! each call, and, before a call is sent, its installation, grant and
-//! pinned definition read again.
+//! `<app_key>_<short_id>_<tool_name>`, decision 0047), the floor's and the
+//! [`ApprovalPolicy`]'s decision on each call, and, before a call is sent,
+//! its installation, grant and pinned definition read again.
+//!
+//! The tools are read once a run, for its first model attempt, and frozen
+//! with it: every later attempt offers the same list with the same
+//! descriptions ([`frozen_offer`]), so each turn's request starts with the
+//! one before and the provider's prompt cache holds. What changes meanwhile
+//! (a grant edited or revoked, a policy, a tool gone, an installation
+//! renamed, disconnected or removed) never changes the list: a call to a
+//! tool no longer allowed is refused when it's decided or sent, with a
+//! fixed message, and a tool granted since waits for the next run. Each
+//! turn is sent with the agent's prompt cache key ([`prompt_cache_key`]),
+//! the same for every run of the agent with the same tools, outside the
+//! request's digest.
 //!
 //! The job queue's lease and the run's claim go together: the job's lease
 //! is extended before every step that keeps the claim, and once a step
@@ -43,14 +54,14 @@ use zupflow_core::ids::{AgentId, InstallationId, ModelId, OrganizationId, RunId,
 use zupflow_core::installations::{Installation, InstallationStatus, InstalledApp};
 use zupflow_core::jobs::{Job, JobId, LeaseToken, Retry};
 use zupflow_core::model_store::{ModelStatus, RouteState};
-use zupflow_core::models::{ProviderAccess, ProviderError, validate_completion};
+use zupflow_core::models::{ProviderAccess, ProviderError, Turn, prompt_cache_key, validate_completion};
 use zupflow_core::policy::{CallApp, Decision, GrantedAs, OrganizationLevel, ToolCall, Verdict, floor};
 use zupflow_core::runs::digest::{Sha256Digest, call_digest};
 use zupflow_core::runs::names::{Candidate, Offer, OfferedTool, build_offer};
 use zupflow_core::runs::reducer::{
     Facts, Gone, Idle, InstallationCheck, Io, Limits, MODEL_FAILED, MODEL_KEY_INVALID, MODEL_UNAVAILABLE, ModelAnswer,
     ModelRequest, ModelResult, Plan, SendCheck, SendRequest, SendResult, Unanswered, UnansweredWhy, advance,
-    calls_to_decide, fail_abandoned, may_park_on, refuse_waiting,
+    calls_to_decide, fail_abandoned, frozen_offer, may_park_on, refuse_waiting,
 };
 use zupflow_core::runs::state::{CallDecision, CallRecord, CallVerdict, ClaimantId, InvocationId, RequestId, Snapshot};
 use zupflow_core::runs::store::{
@@ -456,12 +467,12 @@ impl<P: ToolPort> Driver<'_, P> {
         }
         match control.continuation {
             Continuation::NeedModel { .. } => {
-                facts.offer = Some(self.offer().await?);
+                facts.offer = self.offer_unless_frozen(snapshot).await?;
                 facts.model_route = self.model_route(snapshot).await?;
             }
             Continuation::AwaitModel { .. } => match model.map(|answer| &answer.result) {
                 None => {
-                    facts.offer = Some(self.offer().await?);
+                    facts.offer = self.offer_unless_frozen(snapshot).await?;
                     facts.model_route = self.model_route(snapshot).await?;
                 }
                 Some(ModelResult::Answered(completion)) => {
@@ -583,7 +594,11 @@ impl<P: ToolPort> Driver<'_, P> {
                 );
             }
         };
-        let turn = asked.as_turn();
+        let cache_key = prompt_cache_key(self.organization_id, self.workspace_id, self.agent_id, &asked.tools);
+        let turn = Turn {
+            cache_key: Some(&cache_key),
+            ..asked.as_turn()
+        };
         let access = ProviderAccess {
             kind: reach.kind,
             key: &reach.key,
@@ -717,7 +732,16 @@ impl<P: ToolPort> Driver<'_, P> {
         }
     }
 
-    /// The tools to offer the next model attempt: each granted tool of each
+    /// The tools to offer the run's first model attempt, read now; `None`
+    /// once an attempt froze them, since every later one offers those.
+    async fn offer_unless_frozen(&self, snapshot: &Snapshot) -> Result<Option<Offer>, &'static str> {
+        if frozen_offer(snapshot).is_some() {
+            return Ok(None);
+        }
+        self.offer().await.map(Some)
+    }
+
+    /// The tools to offer the run's first model attempt: each granted tool of each
     /// installation that neither the floor nor the policy refuses, named
     /// after its app's key, its installation's short ID and itself, and
     /// described with its pinned definition. A deleted or disconnected

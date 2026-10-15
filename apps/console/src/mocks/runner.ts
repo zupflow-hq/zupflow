@@ -209,6 +209,27 @@ function modelRefusal(db: Db, run: RunRow): RunError | null {
 }
 
 /**
+ * One model turn that reads `fresh` tokens after everything the run's previous
+ * turn read. The provider serves that prefix from its prompt cache; Claude
+ * (through Anthropic, or OpenRouter) also reports what it writes to the cache,
+ * where OpenAI and OpenRouter's other models cache on their own and report no
+ * writes. `input_tokens` counts all of it.
+ */
+function modelTurn(db: Db, run: RunRow, fresh: number): void {
+  const cached = run.prompt_tokens;
+  run.usage.input_tokens += cached + fresh;
+  run.usage.cache_read_input_tokens += cached;
+  if (writesCache(db, run)) run.usage.cache_write_input_tokens += fresh;
+  run.prompt_tokens = cached + fresh;
+}
+
+/** Whether the run's provider reports the tokens it writes to its prompt cache. */
+function writesCache(db: Db, run: RunRow): boolean {
+  const kind = runRoute(db, run)?.connection.kind;
+  return kind === "anthropic" || (kind === "openrouter" && run.model.provider_model_id.startsWith("anthropic/"));
+}
+
+/**
  * Execute the next step. Returns `paused` when the run waits for a human and
  * `finished` when it reached a terminal state.
  */
@@ -233,7 +254,7 @@ export function advanceRun(db: Db, run: RunRow, at: string, rng: Rng): StepOutco
         return "finished";
       }
       run.model.key_version = runRoute(db, run)?.connection.key_version ?? null;
-      run.usage.input_tokens += 900 + Math.floor(rng() * 2600);
+      modelTurn(db, run, 900 + Math.floor(rng() * 2600));
       return "continue";
     }
 
@@ -286,7 +307,7 @@ export function advanceRun(db: Db, run: RunRow, at: string, rng: Rng): StepOutco
         result,
         duration_ms: step.duration_ms,
       });
-      run.usage.input_tokens += 200 + Math.floor(rng() * 1800);
+      modelTurn(db, run, 200 + Math.floor(rng() * 1800));
       return "continue";
     }
 

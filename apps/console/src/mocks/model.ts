@@ -336,6 +336,11 @@ export interface RunRow {
   finished_at: string | null;
   /** The model the run calls, fixed when it's created: a queued run never switches to a later default. */
   model: RunModelRow;
+  /**
+   * What the run's last model turn read, in tokens: the next turn sends it all
+   * again, so its provider serves it from the prompt cache.
+   */
+  prompt_tokens: number;
   /** Remaining simulation steps for live runs. Empty once terminal. */
   plan: RunStep[];
 }

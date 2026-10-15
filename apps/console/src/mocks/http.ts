@@ -876,7 +876,7 @@ export function toAgent(a: AgentRow): Agent {
 export function toRun(r: RunRow): Run {
   const agent = db().agents.find((a) => sameWorkspace(a, r) && a.id === r.agent_id);
   // The run's model shows in its `run.started` event, not on the run.
-  const { plan: _plan, organization_id: _organization, model: _model, ...rest } = r;
+  const { plan: _plan, organization_id: _organization, model: _model, prompt_tokens: _prompt, ...rest } = r;
   return { ...rest, agent_name: agent?.name ?? "Deleted agent" };
 }
 

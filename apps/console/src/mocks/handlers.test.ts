@@ -3867,6 +3867,48 @@ describe("model providers", () => {
     expect((await owner.models.getDefault(northwind(), "sandbox")).model?.name).not.toMatch(/^Poisoned/);
   });
 
+  it("counts what a run's provider read from and wrote to its prompt cache, and sums it into usage", async () => {
+    const { runRoute } = await import("./model-scope");
+    const finished = db().runs.filter((r) => r.organization_id === northwind() && r.status === "completed");
+    const multiTurn = finished.filter((r) => r.usage.tool_calls > 0);
+    expect(multiTurn.length).toBeGreaterThan(0);
+    for (const run of finished) {
+      const { input_tokens, cache_read_input_tokens, cache_write_input_tokens } = run.usage;
+      expect(cache_read_input_tokens + cache_write_input_tokens).toBeLessThanOrEqual(input_tokens);
+    }
+    for (const run of multiTurn) {
+      // Every turn after the first sends the one before it again: the provider serves that from its cache.
+      expect(run.usage.cache_read_input_tokens).toBeGreaterThan(0);
+      const kind = runRoute(db(), run)?.connection.kind;
+      const claude =
+        kind === "anthropic" || (kind === "openrouter" && run.model.provider_model_id.startsWith("anthropic/"));
+      // OpenAI and OpenRouter's other models cache on their own and report no writes.
+      if (!claude) expect(run.usage.cache_write_input_tokens).toBe(0);
+    }
+    for (const environment of ["sandbox", "production"] as const) {
+      const report = await owner.organizations.usage(northwind(), environment, 90);
+      const since = must(report.days[0]).date;
+      const workspaces = new Set(
+        db()
+          .workspaces.filter((w) => w.organization_id === northwind() && w.environment === environment)
+          .map((w) => w.id),
+      );
+      const counted = db().runs.filter(
+        (r) =>
+          r.organization_id === northwind() && workspaces.has(r.workspace_id) && r.created_at.slice(0, 10) >= since,
+      );
+      for (const field of [
+        "tool_calls",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_write_input_tokens",
+      ] as const) {
+        expect(report.totals[field], `${environment} ${field}`).toBe(counted.reduce((n, r) => n + r.usage[field], 0));
+      }
+    }
+  });
+
   it("starts a run on its agent's model, and fails it when the provider refuses the connection's key", async () => {
     const { advanceRun } = await import("./runner");
     const qa = ws("qa-playground");

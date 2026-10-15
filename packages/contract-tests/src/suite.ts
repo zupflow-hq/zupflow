@@ -1708,6 +1708,38 @@ export function contractSuite(target: Target) {
         expect(JSON.stringify(await usage())).toBe(before);
       });
 
+      it("sums each day into the totals, and keeps cache tokens within input tokens on days, totals and runs", async () => {
+        const fields = [
+          "runs",
+          "failed_runs",
+          "tool_calls",
+          "input_tokens",
+          "output_tokens",
+          "cache_read_input_tokens",
+          "cache_write_input_tokens",
+        ] as const;
+        const withinInput = (counts: {
+          input_tokens: number;
+          cache_read_input_tokens: number;
+          cache_write_input_tokens: number;
+        }) => {
+          expect(counts.cache_read_input_tokens).toBeGreaterThanOrEqual(0);
+          expect(counts.cache_write_input_tokens).toBeGreaterThanOrEqual(0);
+          expect(counts.cache_read_input_tokens + counts.cache_write_input_tokens).toBeLessThanOrEqual(
+            counts.input_tokens,
+          );
+        };
+        for (const environment of ["sandbox", "production"] as const) {
+          const report = await owner.organizations.usage(fx.organization, environment, 90);
+          for (const field of fields) {
+            expect(report.totals[field], field).toBe(report.days.reduce((n, day) => n + day[field], 0));
+          }
+          for (const counts of [...report.days, report.totals]) withinInput(counts);
+          const runs = await owner.organizationRuns.list(fx.organization, { environment, limit: 100 });
+          for (const run of runs.items) withinInput(run.usage);
+        }
+      });
+
       it("reads days as a whole number, clamped to 1 through 90", async () => {
         const days = async (value: string | number) =>
           (await owner.organizations.usage(fx.organization, "sandbox", value as number)).days.length;
