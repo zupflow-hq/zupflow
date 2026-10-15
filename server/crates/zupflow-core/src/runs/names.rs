@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::apps::{APP_KEY_MAX, is_app_key};
-use crate::ids::InstallationId;
+use crate::ids::{ChannelConnectionId, InstallationId};
 use crate::installations::ShortId;
 use crate::models::{MAX_MODEL_TOOL_NAME, ToolSpec};
 use crate::runs::digest::Sha256Digest;
@@ -122,15 +122,36 @@ pub struct Candidate {
     pub definition_sha256: Sha256Digest,
 }
 
+/// Where a call to an offered tool goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolHost {
+    /// One of the workspace's installations, through its MCP server.
+    Installation(InstallationId),
+    /// One of the agent's channel connections, through its provider
+    /// ([`crate::channels::tools`]).
+    Channel(ChannelConnectionId),
+    /// The run itself: nothing is sent (`stay_silent`).
+    Run,
+}
+
 /// A tool as one turn offers it: the name the model calls it by, what the
 /// model reads about it, and where a call to it goes.
+///
+/// An installation's tool names its installation; a channel tool its
+/// connection, whose short ID, label and provider key stand where an
+/// installation's would; a tool of the run itself (`stay_silent`) names
+/// neither. Never both. An offer stored before channel tools existed reads
+/// as it was written.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OfferedTool {
     pub name: String,
     /// The full description the model reads, label and short ID first.
     pub description: String,
     pub input_schema: Value,
-    pub installation_id: InstallationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_id: Option<InstallationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_connection_id: Option<ChannelConnectionId>,
     pub installation_short_id: String,
     pub installation_label: String,
     pub app_key: String,
@@ -141,6 +162,15 @@ pub struct OfferedTool {
 }
 
 impl OfferedTool {
+    /// Where a call to it goes.
+    pub fn host(&self) -> ToolHost {
+        match (self.installation_id, self.channel_connection_id) {
+            (Some(installation_id), _) => ToolHost::Installation(installation_id),
+            (None, Some(connection_id)) => ToolHost::Channel(connection_id),
+            (None, None) => ToolHost::Run,
+        }
+    }
+
     /// The tool as the model is given it.
     pub fn spec(&self) -> ToolSpec {
         ToolSpec {
@@ -289,7 +319,8 @@ pub fn build_offer(candidates: impl IntoIterator<Item = Candidate>) -> BuiltOffe
             ),
             name: name.clone(),
             input_schema: candidate.input_schema,
-            installation_id: candidate.installation_id,
+            installation_id: Some(candidate.installation_id),
+            channel_connection_id: None,
             installation_short_id: candidate.installation_short_id,
             installation_label: candidate.installation_label,
             app_key: candidate.app_key,
@@ -311,7 +342,7 @@ pub fn build_offer(candidates: impl IntoIterator<Item = Candidate>) -> BuiltOffe
         }
         let mut entries: Vec<(InstallationId, String)> = entries
             .into_iter()
-            .map(|tool| (tool.installation_id, tool.tool))
+            .filter_map(|tool| Some((tool.installation_id?, tool.tool)))
             .collect();
         entries.sort();
         clashes.push(Clash { name, entries });
@@ -490,14 +521,15 @@ mod tests {
         assert!(built.clashes.is_empty());
         assert!(built.excluded.is_empty());
         let work = built.offer.find("taskboard_k7m2qd_create_task").expect("offered");
-        assert_eq!(work.installation_id, installation(1));
+        assert_eq!(work.installation_id, Some(installation(1)));
+        assert_eq!(work.host(), ToolHost::Installation(installation(1)));
         assert_eq!(work.tool, "create_task");
         assert_eq!(
             work.description,
             "Taskboard, installation \"Work\" (k7m2qd). Create a task."
         );
         let personal = built.offer.find("taskboard_p3x7ta_create_task").expect("offered");
-        assert_eq!(personal.installation_id, installation(2));
+        assert_eq!(personal.installation_id, Some(installation(2)));
         assert!(personal.description.contains("\"Personal\" (p3x7ta)"));
         assert_eq!(built.offer.find("create_task"), None);
         assert_eq!(built.offer.find("taskboard_k7m2qd_create_tas"), None);
@@ -599,7 +631,7 @@ mod tests {
             Some("c__")
         );
         assert_eq!(
-            built.offer.find("a_p3x7ta_b_c").map(|tool| tool.installation_id),
+            built.offer.find("a_p3x7ta_b_c").and_then(|tool| tool.installation_id),
             Some(installation(2))
         );
     }

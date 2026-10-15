@@ -986,3 +986,806 @@ async fn names_a_mentioned_channel_as_its_own_workspace_knows_it() {
         "[U0ANA] @shared see #C0OTHER, #launch-plans and #C0NEW"
     );
 }
+
+// --- Channel tools ---------------------------------------------------------
+
+/// `installed`'s agent's runs' calls, in the order made.
+async fn calls_of(world: &World, run: &Value) -> Vec<faults::RecordedCall> {
+    world.setup.calls(World::run_id(run)).await
+}
+
+#[tokio::test]
+async fn replies_with_its_tool_once_and_shows_it_is_working() {
+    let world = main_world().await;
+    let main = &world.main;
+    // Without the tool, its answer is its reply, posted by the reply job.
+    let asked = world
+        .say(ANA, &format!("{} is the build green?", main.mention()), None)
+        .await;
+    world.work().await;
+    world.reply().await;
+    let posted = world.chat.posted_by_apps();
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert!(posted[0].text.starts_with("You said: "), "{}", posted[0].text);
+    assert_eq!(posted[0].thread_ts.as_deref(), Some(asked.ts.as_str()));
+    assert_eq!(posted[0].user.as_deref(), Some(main.identity.as_str()));
+    // It showed it was working while it asked its model, then stopped.
+    assert_eq!(
+        world.chat.working(),
+        [
+            (SUPPORT.to_owned(), asked.ts.clone(), true),
+            (SUPPORT.to_owned(), asked.ts.clone(), false)
+        ]
+    );
+
+    // With it, the tool's post is the answer: nothing is posted again.
+    // A new thread, so its session offers the tool.
+    world.grant(main, &["reply"]).await;
+    let reply = world.calling(main, "reply", json!({ "text": "On it." })).await;
+    let second = world
+        .say(ANA, &format!("{} check the deploy\n{reply}", main.mention()), None)
+        .await;
+    world.work().await;
+    world.reply().await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs[1]["status"], "completed", "{}", runs[1]);
+    let posted = world.chat.posted_by_apps();
+    assert_eq!(posted.len(), 2, "the tool's post, and no answer after it: {posted:?}");
+    assert_eq!(posted[1].text, "On it.");
+    assert_eq!(posted[1].thread_ts.as_deref(), Some(second.ts.as_str()));
+    let calls = calls_of(&world, &runs[1]).await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(posted[1].send_id.as_deref(), Some(calls[0].id.to_string().as_str()));
+    // Recorded as the connection's own message, from the call, one hop on
+    // from the person who asked.
+    let messages = world.messages_in(main, SUPPORT).await;
+    let own = messages
+        .iter()
+        .find(|message| message["external_id"] == posted[1].ts.as_str())
+        .unwrap();
+    assert_eq!(own["direction"], "outbound");
+    assert_eq!(own["run_id"], id(&runs[1]));
+    assert_eq!(own["tool_call_id"], calls[0].id.to_string().as_str());
+    assert_eq!(own["agent_hop"], 1);
+}
+
+#[tokio::test]
+async fn posts_once_when_the_answer_to_its_post_is_lost() {
+    let world = main_world().await;
+    let main = &world.main;
+    world.grant(main, &["reply"]).await;
+    let reply = world.calling(main, "reply", json!({ "text": "Looking." })).await;
+    world.chat.lose_answers(1);
+    world
+        .say(ANA, &format!("{} anything new?\n{reply}", main.mention()), None)
+        .await;
+    world.work().await;
+    world.reply().await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs[0]["status"], "completed", "{}", runs[0]);
+    let calls = calls_of(&world, &runs[0]).await;
+    assert_eq!(calls[0].state, zupflow_core::runs::CallState::Completed);
+    // Found by the call's ID, not posted twice.
+    let posted = world.chat.posted_by_apps();
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    let own: Vec<Value> = world
+        .messages_in(main, SUPPORT)
+        .await
+        .into_iter()
+        .filter(|message| message["direction"] == "outbound")
+        .collect();
+    assert_eq!(own.len(), 1);
+    assert_eq!(own[0]["external_id"], posted[0].ts.as_str());
+}
+
+#[tokio::test]
+async fn stays_silent_with_a_reason_and_posts_nothing() {
+    let world = main_world().await;
+    let main = &world.main;
+    // Offered in every channel session, granted or not.
+    let silent = "call stay_silent {\"reason\":\"Ana answered it herself.\"}";
+    world
+        .say(ANA, &format!("{} never mind\n{silent}", main.mention()), None)
+        .await;
+    world.work().await;
+    world.reply().await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs[0]["status"], "completed", "{}", runs[0]);
+    assert_eq!(runs[0]["channel"]["silent_reason"], "Ana answered it herself.");
+    assert!(world.chat.posted_by_apps().is_empty());
+    // An app tool of a session is never offered as a channel one, nor the
+    // other way round: the model's names are all it has.
+    let calls = calls_of(&world, &runs[0]).await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].model_tool_name, "stay_silent");
+}
+
+#[tokio::test]
+async fn refuses_what_is_outside_its_audience() {
+    let world = main_world().await;
+    let main = &world.main;
+    world
+        .grant(main, &["send_message", "edit_message", "react", "reply"])
+        .await;
+    // Another conversation the connection knows, and a message in it.
+    let general = world.post(&[main], "C0GENERAL", BO, "lunch?", None).await;
+    world.work().await;
+    let general_id = world.conversation_id(main, "C0GENERAL").await;
+    let lunch = world.message_id(main, &general).await;
+
+    let asked = world.say(ANA, &format!("{} hi", main.mention()), None).await;
+    world.work().await;
+    let asked_id = world.message_id(main, &asked).await;
+    let elsewhere = world
+        .calling(
+            main,
+            "send_message",
+            json!({ "conversation": general_id, "text": "hello all" }),
+        )
+        .await;
+    let edit = world
+        .calling(main, "edit_message", json!({ "message": asked_id, "text": "changed" }))
+        .await;
+    let react = world
+        .calling(main, "react", json!({ "message": lunch, "emoji": "eyes" }))
+        .await;
+    let unknown = world
+        .calling(
+            main,
+            "send_message",
+            json!({ "conversation": "conv_0000000000000000000000", "text": "hi" }),
+        )
+        .await;
+    world
+        .say(
+            ANA,
+            &format!("try these\n{elsewhere}\n{edit}\n{react}\n{unknown}"),
+            Some(&asked.ts),
+        )
+        .await;
+    world.work().await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1]["status"], "completed", "{}", runs[1]);
+    let calls = calls_of(&world, &runs[1]).await;
+    assert_eq!(calls.len(), 4);
+    for call in &calls {
+        assert_eq!(call.state, zupflow_core::runs::CallState::Refused, "{call:?}");
+        let decision = call.decision.as_ref().unwrap();
+        assert_eq!(decision.rule, "outside_audience", "{call:?}");
+        assert_eq!(decision.policy, "channel");
+    }
+    let output = runs[1]["output"].as_str().unwrap();
+    assert!(
+        output.contains("You can only post in the Slack conversation this run started in."),
+        "{output}"
+    );
+    assert!(
+        output.contains("You can only edit or delete messages you posted."),
+        "{output}"
+    );
+    assert!(output.contains("isn't one this connection knows"), "{output}");
+    assert!(world.chat.reactions().is_empty());
+
+    // Allowed anywhere it's a member: the reaction is made.
+    world.configure(main, json!({ "audience": "anywhere" })).await;
+    world.say(ANA, &format!("again\n{react}"), Some(&asked.ts)).await;
+    world.work().await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs[2]["status"], "completed", "{}", runs[2]);
+    let reactions = world.chat.reactions();
+    assert_eq!(reactions.len(), 1, "{reactions:?}");
+    assert_eq!(
+        (
+            reactions[0].channel.as_str(),
+            reactions[0].ts.as_str(),
+            reactions[0].emoji.as_str()
+        ),
+        ("C0GENERAL", general.ts.as_str(), "eyes")
+    );
+}
+
+#[tokio::test]
+async fn sends_elsewhere_only_once_approved_and_still_allowed() {
+    let world = main_world().await;
+    let main = &world.main;
+    world.grant(main, &["send_message"]).await;
+    world.configure(main, json!({ "audience": "anywhere" })).await;
+    world.post(&[main], "C0GENERAL", BO, "lunch?", None).await;
+    world.work().await;
+    let general_id = world.conversation_id(main, "C0GENERAL").await;
+    let send = world
+        .calling(
+            main,
+            "send_message",
+            json!({ "conversation": general_id, "text": "Deploy at 5." }),
+        )
+        .await;
+    // The organization's level asks for approval before a send elsewhere.
+    let asked = world
+        .say(ANA, &format!("{} tell everyone\n{send}", main.mention()), None)
+        .await;
+    world.work().await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs[0]["status"], "waiting_for_approval", "{}", runs[0]);
+    assert!(world.chat.posted_by_apps().is_empty());
+    world.approve(World::run_id(&runs[0])).await;
+    world.work().await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs[0]["status"], "completed", "{}", runs[0]);
+    let posted = world.chat.posted_by_apps();
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert_eq!(
+        (
+            posted[0].channel.as_str(),
+            posted[0].thread_ts.as_deref(),
+            posted[0].text.as_str()
+        ),
+        ("C0GENERAL", None, "Deploy at 5.")
+    );
+
+    // Approved, then no longer allowed there: checked again, never sent.
+    world.say(ANA, &format!("once more\n{send}"), Some(&asked.ts)).await;
+    world.work().await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs[1]["status"], "waiting_for_approval", "{}", runs[1]);
+    world.configure(main, json!({ "audience": "origin" })).await;
+    world.approve(World::run_id(&runs[1])).await;
+    world.work().await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs[1]["status"], "completed", "{}", runs[1]);
+    let calls = calls_of(&world, &runs[1]).await;
+    assert_eq!(
+        calls[0].failure.as_ref().unwrap().code,
+        "outside_audience",
+        "{:?}",
+        calls[0]
+    );
+    assert_eq!(world.chat.posted_by_apps().len(), 1);
+}
+
+#[tokio::test]
+async fn notes_an_edit_and_a_deletion_once_in_the_next_turn() {
+    let world = main_world().await;
+    let main = &world.main;
+    let asked = world
+        .say(ANA, &format!("{} is the build red?", main.mention()), None)
+        .await;
+    world.work().await;
+    let first = world.runs(main).await[0].clone();
+    let follow = world.say(BO, "it failed at 3", Some(&asked.ts)).await;
+    world.work().await;
+
+    // Edits and deletes wake nobody.
+    world
+        .deliver(
+            main,
+            &world.chat.edit(&asked, "<@U0HELPER> is the build green?", world.now()),
+        )
+        .await;
+    world.deliver(main, &world.chat.delete(&follow, world.now())).await;
+    world.work().await;
+    assert_eq!(world.runs(main).await.len(), 2);
+    // The thread's next turn says so first, without rewriting either turn
+    // the model read before.
+    world.say(ANA, "well?", Some(&asked.ts)).await;
+    world.work().await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs.len(), 3);
+    assert_eq!(
+        runs[2]["output"],
+        "You said: [U0ANA edited an earlier message] @helper is the build green?\n\
+         [U0BO deleted an earlier message]\n[U0ANA] well?"
+    );
+    assert_eq!(runs[0]["input"], first["input"], "what it said then stays");
+    // Noted once.
+    world.say(ANA, "thanks", Some(&asked.ts)).await;
+    world.work().await;
+    assert_eq!(world.runs(main).await[3]["output"], "You said: [U0ANA] thanks");
+    // What the connection kept says both.
+    let messages = world.messages_in(main, SUPPORT).await;
+    let kept = |ts: &str| {
+        messages
+            .iter()
+            .find(|message| message["external_id"] == ts)
+            .unwrap()
+            .clone()
+    };
+    assert!(kept(&asked.ts)["edited_at"].is_string());
+    assert!(kept(&follow.ts)["deleted_at"].is_string());
+}
+
+#[tokio::test]
+async fn sweeps_messages_and_run_text_past_retention_and_starts_afresh() {
+    let world = main_world().await;
+    let main = &world.main;
+    let asked = world
+        .say(ANA, &format!("{} the secret plan", main.mention()), None)
+        .await;
+    world.work().await;
+    let before = world.runs(main).await;
+    assert_eq!(before[0]["status"], "completed");
+    // A month and a day on, the sweep comes due.
+    world.setup.kit.clock.advance(Duration::from_secs(31 * 24 * 60 * 60));
+    let state = world.setup.kit.state(faults::Worker::A);
+    assert_eq!(zupflow_server::channels::retention_due(&state).await, 1);
+    assert_eq!(
+        zupflow_server::channels::retention_due(&state).await,
+        0,
+        "queued once until it runs"
+    );
+    while zupflow_server::channels::work_once(&state).await {}
+    assert!(world.messages_in(main, SUPPORT).await.is_empty());
+    let after = world.runs(main).await;
+    assert_eq!(after[0]["status"], "completed");
+    assert_eq!(after[0]["input"], "(Removed after the retention period.)");
+    assert!(after[0]["output"].is_null(), "{}", after[0]);
+    // The thread's next message starts a new session: nothing swept is
+    // read back to the model.
+    world
+        .say(ANA, &format!("{} again", main.mention()), Some(&asked.ts))
+        .await;
+    world.work().await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs.len(), 2);
+    assert_ne!(runs[1]["session_id"], runs[0]["session_id"]);
+    assert_eq!(runs[1]["output"], "You said: [U0ANA] @helper again");
+}
+
+#[tokio::test]
+async fn never_reaches_another_workspaces_or_organizations_connection() {
+    let world = main_world().await;
+    let main = world.main.clone();
+    world
+        .grant(
+            &main,
+            &[
+                "read_messages",
+                "read_thread",
+                "search_messages",
+                "send_message",
+                "react",
+                "edit_message",
+            ],
+        )
+        .await;
+    world.configure(&main, json!({ "audience": "anywhere" })).await;
+    // A sibling workspace's agent and another organization's, each with
+    // its own app in the same team, each with a conversation and a post of
+    // its own.
+    let sibling = world.setup.sibling("beta", "tk_beta").await;
+    let beta = world
+        .install(
+            "alice",
+            &sibling.org,
+            &sibling.ws,
+            &sibling.agent,
+            TEAM,
+            "U0BETA",
+            "beta",
+        )
+        .await;
+    let other = world.setup.other_organization("bob", "larkspur", "tk_other").await;
+    let outside = world
+        .install("bob", &other.org, &other.ws, &other.agent, TEAM, "U0OUTSIDE", "outside")
+        .await;
+    let mut theirs = Vec::new();
+    for (installed, channel) in [(&beta, "C0BETA"), (&outside, "C0OUTSIDE")] {
+        let posted = world.post(&[installed], channel, BO, "the numbers", None).await;
+        world.work().await;
+        theirs.push((
+            world.conversation_id(installed, channel).await,
+            world.message_id(installed, &posted).await,
+        ));
+    }
+    let asked = world.say(ANA, &format!("{} hi", main.mention()), None).await;
+    world.work().await;
+    for (conversation, message) in &theirs {
+        let mut lines = Vec::new();
+        for (tool, arguments) in [
+            ("read_messages", json!({ "conversation": conversation })),
+            ("read_thread", json!({ "message": message })),
+            ("send_message", json!({ "conversation": conversation, "text": "hi" })),
+            ("react", json!({ "message": message, "emoji": "eyes" })),
+            ("edit_message", json!({ "message": message, "text": "mine now" })),
+        ] {
+            lines.push(world.calling(&main, tool, arguments).await);
+        }
+        world
+            .say(ANA, &format!("go\n{}", lines.join("\n")), Some(&asked.ts))
+            .await;
+        world.work().await;
+    }
+    let runs = world.runs(&main).await;
+    assert_eq!(runs.len(), 3);
+    for run in &runs[1..] {
+        assert_eq!(run["status"], "completed", "{run}");
+        let output = run["output"].as_str().unwrap();
+        assert!(!output.contains("the numbers"), "{output}");
+        let calls = calls_of(&world, run).await;
+        assert_eq!(calls.len(), 5);
+        for call in &calls {
+            assert!(
+                matches!(
+                    call.state,
+                    zupflow_core::runs::CallState::Refused | zupflow_core::runs::CallState::Failed
+                ),
+                "{call:?}"
+            );
+            assert!(
+                call.outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.content.contains("isn't one this connection knows")),
+                "{call:?}"
+            );
+        }
+    }
+    // Nothing reached the chat from it, and the others' records are as
+    // they were.
+    assert!(world.chat.posted_by_apps().is_empty());
+    assert!(world.chat.reactions().is_empty());
+    for (installed, channel) in [(&beta, "C0BETA"), (&outside, "C0OUTSIDE")] {
+        let messages = world.messages_in(installed, channel).await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["text"], "the numbers");
+        assert!(messages[0]["edited_at"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn leaves_a_post_it_cant_find_unknown_and_never_answers_after_it() {
+    let world = main_world().await;
+    let main = &world.main;
+    world.grant(main, &["reply"]).await;
+    let reply = world.calling(main, "reply", json!({ "text": "Looking." })).await;
+    // Its answer lost, and the provider's search not showing it yet.
+    world.chat.lose_answers(1);
+    world.chat.lag_searches(true);
+    world
+        .say(ANA, &format!("{} anything new?\n{reply}", main.mention()), None)
+        .await;
+    world.work().await;
+    world.reply().await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs[0]["status"], "completed", "{}", runs[0]);
+    assert!(!runs[0]["output"].as_str().unwrap().trim().is_empty());
+    let calls = calls_of(&world, &runs[0]).await;
+    assert_eq!(calls[0].state, zupflow_core::runs::CallState::Unknown);
+    // Posted once: not made again for not being found, and its answer not
+    // posted after it, though nothing recorded the post.
+    let posted = world.chat.posted_by_apps();
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert_eq!(posted[0].text, "Looking.");
+    assert!(
+        world
+            .messages_in(main, SUPPORT)
+            .await
+            .iter()
+            .all(|message| message["direction"] == "inbound")
+    );
+}
+
+#[tokio::test]
+async fn refuses_shared_conversations_and_other_teams_and_reads_only_its_own_dm() {
+    let world = main_world().await;
+    let main = &world.main;
+    world
+        .grant(
+            main,
+            &["react", "send_direct_message", "read_messages", "get_conversation"],
+        )
+        .await;
+    world.configure(main, json!({ "audience": "anywhere" })).await;
+    // A conversation shared with another organization, where its guest
+    // posted; and someone's direct message to the agent.
+    let guest = Poster::external("U0GUEST", "T0PARTNER");
+    let shared = world.post_as(&[main], "C0SHARED", &guest, "the numbers", None).await;
+    world.post(&[main], "D0BO", BO, "my review is due", None).await;
+    world.work().await;
+    let shared_message = world.message_id(main, &shared).await;
+    let guest_id = world.messages_in(main, "C0SHARED").await[0]["author"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let dm_id = world.conversation_id(main, "D0BO").await;
+    let react = world
+        .calling(main, "react", json!({ "message": shared_message, "emoji": "eyes" }))
+        .await;
+    let direct = world
+        .calling(
+            main,
+            "send_direct_message",
+            json!({ "person": guest_id, "text": "hello" }),
+        )
+        .await;
+    let read = world
+        .calling(main, "read_messages", json!({ "conversation": dm_id }))
+        .await;
+    let look = world
+        .calling(main, "get_conversation", json!({ "conversation": dm_id }))
+        .await;
+    let asked = world
+        .say(
+            ANA,
+            &format!("{} try\n{react}\n{direct}\n{read}\n{look}", main.mention()),
+            None,
+        )
+        .await;
+    world.work().await;
+    let runs = world.runs(main).await;
+    let run = runs.last().unwrap();
+    assert_eq!(run["status"], "completed", "{run}");
+    let calls = calls_of(&world, run).await;
+    assert_eq!(calls.len(), 4);
+    for call in &calls[..2] {
+        assert_eq!(call.state, zupflow_core::runs::CallState::Refused, "{call:?}");
+        assert_eq!(call.decision.as_ref().unwrap().rule, "outside_audience");
+    }
+    let said = |call: &faults::RecordedCall| call.outcome.as_ref().unwrap().content.clone();
+    assert!(
+        said(&calls[0]).contains("shared with another organization"),
+        "{calls:?}"
+    );
+    assert!(said(&calls[1]).contains("isn't in your team"), "{calls:?}");
+    for call in &calls[2..] {
+        assert_eq!(call.state, zupflow_core::runs::CallState::Failed, "{call:?}");
+        assert!(
+            said(call).contains("direct message this run didn't start in"),
+            "{call:?}"
+        );
+        assert!(!said(call).contains("my review"), "{call:?}");
+    }
+    assert!(world.chat.reactions().is_empty());
+
+    // The direct message's own run reads it.
+    let dm_runs: Vec<Value> = runs
+        .iter()
+        .filter(|run| run["channel"]["conversation_id"] == dm_id.as_str())
+        .cloned()
+        .collect();
+    assert_eq!(dm_runs.len(), 1, "{runs:?}");
+    world.post(&[main], "D0BO", BO, &format!("again\n{read}"), None).await;
+    world.work().await;
+    let runs = world.runs(main).await;
+    let calls = calls_of(&world, runs.last().unwrap()).await;
+    assert_eq!(calls[0].state, zupflow_core::runs::CallState::Completed, "{calls:?}");
+    assert!(said(&calls[0]).contains("my review is due"), "{calls:?}");
+
+    // Allowed outsiders, it acts in the shared conversation.
+    world.configure(main, json!({ "allow_external": true })).await;
+    world.say(ANA, &format!("again\n{react}"), Some(&asked.ts)).await;
+    world.work().await;
+    assert_eq!(world.chat.reactions().len(), 1);
+}
+
+#[tokio::test]
+async fn reads_messages_as_its_turns_render_them() {
+    let world = main_world().await;
+    let main = &world.main;
+    world.grant(main, &["read_messages", "search_messages"]).await;
+    name_conversation(&world, main, "C0OTHER", "other").await;
+    world
+        .post(
+            &[main],
+            "C0GENERAL",
+            BO,
+            "<@U0HELPER> see <#C0OTHER> &amp; the plan",
+            None,
+        )
+        .await;
+    world.work().await;
+    let general = world.conversation_id(main, "C0GENERAL").await;
+    let read = world
+        .calling(main, "read_messages", json!({ "conversation": general }))
+        .await;
+    // Found by what it reads as, not by its markup.
+    let search = world
+        .calling(
+            main,
+            "search_messages",
+            json!({ "query": "@helper see #other & the", "conversation": general }),
+        )
+        .await;
+    let markup = world
+        .calling(
+            main,
+            "search_messages",
+            json!({ "query": "U0HELPER", "conversation": general }),
+        )
+        .await;
+    world
+        .say(
+            ANA,
+            &format!("{} look\n{read}\n{search}\n{markup}", main.mention()),
+            None,
+        )
+        .await;
+    world.work().await;
+    let runs = world.runs(main).await;
+    let calls = calls_of(&world, runs.last().unwrap()).await;
+    assert_eq!(calls.len(), 3);
+    for call in &calls {
+        assert_eq!(call.state, zupflow_core::runs::CallState::Completed, "{call:?}");
+        let said = &call.outcome.as_ref().unwrap().content;
+        assert!(!said.contains("U0HELPER") && !said.contains("C0OTHER"), "{said}");
+    }
+    for call in &calls[..2] {
+        let said = &call.outcome.as_ref().unwrap().content;
+        assert!(said.contains("@helper see #other & the plan"), "{said}");
+    }
+    let found: Value = serde_json::from_str(&calls[2].outcome.as_ref().unwrap().content).unwrap();
+    assert_eq!(found["messages"], json!([]), "a provider ID isn't what it reads");
+}
+
+#[tokio::test]
+async fn keeps_the_live_session_when_an_older_sessions_run_ages_out() {
+    const DAY: u64 = 24 * 60 * 60;
+    let world = main_world().await;
+    let main = &world.main;
+    let asked = world.say(ANA, &format!("{} day one", main.mention()), None).await;
+    world.work().await;
+    // A day on, its tools change: the thread's next run starts a new
+    // session, and the first one's is left behind.
+    world.setup.kit.clock.advance(Duration::from_secs(DAY));
+    world.grant(main, &["reply"]).await;
+    world
+        .say(ANA, &format!("{} day two", main.mention()), Some(&asked.ts))
+        .await;
+    world.work().await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs.len(), 2);
+    assert_ne!(runs[0]["session_id"], runs[1]["session_id"]);
+    // The first run ages out; the second, the live session's, doesn't.
+    world.setup.kit.clock.advance(Duration::from_secs(29 * DAY + DAY / 2));
+    let state = world.setup.kit.state(faults::Worker::A);
+    assert_eq!(zupflow_server::channels::retention_due(&state).await, 1);
+    while zupflow_server::channels::work_once(&state).await {}
+    let runs = world.runs(main).await;
+    assert_eq!(runs[0]["input"], "(Removed after the retention period.)");
+    assert!(
+        runs[1]["input"].as_str().unwrap().ends_with("[U0ANA] @helper day two"),
+        "{}",
+        runs[1]
+    );
+    // The live session goes on.
+    world
+        .say(ANA, &format!("{} day thirty", main.mention()), Some(&asked.ts))
+        .await;
+    world.work().await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[2]["status"], "completed", "{}", runs[2]);
+    assert_eq!(runs[2]["session_id"], runs[1]["session_id"]);
+}
+
+#[tokio::test]
+async fn sweeping_a_run_leaves_none_of_its_text() {
+    let world = main_world().await;
+    let main = &world.main;
+    world
+        .say(ANA, &format!("{} the zebra plan", main.mention()), None)
+        .await;
+    world.work().await;
+    // A run that reads it through a tool, then stays silent saying why.
+    world.grant(main, &["read_messages"]).await;
+    let support = world.conversation_id(main, SUPPORT).await;
+    let read = world
+        .calling(main, "read_messages", json!({ "conversation": support }))
+        .await;
+    let silent = "call stay_silent {\"reason\":\"The zebra plan is settled.\"}";
+    world
+        .say(ANA, &format!("{} recap\n{read}\nthen\n{silent}", main.mention()), None)
+        .await;
+    world.work().await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1]["channel"]["silent_reason"], "The zebra plan is settled.");
+    assert!(world.database_text().await.contains("zebra"));
+
+    world.setup.kit.clock.advance(Duration::from_secs(31 * 24 * 60 * 60));
+    let state = world.setup.kit.state(faults::Worker::A);
+    zupflow_server::channels::retention_due(&state).await;
+    while zupflow_server::channels::work_once(&state).await {}
+    let runs = world.runs(main).await;
+    assert!(runs[1]["channel"]["silent_reason"].is_null(), "{}", runs[1]);
+    let text = world.database_text().await;
+    let left: Vec<&str> = text.lines().filter(|line| line.contains("zebra")).collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[tokio::test]
+async fn notes_an_edit_that_arrives_while_a_steered_turn_is_taken() {
+    let world = main_world().await;
+    let main = &world.main;
+    let kit = &world.setup.kit;
+    world.grant(main, &["list_conversations"]).await;
+    let list = world.calling(main, "list_conversations", json!({})).await;
+    let asked = world
+        .say(ANA, &format!("{} is the build red?\n{list}", main.mention()), None)
+        .await;
+    world.handle().await;
+    // While its first turn's call is made, a follow-up arrives: its next
+    // turn takes it in.
+    let answered = kit.faults.arm(faults::Worker::A, faults::Point::AfterModel);
+    let running = kit.spawn(faults::Worker::A);
+    answered.reached().await;
+    world.say(BO, "it failed at 3", Some(&asked.ts)).await;
+    world.handle().await;
+    let preparing = kit
+        .faults
+        .arm(faults::Worker::A, faults::Point::Before(faults::Write::PrepareModel));
+    answered.release();
+    preparing.reached().await;
+    // The steered turn is rendered; the question is edited a second later,
+    // before the turn is taken.
+    kit.clock.advance(Duration::from_secs(1));
+    world
+        .deliver(
+            main,
+            &world.chat.edit(&asked, "<@U0HELPER> is the build green?", world.now()),
+        )
+        .await;
+    preparing.release();
+    running.finish().await;
+    kit.drain(faults::Worker::A).await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["status"], "completed", "{}", runs[0]);
+    // The steered turn didn't see the edit: the next one notes it.
+    world.say(ANA, "well?", Some(&asked.ts)).await;
+    world.work().await;
+    let runs = world.runs(main).await;
+    assert_eq!(runs.len(), 2);
+    assert_eq!(
+        runs[1]["output"],
+        "You said: [U0ANA edited an earlier message] @helper is the build green?\n[U0ANA] well?"
+    );
+}
+
+#[tokio::test]
+async fn refuses_an_approved_call_whose_connection_was_removed() {
+    let world = main_world().await;
+    let main = &world.main;
+    world.grant(main, &["send_message"]).await;
+    world.configure(main, json!({ "audience": "anywhere" })).await;
+    world.post(&[main], "C0GENERAL", BO, "lunch?", None).await;
+    world.work().await;
+    let general_id = world.conversation_id(main, "C0GENERAL").await;
+    let send = world
+        .calling(
+            main,
+            "send_message",
+            json!({ "conversation": general_id, "text": "Deploy at 5." }),
+        )
+        .await;
+    world
+        .say(ANA, &format!("{} tell everyone\n{send}", main.mention()), None)
+        .await;
+    world.work().await;
+    let runs = world.runs(main).await;
+    let waiting = runs.last().unwrap().clone();
+    assert_eq!(waiting["status"], "waiting_for_approval", "{waiting}");
+    let (status, body) = world
+        .setup
+        .kit
+        .send(
+            call(
+                &main.user,
+                Method::DELETE,
+                format!("/v1/workspaces/{}/channel-connections/{}", main.ws, main.connection),
+            )
+            .naming(&main.org),
+        )
+        .await;
+    assert!(status.is_success(), "{status}: {body}");
+    world.approve(World::run_id(&waiting)).await;
+    world.work().await;
+    let calls = calls_of(&world, &waiting).await;
+    assert_eq!(
+        calls[0].failure.as_ref().map(|failure| failure.code.as_str()),
+        Some("channel_connection_removed"),
+        "{:?}",
+        calls[0]
+    );
+    assert!(world.chat.posted_by_apps().is_empty());
+}

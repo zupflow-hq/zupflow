@@ -47,7 +47,8 @@ use crate::audit::Audit;
 use crate::connect::ConnectSession;
 use crate::ids::{
     AgentChannelId, AgentId, ApiKeyId, ChannelAppId, ChannelAppManagerId, ChannelConnectionId, ChannelConversationId,
-    ChannelMessageId, ConnectSessionId, MemberId, OrganizationId, RunId, SessionId, ToolCallId, UserId, WorkspaceId,
+    ChannelMessageId, ChannelPersonId, ConnectSessionId, MemberId, OrganizationId, RunId, SessionId, ToolCallId,
+    UserId, WorkspaceId,
 };
 use crate::keys::Sealed;
 use crate::model_store::RunModel;
@@ -305,6 +306,78 @@ pub struct MessageFilter {
     pub thread: Option<String>,
 }
 
+/// What a channel run's tools act from, read in the run's scope: its agent
+/// channel (the grant, approvals and audience), its connection, where it
+/// started, and its hops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunChannelContext {
+    pub agent_channel: AgentChannel,
+    pub connection: ChannelConnection,
+    /// The conversation the run started in.
+    pub origin: ChannelConversation,
+    pub thread_key: String,
+    /// One more than the most hops among the messages that started or
+    /// joined the run: what each of its posts records.
+    pub hop: u32,
+}
+
+/// Someone a connection has seen, as its tools show them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownPerson {
+    pub id: ChannelPersonId,
+    /// The provider's ID: never shown to the model.
+    pub external_id: String,
+    pub handle: Option<String>,
+    pub display_name: Option<String>,
+    pub is_automated: bool,
+    /// The team they belong to, when a message of theirs said.
+    pub team_id: Option<String>,
+}
+
+/// How many changes a connection made at its provider lately (posts,
+/// edits, reactions, deletions), by the send slots they took.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SendCounts {
+    /// In the last second.
+    pub second: u32,
+    /// In the last hour.
+    pub hour: u32,
+}
+
+/// The most changes one connection makes at its provider in a second.
+pub const SENDS_PER_SECOND: u32 = 1;
+
+/// The most changes one connection makes at its provider in an hour.
+pub const SENDS_PER_HOUR: u32 = 200;
+
+/// The longest a change waits for its connection's next free second
+/// before it's refused as rate limited.
+pub const MAX_SEND_WAIT_MS: i64 = 5_000;
+
+/// A change's place in its connection's sends:
+/// [`ChannelStore::take_send_slot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendSlot {
+    /// Reserved, this long from now: make the change then. Slots are a
+    /// second apart, so waiting out its own is all a change needs.
+    Taken { wait_millis: u64 },
+    /// The connection's next free second is more than
+    /// [`MAX_SEND_WAIT_MS`] away.
+    Busy,
+    /// The connection made, or reserved, [`SENDS_PER_HOUR`] changes in the
+    /// last hour.
+    HourFull,
+}
+
+/// What a workspace's retention sweep removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Swept {
+    pub messages: u64,
+    pub inbound_events: u64,
+    /// Channel runs whose text was cleared.
+    pub runs: u64,
+}
+
 /// An agent's session in one thread of one conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelSession {
@@ -343,6 +416,12 @@ pub enum DeliveryOutcome {
     Ignored,
     /// The connection needs reconnecting.
     Uninstalled,
+    /// A message the connection kept was edited or deleted: recorded beside
+    /// what it said, which is never rewritten.
+    Changed {
+        connection_id: ChannelConnectionId,
+        message_id: ChannelMessageId,
+    },
     /// A message, saved; `new` when this delivery saved it (and queued its
     /// inbound job).
     Message {
@@ -403,6 +482,27 @@ pub struct SessionTemplate {
     pub instructions: String,
     pub offer: Offer,
     pub history_budget: u64,
+}
+
+impl SessionTemplate {
+    /// Whether a session fixed with `other` asks its model the same way:
+    /// the same model through the same connection, the same instructions,
+    /// and the same tools as the model reads them (each one's name,
+    /// description and schema, in order). What only the Console shows (a
+    /// connection's or installation's label, a team's name) and the history
+    /// budget never start a new session on their own, so a rename doesn't
+    /// throw the provider's cache away.
+    pub fn same_for_the_model(&self, other: &SessionTemplate) -> bool {
+        let specs = |template: &SessionTemplate| {
+            template
+                .offer
+                .tools()
+                .iter()
+                .map(|tool| (tool.name.clone(), tool.description.clone(), tool.input_schema.clone()))
+                .collect::<Vec<_>>()
+        };
+        self.model == other.model && self.instructions == other.instructions && specs(self) == specs(other)
+    }
 }
 
 /// What came of a dispatch.
@@ -469,6 +569,8 @@ pub enum ChannelError {
     ConnectionNotFound,
     #[error("conversation not found")]
     ConversationNotFound,
+    #[error("message not found")]
+    MessageNotFound,
     #[error("agent not found")]
     AgentNotFound,
     #[error("agent channel not found")]
@@ -1119,6 +1221,165 @@ pub trait ChannelStore: Send + Sync {
         conversation_id: ChannelConversationId,
         thread_key: &str,
     ) -> Result<Option<ChannelSession>, ChannelError>;
+
+    // --- Channel tools --------------------------------------------------------
+
+    /// What a channel run's tools act from; `None` unless the run is a
+    /// channel run whose agent channel, connection and conversation are all
+    /// still there, in this workspace.
+    async fn run_channel(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+    ) -> Result<Option<RunChannelContext>, ChannelError>;
+
+    /// One of the connection's messages; `None` for another connection's,
+    /// even in this workspace.
+    async fn find_message(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        message_id: ChannelMessageId,
+    ) -> Result<Option<ChannelMessage>, ChannelError>;
+
+    /// The message a run's call posted, if one is recorded.
+    async fn sent_by_call(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+        call_id: ToolCallId,
+    ) -> Result<Option<ChannelMessage>, ChannelError>;
+
+    /// Someone the connection has seen; `None` for another connection's.
+    async fn find_person(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        person_id: ChannelPersonId,
+    ) -> Result<Option<KnownPerson>, ChannelError>;
+
+    /// The connection's people whose name or handle contains `query`, any
+    /// case, up to `limit`, by name.
+    async fn find_people(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<KnownPerson>, ChannelError>;
+
+    /// The connection's kept messages, not deleted, that may match `query`
+    /// once rendered: those whose text contains it, any case, and those with
+    /// markup a rendering could turn into it. In `conversation_id` when
+    /// given, never in a direct message other than `readable_dm`; newest
+    /// first, up to `limit`. The caller renders them and matches again.
+    #[allow(clippy::too_many_arguments)]
+    async fn search_messages(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        conversation_id: Option<ChannelConversationId>,
+        readable_dm: ChannelConversationId,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<ChannelMessage>, ChannelError>;
+
+    /// The names the connection's messages are rendered with, as a run's
+    /// turns render them: the team's identities, then the people the
+    /// connection knows, by the provider IDs in `people`; and the
+    /// conversations it knows by name, by those in `conversations`.
+    async fn mention_names(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        people: &[String],
+        conversations: &[String],
+    ) -> Result<super::thread::MentionNames, ChannelError>;
+
+    /// How many changes the connection made at its provider in the second
+    /// and the hour before `now`, by their send slots.
+    async fn send_counts(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        now: Timestamp,
+    ) -> Result<SendCounts, ChannelError>;
+
+    /// Reserves the connection's next send slot for one change by a run's
+    /// call, in one transaction against every other taker: the first free
+    /// second at or after `now`, a second after the latest reserved one, so
+    /// at most [`SENDS_PER_SECOND`] a second and [`SENDS_PER_HOUR`] an hour
+    /// however many runs send at once. Nothing is reserved when the slot is
+    /// further off than [`MAX_SEND_WAIT_MS`] or the hour is full. Slots
+    /// older than an hour are dropped.
+    #[allow(clippy::too_many_arguments)]
+    async fn take_send_slot(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        run_id: RunId,
+        call_id: ToolCallId,
+        now: Timestamp,
+    ) -> Result<SendSlot, ChannelError>;
+
+    /// Records an edit of the connection's own message: its new text, beside
+    /// what it first said. `MessageNotFound` for any other message.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_own_edit(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        message_id: ChannelMessageId,
+        text: &str,
+        now: Timestamp,
+    ) -> Result<(), ChannelError>;
+
+    /// Records that the connection's own message was deleted.
+    /// `MessageNotFound` for any other message.
+    async fn record_own_delete(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        message_id: ChannelMessageId,
+        now: Timestamp,
+    ) -> Result<(), ChannelError>;
+
+    // --- Retention --------------------------------------------------------------
+
+    /// The workspaces with channel data past their organization's retention
+    /// at `now`, up to `limit`. Cross-tenant by design, like a worker's
+    /// claim: each comes with its scope, and is swept in it.
+    async fn retention_due_cross_tenant(
+        &self,
+        now: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<(OrganizationId, WorkspaceId)>, ChannelError>;
+
+    /// Deletes, in one workspace, the channel data past its organization's
+    /// retention at `now`: messages (and with them what was dispatched for
+    /// them), inbound event records after
+    /// [`super::INBOUND_EVENT_RETENTION_DAYS`], and the text of channel runs
+    /// that finished before the cutoff: their input, output, turns, steered
+    /// turns and kept transcripts. A session whose runs lose their text
+    /// starts a new run session, reading its thread anew; one with a run in
+    /// progress keeps its runs until a later sweep.
+    async fn sweep_retention(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        now: Timestamp,
+    ) -> Result<Swept, ChannelError>;
 
     // --- The organization's levels and settings -------------------------------
 

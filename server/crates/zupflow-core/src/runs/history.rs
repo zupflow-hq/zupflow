@@ -32,6 +32,18 @@ pub fn history_budget(context_window: Option<u64>) -> u64 {
     (window.saturating_mul(HISTORY_SHARE_PERCENT) / 100).max(1)
 }
 
+/// What a channel run's model is told after an answer with neither text
+/// nor calls: one more turn, then the run fails with `empty_output`. The
+/// empty answer itself is never sent back (providers refuse one); this
+/// stands in its place, the same every time.
+pub const NUDGE: &str = "Your last answer was empty, so nothing was posted. Answer the thread now, or call \
+                         stay_silent with a short reason if it needs no answer from you.";
+
+/// Whether a committed turn answered with neither text nor calls.
+pub fn blank(text: &Option<String>, calls: usize) -> bool {
+    calls == 0 && text.as_deref().is_none_or(|text| text.trim().is_empty())
+}
+
 /// A committed turn's assistant message exactly as its run sent it (its
 /// text untouched, so every adapter renders it as it did), except that an
 /// answer with neither text nor calls is left out: providers refuse an
@@ -50,17 +62,26 @@ fn assistant(text: &Option<String>, tool_calls: Vec<ModelToolCall>) -> Option<Me
 ///
 /// It depends only on what never changes once the run has ended: a last
 /// turn with calls is left out (one of its calls may be settled only
-/// later, when its sender's lease lapses), and so are the turns after a
-/// call without an outcome. Steered turns after the last turn kept follow
-/// it, in order.
-pub fn transcript(input: &str, turns: &[CommittedTurn], calls: &[CallRecord], steers: &[SteeredTurn]) -> Vec<Message> {
+/// later, when its sender's lease lapses) unless the run `completed`, which
+/// it does only once every call is settled (a run that stayed silent ends
+/// on its `stay_silent` turn); and so are the turns after a call without an
+/// outcome. An empty answer before the last turn is the [`NUDGE`] that
+/// followed it, as it was sent. Steered turns after the last turn kept
+/// follow it, in order.
+pub fn transcript(
+    input: &str,
+    turns: &[CommittedTurn],
+    calls: &[CallRecord],
+    steers: &[SteeredTurn],
+    completed: bool,
+) -> Vec<Message> {
     let mut messages = vec![Message::User { text: input.to_owned() }];
     let last = turns.len().checked_sub(1);
     let mut kept = 0usize;
     'turns: for (index, turn) in turns.iter().enumerate() {
         let mut own: Vec<&CallRecord> = calls.iter().filter(|call| call.turn == turn.turn).collect();
         own.sort_by_key(|call| call.position);
-        if Some(index) == last && !own.is_empty() {
+        if Some(index) == last && !own.is_empty() && !completed {
             break;
         }
         let mut results = Vec::with_capacity(own.len());
@@ -89,6 +110,8 @@ pub fn transcript(input: &str, turns: &[CommittedTurn], calls: &[CallRecord], st
             .collect();
         if let Some(answer) = assistant(&turn.text, tool_calls) {
             messages.push(answer);
+        } else if Some(index) != last && blank(&turn.text, own.len()) {
+            messages.push(Message::User { text: NUDGE.to_owned() });
         }
         messages.extend(results);
         kept = index + 1;
@@ -204,6 +227,7 @@ mod tests {
             &[turn(0, Some("Looking.")), turn(1, Some("Done."))],
             &[call(0, 0, Some("{}"))],
             &steers,
+            true,
         );
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[0], user("[Ana] hello"));
@@ -220,12 +244,14 @@ mod tests {
             &[turn(0, Some("a")), turn(1, None)],
             &[call(0, 0, Some("x")), call(1, 0, None)],
             &[],
+            false,
         );
         let settled = transcript(
             "hi",
             &[turn(0, Some("a")), turn(1, None)],
             &[call(0, 0, Some("x")), call(1, 0, Some("late"))],
             &[],
+            false,
         );
         assert_eq!(
             unsettled, settled,
@@ -244,8 +270,28 @@ mod tests {
                 turn: 1,
                 text: "more".to_owned(),
             }],
+            true,
         );
         assert_eq!(messages, vec![user("hi"), user("more")]);
+    }
+
+    #[test]
+    fn keeps_a_completed_runs_last_turn_with_calls_and_its_nudges() {
+        // Stayed silent: its last turn's calls were settled when it ended.
+        let silent = transcript(
+            "hi",
+            &[turn(0, None), turn(1, None)],
+            &[call(1, 0, Some("Nothing will be posted."))],
+            &[],
+            true,
+        );
+        assert_eq!(silent.len(), 4);
+        assert_eq!(silent[1], user(NUDGE), "the empty answer is the nudge that followed it");
+        assert!(matches!(&silent[2], Message::Assistant { tool_calls, .. } if tool_calls.len() == 1));
+        assert!(matches!(&silent[3], Message::ToolResult { .. }));
+        // An empty last answer: nothing followed it.
+        let failed = transcript("hi", &[turn(0, Some("")), turn(1, None)], &[], &[], false);
+        assert_eq!(failed, vec![user("hi"), user(NUDGE)]);
     }
 
     #[test]

@@ -494,6 +494,7 @@ fn channel_failure(error: ChannelError) -> Failure {
         ChannelError::AppNotFound => ApiError::not_found("Channel app").into(),
         ChannelError::ConnectionNotFound => ApiError::not_found("Channel connection").into(),
         ChannelError::ConversationNotFound => ApiError::not_found("Conversation").into(),
+        ChannelError::MessageNotFound => ApiError::not_found("Message").into(),
         ChannelError::AgentNotFound => ApiError::not_found("Agent").into(),
         ChannelError::AgentChannelNotFound => ApiError::not_found("Agent channel").into(),
         ChannelError::SessionNotFound => ApiError::not_found("Connect session").into(),
@@ -2911,6 +2912,11 @@ pub async fn rotate_due(state: &AppState) {
     crate::channel_upkeep::sweep(state).await;
 }
 
+/// Queues the retention sweeps that are due, one per workspace: how many.
+pub async fn retention_due(state: &AppState) -> usize {
+    crate::channel_upkeep::retention_due(state).await
+}
+
 /// Makes apps and keeps them in step until the process stops, and sweeps
 /// for stranded apps and tokens due for rotation. New messages have their
 /// own worker ([`crate::channel_inbound::run_worker`]), so a slow provider
@@ -2921,6 +2927,7 @@ pub async fn run_worker(state: AppState) {
         if tokio::time::Instant::now() >= next_sweep {
             reap_once(&state).await;
             rotate_due(&state).await;
+            retention_due(&state).await;
             next_sweep = tokio::time::Instant::now() + REAP_EVERY;
         }
         if !work_once(&state).await {

@@ -27,8 +27,9 @@ use zupflow_core::channels::provider::InboundEvent;
 use zupflow_core::channels::store::{
     AppCreation, AppFilter, AppSecretsRecord, ChannelEditor, ChannelError, ChannelSession, ChannelStore,
     ConnectionChanges, ConnectionFilter, ConversationFilter, DeliveryOutcome, DispatchOutcome, InboundContext,
-    LevelChange, MadeApp, MessageFilter, NewApp, NewConversation, NewDelivery, NewDispatch, NewInstall, NewManager,
-    NewMessage, NewPerson, RecordedMessage, RotationSweep, SealedVersion, SessionTemplate, TokenReplacement,
+    KnownPerson, LevelChange, MadeApp, MessageFilter, NewApp, NewConversation, NewDelivery, NewDispatch, NewInstall,
+    NewManager, NewMessage, NewPerson, RecordedMessage, RotationSweep, RunChannelContext, SealedVersion, SendCounts,
+    SendSlot, SessionTemplate, Swept, TokenReplacement,
 };
 use zupflow_core::channels::thread::origin_keys;
 use zupflow_core::channels::{
@@ -151,8 +152,8 @@ macro_rules! conversation_select {
 macro_rules! message_select {
     () => {
         "SELECT g.id, g.organization_id, g.workspace_id, g.connection_id, g.conversation_id, g.external_id, \
-         g.thread_key, g.direction, g.text, g.mentions, g.run_id, g.tool_call_id, g.agent_hop, g.sent_at, \
-         g.edited_at, g.deleted_at, g.created_at, p.id AS person_id, p.handle AS person_handle, \
+         g.thread_key, g.direction, g.text, g.edited_text, g.mentions, g.run_id, g.tool_call_id, g.agent_hop, \
+         g.sent_at, g.edited_at, g.deleted_at, g.created_at, p.id AS person_id, p.handle AS person_handle, \
          p.display_name AS person_display_name, p.is_automated AS person_is_automated \
          FROM channel_messages g LEFT JOIN channel_people p ON p.organization_id = g.organization_id \
          AND p.workspace_id = g.workspace_id AND p.connection_id = g.connection_id AND p.id = g.author_person_id"
@@ -198,6 +199,9 @@ const FIND_AGENT_CHANNEL_ON: &str = concat!(
     agent_channel_select!(),
     " WHERE h.organization_id = ? AND h.workspace_id = ? AND h.connection_id = ?"
 );
+
+// After the column macros, which it uses.
+mod tooling;
 
 /// An active member who may change a workspace's channels: a developer or stricter.
 const WORKSPACE_MEMBER: &str = "SELECT 1 FROM members mb JOIN workspaces w ON w.organization_id = mb.organization_id \
@@ -379,6 +383,7 @@ fn message_from(row: &SqliteRow) -> Result<ChannelMessage, ChannelError> {
         direction: parsed(row, "direction", Direction::parse)?,
         author,
         text: text(row, "text")?,
+        edited_text: row.try_get("edited_text").map_err(read)?,
         mentions: json_list(row, "mentions")?,
         run_id: maybe_uuid(row, "run_id")?.map(RunId::from_uuid),
         tool_call_id: maybe_uuid(row, "tool_call_id")?.map(ToolCallId::from_uuid),
@@ -1598,6 +1603,74 @@ pub(crate) async fn breaker_settings(
         .map_err(|_| StoreError::Unavailable)
 }
 
+/// How a kept message changed at the provider.
+enum Change<'a> {
+    Edited { text: &'a str, at: Timestamp },
+    Deleted { at: Timestamp },
+}
+
+/// Records an edit or a delete of a message the connection kept, found by
+/// the provider's IDs within the connection: beside what it said, which is
+/// never rewritten. A message it never kept, or one deleted already, is
+/// left alone.
+async fn changed(
+    transaction: &mut SqliteConnection,
+    (organization_id, workspace_id, connection_id): (OrganizationId, WorkspaceId, ChannelConnectionId),
+    (conversation_external_id, external_id): (&str, &str),
+    change: Change<'_>,
+    now: Timestamp,
+) -> Result<DeliveryOutcome, ChannelError> {
+    let found: Option<Uuid> = sqlx::query_scalar(
+        "SELECT g.id FROM channel_messages g JOIN channel_conversations c ON c.organization_id = g.organization_id \
+         AND c.workspace_id = g.workspace_id AND c.connection_id = g.connection_id AND c.id = g.conversation_id \
+         WHERE g.organization_id = ? AND g.workspace_id = ? AND g.connection_id = ? AND c.external_id = ? \
+         AND g.external_id = ? AND g.deleted_at IS NULL",
+    )
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(connection_id.uuid())
+    .bind(conversation_external_id)
+    .bind(external_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(failed("record_delivery"))?;
+    let Some(message) = found else {
+        return Ok(DeliveryOutcome::Ignored);
+    };
+    let (edited_text, edited_at, deleted_at) = match change {
+        // The provider's reader bounds the text, as it does a new message's.
+        Change::Edited { text, at } => (Some(text), Some(at), None),
+        Change::Deleted { at } => (None, None, Some(at)),
+    };
+    // An edit older than the one kept (deliveries can arrive out of
+    // order) leaves the text as it is; either way, the change is noted as
+    // learned now, on Zupflow's clock, which the session's turns compare.
+    sqlx::query(
+        "UPDATE channel_messages SET \
+         edited_text = CASE WHEN ?1 IS NOT NULL AND (edited_at IS NULL OR ?2 >= edited_at) THEN ?1 \
+         ELSE edited_text END, \
+         edited_at = CASE WHEN ?2 IS NOT NULL AND (edited_at IS NULL OR ?2 >= edited_at) THEN ?2 \
+         ELSE edited_at END, \
+         deleted_at = coalesce(deleted_at, ?3), changed_at = ?4 \
+         WHERE organization_id = ?5 AND workspace_id = ?6 AND connection_id = ?7 AND id = ?8",
+    )
+    .bind(edited_text)
+    .bind(edited_at.map(Timestamp::millis))
+    .bind(deleted_at.map(Timestamp::millis))
+    .bind(now.millis())
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(connection_id.uuid())
+    .bind(message)
+    .execute(&mut *transaction)
+    .await
+    .map_err(failed("record_delivery"))?;
+    Ok(DeliveryOutcome::Changed {
+        connection_id,
+        message_id: ChannelMessageId::from_uuid(message),
+    })
+}
+
 /// A delivery recorded for the first time, through the app's live
 /// connection: [`ChannelStore::record_delivery`].
 async fn receive(
@@ -1639,6 +1712,36 @@ async fn receive(
             return Ok(DeliveryOutcome::Uninstalled);
         }
         InboundEvent::Other => return Ok(DeliveryOutcome::Ignored),
+        InboundEvent::Edited(edited) => {
+            if connection.status != ConnectionStatus::Connected {
+                return Ok(DeliveryOutcome::Ignored);
+            }
+            let change = Change::Edited {
+                text: &edited.text,
+                at: edited.edited_at,
+            };
+            return changed(
+                transaction,
+                (organization_id, workspace_id, connection.id),
+                (&edited.conversation_external_id, &edited.external_id),
+                change,
+                now,
+            )
+            .await;
+        }
+        InboundEvent::Deleted(deleted) => {
+            if connection.status != ConnectionStatus::Connected {
+                return Ok(DeliveryOutcome::Ignored);
+            }
+            return changed(
+                transaction,
+                (organization_id, workspace_id, connection.id),
+                (&deleted.conversation_external_id, &deleted.external_id),
+                Change::Deleted { at: deleted.deleted_at },
+                now,
+            )
+            .await;
+        }
         InboundEvent::Message(message) => message,
     };
     if connection.status != ConnectionStatus::Connected {
@@ -3346,6 +3449,166 @@ impl ChannelStore for SqliteChannelStore {
         Ok(steer)
     }
 
+    async fn run_channel(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+    ) -> Result<Option<RunChannelContext>, ChannelError> {
+        tooling::run_channel(self, organization_id, workspace_id, run_id).await
+    }
+
+    async fn find_message(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        message_id: ChannelMessageId,
+    ) -> Result<Option<ChannelMessage>, ChannelError> {
+        tooling::find_message(self, organization_id, workspace_id, connection_id, message_id).await
+    }
+
+    async fn sent_by_call(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+        call_id: ToolCallId,
+    ) -> Result<Option<ChannelMessage>, ChannelError> {
+        tooling::sent_by_call(self, organization_id, workspace_id, run_id, call_id).await
+    }
+
+    async fn find_person(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        person_id: ChannelPersonId,
+    ) -> Result<Option<KnownPerson>, ChannelError> {
+        tooling::find_person(self, organization_id, workspace_id, connection_id, person_id).await
+    }
+
+    async fn find_people(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<KnownPerson>, ChannelError> {
+        tooling::find_people(self, organization_id, workspace_id, connection_id, query, limit).await
+    }
+
+    async fn search_messages(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        conversation_id: Option<ChannelConversationId>,
+        readable_dm: ChannelConversationId,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<ChannelMessage>, ChannelError> {
+        tooling::search_messages(
+            self,
+            organization_id,
+            workspace_id,
+            connection_id,
+            conversation_id,
+            readable_dm,
+            query,
+            limit,
+        )
+        .await
+    }
+
+    async fn mention_names(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        people: &[String],
+        conversations: &[String],
+    ) -> Result<zupflow_core::channels::thread::MentionNames, ChannelError> {
+        tooling::mention_names(
+            self,
+            (organization_id, workspace_id, connection_id),
+            people,
+            conversations,
+        )
+        .await
+    }
+
+    async fn send_counts(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        now: Timestamp,
+    ) -> Result<SendCounts, ChannelError> {
+        tooling::send_counts(self, (organization_id, workspace_id, connection_id), now).await
+    }
+
+    async fn take_send_slot(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        run_id: RunId,
+        call_id: ToolCallId,
+        now: Timestamp,
+    ) -> Result<SendSlot, ChannelError> {
+        tooling::take_send_slot(
+            self,
+            (organization_id, workspace_id, connection_id),
+            (run_id, call_id),
+            now,
+        )
+        .await
+    }
+
+    async fn record_own_edit(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        message_id: ChannelMessageId,
+        text: &str,
+        now: Timestamp,
+    ) -> Result<(), ChannelError> {
+        let scope = (organization_id, workspace_id, connection_id);
+        tooling::record_own_change(self, scope, message_id, Some(text), now).await
+    }
+
+    async fn record_own_delete(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        message_id: ChannelMessageId,
+        now: Timestamp,
+    ) -> Result<(), ChannelError> {
+        let scope = (organization_id, workspace_id, connection_id);
+        tooling::record_own_change(self, scope, message_id, None, now).await
+    }
+
+    async fn retention_due_cross_tenant(
+        &self,
+        now: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<(OrganizationId, WorkspaceId)>, ChannelError> {
+        tooling::retention_due_cross_tenant(self, now, limit).await
+    }
+
+    async fn sweep_retention(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        now: Timestamp,
+    ) -> Result<Swept, ChannelError> {
+        tooling::sweep_retention(self, organization_id, workspace_id, now).await
+    }
+
     async fn find_session(
         &self,
         organization_id: OrganizationId,
@@ -3764,6 +4027,9 @@ mod tests {
         "reap_stranded_apps_cross_tenant",
         // A sweep over every workspace's linked teams for tokens to rotate.
         "queue_due_rotations_cross_tenant",
+        // A sweep over every workspace's channel data for what's past
+        // retention, each then swept in its own scope.
+        "retention_due_cross_tenant",
     ];
 
     /// Statements on a workspace's tables that hold to the organization
@@ -3934,6 +4200,7 @@ mod tests {
             &source[..source.find("#[cfg(test)]").unwrap()],
             include_str!("channels/lifecycle.rs"),
             include_str!("channels/exchange.rs"),
+            include_str!("channels/tooling.rs"),
         ]
         .concat();
         let audited = audit(&source);

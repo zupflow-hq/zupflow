@@ -222,6 +222,12 @@ pub struct Steer {
     /// The newest thread message the turn includes: the session's
     /// conversation has taken in everything up to it.
     pub seen: SeenMessage,
+    /// When Zupflow learned of the newest edit or deletion among the
+    /// thread's messages up to `seen`, as the turn was rendered: the
+    /// session's turns have noted every change up to it, and a change
+    /// learned of later is noted in a later turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes_noted_at: Option<Timestamp>,
 }
 
 /// A thread message a session's conversation has taken in, everything
@@ -265,6 +271,10 @@ pub struct CommitTurn {
     pub next: Continuation,
     /// A final answer ends the run with the turn.
     pub ending: Option<RunEnding>,
+    /// The reason the turn's `stay_silent` call gave: the run posts nothing,
+    /// and ends once the turn's calls are settled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub silent: Option<String>,
 }
 
 /// Waiting for a person: `waiting_for_approval`, `approval.requested`,
@@ -372,6 +382,10 @@ pub enum SendOutcome {
     /// Refused for the credential even after one refresh: the installation
     /// needs reconnecting.
     Unauthorized,
+    /// Refused before anything was sent, by a stable code and a message
+    /// for the model and the timeline (a channel tool's call naming
+    /// something it can't reach, say).
+    Refused { code: String, message: String },
 }
 
 /// How a call is settled.

@@ -13,8 +13,10 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use tower::ServiceExt;
-use zupflow_channels::fake::{ChatMessage, FakeChat, Poster, SLACK_HEADERS, sign};
+
+use zupflow_channels::fake::{ChatMessage, FakeChannelProvider, FakeChat, Poster, SLACK_HEADERS, sign};
 use zupflow_core::channels::store::{NewConversation, NewInstall, NewMessage, SealedVersion};
 use zupflow_core::channels::{ConnectionTeam, ConversationKind, Direction, FIRST_VERSION, Identity};
 use zupflow_core::ids::{ChannelAppId, ChannelConnectionId, ChannelMessageId, OrganizationId, RunId, WorkspaceId};
@@ -86,17 +88,23 @@ pub struct Made {
 
 pub struct World {
     pub setup: Setup,
-    pub chat: FakeChat,
+    /// The team's chat: what people post, and what the agents' apps do in
+    /// it with their tokens.
+    pub chat: Arc<FakeChat>,
     /// The API on the kit's clock, as the provider reaches it.
     pub api: axum::Router,
     /// The setup's agent, installed in [`TEAM`].
     pub main: Installed,
 }
 
-pub async fn world(setup: Setup) -> World {
+pub async fn world(mut setup: Setup) -> World {
+    let chat = Arc::new(FakeChat::new(TEAM));
+    setup
+        .kit
+        .use_channel_provider(Arc::new(FakeChannelProvider::in_chat(chat.clone())));
     let api = zupflow_server::app(setup.kit.state(Worker::Api), RequestGuard::default());
     let mut world = World {
-        chat: FakeChat::new(TEAM),
+        chat,
         api,
         main: placeholder(),
         setup,
@@ -179,6 +187,9 @@ impl World {
             .unwrap()
             .environment;
         let connection_id = ChannelConnectionId::generate();
+        // Each app's own token, which the chat knows it by.
+        let token = format!("xoxb-{identity}");
+        self.chat.install(&token, Poster::app(identity, &bot_id_of(identity)));
         let sealed = keys::seal(
             state.keys.as_ref(),
             &EncryptionContext::channel_connection_credential(
@@ -188,7 +199,7 @@ impl World {
                 connection_id,
                 FIRST_VERSION,
             ),
-            br#"{"token":"xoxb-test"}"#,
+            json!({ "token": token }).to_string().as_bytes(),
         )
         .await
         .unwrap();
@@ -402,6 +413,12 @@ impl World {
         while zupflow_server::channel_inbound::work_once(&state).await {}
     }
 
+    /// The replies due, posted.
+    pub async fn reply(&self) {
+        let state = self.setup.kit.state(Worker::A);
+        while zupflow_server::channel_reply::work_once(&state).await {}
+    }
+
     /// The inbound jobs, then every run, worked as far as they go.
     pub async fn work(&self) {
         self.handle().await;
@@ -472,6 +489,73 @@ impl World {
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{saved}");
+    }
+
+    /// `installed`'s connection as the API reads it.
+    pub async fn connection(&self, installed: &Installed) -> Value {
+        let (status, body) = self
+            .setup
+            .kit
+            .send(
+                call(
+                    &installed.user,
+                    Method::GET,
+                    format!(
+                        "/v1/workspaces/{}/channel-connections/{}",
+                        installed.ws, installed.connection
+                    ),
+                )
+                .naming(&installed.org),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["data"].clone()
+    }
+
+    /// The name `installed`'s agent calls its channel tool `tool` by.
+    pub async fn tool(&self, installed: &Installed, tool: &str) -> String {
+        let connection = self.connection(installed).await;
+        format!("slack_{}_{tool}", connection["short_id"].as_str().unwrap())
+    }
+
+    /// The line that has the model call `installed`'s channel tool `tool`.
+    pub async fn calling(&self, installed: &Installed, tool: &str, arguments: Value) -> String {
+        format!("call {} {arguments}", self.tool(installed, tool).await)
+    }
+
+    /// Grants `installed`'s agent these channel tools, and no others: each
+    /// the organization's levels approve first is granted needing approval.
+    pub async fn grant(&self, installed: &Installed, tools: &[&str]) {
+        let approved: Vec<&str> = tools
+            .iter()
+            .copied()
+            .filter(|tool| {
+                zupflow_core::channels::channel_tool(tool)
+                    .is_some_and(|(_, level)| level == zupflow_core::policy::ToolLevel::Approve)
+            })
+            .collect();
+        self.configure(installed, json!({ "tools": tools, "approval_required": approved }))
+            .await;
+    }
+
+    /// The ID `installed`'s connection gives the conversation `external_id`.
+    pub async fn conversation_id(&self, installed: &Installed, external_id: &str) -> String {
+        self.conversations(installed)
+            .await
+            .into_iter()
+            .find(|conversation| conversation["external_id"] == external_id)
+            .map(|conversation| id(&conversation).to_owned())
+            .unwrap()
+    }
+
+    /// The ID `installed`'s connection gives the message `message`.
+    pub async fn message_id(&self, installed: &Installed, message: &ChatMessage) -> String {
+        self.messages_in(installed, &message.channel)
+            .await
+            .into_iter()
+            .find(|held| held["external_id"] == message.ts.as_str())
+            .map(|held| id(&held).to_owned())
+            .unwrap()
     }
 
     /// The conversation's messages in `installed`'s workspace, newest first.
@@ -578,6 +662,42 @@ impl World {
                 .unwrap();
         assert_eq!(updated.rows_affected(), 1);
         pool.close().await;
+    }
+
+    /// Every value the database holds, as text where it is text, one per
+    /// line: what a test finds nowhere is nowhere.
+    pub async fn database_text(&self) -> String {
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", self.setup.kit.database().display()))
+            .await
+            .unwrap();
+        let tables: Vec<(String,)> = sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let mut text = String::new();
+        for (table,) in tables {
+            let columns: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT name FROM pragma_table_info('{table}')"
+            )))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            for (column,) in columns {
+                let values: Vec<(Option<Vec<u8>>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                    "SELECT CAST(\"{column}\" AS BLOB) FROM \"{table}\""
+                )))
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+                for value in values.into_iter().filter_map(|(value,)| value) {
+                    text.push_str(&format!("{table}.{column}: "));
+                    text.push_str(&String::from_utf8_lossy(&value).replace('\n', " "));
+                    text.push('\n');
+                }
+            }
+        }
+        pool.close().await;
+        text
     }
 
     /// Approves the call `run` waits on, as the organization's backend would.

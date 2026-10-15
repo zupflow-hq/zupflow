@@ -626,6 +626,15 @@ impl Kit {
         }
     }
 
+    /// Every worker and the API reach channels through `provider` from now.
+    pub fn use_channel_provider(&mut self, provider: Arc<dyn zupflow_core::channels::provider::ChannelProvider>) {
+        self.base.channel_provider = provider;
+        self.api = zupflow_server::app(
+            worker_state(&self.base, &self.faults, Worker::Api),
+            RequestGuard::default(),
+        );
+    }
+
     /// The server's database file, for what a test sets up that no API does.
     pub fn database(&self) -> &std::path::Path {
         &self.database

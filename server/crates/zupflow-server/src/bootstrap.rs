@@ -185,7 +185,7 @@ pub fn channel_provider(config: &Config) -> Arc<dyn zupflow_core::channels::prov
     match config.channel_provisioner {
         ChannelProvisionerMode::Slack => Arc::new(zupflow_slack::SlackChannelProvider::new(config.slack_api.clone())),
         ChannelProvisionerMode::None | ChannelProvisionerMode::Scripted => {
-            Arc::new(zupflow_channels::fake::FakeChannelProvider)
+            Arc::new(zupflow_channels::fake::FakeChannelProvider::default())
         }
     }
 }

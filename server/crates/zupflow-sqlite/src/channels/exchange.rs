@@ -13,7 +13,9 @@ use uuid::Uuid;
 use zupflow_core::channels::reply::{ChannelReply, lookup_stale, reply_job};
 use zupflow_core::channels::store::{ChannelError, PersonLookup};
 use zupflow_core::channels::{ConnectionStatus, ConversationKind};
-use zupflow_core::ids::{ChannelConnectionId, ChannelMessageId, ChannelPersonId, OrganizationId, RunId, WorkspaceId};
+use zupflow_core::ids::{
+    ChannelConnectionId, ChannelConversationId, ChannelMessageId, ChannelPersonId, OrganizationId, RunId, WorkspaceId,
+};
 use zupflow_core::runs::store::StoreError;
 use zupflow_core::scope::Scope;
 use zupflow_core::time::Timestamp;
@@ -198,7 +200,7 @@ pub(super) async fn reply_of(
     .map_err(failed("reply_of"))?;
     let sent: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM channel_messages WHERE organization_id = ? AND workspace_id = ? AND connection_id = ? \
-         AND run_id = ? AND direction = 'outbound' ORDER BY created_at, id LIMIT 1",
+         AND run_id = ? AND direction = 'outbound' AND tool_call_id IS NULL ORDER BY created_at, id LIMIT 1",
     )
     .bind(organization_id.uuid())
     .bind(workspace_id.uuid())
@@ -230,8 +232,11 @@ pub(super) async fn reply_of(
 }
 
 /// Queues the reply job for a channel run that just ended, inside the
-/// transaction that ends it, when it ended with an answer: the job reads
-/// the rest ([`reply_of`]).
+/// transaction that ends it, when it ended with an answer, its agent
+/// channel replies with the output, and the run didn't answer its thread
+/// itself: neither a post it recorded there nor a call that may have posted
+/// there (started, completed or of unknown outcome, recorded or not). The
+/// job reads the rest ([`reply_of`]).
 pub(crate) async fn queue_reply(
     connection: &mut SqliteConnection,
     organization_id: OrganizationId,
@@ -239,21 +244,53 @@ pub(crate) async fn queue_reply(
     run_id: RunId,
     now: Timestamp,
 ) -> Result<(), StoreError> {
-    let answered: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM runs WHERE organization_id = ? AND workspace_id = ? AND id = ? \
-         AND channel_session_id IS NOT NULL AND status = 'completed' AND silent_reason IS NULL \
-         AND trim(coalesce(output, '')) <> ''",
+    let unavailable = |error: sqlx::Error| {
+        tracing::error!(event = "channels.database_error", operation = "queue_reply", %error);
+        StoreError::Unavailable
+    };
+    let answering = sqlx::query(
+        "SELECT r.channel_connection_id, r.channel_conversation_id, r.channel_thread_key FROM runs r \
+         JOIN channel_sessions s ON s.organization_id = r.organization_id AND s.workspace_id = r.workspace_id \
+         AND s.id = r.channel_session_id \
+         JOIN agent_channels h ON h.organization_id = r.organization_id AND h.workspace_id = r.workspace_id \
+         AND h.id = s.agent_channel_id AND h.connection_id = r.channel_connection_id \
+         WHERE r.organization_id = ? AND r.workspace_id = ? AND r.id = ? \
+         AND r.status = 'completed' AND r.silent_reason IS NULL AND trim(coalesce(r.output, '')) <> '' \
+         AND h.reply_with_output = 1 \
+         AND NOT EXISTS (SELECT 1 FROM channel_messages g WHERE g.organization_id = r.organization_id \
+         AND g.workspace_id = r.workspace_id AND g.connection_id = r.channel_connection_id \
+         AND g.conversation_id = r.channel_conversation_id AND g.thread_key = r.channel_thread_key \
+         AND g.run_id = r.id AND g.direction = 'outbound' AND g.tool_call_id IS NOT NULL)",
     )
     .bind(organization_id.uuid())
     .bind(workspace_id.uuid())
     .bind(run_id.uuid())
     .fetch_optional(&mut *connection)
     .await
-    .map_err(|error| {
+    .map_err(unavailable)?;
+    let Some(answering) = answering else {
+        return Ok(());
+    };
+    let read_column = |error: sqlx::Error| {
         tracing::error!(event = "channels.database_error", operation = "queue_reply", %error);
         StoreError::Unavailable
-    })?;
-    if answered.is_none() {
+    };
+    let connection_id: Uuid = answering.try_get("channel_connection_id").map_err(read_column)?;
+    let origin: Uuid = answering.try_get("channel_conversation_id").map_err(read_column)?;
+    let thread_key: Option<String> = answering.try_get("channel_thread_key").map_err(read_column)?;
+    let thread_key = thread_key.unwrap_or_default();
+    if posted_to_origin(
+        connection,
+        (
+            organization_id,
+            workspace_id,
+            ChannelConnectionId::from_uuid(connection_id),
+        ),
+        run_id,
+        (origin, &thread_key),
+    )
+    .await?
+    {
         return Ok(());
     }
     let job = reply_job(run_id).ok_or(StoreError::Unavailable)?;
@@ -271,4 +308,82 @@ pub(crate) async fn queue_reply(
         StoreError::Unavailable
     })?;
     Ok(())
+}
+
+/// Whether a call of the run may have posted in the thread it began in:
+/// `reply`, or `send_message` to that conversation and thread, started,
+/// completed or of unknown outcome.
+async fn posted_to_origin(
+    connection: &mut SqliteConnection,
+    (organization_id, workspace_id, connection_id): (OrganizationId, WorkspaceId, ChannelConnectionId),
+    run_id: RunId,
+    (origin, thread_key): (Uuid, &str),
+) -> Result<bool, StoreError> {
+    let unavailable = |error: sqlx::Error| {
+        tracing::error!(event = "channels.database_error", operation = "queue_reply", %error);
+        StoreError::Unavailable
+    };
+    let calls = sqlx::query(
+        "SELECT tool, arguments FROM run_tool_calls WHERE organization_id = ? AND workspace_id = ? AND run_id = ? \
+         AND channel_connection_id = ? AND tool IN ('reply', 'send_message') \
+         AND state IN ('started', 'completed', 'unknown')",
+    )
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(run_id.uuid())
+    .bind(connection_id.uuid())
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(unavailable)?;
+    for call in calls {
+        let tool: String = call.try_get("tool").map_err(unavailable)?;
+        if tool == "reply" {
+            return Ok(true);
+        }
+        let arguments: String = call.try_get("arguments").map_err(unavailable)?;
+        let arguments: serde_json::Value = serde_json::from_str(&arguments).unwrap_or_default();
+        let named = |key: &str| {
+            arguments
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        };
+        let to_origin = named("conversation")
+            .and_then(|named| ChannelConversationId::parse(named).ok())
+            .is_some_and(|conversation| conversation.uuid() == origin);
+        if !to_origin {
+            continue;
+        }
+        let in_thread = match named("thread").and_then(|named| ChannelMessageId::parse(named).ok()) {
+            None => thread_key.is_empty(),
+            Some(message) => {
+                let row = sqlx::query(
+                    "SELECT external_id, thread_key FROM channel_messages WHERE organization_id = ? \
+                     AND workspace_id = ? AND connection_id = ? AND conversation_id = ? AND id = ?",
+                )
+                .bind(organization_id.uuid())
+                .bind(workspace_id.uuid())
+                .bind(connection_id.uuid())
+                .bind(origin)
+                .bind(message.uuid())
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(unavailable)?;
+                match row {
+                    Some(row) => {
+                        let external_id: String = row.try_get("external_id").map_err(unavailable)?;
+                        let key: String = row.try_get("thread_key").map_err(unavailable)?;
+                        let key = if key.is_empty() { external_id } else { key };
+                        key == thread_key
+                    }
+                    None => false,
+                }
+            }
+        };
+        if in_thread {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

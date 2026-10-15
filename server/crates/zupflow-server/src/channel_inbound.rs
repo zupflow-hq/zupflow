@@ -65,6 +65,7 @@ use crate::auth::AppState;
 use crate::http::Failure;
 use crate::input::ProviderEventBody;
 use crate::run_engine::AgentReads;
+use zupflow_core::runs::names::Offer;
 
 pub fn routes() -> Router<AppState> {
     Router::new().route("/channels/inbound/{inbound_ref}", post(receive))
@@ -249,6 +250,12 @@ async fn receive(
         DeliveryOutcome::Uninstalled => {
             tracing::info!(event = "channels.app_uninstalled", %organization_id, %workspace_id, %app_id);
         }
+        DeliveryOutcome::Changed {
+            connection_id,
+            message_id,
+        } => {
+            tracing::info!(event = "channels.message_changed", %organization_id, %workspace_id, %app_id, %connection_id, %message_id);
+        }
         DeliveryOutcome::Duplicate | DeliveryOutcome::Ignored | DeliveryOutcome::Message { .. } => {}
     }
     Ok(answer(None))
@@ -394,14 +401,20 @@ async fn template(
         .await
         .map_err(|_| "store_unavailable")?
         .and_then(|found| found.context_window);
-    let offer = AgentReads {
+    // The agent's app tools, then its channel tools and stay_silent: one
+    // list, sorted, fixed for the session.
+    let mut tools = AgentReads {
         state,
         organization_id,
         workspace_id,
         agent_id: agent.id,
     }
     .offer()
-    .await?;
+    .await?
+    .tools()
+    .to_vec();
+    tools.extend(crate::channel_tools::session_tools(state, organization_id, &context.connection, channel).await?);
+    let offer = Offer::new(tools).map_err(|_| "offer_invalid")?;
     let preface = preface(
         context.connection.provider,
         &context.connection.identity.handle,

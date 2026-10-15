@@ -96,6 +96,7 @@ const TABLES: &[(&str, Scoping)] = &[
     ("channel_conversations", Scoping::Workspace),
     ("channel_people", Scoping::Workspace),
     ("channel_messages", Scoping::Workspace),
+    ("channel_send_slots", Scoping::Workspace),
     ("agent_channels", Scoping::Workspace),
     ("channel_sessions", Scoping::Workspace),
     ("channel_dispatches", Scoping::Workspace),

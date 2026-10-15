@@ -154,6 +154,7 @@ fn fresh() -> Snapshot {
         calls: Vec::new(),
         model_attempts: Vec::new(),
         session: None,
+        silent_reason: None,
     }
 }
 
@@ -196,12 +197,12 @@ fn record(n: u128, position: u32, name: &str, state: CallState) -> CallRecord {
         position,
         model_call_id: format!("m{n}"),
         model_tool_name: name.to_owned(),
-        target: Some(bound(tool)),
+        target: bound(tool),
         arguments: arguments(),
         state,
         decision: None,
         call_digest: Some(call_digest(
-            tool.installation_id,
+            tool.installation_id.expect("an app tool"),
             &tool.app_key,
             &tool.tool,
             &tool.definition_sha256,
@@ -258,6 +259,15 @@ fn sending(lease_ms: i64) -> Snapshot {
 
 fn model_id() -> ModelId {
     ModelId::from_uuid(Uuid::from_u128(30))
+}
+
+/// Where the session's runs begin: a thread in a channel connection.
+fn origin() -> crate::runs::state::ChannelOrigin {
+    crate::runs::state::ChannelOrigin {
+        connection_id: crate::ids::ChannelConnectionId::from_uuid(Uuid::from_u128(0xc0)),
+        conversation_id: crate::ids::ChannelConversationId::from_uuid(Uuid::from_u128(0xc1)),
+        thread_key: "1700000000.000100".to_owned(),
+    }
 }
 
 fn connection_id() -> ModelConnectionId {
@@ -879,6 +889,7 @@ fn a_final_answer_completes_the_run_with_its_turn() {
             ending: Some(RunEnding::Completed {
                 output: "Done.".to_owned(),
             }),
+            silent: None,
         })
     );
     assert_eq!(guards(&plan), releases(1));
@@ -939,7 +950,7 @@ fn each_call_is_looked_up_in_the_frozen_offer_and_decided() {
     // Bound to exactly the installation its name means, with its digest.
     let personal_call = &commit.calls[1];
     let target = personal_call.target.as_ref().expect("a target");
-    assert_eq!(target.installation_id, personal());
+    assert_eq!(target.installation_id, Some(personal()));
     assert_eq!(
         (target.installation_short_id.as_str(), target.tool.as_str()),
         ("p3x7ta", "create_task")
@@ -2413,6 +2424,7 @@ fn every_operation_says_where_it_leaves_the_run() {
                 calls: Vec::new(),
                 next,
                 ending: None,
+                silent: None,
             }),
             RunStatus::Running,
             next,
@@ -2426,6 +2438,7 @@ fn every_operation_says_where_it_leaves_the_run() {
                 calls: Vec::new(),
                 next: Continuation::Done,
                 ending: Some(failed.clone()),
+                silent: None,
             }),
             RunStatus::Failed,
             Continuation::Done,
@@ -2700,7 +2713,7 @@ fn commit(snapshot: &mut Snapshot, request: &TransitionRequest, now: Timestamp) 
             let record = &mut snapshot.calls[index];
             assert_eq!(record.state, CallState::AwaitingApproval, "only a waiting call");
             assert_eq!(
-                record.target.as_ref().map(|target| target.installation_id),
+                record.target.as_ref().and_then(|target| target.installation_id),
                 Some(refuse.installation_id),
                 "bound to the installation that went"
             );
@@ -3374,7 +3387,7 @@ fn long_floats_in_arguments_survive_storage() {
     };
     let target = call.target.clone().expect("a target");
     call.call_digest = Some(call_digest(
-        target.installation_id,
+        target.installation_id.expect("an app tool"),
         &target.app_key,
         &target.tool,
         &target.definition_sha256,
@@ -3444,6 +3457,7 @@ fn in_session() -> Snapshot {
     let mut snapshot = running(Continuation::NeedModel { turn: 0 });
     snapshot.input = "[Ana] and now?".to_owned();
     snapshot.session = Some(crate::runs::state::SessionContext {
+        origin: origin(),
         history: vec![
             Message::User {
                 text: "[Ana] hello".to_owned(),
@@ -3470,6 +3484,7 @@ fn steer(text: &str) -> crate::runs::transition::Steer {
             id: crate::ids::ChannelMessageId::from_uuid(Uuid::from_u128(71)),
             at: at(0),
         },
+        changes_noted_at: None,
     }
 }
 
@@ -3579,4 +3594,406 @@ fn a_run_outside_a_session_takes_no_steer() {
         panic!("prepares");
     };
     assert_eq!(prepared.steer, None);
+}
+
+// ---------------------------------------------------------------------------
+// A channel session's own tools
+
+/// The session's channel tools: `reply` through its origin's connection,
+/// and `stay_silent`.
+fn channel_offer() -> Offer {
+    let connection = crate::channels::tools::OfferingConnection {
+        id: origin().connection_id,
+        provider: crate::channels::ChannelProviderKind::Slack,
+        short_id: "c4n7xt",
+        label: "helper",
+        handle: "helper",
+    };
+    Offer::new(vec![
+        crate::channels::tools::offered_tool(&connection, "reply").expect("offered"),
+        crate::channels::tools::stay_silent().expect("offered"),
+    ])
+    .expect("an offer")
+}
+
+const CHANNEL_REPLY: &str = "slack_c4n7xt_reply";
+
+/// A channel run whose session offers its channel tools, turn 0 prepared
+/// as attempt 1 and awaiting its answer.
+fn channel_awaiting_model() -> Snapshot {
+    let mut snapshot = in_session();
+    if let Some(session) = snapshot.session.as_mut() {
+        session.offer = channel_offer();
+    }
+    snapshot.control.continuation = Continuation::AwaitModel { turn: 0, attempt: 1 };
+    let digest = model_request(&snapshot, 0, 1, None, &channel_offer(), None)
+        .expect("a request")
+        .digest();
+    snapshot.model_attempts.push(ModelAttempt {
+        turn: 0,
+        attempt: 1,
+        state: ModelAttemptState::Prepared,
+        request_digest: digest,
+        offer: channel_offer(),
+        timed_out: false,
+    });
+    snapshot
+}
+
+fn object(value: Value) -> Map<String, Value> {
+    match value {
+        Value::Object(object) => object,
+        other => panic!("not an object: {other}"),
+    }
+}
+
+fn calling(calls: &[(&str, &str, Value)]) -> Reply {
+    Reply::ToolCalls {
+        text: None,
+        calls: calls
+            .iter()
+            .map(|(id, name, arguments)| ModelToolCall {
+                id: (*id).to_owned(),
+                name: (*name).to_owned(),
+                arguments: object(arguments.clone()),
+            })
+            .collect(),
+    }
+}
+
+fn committed(plan: &Plan) -> &CommitTurn {
+    match operation(plan) {
+        Operation::CommitTurn(commit) => commit,
+        other => panic!("not a committed turn: {other:?}"),
+    }
+}
+
+#[test]
+fn stay_silent_ends_a_channel_run_with_its_reason_once_its_calls_are_settled() {
+    let silent = calling(&[(
+        "s",
+        crate::channels::tools::STAY_SILENT,
+        json!({ "reason": " Not for me. " }),
+    )]);
+    let facts = Facts {
+        model: Some(answered(0, 1, silent)),
+        call_ids: vec![call_id(1)],
+        offer: None,
+        ..claimed()
+    };
+    let plan = planned(&channel_awaiting_model(), &facts);
+    let commit = committed(&plan);
+    assert_eq!(commit.silent.as_deref(), Some("Not for me."));
+    assert_eq!(commit.next, Continuation::Done);
+    assert_eq!(commit.ending, Some(RunEnding::Completed { output: String::new() }));
+    // The run's own: settled as recorded, bound to nothing, sent nowhere.
+    let call = &commit.calls[0];
+    assert_eq!(call.state, CallState::Completed);
+    assert_eq!((call.target.as_ref(), call.call_digest), (None, None));
+    assert_eq!(
+        call.outcome.as_ref().map(|outcome| outcome.content.as_str()),
+        Some(crate::channels::tools::STAYED_SILENT)
+    );
+    assert_eq!(guards(&plan), releases(1));
+
+    // Beside a reply asked for first, the reply is sent, bound to the run's
+    // own connection and where it began, and the silence refused: a run
+    // either posts or stays silent.
+    let both = calling(&[
+        ("r", CHANNEL_REPLY, json!({ "text": "Done." })),
+        (
+            "s",
+            crate::channels::tools::STAY_SILENT,
+            json!({ "reason": "Answered above." }),
+        ),
+    ]);
+    let facts = Facts {
+        model: Some(answered(0, 1, both)),
+        call_ids: vec![call_id(1), call_id(2)],
+        decisions: vec![(0, allow())],
+        offer: None,
+        ..claimed()
+    };
+    let plan = planned(&channel_awaiting_model(), &facts);
+    let commit = committed(&plan);
+    assert_eq!(commit.silent, None);
+    assert_eq!(commit.next, Continuation::NeedCall { turn: 0, position: 0 });
+    assert_eq!(commit.ending, None);
+    assert_eq!(commit.calls[1].state, CallState::Refused);
+    assert_eq!(
+        commit.calls[1].outcome.as_ref().map(|outcome| outcome.content.as_str()),
+        Some(POSTED_SO_NOT_SILENT)
+    );
+    let reply = &commit.calls[0];
+    let target = reply.target.as_ref().expect("bound");
+    assert_eq!(target.channel(), Some(origin().connection_id));
+    assert_eq!(target.installation_id, None);
+    assert_eq!(
+        reply.call_digest,
+        Some(crate::runs::digest::channel_call_digest(
+            origin().connection_id,
+            "slack",
+            "reply",
+            &crate::channels::tools::definition_sha256("reply").expect("defined"),
+            &object(json!({ "text": "Done." })),
+            (origin().conversation_id, origin().thread_key.as_str()),
+        ))
+    );
+
+    // Without a reason, it isn't silence: the model is told to give one.
+    let bare = calling(&[("s", crate::channels::tools::STAY_SILENT, json!({ "reason": "  " }))]);
+    let facts = Facts {
+        model: Some(answered(0, 1, bare)),
+        call_ids: vec![call_id(1)],
+        offer: None,
+        ..claimed()
+    };
+    let plan = planned(&channel_awaiting_model(), &facts);
+    let commit = committed(&plan);
+    assert_eq!(commit.silent, None);
+    assert_eq!(commit.next, Continuation::NeedModel { turn: 1 });
+    assert_eq!(commit.calls[0].state, CallState::Refused);
+    assert_eq!(
+        commit.calls[0].outcome.as_ref().map(|outcome| outcome.content.as_str()),
+        Some(crate::channels::tools::SILENT_WITHOUT_REASON)
+    );
+}
+
+#[test]
+fn an_empty_channel_answer_is_nudged_once_then_fails_the_run() {
+    let empty = |turn: u32| Facts {
+        model: Some(answered(turn, 1, Reply::Text("  ".to_owned()))),
+        offer: None,
+        ..claimed()
+    };
+    let plan = planned(&channel_awaiting_model(), &empty(0));
+    let commit = committed(&plan);
+    assert_eq!(
+        (commit.next, commit.ending.clone()),
+        (Continuation::NeedModel { turn: 1 }, None)
+    );
+    assert_eq!(guards(&plan), keeps(1));
+
+    // The next turn says so in place of the empty answer: no fallback text.
+    let mut nudged = channel_awaiting_model();
+    nudged.model_attempts[0].state = ModelAttemptState::Answered;
+    nudged.turns.push(CommittedTurn {
+        turn: 0,
+        text: Some("  ".to_owned()),
+    });
+    nudged.control.continuation = Continuation::NeedModel { turn: 1 };
+    let plan = planned(
+        &nudged,
+        &Facts {
+            offer: None,
+            ..claimed()
+        },
+    );
+    let Io::CallModel(request) = plan.io() else {
+        panic!("calls the model");
+    };
+    assert_eq!(request.messages.last(), Some(&user(crate::runs::history::NUDGE)));
+
+    // A second empty answer fails it.
+    nudged.model_attempts.push(ModelAttempt {
+        turn: 1,
+        attempt: 1,
+        state: ModelAttemptState::Prepared,
+        request_digest: request.digest(),
+        offer: channel_offer(),
+        timed_out: false,
+    });
+    nudged.control.continuation = Continuation::AwaitModel { turn: 1, attempt: 1 };
+    let plan = planned(&nudged, &empty(1));
+    let commit = committed(&plan);
+    let Some(RunEnding::Failed { error }) = &commit.ending else {
+        panic!("fails: {commit:?}");
+    };
+    assert_eq!(error.code, EMPTY_OUTPUT);
+    assert_eq!(commit.next, Continuation::Done);
+
+    // Outside a channel session, an empty answer is the run's output.
+    let plan = planned(
+        &awaiting_model(),
+        &Facts {
+            model: Some(answered(0, 1, Reply::Text(String::new()))),
+            ..claimed()
+        },
+    );
+    assert_eq!(
+        committed(&plan).ending,
+        Some(RunEnding::Completed { output: String::new() })
+    );
+}
+
+/// A channel run whose turn 0 called its reply tool, the call settled
+/// `state`, and whose turn 1 awaits its answer.
+fn channel_after_reply(state: CallState) -> Snapshot {
+    let answer = calling(&[("r", CHANNEL_REPLY, json!({ "text": "Done." }))]);
+    let facts = Facts {
+        model: Some(answered(0, 1, answer)),
+        call_ids: vec![call_id(1)],
+        decisions: vec![(0, allow())],
+        offer: None,
+        ..claimed()
+    };
+    let plan = planned(&channel_awaiting_model(), &facts);
+    let new = committed(&plan).calls[0].clone();
+    let mut snapshot = channel_awaiting_model();
+    snapshot.model_attempts[0].state = ModelAttemptState::Answered;
+    snapshot.turns.push(CommittedTurn { turn: 0, text: None });
+    snapshot.calls.push(CallRecord {
+        id: new.id,
+        turn: 0,
+        position: new.position,
+        model_call_id: new.model_call_id,
+        model_tool_name: new.model_tool_name,
+        target: new.target,
+        arguments: new.arguments,
+        state,
+        decision: new.decision,
+        call_digest: new.call_digest,
+        approval: None,
+        outcome: Some(CallOutcome {
+            content: "{\"posted\":true}".to_owned(),
+            is_error: state != CallState::Completed,
+        }),
+        failure: None,
+        attempts: Vec::new(),
+    });
+    snapshot.control.continuation = Continuation::NeedModel { turn: 1 };
+    let plan = planned(
+        &snapshot,
+        &Facts {
+            offer: None,
+            ..claimed()
+        },
+    );
+    let Io::CallModel(request) = plan.io() else {
+        panic!("calls the model");
+    };
+    snapshot.model_attempts.push(ModelAttempt {
+        turn: 1,
+        attempt: 1,
+        state: ModelAttemptState::Prepared,
+        request_digest: request.digest(),
+        offer: channel_offer(),
+        timed_out: false,
+    });
+    snapshot.control.continuation = Continuation::AwaitModel { turn: 1, attempt: 1 };
+    snapshot
+}
+
+#[test]
+fn a_run_that_posted_or_may_have_cant_stay_silent_and_isnt_nudged() {
+    for state in [CallState::Completed, CallState::Unknown] {
+        // Its blank answer after the post ends it: the thread was answered,
+        // or may have been.
+        let blank = Facts {
+            model: Some(answered(1, 1, Reply::Text("  ".to_owned()))),
+            offer: None,
+            ..claimed()
+        };
+        let commit = committed(&planned(&channel_after_reply(state), &blank)).clone();
+        assert_eq!(commit.next, Continuation::Done, "{state:?}");
+        assert!(
+            matches!(commit.ending, Some(RunEnding::Completed { .. })),
+            "{state:?}: {:?}",
+            commit.ending
+        );
+
+        // Silence after it is refused, and the run goes on.
+        let silent = Facts {
+            model: Some(answered(
+                1,
+                1,
+                calling(&[(
+                    "s",
+                    crate::channels::tools::STAY_SILENT,
+                    json!({ "reason": "Nothing to add." }),
+                )]),
+            )),
+            call_ids: vec![call_id(2)],
+            offer: None,
+            ..claimed()
+        };
+        let commit = committed(&planned(&channel_after_reply(state), &silent)).clone();
+        assert_eq!(commit.silent, None, "{state:?}");
+        assert_eq!(commit.calls[0].state, CallState::Refused);
+        assert_eq!(
+            commit.calls[0].outcome.as_ref().map(|outcome| outcome.content.as_str()),
+            Some(POSTED_SO_NOT_SILENT)
+        );
+        assert_eq!(commit.next, Continuation::NeedModel { turn: 2 });
+    }
+}
+
+#[test]
+fn a_post_after_stay_silent_in_its_turn_is_refused() {
+    let answer = calling(&[
+        (
+            "s",
+            crate::channels::tools::STAY_SILENT,
+            json!({ "reason": "Ana has it." }),
+        ),
+        ("r", CHANNEL_REPLY, json!({ "text": "Done." })),
+    ]);
+    let facts = Facts {
+        model: Some(answered(0, 1, answer)),
+        call_ids: vec![call_id(1), call_id(2)],
+        decisions: vec![(1, allow())],
+        offer: None,
+        ..claimed()
+    };
+    let plan = planned(&channel_awaiting_model(), &facts);
+    let commit = committed(&plan);
+    assert_eq!(commit.silent.as_deref(), Some("Ana has it."));
+    assert_eq!(commit.calls[1].state, CallState::Refused);
+    assert_eq!(
+        commit.calls[1].failure.as_ref().map(|failure| failure.message.as_str()),
+        Some(SILENT_SO_NOT_POSTED)
+    );
+    assert_eq!(commit.next, Continuation::Done);
+    assert_eq!(commit.ending, Some(RunEnding::Completed { output: String::new() }));
+}
+
+#[test]
+fn a_runs_channel_changes_count_edits_and_reactions_beside_posts() {
+    let connection = crate::channels::tools::OfferingConnection {
+        id: origin().connection_id,
+        provider: crate::channels::ChannelProviderKind::Slack,
+        short_id: "c4n7xt",
+        label: "helper",
+        handle: "helper",
+    };
+    let call = |n: u128, tool: &str, state: CallState| {
+        let offered = crate::channels::tools::offered_tool(&connection, tool).expect("offered");
+        CallRecord {
+            id: call_id(n),
+            turn: 0,
+            position: 0,
+            model_call_id: format!("m{n}"),
+            model_tool_name: offered.name.clone(),
+            target: bound(&offered),
+            arguments: Map::new(),
+            state,
+            decision: None,
+            call_digest: None,
+            approval: None,
+            outcome: None,
+            failure: None,
+            attempts: Vec::new(),
+        }
+    };
+    let mut snapshot = in_session();
+    snapshot.calls = vec![
+        call(1, "reply", CallState::Completed),
+        call(2, "react", CallState::Completed),
+        call(3, "edit_message", CallState::Unknown),
+        call(4, "delete_message", CallState::AwaitingApproval),
+        call(5, "react", CallState::Refused),
+        call(6, "send_message", CallState::Failed),
+        call(7, "read_messages", CallState::Completed),
+    ];
+    assert_eq!(channel_changes(&snapshot), 4);
 }

@@ -11,8 +11,8 @@ use zeroize::Zeroizing;
 use zupflow_core::channels::ChannelProviderKind;
 use zupflow_core::channels::ConversationKind;
 use zupflow_core::channels::provider::{
-    ChannelProvider, InboundDelivery, InboundEvent, InboundRefusal, InboundRequest, NormalizedMessage, OutgoingPost,
-    ProviderCallError, ProviderPerson,
+    ChannelProvider, DeletedMessage, EditedMessage, InboundDelivery, InboundEvent, InboundRefusal, InboundRequest,
+    MessageRef, NormalizedMessage, OutgoingPost, ProviderCallError, ProviderPerson,
 };
 use zupflow_core::channels::provision::{
     AppManifest, AppProvisioner, ConsentExchange, ConsentRequest, InstallStep, ManagerTokens, ProvisionError,
@@ -876,21 +876,40 @@ fn the_apps_own_messages_and_other_apps_are_marked_automated() {
     }
 }
 
-/// Edits and deletions are recorded once and change nothing: a message is
-/// read as it first arrived, and that's what a model was sent.
+/// An edit by its author and a deletion are read as such, by the message
+/// they change; a change nobody made to the text (an unfurl, a reply
+/// counted) is nothing.
 #[test]
-fn edits_and_deletions_are_recorded_and_nothing_more() {
-    for (fixture, event_id) in [
-        ("message_changed", "Ev0EDITED001"),
-        ("message_deleted", "Ev0DELETED01"),
-        ("message_unfurled", "Ev0UNFURL001"),
-    ] {
-        assert_eq!(
-            read(fixture),
-            delivered(event_id, "message", InboundEvent::Other),
-            "{fixture}"
-        );
-    }
+fn edits_and_deletions_are_read_and_other_changes_ignored() {
+    assert_eq!(
+        read("message_changed"),
+        delivered(
+            "Ev0EDITED001",
+            "message",
+            InboundEvent::Edited(Box::new(EditedMessage {
+                conversation_external_id: "C0GENERAL".to_owned(),
+                external_id: "1760000160.000300".to_owned(),
+                text: "Thanks <@UBOT00001>, and <@U0ALICE01> too".to_owned(),
+                edited_at: at("1760000220.000000"),
+            }))
+        )
+    );
+    assert_eq!(
+        read("message_deleted"),
+        delivered(
+            "Ev0DELETED01",
+            "message",
+            InboundEvent::Deleted(Box::new(DeletedMessage {
+                conversation_external_id: "C0GENERAL".to_owned(),
+                external_id: "1760000160.000300".to_owned(),
+                deleted_at: at("1760000700.000100"),
+            }))
+        )
+    );
+    assert_eq!(
+        read("message_unfurled"),
+        delivered("Ev0UNFURL001", "message", InboundEvent::Other)
+    );
 }
 
 #[test]
@@ -1374,5 +1393,80 @@ fn the_fake_is_reached_at_its_own_address() {
     assert_eq!(
         FakeSlack::api().method_url("auth.test"),
         format!("{FAKE_API_URL}/auth.test")
+    );
+}
+
+/// What a run's channel tools ask of the provider, with the connection's
+/// bot token: an edit, a reaction and a deletion of a message by its
+/// conversation and `ts`, a direct conversation opened with one user, and
+/// the thread's status while the agent works.
+#[tokio::test]
+async fn the_provider_edits_reacts_deletes_opens_dms_and_shows_work() {
+    let slack = FakeSlack::new();
+    let token = installed(&slack).await;
+    let provider = SlackChannelProvider::new(FakeSlack::api());
+    let posted = provider
+        .post(
+            &slack,
+            &token,
+            &OutgoingPost {
+                conversation_external_id: "C0GENERAL",
+                thread_key: "1760000100.000200",
+                text: "On it.",
+                send_id: "call_0001",
+            },
+        )
+        .await
+        .expect("posted");
+    let message = MessageRef {
+        conversation_external_id: "C0GENERAL",
+        external_id: &posted,
+    };
+    provider.edit(&slack, &token, &message, "Done.").await.expect("edited");
+    assert_eq!(slack.calls_to("chat.update")[0].form["ts"], posted);
+    provider
+        .react(&slack, &token, &message, "eyes", false)
+        .await
+        .expect("reacted");
+    assert_eq!(slack.calls_to("reactions.add")[0].form["timestamp"], posted);
+    provider.delete(&slack, &token, &message).await.expect("deleted");
+    provider
+        .delete(&slack, &token, &message)
+        .await
+        .expect("deleted already");
+    slack.add_user(json!({ "id": "U0ALICE01", "name": "alice", "deleted": false, "is_bot": false }));
+    assert_eq!(
+        provider.open_direct(&slack, &token, "U0ALICE01").await,
+        Ok("DU0ALICE01".to_owned())
+    );
+    // A bot ID names no one to message.
+    assert_eq!(
+        provider.open_direct(&slack, &token, "B0WEBHOOK").await,
+        Err(ProviderCallError::Refused("user_not_found"))
+    );
+    assert!(
+        provider
+            .show_working(&slack, &token, "C0GENERAL", "1760000100.000200", true)
+            .await
+    );
+    assert!(
+        provider
+            .show_working(&slack, &token, "C0GENERAL", "1760000100.000200", false)
+            .await
+    );
+    let cleared = slack.calls_to("assistant.threads.setStatus").pop().expect("cleared");
+    assert_eq!(cleared.form["status"], "");
+    // A DM's top level has no thread to show it in; a failure is only not shown.
+    assert!(!provider.show_working(&slack, &token, "D0ALICEDM", "", true).await);
+    slack.fail_next("assistant.threads.setStatus", Fault::Status(500));
+    assert!(
+        !provider
+            .show_working(&slack, &token, "C0GENERAL", "1760000100.000200", true)
+            .await
+    );
+    slack.fail_next("chat.update", Fault::Error("cant_update_message".to_owned()));
+    assert_eq!(
+        provider.edit(&slack, &token, &message, "Again.").await,
+        Err(ProviderCallError::Refused("cant_update_message"))
     );
 }

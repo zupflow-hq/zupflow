@@ -2,9 +2,11 @@
 //! paths, over the providers' APIs faked in process: every turn of every
 //! run in a thread's session continues the turn before it, byte for byte,
 //! through a second run, a steered turn, a collected follow-up, an
-//! approval pause, and a worker that dies mid-run. The one break is the
-//! trim, when the history would go over its budget: once, there, and the
-//! runs after it continue again.
+//! approval pause, a worker that dies mid-run, a run that calls a channel
+//! tool, an edit noted in the next turn, and the agent, its connection and
+//! its team renamed mid-session.
+//! The one break is the trim, when the history would go over its budget:
+//! once, there, and the runs after it continue again.
 
 #![allow(clippy::unwrap_used)]
 
@@ -252,5 +254,104 @@ async fn breaks_the_prefix_once_when_the_history_is_trimmed() {
             "{name}: the second and third runs, then the fourth's"
         );
         assert_eq!(messages(&sent[4]), 7, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn continues_a_session_through_a_channel_tool_an_edit_and_a_rename() {
+    for (kind, model) in PATHS {
+        let (world, _) = on(kind, model).await;
+        let name = format!("{kind:?} {model}");
+        let main = &world.main;
+        world.grant(main, &["reply", "react"]).await;
+        let reply = world.calling(main, "reply", json!({ "text": "On it." })).await;
+        let before = turns(&world).len();
+
+        // A run that answers through its reply tool.
+        let asked = world
+            .say(ANA, &format!("{} is the build red?\n{reply}", main.mention()), None)
+            .await;
+        world.work().await;
+        // The question edited, and the agent renamed, while the session
+        // lasts.
+        world
+            .deliver(main, &world.chat.edit(&asked, "is the build green?", world.now()))
+            .await;
+        let (status, renamed) = world
+            .setup
+            .kit
+            .send(
+                call(
+                    "alice",
+                    Method::PATCH,
+                    format!("/v1/workspaces/{}/agents/{}", world.setup.ws, main.agent),
+                )
+                .naming(&world.setup.org)
+                .body(json!({ "name": "Release helper" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{renamed}");
+        // Its connection relabelled, and the team renamed at the provider:
+        // names people see, not the model.
+        let (status, relabelled) = world
+            .setup
+            .kit
+            .send(
+                call(
+                    "alice",
+                    Method::PATCH,
+                    format!("/v1/workspaces/{}/channel-connections/{}", main.ws, main.connection),
+                )
+                .naming(&world.setup.org)
+                .body(json!({ "label": "Release desk" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{relabelled}");
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", world.setup.kit.database().display()))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE channel_connections SET team_name = 'North Renamed' WHERE team_id = 'T0NORTH'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let state = world.setup.kit.state(Worker::A);
+        while zupflow_server::channels::work_once(&state).await {}
+        world.say(BO, "thanks", Some(&asked.ts)).await;
+        world.work().await;
+
+        let runs = world.runs(main).await;
+        assert_eq!(runs.len(), 2, "{name}");
+        assert!(runs.iter().all(|run| run["status"] == "completed"), "{name}: {runs:?}");
+        assert_eq!(runs[0]["session_id"], runs[1]["session_id"], "{name}");
+        assert_eq!(world.chat.posted_by_apps().len(), 1, "{name}");
+        let sent = turns(&world).split_off(before);
+        // The call and the answer after it, then the follow-up.
+        assert_eq!(sent.len(), 3, "{name}");
+        assert_eq!(breaks(kind, &sent), [], "{name}: every turn continues the one before");
+        // Its tools are the session's, offered unchanged on every turn.
+        let tools = |turn: &Received| turn.body["tools"].clone();
+        assert_eq!(tools(&sent[0]), tools(&sent[2]), "{name}");
+        let offered = tools(&sent[0]).to_string();
+        assert!(
+            offered.contains("_reply") && offered.contains("stay_silent"),
+            "{name}: {offered}"
+        );
+        // The edit is noted at the start of the next turn, and the turn the
+        // model read before is as it was.
+        let last = String::from_utf8_lossy(&sent[2].raw).into_owned();
+        assert!(
+            last.contains("[U0ANA edited an earlier message] is the build green?"),
+            "{name}: {last}"
+        );
+        assert!(last.contains("is the build red?"), "{name}");
+        assert!(
+            !last.contains("Release helper"),
+            "{name}: the session keeps its preface"
+        );
+        assert!(
+            !offered.contains("Release desk") && !offered.contains("North Renamed"),
+            "{name}: {offered}"
+        );
     }
 }

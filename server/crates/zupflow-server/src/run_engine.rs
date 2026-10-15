@@ -57,7 +57,7 @@ use zupflow_core::model_store::{ModelStatus, RouteState};
 use zupflow_core::models::{ProviderAccess, ProviderError, Turn, prompt_cache_key, validate_completion};
 use zupflow_core::policy::{CallApp, Decision, GrantedAs, OrganizationLevel, ToolCall, Verdict, floor};
 use zupflow_core::runs::digest::{Sha256Digest, call_digest};
-use zupflow_core::runs::names::{Candidate, Offer, OfferedTool, build_offer};
+use zupflow_core::runs::names::{Candidate, Offer, OfferedTool, ToolHost, build_offer};
 use zupflow_core::runs::reducer::{
     Facts, Gone, Idle, InstallationCheck, Io, Limits, MODEL_FAILED, MODEL_KEY_INVALID, MODEL_UNAVAILABLE, ModelAnswer,
     ModelRequest, ModelResult, Plan, SendCheck, SendRequest, SendResult, Unanswered, UnansweredWhy, advance,
@@ -74,6 +74,7 @@ use zupflow_core::tools::{RegisteredTool, ToolError};
 use zupflow_mcp::CallError;
 
 use crate::auth::AppState;
+use crate::channel_tools;
 use crate::mcp_access::{self, Unreachable};
 use crate::model_access::{self, Unopened};
 use crate::run_observe;
@@ -298,6 +299,23 @@ impl<P: ToolPort> Driver<'_, P> {
         let mut model: Option<ModelAnswer> = None;
         let mut sent: Option<SendResult> = None;
         let mut reach: Option<P::Reach> = None;
+        let mut working: Option<channel_tools::Working> = None;
+        let outcome = self
+            .steps_until_done(&mut model, &mut sent, &mut reach, &mut working)
+            .await;
+        if let Some(working) = working {
+            working.stop().await;
+        }
+        outcome
+    }
+
+    async fn steps_until_done(
+        &mut self,
+        model: &mut Option<ModelAnswer>,
+        sent: &mut Option<SendResult>,
+        reach: &mut Option<P::Reach>,
+        working: &mut Option<channel_tools::Working>,
+    ) -> Outcome {
         // Every step commits or reloads; a run that keeps conflicting is
         // given back rather than worked forever.
         let budget = self.limits.max_steps_per_claim.saturating_mul(4).saturating_add(16);
@@ -320,9 +338,9 @@ impl<P: ToolPort> Driver<'_, P> {
                         attempt: answer.attempt,
                     })
             }) {
-                model = None;
+                *model = None;
             }
-            let facts = match self.facts(&snapshot, model.as_ref(), sent.as_ref(), &mut reach).await {
+            let facts = match self.facts(&snapshot, model.as_ref(), sent.as_ref(), reach).await {
                 Ok(facts) => facts,
                 Err(why) => return Outcome::Retry(why),
             };
@@ -336,7 +354,7 @@ impl<P: ToolPort> Driver<'_, P> {
             let (request, then) = match plan {
                 Plan::Apply { request, then } => (request, then),
                 Plan::Idle(Idle::Recorded) => {
-                    sent = None;
+                    *sent = None;
                     continue;
                 }
                 Plan::Idle(Idle::Finished | Idle::AwaitingApproval) => return Outcome::Complete,
@@ -381,7 +399,7 @@ impl<P: ToolPort> Driver<'_, P> {
                             self.steps = 0;
                         }
                         // The send claim isn't this outcome's to record.
-                        Conflict::SendClaim => sent = None,
+                        Conflict::SendClaim => *sent = None,
                     }
                     continue;
                 }
@@ -398,8 +416,8 @@ impl<P: ToolPort> Driver<'_, P> {
             self.steps = self.steps.saturating_add(1);
             match operation {
                 Operation::Claim(claim) => self.claim = Some(claim.epoch),
-                Operation::RecordOutcome(_) => sent = None,
-                Operation::CommitTurn(_) | Operation::Yield(_) | Operation::Finish(_) => model = None,
+                Operation::RecordOutcome(_) => *sent = None,
+                Operation::CommitTurn(_) | Operation::Yield(_) | Operation::Finish(_) => *model = None,
                 _ => {}
             }
             // A step that released the claim dealt with the job too.
@@ -408,7 +426,22 @@ impl<P: ToolPort> Driver<'_, P> {
                 .owner
                 .is_some_and(|owner| owner.renew_lease_ms.is_none());
             match then {
-                Io::CallModel(asked) => model = Some(self.ask(&snapshot, &asked).await),
+                Io::CallModel(asked) => {
+                    // The thread shows the agent working while its model
+                    // answers: best effort, never a reason to fail.
+                    if working.is_none()
+                        && let Some(session) = &snapshot.session
+                    {
+                        *working = channel_tools::Working::start(
+                            self.state,
+                            self.organization_id,
+                            self.workspace_id,
+                            &session.origin,
+                        )
+                        .await;
+                    }
+                    *model = Some(self.ask(&snapshot, &asked).await);
+                }
                 Io::SendCall(send) => {
                     let started = std::time::Instant::now();
                     let outcome = match reach.take() {
@@ -439,7 +472,28 @@ impl<P: ToolPort> Driver<'_, P> {
                         started.elapsed(),
                     )
                     .await;
-                    sent = Some(sent_result(&send, outcome));
+                    *sent = Some(sent_result(&send, outcome));
+                }
+                Io::SendChannel(send) => {
+                    let started = std::time::Instant::now();
+                    let outcome = channel_tools::send(self.state, &send).await;
+                    run_observe::channel_sent(
+                        self.state,
+                        self.organization_id,
+                        self.workspace_id,
+                        self.environment,
+                        self.run_id,
+                        &send,
+                        &outcome,
+                        started.elapsed(),
+                    )
+                    .await;
+                    *sent = Some(SendResult {
+                        call_id: send.call_id,
+                        attempt: send.attempt,
+                        invocation_id: send.invocation_id,
+                        outcome,
+                    });
                 }
                 Io::Nothing if released => return Outcome::Leave,
                 Io::Nothing => {}
@@ -497,8 +551,33 @@ impl<P: ToolPort> Driver<'_, P> {
                 }
                 Some(ModelResult::Answered(completion)) => {
                     let wanted = calls_to_decide(snapshot, completion, &self.limits).map_err(|_| "run_inconsistent")?;
+                    // What the run changed, and what this turn's earlier
+                    // calls would change, count against its changes.
+                    let mut changes = zupflow_core::runs::reducer::channel_changes(snapshot);
                     for (position, tool) in wanted {
-                        facts.decisions.push((position, self.decide_offered(tool).await?));
+                        let decision = match tool.host() {
+                            ToolHost::Channel(_) => {
+                                let arguments = asked_arguments(completion, position);
+                                let decided = channel_tools::decide(
+                                    self.state,
+                                    self.organization_id,
+                                    self.workspace_id,
+                                    self.run_id,
+                                    &tool.tool,
+                                    &arguments,
+                                    Some(changes),
+                                )
+                                .await?;
+                                if channel_tool_changes(&tool.tool)
+                                    && !matches!(decided.verdict, CallVerdict::Deny { .. })
+                                {
+                                    changes = changes.saturating_add(1);
+                                }
+                                decided
+                            }
+                            _ => self.decide_offered(tool).await?,
+                        };
+                        facts.decisions.push((position, decision));
                     }
                     let asked = match &completion.reply {
                         zupflow_core::models::Reply::ToolCalls { calls, .. } => calls.len(),
@@ -520,7 +599,48 @@ impl<P: ToolPort> Driver<'_, P> {
                 }
                 _ => {}
             },
-            Continuation::AwaitApproval { .. } | Continuation::AwaitCall { .. } | Continuation::Done => {}
+            // A channel post whose sender stopped is settled by finding it,
+            // rather than left unknown.
+            Continuation::AwaitCall { call_id, attempt } => {
+                let lapsed = snapshot
+                    .call(call_id)
+                    .filter(|call| call.state == CallState::Started)
+                    .and_then(|call| {
+                        call.attempt(attempt)
+                            .filter(|sending| !sending.outcome_recorded && sending.send_lease_until <= facts.now)
+                            .map(|sending| (call, sending))
+                    });
+                if let Some((call, sending)) = lapsed
+                    && call.target.as_ref().is_some_and(|target| target.channel().is_some())
+                {
+                    let lease = i64::try_from(self.limits.send_lease_ms).unwrap_or(i64::MAX);
+                    let attempted_at = zupflow_core::time::Timestamp::from_millis(
+                        sending
+                            .send_lease_until
+                            .millis()
+                            .saturating_sub(lease)
+                            .saturating_sub(60_000),
+                    );
+                    let settled = channel_tools::settle_lapsed(
+                        self.state,
+                        self.organization_id,
+                        self.workspace_id,
+                        self.run_id,
+                        call,
+                        attempted_at,
+                    )
+                    .await;
+                    if let Some(outcome) = settled {
+                        facts.sent = Some(SendResult {
+                            call_id,
+                            attempt,
+                            invocation_id: sending.invocation_id,
+                            outcome,
+                        });
+                    }
+                }
+            }
+            Continuation::AwaitApproval { .. } | Continuation::Done => {}
         }
         Ok(facts)
     }
@@ -764,7 +884,10 @@ impl<P: ToolPort> Driver<'_, P> {
     /// The floor's and then the policy's decision on a call to an offered
     /// tool, read now.
     async fn decide_offered(&self, tool: &OfferedTool) -> Result<CallDecision, &'static str> {
-        let Some(installation) = self.reads().installation(tool.installation_id).await? else {
+        let Some(installation_id) = tool.installation_id else {
+            return Ok(not_granted(&tool.tool, self.state.approvals.name()));
+        };
+        let Some(installation) = self.reads().installation(installation_id).await? else {
             // Deleted since it was offered, and its grants with it.
             return Ok(not_granted(&tool.tool, self.state.approvals.name()));
         };
@@ -781,7 +904,22 @@ impl<P: ToolPort> Driver<'_, P> {
             // An open call always has a target; the reducer says so.
             return Err("run_inconsistent");
         };
-        let Some(installation) = self.reads().installation(target.installation_id).await? else {
+        if target.channel().is_some() {
+            let check = channel_tools::send_check(
+                self.state,
+                self.organization_id,
+                self.workspace_id,
+                self.run_id,
+                call,
+                false,
+            )
+            .await?;
+            return Ok((check, None));
+        }
+        let Some(installation_id) = target.installation_id else {
+            return Err("run_inconsistent");
+        };
+        let Some(installation) = self.reads().installation(installation_id).await? else {
             let decision = call.decision.clone().ok_or("run_inconsistent")?;
             return Ok((
                 SendCheck {
@@ -810,7 +948,7 @@ impl<P: ToolPort> Driver<'_, P> {
                     CallVerdict::Deny { .. } => false,
                 } && definition.is_some_and(|definition| {
                     Some(call_digest(
-                        target.installation_id,
+                        installation_id,
                         &target.app_key,
                         &target.tool,
                         &definition,
@@ -869,7 +1007,21 @@ impl<P: ToolPort> Driver<'_, P> {
             // A call waiting for approval always has both; the store says so.
             return Err("run_inconsistent");
         };
-        let installation = match self.reads().installation(target.installation_id).await? {
+        if target.channel().is_some() {
+            return channel_tools::send_check(
+                self.state,
+                self.organization_id,
+                self.workspace_id,
+                self.run_id,
+                call,
+                true,
+            )
+            .await;
+        }
+        let Some(installation_id) = target.installation_id else {
+            return Err("run_inconsistent");
+        };
+        let installation = match self.reads().installation(installation_id).await? {
             None => InstallationCheck::Removed,
             Some(found) if found.status == InstallationStatus::Disconnected => InstallationCheck::Disconnected,
             Some(_) => InstallationCheck::Usable,
@@ -1148,6 +1300,22 @@ impl AgentReads<'_> {
             Err(_) => Levels::Unreadable,
         }
     }
+}
+
+/// The arguments the model gave the call at `position` of its answer.
+fn asked_arguments(completion: &zupflow_core::models::Completion, position: u32) -> Map<String, Value> {
+    match &completion.reply {
+        zupflow_core::models::Reply::ToolCalls { calls, .. } => usize::try_from(position)
+            .ok()
+            .and_then(|index| calls.get(index))
+            .map(|call| call.arguments.clone())
+            .unwrap_or_default(),
+        zupflow_core::models::Reply::Text(_) => Map::new(),
+    }
+}
+
+fn channel_tool_changes(tool: &str) -> bool {
+    zupflow_core::channels::tools::writes(tool)
 }
 
 /// The floor's answer for a tool no grant names any more.

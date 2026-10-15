@@ -15,6 +15,7 @@ pub mod bootstrap;
 pub mod channel_inbound;
 mod channel_install;
 pub mod channel_reply;
+mod channel_tools;
 mod channel_upkeep;
 pub mod channels;
 pub mod config;

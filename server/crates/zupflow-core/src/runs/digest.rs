@@ -16,10 +16,13 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 
-use crate::ids::InstallationId;
+use crate::ids::{ChannelConnectionId, ChannelConversationId, InstallationId};
 
 /// The domain of a call's digest.
 pub const CALL_DOMAIN: &str = "zupflow.run.call.v1";
+
+/// The domain of a channel tool call's digest.
+pub const CHANNEL_CALL_DOMAIN: &str = "zupflow.run.channel_call.v1";
 
 /// A SHA-256 digest, written `sha256:` and 64 lowercase hex characters.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -188,6 +191,37 @@ pub fn call_digest(
     digest_json(CALL_DOMAIN, &Value::Object(value))
 }
 
+/// A channel tool call's digest: its connection, the provider and the
+/// tool, the definition it was decided against, its arguments (the exact
+/// text, and any conversation, thread, person or message it names), and
+/// the conversation and thread the run was started in, where a `reply`
+/// goes. An approval is bound to it, and a send checks it again, so what's
+/// posted is exactly what was reviewed, and where.
+pub fn channel_call_digest(
+    connection_id: ChannelConnectionId,
+    provider: &str,
+    tool: &str,
+    definition_sha256: &Sha256Digest,
+    arguments: &Map<String, Value>,
+    origin: (ChannelConversationId, &str),
+) -> Sha256Digest {
+    let mut value = Map::new();
+    value.insert(
+        "channel_connection_id".to_owned(),
+        Value::String(connection_id.to_string()),
+    );
+    value.insert("provider".to_owned(), Value::String(provider.to_owned()));
+    value.insert("tool".to_owned(), Value::String(tool.to_owned()));
+    value.insert(
+        "definition_sha256".to_owned(),
+        Value::String(definition_sha256.to_hex()),
+    );
+    value.insert("arguments".to_owned(), Value::Object(arguments.clone()));
+    value.insert("origin_conversation_id".to_owned(), Value::String(origin.0.to_string()));
+    value.insert("origin_thread_key".to_owned(), Value::String(origin.1.to_owned()));
+    digest_json(CHANNEL_CALL_DOMAIN, &Value::Object(value))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -331,5 +365,80 @@ mod tests {
         for digest in changed {
             assert_ne!(digest, base);
         }
+    }
+
+    #[test]
+    fn a_channel_call_digest_covers_its_target_and_where_the_run_began() {
+        let connection = ChannelConnectionId::from_uuid(Uuid::from_u128(1));
+        let conversation = ChannelConversationId::from_uuid(Uuid::from_u128(2));
+        let definition = Sha256Digest::of(b"reply");
+        let arguments = object(json!({ "text": "On it." }));
+        let base = channel_call_digest(
+            connection,
+            "slack",
+            "reply",
+            &definition,
+            &arguments,
+            (conversation, "1.0"),
+        );
+        let others = [
+            channel_call_digest(
+                ChannelConnectionId::from_uuid(Uuid::from_u128(9)),
+                "slack",
+                "reply",
+                &definition,
+                &arguments,
+                (conversation, "1.0"),
+            ),
+            channel_call_digest(
+                connection,
+                "slack",
+                "send_message",
+                &definition,
+                &arguments,
+                (conversation, "1.0"),
+            ),
+            channel_call_digest(
+                connection,
+                "slack",
+                "reply",
+                &Sha256Digest::of(b"other"),
+                &arguments,
+                (conversation, "1.0"),
+            ),
+            channel_call_digest(
+                connection,
+                "slack",
+                "reply",
+                &definition,
+                &object(json!({ "text": "On it!" })),
+                (conversation, "1.0"),
+            ),
+            channel_call_digest(
+                connection,
+                "slack",
+                "reply",
+                &definition,
+                &arguments,
+                (ChannelConversationId::from_uuid(Uuid::from_u128(3)), "1.0"),
+            ),
+            channel_call_digest(
+                connection,
+                "slack",
+                "reply",
+                &definition,
+                &arguments,
+                (conversation, "2.0"),
+            ),
+        ];
+        for other in others {
+            assert_ne!(other, base);
+        }
+        // Never an installation call's digest over the same parts.
+        let installation = InstallationId::from_uuid(Uuid::from_u128(1));
+        assert_ne!(
+            call_digest(installation, "slack", "reply", &definition, &arguments),
+            base
+        );
     }
 }

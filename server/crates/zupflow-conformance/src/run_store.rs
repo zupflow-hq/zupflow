@@ -1117,7 +1117,7 @@ async fn walks_a_run_through_every_step(stores: &Stores<'_>, a: Tenant, agent_a:
     let target = read.target.as_ref().expect("a target");
     assert_eq!(
         (
-            target.installation_id,
+            target.installation_id.expect("an app tool"),
             target.installation_short_id.as_str(),
             target.app_key.as_str(),
             target.tool.as_str()
@@ -3128,7 +3128,7 @@ async fn writes_all_or_nothing(stores: &Stores<'_>, a: Tenant, agent_a: AgentId)
     let redigest = |call: &mut NewCall| {
         let target = call.target.clone().unwrap();
         call.call_digest = Some(call_digest(
-            target.installation_id,
+            target.installation_id.expect("an app tool"),
             &target.app_key,
             &target.tool,
             &target.definition_sha256,
@@ -3137,12 +3137,12 @@ async fn writes_all_or_nothing(stores: &Stores<'_>, a: Tenant, agent_a: AgentId)
     };
     for (operation, why) in [
         (
-            forge(&|call: &mut NewCall| call.target.as_mut().unwrap().installation_id = personal()),
+            forge(&|call: &mut NewCall| call.target.as_mut().unwrap().installation_id = Some(personal())),
             "a call sent to another installation than its name means",
         ),
         (
             forge(&|call: &mut NewCall| {
-                call.target.as_mut().unwrap().installation_id = personal();
+                call.target.as_mut().unwrap().installation_id = Some(personal());
                 redigest(call);
             }),
             "a call sent elsewhere, digested to match",
@@ -3208,6 +3208,7 @@ async fn writes_all_or_nothing(stores: &Stores<'_>, a: Tenant, agent_a: AgentId)
             calls: Vec::<NewCall>::new(),
             next: Continuation::NeedModel { turn: 1 },
             ending: None,
+            silent: None,
         }),
     )
     .await;

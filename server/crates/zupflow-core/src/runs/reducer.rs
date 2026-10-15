@@ -33,11 +33,13 @@ use std::time::Duration;
 use serde_json::{Map, Value, json};
 
 use crate::audit::AuditActor;
-use crate::ids::{ApiKeyId, InstallationId, OrganizationId, RunId, ToolCallId, WorkspaceId};
+use crate::channels::tools::{self, SILENT_WITHOUT_REASON, STAYED_SILENT};
+use crate::ids::{ApiKeyId, ChannelConnectionId, InstallationId, OrganizationId, RunId, ToolCallId, WorkspaceId};
 use crate::model_store::RouteState;
 use crate::models::{Completion, Message, ModelToolCall, Reply, ToolSpec, Turn, validate_completion, validate_turn};
-use crate::runs::digest::{Sha256Digest, call_digest, digest_json};
-use crate::runs::names::{Offer, OfferedTool};
+use crate::runs::digest::{Sha256Digest, call_digest, channel_call_digest, digest_json};
+use crate::runs::history::{NUDGE, blank};
+use crate::runs::names::{Offer, OfferedTool, ToolHost};
 use crate::runs::state::{
     BoundTarget, CallAttempt, CallDecision, CallRecord, CallVerdict, ClaimantId, Continuation, EXECUTION_VERSION,
     InvocationId, ModelAttemptState, RequestId, Snapshot, SteeredTurn, Usage, supports,
@@ -103,6 +105,95 @@ impl Gone {
                 format!("{label} was disconnected, so this call wasn't made."),
             ),
         }
+    }
+}
+
+/// The failure code of a channel tool's call whose connection was deleted:
+/// refused, and the run goes on.
+pub const CONNECTION_REMOVED: &str = "channel_connection_removed";
+
+/// The failure code of a channel tool's call whose connection was
+/// disconnected or needs reconnecting: refused, and the run goes on.
+pub const CONNECTION_UNUSABLE: &str = "channel_connection_unusable";
+
+/// The failure code of a run whose model answered with nothing twice, and
+/// never called `stay_silent`.
+pub const EMPTY_OUTPUT: &str = "empty_output";
+
+/// What the model reads back for `stay_silent` in a run that posted, or
+/// is about to.
+pub const POSTED_SO_NOT_SILENT: &str =
+    "This run posted in the thread already, so it can't stay silent. Finish with your answer instead.";
+
+/// What the model reads back for a post after `stay_silent` in its turn.
+pub const SILENT_SO_NOT_POSTED: &str = "You chose to stay silent in this turn, so nothing more is posted.";
+
+/// Whether a call's target posts a message through a channel.
+fn is_post(target: Option<&BoundTarget>) -> bool {
+    target.is_some_and(|target| target.channel().is_some() && tools::posts(&target.tool))
+}
+
+/// How many changes a run made, or may still make, at its channel's
+/// provider: posts, edits, reactions and deletions alike, allowed,
+/// awaiting approval, approved, sent or of unknown outcome. What a run's
+/// next calls are held to against its limit.
+pub fn channel_changes(snapshot: &Snapshot) -> u32 {
+    let counted = snapshot
+        .calls
+        .iter()
+        .filter(|call| {
+            call.target
+                .as_ref()
+                .is_some_and(|target| target.channel().is_some() && tools::writes(&target.tool))
+        })
+        .filter(|call| {
+            matches!(
+                call.state,
+                CallState::Allowed
+                    | CallState::AwaitingApproval
+                    | CallState::Approved
+                    | CallState::Started
+                    | CallState::Completed
+                    | CallState::Unknown
+            )
+        })
+        .count();
+    u32::try_from(counted).unwrap_or(u32::MAX)
+}
+
+/// The failure code of a call the floor, the policy or a channel's rules
+/// refused, unless its rule names its own (`outside_audience`,
+/// `rate_limited`).
+pub const TOOL_REFUSED: &str = "tool_refused";
+
+/// The code a refused call fails with: its rule's own, for the rules a
+/// channel tool's call is refused by, else [`TOOL_REFUSED`].
+pub fn refusal_code(decision: &CallDecision) -> &str {
+    match decision.rule.as_str() {
+        rule @ ("outside_audience" | "rate_limited") => rule,
+        _ => TOOL_REFUSED,
+    }
+}
+
+/// How a call's target went away, as its refusal says it.
+fn gone_refusal(gone: Gone, target: &BoundTarget) -> (&'static str, String) {
+    let label = &target.installation_label;
+    match (target.host(), gone) {
+        (ToolHost::Channel(_), Gone::Removed) => (
+            CONNECTION_REMOVED,
+            format!(
+                "{label} was removed from {}, so this call wasn't made.",
+                target.app_name
+            ),
+        ),
+        (ToolHost::Channel(_), Gone::Disconnected) => (
+            CONNECTION_UNUSABLE,
+            format!(
+                "{label} was disconnected from {}, so this call wasn't made.",
+                target.app_name
+            ),
+        ),
+        _ => gone.refusal(label),
     }
 }
 
@@ -386,12 +477,38 @@ pub struct SendRequest {
     pub arguments: Map<String, Value>,
 }
 
+/// One channel tool's call to make, under its send claim, through the
+/// run's own connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelSendRequest {
+    /// The run's scope: the connection, and everything the call names, is
+    /// found in it, and only in it.
+    pub organization_id: OrganizationId,
+    pub workspace_id: WorkspaceId,
+    pub run_id: RunId,
+    pub call_id: ToolCallId,
+    pub attempt: u32,
+    pub invocation_id: InvocationId,
+    /// Only the run's connection, with its own token: never another.
+    pub connection_id: ChannelConnectionId,
+    pub tool: String,
+    pub arguments: Map<String, Value>,
+    /// The digest the call was decided (and any approval given) on: the
+    /// sender checks it again against what it is about to do.
+    pub call_digest: Sha256Digest,
+    pub definition_sha256: Sha256Digest,
+    /// The provider's key, as the digest covers it.
+    pub provider: String,
+}
+
 /// The I/O a plan allows once its transition commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Io {
     Nothing,
     CallModel(ModelRequest),
     SendCall(SendRequest),
+    /// Boxed: a channel send is large beside the others.
+    SendChannel(Box<ChannelSendRequest>),
 }
 
 /// Why there's nothing to apply now.
@@ -748,6 +865,11 @@ fn conversation(snapshot: &Snapshot) -> Result<Vec<Message>, AdvanceError> {
         steered(turn.turn, &mut messages);
         let mut calls: Vec<&CallRecord> = snapshot.calls.iter().filter(|call| call.turn == turn.turn).collect();
         calls.sort_by_key(|call| call.position);
+        // An empty answer is never sent back: the nudge that followed it is.
+        if blank(&turn.text, calls.len()) {
+            messages.push(Message::User { text: NUDGE.to_owned() });
+            continue;
+        }
         messages.push(Message::Assistant {
             text: turn.text.clone(),
             tool_calls: calls
@@ -831,15 +953,57 @@ fn model_request(
     })
 }
 
-fn bound(tool: &OfferedTool) -> BoundTarget {
-    BoundTarget {
+/// Where a call to `tool` goes; `None` for the run's own tool, which goes
+/// nowhere.
+fn bound(tool: &OfferedTool) -> Option<BoundTarget> {
+    if tool.host() == ToolHost::Run {
+        return None;
+    }
+    Some(BoundTarget {
         installation_id: tool.installation_id,
+        channel_connection_id: tool.channel_connection_id,
         installation_short_id: tool.installation_short_id.clone(),
         installation_label: tool.installation_label.clone(),
         app_key: tool.app_key.clone(),
         app_name: tool.app_name.clone(),
         tool: tool.tool.clone(),
         definition_sha256: tool.definition_sha256,
+    })
+}
+
+/// The digest a call to `target` with `arguments` is bound by, against
+/// `definition`: an installation's call's, or a channel tool's, which
+/// covers where the run was started. `None` for a channel tool's call in a
+/// run that has no channel, or one through another connection than the
+/// run's: neither is ever offered.
+pub fn target_digest(
+    snapshot: &Snapshot,
+    target: &BoundTarget,
+    definition: &Sha256Digest,
+    arguments: &Map<String, Value>,
+) -> Option<Sha256Digest> {
+    match target.host() {
+        ToolHost::Installation(installation_id) => Some(call_digest(
+            installation_id,
+            &target.app_key,
+            &target.tool,
+            definition,
+            arguments,
+        )),
+        ToolHost::Channel(connection_id) => {
+            let origin = &snapshot.session.as_ref()?.origin;
+            (origin.connection_id == connection_id).then(|| {
+                channel_call_digest(
+                    connection_id,
+                    &target.app_key,
+                    &target.tool,
+                    definition,
+                    arguments,
+                    (origin.conversation_id, &origin.thread_key),
+                )
+            })
+        }
+        ToolHost::Run => None,
     }
 }
 
@@ -874,7 +1038,12 @@ pub fn calls_to_decide<'a>(
         if position >= limits.max_calls_per_turn {
             break;
         }
-        if let Some(tool) = prepared.offer.find(&call.name) {
+        // The run's own tool (stay_silent) is nobody's to decide on.
+        if let Some(tool) = prepared
+            .offer
+            .find(&call.name)
+            .filter(|tool| tool.host() != ToolHost::Run)
+        {
             wanted.push((position, tool));
         }
     }
@@ -917,6 +1086,7 @@ fn settlement(outcome: &SendOutcome, label: &str) -> Settlement {
             RECONNECT_REQUIRED,
             &format!("{label} needs to be reconnected before its tools can run."),
         ),
+        SendOutcome::Refused { code, message } => failed(code, message),
     }
 }
 
@@ -1093,6 +1263,17 @@ impl Worker<'_> {
             return Err(AdvanceError::InvalidSnapshot(
                 "a prepared model attempt outside `AwaitModel`",
             ));
+        }
+        // It stayed silent, and every call it asked for with that is
+        // settled: it ends here, with what it said, and nothing is posted.
+        if self.snapshot.silent_reason.is_some() {
+            let output = self
+                .snapshot
+                .turns
+                .last()
+                .and_then(|turn| turn.text.clone())
+                .unwrap_or_default();
+            return Ok(self.finish(RunEnding::Completed { output }));
         }
         if let Some(plan) = self.over_budget() {
             return Ok(plan);
@@ -1272,6 +1453,40 @@ impl Worker<'_> {
         }
         let usage = Usage::from(completion.usage);
         let commit = match &completion.reply {
+            // A channel run that answers with nothing, and hasn't posted
+            // anything with its tools, is told so once; a second empty
+            // answer fails it. It never falls back to a text of its own.
+            Reply::Text(text) if self.snapshot.session.is_some() && blank(&Some(text.clone()), 0) && !self.posted() => {
+                if self.nudged() {
+                    CommitTurn {
+                        turn,
+                        attempt,
+                        text: Some(text.clone()),
+                        usage,
+                        calls: Vec::new(),
+                        next: Continuation::Done,
+                        ending: Some(RunEnding::Failed {
+                            error: Failure::new(
+                                EMPTY_OUTPUT,
+                                "The agent answered with nothing twice and didn't say why it stayed silent, so \
+                                 nothing was posted.",
+                            ),
+                        }),
+                        silent: None,
+                    }
+                } else {
+                    CommitTurn {
+                        turn,
+                        attempt,
+                        text: Some(text.clone()),
+                        usage,
+                        calls: Vec::new(),
+                        next: Continuation::NeedModel { turn: next_u32(turn)? },
+                        ending: None,
+                        silent: None,
+                    }
+                }
+            }
             Reply::Text(text) => CommitTurn {
                 turn,
                 attempt,
@@ -1280,15 +1495,29 @@ impl Worker<'_> {
                 calls: Vec::new(),
                 next: Continuation::Done,
                 ending: Some(RunEnding::Completed { output: text.clone() }),
+                silent: None,
             },
             Reply::ToolCalls { text, calls } => {
-                let calls = self.new_calls(&prepared.offer, calls)?;
-                let next = match calls.iter().find(|call| call.state != CallState::Refused) {
-                    Some(call) => Continuation::NeedCall {
-                        turn,
-                        position: call.position,
-                    },
-                    None => Continuation::NeedModel { turn: next_u32(turn)? },
+                let (calls, silent) = self.new_calls(&prepared.offer, calls)?;
+                let open = calls
+                    .iter()
+                    .find(|call| matches!(call.state, CallState::Allowed | CallState::AwaitingApproval));
+                let (next, ending) = match (open, &silent) {
+                    (Some(call), _) => (
+                        Continuation::NeedCall {
+                            turn,
+                            position: call.position,
+                        },
+                        None,
+                    ),
+                    // Stayed silent, with nothing left to send: it ends now.
+                    (None, Some(_)) => (
+                        Continuation::Done,
+                        Some(RunEnding::Completed {
+                            output: text.clone().unwrap_or_default(),
+                        }),
+                    ),
+                    (None, None) => (Continuation::NeedModel { turn: next_u32(turn)? }, None),
                 };
                 CommitTurn {
                     turn,
@@ -1297,7 +1526,8 @@ impl Worker<'_> {
                     usage,
                     calls,
                     next,
-                    ending: None,
+                    ending,
+                    silent,
                 }
             }
         };
@@ -1309,8 +1539,50 @@ impl Worker<'_> {
         Ok(self.apply(guards, Operation::CommitTurn(commit), Io::Nothing))
     }
 
-    /// Each call of the answer, looked up in the frozen offer and decided.
-    fn new_calls(&self, offer: &Offer, asked: &[ModelToolCall]) -> Result<Vec<NewCall>, AdvanceError> {
+    /// Whether an earlier turn of the run answered with nothing: it was
+    /// told so once already.
+    fn nudged(&self) -> bool {
+        self.snapshot.turns.iter().any(|turn| {
+            let calls = self.snapshot.calls.iter().filter(|call| call.turn == turn.turn).count();
+            blank(&turn.text, calls)
+        })
+    }
+
+    /// Whether the run posted a message with a channel tool, or may have
+    /// (its outcome unknown): it answered the thread, whatever its last
+    /// answer says.
+    fn posted(&self) -> bool {
+        self.snapshot.calls.iter().any(|call| {
+            matches!(
+                call.state,
+                CallState::Started | CallState::Completed | CallState::Unknown
+            ) && is_post(call.target.as_ref())
+        })
+    }
+
+    /// Whether the run posted, or is to post once its calls are sent or
+    /// approved: then it can't stay silent.
+    fn posting(&self) -> bool {
+        self.snapshot.calls.iter().any(|call| {
+            matches!(
+                call.state,
+                CallState::Allowed
+                    | CallState::AwaitingApproval
+                    | CallState::Approved
+                    | CallState::Started
+                    | CallState::Completed
+                    | CallState::Unknown
+            ) && is_post(call.target.as_ref())
+        })
+    }
+
+    /// Each call of the answer, looked up in the frozen offer and decided,
+    /// and the reason the first `stay_silent` among them gave.
+    fn new_calls(
+        &self,
+        offer: &Offer,
+        asked: &[ModelToolCall],
+    ) -> Result<(Vec<NewCall>, Option<String>), AdvanceError> {
         let limit = self.facts.limits.max_calls_per_turn;
         if self.facts.call_ids.len() < asked.len() {
             return Err(AdvanceError::MissingFact("call_ids"));
@@ -1324,6 +1596,9 @@ impl Worker<'_> {
             return Err(AdvanceError::InvalidFact("a call ID given twice or already used"));
         }
         let mut calls = Vec::with_capacity(asked.len());
+        let mut silent: Option<String> = None;
+        // A run either posts or stays silent, whichever it asks for first.
+        let mut posting = self.posting();
         for (index, (call, id)) in asked.iter().zip(ids).enumerate() {
             let position = position(index)?;
             let mut new = NewCall {
@@ -1348,17 +1623,41 @@ impl Worker<'_> {
                 calls.push(new);
                 continue;
             };
-            new.call_digest = Some(call_digest(
-                tool.installation_id,
-                &tool.app_key,
-                &tool.tool,
-                &tool.definition_sha256,
-                &call.arguments,
-            ));
-            new.target = Some(bound(tool));
+            // The run's own: settled as it's recorded, and nothing is sent.
+            let Some(target) = bound(tool) else {
+                match tools::silent_reason(&call.arguments) {
+                    Some(_) if posting => {
+                        new.outcome = Some(refused(POSTED_SO_NOT_SILENT.to_owned()));
+                    }
+                    Some(reason) => {
+                        new.state = CallState::Completed;
+                        new.outcome = Some(CallOutcome {
+                            content: STAYED_SILENT.to_owned(),
+                            is_error: false,
+                        });
+                        silent.get_or_insert(reason);
+                    }
+                    None => new.outcome = Some(refused(SILENT_WITHOUT_REASON.to_owned())),
+                }
+                calls.push(new);
+                continue;
+            };
+            new.call_digest = Some(
+                target_digest(self.snapshot, &target, &tool.definition_sha256, &call.arguments).ok_or(
+                    AdvanceError::InvalidSnapshot("a channel tool offered outside its run's connection"),
+                )?,
+            );
+            let posts = is_post(Some(&target));
+            new.target = Some(target);
+            if posts && silent.is_some() {
+                new.failure = Some(Failure::new(TOOL_REFUSED, SILENT_SO_NOT_POSTED));
+                new.outcome = Some(refused(SILENT_SO_NOT_POSTED.to_owned()));
+                calls.push(new);
+                continue;
+            }
             if position >= limit {
                 let reason = format!("Only {limit} calls can be made in one turn.");
-                new.failure = Some(Failure::new("tool_refused", reason.clone()));
+                new.failure = Some(Failure::new(TOOL_REFUSED, reason.clone()));
                 new.outcome = Some(refused(reason));
                 calls.push(new);
                 continue;
@@ -1371,17 +1670,23 @@ impl Worker<'_> {
                 .map(|(_, decision)| decision.clone())
                 .ok_or(AdvanceError::MissingFact("decisions"))?;
             match &decision.verdict {
-                CallVerdict::Allow => new.state = CallState::Allowed,
-                CallVerdict::RequireApproval { .. } => new.state = CallState::AwaitingApproval,
+                CallVerdict::Allow => {
+                    new.state = CallState::Allowed;
+                    posting |= posts;
+                }
+                CallVerdict::RequireApproval { .. } => {
+                    new.state = CallState::AwaitingApproval;
+                    posting |= posts;
+                }
                 CallVerdict::Deny { reason } => {
-                    new.failure = Some(Failure::new("tool_refused", reason.clone()));
+                    new.failure = Some(Failure::new(refusal_code(&decision), reason.clone()));
                     new.outcome = Some(refused(reason.clone()));
                 }
             }
             new.decision = Some(decision);
             calls.push(new);
         }
-        Ok(calls)
+        Ok((calls, silent))
     }
 
     fn need_call(&self, turn: u32, position: u32) -> Result<Plan, AdvanceError> {
@@ -1447,7 +1752,7 @@ impl Worker<'_> {
         let check = self.send_check(call)?;
         match check.installation.gone() {
             Some(gone) => {
-                let (code, message) = gone.refusal(&target.installation_label);
+                let (code, message) = gone_refusal(gone, target);
                 self.refuse(call, &check.decision, code, message)
             }
             None => Ok(self.park(call, None)),
@@ -1474,14 +1779,23 @@ impl Worker<'_> {
         let label = &target.installation_label;
         let refuse = |code: &str, message: String| self.refuse(call, &check.decision, code, message);
         if let Some(gone) = check.installation.gone() {
-            let (code, message) = gone.refusal(label);
+            let (code, message) = gone_refusal(gone, target);
             return refuse(code, message);
         }
         match check.installation {
             InstallationCheck::Usable | InstallationCheck::Removed | InstallationCheck::Disconnected => {}
+            InstallationCheck::Unusable if target.channel().is_some() => {
+                return refuse(
+                    CONNECTION_UNUSABLE,
+                    format!(
+                        "{label} can't reach {} until it's reconnected, so this call wasn't made.",
+                        target.app_name
+                    ),
+                );
+            }
             InstallationCheck::Unusable => {
                 return refuse(
-                    "tool_refused",
+                    TOOL_REFUSED,
                     format!("{label} can't be used as it's set up: check its app's configuration, or reconnect it."),
                 );
             }
@@ -1494,19 +1808,14 @@ impl Worker<'_> {
             }
         }
         if let CallVerdict::Deny { reason } = &check.decision.verdict {
-            return refuse("tool_refused", reason.clone());
+            return refuse(refusal_code(&check.decision), reason.clone());
         }
         // The digest binds the call, and any approval of it, to the pinned
-        // definition it was decided against.
-        let still = check.definition_sha256.map(|definition| {
-            call_digest(
-                target.installation_id,
-                &target.app_key,
-                &target.tool,
-                &definition,
-                &call.arguments,
-            )
-        });
+        // definition it was decided against (and a channel tool's call to
+        // where its run was started).
+        let still = check
+            .definition_sha256
+            .and_then(|definition| target_digest(self.snapshot, target, &definition, &call.arguments));
         // The run offers the definition it started with: one gone or
         // changed since (a change accepted mid-run, say) is no longer
         // there for it to call, whenever the change came.
@@ -1549,17 +1858,36 @@ impl Worker<'_> {
                 attempt,
             },
         });
-        let send = SendRequest {
-            organization_id: self.snapshot.organization_id,
-            workspace_id: self.snapshot.workspace_id,
-            call_id: call.id,
-            attempt,
-            invocation_id,
-            installation_id: target.installation_id,
-            tool: target.tool.clone(),
-            arguments: call.arguments.clone(),
+        let io = match target.host() {
+            ToolHost::Installation(installation_id) => Io::SendCall(SendRequest {
+                organization_id: self.snapshot.organization_id,
+                workspace_id: self.snapshot.workspace_id,
+                call_id: call.id,
+                attempt,
+                invocation_id,
+                installation_id,
+                tool: target.tool.clone(),
+                arguments: call.arguments.clone(),
+            }),
+            ToolHost::Channel(connection_id) => Io::SendChannel(Box::new(ChannelSendRequest {
+                organization_id: self.snapshot.organization_id,
+                workspace_id: self.snapshot.workspace_id,
+                run_id: self.snapshot.run_id,
+                call_id: call.id,
+                attempt,
+                invocation_id,
+                connection_id,
+                tool: target.tool.clone(),
+                arguments: call.arguments.clone(),
+                call_digest: call
+                    .call_digest
+                    .ok_or(AdvanceError::InvalidSnapshot("a channel call without its digest"))?,
+                definition_sha256: target.definition_sha256,
+                provider: target.app_key.clone(),
+            })),
+            ToolHost::Run => return Err(AdvanceError::InvalidSnapshot("the run's own tool sent")),
         };
-        Ok(self.apply(self.keeps(), operation, Io::SendCall(send)))
+        Ok(self.apply(self.keeps(), operation, io))
     }
 
     fn await_call(&self, call_id: ToolCallId, attempt: u32) -> Result<Plan, AdvanceError> {
@@ -1758,7 +2086,7 @@ pub fn refuse_waiting(
     let target = call
         .target
         .as_ref()
-        .filter(|target| target.installation_id == installation_id)
+        .filter(|target| target.installation_id == Some(installation_id))
         .ok_or(ControlError::NotWaiting)?;
     let (code, message) = gone.refusal(&target.installation_label);
     Ok(request(
@@ -1790,7 +2118,7 @@ pub fn may_park_on(snapshot: &Snapshot, installation_id: InstallationId) -> bool
                 && call
                     .target
                     .as_ref()
-                    .is_some_and(|target| target.installation_id == installation_id)
+                    .is_some_and(|target| target.installation_id == Some(installation_id))
         })
 }
 

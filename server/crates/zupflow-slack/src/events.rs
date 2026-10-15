@@ -19,8 +19,10 @@
 //! | Slack event | Zupflow |
 //! | --- | --- |
 //! | `message` (no subtype, `thread_broadcast`, `file_share`, `me_message`, `bot_message`) | [`InboundEvent::Message`] |
+//! | `message` `message_changed`, edited by its author (`message.edited`) | [`InboundEvent::Edited`] |
+//! | `message` `message_deleted` | [`InboundEvent::Deleted`] |
 //! | `app_uninstalled`, `tokens_revoked` | [`InboundEvent::Uninstalled`] |
-//! | `app_mention`, edits, deletions, anything else (joins, topic changes, unfurls, `app_rate_limited`) | [`InboundEvent::Other`] |
+//! | `app_mention`, other changes (a thread's reply count, an unfurl), anything else (joins, topic changes, `app_rate_limited`) | [`InboundEvent::Other`] |
 //!
 //! A message's conversation is its `channel`, of the kind its
 //! `channel_type` names (a message that names none is `Other`: its kind is
@@ -39,6 +41,12 @@
 //! knows the identity. A field longer than Slack sends makes the event
 //! `Other`.
 //!
+//! An edit names the message it changed by its `message.ts`, with its new
+//! `message.text`, at its `message.edited.ts`; a deletion by its
+//! `deleted_ts`. Slack also sends `message_changed` when nobody edited the
+//! text (a reply counted on its thread's first message, a link unfurled):
+//! without `message.edited` it's `Other`.
+//!
 //! Text stays in Slack's markup; a run renders it when it takes it in
 //! ([`zupflow_core::channels::thread::plain_text`]).
 
@@ -47,8 +55,9 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Map, Value};
 use sha2::Sha256;
 use zupflow_core::channels::provider::{
-    ChannelProvider, INBOUND_TOLERANCE_SECONDS, InboundDelivery, InboundEvent, InboundRefusal, InboundRequest,
-    NormalizedMessage, OutgoingPost, ProviderCallError, ProviderPerson, SignatureHeaders,
+    ChannelProvider, DeletedMessage, EditedMessage, INBOUND_TOLERANCE_SECONDS, InboundDelivery, InboundEvent,
+    InboundRefusal, InboundRequest, MessageRef, NormalizedMessage, OutgoingPost, ProviderCallError, ProviderPerson,
+    SignatureHeaders,
 };
 use zupflow_core::channels::{ChannelProviderKind, ConversationKind};
 use zupflow_core::outbound::OutboundHttp;
@@ -205,6 +214,32 @@ fn new_message(event: &Map<String, Value>, shared: bool, now: Timestamp) -> Opti
     })
 }
 
+/// An edit by its author: the message it changed, its new text and when.
+fn edited(event: &Map<String, Value>, now: Timestamp) -> Option<EditedMessage> {
+    let channel = field(event, "channel", FIELD_MAX)?;
+    let message = event.get("message").and_then(Value::as_object)?;
+    let edit = message.get("edited").and_then(Value::as_object)?;
+    let ts = field(message, "ts", FIELD_MAX)?;
+    let text = message_text(message)?;
+    Some(EditedMessage {
+        conversation_external_id: channel.to_owned(),
+        external_id: ts.to_owned(),
+        text,
+        edited_at: field(edit, "ts", FIELD_MAX).and_then(ts_time).unwrap_or(now),
+    })
+}
+
+/// A deletion: the message it removed, and when.
+fn deleted(event: &Map<String, Value>, now: Timestamp) -> Option<DeletedMessage> {
+    let channel = field(event, "channel", FIELD_MAX)?;
+    let ts = field(event, "deleted_ts", FIELD_MAX)?;
+    Some(DeletedMessage {
+        conversation_external_id: channel.to_owned(),
+        external_id: ts.to_owned(),
+        deleted_at: field(event, "ts", FIELD_MAX).and_then(ts_time).unwrap_or(now),
+    })
+}
+
 /// One event of an `event_callback`, in Zupflow's terms.
 fn event(event: &Map<String, Value>, shared: bool, now: Timestamp) -> InboundEvent {
     match event.get("type").and_then(Value::as_str) {
@@ -215,8 +250,14 @@ fn event(event: &Map<String, Value>, shared: bool, now: Timestamp) -> InboundEve
                 new_message(event, shared, now)
                     .map_or(InboundEvent::Other, |message| InboundEvent::Message(Box::new(message)))
             }
-            // Edits and deletions are recorded once, and change nothing
-            // stored, or sent to a model, before.
+            // An edit or a deletion is recorded beside the message, and
+            // noted in the next turn: nothing sent before changes.
+            Some("message_changed") => {
+                edited(event, now).map_or(InboundEvent::Other, |edited| InboundEvent::Edited(Box::new(edited)))
+            }
+            Some("message_deleted") => {
+                deleted(event, now).map_or(InboundEvent::Other, |deleted| InboundEvent::Deleted(Box::new(deleted)))
+            }
             Some(_) => InboundEvent::Other,
         },
         Some("app_uninstalled" | "tokens_revoked") => InboundEvent::Uninstalled,
@@ -429,5 +470,90 @@ impl ChannelProvider for SlackChannelProvider {
                 SlackError::NoAnswer => ProviderCallError::OutcomeUnknown,
                 error => call_error(error, false),
             })
+    }
+
+    /// `chat.update`, as one `markdown` block; text longer than a block
+    /// holds is refused (`too_long`), never cut.
+    async fn edit(
+        &self,
+        http: &dyn OutboundHttp,
+        token: &str,
+        message: &MessageRef<'_>,
+        text: &str,
+    ) -> Result<(), ProviderCallError> {
+        self.client
+            .update_message(http, token, message.conversation_external_id, message.external_id, text)
+            .await
+            .map_err(|error| call_error(error, true))
+    }
+
+    /// `chat.delete`: one gone already is deleted.
+    async fn delete(
+        &self,
+        http: &dyn OutboundHttp,
+        token: &str,
+        message: &MessageRef<'_>,
+    ) -> Result<(), ProviderCallError> {
+        self.client
+            .delete_message(http, token, message.conversation_external_id, message.external_id)
+            .await
+            .map_err(|error| call_error(error, true))
+    }
+
+    /// `reactions.add` or `.remove`.
+    async fn react(
+        &self,
+        http: &dyn OutboundHttp,
+        token: &str,
+        message: &MessageRef<'_>,
+        emoji: &str,
+        remove: bool,
+    ) -> Result<(), ProviderCallError> {
+        self.client
+            .react(
+                http,
+                token,
+                message.conversation_external_id,
+                message.external_id,
+                emoji,
+                remove,
+            )
+            .await
+            .map_err(|error| call_error(error, true))
+    }
+
+    /// `conversations.open` with one user.
+    async fn open_direct(
+        &self,
+        http: &dyn OutboundHttp,
+        token: &str,
+        person_external_id: &str,
+    ) -> Result<String, ProviderCallError> {
+        if !is_user_id(person_external_id) {
+            return Err(ProviderCallError::Refused("user_not_found"));
+        }
+        self.client
+            .open_dm(http, token, person_external_id)
+            .await
+            .map_err(|error| call_error(error, false))
+    }
+
+    /// `assistant.threads.setStatus`: a short status while working, and an
+    /// empty one to clear it. Only in a thread: a DM's top level has none.
+    async fn show_working(
+        &self,
+        http: &dyn OutboundHttp,
+        token: &str,
+        conversation_external_id: &str,
+        thread_key: &str,
+        working: bool,
+    ) -> bool {
+        if thread_key.is_empty() {
+            return false;
+        }
+        let status = if working { "is working on it…" } else { "" };
+        self.client
+            .set_status(http, token, conversation_external_id, thread_key, status)
+            .await
     }
 }

@@ -18,8 +18,16 @@
 //! (announced), so someone pastes new ones. Payloads name the manager and
 //! version, never a token.
 //!
+//! **Retention.** A sweep queues one `sweep_channel_retention` job per
+//! workspace with channel data past its organization's retention (one at a
+//! time per workspace); the job deletes it in the workspace's own scope
+//! ([`ChannelStore::sweep_retention`]). Its payload names nothing: the
+//! scope is all it needs.
+//!
 //! Nothing here sleeps on a rate limit: the job is postponed for as long as
 //! the provider asked, without using an attempt.
+//!
+//! [`ChannelStore::sweep_retention`]: zupflow_core::channels::store::ChannelStore::sweep_retention
 
 use std::time::Duration;
 
@@ -27,7 +35,7 @@ use serde_json::{Value, json};
 use zupflow_core::audit::{AuditAction, AuditActor, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::channels::provision::{ProvisionError, RELEASE_CHANNEL_APP, RotatedTokens, SYNC_CHANNEL_APP};
 use zupflow_core::channels::store::{ChannelError, TokenReplacement};
-use zupflow_core::channels::{AppStatus, ChannelAppManager, ManagerStatus, TOKEN_LIFETIME_MS};
+use zupflow_core::channels::{AppStatus, ChannelAppManager, ManagerStatus, RETENTION_JOB, TOKEN_LIFETIME_MS};
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{ChannelAppId, ChannelAppManagerId, ChannelConnectionId, OrganizationId, WorkspaceId};
 use zupflow_core::jobs::{Job, JobOptions};
@@ -72,10 +80,15 @@ fn wait(retry_after_secs: u32) -> Next {
 
 /// The kinds this module handles.
 pub(crate) fn kinds() -> Vec<Name> {
-    [ROTATE_CHANNEL_MANAGER, SYNC_CHANNEL_APP, RELEASE_CHANNEL_APP]
-        .into_iter()
-        .filter_map(|kind| Name::new(kind).ok())
-        .collect()
+    [
+        ROTATE_CHANNEL_MANAGER,
+        SYNC_CHANNEL_APP,
+        RELEASE_CHANNEL_APP,
+        RETENTION_JOB,
+    ]
+    .into_iter()
+    .filter_map(|kind| Name::new(kind).ok())
+    .collect()
 }
 
 fn rotation_job(manager_id: ChannelAppManagerId, version: u32) -> QueuedJob {
@@ -112,6 +125,63 @@ pub(crate) async fn sweep(state: &AppState) {
         }
         Ok(_) => {}
         Err(error) => tracing::warn!(event = "channels.rotation_sweep_failed", %error),
+    }
+}
+
+/// Queues a retention sweep for each workspace with channel data past its
+/// organization's retention. Cross-tenant, like a claim: each job is the
+/// workspace's own.
+pub(crate) async fn retention_due(state: &AppState) -> usize {
+    let due = match state
+        .channels
+        .retention_due_cross_tenant(state.clock.now(), SWEEP_LIMIT)
+        .await
+    {
+        Ok(due) => due,
+        Err(error) => {
+            tracing::warn!(event = "channels.retention_sweep_failed", %error);
+            return 0;
+        }
+    };
+    let Ok(kind) = Name::new(RETENTION_JOB) else {
+        return 0;
+    };
+    let mut queued = 0;
+    for (organization_id, workspace_id) in due {
+        let options = JobOptions {
+            delay: Duration::ZERO,
+            max_attempts: 5,
+        };
+        let scope = Scope::Workspace(organization_id, workspace_id);
+        match state.jobs.enqueue(&scope, &kind, b"{}".to_vec(), options).await {
+            Ok(_) => queued += 1,
+            Err(error) => {
+                tracing::warn!(event = "channels.retention_not_queued", %organization_id, %workspace_id, %error);
+            }
+        }
+    }
+    queued
+}
+
+/// Deletes one workspace's channel data past retention.
+async fn sweep_retention(state: &AppState, organization_id: OrganizationId, workspace_id: WorkspaceId) -> Next {
+    match state
+        .channels
+        .sweep_retention(organization_id, workspace_id, state.clock.now())
+        .await
+    {
+        Ok(swept) => {
+            tracing::info!(
+                event = "channels.retention_swept",
+                %organization_id,
+                %workspace_id,
+                messages = swept.messages,
+                inbound_events = swept.inbound_events,
+                runs = swept.runs
+            );
+            Next::Done
+        }
+        Err(_) => Next::Retry("store_unavailable"),
     }
 }
 
@@ -166,6 +236,9 @@ pub(crate) async fn handle(state: &AppState, job: Job) {
                 }
                 None => Next::Done,
             }
+        }
+        (Scope::Workspace(organization_id, workspace_id), RETENTION_JOB) => {
+            sweep_retention(state, organization_id, workspace_id).await
         }
         _ => {
             tracing::error!(event = "channels.malformed_job", kind = kind.as_str());

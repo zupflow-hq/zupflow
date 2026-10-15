@@ -32,15 +32,18 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection};
 use uuid::Uuid;
 use zupflow_core::audit::{AuditAction, AuditActor, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::channels::handling::DispatchReason;
+use zupflow_core::channels::tools;
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{
     AgentId, ApiKeyId, ChannelConnectionId, ChannelConversationId, ChannelMessageId, InstallationId, ModelConnectionId,
     ModelId, OrganizationId, RunEventId, RunId, SessionId, ToolCallId, WorkspaceId,
 };
 use zupflow_core::models::MAX_RETRY_AFTER;
-use zupflow_core::runs::digest::{Sha256Digest, call_digest};
-use zupflow_core::runs::names::Offer;
-use zupflow_core::runs::reducer::{INSTALLATION_DISCONNECTED, INSTALLATION_REMOVED};
+use zupflow_core::runs::digest::Sha256Digest;
+use zupflow_core::runs::names::{Offer, ToolHost};
+use zupflow_core::runs::reducer::{
+    CONNECTION_REMOVED, CONNECTION_UNUSABLE, INSTALLATION_DISCONNECTED, INSTALLATION_REMOVED, target_digest,
+};
 use zupflow_core::runs::state::{
     BoundTarget, CallAttempt, CallDecision, CallRecord, CallVerdict, ClaimantId, CommittedTurn, Continuation,
     EXECUTION_VERSION, InvocationId, ModelAttempt, ModelAttemptState, RunControl, Snapshot, Usage, supports,
@@ -193,6 +196,7 @@ struct RunRow {
     instructions: String,
     input: String,
     usage: RunUsage,
+    silent_reason: Option<String>,
 }
 
 async fn run_row(
@@ -204,7 +208,7 @@ async fn run_row(
     let row = sqlx::query(
         "SELECT status, continuation, revision, owner_epoch, owner_claimant, lease_until, cancel_requested_at, \
          execution_version, job_id, agent_id, model, model_id, model_connection_id, instructions, input, \
-         input_tokens, output_tokens, cache_read_input_tokens, cache_write_input_tokens, tool_calls \
+         input_tokens, output_tokens, cache_read_input_tokens, cache_write_input_tokens, tool_calls, silent_reason \
          FROM runs WHERE organization_id = ? AND workspace_id = ? AND id = ?",
     )
     .bind(organization_id.uuid())
@@ -232,6 +236,7 @@ async fn run_row(
         instructions: row.try_get("instructions").map_err(unreadable)?,
         input: row.try_get("input").map_err(unreadable)?,
         usage: run_usage(&row)?,
+        silent_reason: row.try_get("silent_reason").map_err(unreadable)?,
     }))
 }
 
@@ -248,9 +253,16 @@ struct Loaded {
 fn call_from(row: &SqliteRow) -> Result<CallRecord, StoreError> {
     let text = |column: &str| row.try_get::<Option<String>, _>(column).map_err(unreadable);
     let installation: Option<Uuid> = row.try_get("installation_id").map_err(unreadable)?;
+    let channel: Option<Uuid> = row.try_get("channel_connection_id").map_err(unreadable)?;
     let definition = digest(row, "definition_sha256")?;
+    let host = match (installation, channel) {
+        (Some(installation), None) => Some((Some(InstallationId::from_uuid(installation)), None)),
+        (None, Some(channel)) => Some((None, Some(ChannelConnectionId::from_uuid(channel)))),
+        (None, None) => None,
+        (Some(_), Some(_)) => return Err(corrupt("a call bound to an installation and a channel")),
+    };
     let target = match (
-        installation,
+        host,
         text("installation_short_id")?,
         text("installation_label")?,
         text("app_key")?,
@@ -259,7 +271,7 @@ fn call_from(row: &SqliteRow) -> Result<CallRecord, StoreError> {
         definition,
     ) {
         (
-            Some(installation_id),
+            Some((installation_id, channel_connection_id)),
             Some(installation_short_id),
             Some(installation_label),
             Some(app_key),
@@ -267,7 +279,8 @@ fn call_from(row: &SqliteRow) -> Result<CallRecord, StoreError> {
             Some(tool),
             Some(definition_sha256),
         ) => Some(BoundTarget {
-            installation_id: InstallationId::from_uuid(installation_id),
+            installation_id,
+            channel_connection_id,
             installation_short_id,
             installation_label,
             app_key,
@@ -373,8 +386,8 @@ pub(crate) async fn recorded_calls(
     run_id: RunId,
 ) -> Result<Vec<CallRecord>, StoreError> {
     sqlx::query(
-        "SELECT id, turn, position, model_call_id, name, installation_id, installation_short_id, installation_label, \
-         app_key, app_name, tool, definition_sha256, arguments, state, verdict, policy, mode, rule, reason, \
+        "SELECT id, turn, position, model_call_id, name, installation_id, channel_connection_id, installation_short_id, \
+         installation_label, app_key, app_name, tool, definition_sha256, arguments, state, verdict, policy, mode, rule, reason, \
          call_digest, approval, approval_api_key_id, outcome, outcome_is_error, failure_code, failure_message \
          FROM run_tool_calls WHERE organization_id = ? AND workspace_id = ? AND run_id = ? ORDER BY turn, position",
     )
@@ -492,6 +505,7 @@ async fn load(
             calls,
             model_attempts,
             session,
+            silent_reason: row.silent_reason,
         },
         job_id: row.job_id,
         agent_id: row.agent_id,
@@ -631,6 +645,16 @@ fn installation_went(failure: &Failure) -> bool {
     failure.code == INSTALLATION_REMOVED || failure.code == INSTALLATION_DISCONNECTED
 }
 
+/// Whether a refusal says the call's host went away: its installation, or
+/// its channel connection.
+fn went(target: &BoundTarget, failure: &Failure) -> bool {
+    match target.host() {
+        ToolHost::Channel(_) => failure.code == CONNECTION_REMOVED || failure.code == CONNECTION_UNUSABLE,
+        ToolHost::Installation(_) => installation_went(failure),
+        ToolHost::Run => false,
+    }
+}
+
 /// What a transition does to the run's job.
 enum JobAction {
     Keep,
@@ -661,6 +685,8 @@ struct RowChange {
     /// The tokens of the turn this transition commits.
     add_usage: Usage,
     add_tool_calls: u64,
+    /// Why the run stays silent, once a turn says so.
+    silent: Option<String>,
 }
 
 /// One transition's writes, on its transaction.
@@ -673,12 +699,23 @@ struct Writer<'a> {
     events: Vec<(RunEventType, Value)>,
 }
 
+/// The tool a call's events name: an installation's, or a channel
+/// connection's, as the contract's `ToolCallRef` has it.
 fn reference(call_id: ToolCallId, target: &BoundTarget) -> Map<String, Value> {
     let mut data = Map::new();
     data.insert("call_id".to_owned(), json!(call_id));
-    data.insert("installation_id".to_owned(), json!(target.installation_id));
-    data.insert("installation_label".to_owned(), json!(target.installation_label));
-    data.insert("app_name".to_owned(), json!(target.app_name));
+    match (target.installation_id, target.channel_connection_id) {
+        (_, Some(connection_id)) => {
+            data.insert("channel_connection_id".to_owned(), json!(connection_id));
+            data.insert("connection_label".to_owned(), json!(target.installation_label));
+            data.insert("provider".to_owned(), json!(target.app_key));
+        }
+        (installation_id, None) => {
+            data.insert("installation_id".to_owned(), json!(installation_id));
+            data.insert("installation_label".to_owned(), json!(target.installation_label));
+            data.insert("app_name".to_owned(), json!(target.app_name));
+        }
+    }
     data.insert("tool".to_owned(), json!(target.tool));
     data
 }
@@ -719,6 +756,15 @@ impl Writer<'_> {
                 call.target.is_some() && call.decision.is_some() && call.outcome.is_none() && call.failure.is_none()
             }
             CallState::Refused => call.outcome.is_some(),
+            // Only the run's own tool settles as it's recorded: stay_silent,
+            // with a reason, and nothing sent.
+            CallState::Completed => {
+                call.target.is_none()
+                    && call.decision.is_none()
+                    && call.failure.is_none()
+                    && call.outcome.as_ref().is_some_and(|outcome| !outcome.is_error)
+                    && tools::silent_reason(&call.arguments).is_some()
+            }
             _ => false,
         };
         if !fits || call.call_digest.is_some() != call.target.is_some() {
@@ -730,10 +776,10 @@ impl Writer<'_> {
         let (verdict, reason) = decision.map(decision_columns).unzip();
         sqlx::query(
             "INSERT INTO run_tool_calls (id, organization_id, workspace_id, run_id, turn, position, model_call_id, \
-             name, installation_id, installation_short_id, installation_label, app_key, app_name, tool, \
-             definition_sha256, arguments, state, verdict, policy, mode, rule, reason, call_digest, \
+             name, installation_id, channel_connection_id, installation_short_id, installation_label, app_key, \
+             app_name, tool, definition_sha256, arguments, state, verdict, policy, mode, rule, reason, call_digest, \
              outcome, outcome_is_error, failure_code, failure_message, finished_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(call.id.uuid())
         .bind(org)
@@ -743,7 +789,12 @@ impl Writer<'_> {
         .bind(i64::from(call.position))
         .bind(&call.model_call_id)
         .bind(&call.model_tool_name)
-        .bind(target.map(|target| target.installation_id.uuid()))
+        .bind(target.and_then(|target| target.installation_id).map(|id| id.uuid()))
+        .bind(
+            target
+                .and_then(|target| target.channel_connection_id)
+                .map(|id| id.uuid()),
+        )
         .bind(target.map(|target| target.installation_short_id.as_str()))
         .bind(target.map(|target| target.installation_label.as_str()))
         .bind(target.map(|target| target.app_key.as_str()))
@@ -762,7 +813,7 @@ impl Writer<'_> {
         .bind(call.outcome.as_ref().map(|outcome| i64::from(outcome.is_error)))
         .bind(call.failure.as_ref().map(|failure| failure.code.as_str()))
         .bind(call.failure.as_ref().map(|failure| failure.message.as_str()))
-        .bind((call.state == CallState::Refused).then_some(self.now.millis()))
+        .bind(call.state.is_settled().then_some(self.now.millis()))
         .execute(&mut *self.connection)
         .await
         .map_err(failed("insert_call"))?;
@@ -1183,26 +1234,26 @@ async fn audit(
 /// A call of an answer must be what the attempt's frozen offer makes of it:
 /// the target of the name the model used, or none for a name it wasn't
 /// offered, and the digest of exactly that target and its arguments.
-fn bound_by_offer(offer: &Offer, call: &NewCall) -> Result<(), StoreError> {
+fn bound_by_offer(snapshot: &Snapshot, offer: &Offer, call: &NewCall) -> Result<(), StoreError> {
     let offered = offer.find(&call.model_tool_name);
     let fits = match (offered, &call.target) {
         (None, None) => call.call_digest.is_none(),
+        // The run's own tool: nothing to bind, nothing to digest.
+        (Some(tool), None) => {
+            tool.host() == ToolHost::Run && tool.tool == tools::STAY_SILENT && call.call_digest.is_none()
+        }
         (Some(tool), Some(target)) => {
             target.installation_id == tool.installation_id
+                && target.channel_connection_id == tool.channel_connection_id
+                && target.host() != ToolHost::Run
                 && target.installation_short_id == tool.installation_short_id
                 && target.installation_label == tool.installation_label
                 && target.app_key == tool.app_key
                 && target.app_name == tool.app_name
                 && target.tool == tool.tool
                 && target.definition_sha256 == tool.definition_sha256
-                && call.call_digest
-                    == Some(call_digest(
-                        target.installation_id,
-                        &target.app_key,
-                        &target.tool,
-                        &target.definition_sha256,
-                        &call.arguments,
-                    ))
+                && call.call_digest.is_some()
+                && call.call_digest == target_digest(snapshot, target, &target.definition_sha256, &call.arguments)
         }
         _ => false,
     };
@@ -1412,6 +1463,7 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
             calls,
             next,
             ending,
+            silent,
         }) => {
             if control.continuation
                 != (Continuation::AwaitModel {
@@ -1422,28 +1474,35 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
             {
                 return Err(refused("an answer to a model attempt the run doesn't wait on"));
             }
-            if ending.is_some() && !calls.is_empty() {
+            // The reason the turn's stay_silent call gave, if it made one.
+            let silenced = calls
+                .iter()
+                .filter(|call| call.state == CallState::Completed && call.target.is_none())
+                .find_map(|call| tools::silent_reason(&call.arguments));
+            if *silent != silenced || (silent.is_some() && snapshot.session.is_none()) {
+                return Err(refused("a silence that isn't what the turn's calls say"));
+            }
+            // A turn's calls end the run only when it stays silent and none
+            // is left to make.
+            let open = calls
+                .iter()
+                .filter(|call| matches!(call.state, CallState::Allowed | CallState::AwaitingApproval))
+                .map(|call| call.position)
+                .min();
+            if ending.is_some() && !calls.is_empty() && (open.is_some() || silent.is_none()) {
                 return Err(refused("a final answer with calls"));
             }
-            let expected = if ending.is_some() {
-                Some(Continuation::Done)
-            } else {
-                match calls
-                    .iter()
-                    .filter(|call| call.state != CallState::Refused)
-                    .map(|call| call.position)
-                    .min()
-                {
-                    Some(position) => Some(Continuation::NeedCall { turn: *turn, position }),
-                    None => turn.checked_add(1).map(|turn| Continuation::NeedModel { turn }),
-                }
+            let expected = match (open, ending) {
+                (Some(position), _) => Some(Continuation::NeedCall { turn: *turn, position }),
+                (None, Some(_)) => Some(Continuation::Done),
+                (None, None) => turn.checked_add(1).map(|turn| Continuation::NeedModel { turn }),
             };
             expect_next(*next, expected)?;
             let prepared = snapshot
                 .model_attempt(*turn, *attempt)
                 .ok_or(refused("an answer to a model attempt that isn't recorded"))?;
             for call in calls {
-                bound_by_offer(&prepared.offer, call)?;
+                bound_by_offer(snapshot, &prepared.offer, call)?;
             }
             writer
                 .set_model_attempt(
@@ -1481,9 +1540,13 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
             for call in calls {
                 writer.insert_call(*turn, call).await?;
             }
+            if let Some(reason) = silent.as_ref().filter(|_| snapshot.silent_reason.is_none()) {
+                writer.event(RunEventType::RunStayedSilent, json!({ "reason": reason }));
+            }
             let row = RowChange {
                 ending: ending.clone(),
                 add_usage: *usage,
+                silent: silent.clone(),
                 ..RowChange::default()
             };
             let job = if ending.is_some() {
@@ -1611,7 +1674,7 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
                 .filter(|call| waiting && call.state == CallState::AwaitingApproval)
                 .ok_or(refused("a refusal of a call the run doesn't wait for"))?;
             let target = target_of(call)?;
-            if target.installation_id != *installation_id {
+            if target.installation_id != Some(*installation_id) {
                 return Err(refused("a refusal for an installation the call isn't bound to"));
             }
             if !installation_went(failure) || !outcome.is_error {
@@ -1635,7 +1698,9 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
             // only because its installation went away.
             let fits = match (call.state, authorization) {
                 (CallState::Allowed | CallState::Approved, _) => true,
-                (CallState::AwaitingApproval, Authorization::Refuse { failure, .. }) => installation_went(failure),
+                (CallState::AwaitingApproval, Authorization::Refuse { failure, .. }) => {
+                    target_of(call).is_ok_and(|target| went(target, failure))
+                }
                 _ => false,
             };
             if !fits {
@@ -2495,7 +2560,7 @@ impl SqliteRunStore {
              finished_at = coalesce(finished_at, ?), output = coalesce(output, ?), \
              error_code = coalesce(error_code, ?), error_message = coalesce(error_message, ?), \
              input_tokens = ?, output_tokens = ?, cache_read_input_tokens = ?, cache_write_input_tokens = ?, \
-             tool_calls = ?, job_id = ? \
+             tool_calls = ?, job_id = ?, silent_reason = coalesce(silent_reason, ?) \
              WHERE organization_id = ? AND workspace_id = ? AND id = ? AND revision = ?",
         )
         .bind(status.as_str())
@@ -2516,6 +2581,7 @@ impl SqliteRunStore {
         .bind(int(usage.cache_write_input_tokens)?)
         .bind(int(usage.tool_calls)?)
         .bind(job_id)
+        .bind(row.silent.as_deref())
         .bind(org)
         .bind(ws)
         .bind(run)

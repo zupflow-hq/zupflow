@@ -289,7 +289,7 @@ async fn serve(path: &str, serving: Serving) -> Result<(), String> {
         model_catalog: Arc::new(ScriptedProviders),
         connect: Arc::new(SqliteConnectStore::new(database.clone())),
         channels: Arc::new(zupflow_sqlite::SqliteChannelStore::new(database.clone())),
-        channel_provider: std::sync::Arc::new(zupflow_channels::fake::FakeChannelProvider),
+        channel_provider: std::sync::Arc::new(zupflow_channels::fake::FakeChannelProvider::default()),
         channel_provisioner: Arc::new(
             zupflow_basic::scripted_channel_provisioner::ScriptedChannelProvisioner::default(),
         ),

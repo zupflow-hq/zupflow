@@ -14,6 +14,7 @@
 //! - [`provision`]: [`provision::AppProvisioner`], which creates, changes
 //!   and deletes one agent's app in one team.
 //! - [`store`]: [`store::ChannelStore`], everything above as stored.
+//! - [`tools`]: the channel tools and `stay_silent`, as a session offers them.
 //!
 //! Everything is workspace-scoped except the tool levels and settings, which
 //! are the organization's. Zupflow's own names avoid "bot": a connection acts
@@ -26,6 +27,7 @@ pub mod provision;
 pub mod reply;
 pub mod store;
 pub mod thread;
+pub mod tools;
 
 use serde::Serialize;
 
@@ -233,6 +235,13 @@ pub const DEFAULT_BREAKER_WINDOW_MINUTES: u32 = 10;
 pub const DEFAULT_BREAKER_PAUSE_MINUTES: u32 = 10;
 pub const DEFAULT_MESSAGE_RETENTION_DAYS: u32 = 30;
 
+/// How long a record of a provider's event is kept, for retries to find.
+pub const INBOUND_EVENT_RETENTION_DAYS: u32 = 7;
+
+/// The job that deletes one workspace's channel data past retention: its
+/// scope is the workspace, and its payload names nothing else.
+pub const RETENTION_JOB: &str = "sweep_channel_retention";
+
 /// How long a configuration token lasts before it must be rotated, as Slack's do.
 pub const TOKEN_LIFETIME_MS: i64 = 12 * 60 * 60 * 1000;
 
@@ -387,6 +396,8 @@ pub struct ChannelMessage {
     pub author: Option<ChannelPerson>,
     /// Exactly as received; a reader shows `""` once it's deleted.
     pub text: String,
+    /// What it says since it was last edited, kept beside `text`.
+    pub edited_text: Option<String>,
     pub mentions: Vec<String>,
     pub run_id: Option<RunId>,
     pub tool_call_id: Option<ToolCallId>,

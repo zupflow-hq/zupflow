@@ -30,7 +30,8 @@ use zupflow_core::channels::store::{
     BreakerOutcome, ChannelSession, ChannelSessionKey, DispatchOutcome, NewDispatch, SessionTemplate,
 };
 use zupflow_core::channels::thread::{
-    LineAuthor, MAX_TAKEN, MentionNames, STEER_HEADER, ThreadLine, conversation_mentions, plain_text, render_turn,
+    LineAuthor, MAX_TAKEN, MentionNames, STEER_HEADER, ThreadLine, change_note, conversation_mentions, plain_text,
+    render_turn,
 };
 use zupflow_core::channels::{ChannelProviderKind, ConversationKind, MidRun};
 use zupflow_core::ids::{
@@ -42,10 +43,10 @@ use zupflow_core::models::Message;
 use zupflow_core::runs::history::{transcript, trimmed_start, weight as weight_of};
 use zupflow_core::runs::names::Offer;
 use zupflow_core::runs::reducer::admit;
-use zupflow_core::runs::state::{SessionContext, SteeredTurn};
+use zupflow_core::runs::state::{ChannelOrigin, SessionContext, SteeredTurn};
 use zupflow_core::runs::store::StoreError;
 use zupflow_core::runs::transition::{SeenMessage, Steer};
-use zupflow_core::runs::{ChannelAdmission, NewRun, RunTrigger, TakenIn};
+use zupflow_core::runs::{ChannelAdmission, NewRun, RunStatus, RunTrigger, TakenIn};
 use zupflow_core::time::Timestamp;
 use zupflow_core::webhooks::WebhookEventType;
 
@@ -94,13 +95,15 @@ struct SessionRow {
     session: ChannelSession,
     template: Option<SessionTemplate>,
     seen: Option<(Uuid, i64)>,
+    /// When its turns last noted the thread's edits and deletes.
+    changes_noted_at: Option<i64>,
 }
 
 macro_rules! session_select {
     () => {
         "SELECT s.id, s.agent_channel_id, s.conversation_id, s.thread_key, s.session_id, s.active_run_id, \
          s.last_run_id, s.run_count, s.model, s.model_id, s.model_connection_id, s.instructions, s.offer, \
-         s.history_budget, s.seen_message_id, s.seen_at FROM channel_sessions s"
+         s.history_budget, s.seen_message_id, s.seen_at, s.changes_noted_at FROM channel_sessions s"
     };
 }
 
@@ -149,6 +152,7 @@ fn session_from(row: &SqliteRow) -> Result<SessionRow, StoreError> {
         },
         template,
         seen,
+        changes_noted_at: get(row, "changes_noted_at")?,
     })
 }
 
@@ -649,6 +653,26 @@ async fn place_of(
     let provider: String = get(&row, "provider")?;
     let mid_run: String = get(&row, "mid_run")?;
     let team: String = get(&row, "team_id")?;
+    let identities = team_identities(connection, organization_id, workspace_id, &team).await?;
+    Ok(Place {
+        provider: ChannelProviderKind::parse(&provider).ok_or_else(|| corrupt("a connection's provider"))?,
+        connection_id: ChannelConnectionId::from_uuid(get(&row, "id")?),
+        agent_id: AgentId::from_uuid(get(&row, "agent_id")?),
+        identities,
+        own_identity: get(&row, "identity_external_id")?,
+        own_bot_id: get(&row, "identity_bot_id")?,
+        mid_run: MidRun::parse(&mid_run).ok_or_else(|| corrupt("an agent channel's mid-run rule"))?,
+    })
+}
+
+/// Every live identity of the workspace's connections in `team`, by provider
+/// ID (its user and its bot ID), each named by its handle.
+pub(crate) async fn team_identities(
+    connection: &mut SqliteConnection,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    team: &str,
+) -> Result<BTreeMap<String, String>, StoreError> {
     let mut identities = BTreeMap::new();
     for row in sqlx::query(
         "SELECT identity_external_id, identity_bot_id, handle FROM channel_connections \
@@ -656,7 +680,7 @@ async fn place_of(
     )
     .bind(organization_id.uuid())
     .bind(workspace_id.uuid())
-    .bind(&team)
+    .bind(team)
     .fetch_all(&mut *connection)
     .await
     .map_err(failed("place"))?
@@ -667,15 +691,62 @@ async fn place_of(
         }
         identities.insert(get::<String>(&row, "identity_external_id")?, handle);
     }
-    Ok(Place {
-        provider: ChannelProviderKind::parse(&provider).ok_or_else(|| corrupt("a connection's provider"))?,
-        connection_id: ChannelConnectionId::from_uuid(get(&row, "id")?),
-        agent_id: AgentId::from_uuid(get(&row, "agent_id")?),
-        identities,
-        own_identity: get(&row, "identity_external_id")?,
-        own_bot_id: get(&row, "identity_bot_id")?,
-        mid_run: MidRun::parse(&mid_run).ok_or_else(|| corrupt("an agent channel's mid-run rule"))?,
-    })
+    Ok(identities)
+}
+
+/// The names a connection's messages are rendered with: `identities` (the
+/// team's), then the people the connection knows by the provider IDs in
+/// `people`, and the conversations it knows by name among `channels`.
+pub(crate) async fn mention_names_in(
+    connection: &mut SqliteConnection,
+    (organization_id, workspace_id, connection_id): (OrganizationId, WorkspaceId, ChannelConnectionId),
+    identities: BTreeMap<String, String>,
+    people: &[&String],
+    channels: &BTreeSet<String>,
+) -> Result<MentionNames, StoreError> {
+    let mut names = MentionNames {
+        people: identities,
+        conversations: BTreeMap::new(),
+    };
+    if !people.is_empty() {
+        let rows = sqlx::query(
+            "SELECT external_id, display_name, handle FROM channel_people \
+             WHERE organization_id = ? AND workspace_id = ? AND connection_id = ? \
+             AND external_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(connection_id.uuid())
+        .bind(to_json(&people)?)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(failed("render"))?;
+        for row in &rows {
+            let external_id: String = get(row, "external_id")?;
+            let name: Option<String> = get::<Option<String>>(row, "display_name")?.or(get(row, "handle")?);
+            if let Some(name) = name {
+                names.people.entry(external_id).or_insert(name);
+            }
+        }
+    }
+    if !channels.is_empty() {
+        let rows = sqlx::query(
+            "SELECT external_id, name FROM channel_conversations \
+             WHERE organization_id = ? AND workspace_id = ? AND connection_id = ? AND name IS NOT NULL \
+             AND external_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(connection_id.uuid())
+        .bind(to_json(channels)?)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(failed("render"))?;
+        for row in &rows {
+            names.conversations.insert(get(row, "external_id")?, get(row, "name")?);
+        }
+    }
+    Ok(names)
 }
 
 /// A thread message as read for a turn.
@@ -712,7 +783,8 @@ fn read_from(row: &SqliteRow) -> Result<Read, StoreError> {
 
 macro_rules! thread_select {
     () => {
-        "SELECT g.id, g.created_at, g.direction, g.text, g.mentions, p.external_id AS person_external_id, \
+        "SELECT g.id, g.created_at, g.direction, coalesce(g.edited_text, g.text) AS text, g.mentions, \
+         p.external_id AS person_external_id, \
          p.display_name AS person_display_name, p.handle AS person_handle, p.is_automated AS person_is_automated \
          FROM channel_messages g LEFT JOIN channel_people p ON p.organization_id = g.organization_id \
          AND p.workspace_id = g.workspace_id AND p.connection_id = g.connection_id AND p.id = g.author_person_id"
@@ -735,7 +807,7 @@ async fn render(
     seen: Option<(Uuid, i64)>,
     taken: &[Waiting],
     header: Option<&str>,
-) -> Result<(String, SeenMessage), StoreError> {
+) -> Result<(String, SeenMessage, Option<Timestamp>), StoreError> {
     let newest = taken
         .iter()
         .max_by_key(|waiting| (waiting.at, waiting.message))
@@ -801,53 +873,19 @@ async fn render(
     // The names mentions are rendered with: the team's identities, then
     // the people the connection knows, and the conversations it knows by
     // name.
-    let mut names = MentionNames {
-        people: place.identities.clone(),
-        conversations: BTreeMap::new(),
-    };
     let mentioned: Vec<&String> = reads.iter().flat_map(|read| read.mentions.iter()).collect();
-    if !mentioned.is_empty() {
-        let people = sqlx::query(
-            "SELECT external_id, display_name, handle FROM channel_people \
-             WHERE organization_id = ? AND workspace_id = ? AND connection_id = ? \
-             AND external_id IN (SELECT value FROM json_each(?))",
-        )
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(place.connection_id.uuid())
-        .bind(to_json(&mentioned)?)
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(failed("render"))?;
-        for row in &people {
-            let external_id: String = get(row, "external_id")?;
-            let name: Option<String> = get::<Option<String>>(row, "display_name")?.or(get(row, "handle")?);
-            if let Some(name) = name {
-                names.people.entry(external_id).or_insert(name);
-            }
-        }
-    }
     let channels: BTreeSet<String> = reads
         .iter()
         .flat_map(|read| conversation_mentions(place.provider, &read.text))
         .collect();
-    if !channels.is_empty() {
-        let conversations = sqlx::query(
-            "SELECT external_id, name FROM channel_conversations \
-             WHERE organization_id = ? AND workspace_id = ? AND connection_id = ? AND name IS NOT NULL \
-             AND external_id IN (SELECT value FROM json_each(?))",
-        )
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(place.connection_id.uuid())
-        .bind(to_json(&channels)?)
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(failed("render"))?;
-        for row in &conversations {
-            names.conversations.insert(get(row, "external_id")?, get(row, "name")?);
-        }
-    }
+    let names = mention_names_in(
+        connection,
+        (organization_id, workspace_id, place.connection_id),
+        place.identities.clone(),
+        &mentioned,
+        &channels,
+    )
+    .await?;
     // What the agent said before is in the session's history; only a
     // session's first turn reads it from the thread.
     let first = seen.is_none();
@@ -883,7 +921,23 @@ async fn render(
         })
         .collect();
     let provider = place.provider;
-    let text = render_turn(header, &lines, &|text| plain_text(provider, text, &names));
+    let plain = |text: &str| plain_text(provider, text, &names);
+    // What changed since its turns last looked, in messages it read before:
+    // noted at the start of this turn, never rewritten where it was sent.
+    let notes = match seen {
+        Some(seen) => change_notes(connection, organization_id, workspace_id, place, session, seen)
+            .await?
+            .iter()
+            .map(|(author, edited)| change_note(author, edited.as_deref().map(&plain).as_deref()))
+            .collect(),
+        None => Vec::new(),
+    };
+    let head = match (header, notes.is_empty()) {
+        (header, true) => header.map(str::to_owned),
+        (Some(header), false) => Some(format!("{header}\n{}", notes.join("\n"))),
+        (None, false) => Some(notes.join("\n")),
+    };
+    let text = render_turn(head.as_deref(), &lines, &plain);
     let seen = match seen {
         Some((id, at)) if (at, id) > (newest.at, newest.message) => SeenMessage {
             id: ChannelMessageId::from_uuid(id),
@@ -894,7 +948,82 @@ async fn render(
             at: Timestamp::from_millis(newest.at),
         },
     };
-    Ok((text, seen))
+    // Every change learned of so far to a message up to `seen` is in this
+    // turn: noted above, or read as it now says. What's learned of later
+    // is noted in a later turn.
+    let noted: Option<i64> = sqlx::query_scalar(
+        "SELECT max(changed_at) FROM channel_messages \
+         WHERE organization_id = ?1 AND workspace_id = ?2 AND connection_id = ?3 AND conversation_id = ?4 \
+         AND thread_key = ?5 AND direction = 'inbound' \
+         AND (created_at < ?6 OR (created_at = ?6 AND id <= ?7))",
+    )
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(place.connection_id.uuid())
+    .bind(session.session.conversation_id.uuid())
+    .bind(&session.session.thread_key)
+    .bind(seen.at.millis())
+    .bind(seen.id.uuid())
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(failed("render"))?;
+    Ok((text, seen, noted.map(Timestamp::from_millis)))
+}
+
+/// The most edits and deletes one turn notes.
+const MAX_NOTES: i64 = 20;
+
+/// The thread's messages from others that the session read before (up to
+/// `seen`) and that were edited or deleted since its turns last noted
+/// changes, oldest first: each one's author, and its new text unless it
+/// was deleted.
+async fn change_notes(
+    connection: &mut SqliteConnection,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    place: &Place,
+    session: &SessionRow,
+    (seen_id, seen_at): (Uuid, i64),
+) -> Result<Vec<(String, Option<String>)>, StoreError> {
+    let since = session.changes_noted_at.unwrap_or(seen_at);
+    let rows = sqlx::query(
+        "SELECT g.edited_text, g.deleted_at, p.external_id, p.display_name, p.handle FROM channel_messages g \
+         LEFT JOIN channel_people p ON p.organization_id = g.organization_id AND p.workspace_id = g.workspace_id \
+         AND p.connection_id = g.connection_id AND p.id = g.author_person_id \
+         WHERE g.organization_id = ?1 AND g.workspace_id = ?2 AND g.connection_id = ?3 AND g.conversation_id = ?4 \
+         AND g.thread_key = ?5 AND g.direction = 'inbound' \
+         AND (g.created_at < ?6 OR (g.created_at = ?6 AND g.id <= ?7)) \
+         AND g.changed_at > ?8 \
+         ORDER BY g.created_at, g.id LIMIT ?9",
+    )
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(place.connection_id.uuid())
+    .bind(session.session.conversation_id.uuid())
+    .bind(&session.session.thread_key)
+    .bind(seen_at)
+    .bind(seen_id)
+    .bind(since)
+    .bind(MAX_NOTES)
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(failed("change_notes"))?;
+    let mut notes = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let external_id: Option<String> = get(row, "external_id")?;
+        let name = get::<Option<String>>(row, "display_name")?
+            .or(get(row, "handle")?)
+            .or(external_id)
+            .unwrap_or_else(|| "Someone".to_owned());
+        let deleted: Option<i64> = get(row, "deleted_at")?;
+        let edited: Option<String> = get(row, "edited_text")?;
+        match (deleted, edited) {
+            (Some(_), _) => notes.push((name, None)),
+            (None, Some(text)) => notes.push((name, Some(text))),
+            (None, None) => {}
+        }
+    }
+    Ok(notes)
 }
 
 // --- Starting runs -----------------------------------------------------------
@@ -980,7 +1109,18 @@ async fn build_transcript(
     let turns = crate::runs::committed_turns(connection, organization_id, workspace_id, run_id).await?;
     let calls = crate::runs::recorded_calls(connection, organization_id, workspace_id, run_id).await?;
     let steers = steered_turns(connection, organization_id, workspace_id, run_id).await?;
-    Ok(transcript(input, &turns, &calls, &steers))
+    // Only a completed run's last turn is final whatever its calls: one
+    // that stayed silent ends on its stay_silent call.
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM runs WHERE organization_id = ? AND workspace_id = ? AND id = ?")
+            .bind(organization_id.uuid())
+            .bind(workspace_id.uuid())
+            .bind(run_id.uuid())
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(failed("build_transcript"))?;
+    let completed = status.as_deref() == Some(RunStatus::Completed.as_str());
+    Ok(transcript(input, &turns, &calls, &steers, completed))
 }
 
 /// The transcripts of a run session's runs from `from` up to before
@@ -1077,10 +1217,11 @@ async fn start_session_run(
     if session.session.active_run_id.is_some() {
         return Err(StoreError::Refused("a run started in a busy session"));
     }
-    // What changed for the session's runs starts a new run session: its
-    // history starts over, and it reads the thread anew.
+    // What changed for the session's runs, as their model reads them,
+    // starts a new run session: its history starts over, and it reads the
+    // thread anew. A label or a team renamed doesn't.
     let (session_id, template, seen) = match (fresh, &session.template) {
-        (Some(fresh), Some(own)) if fresh != own => (SessionId::generate(), fresh, None),
+        (Some(fresh), Some(own)) if !fresh.same_for_the_model(own) => (SessionId::generate(), fresh, None),
         (Some(fresh), _) => (session.session.session_id, fresh, session.seen),
         (None, Some(own)) => (session.session.session_id, own, session.seen),
         (None, None) => return Ok(Start::Nothing),
@@ -1123,7 +1264,7 @@ async fn start_session_run(
         session.session.agent_channel_id,
     )
     .await?;
-    let (input, seen) = render(
+    let (input, seen, noted) = render(
         connection,
         organization_id,
         workspace_id,
@@ -1209,10 +1350,11 @@ async fn start_session_run(
     .await?;
     let offer = to_json(&template.offer)?;
     let started = sqlx::query(
-        "UPDATE channel_sessions SET session_id = ?, active_run_id = ?, run_count = ?, seen_message_id = ?, \
-         seen_at = ?, model = ?, model_id = ?, model_connection_id = ?, instructions = ?, offer = ?, \
-         history_budget = ?, updated_at = ? \
-         WHERE organization_id = ? AND workspace_id = ? AND id = ? AND active_run_id IS NULL",
+        "UPDATE channel_sessions SET session_id = ?1, active_run_id = ?2, run_count = ?3, seen_message_id = ?4, \
+         seen_at = ?5, model = ?6, model_id = ?7, model_connection_id = ?8, instructions = ?9, offer = ?10, \
+         history_budget = ?11, updated_at = ?12, changes_noted_at = CASE WHEN ?13 IS NULL THEN changes_noted_at \
+         WHEN changes_noted_at IS NULL OR changes_noted_at < ?13 THEN ?13 ELSE changes_noted_at END \
+         WHERE organization_id = ?14 AND workspace_id = ?15 AND id = ?16 AND active_run_id IS NULL",
     )
     .bind(session_id.uuid())
     .bind(run_id.uuid())
@@ -1226,6 +1368,7 @@ async fn start_session_run(
     .bind(offer)
     .bind(i64::try_from(template.history_budget).map_err(unreadable)?)
     .bind(now.millis())
+    .bind(noted.map(Timestamp::millis))
     .bind(organization_id.uuid())
     .bind(workspace_id.uuid())
     .bind(key.uuid())
@@ -1382,7 +1525,7 @@ pub(crate) async fn steerable_in(
     if taken.is_empty() {
         return Ok(None);
     }
-    let (text, seen) = render(
+    let (text, seen, noted) = render(
         connection,
         organization_id,
         workspace_id,
@@ -1404,6 +1547,7 @@ pub(crate) async fn steerable_in(
             .map(|waiting| ChannelMessageId::from_uuid(waiting.message))
             .collect(),
         seen,
+        changes_noted_at: noted,
     }))
 }
 
@@ -1459,6 +1603,21 @@ pub(crate) async fn take_steer(
     .execute(&mut *connection)
     .await
     .map_err(failed("take_steer"))?;
+    // The steered turn noted what changed up to when it was rendered: a
+    // change learned of since is noted in a later turn.
+    // The watermark moves forward, never back.
+    sqlx::query(
+        "UPDATE channel_sessions SET changes_noted_at = CASE WHEN ?1 IS NULL THEN changes_noted_at \
+         WHEN changes_noted_at IS NULL OR changes_noted_at < ?1 THEN ?1 ELSE changes_noted_at END \
+         WHERE organization_id = ?2 AND workspace_id = ?3 AND id = ?4",
+    )
+    .bind(steer.changes_noted_at.map(Timestamp::millis))
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(session.session.key.uuid())
+    .execute(&mut *connection)
+    .await
+    .map_err(failed("take_steer"))?;
     let newer = session
         .seen
         .is_none_or(|(id, at)| (steer.seen.at.millis(), steer.seen.id.uuid()) > (at, id));
@@ -1493,7 +1652,8 @@ pub(crate) async fn session_context(
     run_id: RunId,
 ) -> Result<Option<SessionContext>, StoreError> {
     let row = sqlx::query(
-        "SELECT channel_session_id, session_id, session_sequence, history_start_run_id, offer FROM runs \
+        "SELECT channel_session_id, session_id, session_sequence, history_start_run_id, offer, \
+         channel_connection_id, channel_conversation_id, channel_thread_key FROM runs \
          WHERE organization_id = ? AND workspace_id = ? AND id = ?",
     )
     .bind(organization_id.uuid())
@@ -1506,11 +1666,22 @@ pub(crate) async fn session_context(
     let Some(key) = get::<Option<Uuid>>(&row, "channel_session_id")? else {
         return Ok(None);
     };
-    let (Some(sequence), Some(start), Some(offer)) = (
+    let (
+        Some(sequence),
+        Some(start),
+        Some(offer),
+        Some(origin_connection),
+        Some(origin_conversation),
+        Some(thread_key),
+    ) = (
         get::<Option<i64>>(&row, "session_sequence")?,
         get::<Option<Uuid>>(&row, "history_start_run_id")?,
         get::<Option<String>>(&row, "offer")?,
-    ) else {
+        get::<Option<Uuid>>(&row, "channel_connection_id")?,
+        get::<Option<Uuid>>(&row, "channel_conversation_id")?,
+        get::<Option<String>>(&row, "channel_thread_key")?,
+    )
+    else {
         return Err(corrupt("a channel run without its place in its session"));
     };
     let sequence = small(sequence)?;
@@ -1545,6 +1716,11 @@ pub(crate) async fn session_context(
     )
     .await?;
     Ok(Some(SessionContext {
+        origin: ChannelOrigin {
+            connection_id: ChannelConnectionId::from_uuid(origin_connection),
+            conversation_id: ChannelConversationId::from_uuid(origin_conversation),
+            thread_key,
+        },
         history,
         offer: serde_json::from_str::<Offer>(&offer).map_err(unreadable)?,
         steers: steered_turns(connection, organization_id, workspace_id, run_id).await?,

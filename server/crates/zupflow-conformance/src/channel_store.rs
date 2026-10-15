@@ -33,12 +33,14 @@ use std::time::Duration;
 use zupflow_core::agents::{AgentChanges, AgentError, AgentStatus, AgentStore};
 use zupflow_core::audit::AuditActor;
 use zupflow_core::channels::handling::{DispatchReason, INBOUND_JOB, message_of_job};
-use zupflow_core::channels::provider::{InboundEvent, NormalizedMessage, ProviderPerson};
+use zupflow_core::channels::provider::{
+    DeletedMessage, EditedMessage, InboundEvent, NormalizedMessage, ProviderPerson,
+};
 use zupflow_core::channels::reply::{ChannelReply, REPLY_JOB};
 use zupflow_core::channels::store::{
     AppCreation, AppFilter, ChannelEditor, ChannelError, ChannelStore, ConnectionChanges, ConnectionFilter,
     ConversationFilter, DeliveryOutcome, DispatchOutcome, LevelChange, MadeApp, MessageFilter, NewApp, NewConversation,
-    NewDelivery, NewDispatch, NewInstall, NewManager, NewMessage, NewPerson, PersonLookup, SealedVersion,
+    NewDelivery, NewDispatch, NewInstall, NewManager, NewMessage, NewPerson, PersonLookup, SealedVersion, SendSlot,
     SessionTemplate, TokenReplacement,
 };
 use zupflow_core::channels::thread::{STEER_HEADER, origin_keys};
@@ -50,8 +52,8 @@ use zupflow_core::connect::{ConnectIntent, ConnectSessionStatus, ConnectStore, N
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{
     AgentChannelId, AgentId, ApiKeyId, ChannelAppId, ChannelAppManagerId, ChannelConnectionId, ChannelConversationId,
-    ChannelMessageId, ConnectSessionId, MemberId, ModelConnectionId, ModelId, OrganizationId, RunId, UserId,
-    WorkspaceId,
+    ChannelMessageId, ConnectSessionId, MemberId, ModelConnectionId, ModelId, OrganizationId, RunId, ToolCallId,
+    UserId, WorkspaceId,
 };
 use zupflow_core::jobs::{JobOptions, JobQueue};
 use zupflow_core::keys::{Sealed, WrappedKey};
@@ -131,6 +133,9 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     rotates_a_teams_tokens_once_per_version(&stores, &prepare).await;
     reads_people_once_and_replies_only_to_answers(&stores, &prepare).await;
     replies_to_an_answer_until_it_is_sent(&stores, &prepare).await;
+    acts_only_within_its_connection_and_sweeps_past_retention(&stores, &prepare).await;
+    reserves_send_slots_a_second_apart_per_connection(&stores, &prepare).await;
+    searches_direct_messages_only_where_readable(&stores, &prepare).await;
 }
 
 async fn tenant(prepare: &Prepare) -> Tenant {
@@ -3116,4 +3121,377 @@ async fn replies_to_an_answer_until_it_is_sent(stores: &Stores<'_>, prepare: &Pr
         .unwrap()
         .expect("a reply");
     assert_eq!(reply.sent, Some(posted.id));
+}
+
+/// What a run's channel tools reach is the run's own connection's alone:
+/// another connection's message or person, even in the same workspace, is
+/// as one that doesn't exist. Edits are kept beside what a message first
+/// said, the latest one winning whatever order they arrive in, and the
+/// retention sweep deletes only its own workspace's old messages.
+async fn acts_only_within_its_connection_and_sweeps_past_retention(stores: &Stores<'_>, prepare: &Prepare) {
+    const DAY: i64 = 24 * 60 * 60 * 1000;
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let (_, app, own) = installed(stores, &t, ws, t.agent).await;
+    let (_, _, other) = installed(stores, &t, ws, t.other_agent).await;
+    let (_, _, sibling) = installed(stores, &t, t.sibling, t.sibling_agent).await;
+    let at = now().millis();
+    let record = |workspace_id: WorkspaceId, connection_id: ChannelConnectionId, message: NewMessage| async move {
+        stores
+            .channels
+            .record_message(org, workspace_id, connection_id, &message, now())
+            .await
+            .expect("recorded")
+            .message
+    };
+    let old = record(ws, own, message("1.1", "C0SUPPORT", "Lunch at noon", at - 40 * DAY)).await;
+    let recent = record(ws, own, message("1.2", "C0SUPPORT", "lunch moved", at - DAY)).await;
+    let others = record(ws, other, message("2.1", "C0SUPPORT", "lunch for two", at - DAY)).await;
+    let siblings = record(
+        t.sibling,
+        sibling,
+        message("3.1", "C0SUPPORT", "lunch nearby", at - 40 * DAY),
+    )
+    .await;
+
+    // Found within the connection only.
+    let find = |workspace_id: WorkspaceId, connection_id: ChannelConnectionId, message_id: ChannelMessageId| async move {
+        stores
+            .channels
+            .find_message(org, workspace_id, connection_id, message_id)
+            .await
+            .unwrap()
+            .map(|message| message.id)
+    };
+    assert_eq!(find(ws, own, recent.id).await, Some(recent.id));
+    assert_eq!(
+        find(ws, own, others.id).await,
+        None,
+        "another connection's, same workspace"
+    );
+    assert_eq!(find(ws, own, siblings.id).await, None, "another workspace's");
+    assert_eq!(
+        find(t.sibling, own, siblings.id).await,
+        None,
+        "named with another workspace"
+    );
+    assert_eq!(
+        stores
+            .channels
+            .find_message(OrganizationId::generate(), ws, own, recent.id)
+            .await
+            .unwrap(),
+        None,
+        "named with another organization"
+    );
+    let found: Vec<ChannelMessageId> = stores
+        .channels
+        .search_messages(org, ws, own, None, ChannelConversationId::generate(), "LUNCH", 10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|message| message.id)
+        .collect();
+    assert_eq!(found, [recent.id, old.id], "its own, newest first");
+    let people = stores.channels.find_people(org, ws, own, "dan", 10).await.unwrap();
+    assert_eq!(people.len(), 1);
+    assert_eq!(
+        people[0].team_id.as_deref(),
+        Some("T0NORTH"),
+        "the team its message named"
+    );
+    let others_person = others.author.as_ref().expect("an author").id;
+    assert_ne!(people[0].id, others_person, "each connection knows its own people");
+    assert!(
+        stores
+            .channels
+            .find_person(org, ws, own, others_person)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Only its own messages are its to edit, and its posts are counted.
+    assert!(matches!(
+        stores
+            .channels
+            .record_own_edit(org, ws, own, recent.id, "no", now())
+            .await,
+        Err(ChannelError::MessageNotFound)
+    ));
+    let posted = record(
+        ws,
+        own,
+        NewMessage {
+            direction: Direction::Outbound,
+            author: None,
+            mentions: Vec::new(),
+            ..message("1.3", "C0SUPPORT", "On it.", at)
+        },
+    )
+    .await;
+    stores
+        .channels
+        .record_own_edit(org, ws, own, posted.id, "On it, now.", now())
+        .await
+        .unwrap();
+    assert!(matches!(
+        stores
+            .channels
+            .record_own_edit(org, ws, other, posted.id, "theirs", now())
+            .await,
+        Err(ChannelError::MessageNotFound)
+    ));
+    let edited = stores
+        .channels
+        .find_message(org, ws, own, posted.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (edited.text.as_str(), edited.edited_text.as_deref()),
+        ("On it.", Some("On it, now."))
+    );
+
+    // A person's edits: the latest wins, whatever order they arrive in.
+    let edit = |id: &str, external_id: &str, text: &str, edited_at: i64| NewDelivery {
+        provider_event_id: id.to_owned(),
+        kind: "message".to_owned(),
+        team_id: Some("T0NORTH".to_owned()),
+        event: InboundEvent::Edited(Box::new(EditedMessage {
+            conversation_external_id: "C0SUPPORT".to_owned(),
+            external_id: external_id.to_owned(),
+            text: text.to_owned(),
+            edited_at: Timestamp::from_millis(edited_at),
+        })),
+    };
+    for (id, text, edited_at) in [
+        ("EvE2", "lunch at one", at - 10),
+        ("EvE1", "lunch at half past", at - 20),
+    ] {
+        let outcome = stores
+            .channels
+            .record_delivery(org, ws, app, &edit(id, "1.2", text, edited_at), now())
+            .await;
+        assert_eq!(
+            outcome,
+            Ok(DeliveryOutcome::Changed {
+                connection_id: own,
+                message_id: recent.id
+            })
+        );
+    }
+    let kept = stores
+        .channels
+        .find_message(org, ws, own, recent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (kept.text.as_str(), kept.edited_text.as_deref()),
+        ("lunch moved", Some("lunch at one"))
+    );
+    // Another connection's message, by its provider ID: not this one's.
+    assert_eq!(
+        stores
+            .channels
+            .record_delivery(org, ws, app, &edit("EvE3", "2.1", "mine", at), now())
+            .await,
+        Ok(DeliveryOutcome::Ignored)
+    );
+    let deleted = NewDelivery {
+        provider_event_id: "EvD1".to_owned(),
+        kind: "message".to_owned(),
+        team_id: Some("T0NORTH".to_owned()),
+        event: InboundEvent::Deleted(Box::new(DeletedMessage {
+            conversation_external_id: "C0SUPPORT".to_owned(),
+            external_id: "1.2".to_owned(),
+            deleted_at: Timestamp::from_millis(at),
+        })),
+    };
+    stores
+        .channels
+        .record_delivery(org, ws, app, &deleted, now())
+        .await
+        .unwrap();
+    let kept = stores
+        .channels
+        .find_message(org, ws, own, recent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(kept.deleted_at.is_some());
+    assert!(
+        stores
+            .channels
+            .search_messages(
+                org,
+                ws,
+                own,
+                None,
+                ChannelConversationId::generate(),
+                "lunch at one",
+                10
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+        "a deleted message isn't found"
+    );
+
+    // Past the organization's 30 days: only this workspace's old message.
+    let due = stores.channels.retention_due_cross_tenant(now(), 1_000).await.unwrap();
+    assert!(due.contains(&(org, ws)) && due.contains(&(org, t.sibling)));
+    let swept = stores.channels.sweep_retention(org, ws, now()).await.unwrap();
+    assert_eq!(swept.messages, 1);
+    assert_eq!(find(ws, own, old.id).await, None);
+    assert_eq!(find(ws, own, recent.id).await, Some(recent.id));
+    assert_eq!(
+        find(t.sibling, sibling, siblings.id).await,
+        Some(siblings.id),
+        "another workspace's waits"
+    );
+    let due = stores.channels.retention_due_cross_tenant(now(), 1_000).await.unwrap();
+    assert!(!due.contains(&(org, ws)) && due.contains(&(org, t.sibling)));
+}
+
+/// A connection's changes at its provider take send slots a second apart,
+/// however many runs take them at once, and at most 200 an hour; another
+/// connection's slots are its own.
+async fn reserves_send_slots_a_second_apart_per_connection(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let (_, _, own) = installed(stores, &t, ws, t.agent).await;
+    let (_, _, other) = installed(stores, &t, ws, t.other_agent).await;
+    let at = now().millis();
+    let take = |connection_id: ChannelConnectionId, millis: i64| async move {
+        stores
+            .channels
+            .take_send_slot(
+                org,
+                ws,
+                connection_id,
+                RunId::generate(),
+                ToolCallId::generate(),
+                Timestamp::from_millis(millis),
+            )
+            .await
+            .expect("a slot")
+    };
+    // Taken at once, all together: a second apart, never two in a second,
+    // and refused once the next free one is further off than a send waits.
+    let mut taken = futures_join_all((0..9).map(|_| take(own, at))).await;
+    taken.sort_by_key(|slot| match slot {
+        SendSlot::Taken { wait_millis } => *wait_millis,
+        _ => u64::MAX,
+    });
+    assert_eq!(
+        taken,
+        [
+            SendSlot::Taken { wait_millis: 0 },
+            SendSlot::Taken { wait_millis: 1000 },
+            SendSlot::Taken { wait_millis: 2000 },
+            SendSlot::Taken { wait_millis: 3000 },
+            SendSlot::Taken { wait_millis: 4000 },
+            SendSlot::Taken { wait_millis: 5000 },
+            SendSlot::Busy,
+            SendSlot::Busy,
+            SendSlot::Busy,
+        ]
+    );
+    assert_eq!(
+        take(other, at).await,
+        SendSlot::Taken { wait_millis: 0 },
+        "another connection's"
+    );
+    assert_eq!(
+        stores
+            .channels
+            .send_counts(org, ws, own, Timestamp::from_millis(at))
+            .await
+            .unwrap()
+            .hour,
+        6
+    );
+    // Later, the next slot is free at once.
+    assert_eq!(take(own, at + 10_000).await, SendSlot::Taken { wait_millis: 0 });
+
+    // Two hours on, the old ones are gone: 200 in an hour, then no more.
+    let later = at + 2 * 60 * 60 * 1000;
+    for second in 0..200 {
+        assert_eq!(
+            take(own, later + second * 1000).await,
+            SendSlot::Taken { wait_millis: 0 }
+        );
+    }
+    assert_eq!(
+        stores
+            .channels
+            .send_counts(org, ws, own, Timestamp::from_millis(later + 200_000))
+            .await
+            .unwrap()
+            .hour,
+        200
+    );
+    assert_eq!(take(own, later + 200_000).await, SendSlot::HourFull);
+    assert_eq!(take(other, later + 200_000).await, SendSlot::Taken { wait_millis: 0 });
+    // An hour after the first of them, room again.
+    assert_eq!(
+        take(own, later + 60 * 60 * 1000 + 500).await,
+        SendSlot::Taken { wait_millis: 0 }
+    );
+}
+
+/// A search reads a direct message only in the conversation it names as
+/// readable; every other conversation's messages as before.
+async fn searches_direct_messages_only_where_readable(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let (_, _, own) = installed(stores, &t, ws, t.agent).await;
+    let at = now().millis();
+    let record = |message: NewMessage| async move {
+        stores
+            .channels
+            .record_message(org, ws, own, &message, now())
+            .await
+            .expect("recorded")
+            .message
+    };
+    let direct = |external_id: &str, conversation: &str| NewMessage {
+        conversation: NewConversation {
+            external_id: conversation.to_owned(),
+            kind: ConversationKind::Dm,
+            name: None,
+            is_external: false,
+            identity_is_member: true,
+        },
+        ..message(external_id, conversation, "the launch date", at)
+    };
+    let mine = record(direct("8.1", "D0MINE")).await;
+    let theirs = record(direct("8.2", "D0THEIRS")).await;
+    let open = record(message("8.3", "C0SUPPORT", "the launch date &amp; time", at)).await;
+    let search = |readable: ChannelConversationId| async move {
+        let mut found: Vec<ChannelMessageId> = stores
+            .channels
+            .search_messages(org, ws, own, None, readable, "launch", 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|message| message.id)
+            .collect();
+        found.sort();
+        found
+    };
+    let mut expected = vec![mine.id, open.id];
+    expected.sort();
+    assert_eq!(search(mine.conversation_id).await, expected);
+    assert_eq!(search(ChannelConversationId::generate()).await, [open.id]);
+    assert!(!search(mine.conversation_id).await.contains(&theirs.id));
+    // An escape a rendering undoes is a candidate for the caller to match.
+    let found = stores
+        .channels
+        .search_messages(org, ws, own, None, ChannelConversationId::generate(), "date & time", 10)
+        .await
+        .unwrap();
+    assert_eq!(found.iter().map(|message| message.id).collect::<Vec<_>>(), [open.id]);
 }

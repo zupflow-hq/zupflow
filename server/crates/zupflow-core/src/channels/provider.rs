@@ -1,8 +1,10 @@
 //! What a channel provider does with an installed connection: check that a
 //! delivery to an app's inbound endpoint was signed by that app, and read
 //! what it says into Zupflow's own terms; and, with the connection's token,
-//! read a person's details and post a run's answer. The inbound route and
-//! job call it, and so does the reply job.
+//! read a person's details, post a run's answer, and do what the agent's
+//! channel tools ask (post, edit, delete, react, open a DM, show that it's
+//! working). The inbound route and job call it, and so do the reply job
+//! and the run engine.
 //!
 //! A provider never trusts a delivery's body before [`ChannelProvider::verify`]
 //! accepts its signature, and never passes the other side's text on in an
@@ -71,6 +73,10 @@ pub enum InboundDelivery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundEvent {
     Message(Box<NormalizedMessage>),
+    /// Someone changed a message's text.
+    Edited(Box<EditedMessage>),
+    /// Someone deleted a message.
+    Deleted(Box<DeletedMessage>),
     /// The app was removed from the team, or its tokens revoked.
     Uninstalled,
     /// Something Zupflow doesn't act on: recorded once, nothing more.
@@ -102,6 +108,24 @@ pub struct NormalizedMessage {
     pub sent_at: Timestamp,
 }
 
+/// A message's new text, as the provider normalized it: in its markup, as
+/// a new message's is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditedMessage {
+    pub conversation_external_id: String,
+    pub external_id: String,
+    pub text: String,
+    pub edited_at: Timestamp,
+}
+
+/// A message deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedMessage {
+    pub conversation_external_id: String,
+    pub external_id: String,
+    pub deleted_at: Timestamp,
+}
+
 /// A person, as the provider describes them to a connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderPerson {
@@ -121,7 +145,8 @@ pub struct OutgoingPost<'a> {
     pub thread_key: &'a str,
     pub text: &'a str,
     /// What the post carries so a send whose answer was lost can be found
-    /// ([`ChannelProvider::find_sent`]): the run's ID.
+    /// ([`ChannelProvider::find_sent`]): the run's ID for its answer, the
+    /// call's ID for a channel tool's post.
     pub send_id: &'a str,
 }
 
@@ -210,6 +235,73 @@ pub trait ChannelProvider: Send + Sync {
     ) -> Result<Option<String>, ProviderCallError> {
         Err(ProviderCallError::Unsupported)
     }
+
+    /// Changes the text of the connection's own message. Text longer than
+    /// the provider takes is refused (`too_long`), never cut.
+    async fn edit(
+        &self,
+        _http: &dyn OutboundHttp,
+        _token: &str,
+        _message: &MessageRef<'_>,
+        _text: &str,
+    ) -> Result<(), ProviderCallError> {
+        Err(ProviderCallError::Unsupported)
+    }
+
+    /// Deletes the connection's own message; one already gone is deleted.
+    async fn delete(
+        &self,
+        _http: &dyn OutboundHttp,
+        _token: &str,
+        _message: &MessageRef<'_>,
+    ) -> Result<(), ProviderCallError> {
+        Err(ProviderCallError::Unsupported)
+    }
+
+    /// Adds the connection's reaction to a message, or takes it away;
+    /// adding one already there, or taking away one that isn't, is done.
+    async fn react(
+        &self,
+        _http: &dyn OutboundHttp,
+        _token: &str,
+        _message: &MessageRef<'_>,
+        _emoji: &str,
+        _remove: bool,
+    ) -> Result<(), ProviderCallError> {
+        Err(ProviderCallError::Unsupported)
+    }
+
+    /// The direct conversation with one person, opened if it isn't: its
+    /// external ID.
+    async fn open_direct(
+        &self,
+        _http: &dyn OutboundHttp,
+        _token: &str,
+        _person_external_id: &str,
+    ) -> Result<String, ProviderCallError> {
+        Err(ProviderCallError::Unsupported)
+    }
+
+    /// Shows, in a thread, that the connection's agent is working (`true`)
+    /// or no longer is. Best effort: whether it was shown; never an error,
+    /// and never worth a retry.
+    async fn show_working(
+        &self,
+        _http: &dyn OutboundHttp,
+        _token: &str,
+        _conversation_external_id: &str,
+        _thread_key: &str,
+        _working: bool,
+    ) -> bool {
+        false
+    }
+}
+
+/// A message the connection acts on, by the provider's IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageRef<'a> {
+    pub conversation_external_id: &'a str,
+    pub external_id: &'a str,
 }
 
 #[cfg(test)]
