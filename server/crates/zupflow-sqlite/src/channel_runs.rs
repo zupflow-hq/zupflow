@@ -19,7 +19,7 @@
 //! ([`zupflow_core::runs::history::trimmed_start`]), so the cache misses
 //! once per trim.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde_json::json;
 use sqlx::sqlite::SqliteRow;
@@ -29,7 +29,9 @@ use zupflow_core::channels::handling::DispatchReason;
 use zupflow_core::channels::store::{
     BreakerOutcome, ChannelSession, ChannelSessionKey, DispatchOutcome, NewDispatch, SessionTemplate,
 };
-use zupflow_core::channels::thread::{LineAuthor, MAX_TAKEN, STEER_HEADER, ThreadLine, plain_text, render_turn};
+use zupflow_core::channels::thread::{
+    LineAuthor, MAX_TAKEN, MentionNames, STEER_HEADER, ThreadLine, conversation_mentions, plain_text, render_turn,
+};
 use zupflow_core::channels::{ChannelProviderKind, ConversationKind, MidRun};
 use zupflow_core::ids::{
     AgentChannelId, AgentId, ChannelConnectionId, ChannelConversationId, ChannelMessageId, ModelConnectionId, ModelId,
@@ -797,8 +799,12 @@ async fn render(
     let taken_ids: HashSet<Uuid> = taken.iter().map(|waiting| waiting.message).collect();
     let to_you = |read: &Read| direct || taken_ids.contains(&read.id) || read.mentions.contains(&place.own_identity);
     // The names mentions are rendered with: the team's identities, then
-    // the people the connection knows.
-    let mut names = place.identities.clone();
+    // the people the connection knows, and the conversations it knows by
+    // name.
+    let mut names = MentionNames {
+        people: place.identities.clone(),
+        conversations: BTreeMap::new(),
+    };
     let mentioned: Vec<&String> = reads.iter().flat_map(|read| read.mentions.iter()).collect();
     if !mentioned.is_empty() {
         let people = sqlx::query(
@@ -817,8 +823,29 @@ async fn render(
             let external_id: String = get(row, "external_id")?;
             let name: Option<String> = get::<Option<String>>(row, "display_name")?.or(get(row, "handle")?);
             if let Some(name) = name {
-                names.entry(external_id).or_insert(name);
+                names.people.entry(external_id).or_insert(name);
             }
+        }
+    }
+    let channels: BTreeSet<String> = reads
+        .iter()
+        .flat_map(|read| conversation_mentions(place.provider, &read.text))
+        .collect();
+    if !channels.is_empty() {
+        let conversations = sqlx::query(
+            "SELECT external_id, name FROM channel_conversations \
+             WHERE organization_id = ? AND workspace_id = ? AND connection_id = ? AND name IS NOT NULL \
+             AND external_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(place.connection_id.uuid())
+        .bind(to_json(&channels)?)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(failed("render"))?;
+        for row in &conversations {
+            names.conversations.insert(get(row, "external_id")?, get(row, "name")?);
         }
     }
     // What the agent said before is in the session's history; only a
@@ -1258,7 +1285,8 @@ pub(crate) async fn run_ended(
         // Its session is gone, with its agent channel.
         return Ok(());
     }
-    // Part B's reply with the run's output goes here, before the next run.
+    // Its answer is posted by its own job, queued here, before the next run.
+    crate::channels::exchange::queue_reply(connection, organization_id, workspace_id, run_id, now).await?;
     let Some(session) = session_by_key(connection, organization_id, workspace_id, key).await? else {
         return Ok(());
     };

@@ -616,6 +616,69 @@ one run after it (`collect`). `tests/channel_runs.rs` drives all of it through
 the route with a fake team chat, and `tests/channel_prompt_cache.rs` checks the
 prefix turn by turn on the Anthropic and OpenAI paths.
 
+### Agents in Slack
+
+With `ZUPFLOW_CHANNEL_PROVISIONER=slack`, each agent gets its own Slack app,
+made and kept in step through Slack's manifest API (`zupflow-slack`). Unset,
+nothing is made; `scripted` is a stand-in for local work and tests only.
+
+1. **Give the server a public HTTPS address.** Slack sends each app's events
+   to `{ZUPFLOW_PUBLIC_URL}/channels/inbound/{reference}` and the browser back
+   from its consent page to `{ZUPFLOW_PUBLIC_URL}/connect/oauth/callback`, so
+   with `slack` the server refuses to start unless `ZUPFLOW_PUBLIC_URL` is an
+   `https://` origin, and Slack must be able to reach it. For local work, run
+   a tunnel to `127.0.0.1:8080` (any HTTPS tunnel will do) and set
+   `ZUPFLOW_PUBLIC_URL` to the tunnel's origin; it must stay the same for as
+   long as its apps live, since their manifests name it.
+2. **Generate a configuration token.** A Slack workspace admin opens
+   [api.slack.com/apps](https://api.slack.com/apps), and under *Your App
+   Configuration Tokens* generates one for the workspace. Slack shows an
+   access token (`xoxe.xoxp-…`) and a refresh token (`xoxe-…`).
+3. **Link the team.** Paste both in the Console (*Link a Slack team*) or
+   on a hosted Connect page for a `channel_app_manager` session. The server
+   checks them with Slack, seals them, and from then on rotates them itself, an
+   hour before each pair's 12-hour life ends (at once for a pasted pair, whose
+   age it can't know), one rotation per pair however many workers run. A pair
+   Slack refuses leaves the team `token_expired` (with a
+   `channel_app_manager.status_changed` webhook), and someone pastes a new one.
+4. **Give an agent its app, and install it.** Making the app is a background
+   job, in two steps: the app is made without its events, its secrets
+   stored, and then its events subscribed, since Slack checks the events URL
+   with a request signed by the app's own secret. Installing it is a hosted
+   Connect session (`channel_app`) whose page sends the person to Slack's
+   consent page with the app's own client. The install must be in the team
+   the configuration token belongs to.
+
+Renaming an agent, or changing its description, updates its app's manifest;
+disconnecting revokes its bot token. Deleting the app revokes its bot token
+and then deletes it at Slack with the team's configuration token, so the team
+can't be unlinked until that's done (`409 in_use`); if the team's tokens
+expired, pasting new ones finishes it. A Slack rate limit postpones the job
+for as long as Slack asked, without using an attempt.
+
+Once installed, the app's events arrive at its inbound endpoint, read in
+Slack's terms (`zupflow_slack::SlackChannelProvider`): a mention is read once,
+from its `message` event (its `app_mention` is recorded and nothing more);
+edits and deletions change nothing a model was sent; a message in a channel
+shared with another organization (Slack Connect) is read with its author's
+own team, so it wakes the agent only when the agent allows people of other
+organizations; and any post with a `bot_id` is an app's. Only for a message
+the agent may answer does the inbound job ask Slack about people with
+`users.info`: the author's email when a sender list is checked, and once the
+message wakes the agent, its author and the people it mentions (ten at
+most), so runs read them by name (an ID when Slack can't say). A name, once
+read, is kept; someone Slack doesn't show, and an email a sender list
+matches, are asked about again a day later. A run's answer is posted in its
+thread with `chat.postMessage` by a job of its own, carrying the run's ID, so
+a post whose answer was lost is found before it's sent again; a rate limit is
+waited out for a day after the run at most.
+
+`ZUPFLOW_SLACK_API_URL` points the calls somewhere other than
+`https://slack.com/api` (a stand-in, say); it must be `https://`, and consent
+pages are sent to `/oauth/v2/authorize` at the same origin. Without `slack`,
+deliveries are read by the fake provider, which calls no one, so nothing is
+posted back.
+
 ### The contract suite against the backend
 
 ```bash

@@ -547,7 +547,20 @@ export function contractSuite(target: Target) {
         await owner.agentChannels.delete(sandbox.id, installed.agentId, installed.connection.id);
         await owner.channelConnections.delete(sandbox.id, installed.connection.id);
         await owner.channelApps.delete(sandbox.id, channelApp.id);
-        await owner.channelAppManagers.delete(sandbox.id, manager.id);
+        // A deleted app is removed at the provider by the team's tokens: until then the team is in use.
+        for (let attempt = 0; ; attempt++) {
+          const refused = await owner.channelAppManagers.delete(sandbox.id, manager.id).then(
+            () => null,
+            (error: unknown) => {
+              if (error instanceof ZupflowApiError && error.status === 409 && error.code === "in_use" && attempt < 50) {
+                return error;
+              }
+              throw error;
+            },
+          );
+          if (!refused) break;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
         await owner.agents.delete(sandbox.id, channelAgent.id);
         // The provider's endpoint last: it needs what the provider knows of an app, which only the target can say.
         await deliver(installed.app.id, { type: "url_verification", challenge: "contract" });

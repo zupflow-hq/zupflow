@@ -14,6 +14,10 @@
 //! asked, records the provider's ID at once, and a later attempt forgets it
 //! only once it's deleted there; an app whose making job is gone or buried
 //! is failed, and one still in flight gets a job to clean up after it.
+//! An app is installed through the Connect session that asked for it, as
+//! one with the session's completion; a made app that's deleted gets a job
+//! to remove it at its provider; and a team's tokens get one rotation job
+//! per version, or expire when they lapse unrotated.
 //!
 //! `prepare` makes a [`Tenant`] exist: its organization, two Sandbox
 //! workspaces and a Production one, an active admin, developer and viewer
@@ -29,12 +33,13 @@ use std::time::Duration;
 use zupflow_core::agents::{AgentChanges, AgentError, AgentStatus, AgentStore};
 use zupflow_core::audit::AuditActor;
 use zupflow_core::channels::handling::{DispatchReason, INBOUND_JOB, message_of_job};
-use zupflow_core::channels::provider::{InboundEvent, NormalizedMessage};
+use zupflow_core::channels::provider::{InboundEvent, NormalizedMessage, ProviderPerson};
+use zupflow_core::channels::reply::{ChannelReply, REPLY_JOB};
 use zupflow_core::channels::store::{
     AppCreation, AppFilter, ChannelEditor, ChannelError, ChannelStore, ConnectionChanges, ConnectionFilter,
     ConversationFilter, DeliveryOutcome, DispatchOutcome, LevelChange, MadeApp, MessageFilter, NewApp, NewConversation,
-    NewDelivery, NewDispatch, NewInstall, NewManager, NewMessage, NewPerson, SealedVersion, SessionTemplate,
-    TokenReplacement,
+    NewDelivery, NewDispatch, NewInstall, NewManager, NewMessage, NewPerson, PersonLookup, SealedVersion,
+    SessionTemplate, TokenReplacement,
 };
 use zupflow_core::channels::thread::{STEER_HEADER, origin_keys};
 use zupflow_core::channels::{
@@ -50,15 +55,17 @@ use zupflow_core::ids::{
 };
 use zupflow_core::jobs::{JobOptions, JobQueue};
 use zupflow_core::keys::{Sealed, WrappedKey};
-use zupflow_core::model_store::RunModel;
+use zupflow_core::model_store::{RouteState, RunModel};
 use zupflow_core::models::Message;
+use zupflow_core::models::{Completion, Reply, TokenUsage};
 use zupflow_core::policy::ToolLevel;
 use zupflow_core::runs::QueuedJob;
 use zupflow_core::runs::RunTrigger;
 use zupflow_core::runs::names::Offer;
-use zupflow_core::runs::reducer::cancel;
-use zupflow_core::runs::state::RequestId;
+use zupflow_core::runs::reducer::{Facts, ModelAnswer, ModelResult, advance, cancel};
+use zupflow_core::runs::state::{ClaimantId, Continuation, InvocationId, RequestId};
 use zupflow_core::runs::store::{Applied, RunStore};
+use zupflow_core::runs::transition::Operation;
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
 
@@ -118,6 +125,12 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     keeps_workspaces_and_organizations_apart(&stores, &prepare).await;
     makes_an_app_at_least_once(&stores, &prepare).await;
     settles_apps_whose_job_is_gone(&stores, &prepare).await;
+    installs_an_app_through_its_connect_session(&stores, &prepare).await;
+    removes_a_made_app_at_its_provider_too(&stores, &prepare).await;
+    syncs_an_agents_apps_with_its_changes(&stores, &prepare).await;
+    rotates_a_teams_tokens_once_per_version(&stores, &prepare).await;
+    reads_people_once_and_replies_only_to_answers(&stores, &prepare).await;
+    replies_to_an_answer_until_it_is_sent(&stores, &prepare).await;
 }
 
 async fn tenant(prepare: &Prepare) -> Tenant {
@@ -919,6 +932,14 @@ async fn removes_apps_and_connections_keeping_history(stores: &Stores<'_>, prepa
         )
         .await;
     assert_eq!(put.err(), Some(ChannelError::ConnectionDisconnected));
+    // Made at its provider: the team is what removes it there, so it stays
+    // linked until the app is released.
+    assert_eq!(unlink().await, Err(ChannelError::RemovalsPending(1)));
+    assert_eq!(stores.channels.record_app_released(org, ws, app, now()).await, Ok(true));
+    assert_eq!(
+        stores.channels.record_app_released(org, ws, app, now()).await,
+        Ok(false)
+    );
     assert_eq!(unlink().await, Ok(()), "a team unlinks once its apps are gone");
     assert!(stores.channels.find_manager(org, ws, manager).await.unwrap().is_none());
     assert!(
@@ -1304,6 +1325,12 @@ async fn starts_one_run_per_session(stores: &Stores<'_>, prepare: &Prepare) {
         stores.runs.apply(org, ws, &cancel).await,
         Ok(Applied::Committed(_))
     ));
+    // A run that ended without an answer has nothing to post.
+    assert_eq!(stores.channels.reply_of(org, ws, first).await, Ok(None));
+    assert!(
+        claim_in(stores, REPLY_JOB, Scope::Workspace(org, ws)).await.is_none(),
+        "no reply queued for a cancelled run"
+    );
     let after = stores
         .channels
         .find_session(org, ws, channel.id, messages[0].conversation_id, "1700000000.000100")
@@ -2364,4 +2391,729 @@ async fn settles_apps_whose_job_is_gone(stores: &Stores<'_>, prepare: &Prepare) 
         creation_of(channels.app_creation(org, ws, buried).await.unwrap()),
         (AppStatus::Failed, None, false)
     );
+}
+
+/// Claims jobs of `kind` until one of `scope`'s, finishing every other: the
+/// suite's tenants share one queue. The job claimed, if any.
+async fn claim_in(stores: &Stores<'_>, kind: &str, scope: Scope) -> Option<zupflow_core::jobs::Job> {
+    let kinds = [Name::new(kind).unwrap()];
+    while let Some(job) = stores
+        .jobs
+        .claim_next(&kinds, std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+    {
+        if job.scope == scope {
+            return Some(job);
+        }
+        stores.jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+    }
+    None
+}
+
+async fn installs_an_app_through_its_connect_session(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let manager = link(stores, &t, ws).await;
+    let app = make_app(stores, &t, ws, t.agent, manager).await.unwrap();
+    made(stores, &t, ws, app).await;
+    let other_app = make_app(stores, &t, ws, t.other_agent, manager).await.unwrap();
+    made(stores, &t, ws, other_app).await;
+    let session_for = |app: ChannelAppId, marker: u8| async move {
+        let session_id = ConnectSessionId::generate();
+        stores
+            .connect
+            .create_session(
+                org,
+                ws,
+                session_id,
+                &NewConnectSession {
+                    environment: Environment::Sandbox,
+                    app: None,
+                    target: Some(ConnectTarget::ChannelApp {
+                        provider: ChannelProviderKind::Slack,
+                        app,
+                        connection: None,
+                    }),
+                    configuration_version: 0,
+                    intent: ConnectIntent::Create,
+                    installation_id: None,
+                    label: "Scribe".to_owned(),
+                    return_url: None,
+                    requested_scopes: Vec::new(),
+                    reference_hash: ReferenceHash([marker; 32]),
+                },
+                now(),
+            )
+            .await
+            .unwrap();
+        session_id
+    };
+    let session = session_for(app, 41).await;
+    let through = |workspace_id: WorkspaceId, session: ConnectSessionId, app: ChannelAppId, team: &'static str| {
+        let connection = ChannelConnectionId::generate();
+        async move {
+            stores
+                .channels
+                .install_app_through_session(org, workspace_id, session, app, &install(connection, team, 1), now())
+                .await
+                .map(|(session, connection, _)| (session, connection))
+        }
+    };
+    assert_eq!(
+        through(t.sibling, session, app, "T0NORTH").await.err(),
+        Some(ChannelError::SessionNotFound),
+        "a session is found only in its own workspace"
+    );
+    assert_eq!(
+        through(ws, session, other_app, "T0NORTH").await.err(),
+        Some(ChannelError::SessionNotFound),
+        "a session installs only the app it was made for"
+    );
+    let (completed, connection) = through(ws, session, app, "T0NORTH").await.unwrap();
+    assert_eq!(completed.status, ConnectSessionStatus::Completed);
+    assert_eq!(
+        completed.target,
+        Some(ConnectTarget::ChannelApp {
+            provider: ChannelProviderKind::Slack,
+            app,
+            connection: Some(connection.id),
+        })
+    );
+    assert_eq!(connection.status, ConnectionStatus::Connected);
+    assert_eq!(
+        through(ws, session, app, "T0NORTH").await.err(),
+        Some(ChannelError::SessionNotPending),
+        "a session installs once"
+    );
+    let credential = stores
+        .channels
+        .connection_credential(org, ws, connection.id)
+        .await
+        .unwrap()
+        .expect("its token, sealed");
+    assert_eq!(credential.version, 1);
+    for (organization_id, workspace_id) in [(org, t.sibling), (OrganizationId::generate(), ws)] {
+        assert_eq!(
+            stores
+                .channels
+                .connection_credential(organization_id, workspace_id, connection.id)
+                .await,
+            Ok(None),
+            "a token is read only in its own workspace"
+        );
+    }
+    // The manager learned its team: another team's install is refused, and nothing is written.
+    let other_session = session_for(other_app, 42).await;
+    assert_eq!(
+        through(ws, other_session, other_app, "T0ELSEWHERE").await.err(),
+        Some(ChannelError::TeamMismatch)
+    );
+    let pending = stores
+        .connect
+        .find_session(org, ws, other_session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.status, ConnectSessionStatus::Pending, "still pending");
+    let other = stores.channels.find_app(org, ws, other_app).await.unwrap().unwrap();
+    assert_eq!(other.status, AppStatus::AwaitingInstall);
+}
+
+async fn removes_a_made_app_at_its_provider_too(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let release = zupflow_core::channels::provision::RELEASE_CHANNEL_APP;
+    let (manager, app, connection) = installed(stores, &t, ws, t.agent).await;
+    // One never made at the provider has nothing to remove there, and is released as it's deleted.
+    let unmade = make_app(stores, &t, ws, t.other_agent, manager).await.unwrap();
+    for removed in [app, unmade] {
+        stores
+            .channels
+            .delete_app(org, ws, removed, developer(&t), now(), &|_| by_suite_in(ws))
+            .await
+            .unwrap();
+    }
+    let job = claim_in(stores, release, Scope::Workspace(org, ws))
+        .await
+        .expect("a job removes it at its provider");
+    let payload: serde_json::Value = serde_json::from_slice(&job.payload).unwrap();
+    assert_eq!(
+        payload,
+        serde_json::json!({ "app_id": app.to_string(), "connection_id": connection.to_string() }),
+        "naming the app and the connection whose token it revokes, never a secret"
+    );
+    stores.jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+    assert!(claim_in(stores, release, Scope::Workspace(org, ws)).await.is_none());
+    // Its token stays readable, sealed, for the job to revoke.
+    assert!(
+        stores
+            .channels
+            .connection_credential(org, ws, connection)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // Until it's released, its team stays linked, and pasted tokens queue
+    // its removal again (a rotation's don't); never another workspace's.
+    let audit_manager = |_: &zupflow_core::channels::ChannelAppManager| by_suite_in(ws);
+    let unlink = || {
+        stores
+            .channels
+            .delete_manager(org, ws, manager, developer(&t), &audit_manager)
+    };
+    assert_eq!(unlink().await, Err(ChannelError::RemovalsPending(1)));
+    let replacement = |version: u32| TokenReplacement {
+        expected_version: version,
+        credential: sealed(5),
+        token_last4: "0005".to_owned(),
+        token_expires_at: None,
+    };
+    stores
+        .channels
+        .replace_manager_tokens(org, ws, manager, None, &replacement(1), now(), &|_| by_suite_in(ws))
+        .await
+        .unwrap();
+    assert!(
+        claim_in(stores, release, Scope::Workspace(org, ws)).await.is_none(),
+        "not for a rotation"
+    );
+    stores
+        .channels
+        .replace_manager_tokens(org, ws, manager, Some(developer(&t)), &replacement(2), now(), &|_| {
+            by_suite_in(ws)
+        })
+        .await
+        .unwrap();
+    let job = claim_in(stores, release, Scope::Workspace(org, ws))
+        .await
+        .expect("queued again by pasted tokens");
+    let payload: serde_json::Value = serde_json::from_slice(&job.payload).unwrap();
+    assert_eq!(
+        payload,
+        serde_json::json!({ "app_id": app.to_string(), "connection_id": connection.to_string() })
+    );
+    stores.jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+    assert!(
+        claim_in(stores, release, Scope::Workspace(org, ws)).await.is_none(),
+        "only the unreleased"
+    );
+    for (organization_id, workspace_id) in [(org, t.sibling), (OrganizationId::generate(), ws)] {
+        assert_eq!(
+            stores
+                .channels
+                .record_app_released(organization_id, workspace_id, app, now())
+                .await,
+            Ok(false),
+            "released only in its own workspace"
+        );
+    }
+    assert_eq!(stores.channels.record_app_released(org, ws, app, now()).await, Ok(true));
+    assert_eq!(unlink().await, Ok(()));
+
+    // An agent's apps go with it, at the provider too.
+    let (_, sibling_app, sibling_connection) = installed(stores, &t, t.sibling, t.sibling_agent).await;
+    stores
+        .agents
+        .delete_agent(org, t.sibling, t.sibling_agent, &|_| by_suite_in(t.sibling))
+        .await
+        .unwrap();
+    let job = claim_in(stores, release, Scope::Workspace(org, t.sibling))
+        .await
+        .expect("removed with its agent");
+    let payload: serde_json::Value = serde_json::from_slice(&job.payload).unwrap();
+    assert_eq!(payload["app_id"], sibling_app.to_string());
+    assert_eq!(payload["connection_id"], sibling_connection.to_string());
+    stores.jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+}
+
+/// A change to an agent's name or description queues a manifest sync for
+/// each of its made apps in the same transaction; any other change, none.
+/// A sync records the digest it sent, in the app's own workspace only.
+async fn syncs_an_agents_apps_with_its_changes(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let sync = zupflow_core::channels::provision::SYNC_CHANNEL_APP;
+    let (_, app, _) = installed(stores, &t, ws, t.agent).await;
+    let change = |changes: AgentChanges| async move {
+        stores
+            .agents
+            .update_agent(org, ws, t.agent, &changes, &|_| by_suite_in(ws))
+            .await
+            .unwrap();
+    };
+    change(AgentChanges {
+        instructions: Some("Be briefer.".to_owned()),
+        ..AgentChanges::default()
+    })
+    .await;
+    assert!(
+        claim_in(stores, sync, Scope::Workspace(org, ws)).await.is_none(),
+        "nothing the app shows"
+    );
+    change(AgentChanges {
+        name: Some("Renamed".to_owned()),
+        ..AgentChanges::default()
+    })
+    .await;
+    let job = claim_in(stores, sync, Scope::Workspace(org, ws))
+        .await
+        .expect("a sync, committed with the rename");
+    let payload: serde_json::Value = serde_json::from_slice(&job.payload).unwrap();
+    assert_eq!(payload, serde_json::json!({ "app_id": app.to_string() }));
+    stores.jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+
+    let digest = "ab".repeat(32);
+    assert_eq!(
+        stores
+            .channels
+            .app_secrets(org, ws, app)
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest_digest,
+        None
+    );
+    assert_eq!(
+        stores.channels.record_app_synced(org, t.sibling, app, &digest).await,
+        Ok(false),
+        "only in its own workspace"
+    );
+    assert_eq!(stores.channels.record_app_synced(org, ws, app, &digest).await, Ok(true));
+    assert_eq!(
+        stores
+            .channels
+            .app_secrets(org, ws, app)
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest_digest,
+        Some(digest)
+    );
+}
+
+async fn rotates_a_teams_tokens_once_per_version(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let channels = stores.channels;
+    let kind = "conformance.rotate";
+    let rotate = |manager: ChannelAppManagerId, version: u32| QueuedJob {
+        kind: Name::new(kind).unwrap(),
+        payload: serde_json::json!({ "manager_id": manager.to_string(), "version": version })
+            .to_string()
+            .into_bytes(),
+        options: JobOptions::default(),
+    };
+    let hour = 60 * 60 * 1000;
+    let soon = Timestamp::from_millis(now().millis() + hour);
+    let manager = link(stores, &t, ws).await;
+    // Its expiry isn't known: rotated at once, by one job, however many sweeps run.
+    let sweeps =
+        futures_join_all((0..4).map(|_| channels.queue_due_rotations_cross_tenant(&rotate, soon, 500, now()))).await;
+    let queued: u32 = sweeps.into_iter().map(|sweep| sweep.unwrap().queued).sum();
+    assert!(queued >= 1);
+    let job = claim_in(stores, kind, Scope::Workspace(org, ws))
+        .await
+        .expect("one rotation");
+    let payload: serde_json::Value = serde_json::from_slice(&job.payload).unwrap();
+    assert_eq!(
+        payload,
+        serde_json::json!({ "manager_id": manager.to_string(), "version": 1 })
+    );
+    stores.jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+    channels
+        .queue_due_rotations_cross_tenant(&rotate, soon, 500, now())
+        .await
+        .unwrap();
+    assert!(
+        claim_in(stores, kind, Scope::Workspace(org, ws)).await.is_none(),
+        "once per version"
+    );
+
+    // Rotated: the next version, due an hour before it expires.
+    let rotated = |version: u32, expires_at: Timestamp| TokenReplacement {
+        expected_version: version,
+        credential: sealed(3),
+        token_last4: "0003".to_owned(),
+        token_expires_at: Some(expires_at),
+    };
+    let later = Timestamp::from_millis(now().millis() + 12 * hour);
+    channels
+        .replace_manager_tokens(org, ws, manager, None, &rotated(1, later), now(), &|_| by_suite_in(ws))
+        .await
+        .unwrap();
+    channels
+        .queue_due_rotations_cross_tenant(&rotate, soon, 500, now())
+        .await
+        .unwrap();
+    assert!(
+        claim_in(stores, kind, Scope::Workspace(org, ws)).await.is_none(),
+        "not due yet"
+    );
+    // Due once its expiry is within the sweep's horizon.
+    channels
+        .queue_due_rotations_cross_tenant(&rotate, Timestamp::from_millis(later.millis() + 1), 500, now())
+        .await
+        .unwrap();
+    let job = claim_in(stores, kind, Scope::Workspace(org, ws))
+        .await
+        .expect("due within the hour");
+    let payload: serde_json::Value = serde_json::from_slice(&job.payload).unwrap();
+    assert_eq!(payload["version"], 2);
+    stores.jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+
+    // Not rotated in time: expired, announced once.
+    let past_expiry = Timestamp::from_millis(later.millis() + 1);
+    let sweep = channels
+        .queue_due_rotations_cross_tenant(
+            &rotate,
+            Timestamp::from_millis(past_expiry.millis() + hour),
+            500,
+            past_expiry,
+        )
+        .await
+        .unwrap();
+    assert!(sweep.expired >= 1, "{sweep:?}");
+    let found = channels.find_manager(org, ws, manager).await.unwrap().unwrap();
+    assert_eq!(found.status, zupflow_core::channels::ManagerStatus::TokenExpired);
+    assert!(
+        claim_in(stores, kind, Scope::Workspace(org, ws)).await.is_none(),
+        "an expired team isn't rotated"
+    );
+    assert_eq!(
+        channels
+            .queue_due_rotations_cross_tenant(&rotate, soon, 500, now())
+            .await
+            .map(|sweep| sweep.expired >= 1),
+        Ok(false),
+        "expired once"
+    );
+
+    // Expiring by hand: only the version read, only in its own workspace.
+    let other = link(stores, &t, ws).await;
+    for (organization_id, workspace_id, version) in
+        [(org, t.sibling, 1), (OrganizationId::generate(), ws, 1), (org, ws, 2)]
+    {
+        assert_eq!(
+            channels
+                .expire_manager_tokens(organization_id, workspace_id, other, version, now())
+                .await,
+            Ok(false)
+        );
+    }
+    assert_eq!(channels.expire_manager_tokens(org, ws, other, 1, now()).await, Ok(true));
+    assert_eq!(
+        channels.expire_manager_tokens(org, ws, other, 1, now()).await,
+        Ok(false)
+    );
+
+    // Pasted tokens whose rotation job is buried still expire, within their
+    // lifetime of the rotation being queued, rather than staying active forever.
+    let pasted = link(stores, &t, ws).await;
+    channels
+        .queue_due_rotations_cross_tenant(&rotate, soon, 500, now())
+        .await
+        .unwrap();
+    let job = claim_in(stores, kind, Scope::Workspace(org, ws))
+        .await
+        .expect("its rotation");
+    stores
+        .jobs
+        .bury(&job.scope, job.id, &job.lease, &Name::new("conformance").unwrap())
+        .await
+        .unwrap();
+    let found = channels.find_manager(org, ws, pasted).await.unwrap().unwrap();
+    let bound = found.token_expires_at.expect("an expiry once its rotation is queued");
+    assert!(bound.millis() <= now().millis() + 12 * hour, "{bound:?}");
+    let lapsed = Timestamp::from_millis(bound.millis() + 1);
+    channels
+        .queue_due_rotations_cross_tenant(&rotate, Timestamp::from_millis(lapsed.millis() + hour), 500, lapsed)
+        .await
+        .unwrap();
+    let found = channels.find_manager(org, ws, pasted).await.unwrap().unwrap();
+    assert_eq!(found.status, zupflow_core::channels::ManagerStatus::TokenExpired);
+}
+
+/// The people a connection reads from its provider are its own: a name is
+/// kept once known (so what a run was sent never changes under it), only a
+/// name that fits is kept, someone the provider doesn't know isn't asked
+/// about again for a day, an email is what the provider said last and is
+/// read again after a day, and another workspace or organization reaches
+/// none of them. A run reads a mention by the name read.
+async fn reads_people_once_and_replies_only_to_answers(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let (_, _, connection) = installed(stores, &t, ws, t.agent).await;
+    recorded(stores, &t, connection, "2.0", "hello").await;
+    let ids = |list: &[&str]| -> Vec<String> { list.iter().map(|id| (*id).to_owned()).collect() };
+    let asked = ids(&["U0DANA", "U0NEW", "U0NEW", "U0LONG", "U0LATER", "U0GONE"]);
+    let start = now();
+    let read = |names: Vec<String>, emails: Vec<String>, at: Timestamp| async move {
+        stores
+            .channels
+            .people_to_read(org, ws, connection, &names, &emails, at)
+            .await
+    };
+    assert_eq!(
+        read(asked.clone(), Vec::new(), start).await,
+        Ok(ids(&["U0NEW", "U0LONG", "U0LATER", "U0GONE"])),
+        "named people aren't read for their names; each other one once, in order"
+    );
+    assert_eq!(
+        read(Vec::new(), ids(&["U0DANA"]), start).await,
+        Ok(ids(&["U0DANA"])),
+        "an email never read from the provider is read"
+    );
+    let found = |id: &str, name: String, email: &str| PersonLookup {
+        external_id: id.to_owned(),
+        found: Some(ProviderPerson {
+            handle: Some(id.to_lowercase()),
+            display_name: Some(name),
+            email: Some(email.to_owned()),
+            is_automated: false,
+        }),
+    };
+    let gone = |id: &str| PersonLookup {
+        external_id: id.to_owned(),
+        found: None,
+    };
+    stores
+        .channels
+        .record_people(
+            org,
+            ws,
+            connection,
+            &[
+                found("U0NEW", "Nadia".to_owned(), "nadia@northwind.example"),
+                found("U0DANA", "Renamed".to_owned(), "dana@moved.example"),
+                found("U0LONG", "x".repeat(301), "long@northwind.example"),
+                gone("U0GONE"),
+            ],
+            start,
+        )
+        .await
+        .expect("saved");
+    assert_eq!(
+        read(asked.clone(), ids(&["U0DANA"]), start).await,
+        Ok(ids(&["U0LATER"])),
+        "someone unknown, or whose name is too long to keep, isn't asked about again yet"
+    );
+    let dana = recorded(stores, &t, connection, "2.1", "again").await;
+    assert_eq!(
+        dana.author.and_then(|author| author.display_name).as_deref(),
+        Some("Dana"),
+        "a known name is kept"
+    );
+    let email = |message: ChannelMessageId| async move {
+        stores
+            .channels
+            .inbound_context(org, ws, message)
+            .await
+            .unwrap()
+            .expect("the message")
+            .author_email
+    };
+    assert_eq!(
+        email(dana.id).await.as_deref(),
+        Some("dana@moved.example"),
+        "the email is what the provider said last"
+    );
+    // A day on, someone unknown is asked about again, and so is an email a
+    // sender list checks; a known name never is.
+    let later = Timestamp::from_millis(start.millis() + 24 * 60 * 60 * 1000);
+    assert_eq!(
+        read(
+            ids(&["U0DANA", "U0NEW", "U0LONG", "U0GONE"]),
+            ids(&["U0DANA", "U0NEW"]),
+            later
+        )
+        .await,
+        Ok(ids(&["U0LONG", "U0GONE", "U0DANA", "U0NEW"]))
+    );
+    // Someone the provider no longer shows keeps their name, but no email
+    // a sender list could still match.
+    stores
+        .channels
+        .record_people(org, ws, connection, &[gone("U0DANA")], later)
+        .await
+        .expect("saved");
+    assert_eq!(email(dana.id).await, None);
+    let dana = recorded(stores, &t, connection, "2.3", "still here").await;
+    assert_eq!(
+        dana.author.and_then(|author| author.display_name).as_deref(),
+        Some("Dana")
+    );
+    // Another workspace or organization reaches none of them.
+    for (other_org, other_ws) in [(org, t.sibling), (OrganizationId::generate(), ws)] {
+        assert_eq!(
+            stores
+                .channels
+                .people_to_read(other_org, other_ws, connection, &asked, &[], start)
+                .await,
+            Ok(ids(&["U0DANA", "U0NEW", "U0LONG", "U0LATER", "U0GONE"]))
+        );
+        assert_eq!(
+            stores
+                .channels
+                .record_people(
+                    other_org,
+                    other_ws,
+                    connection,
+                    &[found("U0LATER", "Lee".to_owned(), "lee@northwind.example")],
+                    start
+                )
+                .await,
+            Err(ChannelError::ConnectionNotFound)
+        );
+    }
+    assert_eq!(read(asked.clone(), Vec::new(), start).await, Ok(ids(&["U0LATER"])));
+
+    // A mention of someone read is rendered by their name.
+    let channel = stores.channels.list_agent_channels(org, ws, t.agent).await.unwrap()[0].clone();
+    let mut asking = message("2.2", "C0SUPPORT", "<@U0CONFORM> ask <@U0NEW>", 1_000);
+    asking.mentions = vec!["U0CONFORM".to_owned(), "U0NEW".to_owned()];
+    let asking = stores
+        .channels
+        .record_message(org, ws, connection, &asking, now())
+        .await
+        .unwrap()
+        .message;
+    let outcome = stores
+        .channels
+        .dispatch(
+            org,
+            ws,
+            &dispatch_of(asking.id, channel.id, "2.2"),
+            Some(&template()),
+            now(),
+        )
+        .await
+        .unwrap();
+    let DispatchOutcome::Started { run_id } = outcome else {
+        panic!("a run starts: {outcome:?}");
+    };
+    let run = stores.runs.find_run(org, ws, run_id).await.unwrap().unwrap();
+    assert!(run.input.contains("ask @Nadia"), "{}", run.input);
+    // Running, not answered: nothing to post. A run that isn't a channel
+    // run, or another scope's, has none either.
+    assert_eq!(stores.channels.reply_of(org, ws, run_id).await, Ok(None));
+    assert_eq!(stores.channels.reply_of(org, ws, t.runs[0]).await, Ok(None));
+    assert_eq!(stores.channels.reply_of(org, t.sibling, run_id).await, Ok(None));
+    assert_eq!(
+        stores.channels.reply_of(OrganizationId::generate(), ws, run_id).await,
+        Ok(None)
+    );
+}
+
+/// Drives a run to its final answer, as a worker does: claimed, its model
+/// asked, and `text` the answer.
+async fn answer_run(stores: &Stores<'_>, org: OrganizationId, ws: WorkspaceId, run: RunId, text: &str) {
+    let mut facts = Facts {
+        claimant: Some(ClaimantId::from_uuid(uuid::Uuid::now_v7())),
+        offer: Some(Offer::default()),
+        model_route: Some(RouteState::Usable { key_version: 1 }),
+        invocation_id: Some(InvocationId::from_uuid(uuid::Uuid::now_v7())),
+        ..Facts::at(now())
+    };
+    for _ in 0..8 {
+        let snapshot = stores.runs.find_snapshot(org, ws, run).await.unwrap().expect("the run");
+        facts.model = match snapshot.control.continuation {
+            Continuation::Done => return,
+            Continuation::AwaitModel { turn, attempt } => Some(ModelAnswer {
+                turn,
+                attempt,
+                result: ModelResult::Answered(Completion {
+                    reply: Reply::Text(text.to_owned()),
+                    usage: TokenUsage::default(),
+                }),
+            }),
+            _ => None,
+        };
+        let plan = advance(&snapshot, &facts).expect("a plan");
+        let request = plan.request().expect("a transition").clone();
+        if let Operation::Claim(claim) = request.operation() {
+            facts.claim = Some(claim.epoch);
+        }
+        let applied = stores.runs.apply(org, ws, &request).await;
+        assert!(matches!(applied, Ok(Applied::Committed(_))), "{applied:?}");
+    }
+    panic!("the run didn't end");
+}
+
+/// A channel run that ended with an answer queues its reply in the
+/// transaction that ends it; the reply reads where it goes, with one more
+/// hop than the most that led to what it took in, until the connection
+/// records posting it. Another scope reads none of it.
+async fn replies_to_an_answer_until_it_is_sent(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let (_, _, connection) = installed(stores, &t, ws, t.agent).await;
+    let channel = stores.channels.list_agent_channels(org, ws, t.agent).await.unwrap()[0].clone();
+    let asked = recorded(stores, &t, connection, "3.0", "<@U0CONFORM> what's due?").await;
+    let mut dispatch = dispatch_of(asked.id, channel.id, "3.0");
+    dispatch.agent_hop = 2;
+    let outcome = stores
+        .channels
+        .dispatch(org, ws, &dispatch, Some(&template()), now())
+        .await
+        .unwrap();
+    let DispatchOutcome::Started { run_id } = outcome else {
+        panic!("a run starts: {outcome:?}");
+    };
+    answer_run(stores, org, ws, run_id, "Two invoices.").await;
+    let run = stores.runs.find_run(org, ws, run_id).await.unwrap().unwrap();
+    assert_eq!(run.output.as_deref(), Some("Two invoices."));
+    let job = claim_in(stores, REPLY_JOB, Scope::Workspace(org, ws))
+        .await
+        .expect("the reply is queued");
+    assert_eq!(zupflow_core::channels::reply::run_of_job(&job.payload), Some(run_id));
+    stores.jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+
+    let reply = stores
+        .channels
+        .reply_of(org, ws, run_id)
+        .await
+        .unwrap()
+        .expect("a reply");
+    assert_eq!(
+        reply,
+        ChannelReply {
+            connection_id: connection,
+            connection_status: ConnectionStatus::Connected,
+            conversation_external_id: "C0SUPPORT".to_owned(),
+            conversation_kind: ConversationKind::Channel,
+            conversation_is_external: false,
+            thread_key: "1700000000.000100".to_owned(),
+            text: "Two invoices.".to_owned(),
+            agent_hop: 3,
+            finished_at: run.finished_at.expect("ended"),
+            sent: None,
+        }
+    );
+    assert_eq!(stores.channels.reply_of(org, t.sibling, run_id).await, Ok(None));
+    assert_eq!(
+        stores.channels.reply_of(OrganizationId::generate(), ws, run_id).await,
+        Ok(None)
+    );
+    // Once the connection records posting it, it's sent.
+    let mut posted = message("3.1", "C0SUPPORT", "Two invoices.", 2_000);
+    posted.direction = Direction::Outbound;
+    posted.author = None;
+    posted.mentions = Vec::new();
+    posted.run_id = Some(run_id);
+    posted.agent_hop = reply.agent_hop;
+    let posted = stores
+        .channels
+        .record_message(org, ws, connection, &posted, now())
+        .await
+        .unwrap()
+        .message;
+    let reply = stores
+        .channels
+        .reply_of(org, ws, run_id)
+        .await
+        .unwrap()
+        .expect("a reply");
+    assert_eq!(reply.sent, Some(posted.id));
 }

@@ -502,7 +502,47 @@ impl FakeChat {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use async_trait::async_trait;
+    use zupflow_core::channels::provider::{OutgoingPost, ProviderCallError};
+    use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse};
+
     use super::*;
+
+    /// The fake provider calls no one: anything sent fails the test.
+    struct NoRequests;
+
+    #[async_trait]
+    impl OutboundHttp for NoRequests {
+        async fn send(&self, _: OutboundRequest, _: Limits) -> Result<OutboundResponse, OutboundError> {
+            panic!("the fake provider sent a request");
+        }
+    }
+
+    /// A provider that can't look people up or find a lost post says so:
+    /// never "no such person" (which is remembered) nor "not sent" (which
+    /// would post an answer twice).
+    #[tokio::test]
+    async fn says_what_it_cannot_do() {
+        let provider = FakeChannelProvider;
+        let post = OutgoingPost {
+            conversation_external_id: "C0GENERAL",
+            thread_key: "1.0",
+            text: "hi",
+            send_id: "run_1",
+        };
+        assert_eq!(
+            provider.person(&NoRequests, "token", "U0ANA").await,
+            Err(ProviderCallError::Unsupported)
+        );
+        assert_eq!(
+            provider.find_sent(&NoRequests, "token", &post, now()).await,
+            Err(ProviderCallError::Unsupported)
+        );
+        assert_eq!(
+            provider.post(&NoRequests, "token", &post).await,
+            Err(ProviderCallError::Unsupported)
+        );
+    }
 
     const SECRET: &[u8] = b"signing-secret";
 

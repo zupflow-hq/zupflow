@@ -18,9 +18,11 @@
 //! [`EncryptionContext`] and never shown, logged or put in a job.
 //!
 //! The provider's inbound endpoint and the job that answers a new message
-//! are [`crate::channel_inbound`]'s; this worker takes that job too. Not
-//! served yet: the consent callback that installs an app, token rotation,
-//! and the provider calls that update or delete an app.
+//! are [`crate::channel_inbound`]'s, with a worker of their own. The
+//! consent callback that installs an app is `crate::channel_install`'s;
+//! rotating a team's tokens, keeping an app in step with its agent and
+//! removing a deleted one at the provider are `crate::channel_upkeep`'s,
+//! on this worker.
 
 use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
@@ -32,11 +34,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use zupflow_core::apps::ToolEffect;
 use zupflow_core::audit::{AuditAction, AuditActor, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::channels::provision::{
-    AppManifest, ConsentRequest, InstallStep, MAX_APP_NAME, ManagerTokens, ProvisionError, SLACK_EVENTS, SLACK_SCOPES,
+    AppManifest, InstallStep, MAX_APP_NAME, ManagerTokens, ProvisionError, SLACK_EVENTS, SLACK_SCOPES,
 };
 use zupflow_core::channels::store::{
     AppCreation, AppFilter, ChannelEditor, ChannelError, ConnectionChanges, ConnectionFilter, ConversationFilter,
@@ -461,7 +463,7 @@ fn not_agents_app(agent: &str, provider: ChannelProviderKind) -> Failure {
     .into()
 }
 
-fn app_not_eligible() -> Failure {
+pub(crate) fn app_not_eligible() -> Failure {
     ApiError::new(
         422,
         "app_not_eligible",
@@ -500,6 +502,13 @@ fn channel_failure(error: ChannelError) -> Failure {
             ApiError::new(409, "channel_app_exists", "This agent already has an app in this team.").into()
         }
         ChannelError::ManagerInUse(apps) => in_use(apps),
+        ChannelError::RemovalsPending(_) => ApiError::new(
+            409,
+            "in_use",
+            "Apps removed from this team are still being deleted. Try again in a minute; if the team's tokens \
+             expired, replace them first.",
+        )
+        .into(),
         ChannelError::TokensChanged => ApiError::new(
             409,
             "tokens_changed",
@@ -563,7 +572,7 @@ fn unknown_conversation() -> Failure {
 }
 
 /// The provisioner couldn't check or use the tokens: refused, or not asked.
-fn provision_failure(error: ProvisionError, provider: ChannelProviderKind) -> Failure {
+pub(crate) fn provision_failure(error: ProvisionError, provider: ChannelProviderKind) -> Failure {
     let name = provider.name();
     match error {
         ProvisionError::TokensRefused | ProvisionError::Refused(_) => field_error(
@@ -588,6 +597,12 @@ fn provision_failure(error: ProvisionError, provider: ChannelProviderKind) -> Fa
         ProvisionError::Unavailable | ProvisionError::AppNotFound => {
             ApiError::new(503, "unavailable", format!("{name} didn't answer. Try again shortly.")).into()
         }
+        ProvisionError::RateLimited { retry_after_secs } => ApiError::new(
+            503,
+            "unavailable",
+            format!("{name} asked to wait {retry_after_secs} seconds before it's asked again. Try again then."),
+        )
+        .into(),
     }
 }
 
@@ -792,7 +807,8 @@ struct SealingTokens<'a> {
     refresh_token: &'a str,
 }
 
-#[derive(Deserialize)]
+/// Wiped when dropped: what's kept is moved out, never copied.
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 struct OpenedTokens {
     configuration_token: String,
     refresh_token: String,
@@ -801,14 +817,14 @@ struct OpenedTokens {
 /// A workspace with its organization and its environment, as the sealing
 /// contexts of its secrets name them.
 #[derive(Debug, Clone, Copy)]
-struct SealingScope {
-    organization_id: OrganizationId,
-    workspace_id: WorkspaceId,
-    environment: Environment,
+pub(crate) struct SealingScope {
+    pub(crate) organization_id: OrganizationId,
+    pub(crate) workspace_id: WorkspaceId,
+    pub(crate) environment: Environment,
 }
 
 /// A team's tokens sealed together, as one value at `version`.
-async fn seal_tokens(
+pub(crate) async fn seal_tokens(
     state: &AppState,
     scope: SealingScope,
     manager_id: ChannelAppManagerId,
@@ -1218,6 +1234,10 @@ async fn delete_app(
         .await
         .map_err(channel_failure)?;
     tracing::info!(event = "channels.app_deleted", %organization_id, %workspace_id, app_id = %app.id);
+    // Its removal at the provider was queued with the deletion: a worker is
+    // woken for it now, so its team can be unlinked soon after.
+    let woken = state.clone();
+    tokio::spawn(async move { work_once(&woken).await });
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -1328,6 +1348,8 @@ async fn delete_connection(
     access.access.require(MemberRole::is_developer, "disconnect channels")?;
     let connection = find_connection(&state, &access, &connection).await?;
     let (organization_id, workspace_id) = (access.access.organization_id, access.workspace.id);
+    // Its token, opened before the store forgets it, to revoke at the provider after.
+    let token = connection_token(&state, &access, &connection).await;
     state
         .channels
         .delete_connection(
@@ -1347,7 +1369,59 @@ async fn delete_connection(
         .await
         .map_err(channel_failure)?;
     tracing::info!(event = "channels.connection_deleted", %organization_id, %workspace_id, connection_id = %connection.id);
+    if let Some(token) = token
+        && let Err(error) = state
+            .channel_provisioner
+            .revoke_install(state.outbound.as_ref(), &token)
+            .await
+    {
+        // Removed here all the same; at the provider, the app stays installed until someone removes it there.
+        tracing::warn!(event = "channels.token_not_revoked", %organization_id, %workspace_id, connection_id = %connection.id, %error);
+    }
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// What a connection's sealed credential holds: its token. Wiped when
+/// dropped: what's kept is moved out, never copied.
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
+pub(crate) struct OpenedConnection {
+    pub(crate) token: String,
+}
+
+/// A connection's current token, opened, or `None` when it has none or it
+/// can't be read (logged: the connection is removed all the same).
+async fn connection_token(
+    state: &AppState,
+    access: &WorkspaceAccess,
+    connection: &ChannelConnection,
+) -> Option<Zeroizing<String>> {
+    let (organization_id, workspace_id) = (access.access.organization_id, access.workspace.id);
+    let sealed = match state
+        .channels
+        .connection_credential(organization_id, workspace_id, connection.id)
+        .await
+    {
+        Ok(sealed) => sealed?,
+        Err(error) => {
+            tracing::warn!(event = "channels.token_unreadable", %organization_id, %workspace_id, connection_id = %connection.id, %error);
+            return None;
+        }
+    };
+    let context = EncryptionContext::channel_connection_credential(
+        organization_id,
+        workspace_id,
+        access.workspace.environment,
+        connection.id,
+        sealed.version,
+    );
+    let opened = keys::open(state.keys.as_ref(), &context, &sealed.sealed).await.ok();
+    let token = opened
+        .and_then(|plaintext| serde_json::from_slice::<OpenedConnection>(plaintext.expose()).ok())
+        .map(|mut opened| Zeroizing::new(std::mem::take(&mut opened.token)));
+    if token.is_none() {
+        tracing::warn!(event = "channels.token_unopenable", %organization_id, %workspace_id, connection_id = %connection.id);
+    }
+    token
 }
 
 async fn list_conversations(
@@ -2271,58 +2345,6 @@ pub(crate) async fn submit_channel_credentials(
     ))
 }
 
-/// Where the person allows an agent's app in their team: the provider's
-/// consent page. A team is linked by pasting tokens instead.
-///
-/// The `state` sent is random and not yet kept: installing on the way back
-/// (the consent callback) comes with the provider's install, in phase 4.
-pub(crate) async fn authorize_channel_session(state: &AppState, session: &ConnectSession) -> Result<Response, Failure> {
-    let Some(ConnectTarget::ChannelApp { app, .. }) = session.target else {
-        return Err(ApiError::new(
-            422,
-            "wrong_auth_type",
-            "Linking a team takes a configuration token, pasted on this page.",
-        )
-        .into());
-    };
-    let (organization_id, workspace_id) = (session.organization_id, session.workspace_id);
-    let app = state
-        .channels
-        .find_app(organization_id, workspace_id, app)
-        .await
-        .map_err(channel_failure)?
-        .filter(|app| app.status.is_installable())
-        .ok_or_else(app_not_eligible)?;
-    let active = state
-        .channels
-        .find_manager(organization_id, workspace_id, app.manager_id)
-        .await
-        .map_err(channel_failure)?
-        .is_some_and(|manager| manager.status == ManagerStatus::Active);
-    if !active {
-        return Err(app_not_eligible());
-    }
-    let client_id = state
-        .channels
-        .app_secrets(organization_id, workspace_id, app.id)
-        .await
-        .map_err(channel_failure)?
-        .and_then(|secrets| secrets.client_id)
-        .ok_or_else(app_not_eligible)?;
-    let attempt = Reference::generate().map_err(crate::connect::connect_failure)?;
-    let redirect_url = crate::app_configurations::redirect_uri(&state.public_url);
-    let url = state
-        .channel_provisioner
-        .consent_url(&ConsentRequest {
-            client_id: &client_id,
-            scopes: SLACK_SCOPES,
-            redirect_url: &redirect_url,
-            state: attempt.expose(),
-        })
-        .map_err(|error| provision_failure(error, app.provider))?;
-    Ok(envelope(StatusCode::OK, json!({ "authorization_url": url })))
-}
-
 // --- Making apps -----------------------------------------------------------------------------
 
 /// What came of one attempt.
@@ -2332,6 +2354,14 @@ enum Outcome {
     Done,
     /// Worth another attempt later, with why.
     Retry(&'static str),
+    /// The provider asked to wait this long (its rate limit): tried again
+    /// then, without using up an attempt. Nothing was done.
+    Wait(Duration),
+}
+
+/// How long the provider asked to wait.
+fn wait(retry_after_secs: u32) -> Outcome {
+    Outcome::Wait(Duration::from_secs(u64::from(retry_after_secs.max(1))))
 }
 
 /// The app's name, handle and description, from the agent: never a request's text.
@@ -2361,19 +2391,13 @@ pub fn manifest_for(agent: &zupflow_core::agents::Agent, events_url: String, red
     }
 }
 
-/// A connection's tokens, sealed together.
-#[derive(Serialize)]
-struct SealingConnection<'a> {
-    token: &'a str,
-}
-
 #[derive(Serialize)]
 struct SealingSecrets<'a> {
     client_secret: &'a str,
     signing_secret: &'a str,
 }
 
-async fn open_tokens(
+pub(crate) async fn open_tokens(
     state: &AppState,
     organization_id: OrganizationId,
     workspace_id: WorkspaceId,
@@ -2392,10 +2416,10 @@ async fn open_tokens(
         .await
         .map_err(|error| tracing::error!(event = "channels.open_failed", %organization_id, %workspace_id, %manager_id, %error))
         .ok()?;
-    let tokens: OpenedTokens = serde_json::from_slice(opened.expose()).ok()?;
+    let mut tokens: OpenedTokens = serde_json::from_slice(opened.expose()).ok()?;
     Some(ManagerTokens {
-        configuration_token: Zeroizing::new(tokens.configuration_token),
-        refresh_token: Zeroizing::new(tokens.refresh_token),
+        configuration_token: Zeroizing::new(std::mem::take(&mut tokens.configuration_token)),
+        refresh_token: Zeroizing::new(std::mem::take(&mut tokens.refresh_token)),
     })
 }
 
@@ -2417,7 +2441,7 @@ async fn clean_up(
     tokens: &ManagerTokens,
     creation: &AppCreation,
     events_url: &str,
-) -> Result<(), &'static str> {
+) -> Result<(), Outcome> {
     let AppScope {
         organization_id,
         workspace_id,
@@ -2430,7 +2454,8 @@ async fn clean_up(
         // Its answer was lost: found by where its events go.
         None => match provisioner.find(http, tokens, events_url).await {
             Ok(found) => found,
-            Err(ProvisionError::Unavailable) => return Err("provider_unavailable"),
+            Err(ProvisionError::Unavailable) => return Err(Outcome::Retry("provider_unavailable")),
+            Err(ProvisionError::RateLimited { retry_after_secs }) => return Err(wait(retry_after_secs)),
             Err(error) => {
                 tracing::warn!(event = "channels.orphan_not_found", %organization_id, %workspace_id, %app_id, %error);
                 None
@@ -2442,7 +2467,8 @@ async fn clean_up(
             Ok(()) | Err(ProvisionError::AppNotFound) => {
                 tracing::info!(event = "channels.orphan_deleted", %organization_id, %workspace_id, %app_id);
             }
-            Err(ProvisionError::Unavailable) => return Err("provider_unavailable"),
+            Err(ProvisionError::Unavailable) => return Err(Outcome::Retry("provider_unavailable")),
+            Err(ProvisionError::RateLimited { retry_after_secs }) => return Err(wait(retry_after_secs)),
             Err(error) => {
                 tracing::warn!(event = "channels.orphan_kept", %organization_id, %workspace_id, %app_id, %error);
             }
@@ -2452,7 +2478,7 @@ async fn clean_up(
         .channels
         .forget_app_creation(organization_id, workspace_id, app_id, recorded, Timestamp::now())
         .await
-        .map_err(|_| "store_unavailable")
+        .map_err(|_| Outcome::Retry("store_unavailable"))
 }
 
 /// What this attempt made, deleted at the provider and forgotten: for an app
@@ -2533,8 +2559,9 @@ async fn provision(
     };
     let making = creation.app.status == AppStatus::Creating;
     if !making && !creation.in_flight {
-        // Made, failed or deleted, with nothing of an attempt left at the provider.
-        return Outcome::Done;
+        // Made, failed or deleted, with nothing of an attempt left at the
+        // provider; a made app's events subscribed, if that's still to do.
+        return subscribe(state, &creation.app, last_attempt).await;
     }
     let environment = match state.workspaces.find_workspace(organization_id, workspace_id).await {
         Ok(Some(workspace)) => workspace.environment,
@@ -2589,17 +2616,15 @@ async fn provision(
         state.public_url,
         creation.inbound_ref.expose()
     );
-    if creation.in_flight
-        && let Err(why) = clean_up(state, scope, &tokens, &creation, &events_url).await
-    {
-        return if making {
-            retry(why, why).await
-        } else {
-            Outcome::Retry(why)
-        };
+    if creation.in_flight {
+        match clean_up(state, scope, &tokens, &creation, &events_url).await {
+            Ok(()) => {}
+            Err(Outcome::Retry(why)) if making => return retry(why, why).await,
+            Err(later) => return later,
+        }
     }
     if !making {
-        return Outcome::Done;
+        return subscribe(state, &creation.app, last_attempt).await;
     }
     let agent = match state
         .agents
@@ -2632,6 +2657,8 @@ async fn provision(
         Err(ProvisionError::TokensRefused) => return fail("tokens_refused").await,
         Err(ProvisionError::Refused(code)) => return fail(code).await,
         Err(ProvisionError::NotConfigured) => return fail("provisioner_unavailable").await,
+        // Nothing was made: asked again once Slack's wait is over.
+        Err(ProvisionError::RateLimited { retry_after_secs }) => return wait(retry_after_secs),
         // Perhaps made all the same: the next attempt finds it by its events URL.
         Err(ProvisionError::Unavailable | ProvisionError::AppNotFound) => {
             return retry("provider_unavailable", "provider_unavailable").await;
@@ -2709,7 +2736,28 @@ async fn provision(
         )
         .await;
     }
-    Outcome::Done
+    // Its secrets are stored: now its events, whose URL the provider checks
+    // with a challenge signed by them. A retry of this job does only this.
+    subscribe(state, &creation.app, last_attempt).await
+}
+
+/// The second step of making an app: the whole manifest sent, which
+/// subscribes its events, once its secrets are stored to answer the
+/// provider's check of their URL. Done once the store records the digest
+/// sent; the app is read again, so one deleted or failed meanwhile has
+/// nothing to subscribe.
+async fn subscribe(state: &AppState, app: &ChannelApp, last_attempt: bool) -> Outcome {
+    let (organization_id, workspace_id, app_id) = (app.organization_id, app.workspace_id, app.id);
+    match crate::channel_upkeep::sync(state, organization_id, workspace_id, app_id).await {
+        crate::channel_upkeep::Next::Done => Outcome::Done,
+        crate::channel_upkeep::Next::Wait(after) => Outcome::Wait(after),
+        crate::channel_upkeep::Next::Retry(why) if !last_attempt => Outcome::Retry(why),
+        crate::channel_upkeep::Next::Retry(why) => {
+            // Made, but deaf: a change to its agent sends the manifest again.
+            tracing::error!(event = "channels.events_not_subscribed", %organization_id, %workspace_id, %app_id, why);
+            Outcome::Done
+        }
+    }
 }
 
 /// A provider that installed the app itself: its connection, now.
@@ -2731,7 +2779,11 @@ async fn install_made(
         FIRST_VERSION,
     );
     // All the connection's tokens together, as one value: just its token, for now.
-    let Ok(plaintext) = serde_json::to_vec(&SealingConnection { token: &install.token }) else {
+    let Ok(plaintext) = serde_json::to_vec(&crate::channel_install::SealingConnection {
+        token: &install.token,
+        refresh_token: None,
+        expires_at: None,
+    }) else {
         return;
     };
     let plaintext = Zeroizing::new(plaintext);
@@ -2764,13 +2816,16 @@ async fn install_made(
     }
 }
 
-/// Claims and handles one provisioning job, if one is due. Whether one was.
+/// Claims and handles one channel job, if one is due: making an app, or
+/// keeping one in step with its provider. Whether one was.
 pub async fn work_once(state: &AppState) -> bool {
     let Ok(kind) = Name::new(PROVISION_CHANNEL_APP) else {
         return false;
     };
+    let mut kinds = vec![kind];
+    kinds.extend(crate::channel_upkeep::kinds());
     // Cross-tenant by design: a worker takes the next job of any scope.
-    let job = match state.jobs.claim_next(std::slice::from_ref(&kind), LEASE).await {
+    let job = match state.jobs.claim_next(&kinds, LEASE).await {
         Ok(Some(job)) => job,
         Ok(None) => return false,
         Err(error) => {
@@ -2778,7 +2833,11 @@ pub async fn work_once(state: &AppState) -> bool {
             return false;
         }
     };
-    handle(state, job).await;
+    if job.kind.as_str() == PROVISION_CHANNEL_APP {
+        handle(state, job).await;
+    } else {
+        crate::channel_upkeep::handle(state, job).await;
+    }
     true
 }
 
@@ -2811,6 +2870,7 @@ async fn handle(state: &AppState, job: Job) {
             }
             Err(_) => state.jobs.complete(&scope, id, &lease).await,
         },
+        Outcome::Wait(after) => state.jobs.postpone(&scope, id, &lease, after).await,
     };
     if let Err(error) = finished {
         tracing::warn!(event = "channels.finish_failed", %organization_id, %workspace_id, %app_id, %error);
@@ -2845,14 +2905,22 @@ pub async fn reap_once(state: &AppState) -> u32 {
     }
 }
 
-/// Makes apps until the process stops, and sweeps for stranded apps. New
-/// messages have their own worker ([`crate::channel_inbound::run_worker`]),
-/// so a slow provider never holds them up.
+/// Queues the rotations of linked teams' tokens that are due, and expires
+/// those that lapsed unrotated.
+pub async fn rotate_due(state: &AppState) {
+    crate::channel_upkeep::sweep(state).await;
+}
+
+/// Makes apps and keeps them in step until the process stops, and sweeps
+/// for stranded apps and tokens due for rotation. New messages have their
+/// own worker ([`crate::channel_inbound::run_worker`]), so a slow provider
+/// never holds them up.
 pub async fn run_worker(state: AppState) {
     let mut next_sweep = tokio::time::Instant::now();
     loop {
         if tokio::time::Instant::now() >= next_sweep {
             reap_once(&state).await;
+            rotate_due(&state).await;
             next_sweep = tokio::time::Instant::now() + REAP_EVERY;
         }
         if !work_once(&state).await {

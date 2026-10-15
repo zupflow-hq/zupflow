@@ -15,9 +15,13 @@
 //! The store records the delivery once per app and, for a new message,
 //! queues the inbound job ([`INBOUND_JOB`]) in the same transaction. The job
 //! ([`work_once`]) follows the handling steps: it stops on the connection's
-//! own message, builds the candidates (the agent channel on the connection,
-//! when its agent is active and its rules admit the author), asks the
-//! connection's [`MessageHandler`], and records each dispatch in its own
+//! own message, builds the candidates (the agent channel on the
+//! connection, when its agent is active and its rules admit the author:
+//! those that need no one looked up first, then, when it has a sender list,
+//! by the author's email read from the provider), asks the connection's
+//! [`MessageHandler`], reads the names of the people a message that wakes
+//! an agent names ([`crate::channel_reply::learn_people`]), and records
+//! each dispatch in its own
 //! transaction, which starts the session's run when it's idle, counted
 //! against the conversation's breaker. Another agent's message waits, by
 //! the job's retries, for its sender's record of how many hops led to it.
@@ -281,7 +285,9 @@ fn is_external(context: &InboundContext) -> bool {
 /// agent is active and its rules admit the author here; with the hops that
 /// led to the message. The handler never sees an agent the author may not
 /// reach. `Err` when another agent wrote it and its hops aren't known yet.
-fn candidate(context: &InboundContext) -> Result<Option<Admitted<'_>>, HopUnknown> {
+/// `senders`: whether to check the sender list too, which needs the
+/// author's email; without it, the rules that need no one looked up.
+fn candidate(context: &InboundContext, senders: bool) -> Result<Option<Admitted<'_>>, HopUnknown> {
     let Some(channel) = context.channel.as_ref() else {
         return Ok(None);
     };
@@ -317,7 +323,7 @@ fn candidate(context: &InboundContext) -> Result<Option<Admitted<'_>>, HopUnknow
             0
         }
     };
-    if rules.senders == Senders::Listed {
+    if senders && rules.senders == Senders::Listed {
         // By the email the connection knows the author by: no email, no match.
         let Some(email) = context.author_email.as_deref().map(str::trim) else {
             return Ok(None);
@@ -432,13 +438,56 @@ async fn handle_message(
     if context.handled {
         return Ok(());
     }
-    let admitted = match candidate(&context) {
-        Ok(admitted) => admitted,
+    // The rules that need no one looked up come first: no one is read from
+    // the provider, or saved, for a message no agent here may answer.
+    let admissible = match candidate(&context, false) {
+        Ok(admitted) => admitted.is_some(),
         Err(HopUnknown) if !last => return Err("agent_hop_unknown"),
         Err(HopUnknown) => {
             tracing::warn!(event = "channels.agent_hop_unknown", %organization_id, %workspace_id, %message_id);
-            None
+            false
         }
+    };
+    // A sender list matches the author's email as the provider said it
+    // within the day: an older one isn't trusted. While it can't be read,
+    // the job tries again; on its last attempt, the message wakes no one.
+    let listed = context
+        .channel
+        .as_ref()
+        .is_some_and(|channel| channel.settings.senders == Senders::Listed);
+    let mut verified = true;
+    let context = match (&context.author_external_id, context.author_agent) {
+        (Some(author), None) if admissible && listed => {
+            let author = std::slice::from_ref(author);
+            let learned =
+                crate::channel_reply::learn_people(state, organization_id, workspace_id, &context, &[], author).await;
+            if learned.unread {
+                if !last {
+                    return Err("sender_unverified");
+                }
+                tracing::warn!(event = "channels.sender_unverified", %organization_id, %workspace_id, %message_id);
+                verified = false;
+            }
+            if learned.saved {
+                match state
+                    .channels
+                    .inbound_context(organization_id, workspace_id, message_id)
+                    .await
+                    .map_err(|_| "store_unavailable")?
+                {
+                    Some(context) => context,
+                    None => return Ok(()),
+                }
+            } else {
+                context
+            }
+        }
+        _ => context,
+    };
+    let admitted = if admissible && verified {
+        candidate(&context, true).unwrap_or(None)
+    } else {
+        None
     };
     // The connection's own message is recorded only.
     if context.message.direction == Direction::Inbound
@@ -471,6 +520,7 @@ async fn handle_message(
         };
         let candidates = [candidate];
         let handler = handler_for(context.connection.handler);
+        let mut named = false;
         let dispatches = handler
             .decide(&HandlerInput {
                 message: &inbound,
@@ -491,6 +541,18 @@ async fn handle_message(
                 tracing::warn!(event = "channels.no_model", %organization_id, %workspace_id, %message_id, agent_channel_id = %channel.id);
                 continue;
             };
+            // It wakes the agent: the run reads its author and the people it
+            // mentions by name, so they're read first, once.
+            if !named {
+                named = true;
+                let names: Vec<String> = context
+                    .author_external_id
+                    .iter()
+                    .chain(message.mentions.iter())
+                    .cloned()
+                    .collect();
+                crate::channel_reply::learn_people(state, organization_id, workspace_id, &context, &names, &[]).await;
+            }
             let outcome = state
                 .channels
                 .dispatch(

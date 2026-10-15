@@ -30,16 +30,23 @@ use crate::outbound::OutboundHttp;
 use crate::time::Timestamp;
 
 /// The scopes a generated app asks for: Slack's bot scopes for reading the
-/// conversations it's in and writing to them.
+/// conversations it's in, writing to them, knowing who wrote, and showing
+/// that it's working (`assistant:write`). Sorted, so a manifest built from
+/// them is the same bytes every time.
 pub const SLACK_SCOPES: &[&str] = &[
     "app_mentions:read",
+    "assistant:write",
     "channels:history",
     "channels:read",
     "chat:write",
+    "chat:write.customize",
     "groups:history",
+    "groups:read",
     "im:history",
+    "im:read",
     "im:write",
     "mpim:history",
+    "mpim:read",
     "reactions:write",
     "users:read",
     "users:read.email",
@@ -58,6 +65,19 @@ pub const SLACK_EVENTS: &[&str] = &[
 
 /// The longest app name a provider takes.
 pub const MAX_APP_NAME: usize = 35;
+
+/// The job that removes a deleted app at its provider: its bot token
+/// revoked, then the app deleted (Slack's `apps.manifest.delete`). Queued
+/// by the store in the transaction that deletes the app, and again when its
+/// team's tokens are pasted, until the app is recorded released, so no app
+/// made at the provider is forgotten there. Its payload names the app and
+/// its last connection, never a secret.
+pub const RELEASE_CHANNEL_APP: &str = "release_channel_app";
+
+/// The job that sends an app's manifest again after its agent's name or
+/// description changed: queued by the store in the transaction that changes
+/// the agent. Its payload names the app.
+pub const SYNC_CHANNEL_APP: &str = "sync_channel_app";
 
 /// A linked team's tokens, as pasted or last rotated.
 pub struct ManagerTokens {
@@ -113,6 +133,23 @@ pub struct AppManifest {
     pub events_url: String,
     /// Hosted Connect's callback, where an install comes back.
     pub redirect_url: String,
+}
+
+impl AppManifest {
+    /// 64 hex characters of SHA-256 over every field, for telling whether
+    /// the provider already has this manifest.
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let canonical = serde_json::json!({
+            "name": self.name, "description": self.description, "handle": self.handle,
+            "scopes": self.scopes, "events": self.events,
+            "events_url": self.events_url, "redirect_url": self.redirect_url,
+        });
+        Sha256::digest(canonical.to_string().as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
 }
 
 /// An install the provider made itself, with the connection's token.
@@ -181,6 +218,41 @@ pub enum ProvisionError {
     /// This server has no provisioner for the provider.
     #[error("no provisioner is configured")]
     NotConfigured,
+    /// The provider asked to wait this long before calling again (Slack's
+    /// `Retry-After`): try again then, as a job, never by sleeping in a
+    /// request. Nothing was done.
+    #[error("the provider asked to wait")]
+    RateLimited { retry_after_secs: u32 },
+}
+
+/// What the provider's consent page sent back, to exchange for the install:
+/// the code, with the app's own client credentials.
+pub struct ConsentExchange<'a> {
+    pub client_id: &'a str,
+    pub client_secret: &'a str,
+    pub code: &'a str,
+    /// The redirect URL the consent was asked with, exactly.
+    pub redirect_url: &'a str,
+}
+
+impl std::fmt::Debug for ConsentExchange<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsentExchange")
+            .field("client_id", &self.client_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An install the person allowed: the team, the identity and its token, and
+/// which app the provider says it installed.
+#[derive(Debug)]
+pub struct ConsentedInstall {
+    /// The provider's ID for the app installed (Slack: `A0…`), when it says.
+    pub external_app_id: Option<String>,
+    pub install: ProviderInstall,
+    /// Only when the app rotates its tokens (generated Slack apps don't).
+    pub refresh_token: Option<Zeroizing<String>>,
+    pub expires_at: Option<Timestamp>,
 }
 
 /// Creates, changes and deletes one agent's app in one team. Every call is
@@ -226,6 +298,11 @@ pub trait AppProvisioner: Send + Sync {
         events_url: &str,
     ) -> Result<Option<String>, ProvisionError>;
 
+    /// Sends the whole manifest. The app-making job calls it right after
+    /// `create`, once the app's secrets are stored, as the step that
+    /// subscribes its events: a provider that checks an events URL with a
+    /// request signed by the app's own secret (Slack) is answered then. A
+    /// provisioner may so make the app without its events in `create`.
     async fn update(
         &self,
         http: &dyn OutboundHttp,
@@ -245,4 +322,22 @@ pub trait AppProvisioner: Send + Sync {
     /// Where the person allows an app in their team: a URL built here,
     /// without reaching the provider.
     fn consent_url(&self, request: &ConsentRequest<'_>) -> Result<String, ProvisionError>;
+
+    /// Exchanges what the consent page sent back for the install. A
+    /// provisioner whose provider installs apps itself has nothing to
+    /// exchange: `NotConfigured`.
+    async fn complete_consent(
+        &self,
+        _http: &dyn OutboundHttp,
+        _exchange: &ConsentExchange<'_>,
+    ) -> Result<ConsentedInstall, ProvisionError> {
+        Err(ProvisionError::NotConfigured)
+    }
+
+    /// Revokes an installed app's token (in Slack, `auth.revoke`), so a
+    /// removed connection's token stops working at the provider too. One
+    /// already revoked is done. By default, nothing to revoke.
+    async fn revoke_install(&self, _http: &dyn OutboundHttp, _token: &str) -> Result<(), ProvisionError> {
+        Ok(())
+    }
 }

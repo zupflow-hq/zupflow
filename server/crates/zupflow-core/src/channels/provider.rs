@@ -1,7 +1,8 @@
 //! What a channel provider does with an installed connection: check that a
 //! delivery to an app's inbound endpoint was signed by that app, and read
-//! what it says into Zupflow's own terms. The inbound route and job call it;
-//! sending goes through the provider too once runs reach channels.
+//! what it says into Zupflow's own terms; and, with the connection's token,
+//! read a person's details and post a run's answer. The inbound route and
+//! job call it, and so does the reply job.
 //!
 //! A provider never trusts a delivery's body before [`ChannelProvider::verify`]
 //! accepts its signature, and never passes the other side's text on in an
@@ -10,6 +11,7 @@
 use async_trait::async_trait;
 
 use super::{ChannelProviderKind, ConversationKind};
+use crate::outbound::OutboundHttp;
 use crate::time::Timestamp;
 
 /// How far a signed delivery's timestamp may be from the clock.
@@ -100,7 +102,54 @@ pub struct NormalizedMessage {
     pub sent_at: Timestamp,
 }
 
-/// One provider's inbound side.
+/// A person, as the provider describes them to a connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderPerson {
+    pub handle: Option<String>,
+    /// What the provider shows for them.
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+    /// A bot user, an app, or the provider's own.
+    pub is_automated: bool,
+}
+
+/// A message a connection posts: Markdown, in a conversation, in a thread
+/// unless `thread_key` is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutgoingPost<'a> {
+    pub conversation_external_id: &'a str,
+    pub thread_key: &'a str,
+    pub text: &'a str,
+    /// What the post carries so a send whose answer was lost can be found
+    /// ([`ChannelProvider::find_sent`]): the run's ID.
+    pub send_id: &'a str,
+}
+
+/// Why a call with a connection's token didn't happen, in stable terms:
+/// never the provider's own words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ProviderCallError {
+    /// Wait this long, without counting an attempt.
+    #[error("rate_limited")]
+    RateLimited { retry_after_secs: u64 },
+    /// Not reached, or it failed on its side: try again.
+    #[error("provider_unavailable")]
+    Unavailable,
+    /// Sent, but its answer was lost: find it before sending again.
+    #[error("outcome_unknown")]
+    OutcomeUnknown,
+    /// The token was refused: revoked, or the app removed.
+    #[error("token_refused")]
+    TokenRefused,
+    /// Refused for good, by a stable code: what its logs carry.
+    #[error("{0}")]
+    Refused(&'static str),
+    /// This provider doesn't do that.
+    #[error("unsupported")]
+    Unsupported,
+}
+
+/// One provider's side of a connection.
 #[async_trait]
 pub trait ChannelProvider: Send + Sync {
     fn kind(&self) -> ChannelProviderKind;
@@ -121,4 +170,58 @@ pub trait ChannelProvider: Send + Sync {
     /// Reads a verified delivery; `now` stands in for a time the event
     /// doesn't give.
     fn read(&self, body: &[u8], now: Timestamp) -> Result<InboundDelivery, InboundRefusal>;
+
+    /// A person the connection can see, read with its `token`: `Ok(None)`
+    /// only when the provider said it has no such person (or none it shows
+    /// this connection), which is remembered for a while; `Unsupported` (the
+    /// default) when it can't say.
+    async fn person(
+        &self,
+        _http: &dyn OutboundHttp,
+        _token: &str,
+        _external_id: &str,
+    ) -> Result<Option<ProviderPerson>, ProviderCallError> {
+        Err(ProviderCallError::Unsupported)
+    }
+
+    /// Posts `post` with the connection's `token`: the posted message's
+    /// external ID. Text longer than the provider takes is cut, and marked.
+    async fn post(
+        &self,
+        _http: &dyn OutboundHttp,
+        _token: &str,
+        _post: &OutgoingPost<'_>,
+    ) -> Result<String, ProviderCallError> {
+        Err(ProviderCallError::Unsupported)
+    }
+
+    /// Settles a post whose answer was lost: the external ID of the message
+    /// carrying `post.send_id`, posted since `attempted_at`, if the provider
+    /// holds one; `Ok(None)` only when it looked and it wasn't sent.
+    /// `OutcomeUnknown` while that can't be told, and `Unsupported` (the
+    /// default) when the provider can't look: never `Ok(None)` unread, which
+    /// would post an answer twice.
+    async fn find_sent(
+        &self,
+        _http: &dyn OutboundHttp,
+        _token: &str,
+        _post: &OutgoingPost<'_>,
+        _attempted_at: Timestamp,
+    ) -> Result<Option<String>, ProviderCallError> {
+        Err(ProviderCallError::Unsupported)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_a_refusal_by_its_code() {
+        assert_eq!(
+            ProviderCallError::Refused("channel_not_found").to_string(),
+            "channel_not_found"
+        );
+        assert_eq!(ProviderCallError::OutcomeUnknown.to_string(), "outcome_unknown");
+    }
 }

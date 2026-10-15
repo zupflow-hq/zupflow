@@ -1,0 +1,22 @@
+{
+  "team_id": "T0FAKE001",
+  "api_app_id": "A0FAKE00001",
+  "event": {
+    "type": "message",
+    "subtype": "bot_message",
+    "user": "UBOT00001",
+    "bot_id": "B0FAKE001",
+    "app_id": "A0FAKE00001",
+    "text": "Here is the summary.",
+    "ts": "1760000170.000400",
+    "thread_ts": "1760000100.000200",
+    "channel": "C0GENERAL",
+    "event_ts": "1760000170.000400",
+    "channel_type": "channel",
+    "bot_profile": { "id": "B0FAKE001", "app_id": "A0FAKE00001", "name": "Atlas", "team_id": "T0FAKE001" },
+    "metadata": { "event_type": "zupflow_send", "event_payload": { "invocation_id": "inv_0001" } }
+  },
+  "type": "event_callback",
+  "event_id": "Ev0OWNPOST01",
+  "event_time": 1760000170
+}

@@ -1,0 +1,12 @@
+{
+  "team_id": "T0FAKE001",
+  "api_app_id": "A0FAKE00001",
+  "event": {
+    "type": "tokens_revoked",
+    "tokens": { "oauth": [], "bot": ["UBOT00001"] },
+    "event_ts": "1760000950.000100"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0REVOKED01",
+  "event_time": 1760000950
+}

@@ -168,6 +168,29 @@ impl EncryptionContext {
         }
     }
 
+    /// What a channel Connect session keeps while the person is on the
+    /// provider's page allowing an agent's app: the link's reference, sealed
+    /// once per authorization attempt. A channel session installs no catalog
+    /// or workspace app, so the context names no app (an app's session always
+    /// does): the session is its owner, and the attempt its version.
+    pub fn channel_connect_authorization(
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        environment: Environment,
+        session_id: ConnectSessionId,
+        attempt: u32,
+    ) -> Self {
+        Self {
+            organization_id,
+            workspace_id: Some(workspace_id),
+            environment,
+            purpose: Purpose::ConnectAuthorization,
+            app_id: None,
+            object: session_id.to_string(),
+            version: attempt,
+        }
+    }
+
     /// A webhook endpoint's signing secret. An endpoint belongs to one
     /// organization and one environment.
     pub fn webhook_signing_secret(
@@ -511,6 +534,12 @@ mod tests {
             EncryptionContext::connect_authorization(org, ws, Environment::Sandbox, app, cs, 4).canonical(),
             format!(
                 "zupflow.v1;org={org};ws={ws};env=sandbox;purpose=connect_authorization;app={app};object={cs};version=4"
+            )
+        );
+        assert_eq!(
+            EncryptionContext::channel_connect_authorization(org, ws, Environment::Sandbox, cs, 4).canonical(),
+            format!(
+                "zupflow.v1;org={org};ws={ws};env=sandbox;purpose=connect_authorization;app=-;object={cs};version=4"
             )
         );
         let manager = ChannelAppManagerId::generate();

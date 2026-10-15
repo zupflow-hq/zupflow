@@ -53,50 +53,165 @@ pub struct ThreadLine {
     pub to_you: bool,
 }
 
-/// A message's text as the model reads it: the provider's markup for a
-/// mention of a known ID becomes `@` and the name `names` gives it, the
-/// provider's escapes are undone, and nothing else changes.
-pub fn plain_text(provider: ChannelProviderKind, text: &str, names: &BTreeMap<String, String>) -> String {
+/// The names a message's mentions are rendered with, as the connection
+/// knows them: by the provider's ID of a person (or an agent's identity) and
+/// of a conversation. Kept apart so a person's ID never names a channel.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MentionNames {
+    pub people: BTreeMap<String, String>,
+    pub conversations: BTreeMap<String, String>,
+}
+
+/// A message's text as the model reads it: the provider's markup becomes
+/// plain words (a mention of a known ID is `@` and the name `names` gives
+/// it, a channel `#` and its name, a link its label and address), the
+/// provider's escapes are undone, and nothing else changes. The same text
+/// and names always give the same bytes.
+pub fn plain_text(provider: ChannelProviderKind, text: &str, names: &MentionNames) -> String {
     match provider {
         ChannelProviderKind::Slack => slack_plain(text, names),
     }
 }
 
-/// Slack's markup: `<@U123>` or `<@U123|label>` mentions a user; `<#C1|name>`
-/// a channel; `<url|label>` a link; `&lt;`, `&gt;` and `&amp;` escape.
-fn slack_plain(text: &str, names: &BTreeMap<String, String>) -> String {
+/// The conversations a message mentions, by the provider's ID: the ones
+/// whose stored names [`plain_text`] reads.
+pub fn conversation_mentions(provider: ChannelProviderKind, text: &str) -> Vec<String> {
+    match provider {
+        ChannelProviderKind::Slack => slack_conversation_mentions(text),
+    }
+}
+
+/// Slack's markup, between `<` and `>`: `<@U1>` or `<@U1|label>` mentions a
+/// user; `<#C1>` or `<#C1|name>` a channel; `<!here>`, `<!channel>` and
+/// `<!everyone>` notify; `<!subteam^S1|@team>` mentions a user group;
+/// `<!date^…|fallback>` is a date; anything else is a link, `<url>` or
+/// `<url|label>`. `&lt;`, `&gt;` and `&amp;` escape, undone once. A `<`
+/// with no `>` before the next `<` is text.
+fn slack_plain(text: &str, names: &MentionNames) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find('<') {
-        out.push_str(&rest[..open]);
+        slack_unescape_into(&rest[..open], &mut out);
         let after = &rest[open + 1..];
-        let Some(close) = after.find('>') else {
-            out.push_str(&rest[open..]);
-            rest = "";
-            break;
-        };
-        let inner = &after[..close];
-        let (target, label) = match inner.split_once('|') {
-            Some((target, label)) => (target, Some(label)),
-            None => (inner, None),
-        };
-        if let Some(id) = target.strip_prefix('@') {
-            let name = names.get(id).map(String::as_str).or(label).unwrap_or(id);
-            out.push('@');
-            out.push_str(name);
-        } else if let Some(id) = target.strip_prefix('#') {
-            out.push('#');
-            out.push_str(label.unwrap_or(id));
-        } else if let Some(special) = target.strip_prefix('!') {
-            out.push('@');
-            out.push_str(label.unwrap_or(special));
-        } else {
-            out.push_str(label.unwrap_or(target));
+        match after.find(['>', '<']) {
+            Some(close) if after[close..].starts_with('>') => {
+                slack_sequence(&after[..close], names, &mut out);
+                rest = &after[close + 1..];
+            }
+            _ => {
+                out.push('<');
+                rest = after;
+            }
         }
-        rest = &after[close + 1..];
+    }
+    slack_unescape_into(rest, &mut out);
+    out
+}
+
+/// One sequence's plain words.
+fn slack_sequence(inner: &str, names: &MentionNames, out: &mut String) {
+    let (target, label) = match inner.split_once('|') {
+        Some((target, label)) => (target, Some(slack_unescape(label)).filter(|label| !label.is_empty())),
+        None => (inner, None),
+    };
+    if let Some(id) = target.strip_prefix('@') {
+        let name = names
+            .people
+            .get(id)
+            .cloned()
+            .or(label)
+            .unwrap_or_else(|| slack_unescape(id));
+        out.push('@');
+        out.push_str(name.trim_start_matches('@'));
+    } else if let Some(id) = target.strip_prefix('#') {
+        let name = names
+            .conversations
+            .get(id)
+            .cloned()
+            .or(label)
+            .unwrap_or_else(|| slack_unescape(id));
+        out.push('#');
+        out.push_str(name.trim_start_matches('#'));
+    } else if let Some(command) = target.strip_prefix('!') {
+        let (kind, argument) = command.split_once('^').unwrap_or((command, ""));
+        match kind {
+            "here" | "channel" | "everyone" => {
+                out.push('@');
+                out.push_str(kind);
+            }
+            "subteam" => {
+                let name = label.unwrap_or_else(|| slack_unescape(argument.split('^').next().unwrap_or_default()));
+                out.push('@');
+                out.push_str(name.trim_start_matches('@'));
+            }
+            "date" => out.push_str(&label.unwrap_or_default()),
+            _ => out.push_str(&label.unwrap_or_else(|| slack_unescape(command))),
+        }
+    } else {
+        let address = slack_unescape(target);
+        let mailbox = address.strip_prefix("mailto:");
+        match label {
+            Some(label) if label == address || mailbox == Some(label.as_str()) => out.push_str(&label),
+            Some(label) => {
+                out.push_str(&label);
+                out.push_str(" (");
+                out.push_str(&address);
+                out.push(')');
+            }
+            None => out.push_str(&address),
+        }
+    }
+}
+
+/// `text` with Slack's three escapes undone, each once: `&amp;lt;` is
+/// `&lt;`.
+fn slack_unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    slack_unescape_into(text, &mut out);
+    out
+}
+
+fn slack_unescape_into(text: &str, out: &mut String) {
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        let (plain, len) = if tail.starts_with("&amp;") {
+            ('&', 5)
+        } else if tail.starts_with("&lt;") {
+            ('<', 4)
+        } else if tail.starts_with("&gt;") {
+            ('>', 4)
+        } else {
+            ('&', 1)
+        };
+        out.push(plain);
+        rest = &tail[len..];
     }
     out.push_str(rest);
-    out.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+}
+
+/// Slack's channel mentions, `<#C1>` or `<#C1|name>`, by ID: each once,
+/// in ID order.
+fn slack_conversation_mentions(text: &str) -> Vec<String> {
+    let mut found = std::collections::BTreeSet::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<#") {
+        let after = &rest[start + 2..];
+        let end = after.find(['|', '>', '<']).unwrap_or(after.len());
+        let id = &after[..end];
+        if after[end..].starts_with(['|', '>'])
+            && !id.is_empty()
+            && id.len() <= 32
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        {
+            found.insert(id.to_owned());
+        }
+        rest = &after[end..];
+    }
+    found.into_iter().collect()
 }
 
 fn line(line: &ThreadLine, text: &str) -> String {
@@ -212,21 +327,140 @@ pub fn origin_keys(team_id: &str, conversation: &str, message: &str, thread_key:
 mod tests {
     use super::*;
 
-    fn names() -> BTreeMap<String, String> {
-        BTreeMap::from([("U1".to_owned(), "support".to_owned())])
+    fn names() -> MentionNames {
+        MentionNames {
+            people: BTreeMap::from([("U1".to_owned(), "support".to_owned())]),
+            conversations: BTreeMap::new(),
+        }
+    }
+
+    fn slack(text: &str, names: &MentionNames) -> String {
+        plain_text(ChannelProviderKind::Slack, text, names)
     }
 
     #[test]
     fn renders_mentions_by_name_and_undoes_escapes() {
-        let plain = plain_text(
-            ChannelProviderKind::Slack,
+        let plain = slack(
             "<@U1> and <@U2|ana> see <#C1|ops>, <https://x.example|docs> &lt;b&gt; &amp;",
             &names(),
         );
-        assert_eq!(plain, "@support and @ana see #ops, docs <b> &");
+        assert_eq!(plain, "@support and @ana see #ops, docs (https://x.example) <b> &");
+        assert_eq!(slack("<@U9> <broken", &names()), "@U9 <broken");
+        assert_eq!(slack("a < b <@U1> c", &names()), "a < b @support c");
+        assert_eq!(slack("open <", &names()), "open <");
+    }
+
+    fn fixture_names() -> MentionNames {
+        MentionNames {
+            people: BTreeMap::from([
+                ("U0ALICE01".to_owned(), "Alice Moreau".to_owned()),
+                ("U0BOB0002".to_owned(), "bob".to_owned()),
+                ("UBOT00001".to_owned(), "atlas".to_owned()),
+            ]),
+            conversations: BTreeMap::from([
+                ("C0NOLABEL".to_owned(), "random".to_owned()),
+                ("C0RENAMED".to_owned(), "launch".to_owned()),
+            ]),
+        }
+    }
+
+    /// What Slack sends, and what the model reads.
+    const SLACK_CASES: &[(&str, &str)] = &[
+        (
+            "plain words, *bold*, _italic_, `code`",
+            "plain words, *bold*, _italic_, `code`",
+        ),
+        ("hi <@U0ALICE01>", "hi @Alice Moreau"),
+        ("hi <@U0ALICE01|ally>", "hi @Alice Moreau"),
+        ("hi <@U0STRANGER|stranger>", "hi @stranger"),
+        ("hi <@U0STRANGER>", "hi @U0STRANGER"),
+        ("<@UBOT00001> and <@U0BOB0002>", "@atlas and @bob"),
+        ("see <#C0GENERAL|general>", "see #general"),
+        ("see <#C0NOLABEL>", "see #random"),
+        ("see <#C0RENAMED|old-name>", "see #launch"),
+        ("see <#C0UNKNOWN>", "see #C0UNKNOWN"),
+        ("<!here> <!channel> <!everyone>", "@here @channel @everyone"),
+        ("<!here|here> <!channel|@channel>", "@here @channel"),
+        ("ping <!subteam^S0TEAM|@oncall>", "ping @oncall"),
+        ("ping <!subteam^S0TEAM>", "ping @S0TEAM"),
+        ("due <!date^1760000000^{date_short}|Oct 9, 2025>", "due Oct 9, 2025"),
+        (
+            "<https://docs.example/start|the guide>",
+            "the guide (https://docs.example/start)",
+        ),
+        ("<https://docs.example/start>", "https://docs.example/start"),
+        (
+            "<https://docs.example/start|https://docs.example/start>",
+            "https://docs.example/start",
+        ),
+        (
+            "<https://docs.example/?a=1&amp;b=2|search>",
+            "search (https://docs.example/?a=1&b=2)",
+        ),
+        ("<https://docs.example/?a=1&amp;b=2>", "https://docs.example/?a=1&b=2"),
+        (
+            "<https://docs.example/|a &lt;b&gt; label>",
+            "a <b> label (https://docs.example/)",
+        ),
+        ("<mailto:alice@team.example|alice@team.example>", "alice@team.example"),
+        ("<mailto:alice@team.example>", "mailto:alice@team.example"),
+        ("a &lt; b &amp;&amp; c &gt; d", "a < b && c > d"),
+        ("&amp;lt; stays one level", "&lt; stays one level"),
+        ("fish & chips &amp", "fish & chips &amp"),
+        (":tada: :wave::skin-tone-2:", ":tada: :wave::skin-tone-2:"),
+        ("line one\nline two", "line one\nline two"),
+        ("stray < bracket", "stray < bracket"),
+        ("<unclosed", "<unclosed"),
+        ("```\nfn main() {}\n```", "```\nfn main() {}\n```"),
+    ];
+
+    #[test]
+    fn renders_what_slack_sends() {
+        let names = fixture_names();
+        for (sent, read) in SLACK_CASES {
+            assert_eq!(slack(sent, &names), *read, "for {sent:?}");
+        }
+    }
+
+    #[test]
+    fn renders_the_same_bytes_every_time() {
+        let names = fixture_names();
+        let text: String = SLACK_CASES.iter().map(|(sent, _)| *sent).collect::<Vec<_>>().join(" ");
+        let first = slack(&text, &names);
+        for _ in 0..50 {
+            assert_eq!(slack(&text, &names), first);
+        }
+        // Built in the other order, the same names render the same.
+        let reversed = MentionNames {
+            people: names.people.iter().rev().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            conversations: names
+                .conversations
+                .iter()
+                .rev()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        };
+        assert_eq!(slack(&text, &reversed), first);
+        // A name learned since changes what a new render reads.
+        let mut more = names.clone();
+        more.people.insert("U0STRANGER".to_owned(), "Sam".to_owned());
+        assert_ne!(slack(&text, &more), first);
+    }
+
+    #[test]
+    fn keeps_people_and_channels_apart() {
+        let names = MentionNames {
+            people: BTreeMap::from([("X1".to_owned(), "ana".to_owned())]),
+            conversations: BTreeMap::from([("X2".to_owned(), "ops".to_owned())]),
+        };
+        assert_eq!(slack("<@X2> <#X1> <@X1> <#X2>", &names), "@X2 #X1 @ana #ops");
+    }
+
+    #[test]
+    fn finds_the_channels_a_message_mentions() {
         assert_eq!(
-            plain_text(ChannelProviderKind::Slack, "<@U9> <broken", &names()),
-            "@U9 <broken"
+            conversation_mentions(ChannelProviderKind::Slack, "<#C2|b> <#C1> <#C2> <@U1> <#c3> <#C4 <#C5"),
+            ["C1", "C2"]
         );
     }
 

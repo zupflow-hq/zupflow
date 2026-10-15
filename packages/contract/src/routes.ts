@@ -1104,7 +1104,8 @@ export const routes: readonly Route[] = [
     operationId: "deleteChannelAppManager",
     method: "delete",
     path: "/v1/workspaces/{ws}/channel-app-managers/{manager}",
-    summary: "Unlink a team and forget its tokens. Refused while it has apps that aren't deleted: `409 in_use`",
+    summary:
+      "Unlink a team and forget its tokens. Refused while it has apps that aren't deleted, or deleted apps not yet removed at the provider (its tokens remove them; pasting new ones retries): `409 in_use`",
     callers: both,
     params: { ...ws, manager: idSchema("channel_app_manager") },
     response: noContent,

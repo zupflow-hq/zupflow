@@ -901,3 +901,88 @@ async fn reads_a_provider_event_up_to_a_mebibyte() {
         (StatusCode::PAYLOAD_TOO_LARGE, "body_too_large")
     );
 }
+
+/// `installed`'s connection learns conversation `external_id` by `name`,
+/// as it does from a message there.
+async fn name_conversation(world: &World, installed: &Installed, external_id: &str, name: &str) {
+    let (org, ws) = installed.scope();
+    world
+        .setup
+        .kit
+        .state(faults::Worker::A)
+        .channels
+        .record_message(
+            org,
+            ws,
+            ChannelConnectionId::parse(&installed.connection).unwrap(),
+            &NewMessage {
+                id: ChannelMessageId::generate(),
+                conversation: NewConversation {
+                    external_id: external_id.to_owned(),
+                    kind: ConversationKind::Channel,
+                    name: Some(name.to_owned()),
+                    is_external: false,
+                    identity_is_member: true,
+                },
+                direction: Direction::Inbound,
+                author: Some(NewPerson {
+                    external_id: "U0CAROL".to_owned(),
+                    handle: None,
+                    display_name: None,
+                    email: None,
+                    is_automated: false,
+                    team_id: Some(TEAM.to_owned()),
+                }),
+                external_id: "1000000000.000009".to_owned(),
+                thread_key: "1000000000.000009".to_owned(),
+                text: "earlier".to_owned(),
+                mentions: Vec::new(),
+                run_id: None,
+                tool_call_id: None,
+                agent_hop: 0,
+                sent_at: world.now(),
+            },
+            world.now(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn names_a_mentioned_channel_as_its_own_workspace_knows_it() {
+    let world = main_world().await;
+    let main = world.main.clone();
+    // The same team linked in a sibling workspace, which knows other names.
+    let sibling = world.setup.sibling("beta", "tk_beta").await;
+    let shared = world
+        .install(
+            "alice",
+            &sibling.org,
+            &sibling.ws,
+            &sibling.agent,
+            TEAM,
+            "U0SHARED",
+            "shared",
+        )
+        .await;
+    name_conversation(&world, &main, "C0OTHER", "other").await;
+    name_conversation(&world, &shared, "C0LAUNCH", "launch-plans").await;
+    let both = [&main, &shared];
+    let channels = "see <#C0OTHER>, <#C0LAUNCH|old> and <#C0NEW>";
+    world
+        .post(&both, SUPPORT, ANA, &format!("{} {channels}", main.mention()), None)
+        .await;
+    world
+        .post(&both, SUPPORT, ANA, &format!("{} {channels}", shared.mention()), None)
+        .await;
+    world.work().await;
+    let runs = world.runs(&main).await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["input"], "[U0ANA] @helper see #other, #old and #C0NEW");
+    let runs = world.runs(&shared).await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(
+        runs[0]["input"],
+        "[U0ANA] @shared see #C0OTHER, #launch-plans and #C0NEW"
+    );
+}

@@ -379,9 +379,17 @@ impl AgentStore for SqliteAgentStore {
     ) -> Result<Agent, AgentError> {
         let mut transaction = self.immediate("update_agent").await?;
         // A missing agent is missing, whatever model the change names.
-        if !agent_exists(&mut transaction, organization_id, workspace_id, agent_id).await? {
-            return Err(AgentError::AgentNotFound);
-        }
+        let before = sqlx::query(FIND_AGENT)
+            .bind(organization_id.uuid())
+            .bind(workspace_id.uuid())
+            .bind(agent_id.uuid())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(failed("update_agent"))?
+            .as_ref()
+            .map(agent_from)
+            .transpose()?
+            .ok_or(AgentError::AgentNotFound)?;
         if let Some(model_id) = changes.model_id {
             check_model(&mut transaction, organization_id, workspace_id, model_id).await?;
         }
@@ -414,6 +422,19 @@ impl AgentStore for SqliteAgentStore {
             .await
             .map_err(failed("update_agent"))?;
         let agent = agent_from(&row)?;
+        // Its apps carry its name and description: sent to their provider
+        // again by jobs that commit with the change.
+        if agent.name != before.name || agent.description != before.description {
+            crate::channels::queue_agent_app_syncs(
+                &mut transaction,
+                organization_id,
+                workspace_id,
+                agent_id,
+                Timestamp::now(),
+            )
+            .await
+            .map_err(|_| AgentError::Unavailable)?;
+        }
         crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&agent))
             .await
             .map_err(failed("audit"))?;

@@ -47,6 +47,8 @@ use zupflow_core::time::Timestamp;
 use crate::auth::AppState;
 use crate::connect::{attributed, expected_account, secure_enough};
 
+mod channel;
+
 /// How long past its link's expiry a used link still shows its outcome:
 /// long enough to come back from a provider's consent screen and read it.
 pub const OUTCOME_GRACE_MS: i64 = 5 * 60 * 1000;
@@ -270,7 +272,7 @@ async fn page(State(state): State<AppState>, reference: Result<Path<String>, Pat
 
 /// The session's app, in the session's own scope.
 async fn session_app(state: &AppState, session: &ConnectSession) -> Result<App, Unrendered> {
-    // A channel session has no app: the page shows its generic face.
+    // A channel session has no app: its own page renders it.
     let Some(installed) = session.app else {
         return Err(Unrendered::Gone);
     };
@@ -345,6 +347,9 @@ fn with_session(mut url: url::Url, session_id: &str) -> String {
 }
 
 async fn render_session(state: &AppState, session: &ConnectSession, shown: Shown) -> Result<Response, Unrendered> {
+    if session.target.is_some() {
+        return channel::render(state, session, shown).await;
+    }
     let app = session_app(state, session).await?;
     let embedding = embedding(state, session).await?;
     let (title, card) = match shown {

@@ -4,8 +4,8 @@
 //!
 //! Every statement repeats the organization and, for anything but the
 //! levels and settings, the workspace, joins and subqueries included, next
-//! to any unique ID. The one statement that starts without them is
-//! [`ChannelStore::attribute_app_by_inbound_ref_cross_tenant`], named so.
+//! to any unique ID. The statements that start without them are named
+//! `_cross_tenant`, each documented where it is declared.
 //!
 //! Each change is an immediate transaction that first checks, in it, that
 //! the acting editor still may make it (an active developer or stricter, or
@@ -28,7 +28,7 @@ use zupflow_core::channels::store::{
     AppCreation, AppFilter, AppSecretsRecord, ChannelEditor, ChannelError, ChannelSession, ChannelStore,
     ConnectionChanges, ConnectionFilter, ConversationFilter, DeliveryOutcome, DispatchOutcome, InboundContext,
     LevelChange, MadeApp, MessageFilter, NewApp, NewConversation, NewDelivery, NewDispatch, NewInstall, NewManager,
-    NewMessage, NewPerson, RecordedMessage, SealedVersion, SessionTemplate, TokenReplacement,
+    NewMessage, NewPerson, RecordedMessage, RotationSweep, SealedVersion, SessionTemplate, TokenReplacement,
 };
 use zupflow_core::channels::thread::origin_keys;
 use zupflow_core::channels::{
@@ -59,6 +59,11 @@ use zupflow_core::workspaces::Page;
 use crate::Database;
 use crate::connect::session_columns;
 use crate::job_queue::insert_job_at;
+
+pub(crate) mod exchange;
+mod lifecycle;
+
+pub(crate) use lifecycle::queue_agent_app_syncs;
 
 const MINUTE_MS: i64 = 60 * 1000;
 /// Why an app whose making job is gone or buried failed.
@@ -901,6 +906,199 @@ async fn set_connection_status(
     .await
 }
 
+/// [`ChannelStore::install_app`]'s writes, in `transaction`.
+pub(crate) async fn install_app_in(
+    transaction: &mut Transaction<'static, Sqlite>,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    app_id: ChannelAppId,
+    install: &NewInstall,
+    now: Timestamp,
+) -> Result<(ChannelConnection, AgentChannel), ChannelError> {
+    let app = find_app_in(transaction, organization_id, workspace_id, app_id)
+        .await?
+        .ok_or(ChannelError::AppNotFound)?;
+    if !app.status.is_installable() {
+        return Err(ChannelError::AppNotReady);
+    }
+    let manager = find_manager_in(transaction, organization_id, workspace_id, app.manager_id)
+        .await?
+        .filter(|manager| manager.status == ManagerStatus::Active)
+        .ok_or(ChannelError::ManagerInactive)?;
+    match manager.team.id.as_deref() {
+        Some(team) if team != install.team.id => return Err(ChannelError::TeamMismatch),
+        _ => {}
+    }
+    sqlx::query(
+        "UPDATE channel_app_managers SET team_id = ?, team_name = ?, updated_at = ? \
+         WHERE organization_id = ? AND workspace_id = ? AND id = ?",
+    )
+    .bind(&install.team.id)
+    .bind(install.team.name.as_deref())
+    .bind(now.millis())
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(manager.id.uuid())
+    .execute(&mut **transaction)
+    .await
+    .map_err(failed("install_app"))?;
+    let scopes = to_json(&install.granted_scopes)?;
+    let live = live_connection_of(transaction, organization_id, workspace_id, app_id).await?;
+    let connection_id = match live {
+        Some(live) => {
+            let expected = live.credential_version.unwrap_or(0).checked_add(1);
+            if live.id != install.connection_id || Some(install.credential.version) != expected {
+                return Err(ChannelError::InstallChanged);
+            }
+            sqlx::query(
+                // The same identity keeps the bot ID learned from its
+                // posts when the install reports none.
+                "UPDATE channel_connections SET team_name = ?, enterprise_id = ?, identity_external_id = ?, \
+                 handle = ?, identity_bot_id = CASE WHEN identity_external_id = ? \
+                 THEN coalesce(?, identity_bot_id) ELSE ? END, granted_scopes = ?, credential_version = ?, \
+                 connected_at = ?, updated_at = ? \
+                 WHERE organization_id = ? AND workspace_id = ? AND id = ?",
+            )
+            .bind(install.team.name.as_deref())
+            .bind(install.team.enterprise_id.as_deref())
+            .bind(&install.identity.external_id)
+            .bind(&install.identity.handle)
+            .bind(&install.identity.external_id)
+            .bind(install.identity.bot_id.as_deref())
+            .bind(install.identity.bot_id.as_deref())
+            .bind(&scopes)
+            .bind(i64::from(install.credential.version))
+            .bind(now.millis())
+            .bind(now.millis())
+            .bind(organization_id.uuid())
+            .bind(workspace_id.uuid())
+            .bind(live.id.uuid())
+            .execute(&mut **transaction)
+            .await
+            .map_err(failed("install_app"))?;
+            set_connection_status(
+                transaction,
+                organization_id,
+                workspace_id,
+                &live,
+                ConnectionStatus::Connected,
+                now,
+            )
+            .await?;
+            live.id
+        }
+        None => {
+            if install.credential.version != FIRST_VERSION {
+                return Err(ChannelError::InstallChanged);
+            }
+            let mut draw = crate::installations::random_short_id;
+            let short_id = crate::installations::issue_short_id(
+                transaction,
+                organization_id,
+                workspace_id,
+                &mut draw,
+                now.millis(),
+            )
+            .await
+            .map_err(|_| ChannelError::Unavailable)?;
+            sqlx::query(
+                "INSERT INTO channel_connections (id, organization_id, workspace_id, provider, app_id, short_id, \
+                 label, handler, status, team_id, team_name, enterprise_id, identity_external_id, handle, \
+                 identity_bot_id, granted_scopes, credential_version, connected_at, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'mention', 'connected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(install.connection_id.uuid())
+            .bind(organization_id.uuid())
+            .bind(workspace_id.uuid())
+            .bind(app.provider.as_str())
+            .bind(app_id.uuid())
+            .bind(short_id.as_str())
+            .bind(&install.label)
+            .bind(&install.team.id)
+            .bind(install.team.name.as_deref())
+            .bind(install.team.enterprise_id.as_deref())
+            .bind(&install.identity.external_id)
+            .bind(&install.identity.handle)
+            .bind(install.identity.bot_id.as_deref())
+            .bind(&scopes)
+            .bind(i64::from(install.credential.version))
+            .bind(now.millis())
+            .bind(now.millis())
+            .bind(now.millis())
+            .execute(&mut **transaction)
+            .await
+            .map_err(failed("install_app"))?;
+            announce(
+                transaction,
+                organization_id,
+                workspace_id,
+                WebhookEventType::ChannelConnectionStatusChanged,
+                serde_json::json!({
+                    "object": "channel_connection", "id": install.connection_id, "app_id": app_id,
+                    "status": "connected",
+                }),
+                now,
+            )
+            .await?;
+            install.connection_id
+        }
+    };
+    insert_sealed(
+        transaction,
+        INSERT_CONNECTION_CREDENTIAL,
+        organization_id,
+        workspace_id,
+        connection_id.uuid(),
+        install.credential.version,
+        &install.credential.sealed,
+        now,
+    )
+    .await?;
+    sqlx::query(
+        "DELETE FROM channel_connection_credentials \
+         WHERE organization_id = ? AND workspace_id = ? AND connection_id = ? AND version < ?",
+    )
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(connection_id.uuid())
+    .bind(i64::from(install.credential.version))
+    .execute(&mut **transaction)
+    .await
+    .map_err(failed("install_app"))?;
+    if find_agent_channel_on(transaction, organization_id, workspace_id, connection_id)
+        .await?
+        .is_none()
+    {
+        write_agent_channel(
+            transaction,
+            organization_id,
+            workspace_id,
+            None,
+            app.agent_id,
+            connection_id,
+            &AgentChannelSettings::default(),
+            now,
+        )
+        .await?;
+    }
+    set_app_status(
+        transaction,
+        organization_id,
+        workspace_id,
+        &app,
+        AppStatus::Installed,
+        now,
+    )
+    .await?;
+    let connection = find_connection_in(transaction, organization_id, workspace_id, connection_id)
+        .await?
+        .ok_or_else(|| read("a connection gone inside its own transaction"))?;
+    let channel = find_agent_channel_on(transaction, organization_id, workspace_id, connection_id)
+        .await?
+        .ok_or_else(|| read("an agent channel gone inside its own transaction"))?;
+    Ok((connection, channel))
+}
+
 /// Removes an app that isn't deleted: its live connection disconnected and
 /// the agent's channel on it removed, its history kept; the app `deleted`.
 async fn remove_app(
@@ -910,12 +1108,13 @@ async fn remove_app(
     app: &ChannelApp,
     now: Timestamp,
 ) -> Result<(), ChannelError> {
-    if let Some(live) = live_connection_of(transaction, organization_id, workspace_id, app.id).await? {
+    let live = live_connection_of(transaction, organization_id, workspace_id, app.id).await?;
+    if let Some(live) = &live {
         set_connection_status(
             transaction,
             organization_id,
             workspace_id,
-            &live,
+            live,
             ConnectionStatus::Disconnected,
             now,
         )
@@ -927,6 +1126,14 @@ async fn remove_app(
             .execute(&mut **transaction)
             .await
             .map_err(failed("remove_app"))?;
+    }
+    // Made at its provider: removed there too (its live token revoked
+    // first), by a job that commits with this; until then it's unreleased.
+    if app.external_app_id.is_some() && app.status.is_installable() {
+        let connection_id = live.as_ref().map(|live| live.id);
+        lifecycle::queue_release(transaction, organization_id, workspace_id, app.id, connection_id, now).await?;
+    } else {
+        lifecycle::released_at_once(transaction, organization_id, workspace_id, app.id, now).await?;
     }
     set_app_status(transaction, organization_id, workspace_id, app, AppStatus::Deleted, now).await
 }
@@ -1932,6 +2139,8 @@ impl ChannelStore for SqliteChannelStore {
             .ok_or_else(|| read("a manager gone inside its own transaction"))?;
         if editor.is_some() {
             audit_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&replaced)).await?;
+            // Pasted tokens may be what a deleted app's removal was waiting for.
+            lifecycle::requeue_releases(&mut transaction, organization_id, workspace_id, manager_id, now).await?;
         }
         transaction.commit().await.map_err(failed("replace_manager_tokens"))?;
         Ok(replaced)
@@ -1952,6 +2161,20 @@ impl ChannelStore for SqliteChannelStore {
             .ok_or(ChannelError::ManagerNotFound)?;
         if manager.app_count > 0 {
             return Err(ChannelError::ManagerInUse(manager.app_count));
+        }
+        // Deleted apps not yet removed at the provider need its tokens.
+        let unreleased: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM channel_apps WHERE organization_id = ? AND workspace_id = ? AND manager_id = ? \
+             AND status = 'deleted' AND released_at IS NULL",
+        )
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(manager_id.uuid())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(failed("delete_manager"))?;
+        if unreleased > 0 {
+            return Err(ChannelError::RemovalsPending(u64::try_from(unreleased).map_err(read)?));
         }
         sqlx::query("DELETE FROM channel_app_managers WHERE organization_id = ? AND workspace_id = ? AND id = ?")
             .bind(organization_id.uuid())
@@ -2356,7 +2579,8 @@ impl ChannelStore for SqliteChannelStore {
         app_id: ChannelAppId,
     ) -> Result<Option<AppSecretsRecord>, ChannelError> {
         let row = sqlx::query(
-            "SELECT a.inbound_ref, a.client_id, s.version, s.key_id, s.wrapped_key, s.nonce, s.ciphertext \
+            "SELECT a.inbound_ref, a.client_id, a.manifest_digest, s.version, s.key_id, s.wrapped_key, s.nonce, \
+             s.ciphertext \
              FROM channel_apps a LEFT JOIN channel_app_secrets s \
              ON s.organization_id = a.organization_id AND s.workspace_id = a.workspace_id AND s.app_id = a.id \
              WHERE a.organization_id = ? AND a.workspace_id = ? AND a.id = ? AND a.status <> 'deleted' \
@@ -2375,6 +2599,7 @@ impl ChannelStore for SqliteChannelStore {
                 .ok_or_else(|| read("an invalid inbound reference"))?,
             client_id: row.try_get("client_id").map_err(read)?,
             secrets: version.map(|_| sealed_from(&row)).transpose()?,
+            manifest_digest: row.try_get("manifest_digest").map_err(read)?,
         }))
     }
 
@@ -2429,189 +2654,72 @@ impl ChannelStore for SqliteChannelStore {
         now: Timestamp,
     ) -> Result<(ChannelConnection, AgentChannel), ChannelError> {
         let mut transaction = self.immediate("install_app").await?;
-        let app = find_app_in(&mut transaction, organization_id, workspace_id, app_id)
-            .await?
-            .ok_or(ChannelError::AppNotFound)?;
-        if !app.status.is_installable() {
-            return Err(ChannelError::AppNotReady);
-        }
-        let manager = find_manager_in(&mut transaction, organization_id, workspace_id, app.manager_id)
-            .await?
-            .filter(|manager| manager.status == ManagerStatus::Active)
-            .ok_or(ChannelError::ManagerInactive)?;
-        match manager.team.id.as_deref() {
-            Some(team) if team != install.team.id => return Err(ChannelError::TeamMismatch),
-            _ => {}
-        }
-        sqlx::query(
-            "UPDATE channel_app_managers SET team_id = ?, team_name = ?, updated_at = ? \
-             WHERE organization_id = ? AND workspace_id = ? AND id = ?",
-        )
-        .bind(&install.team.id)
-        .bind(install.team.name.as_deref())
-        .bind(now.millis())
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(manager.id.uuid())
-        .execute(&mut *transaction)
-        .await
-        .map_err(failed("install_app"))?;
-        let scopes = to_json(&install.granted_scopes)?;
-        let live = live_connection_of(&mut transaction, organization_id, workspace_id, app_id).await?;
-        let connection_id = match live {
-            Some(live) => {
-                let expected = live.credential_version.unwrap_or(0).checked_add(1);
-                if live.id != install.connection_id || Some(install.credential.version) != expected {
-                    return Err(ChannelError::InstallChanged);
-                }
-                sqlx::query(
-                    // The same identity keeps the bot ID learned from its
-                    // posts when the install reports none.
-                    "UPDATE channel_connections SET team_name = ?, enterprise_id = ?, identity_external_id = ?, \
-                     handle = ?, identity_bot_id = CASE WHEN identity_external_id = ? \
-                     THEN coalesce(?, identity_bot_id) ELSE ? END, granted_scopes = ?, credential_version = ?, \
-                     connected_at = ?, updated_at = ? \
-                     WHERE organization_id = ? AND workspace_id = ? AND id = ?",
-                )
-                .bind(install.team.name.as_deref())
-                .bind(install.team.enterprise_id.as_deref())
-                .bind(&install.identity.external_id)
-                .bind(&install.identity.handle)
-                .bind(&install.identity.external_id)
-                .bind(install.identity.bot_id.as_deref())
-                .bind(install.identity.bot_id.as_deref())
-                .bind(&scopes)
-                .bind(i64::from(install.credential.version))
-                .bind(now.millis())
-                .bind(now.millis())
-                .bind(organization_id.uuid())
-                .bind(workspace_id.uuid())
-                .bind(live.id.uuid())
-                .execute(&mut *transaction)
-                .await
-                .map_err(failed("install_app"))?;
-                set_connection_status(
-                    &mut transaction,
-                    organization_id,
-                    workspace_id,
-                    &live,
-                    ConnectionStatus::Connected,
-                    now,
-                )
-                .await?;
-                live.id
-            }
-            None => {
-                if install.credential.version != FIRST_VERSION {
-                    return Err(ChannelError::InstallChanged);
-                }
-                let mut draw = crate::installations::random_short_id;
-                let short_id = crate::installations::issue_short_id(
-                    &mut transaction,
-                    organization_id,
-                    workspace_id,
-                    &mut draw,
-                    now.millis(),
-                )
-                .await
-                .map_err(|_| ChannelError::Unavailable)?;
-                sqlx::query(
-                    "INSERT INTO channel_connections (id, organization_id, workspace_id, provider, app_id, short_id, \
-                     label, handler, status, team_id, team_name, enterprise_id, identity_external_id, handle, \
-                     identity_bot_id, granted_scopes, credential_version, connected_at, created_at, updated_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, 'mention', 'connected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                )
-                .bind(install.connection_id.uuid())
-                .bind(organization_id.uuid())
-                .bind(workspace_id.uuid())
-                .bind(app.provider.as_str())
-                .bind(app_id.uuid())
-                .bind(short_id.as_str())
-                .bind(&install.label)
-                .bind(&install.team.id)
-                .bind(install.team.name.as_deref())
-                .bind(install.team.enterprise_id.as_deref())
-                .bind(&install.identity.external_id)
-                .bind(&install.identity.handle)
-                .bind(install.identity.bot_id.as_deref())
-                .bind(&scopes)
-                .bind(i64::from(install.credential.version))
-                .bind(now.millis())
-                .bind(now.millis())
-                .bind(now.millis())
-                .execute(&mut *transaction)
-                .await
-                .map_err(failed("install_app"))?;
-                announce(
-                    &mut transaction,
-                    organization_id,
-                    workspace_id,
-                    WebhookEventType::ChannelConnectionStatusChanged,
-                    serde_json::json!({
-                        "object": "channel_connection", "id": install.connection_id, "app_id": app_id,
-                        "status": "connected",
-                    }),
-                    now,
-                )
-                .await?;
-                install.connection_id
-            }
-        };
-        insert_sealed(
-            &mut transaction,
-            INSERT_CONNECTION_CREDENTIAL,
-            organization_id,
-            workspace_id,
-            connection_id.uuid(),
-            install.credential.version,
-            &install.credential.sealed,
-            now,
-        )
-        .await?;
-        sqlx::query(
-            "DELETE FROM channel_connection_credentials \
-             WHERE organization_id = ? AND workspace_id = ? AND connection_id = ? AND version < ?",
-        )
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(connection_id.uuid())
-        .bind(i64::from(install.credential.version))
-        .execute(&mut *transaction)
-        .await
-        .map_err(failed("install_app"))?;
-        if find_agent_channel_on(&mut transaction, organization_id, workspace_id, connection_id)
-            .await?
-            .is_none()
-        {
-            write_agent_channel(
-                &mut transaction,
-                organization_id,
-                workspace_id,
-                None,
-                app.agent_id,
-                connection_id,
-                &AgentChannelSettings::default(),
-                now,
-            )
-            .await?;
-        }
-        set_app_status(
-            &mut transaction,
-            organization_id,
-            workspace_id,
-            &app,
-            AppStatus::Installed,
-            now,
-        )
-        .await?;
-        let connection = find_connection_in(&mut transaction, organization_id, workspace_id, connection_id)
-            .await?
-            .ok_or_else(|| read("a connection gone inside its own transaction"))?;
-        let channel = find_agent_channel_on(&mut transaction, organization_id, workspace_id, connection_id)
-            .await?
-            .ok_or_else(|| read("an agent channel gone inside its own transaction"))?;
+        let installed = install_app_in(&mut transaction, organization_id, workspace_id, app_id, install, now).await?;
         transaction.commit().await.map_err(failed("install_app"))?;
-        Ok((connection, channel))
+        Ok(installed)
+    }
+
+    async fn install_app_through_session(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        session_id: ConnectSessionId,
+        app_id: ChannelAppId,
+        install: &NewInstall,
+        now: Timestamp,
+    ) -> Result<(ConnectSession, ChannelConnection, AgentChannel), ChannelError> {
+        lifecycle::install_app_through_session(self, organization_id, workspace_id, session_id, app_id, install, now)
+            .await
+    }
+
+    async fn connection_credential(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+    ) -> Result<Option<SealedVersion>, ChannelError> {
+        lifecycle::connection_credential(self, organization_id, workspace_id, connection_id).await
+    }
+
+    async fn queue_due_rotations_cross_tenant(
+        &self,
+        rotate: &(dyn Fn(ChannelAppManagerId, u32) -> QueuedJob + Send + Sync),
+        due_by: Timestamp,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<RotationSweep, ChannelError> {
+        lifecycle::queue_due_rotations_cross_tenant(self, rotate, due_by, limit, now).await
+    }
+
+    async fn record_app_released(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        app_id: ChannelAppId,
+        now: Timestamp,
+    ) -> Result<bool, ChannelError> {
+        lifecycle::record_app_released(self, organization_id, workspace_id, app_id, now).await
+    }
+
+    async fn record_app_synced(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        app_id: ChannelAppId,
+        digest: &str,
+    ) -> Result<bool, ChannelError> {
+        lifecycle::record_app_synced(self, organization_id, workspace_id, app_id, digest).await
+    }
+
+    async fn expire_manager_tokens(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        manager_id: ChannelAppManagerId,
+        expected_version: u32,
+        now: Timestamp,
+    ) -> Result<bool, ChannelError> {
+        lifecycle::expire_manager_tokens(self, organization_id, workspace_id, manager_id, expected_version, now).await
     }
 
     async fn list_connections(
@@ -3154,6 +3262,38 @@ impl ChannelStore for SqliteChannelStore {
         Ok(context)
     }
 
+    async fn people_to_read(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        names: &[String],
+        emails: &[String],
+        now: Timestamp,
+    ) -> Result<Vec<String>, ChannelError> {
+        exchange::people_to_read(self, organization_id, workspace_id, connection_id, names, emails, now).await
+    }
+
+    async fn record_people(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        people: &[zupflow_core::channels::store::PersonLookup],
+        now: Timestamp,
+    ) -> Result<(), ChannelError> {
+        exchange::record_people(self, organization_id, workspace_id, connection_id, people, now).await
+    }
+
+    async fn reply_of(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+    ) -> Result<Option<zupflow_core::channels::reply::ChannelReply>, ChannelError> {
+        exchange::reply_of(self, organization_id, workspace_id, run_id).await
+    }
+
     async fn mark_handled(
         &self,
         organization_id: OrganizationId,
@@ -3622,6 +3762,8 @@ mod tests {
         "attribute_app_by_inbound_ref_cross_tenant",
         // A sweep over every workspace's unsettled apps, like a worker's claim.
         "reap_stranded_apps_cross_tenant",
+        // A sweep over every workspace's linked teams for tokens to rotate.
+        "queue_due_rotations_cross_tenant",
     ];
 
     /// Statements on a workspace's tables that hold to the organization
@@ -3787,7 +3929,14 @@ mod tests {
     #[test]
     fn every_statement_names_its_organization_and_workspace() {
         let source = include_str!("channels.rs");
-        let audited = audit(&source[..source.find("#[cfg(test)]").unwrap()]);
+        // The store's own file and what its modules add.
+        let source = [
+            &source[..source.find("#[cfg(test)]").unwrap()],
+            include_str!("channels/lifecycle.rs"),
+            include_str!("channels/exchange.rs"),
+        ]
+        .concat();
+        let audited = audit(&source);
         assert!(audited.problems.is_empty(), "{:#?}", audited.problems);
         for name in CROSS_TENANT.iter().chain(ORGANIZATION_ONLY) {
             assert!(

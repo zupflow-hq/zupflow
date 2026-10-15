@@ -143,8 +143,8 @@ pub fn model_catalog(config: &Config, outbound: &Arc<dyn OutboundHttp>) -> Arc<d
     }
 }
 
-/// What makes agents' apps in linked teams: the scripted provisioner for
-/// local work, or, unset, nothing, so no team can be linked.
+/// What makes agents' apps in linked teams: Slack, the scripted provisioner
+/// for local work, or, unset, nothing, so no team can be linked.
 pub fn channel_provisioner(config: &Config) -> Arc<dyn AppProvisioner> {
     match config.channel_provisioner {
         ChannelProvisionerMode::None => {
@@ -162,14 +162,32 @@ pub fn channel_provisioner(config: &Config) -> Arc<dyn AppProvisioner> {
             );
             Arc::new(zupflow_basic::scripted_channel_provisioner::ScriptedChannelProvisioner::default())
         }
+        ChannelProvisionerMode::Slack => {
+            tracing::info!(
+                event = "server.slack_channel_provisioner",
+                api = config.slack_api.method_url(""),
+                "Channel apps are made in Slack with each linked team's configuration token"
+            );
+            Arc::new(zupflow_slack::SlackProvisioner::new(config.slack_api.clone()))
+        }
     }
 }
 
-/// What reads deliveries to agents' apps' inbound endpoints: deliveries in
-/// Slack's format, signed as Slack signs them. It holds no credential and
-/// calls no one; each delivery is checked with its own app's signing secret.
-pub fn channel_provider() -> Arc<dyn zupflow_core::channels::provider::ChannelProvider> {
-    Arc::new(zupflow_channels::fake::FakeChannelProvider)
+/// What reads deliveries to agents' apps' inbound endpoints, and what a
+/// connection calls with its token: Slack with
+/// `ZUPFLOW_CHANNEL_PROVISIONER=slack` (people read with `users.info`,
+/// answers posted with `chat.postMessage`, at `ZUPFLOW_SLACK_API_URL`);
+/// otherwise the fake provider, which reads deliveries in Slack's format
+/// and calls no one. Either holds no credential: each delivery is checked
+/// with its own app's signing secret, and each call made with its own
+/// connection's token.
+pub fn channel_provider(config: &Config) -> Arc<dyn zupflow_core::channels::provider::ChannelProvider> {
+    match config.channel_provisioner {
+        ChannelProvisionerMode::Slack => Arc::new(zupflow_slack::SlackChannelProvider::new(config.slack_api.clone())),
+        ChannelProvisionerMode::None | ChannelProvisionerMode::Scripted => {
+            Arc::new(zupflow_channels::fake::FakeChannelProvider)
+        }
+    }
 }
 
 /// The outbound HTTP client every call to a provider, an MCP server or a
@@ -201,6 +219,7 @@ pub async fn serve(
     let deliverer = tokio::spawn(crate::webhook_delivery::run_workers(state.clone()));
     let provisioner = tokio::spawn(crate::channels::run_worker(state.clone()));
     let inbound = tokio::spawn(crate::channel_inbound::run_worker(state.clone()));
+    let replies = tokio::spawn(crate::channel_reply::run_worker(state.clone()));
     let served = axum::serve(listener, crate::app(state, guard))
         .with_graceful_shutdown(shutdown)
         .await;
@@ -209,6 +228,7 @@ pub async fn serve(
     deliverer.abort();
     provisioner.abort();
     inbound.abort();
+    replies.abort();
     served.map_err(BootstrapError::Serve)
 }
 

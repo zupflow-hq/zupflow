@@ -1,0 +1,9 @@
+{
+  "token": "ZZZZZZWSxiZZZ2yIvs3peJ",
+  "team_id": "T0FAKE001",
+  "api_app_id": "A0FAKE00001",
+  "event": { "type": "app_uninstalled", "event_ts": "1760000900.000100" },
+  "type": "event_callback",
+  "event_id": "Ev0UNINSTALL",
+  "event_time": 1760000900
+}

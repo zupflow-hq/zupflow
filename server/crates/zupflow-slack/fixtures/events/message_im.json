@@ -1,0 +1,18 @@
+{
+  "token": "ZZZZZZWSxiZZZ2yIvs3peJ",
+  "team_id": "T0FAKE001",
+  "api_app_id": "A0FAKE00001",
+  "event": {
+    "type": "message",
+    "user": "U0ALICE01",
+    "text": "What's on my calendar today?",
+    "ts": "1760000200.000100",
+    "team": "T0FAKE001",
+    "channel": "D0ALICEDM",
+    "event_ts": "1760000200.000100",
+    "channel_type": "im"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0DIRECT001",
+  "event_time": 1760000200
+}

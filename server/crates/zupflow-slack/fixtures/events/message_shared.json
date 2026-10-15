@@ -1,0 +1,22 @@
+{
+  "token": "verification-token-unused",
+  "team_id": "T0FAKE001",
+  "api_app_id": "A0FAKE001",
+  "event": {
+    "type": "message",
+    "user": "U0GUEST01",
+    "text": "<@UBOT00001> could you share the rollout plan?",
+    "ts": "1760000500.000100",
+    "team": "T0OTHERORG",
+    "user_team": "T0OTHERORG",
+    "source_team": "T0OTHERORG",
+    "channel": "C0SHARED1",
+    "event_ts": "1760000500.000100",
+    "channel_type": "channel"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0SHARED001",
+  "event_time": 1760000500,
+  "is_ext_shared_channel": true,
+  "context_team_id": "T0FAKE001"
+}

@@ -130,10 +130,19 @@ async fn links_a_team_and_makes_an_agents_app_with_a_job() {
         )
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let (status, _) = server
-        .send(call("alice", Method::DELETE, format!("{}/{manager}", managers(&ws))).naming(&org))
-        .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    // Its removal at the provider runs on the worker; the team is in use until then.
+    let unlink = || call("alice", Method::DELETE, format!("{}/{manager}", managers(&ws))).naming(&org);
+    let mut unlinked = server.send(unlink()).await;
+    for _ in 0..50 {
+        if unlinked.0 != StatusCode::CONFLICT {
+            break;
+        }
+        assert_eq!(code(&unlinked.1), "in_use");
+        zupflow_server::channels::work_once(&server.state).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        unlinked = server.send(unlink()).await;
+    }
+    assert_eq!(unlinked.0, StatusCode::NO_CONTENT, "{}", unlinked.1);
 }
 
 #[tokio::test]

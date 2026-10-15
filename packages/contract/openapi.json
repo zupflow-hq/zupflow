@@ -15153,7 +15153,7 @@
       },
       "delete": {
         "operationId": "deleteChannelAppManager",
-        "summary": "Unlink a team and forget its tokens. Refused while it has apps that aren't deleted: `409 in_use`",
+        "summary": "Unlink a team and forget its tokens. Refused while it has apps that aren't deleted, or deleted apps not yet removed at the provider (its tokens remove them; pasting new ones retries): `409 in_use`",
         "security": [
           {
             "consoleSession": [],

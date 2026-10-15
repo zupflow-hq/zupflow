@@ -1,0 +1,31 @@
+{
+  "team_id": "T0FAKE001",
+  "api_app_id": "A0FAKE00001",
+  "event": {
+    "type": "message",
+    "subtype": "message_changed",
+    "hidden": true,
+    "message": {
+      "type": "message",
+      "user": "U0BOB0002",
+      "text": "Thanks <@UBOT00001>, and <@U0ALICE01> too",
+      "edited": { "user": "U0BOB0002", "ts": "1760000220.000000" },
+      "ts": "1760000160.000300",
+      "thread_ts": "1760000100.000200"
+    },
+    "previous_message": {
+      "type": "message",
+      "user": "U0BOB0002",
+      "text": "Thanks <@UBOT00001> &amp; <@U0ALICE01|alice> :tada:",
+      "ts": "1760000160.000300",
+      "thread_ts": "1760000100.000200"
+    },
+    "channel": "C0GENERAL",
+    "ts": "1760000220.000500",
+    "event_ts": "1760000220.000500",
+    "channel_type": "channel"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0EDITED001",
+  "event_time": 1760000220
+}

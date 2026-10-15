@@ -8,8 +8,9 @@
 //! tenant are named and documented as such:
 //! [`ChannelStore::attribute_app_by_inbound_ref_cross_tenant`] (a provider's
 //! event names only its app's inbound reference) and
-//! [`ChannelStore::reap_stranded_apps_cross_tenant`] (a sweep, like a
-//! worker's claim, that then works on each app in its own scope).
+//! [`ChannelStore::reap_stranded_apps_cross_tenant`] and
+//! [`ChannelStore::queue_due_rotations_cross_tenant`] (sweeps, like a
+//! worker's claim, that then work on each row in its own scope).
 //!
 //! **Concurrency.** Every change takes the acting [`ChannelEditor`] and
 //! checks, inside its own transaction, that they still may: an active member
@@ -35,7 +36,8 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use super::handling::DispatchReason;
-use super::provider::InboundEvent;
+use super::provider::{InboundEvent, ProviderPerson};
+use super::reply::ChannelReply;
 use super::{
     AgentChannel, AgentChannelSettings, BreakerSettings, ChannelApp, ChannelAppManager, ChannelConnection,
     ChannelConversation, ChannelMessage, ChannelProviderKind, ChannelSettings, ChannelToolLevel, ConnectionTeam,
@@ -191,6 +193,9 @@ pub struct AppSecretsRecord {
     pub client_id: Option<String>,
     /// `None` until the provider has made the app.
     pub secrets: Option<SealedVersion>,
+    /// [`super::provision::AppManifest::digest`] of the manifest a sync last
+    /// sent; `None` before the first.
+    pub manifest_digest: Option<String>,
 }
 
 /// What a list of apps asks for.
@@ -250,6 +255,15 @@ pub struct NewPerson {
     pub is_automated: bool,
     /// The team they belong to, when the provider says.
     pub team_id: Option<String>,
+}
+
+/// What the provider said, asked about one person on a connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonLookup {
+    pub external_id: String,
+    /// `None` when it has no such person, or none it shows the connection:
+    /// remembered, so they aren't asked about again for a while.
+    pub found: Option<ProviderPerson>,
 }
 
 /// A message to record, once per conversation and external ID.
@@ -429,6 +443,15 @@ pub struct LevelChange {
     pub level: ToolLevel,
 }
 
+/// What a rotation sweep did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RotationSweep {
+    /// Rotations queued.
+    pub queued: u32,
+    /// Managers whose tokens expired unrotated.
+    pub expired: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChannelError {
     #[error("the store is unavailable")]
@@ -461,6 +484,10 @@ pub enum ChannelError {
     /// The manager still has this many apps that aren't deleted.
     #[error("the manager still has apps")]
     ManagerInUse(u64),
+    /// This many of the manager's deleted apps aren't removed at the
+    /// provider yet: its tokens are what removes them.
+    #[error("the manager's deleted apps are still being removed")]
+    RemovalsPending(u64),
     /// The tokens were replaced since they were read.
     #[error("the tokens changed meanwhile")]
     TokensChanged,
@@ -554,7 +581,9 @@ pub trait ChannelStore: Send + Sync {
     /// Stores the next version of the tokens and forgets the earlier ones;
     /// the manager is `active` again (announced if it wasn't). `TokensChanged`
     /// unless the stored version is still `expected_version`. `editor` is
-    /// `None` for Zupflow's own rotation: no audit is recorded then.
+    /// `None` for Zupflow's own rotation: no audit is recorded then. Pasted
+    /// tokens (an `editor`'s) queue the release of every deleted app of the
+    /// manager not yet released, since they may be what was missing.
     #[allow(clippy::too_many_arguments)]
     async fn replace_manager_tokens(
         &self,
@@ -568,7 +597,8 @@ pub trait ChannelStore: Send + Sync {
     ) -> Result<ChannelAppManager, ChannelError>;
 
     /// Unlinks a team, forgetting its tokens. `ManagerInUse` while it has apps
-    /// that aren't deleted.
+    /// that aren't deleted, `RemovalsPending` while deleted ones aren't
+    /// released at the provider yet.
     async fn delete_manager(
         &self,
         organization_id: OrganizationId,
@@ -743,6 +773,80 @@ pub trait ChannelStore: Send + Sync {
         install: &NewInstall,
         now: Timestamp,
     ) -> Result<(ChannelConnection, AgentChannel), ChannelError>;
+
+    /// [`Self::install_app`] through the pending `channel_app` Connect
+    /// session that asked for it, as one: the install, then the session
+    /// completed naming the connection (announced). `SessionNotFound` when
+    /// the session isn't this workspace's or targets another app, and
+    /// `SessionNotPending` when it isn't pending at `now`; nothing is
+    /// written then, nor on any of `install_app`'s refusals.
+    #[allow(clippy::too_many_arguments)]
+    async fn install_app_through_session(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        session_id: ConnectSessionId,
+        app_id: ChannelAppId,
+        install: &NewInstall,
+        now: Timestamp,
+    ) -> Result<(ConnectSession, ChannelConnection, AgentChannel), ChannelError>;
+
+    /// A connection's current token, sealed, for the code that uses it
+    /// (revoking it at the provider when the connection is removed).
+    async fn connection_credential(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+    ) -> Result<Option<SealedVersion>, ChannelError>;
+
+    /// **Cross-tenant, by design:** a sweep over every workspace's linked
+    /// teams, like a worker's claim, settling each in its own scope. An
+    /// active manager whose tokens expired by `now` is `token_expired`
+    /// (announced): its rotation didn't happen in time. One whose tokens
+    /// expire by `due_by`, or whose expiry isn't known, gets
+    /// `rotate(manager, version)` queued, once per credential version, so
+    /// one rotation runs at a time and a refresh token is spent once. At
+    /// most `limit` of each; what it did.
+    async fn queue_due_rotations_cross_tenant(
+        &self,
+        rotate: &(dyn Fn(ChannelAppManagerId, u32) -> QueuedJob + Send + Sync),
+        due_by: Timestamp,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<RotationSweep, ChannelError>;
+
+    /// A deleted app is removed at its provider: it no longer holds its
+    /// manager back from being unlinked. Whether it changed.
+    async fn record_app_released(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        app_id: ChannelAppId,
+        now: Timestamp,
+    ) -> Result<bool, ChannelError>;
+
+    /// The provider has the app's manifest of `digest`. Whether it changed:
+    /// not for an app that isn't made or is deleted.
+    async fn record_app_synced(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        app_id: ChannelAppId,
+        digest: &str,
+    ) -> Result<bool, ChannelError>;
+
+    /// The manager's tokens of `expected_version` can't be used or rotated:
+    /// `token_expired` (announced), so someone pastes new ones. Whether it
+    /// changed: not if it isn't active, or its tokens were replaced since.
+    async fn expire_manager_tokens(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        manager_id: ChannelAppManagerId,
+        expected_version: u32,
+        now: Timestamp,
+    ) -> Result<bool, ChannelError>;
 
     // --- Connections and what they've seen -----------------------------------
 
@@ -921,6 +1025,49 @@ pub trait ChannelStore: Send + Sync {
         message_id: ChannelMessageId,
         now: Timestamp,
     ) -> Result<(), ChannelError>;
+
+    /// Whose details to read from the provider, each once, in the order
+    /// given: of `names`, the people the connection knows no name for and
+    /// hasn't asked about within [`PERSON_LOOKUP_TTL`]; of `emails`, those
+    /// whose email it hasn't read within it. The connection's people are
+    /// its cache of them.
+    ///
+    /// [`PERSON_LOOKUP_TTL`]: super::reply::PERSON_LOOKUP_TTL
+    async fn people_to_read(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        names: &[String],
+        emails: &[String],
+        now: Timestamp,
+    ) -> Result<Vec<String>, ChannelError>;
+
+    /// Saves what the provider said about people on a connection, and when
+    /// it was asked. A handle and name are kept once known, so a name a run
+    /// was sent never changes under it; an email is what it said last, as
+    /// sender lists match it. Someone not seen before is saved with whether
+    /// they're automated, or, when it knew no such person, with nothing but
+    /// the time it was asked. Never their team, which only their messages
+    /// say.
+    async fn record_people(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        connection_id: ChannelConnectionId,
+        people: &[PersonLookup],
+        now: Timestamp,
+    ) -> Result<(), ChannelError>;
+
+    /// Where a channel run's answer goes and what it says: `None` unless
+    /// the run is a channel run that ended with an answer and didn't stay
+    /// silent, and its connection and conversation are kept.
+    async fn reply_of(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+    ) -> Result<Option<ChannelReply>, ChannelError>;
 
     // --- Runs in threads -----------------------------------------------------
 

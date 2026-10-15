@@ -142,7 +142,7 @@ pub async fn authorize(State(state): State<AppState>, Path(reference): Path<Stri
         return Err(not_pending(status));
     }
     if session.target.is_some() {
-        return crate::channels::authorize_channel_session(&state, &session).await;
+        return crate::channel_install::authorize(&state, &session, &reference).await;
     }
     let (app, configuration) = still_eligible(&state, &session).await?;
     let Some(installed) = session.app else {
@@ -623,7 +623,7 @@ fn unknown_state() -> Response {
 /// Back to the hosted page, which reads the session's outcome. Neither the
 /// callback's URL (it carries the code) nor the page's (it carries the
 /// reference) is sent on as a referrer.
-fn back_to(state: &AppState, reference: &str) -> Response {
+pub(crate) fn back_to(state: &AppState, reference: &str) -> Response {
     let mut response = Redirect::to(&format!("{}/connect/{reference}", state.public_url)).into_response();
     let headers = response.headers_mut();
     headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
@@ -658,6 +658,10 @@ pub async fn callback(State(state): State<AppState>, RawQuery(query): RawQuery) 
         Ok(None) => return unknown_state(),
         Err(error) => return connect_failure(error).into_response(),
     };
+    // A channel app's install comes back here too.
+    if session.target.is_some() {
+        return crate::channel_install::callback(&state, session, authorization, &params).await;
+    }
     // Only an app's session begins an authorization.
     let Some(installed) = session.app else {
         return unknown_state();

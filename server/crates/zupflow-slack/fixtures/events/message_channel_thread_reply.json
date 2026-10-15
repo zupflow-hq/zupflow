@@ -1,0 +1,21 @@
+{
+  "token": "ZZZZZZWSxiZZZ2yIvs3peJ",
+  "team_id": "T0FAKE001",
+  "api_app_id": "A0FAKE00001",
+  "event": {
+    "type": "message",
+    "client_msg_id": "7f3c2e4a-0b6d-4c1e-9a55-2d0c8e1f3a10",
+    "user": "U0BOB0002",
+    "text": "Thanks <@UBOT00001> &amp; <@U0ALICE01|alice> :tada:",
+    "ts": "1760000160.000300",
+    "thread_ts": "1760000100.000200",
+    "parent_user_id": "U0ALICE01",
+    "team": "T0FAKE001",
+    "channel": "C0GENERAL",
+    "event_ts": "1760000160.000300",
+    "channel_type": "channel"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0REPLY0001",
+  "event_time": 1760000160
+}

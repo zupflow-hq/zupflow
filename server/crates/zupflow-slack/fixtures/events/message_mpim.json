@@ -1,0 +1,16 @@
+{
+  "team_id": "T0FAKE001",
+  "api_app_id": "A0FAKE00001",
+  "event": {
+    "type": "message",
+    "user": "U0BOB0002",
+    "text": "Both of us need this by Friday",
+    "ts": "1760000400.000100",
+    "channel": "G0GROUPDM",
+    "event_ts": "1760000400.000100",
+    "channel_type": "mpim"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0GROUPDM01",
+  "event_time": 1760000400
+}
