@@ -21,7 +21,10 @@ const FROM = "the app that sent you here";
  * their account: they aren't the developer, can't change the app's setup,
  * and only need to know whether starting again can help.
  */
-export function hostedFailure(session: Pick<ConnectSession, "app" | "target" | "failure_code">): HostedFailure {
+export function hostedFailure(
+  session: Pick<ConnectSession, "app" | "target" | "failure_code"> & Partial<Pick<ConnectSession, "label">>,
+): HostedFailure {
+  if (session.target) return channelFailure(session.target, session.label ?? null, session.failure_code);
   const app = connectSubject(session);
   const mcp = session.app?.auth_type === "mcp_oauth";
   switch (session.failure_code) {
@@ -90,6 +93,56 @@ export function hostedFailure(session: Pick<ConnectSession, "app" | "target" | "
       return {
         title: "Couldn't connect",
         body: `Nothing was connected. Start again from ${FROM}.`,
+        next: "start_again",
+      };
+  }
+}
+
+/**
+ * A channel session's failure. Linking a team changes nothing until the
+ * tokens are accepted; adding an agent leaves it out of the team until its app
+ * is allowed.
+ */
+function channelFailure(
+  target: NonNullable<ConnectSession["target"]>,
+  label: string | null,
+  code: string | null,
+): HostedFailure {
+  const provider = connectSubject({ app: null, target });
+  const linking = target.kind === "channel_app_manager";
+  const what = linking ? `your ${provider} team` : (label ?? "the agent");
+  const nothing = linking ? "No team was linked." : `${what} wasn't added to ${provider}.`;
+  switch (code) {
+    case "consent_denied":
+      return {
+        title: "The app wasn't allowed",
+        body: `${nothing} To add it, start again from ${FROM} and choose Allow on ${provider}.`,
+        next: "start_again",
+      };
+    case "app_not_eligible":
+    case "channel_app_not_ready":
+      return {
+        title: `${what} can't be added right now`,
+        body: `Its ${provider} app was removed, or its team's link needs new tokens, so nothing was added. Contact support for ${FROM}.`,
+        next: "contact",
+      };
+    case "provider_unavailable":
+      return {
+        title: `${provider} couldn't be reached`,
+        body: `${nothing} This is usually brief: wait a few minutes, then start again from ${FROM}.`,
+        next: "start_again",
+      };
+    case "authorization_failed":
+    case "token_exchange_failed":
+      return {
+        title: `${provider} didn't finish the install`,
+        body: `${nothing} Start again from ${FROM}. If it keeps happening, contact its support.`,
+        next: "start_again",
+      };
+    default:
+      return {
+        title: linking ? "Couldn't link your team" : `Couldn't add ${what}`,
+        body: `${nothing} Start again from ${FROM}.`,
         next: "start_again",
       };
   }

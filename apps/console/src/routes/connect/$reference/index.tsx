@@ -3,7 +3,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import type { ConnectSession, TokenAuthTemplate } from "@zupflow/sdk";
 import { ZupflowApiError } from "@zupflow/sdk";
 import { CheckCircle2Icon, ExternalLinkIcon, RotateCwIcon, XCircleIcon } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { EnvBadge } from "@/components/app/environment";
 import { AppIcon } from "@/components/app/misc";
 import { Button } from "@/components/ui/button";
@@ -11,9 +11,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
+import { ChannelConnectBody } from "@/features/connect/channel-connect";
 import { hostedFailure } from "@/features/connect/failure";
+import { useAfterSession } from "@/features/connect/finish";
 import { ConnectFrame, ConnectOutcome } from "@/features/connect/frame";
-import { returnUrlFor, SessionEnded } from "@/features/connect/session-ended";
+import { SessionEnded } from "@/features/connect/session-ended";
 import { connectSubject } from "@/features/connect/subject";
 import { useDocumentTitle } from "@/features/context";
 import { useHostedConnectSession } from "@/features/queries";
@@ -25,19 +27,11 @@ export const Route = createFileRoute("/connect/$reference/")({
   component: HostedConnectPage,
 });
 
-function notifyOpener(sessionId: string) {
-  try {
-    window.opener?.postMessage({ type: "zupflow.connect.finished", session_id: sessionId }, window.location.origin);
-  } catch {
-    // The opener is gone or on another origin; the embedding backend still verifies via the API.
-  }
-}
-
 function HostedConnectPage() {
   // The link's last segment is the session's reference: possession authorizes this page.
   const { reference } = Route.useParams();
   const session = useHostedConnectSession(reference);
-  useDocumentTitle(session.data?.app ? `Connect ${session.data.app.name}` : "Connect");
+  useDocumentTitle(documentTitle(session.data));
 
   // A failed re-read keeps the session it already had: it may still be pending.
   if (session.isError && !session.data) {
@@ -67,16 +61,23 @@ function HostedConnectPage() {
       </ConnectFrame>
     );
   }
-  const { app } = session.data;
+  const { app, target } = session.data;
   if (app === null) {
-    // A channel session: linking a team or installing an agent's app has no page here yet.
+    // A channel session: linking a team, or installing one agent's app.
+    if (target === null) {
+      return (
+        <ConnectFrame>
+          <ConnectOutcome
+            icon={<XCircleIcon className="size-9 text-destructive" />}
+            title="This link isn't valid"
+            body="Start again from the app that sent you here."
+          />
+        </ConnectFrame>
+      );
+    }
     return (
       <ConnectFrame>
-        <ConnectOutcome
-          icon={<XCircleIcon className="size-9 text-destructive" />}
-          title={`${connectSubject(session.data)} can't be set up on this page yet`}
-          body="Nothing was changed. Start again from the app that sent you here."
-        />
+        <ChannelConnectBody session={{ ...session.data, target }} reference={reference} />
       </ConnectFrame>
     );
   }
@@ -87,7 +88,15 @@ function HostedConnectPage() {
   );
 }
 
-/** An app's session: the only kind this page connects so far. */
+function documentTitle(session: ConnectSession | undefined): string {
+  if (!session) return "Connect";
+  if (session.app) return `Connect ${session.app.name}`;
+  if (session.target?.kind === "channel_app_manager") return `Link your ${connectSubject(session)} team`;
+  if (session.target) return `Add ${session.label} to ${connectSubject(session)}`;
+  return "Connect";
+}
+
+/** An app's session. */
 type AppConnectSession = ConnectSession & { app: NonNullable<ConnectSession["app"]> };
 
 function ConnectBody({ session, reference }: { session: AppConnectSession; reference: string }) {
@@ -95,19 +104,7 @@ function ConnectBody({ session, reference }: { session: AppConnectSession; refer
   const refresh = () => queryClient.invalidateQueries({ queryKey: qk.hostedConnect(reference) });
   const cancel = useMutation({ mutationFn: () => api.connect.cancel(reference), onSettled: refresh });
 
-  const back = returnUrlFor(session);
-  useEffect(() => {
-    if (session.status === "pending") return;
-    notifyOpener(session.id);
-    if (session.status === "completed" && back) {
-      const t = setTimeout(() => window.location.assign(back), 1200);
-      return () => clearTimeout(t);
-    }
-    if (session.status === "completed" && window.opener) {
-      const t = setTimeout(() => window.close(), 1600);
-      return () => clearTimeout(t);
-    }
-  }, [session.status, session.id, back]);
+  useAfterSession(session);
 
   if (session.status === "completed") {
     return (

@@ -4307,4 +4307,51 @@ describe("channels", () => {
     }
     expect(others()).toBe(before);
   });
+
+  it("seeds channel runs whose messages and sends link back to them, in their own workspace", async () => {
+    const workspace = sandbox();
+    const runs = (await owner.runs.list(workspace.id, { limit: 100 })).items.filter((r) => r.trigger === "channel");
+    expect(runs.map((r) => r.channel?.reason).sort()).toEqual(["direct_message", "mentioned", "thread_follow_up"]);
+    const connection = must(runs[0]?.channel, "channel").connection_id;
+    const conversations = (await owner.channelConnections.conversations(workspace.id, connection, { limit: 100 }))
+      .items;
+    const messages = (
+      await Promise.all(
+        conversations.map((c) => owner.channelConnections.messages(workspace.id, connection, c.id, { limit: 100 })),
+      )
+    ).flatMap((page) => page.items);
+    for (const run of runs) {
+      const channel = must(run.channel, "channel");
+      const origin = must(
+        messages.find((m) => m.id === channel.origin_message_id),
+        "origin message",
+      );
+      expect(origin).toMatchObject({ direction: "inbound", conversation_id: channel.conversation_id });
+      expect(run.usage.cache_read_input_tokens + run.usage.cache_write_input_tokens).toBeLessThanOrEqual(
+        run.usage.input_tokens,
+      );
+      const events = await owner.runs.events(workspace.id, run.id);
+      expect(events[1]).toMatchObject({
+        type: "channel_messages.received",
+        data: { outcome: "started", message_ids: [origin.id] },
+      });
+      const silent = events.find((e) => e.type === "run.stayed_silent");
+      expect(silent?.type === "run.stayed_silent" ? silent.data.reason : null).toBe(channel.silent_reason);
+      for (const sent of messages.filter((m) => m.run_id === run.id)) {
+        expect(sent.direction).toBe("outbound");
+        if (sent.tool_call_id === null) {
+          expect(sent.text).toBe(run.output);
+        } else {
+          expect(events.some((e) => e.type === "tool_call.started" && e.data.call_id === sent.tool_call_id)).toBe(true);
+        }
+      }
+    }
+    expect(messages.filter((m) => m.direction === "outbound").every((m) => runs.some((r) => r.id === m.run_id))).toBe(
+      true,
+    );
+    // Another workspace's runs don't name this workspace's messages.
+    const acmeRuns = (await owner.runs.list(ws("acme").id, { limit: 100 })).items.filter((r) => r.channel);
+    expect(acmeRuns.length).toBeGreaterThan(0);
+    expect(acmeRuns.some((r) => messages.some((m) => m.id === r.channel?.origin_message_id))).toBe(false);
+  });
 });

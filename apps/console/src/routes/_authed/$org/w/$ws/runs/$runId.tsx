@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { TERMINAL_RUN_STATUSES } from "@zupflow/sdk";
+import { CHANNEL_PROVIDER_NAMES, type Run, TERMINAL_RUN_STATUSES } from "@zupflow/sdk";
 import { BanIcon } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
@@ -9,9 +9,12 @@ import { PageContainer, Panel, Properties, Property, SectionHeader } from "@/com
 import { RunStatusPill } from "@/components/app/status";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { WAKE_REASON } from "@/features/channels/labels";
 import { canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { useCancelRun, useRun, useRunEvents } from "@/features/queries";
+import { type RunChannelContext, useRunChannelContext } from "@/features/runs/channel-context";
 import { RunTimeline } from "@/features/runs/timeline";
+import { InputTokens } from "@/features/runs/token-usage";
 import { useDetailCrumb } from "@/lib/crumbs";
 import { toastError } from "@/lib/errors";
 import { duration, fullDateTime, shortId } from "@/lib/format";
@@ -30,6 +33,7 @@ function RunPage() {
   const live = run.data ? !TERMINAL_RUN_STATUSES.includes(run.data.status) : true;
   const events = useRunEvents(ws.id, runId, live);
   const cancel = useCancelRun(ws.id, runId);
+  const channel = useRunChannelContext(org.id, ws.id, run.data);
   const [cancelling, setCancelling] = useState(false);
   useDetailCrumb(run.data ? `Run ${shortId(run.data.id)}` : undefined);
   useDocumentTitle(run.data ? `Run ${shortId(run.data.id)}` : "Run", ws.name);
@@ -63,8 +67,7 @@ function RunPage() {
                 >
                   {r.agent_name}
                 </Link>{" "}
-                · started <RelativeTime iso={r.created_at} /> ·{" "}
-                {r.trigger === "console" ? "from the Console" : "via the API"}
+                · started <RelativeTime iso={r.created_at} /> · {triggerLabel(r, channel)}
               </p>
             </>
           ) : (
@@ -92,7 +95,7 @@ function RunPage() {
             {events.isError ? (
               <QueryError error={events.error} onRetry={() => events.refetch()} what="events" />
             ) : r && events.data ? (
-              <RunTimeline run={r} events={events.data} />
+              <RunTimeline run={r} events={events.data} channel={channel} orgSlug={org.slug} />
             ) : (
               <div className="space-y-5">
                 {[70, 45, 85, 55].map((w) => (
@@ -134,10 +137,38 @@ function RunPage() {
                       </span>
                     ) : null}
                   </Property>
-                  <Property label="Usage" className="sm:grid-cols-1 sm:gap-1">
+                  {r.channel ? (
+                    <Property label="Channel" className="sm:grid-cols-1 sm:gap-1">
+                      <span>
+                        {WAKE_REASON[r.channel.reason]}
+                        {channel?.connection ? (
+                          <span className="text-muted-foreground">
+                            {" "}
+                            · {CHANNEL_PROVIDER_NAMES[channel.connection.provider]} @
+                            {channel.connection.identity.handle}
+                          </span>
+                        ) : null}
+                      </span>
+                      <Link
+                        to="/$org/w/$ws/channels/$connectionId"
+                        params={{ org: org.slug, ws: ws.id, connectionId: r.channel.connection_id }}
+                        search={{ conversation: r.channel.conversation_id, thread: r.channel.thread_key || undefined }}
+                        className="block text-xs text-brand-ink underline-offset-4 hover:underline"
+                      >
+                        Open {r.channel.thread_key ? "thread" : "conversation"}
+                      </Link>
+                      {r.channel.silent_reason ? (
+                        <p className="mt-1 text-xs text-muted-foreground">Stayed silent: {r.channel.silent_reason}</p>
+                      ) : null}
+                    </Property>
+                  ) : null}
+                  <Property label="Input tokens" className="sm:grid-cols-1 sm:gap-1">
+                    <InputTokens usage={r.usage} />
+                  </Property>
+                  <Property label="Output and calls" className="sm:grid-cols-1 sm:gap-1">
                     <span className="tabular">
-                      {r.usage.tool_calls} tool {r.usage.tool_calls === 1 ? "call" : "calls"} ·{" "}
-                      {r.usage.input_tokens.toLocaleString("en")} in · {r.usage.output_tokens.toLocaleString("en")} out
+                      {r.usage.output_tokens.toLocaleString("en")} out · {r.usage.tool_calls} tool{" "}
+                      {r.usage.tool_calls === 1 ? "call" : "calls"}
                     </span>
                   </Property>
                 </Properties>
@@ -174,4 +205,14 @@ function RunPage() {
       />
     </PageContainer>
   );
+}
+
+/** Where the run came from: the Console, the API, or a channel and why it woke the agent. */
+function triggerLabel(run: Run, channel: RunChannelContext | null): string {
+  if (run.trigger === "console") return "from the Console";
+  if (run.trigger === "channel") {
+    const provider = channel?.connection ? CHANNEL_PROVIDER_NAMES[channel.connection.provider] : "a channel";
+    return `from ${provider}`;
+  }
+  return "via the API";
 }

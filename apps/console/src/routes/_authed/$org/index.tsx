@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import type { Environment, Organization, OrganizationId, OrganizationSetup } from "@zupflow/sdk";
+import type { Environment, Organization, OrganizationId, OrganizationSetup, UsageReport } from "@zupflow/sdk";
 import { ArrowRightIcon, CheckIcon } from "lucide-react";
 import { ENVIRONMENT_LABEL } from "@/components/app/environment";
 import { AppIcon, QueryError, RowsSkeleton } from "@/components/app/misc";
@@ -12,6 +12,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { canAdminister, canChange, useDocumentTitle, useOrg } from "@/features/context";
 import { useEnvironment } from "@/features/environment";
 import { useOrgApps, useUsage, useWorkspacePage } from "@/features/queries";
+import { cachedPercent, inputParts } from "@/features/runs/token-usage";
 import { compact } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -171,13 +172,43 @@ function SetupChecklist({ org }: { org: Organization }) {
   );
 }
 
-function Metric({ label, value, tone }: { label: string; value: string; tone?: "danger" }) {
+function Metric({ label, value, tone, hint }: { label: string; value: string; tone?: "danger"; hint?: string }) {
   return (
     <div className="min-w-0">
       <p className="text-xs text-muted-foreground">{label}</p>
       <p className={cn("tabular mt-0.5 text-xl font-semibold tracking-tight", tone === "danger" && "text-destructive")}>
         {value}
       </p>
+      {hint ? <p className="tabular text-xs text-muted-foreground">{hint}</p> : null}
+    </div>
+  );
+}
+
+/**
+ * The period's tokens: input, with the parts the providers read from and
+ * wrote to their prompt caches, and output. A falling cached share is the
+ * first sign that prompts stopped being stable.
+ */
+function TokenMetrics({ totals }: { totals: UsageReport["totals"] | undefined }) {
+  if (!totals) {
+    return (
+      <div className="mt-5 grid grid-cols-2 gap-4 border-t pt-4 sm:grid-cols-4">
+        {[0, 1, 2, 3].map((i) => (
+          <div key={i} className="space-y-2">
+            <Skeleton className="h-3 w-20" />
+            <Skeleton className="h-6 w-14" />
+          </div>
+        ))}
+      </div>
+    );
+  }
+  const parts = inputParts(totals);
+  return (
+    <div className="mt-5 grid grid-cols-2 gap-4 border-t pt-4 sm:grid-cols-4">
+      <Metric label="Input tokens" value={compact(parts.total)} hint={`${compact(parts.fresh)} new`} />
+      <Metric label="Read from cache" value={compact(parts.cached)} hint={`${cachedPercent(totals)} of input`} />
+      <Metric label="Written to cache" value={compact(parts.written)} />
+      <Metric label="Output tokens" value={compact(totals.output_tokens)} />
     </div>
   );
 }
@@ -232,6 +263,7 @@ function EnvironmentActivity({ orgId, environment }: { orgId: OrganizationId; en
           )}
         </div>
       )}
+      {usage.isError ? null : <TokenMetrics totals={totals} />}
     </Panel>
   );
 }

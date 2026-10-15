@@ -2,16 +2,25 @@
  * Query and mutation hooks. Pages read through these; they never call the SDK
  * directly. Each hook owns its cache key and what it invalidates.
  */
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   type AcceptToolChangeInput,
   type AgentId,
   type ApiKeyId,
   type AppId,
+  type ChannelAppId,
+  type ChannelAppListQuery,
+  type ChannelAppManagerId,
+  type ChannelConnectionId,
+  type ChannelConnectionListQuery,
+  type ChannelConversationId,
+  type ChannelConversationListQuery,
+  type ChannelMessageListQuery,
   type ConnectSessionId,
   type CreateAgentInput,
   type CreateApiKeyInput,
   type CreateAppInput,
+  type CreateChannelAppManagerInput,
   type CreateConnectSessionInput,
   type CreatedApiKey,
   type CreatedWebhookEndpoint,
@@ -34,6 +43,7 @@ import {
   type ModelListQuery,
   type OrganizationId,
   type OrganizationRunListQuery,
+  type PutAgentChannelInput,
   type RunEvent,
   type RunId,
   type RunListQuery,
@@ -41,6 +51,9 @@ import {
   type UpdateAgentInput,
   type UpdateAppInput,
   type UpdateAppToolLevelsInput,
+  type UpdateChannelAppManagerInput,
+  type UpdateChannelSettingsInput,
+  type UpdateChannelToolLevelsInput,
   type UpdateConfigurationInput,
   type UpdateConnectSettingsInput,
   type UpdateGrantInput,
@@ -1024,6 +1037,257 @@ export function useResendWebhookDelivery(orgId: OrganizationId, endpointId: Webh
   return useMutation({
     mutationFn: (deliveryId: WebhookDeliveryId) => api.webhooks.resendDelivery(orgId, endpointId, deliveryId),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.webhooks(orgId) }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Channels: linked teams, each agent's generated app, connections with their
+// conversations and messages, and what each agent does on its own. Lists page
+// on the server; nothing loads every conversation or message.
+
+/** A page at a time, newest first. */
+const nextCursor = (last: { pagination: { next_cursor: string | null } }) => last.pagination.next_cursor;
+
+/** The workspace's linked teams, a page at a time. */
+export function useChannelAppManagers(wsId: WorkspaceId) {
+  return useInfiniteQuery({
+    queryKey: qk.channelAppManagers(wsId),
+    queryFn: ({ pageParam }) => api.channelAppManagers.list(wsId, { cursor: pageParam ?? undefined }),
+    initialPageParam: null as string | null,
+    getNextPageParam: nextCursor,
+  });
+}
+
+/** Linked teams by ID, each read on its own: for apps whose team isn't on a loaded page of the list. */
+export function useChannelAppManagersById(wsId: WorkspaceId, ids: ChannelAppManagerId[]) {
+  return useQueries({
+    queries: ids.map((id) => ({
+      queryKey: qk.channelAppManager(wsId, id),
+      queryFn: () => api.channelAppManagers.get(wsId, id),
+    })),
+  });
+}
+
+/** Refreshes every channel query in the workspace: teams count apps, apps name connections. */
+function useInvalidateChannels(wsId: WorkspaceId) {
+  const qc = useQueryClient();
+  return () => {
+    void qc.invalidateQueries({ queryKey: qk.channels(wsId) });
+  };
+}
+
+/**
+ * Links a team with a pasted configuration token and its refresh token. The
+ * tokens leave with the request: with `gcTime: 0` nothing keeps the
+ * mutation's variables once its dialog closes, and responses show only the
+ * last four characters.
+ */
+export function useCreateChannelAppManager(wsId: WorkspaceId) {
+  const invalidate = useInvalidateChannels(wsId);
+  return useMutation({
+    gcTime: 0,
+    mutationFn: (input: CreateChannelAppManagerInput) => api.channelAppManagers.create(wsId, input),
+    onSuccess: invalidate,
+  });
+}
+
+/** Replaces a linked team's tokens; like linking, the tokens aren't kept. */
+export function useReplaceChannelAppManagerTokens(wsId: WorkspaceId) {
+  const invalidate = useInvalidateChannels(wsId);
+  return useMutation({
+    gcTime: 0,
+    mutationFn: ({ managerId, ...input }: UpdateChannelAppManagerInput & { managerId: ChannelAppManagerId }) =>
+      api.channelAppManagers.update(wsId, managerId, input),
+    onSuccess: invalidate,
+  });
+}
+
+export function useDeleteChannelAppManager(wsId: WorkspaceId) {
+  const invalidate = useInvalidateChannels(wsId);
+  return useMutation({
+    mutationFn: (managerId: ChannelAppManagerId) => api.channelAppManagers.delete(wsId, managerId),
+    onSuccess: invalidate,
+  });
+}
+
+/** Apps still on their way to installed: read again until they settle. */
+const SETTLING = new Set(["creating", "updating", "deleting"]);
+
+/** The workspace's generated apps, filtered on the server, polled while any is being made or changed. */
+export function useChannelApps(wsId: WorkspaceId, query: Omit<ChannelAppListQuery, "cursor"> = {}, enabled = true) {
+  return useInfiniteQuery({
+    queryKey: qk.channelApps(wsId, query),
+    queryFn: ({ pageParam }) => api.channelApps.list(wsId, { ...query, cursor: pageParam ?? undefined }),
+    initialPageParam: null as string | null,
+    getNextPageParam: nextCursor,
+    enabled,
+    refetchInterval: (q) =>
+      q.state.data?.pages.some((page) => page.items.some((app) => SETTLING.has(app.status))) ? 2000 : false,
+  });
+}
+
+/** Makes an agent's app in a linked team: it answers `creating`, and a job makes it with the provider. */
+export function useCreateChannelApp(wsId: WorkspaceId) {
+  const invalidate = useInvalidateChannels(wsId);
+  return useMutation({
+    mutationFn: ({ agentId, managerId }: { agentId: AgentId; managerId: ChannelAppManagerId }) =>
+      api.channelApps.create(wsId, { agent_id: agentId, manager_id: managerId }),
+    onSuccess: invalidate,
+  });
+}
+
+/** Removes an agent's app: the provider's app is deleted and its connection disconnected. */
+export function useDeleteChannelApp(wsId: WorkspaceId) {
+  const invalidate = useInvalidateChannels(wsId);
+  return useMutation({
+    mutationFn: (appId: ChannelAppId) => api.channelApps.delete(wsId, appId),
+    onSuccess: invalidate,
+  });
+}
+
+export function useChannelConnections(wsId: WorkspaceId, query: Omit<ChannelConnectionListQuery, "cursor"> = {}) {
+  return useInfiniteQuery({
+    queryKey: qk.channelConnections(wsId, query),
+    queryFn: ({ pageParam }) => api.channelConnections.list(wsId, { ...query, cursor: pageParam ?? undefined }),
+    initialPageParam: null as string | null,
+    getNextPageParam: nextCursor,
+  });
+}
+
+/** One connection, or nothing while there's no ID (a run that isn't a channel run, say). */
+export function useChannelConnection(wsId: WorkspaceId, id: ChannelConnectionId | null | undefined) {
+  return useQuery({
+    queryKey: qk.channelConnection(wsId, id ?? "none"),
+    queryFn: () => api.channelConnections.get(wsId, required(id)),
+    enabled: Boolean(id),
+  });
+}
+
+/** A connection's conversations, most recent first, searched by name on the server, a page at a time. */
+export function useChannelConversations(
+  wsId: WorkspaceId,
+  connectionId: ChannelConnectionId,
+  query: Omit<ChannelConversationListQuery, "cursor">,
+  enabled = true,
+) {
+  return useInfiniteQuery({
+    queryKey: qk.channelConversations(wsId, connectionId, query),
+    queryFn: ({ pageParam }) =>
+      api.channelConnections.conversations(wsId, connectionId, { ...query, cursor: pageParam ?? undefined }),
+    initialPageParam: null as string | null,
+    getNextPageParam: nextCursor,
+    placeholderData: (previous) => previous,
+    enabled,
+  });
+}
+
+/** How many pages of 100 a lookup reads before it gives up: never every conversation. */
+const CONVERSATION_LOOKUP_PAGES = 5;
+
+/**
+ * One conversation by ID, for a link to one the loaded list doesn't hold.
+ * There's no endpoint for one, so this reads the list, most recent first,
+ * until it's found, for at most a few pages; null when it isn't there.
+ */
+export function useChannelConversationLookup(
+  wsId: WorkspaceId,
+  connectionId: ChannelConnectionId,
+  conversationId: ChannelConversationId | undefined,
+  enabled: boolean,
+) {
+  return useQuery({
+    queryKey: qk.channelConversationLookup(wsId, connectionId, conversationId ?? "none"),
+    queryFn: async () => {
+      let cursor: string | undefined;
+      for (let page = 0; page < CONVERSATION_LOOKUP_PAGES; page++) {
+        const found = await api.channelConnections.conversations(wsId, connectionId, { limit: 100, cursor });
+        const hit = found.items.find((c) => c.id === conversationId);
+        if (hit) return hit;
+        if (!found.pagination.next_cursor) return null;
+        cursor = found.pagination.next_cursor;
+      }
+      return null;
+    },
+    enabled: enabled && Boolean(conversationId),
+  });
+}
+
+/** A conversation's messages, newest first, or one thread's with `thread`, a page at a time. */
+export function useChannelMessages(
+  wsId: WorkspaceId,
+  connectionId: ChannelConnectionId | null | undefined,
+  conversationId: ChannelConversationId | null | undefined,
+  query: Omit<ChannelMessageListQuery, "cursor"> = {},
+) {
+  return useInfiniteQuery({
+    queryKey: qk.channelMessages(wsId, connectionId ?? "none", conversationId ?? "none", query),
+    queryFn: ({ pageParam }) =>
+      api.channelConnections.messages(wsId, required(connectionId), required(conversationId), {
+        ...query,
+        cursor: pageParam ?? undefined,
+      }),
+    initialPageParam: null as string | null,
+    getNextPageParam: nextCursor,
+    enabled: Boolean(connectionId && conversationId),
+  });
+}
+
+/** What the agent does on each of its own connections. */
+export function useAgentChannels(wsId: WorkspaceId, agentId: AgentId) {
+  return useQuery({
+    queryKey: qk.agentChannels(wsId, agentId),
+    queryFn: () => api.agentChannels.list(wsId, agentId),
+  });
+}
+
+/** Replaces every setting of the agent's channel on one connection. */
+export function usePutAgentChannel(wsId: WorkspaceId, agentId: AgentId) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ connectionId, ...input }: PutAgentChannelInput & { connectionId: ChannelConnectionId }) =>
+      api.agentChannels.put(wsId, agentId, connectionId, input),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.agentChannels(wsId, agentId) }),
+  });
+}
+
+/** Stops the agent answering on a connection; the connection stays. */
+export function useDeleteAgentChannel(wsId: WorkspaceId, agentId: AgentId) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (connectionId: ChannelConnectionId) => api.agentChannels.delete(wsId, agentId, connectionId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.agentChannels(wsId, agentId) }),
+  });
+}
+
+/** The organization's level for every channel tool, by provider. */
+export function useChannelToolLevels(orgId: OrganizationId) {
+  return useQuery({
+    queryKey: qk.channelToolLevels(orgId),
+    queryFn: () => api.channelSettings.toolLevels(orgId),
+  });
+}
+
+export function useSetChannelToolLevels(orgId: OrganizationId) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: UpdateChannelToolLevelsInput) => api.channelSettings.setToolLevels(orgId, input),
+    onSuccess: (levels) => qc.setQueryData(qk.channelToolLevels(orgId), levels),
+  });
+}
+
+/** The organization's conversation breaker and message retention. */
+export function useChannelSettings(orgId: OrganizationId) {
+  return useQuery({
+    queryKey: qk.channelSettings(orgId),
+    queryFn: () => api.channelSettings.get(orgId),
+  });
+}
+
+export function useUpdateChannelSettings(orgId: OrganizationId) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: UpdateChannelSettingsInput) => api.channelSettings.update(orgId, input),
+    onSuccess: (settings) => qc.setQueryData(qk.channelSettings(orgId), settings),
   });
 }
 

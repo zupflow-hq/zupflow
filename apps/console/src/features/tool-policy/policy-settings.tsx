@@ -26,7 +26,7 @@ export function ToolPolicySettings({ org }: { org: Organization }) {
     <section>
       <SectionHeader
         title="Tool approvals"
-        description="Applies to every workspace. Set each tool's level on its app's page."
+        description="Applies to every workspace. Set each app tool's level on its app's page, and channel tools' below."
       />
       <Panel>
         {policy.isPending ? (

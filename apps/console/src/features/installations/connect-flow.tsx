@@ -31,6 +31,12 @@ const FAILURE_COPY: Record<string, string> = {
 
 /** Why a session failed, in words that fit how its app signs in. */
 function failureCopy(session: ConnectSession, code: string): string {
+  if (session.target && code === "consent_denied") {
+    return `The app wasn't allowed on ${connectSubject(session)}'s screen. Nothing was added. Start again and choose Allow.`;
+  }
+  if (session.target && code === "app_not_eligible") {
+    return "This agent's app was removed, or its team's link needs new tokens. Check the team on the Channels page.";
+  }
   if (code === "token_exchange_failed" && session.app?.auth_type === "mcp_oauth") {
     return "The app's server didn't accept the sign-in. Start again; if it keeps failing, ask the server's owner to check its sign-in.";
   }
@@ -149,7 +155,7 @@ export function ConnectProgress({
       <div className="flex flex-col items-center gap-4 py-8 text-center">
         <Spinner className="size-6 text-brand-ink" />
         <div className="space-y-1">
-          <p className="font-medium">Waiting for authorization</p>
+          <p className="font-medium">{s?.target ? `Waiting for ${connectSubject(s)}` : "Waiting for authorization"}</p>
           <p className="max-w-sm text-sm text-muted-foreground">
             Finish connecting in the Connect window. This updates when the API confirms the result.
           </p>
@@ -172,10 +178,16 @@ export function ConnectProgress({
         <CheckCircle2Icon className="size-8 text-success" />
         <div className="space-y-1">
           <p className="font-medium">
-            {connectSubject(s)} · {s.label} {s.intent === "reconnect" ? "reconnected" : "connected"}
+            {s.target?.kind === "channel_app_manager"
+              ? `${connectSubject(s)} team linked`
+              : s.target
+                ? `${s.label} added to ${connectSubject(s)}`
+                : `${connectSubject(s)} · ${s.label} ${s.intent === "reconnect" ? "reconnected" : "connected"}`}
           </p>
           {s.target === null ? (
             <p className="text-sm text-muted-foreground">Agents still need a grant before they can use it.</p>
+          ) : s.target.kind === "channel_app" ? (
+            <p className="text-sm text-muted-foreground">It answers in the team as its settings allow.</p>
           ) : null}
         </div>
         <Button onClick={() => onDone(s)}>{doneLabel}</Button>

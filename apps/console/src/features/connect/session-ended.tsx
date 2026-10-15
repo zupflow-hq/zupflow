@@ -22,7 +22,8 @@ export function SessionEnded({
   session,
   canClose = false,
 }: {
-  session: Pick<ConnectSession, "id" | "app" | "target" | "status" | "failure_code" | "return_url">;
+  session: Pick<ConnectSession, "id" | "app" | "target" | "status" | "failure_code" | "return_url"> &
+    Partial<Pick<ConnectSession, "label">>;
   /** Whether this window was opened by another, so closing it returns the person there. */
   canClose?: boolean;
 }) {
