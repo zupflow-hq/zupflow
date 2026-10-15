@@ -12,6 +12,7 @@ pub mod audit;
 pub mod auth;
 pub mod auth_templates;
 pub mod bootstrap;
+pub mod channel_inbound;
 pub mod channels;
 pub mod config;
 pub mod connect;
@@ -48,7 +49,7 @@ pub use guard::RequestGuard;
 /// The contract's operations this server serves so far, by `operationId`. The
 /// shared contract suite skips, by name, any case that needs another one; a
 /// test holds this list equal to the routes the router actually answers.
-pub const SERVED_OPERATIONS: [&str; 119] = [
+pub const SERVED_OPERATIONS: [&str; 120] = [
     "getSignInSettings",
     "getViewer",
     "listInvitations",
@@ -168,6 +169,7 @@ pub const SERVED_OPERATIONS: [&str; 119] = [
     "updateChannelToolLevels",
     "getChannelSettings",
     "updateChannelSettings",
+    "receiveChannelEvent",
 ];
 
 /// The whole HTTP surface. Every response under `/v1` is the envelope; the
@@ -189,6 +191,7 @@ pub fn app(state: AppState, guard: RequestGuard) -> Router {
         .merge(connect_page::routes())
         .merge(agents::routes())
         .merge(channels::routes())
+        .merge(channel_inbound::routes())
         .merge(tool_policy::routes())
         .merge(runs::routes())
         .merge(webhooks::routes())

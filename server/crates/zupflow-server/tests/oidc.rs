@@ -84,6 +84,7 @@ async fn setup() -> Setup {
         model_catalog: Arc::new(zupflow_basic::no_providers::NoProviders),
         connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
         channels: Arc::new(zupflow_sqlite::SqliteChannelStore::new(database.clone())),
+        channel_provider: std::sync::Arc::new(zupflow_channels::fake::FakeChannelProvider),
         channel_provisioner: Arc::new(zupflow_basic::scripted_channel_provisioner::NoChannelProvisioner),
         jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
         tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),

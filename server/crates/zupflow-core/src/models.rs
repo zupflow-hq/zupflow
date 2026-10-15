@@ -40,7 +40,7 @@ pub struct ToolSpec {
 }
 
 /// A tool call a model asked for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelToolCall {
     /// The model's own ID for the call, unique in the conversation: what a
     /// tool result answers. Opaque; never shown in the API.
@@ -50,8 +50,10 @@ pub struct ModelToolCall {
     pub arguments: serde_json::Map<String, serde_json::Value>,
 }
 
-/// One message of a conversation with a model.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One message of a conversation with a model. Kept as JSON once a channel
+/// run ends (its transcript), and read back exactly as it was.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
 pub enum Message {
     /// What the run was started with.
     User { text: String },

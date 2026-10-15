@@ -11,18 +11,28 @@ use zupflow_core::error::ApiError;
 
 use crate::http::Failure;
 
-/// The largest body any route here reads.
-const MAX_BODY_BYTES: usize = 64 << 10;
+/// The largest body a route reads, unless it says otherwise.
+pub const MAX_BODY_BYTES: usize = 64 << 10;
+
+/// The largest delivery a channel provider's event may be: Slack's events
+/// can carry far more than an API request (a long message with its blocks
+/// and attachments).
+pub const MAX_PROVIDER_EVENT_BYTES: usize = 1 << 20;
 
 /// A request body, read but not yet interpreted: routes check the caller and
 /// the role first, then ask for the JSON object, so a refused caller gets
-/// `403` before any complaint about what they sent.
-pub struct Body {
+/// `403` before any complaint about what they sent. Read up to `LIMIT`
+/// bytes, and refused past it.
+pub struct Body<const LIMIT: usize = MAX_BODY_BYTES> {
     json: bool,
     bytes: Bytes,
 }
 
-impl<S: Send + Sync> FromRequest<S> for Body {
+/// A channel provider's delivery, read up to [`MAX_PROVIDER_EVENT_BYTES`]:
+/// for the inbound endpoint only.
+pub type ProviderEventBody = Body<MAX_PROVIDER_EVENT_BYTES>;
+
+impl<S: Send + Sync, const LIMIT: usize> FromRequest<S> for Body<LIMIT> {
     type Rejection = Failure;
 
     async fn from_request(request: Request, _state: &S) -> Result<Self, Self::Rejection> {
@@ -32,14 +42,21 @@ impl<S: Send + Sync> FromRequest<S> for Body {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
             .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"));
-        let bytes = axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES)
+        let bytes = axum::body::to_bytes(request.into_body(), LIMIT)
             .await
             .map_err(|_| ApiError::new(413, "body_too_large", "The request body is too large."))?;
         Ok(Self { json, bytes })
     }
 }
 
-impl Body {
+impl<const LIMIT: usize> Body<LIMIT> {
+    /// The body exactly as sent, for a route whose caller signed these
+    /// bytes (a channel provider's delivery): read only to check that
+    /// signature, and interpreted only after it's accepted.
+    pub fn raw(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// The body as a JSON object. JSON only, so a cross-site form or
     /// `text/plain` post can't carry a body without the browser asking first
     /// (a CORS preflight).

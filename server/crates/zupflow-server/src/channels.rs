@@ -17,9 +17,10 @@
 //! seals its secrets. Tokens and secrets are sealed under their own
 //! [`EncryptionContext`] and never shown, logged or put in a job.
 //!
-//! Not served yet: the provider's inbound endpoint, the consent callback that
-//! installs an app, token rotation, and the provider calls that update or
-//! delete an app (phase 4).
+//! The provider's inbound endpoint and the job that answers a new message
+//! are [`crate::channel_inbound`]'s; this worker takes that job too. Not
+//! served yet: the consent callback that installs an app, token rotation,
+//! and the provider calls that update or delete an app.
 
 use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
@@ -2844,7 +2845,9 @@ pub async fn reap_once(state: &AppState) -> u32 {
     }
 }
 
-/// Makes apps until the process stops, and sweeps for stranded ones.
+/// Makes apps until the process stops, and sweeps for stranded apps. New
+/// messages have their own worker ([`crate::channel_inbound::run_worker`]),
+/// so a slow provider never holds them up.
 pub async fn run_worker(state: AppState) {
     let mut next_sweep = tokio::time::Instant::now();
     loop {

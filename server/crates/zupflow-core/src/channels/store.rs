@@ -34,6 +34,8 @@
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use super::handling::DispatchReason;
+use super::provider::InboundEvent;
 use super::{
     AgentChannel, AgentChannelSettings, BreakerSettings, ChannelApp, ChannelAppManager, ChannelConnection,
     ChannelConversation, ChannelMessage, ChannelProviderKind, ChannelSettings, ChannelToolLevel, ConnectionTeam,
@@ -46,8 +48,11 @@ use crate::ids::{
     ChannelMessageId, ConnectSessionId, MemberId, OrganizationId, RunId, SessionId, ToolCallId, UserId, WorkspaceId,
 };
 use crate::keys::Sealed;
+use crate::model_store::RunModel;
 use crate::policy::ToolLevel;
 use crate::runs::QueuedJob;
+use crate::runs::names::Offer;
+use crate::runs::transition::Steer;
 use crate::time::Timestamp;
 use crate::workspaces::Page;
 
@@ -66,6 +71,39 @@ pub enum ChannelEditor {
 /// Internal: never shown, so no prefix and not in the ID registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChannelSessionKey(Uuid);
+
+/// What the handler decided for one agent on one message. Internal, like a
+/// session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChannelDispatchKey(Uuid);
+
+/// Internal keys serialize as their UUID, for transition digests only.
+macro_rules! serialize_as_uuid {
+    ($($key:ty),*) => {$(
+        impl serde::Serialize for $key {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_str(&self.0)
+            }
+        }
+    )*};
+}
+
+serialize_as_uuid!(ChannelSessionKey, ChannelDispatchKey);
+
+impl ChannelDispatchKey {
+    pub fn generate() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    /// For row mapping only.
+    pub fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+
+    pub fn uuid(&self) -> Uuid {
+        self.0
+    }
+}
 
 impl ChannelSessionKey {
     pub fn generate() -> Self {
@@ -210,6 +248,8 @@ pub struct NewPerson {
     pub display_name: Option<String>,
     pub email: Option<String>,
     pub is_automated: bool,
+    /// The team they belong to, when the provider says.
+    pub team_id: Option<String>,
 }
 
 /// A message to record, once per conversation and external ID.
@@ -258,11 +298,117 @@ pub struct ChannelSession {
     pub agent_channel_id: AgentChannelId,
     pub conversation_id: ChannelConversationId,
     pub thread_key: String,
-    /// The runs' `session_id`.
+    /// The runs' `session_id`: a new one when what's fixed for the session
+    /// changes.
     pub session_id: SessionId,
     /// Set while a run is queued or running: one at a time.
     pub active_run_id: Option<RunId>,
     pub last_run_id: Option<RunId>,
+    /// The runs it started, across its session IDs.
+    pub run_count: u32,
+}
+
+/// A delivery to an app, verified and read by its provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewDelivery {
+    pub provider_event_id: String,
+    pub kind: String,
+    /// `None` when the event names no team: never read as the connection's.
+    pub team_id: Option<String>,
+    pub event: InboundEvent,
+}
+
+/// What came of a delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    /// The provider's event was recorded before.
+    Duplicate,
+    /// Recorded, with nothing to do: no live connection, another team's
+    /// event, a connection that isn't connected, or an event Zupflow
+    /// doesn't act on.
+    Ignored,
+    /// The connection needs reconnecting.
+    Uninstalled,
+    /// A message, saved; `new` when this delivery saved it (and queued its
+    /// inbound job).
+    Message {
+        connection_id: ChannelConnectionId,
+        message_id: ChannelMessageId,
+        new: bool,
+    },
+}
+
+/// What the inbound job decides from, read in the message's scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundContext {
+    pub message: ChannelMessage,
+    /// The job handled it before.
+    pub handled: bool,
+    pub connection: ChannelConnection,
+    pub conversation: ChannelConversation,
+    /// The author's provider ID, email and team, as the connection knows
+    /// them.
+    pub author_external_id: Option<String>,
+    pub author_email: Option<String>,
+    pub author_team_id: Option<String>,
+    /// The agent channel on the connection: at most one, its app's agent.
+    pub channel: Option<AgentChannel>,
+    /// Whether that channel's agent is active.
+    pub agent_active: bool,
+    /// When the author is another agent of the workspace, posting through
+    /// its own connection to the same team: its channel, and the hops that
+    /// led to this message, as its connection recorded sending it. `None`
+    /// until that send is recorded (the message can arrive here first):
+    /// never read as no hops.
+    pub author_agent: Option<(AgentChannelId, Option<u32>)>,
+    /// The agent most recently woken by a DM or a mention in this thread,
+    /// across the workspace's agents in the team.
+    pub last_addressed: Option<AgentChannelId>,
+    /// The channel's session in this thread, when it has one.
+    pub in_thread: Option<ChannelSessionKey>,
+}
+
+/// One agent the handler proposed for a message, to record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewDispatch {
+    pub message_id: ChannelMessageId,
+    pub agent_channel_id: AgentChannelId,
+    /// [`super::thread::origin_keys`].
+    pub origin_key: String,
+    pub thread_origin_key: String,
+    pub agent_hop: u32,
+    pub handler: HandlerKind,
+    pub reason: DispatchReason,
+}
+
+/// What a session's runs are fixed with: the model, the instructions with
+/// the channel preface, the tools, and the history budget in tokens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionTemplate {
+    pub model: RunModel,
+    pub instructions: String,
+    pub offer: Offer,
+    pub history_budget: u64,
+}
+
+/// What came of a dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchOutcome {
+    /// Recorded before, for this agent and message.
+    Duplicate,
+    /// Not recorded: the agent isn't active, or its connection isn't
+    /// connected, any more.
+    Inactive,
+    /// The session read the message in an earlier turn, which answered it:
+    /// recorded as read, and nothing starts.
+    AlreadyRead,
+    /// Agents are paused in the conversation until then; `tripped` when
+    /// this dispatch went over the breaker.
+    Paused { until: Timestamp, tripped: bool },
+    /// Waiting for the session's run.
+    Waiting,
+    /// Started this run.
+    Started { run_id: RunId },
 }
 
 /// What the conversation breaker made of one more run.
@@ -739,50 +885,93 @@ pub trait ChannelStore: Send + Sync {
         audit: &Audit<'_, AgentChannel>,
     ) -> Result<(), ChannelError>;
 
+    // --- Inbound -------------------------------------------------------------
+
+    /// Records a verified delivery to an app, in one transaction: the
+    /// provider's event once per app (`Duplicate` after), then, through the
+    /// app's live connection and only when the event names its team
+    /// (`Ignored` otherwise), its time; an uninstall needs the connection
+    /// reconnected (announced); a message on a connected connection is saved
+    /// with its conversation and author, once ([`Self::record_message`]'s
+    /// rules), and a new one queues its inbound job
+    /// ([`super::handling::inbound_job`]) in the same transaction.
+    async fn record_delivery(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        app_id: ChannelAppId,
+        delivery: &NewDelivery,
+        now: Timestamp,
+    ) -> Result<DeliveryOutcome, ChannelError>;
+
+    /// What the inbound job reads to decide who answers a message: `None`
+    /// when it's gone.
+    async fn inbound_context(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        message_id: ChannelMessageId,
+    ) -> Result<Option<InboundContext>, ChannelError>;
+
+    /// Marks a message handled: the inbound job is done with it.
+    async fn mark_handled(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        message_id: ChannelMessageId,
+        now: Timestamp,
+    ) -> Result<(), ChannelError>;
+
     // --- Runs in threads -----------------------------------------------------
 
-    /// The agent channel's session in a thread, made on first use.
-    async fn open_session(
+    /// One dispatch, in one transaction: recorded once per agent and
+    /// message's origin (`Duplicate` after); nothing while the agent isn't
+    /// active or its connection isn't connected (`Inactive`); `Paused` while
+    /// the conversation is; then in the agent's session in the thread, made
+    /// on first use: read already when an earlier turn of its run session
+    /// included the message (`AlreadyRead`), or it starts a run when the
+    /// session is idle (taking every message waiting there, up to
+    /// [`super::thread::MAX_TAKEN`]) or waits for the session's run. Each
+    /// run that starts, here or when the session's run ends, counts against
+    /// the conversation's breaker in the transaction that starts it; the one
+    /// that goes over it starts nothing, and pauses what waited (`Paused`,
+    /// with `tripped`, announced).
+    ///
+    /// `template` is what the session's runs are fixed with, read now: a
+    /// session that has none takes it, and an idle one whose own differs
+    /// starts a new run session with it, its history starting over. `None`
+    /// starts a run with the session's own, and leaves the dispatch waiting
+    /// when it has none.
+    async fn dispatch(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        dispatch: &NewDispatch,
+        template: Option<&SessionTemplate>,
+        now: Timestamp,
+    ) -> Result<DispatchOutcome, ChannelError>;
+
+    /// The thread messages waiting for the run in its session, as one
+    /// steered turn: up to [`super::thread::MAX_TAKEN`], oldest first, when
+    /// the run is its session's active run, its agent channel steers, and
+    /// any wait. Reads only: the run's next model attempt takes them, each
+    /// only while it still waits.
+    async fn steerable(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+    ) -> Result<Option<Steer>, ChannelError>;
+
+    /// The agent channel's session in a thread, if it has one.
+    async fn find_session(
         &self,
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         agent_channel_id: AgentChannelId,
         conversation_id: ChannelConversationId,
         thread_key: &str,
-        now: Timestamp,
-    ) -> Result<ChannelSession, ChannelError>;
-
-    /// Makes `run_id` the session's active run if it has none: `false` when
-    /// another run holds it, so concurrent starts begin one run.
-    async fn claim_session_run(
-        &self,
-        organization_id: OrganizationId,
-        workspace_id: WorkspaceId,
-        session: ChannelSessionKey,
-        run_id: RunId,
-        now: Timestamp,
-    ) -> Result<bool, ChannelError>;
-
-    /// Frees the session when `run_id` holds it, keeping it as the last run.
-    async fn release_session_run(
-        &self,
-        organization_id: OrganizationId,
-        workspace_id: WorkspaceId,
-        session: ChannelSessionKey,
-        run_id: RunId,
-        now: Timestamp,
-    ) -> Result<bool, ChannelError>;
-
-    /// Counts one more run in the conversation against the organization's
-    /// breaker, as one: a run over `breaker_runs` within the window pauses
-    /// agents there for `breaker_pause_minutes` (announced).
-    async fn count_breaker_run(
-        &self,
-        organization_id: OrganizationId,
-        workspace_id: WorkspaceId,
-        conversation_id: ChannelConversationId,
-        now: Timestamp,
-    ) -> Result<BreakerOutcome, ChannelError>;
+    ) -> Result<Option<ChannelSession>, ChannelError>;
 
     // --- The organization's levels and settings -------------------------------
 

@@ -55,6 +55,8 @@ pub struct AppState {
     pub channels: Arc<dyn zupflow_core::channels::store::ChannelStore>,
     /// Makes, changes and deletes agents' apps in linked teams.
     pub channel_provisioner: Arc<dyn zupflow_core::channels::provision::AppProvisioner>,
+    /// Checks and reads what a provider delivers to an app's inbound endpoint.
+    pub channel_provider: Arc<dyn zupflow_core::channels::provider::ChannelProvider>,
     /// Seals the secrets Zupflow holds (decision 0033).
     pub keys: Arc<dyn KeyService>,
     /// Background work: tool discovery and runs.

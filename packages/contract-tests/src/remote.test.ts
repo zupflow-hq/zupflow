@@ -14,6 +14,11 @@
  * serves (comma-separated `operationId`s); a case that needs another is
  * skipped and names it.
  *
+ * `ZUPFLOW_CONTRACT_CHANNEL_APP_SECRETS_COMMAND`, optional, is a shell
+ * command that prints what the channel provider holds for the app whose ID
+ * replaces `{app}`, as JSON (`inbound_ref`, `signing_secret`); without it,
+ * cases that deliver provider events are skipped.
+ *
  * Without `ZUPFLOW_CONTRACT_URL` the suite is skipped; the mock runs it
  * in-process from the Console's tests. With it, every other variable but
  * `ZUPFLOW_CONTRACT_OPERATIONS` is required.
@@ -41,9 +46,16 @@ if (url) {
   const operations = process.env.ZUPFLOW_CONTRACT_OPERATIONS?.split(",")
     .map((id) => id.trim())
     .filter((id) => id !== "");
+  const secretsCommand = process.env.ZUPFLOW_CONTRACT_CHANNEL_APP_SECRETS_COMMAND;
   contractSuite({
     baseUrl: url,
     operations,
+    channelAppSecrets: secretsCommand
+      ? async (app) => {
+          if (!/^chapp_[0-9A-Za-z]+$/.test(app)) throw new Error(`not a channel app ID: ${app}`);
+          return JSON.parse(execSync(secretsCommand.replaceAll("{app}", app), { encoding: "utf8" }));
+        }
+      : undefined,
     token: async (persona) => tokens[persona],
     reset: async () => {
       execSync(reset, { stdio: "inherit" });

@@ -153,6 +153,7 @@ fn fresh() -> Snapshot {
         turns: Vec::new(),
         calls: Vec::new(),
         model_attempts: Vec::new(),
+        session: None,
     }
 }
 
@@ -171,7 +172,7 @@ fn running(continuation: Continuation) -> Snapshot {
 /// Turn 0 prepared as attempt 1, awaiting its answer.
 fn awaiting_model() -> Snapshot {
     let mut snapshot = running(Continuation::AwaitModel { turn: 0, attempt: 1 });
-    let digest = model_request(&snapshot, 0, 1, None, &offer())
+    let digest = model_request(&snapshot, 0, 1, None, &offer(), None)
         .expect("a request")
         .digest();
     snapshot.model_attempts.push(ModelAttempt {
@@ -220,7 +221,7 @@ fn record(n: u128, position: u32, name: &str, state: CallState) -> CallRecord {
 fn with_calls(continuation: Continuation, calls: Vec<CallRecord>) -> Snapshot {
     let mut snapshot = running(continuation);
     snapshot.turns.push(CommittedTurn { turn: 0, text: None });
-    let digest = model_request(&fresh(), 0, 1, None, &offer())
+    let digest = model_request(&fresh(), 0, 1, None, &offer(), None)
         .expect("a request")
         .digest();
     snapshot.model_attempts.push(ModelAttempt {
@@ -601,6 +602,7 @@ fn need_model_prepares_an_attempt_with_the_offer_frozen() {
             request_digest: request.digest(),
             offer: offer(),
             key_version: Some(3),
+            steer: None,
         })
     );
     assert_eq!(guards(&plan), keeps(1));
@@ -1042,7 +1044,7 @@ fn only_the_frozen_offer_names_tools() {
     let mut snapshot = awaiting_model();
     let frozen = build_offer([candidate(work(), "k7m2qd", "Work", "list_tasks")]).offer;
     snapshot.model_attempts[0].offer = frozen.clone();
-    snapshot.model_attempts[0].request_digest = model_request(&snapshot, 0, 1, None, &frozen)
+    snapshot.model_attempts[0].request_digest = model_request(&snapshot, 0, 1, None, &frozen, None)
         .expect("a request")
         .digest();
     let facts = Facts {
@@ -1989,6 +1991,7 @@ fn admit_starts_every_run_the_same_way() {
             provider_model_id: "model-a".to_owned(),
         },
         instructions: "Be brief.".to_owned(),
+        channel: None,
     };
     let request = admit(organization(), workspace(), run_id(), &run);
     assert_eq!(request, admit(organization(), workspace(), run_id(), &run));
@@ -2396,6 +2399,7 @@ fn every_operation_says_where_it_leaves_the_run() {
                 request_digest: Sha256Digest::of(b""),
                 offer: Offer::default(),
                 key_version: None,
+                steer: None,
             }),
             RunStatus::Queued,
             Continuation::AwaitModel { turn: 1, attempt: 2 },
@@ -3410,7 +3414,7 @@ fn long_floats_in_a_frozen_offer_survive_storage() {
     long.input_schema = schema;
     let frozen = build_offer([long]).offer;
     let mut snapshot = running(Continuation::AwaitModel { turn: 0, attempt: 1 });
-    let digest = model_request(&snapshot, 0, 1, None, &frozen)
+    let digest = model_request(&snapshot, 0, 1, None, &frozen, None)
         .expect("a request")
         .digest();
     // The store keeps the offer as JSON and reads it back.
@@ -3432,4 +3436,147 @@ fn long_floats_in_a_frozen_offer_survive_storage() {
         matches!(operation(&planned(&snapshot, &facts)), Operation::CommitTurn(_)),
         "the request's digest still matches"
     );
+}
+
+/// A channel run in a session: two earlier messages of history, the
+/// session's own offer, and no tools of its own read.
+fn in_session() -> Snapshot {
+    let mut snapshot = running(Continuation::NeedModel { turn: 0 });
+    snapshot.input = "[Ana] and now?".to_owned();
+    snapshot.session = Some(crate::runs::state::SessionContext {
+        history: vec![
+            Message::User {
+                text: "[Ana] hello".to_owned(),
+            },
+            Message::Assistant {
+                text: Some("Hi.".to_owned()),
+                tool_calls: Vec::new(),
+            },
+        ],
+        offer: offer(),
+        steers: Vec::new(),
+    });
+    snapshot
+}
+
+fn steer(text: &str) -> crate::runs::transition::Steer {
+    crate::runs::transition::Steer {
+        text: text.to_owned(),
+        dispatches: vec![crate::channels::store::ChannelDispatchKey::from_uuid(Uuid::from_u128(
+            70,
+        ))],
+        message_ids: vec![crate::ids::ChannelMessageId::from_uuid(Uuid::from_u128(71))],
+        seen: crate::runs::transition::SeenMessage {
+            id: crate::ids::ChannelMessageId::from_uuid(Uuid::from_u128(71)),
+            at: at(0),
+        },
+    }
+}
+
+fn user(text: &str) -> Message {
+    Message::User { text: text.to_owned() }
+}
+
+#[test]
+fn a_channel_run_continues_its_session_with_the_sessions_tools() {
+    let snapshot = in_session();
+    // The session's tools: none read for the run.
+    let facts = Facts {
+        offer: None,
+        ..claimed()
+    };
+    let plan = planned(&snapshot, &facts);
+    let Io::CallModel(request) = plan.io() else {
+        panic!("calls the model");
+    };
+    assert_eq!(
+        request.messages[..2],
+        in_session().session.expect("a session").history[..]
+    );
+    assert_eq!(request.messages[2], user("[Ana] and now?"));
+    assert_eq!(request.tools.len(), 3);
+}
+
+#[test]
+fn a_steer_joins_only_a_turns_first_attempt_and_is_resent_as_stored() {
+    let mut snapshot = in_session();
+    snapshot.turns.push(CommittedTurn {
+        turn: 0,
+        text: Some("Looking.".to_owned()),
+    });
+    snapshot.calls.push(CallRecord {
+        outcome: Some(CallOutcome {
+            content: "{}".to_owned(),
+            is_error: false,
+        }),
+        ..record(1, 0, WORK_LIST, CallState::Completed)
+    });
+    snapshot.control.continuation = Continuation::NeedModel { turn: 1 };
+    let joined = steer("New in the thread while you worked:\n[Bo] also this");
+    let facts = Facts {
+        steer: Some(joined.clone()),
+        ..claimed()
+    };
+    let plan = planned(&snapshot, &facts);
+    let Io::CallModel(request) = plan.io() else {
+        panic!("calls the model");
+    };
+    let Operation::PrepareModel(prepared) = operation(&plan) else {
+        panic!("prepares");
+    };
+    assert_eq!(prepared.steer.as_ref(), Some(&joined));
+    assert_eq!(request.messages.len(), 6, "{:?}", request.messages);
+    assert!(matches!(request.messages[4], Message::ToolResult { .. }));
+    assert_eq!(request.messages[5], user(&joined.text));
+
+    // Stored, it sits where it was sent, and a retry sends the same bytes
+    // without taking anything new in.
+    let mut stored = snapshot.clone();
+    if let Some(session) = stored.session.as_mut() {
+        session.steers.push(crate::runs::state::SteeredTurn {
+            turn: 1,
+            text: joined.text.clone(),
+        });
+    }
+    stored.model_attempts.push(ModelAttempt {
+        turn: 1,
+        attempt: 1,
+        state: ModelAttemptState::Unanswered,
+        request_digest: request.digest(),
+        offer: offer(),
+        timed_out: false,
+    });
+    let retry = planned(
+        &stored,
+        &Facts {
+            steer: Some(steer("another")),
+            ..claimed()
+        },
+    );
+    let Io::CallModel(again) = retry.io() else {
+        panic!("calls the model again");
+    };
+    let Operation::PrepareModel(prepared) = operation(&retry) else {
+        panic!("prepares");
+    };
+    assert_eq!(prepared.attempt, 2);
+    assert_eq!(prepared.steer, None);
+    assert_eq!(again.messages, request.messages);
+    assert_eq!(again.digest(), request.digest());
+}
+
+#[test]
+fn a_run_outside_a_session_takes_no_steer() {
+    let snapshot = running(Continuation::NeedModel { turn: 0 });
+    let plan = planned(
+        &snapshot,
+        &Facts {
+            steer: Some(steer("ignored")),
+            ..claimed()
+        },
+    );
+    let Operation::PrepareModel(prepared) = operation(&plan) else {
+        panic!("prepares");
+    };
+    assert_eq!(prepared.steer, None);
 }

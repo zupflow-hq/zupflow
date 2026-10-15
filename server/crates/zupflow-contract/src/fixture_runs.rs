@@ -148,6 +148,7 @@ pub async fn seed(
             input: format!("Use {tool} to find this week's open items."),
             model,
             instructions: "Be brief.".to_owned(),
+            channel: None,
         },
     );
     runs.apply(organization_id, workspace_id, &admission)

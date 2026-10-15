@@ -40,12 +40,13 @@ use crate::runs::digest::{Sha256Digest, call_digest, digest_json};
 use crate::runs::names::{Offer, OfferedTool};
 use crate::runs::state::{
     BoundTarget, CallAttempt, CallDecision, CallRecord, CallVerdict, ClaimantId, Continuation, EXECUTION_VERSION,
-    InvocationId, ModelAttemptState, RequestId, Snapshot, Usage, supports,
+    InvocationId, ModelAttemptState, RequestId, Snapshot, SteeredTurn, Usage, supports,
 };
 use crate::runs::transition::{
     Admit, Authorization, AuthorizeCall, Cancel, Claim, Closing, CommitTurn, FailAbandoned, Finish, Guards,
     ModelAttemptRef, NewCall, Operation, OwnerGuard, Park, PrepareModel, RecordOutcome, RefuseWaiting, ResolveApproval,
-    RunEnding, SendGuard, SendLease, SendOutcome, SettleUnknown, Settlement, TransitionRequest, Yield, YieldReason,
+    RunEnding, SendGuard, SendLease, SendOutcome, SettleUnknown, Settlement, Steer, TransitionRequest, Yield,
+    YieldReason,
 };
 use crate::runs::{ApprovalDecision, CallOutcome, CallState, Failure, NewRun, RunStatus, RunTrigger};
 use crate::time::Timestamp;
@@ -264,6 +265,10 @@ pub struct Facts {
     pub send_check: Option<SendCheck>,
     /// A fresh invocation ID for a send claim.
     pub invocation_id: Option<InvocationId>,
+    /// Thread messages waiting for a channel run, to join it as one user
+    /// turn before the next turn's first attempt. The store takes them only
+    /// while they still wait.
+    pub steer: Option<Steer>,
     /// The sender's outcome.
     pub sent: Option<SendResult>,
     /// Whether the job this worker holds is on its last attempt: a model
@@ -288,6 +293,7 @@ impl Facts {
             call_ids: Vec::new(),
             send_check: None,
             invocation_id: None,
+            steer: None,
             sent: None,
             last_attempt: false,
         }
@@ -719,11 +725,27 @@ fn closing(snapshot: &Snapshot, code: &str, message: &str) -> Option<Closing> {
 
 /// The conversation so far, from what was committed. Every call of a
 /// committed turn must have its outcome.
+///
+/// A channel run continues its session: the session's history comes first,
+/// exactly as earlier runs sent it, and each steered turn sits before the
+/// turn it was taken in for, so every request starts with the one before.
 fn conversation(snapshot: &Snapshot) -> Result<Vec<Message>, AdvanceError> {
-    let mut messages = vec![Message::User {
+    let (mut messages, steers): (Vec<Message>, &[SteeredTurn]) = match &snapshot.session {
+        Some(session) => (session.history.clone(), &session.steers),
+        None => (Vec::new(), &[]),
+    };
+    messages.push(Message::User {
         text: snapshot.input.clone(),
-    }];
+    });
+    let steered = |turn: u32, messages: &mut Vec<Message>| {
+        for steer in steers.iter().filter(|steer| steer.turn == turn) {
+            messages.push(Message::User {
+                text: steer.text.clone(),
+            });
+        }
+    };
     for turn in &snapshot.turns {
+        steered(turn.turn, &mut messages);
         let mut calls: Vec<&CallRecord> = snapshot.calls.iter().filter(|call| call.turn == turn.turn).collect();
         calls.sort_by_key(|call| call.position);
         messages.push(Message::Assistant {
@@ -750,6 +772,12 @@ fn conversation(snapshot: &Snapshot) -> Result<Vec<Message>, AdvanceError> {
             });
         }
     }
+    let next = u32::try_from(snapshot.turns.len()).unwrap_or(u32::MAX);
+    for steer in steers.iter().filter(|steer| steer.turn >= next) {
+        messages.push(Message::User {
+            text: steer.text.clone(),
+        });
+    }
     Ok(messages)
 }
 
@@ -766,12 +794,16 @@ fn conversation(snapshot: &Snapshot) -> Result<Vec<Message>, AdvanceError> {
 /// the model asks for it and again just before it's sent, on what holds
 /// then, and a send checks its installation and the tool's pinned
 /// definition again. A tool granted since waits for the next run.
+///
+/// A channel run offers its session's tools, fixed when the session began,
+/// so every run in it sends the same tools too.
 pub fn frozen_offer(snapshot: &Snapshot) -> Option<&Offer> {
     snapshot
         .model_attempts
         .iter()
         .max_by_key(|attempt| (attempt.turn, attempt.attempt))
         .map(|attempt| &attempt.offer)
+        .or_else(|| snapshot.session.as_ref().map(|session| &session.offer))
 }
 
 fn model_request(
@@ -780,14 +812,21 @@ fn model_request(
     attempt: u32,
     key_version: Option<u32>,
     offer: &Offer,
+    steer: Option<&Steer>,
 ) -> Result<ModelRequest, AdvanceError> {
+    let mut messages = conversation(snapshot)?;
+    if let Some(steer) = steer {
+        messages.push(Message::User {
+            text: steer.text.clone(),
+        });
+    }
     Ok(ModelRequest {
         turn,
         attempt,
         key_version,
         model: snapshot.model.clone(),
         instructions: snapshot.instructions.clone(),
-        messages: conversation(snapshot)?,
+        messages,
         tools: offer.specs(),
     })
 }
@@ -1115,7 +1154,14 @@ impl Worker<'_> {
                 .max()
                 .unwrap_or(0),
         )?;
-        let request = model_request(self.snapshot, turn, attempt, key_version, offer)?;
+        // Waiting thread messages join a channel run only before a turn's
+        // first attempt: a retry asks exactly what its first attempt asked.
+        let steer = self
+            .facts
+            .steer
+            .as_ref()
+            .filter(|_| self.snapshot.session.is_some() && attempt == 1 && abandons.is_none());
+        let request = model_request(self.snapshot, turn, attempt, key_version, offer, steer)?;
         validate_turn(&request.as_turn()).map_err(|_| AdvanceError::InvalidFact("a model request no model takes"))?;
         let operation = Operation::PrepareModel(PrepareModel {
             turn,
@@ -1124,6 +1170,7 @@ impl Worker<'_> {
             request_digest: request.digest(),
             offer: offer.clone(),
             key_version,
+            steer: steer.cloned(),
         });
         Ok(self.apply(self.keeps(), operation, Io::CallModel(request)))
     }
@@ -1158,7 +1205,7 @@ impl Worker<'_> {
             return Err(AdvanceError::InvalidFact("an answer to another model attempt"));
         }
         // Only its digest is compared: the key version isn't in it.
-        let request = model_request(self.snapshot, turn, attempt, None, &prepared.offer)?;
+        let request = model_request(self.snapshot, turn, attempt, None, &prepared.offer, None)?;
         if request.digest() != prepared.request_digest {
             return Err(AdvanceError::InvalidSnapshot(
                 "the conversation changed under a prepared model attempt",
@@ -1578,6 +1625,7 @@ pub fn admit(
             connection_id: run.model.connection_id,
             instructions: run.instructions.clone(),
             execution_version: EXECUTION_VERSION,
+            channel: run.channel.clone(),
         }),
     )
 }

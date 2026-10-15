@@ -165,6 +165,13 @@ pub fn channel_provisioner(config: &Config) -> Arc<dyn AppProvisioner> {
     }
 }
 
+/// What reads deliveries to agents' apps' inbound endpoints: deliveries in
+/// Slack's format, signed as Slack signs them. It holds no credential and
+/// calls no one; each delivery is checked with its own app's signing secret.
+pub fn channel_provider() -> Arc<dyn zupflow_core::channels::provider::ChannelProvider> {
+    Arc::new(zupflow_channels::fake::FakeChannelProvider)
+}
+
 /// The outbound HTTP client every call to a provider, an MCP server or a
 /// webhook endpoint goes through.
 pub fn outbound() -> Result<zupflow_outbound::SafeHttpClient, BootstrapError> {
@@ -193,6 +200,7 @@ pub async fn serve(
     let runner = tokio::spawn(crate::run_engine::run_worker(state.clone()));
     let deliverer = tokio::spawn(crate::webhook_delivery::run_workers(state.clone()));
     let provisioner = tokio::spawn(crate::channels::run_worker(state.clone()));
+    let inbound = tokio::spawn(crate::channel_inbound::run_worker(state.clone()));
     let served = axum::serve(listener, crate::app(state, guard))
         .with_graceful_shutdown(shutdown)
         .await;
@@ -200,6 +208,7 @@ pub async fn serve(
     runner.abort();
     deliverer.abort();
     provisioner.abort();
+    inbound.abort();
     served.map_err(BootstrapError::Serve)
 }
 

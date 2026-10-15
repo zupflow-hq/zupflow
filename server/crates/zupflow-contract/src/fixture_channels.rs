@@ -224,6 +224,7 @@ pub async fn seed(channels: &dyn ChannelStore, keys: &LocalKeyService, seed: &Se
                 identity: Identity {
                     external_id: identity.clone(),
                     handle: handle.trim_matches('-').to_owned(),
+                    bot_id: None,
                 },
                 granted_scopes: SLACK_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
                 label: seed.agent.name.chars().take(40).collect(),
@@ -246,6 +247,7 @@ pub async fn seed(channels: &dyn ChannelStore, keys: &LocalKeyService, seed: &Se
             display_name: Some(display_name.to_owned()),
             email: Some(email.to_owned()),
             is_automated: false,
+            team_id: Some(seed.team.0.to_owned()),
         }
     };
     let support = NewConversation {

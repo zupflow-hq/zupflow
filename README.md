@@ -32,6 +32,8 @@ server/           The Rust backend — a Cargo workspace
   crates/zupflow-mcp/         A minimal MCP client: lists a server's tools through the safe path
   crates/zupflow-providers/   The model provider adapters: OpenAI-compatible chat completions (OpenAI,
                               OpenRouter) and Anthropic Messages, and each provider's model list
+  crates/zupflow-channels/    Channel providers: for now the fake one, which reads deliveries in Slack's
+                              format and signs them as Slack does, with an in-memory team chat for tests
   crates/zupflow-contract/    Development only: the server and fixture the contract suite runs against
   crates/zupflow-taskboard/   Development only: Taskboard, a fake MCP app with its own OAuth, for end-to-end runs
   crates/zupflow-conformance/ The suites every implementation of a trait must pass
@@ -586,6 +588,34 @@ a listing that repeats the credential is refused. The listing and suggested
 catalog tool levels commit in the same transaction. Jobs wait in the
 database's queue, so a restart picks them up again.
 
+A team's chat reaches a workspace's agents through each agent's app. The
+provider delivers to `POST /channels/inbound/{inbound_ref}`; the timestamp is
+checked before anything is looked up, an unknown reference answers exactly as
+a bad signature does, and only a body signed by that app's own secret is read.
+A delivery may be up to 1 MiB, on that route alone. The delivery is recorded
+once per app, and a new message queues the inbound job in the same
+transaction; the job has a worker loop of its own, so making apps never holds
+it up. The connection knows its own posts by its user or its bot ID, and any
+post with a bot ID is an app's. The job decides who answers (a DM, a mention,
+or a reply in a thread the agent was last addressed in, after the sender
+rules, people of other organizations only when the agent allows them, and
+another agent's message only once its sender recorded how many hops led to
+it, while that's under the limit) and starts a run in the thread's session,
+one at a time. Every run that starts, collected ones included, counts against
+the conversation's breaker in the transaction that starts it. Each run of a
+session continues
+the ones before it byte for byte, so the provider's prompt cache holds across
+runs: the session fixes its model, instructions (a fixed channel preface, then
+the agent's own) and tools when it starts, every message reaches the model
+once (a late job finds its message read), rendered when it's taken in (at most
+8,000 characters a turn), each run's transcript is kept as sent when it ends,
+and the history is trimmed by whole runs, a quarter of its budget (60% of the
+model's context window) at a time, so the cache misses once per trim. Messages that
+arrive mid-run join it at its next turn boundary (`steer`) or wait and start
+one run after it (`collect`). `tests/channel_runs.rs` drives all of it through
+the route with a fake team chat, and `tests/channel_prompt_cache.rs` checks the
+prefix turn by turn on the Anthropic and OpenAI paths.
+
 ### The contract suite against the backend
 
 ```bash
@@ -637,6 +667,11 @@ server/target/debug/zupflow-contract-server reset "$fixture_dir/contract.sqlite"
 server/target/debug/zupflow-contract-server serve "$fixture_dir/contract.sqlite" \
   --console http://localhost:5181
 ```
+
+`channel-app-secrets <database> <app>` prints what the channel provider holds
+for one made app (its inbound reference and signing secret), so the suite can
+sign deliveries as the provider would; `pnpm contract:backend` passes it to
+the suite.
 
 `reset` is a development command that replaces that database's fixture,
 never a backend HTTP endpoint. `serve --console` answers CORS for that origin

@@ -33,9 +33,19 @@ pub enum InboundRefusal {
     /// Not signed by the app it was sent to.
     #[error("invalid_signature")]
     InvalidSignature,
+    /// Signed, but not JSON.
+    #[error("invalid_json")]
+    InvalidJson,
     /// Signed, but not something the provider sends.
     #[error("validation_failed")]
     Unreadable,
+}
+
+/// The headers a provider signs its deliveries with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignatureHeaders {
+    pub timestamp: &'static str,
+    pub signature: &'static str,
 }
 
 /// A verified delivery, in Zupflow's terms.
@@ -43,10 +53,13 @@ pub enum InboundRefusal {
 pub enum InboundDelivery {
     /// The provider checking the endpoint: answered with its challenge.
     UrlVerification { challenge: String },
-    /// An event, once per `event_id`.
+    /// An event, once per `event_id`. `kind` is the provider's name for
+    /// it; `team_id` is `None` when the event names no team, which is never
+    /// read as the connection's.
     Event {
         event_id: String,
-        team_id: String,
+        kind: String,
+        team_id: Option<String>,
         event: InboundEvent,
     },
     /// Anything the provider sends that Zupflow doesn't act on.
@@ -55,9 +68,11 @@ pub enum InboundDelivery {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundEvent {
-    Message(NormalizedMessage),
+    Message(Box<NormalizedMessage>),
     /// The app was removed from the team, or its tokens revoked.
     Uninstalled,
+    /// Something Zupflow doesn't act on: recorded once, nothing more.
+    Other,
 }
 
 /// A message as the provider normalized it.
@@ -65,8 +80,18 @@ pub enum InboundEvent {
 pub struct NormalizedMessage {
     pub conversation_external_id: String,
     pub conversation_kind: ConversationKind,
-    /// The author's provider ID; `None` for an app posting without a user.
+    /// Shared with another organization's team (Slack Connect).
+    pub conversation_is_external: bool,
+    /// The author's provider ID: its user, or, for an app posting without
+    /// one, its bot ID.
     pub author_external_id: Option<String>,
+    /// The bot ID an app's post carries (Slack's `bot_id`), with or without
+    /// a user: how a connection knows its own posts by either.
+    pub author_bot_id: Option<String>,
+    /// The team the author belongs to, when the provider says: another
+    /// organization's in a shared conversation.
+    pub author_team_id: Option<String>,
+    /// Posted by an app or an integration: any post that carries a bot ID.
     pub author_is_automated: bool,
     pub external_id: String,
     pub thread_key: String,
@@ -80,11 +105,20 @@ pub struct NormalizedMessage {
 pub trait ChannelProvider: Send + Sync {
     fn kind(&self) -> ChannelProviderKind;
 
-    /// Accepts a delivery only when it's signed with `signing_secret` within
-    /// [`INBOUND_TOLERANCE_SECONDS`] of `now`. Compares in constant time.
+    /// Where a delivery carries its timestamp and signature.
+    fn signature_headers(&self) -> SignatureHeaders;
+
+    /// Whether the delivery's timestamp is within
+    /// [`INBOUND_TOLERANCE_SECONDS`] of `now`: checked first, before the
+    /// app it names is looked up.
+    fn check_timestamp(&self, request: &InboundRequest<'_>, now: Timestamp) -> Result<(), InboundRefusal>;
+
+    /// Accepts a delivery only when its timestamp is fresh and it's signed
+    /// with `signing_secret`. Compares in constant time.
     fn verify(&self, request: &InboundRequest<'_>, signing_secret: &[u8], now: Timestamp)
     -> Result<(), InboundRefusal>;
 
-    /// Reads a verified delivery.
-    fn read(&self, body: &[u8]) -> Result<InboundDelivery, InboundRefusal>;
+    /// Reads a verified delivery; `now` stands in for a time the event
+    /// doesn't give.
+    fn read(&self, body: &[u8], now: Timestamp) -> Result<InboundDelivery, InboundRefusal>;
 }

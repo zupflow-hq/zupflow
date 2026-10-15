@@ -42,6 +42,7 @@ regex = "1"
 url = "2"
 zeroize.workspace = true
 zupflow-basic.workspace = true
+zupflow-channels.workspace = true
 zupflow-core.workspace = true
 zupflow-mcp.workspace = true
 zupflow-oidc.workspace = true

@@ -21,6 +21,7 @@
 //! its runs, named "Deleted agent".
 
 pub mod digest;
+pub mod history;
 pub mod names;
 pub mod reducer;
 pub mod state;
@@ -31,9 +32,15 @@ pub use store::RunStore;
 
 use serde_json::Value;
 
+use crate::channels::handling::DispatchReason;
+use crate::channels::store::ChannelSessionKey;
 use crate::environment::Environment;
-use crate::ids::{AgentId, OrganizationId, RunEventId, RunId, SessionId, WorkspaceId};
+use crate::ids::{
+    AgentId, ChannelConnectionId, ChannelConversationId, ChannelMessageId, OrganizationId, RunEventId, RunId,
+    SessionId, WorkspaceId,
+};
 use crate::jobs::JobOptions;
+use crate::runs::names::Offer;
 use crate::scope::Name;
 use crate::time::Timestamp;
 
@@ -92,6 +99,8 @@ pub enum RunTrigger {
     Api,
     /// A Console member, in Sandbox.
     Console,
+    /// A message in a thread, through an agent's channel.
+    Channel,
 }
 
 impl RunTrigger {
@@ -99,6 +108,7 @@ impl RunTrigger {
         match self {
             Self::Api => "api",
             Self::Console => "console",
+            Self::Channel => "channel",
         }
     }
 
@@ -106,9 +116,63 @@ impl RunTrigger {
         match value {
             "api" => Some(Self::Api),
             "console" => Some(Self::Console),
+            "channel" => Some(Self::Channel),
             _ => None,
         }
     }
+}
+
+/// The contract's `RunChannel`: where a channel run came from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RunChannel {
+    pub connection_id: ChannelConnectionId,
+    pub conversation_id: ChannelConversationId,
+    pub thread_key: String,
+    /// The message that woke it; `None` once retention removed it.
+    pub origin_message_id: Option<ChannelMessageId>,
+    #[serde(serialize_with = "reason_str")]
+    pub reason: DispatchReason,
+    /// The reason the agent gave for staying silent; `None` when it answered.
+    pub silent_reason: Option<String>,
+}
+
+fn reason_str<S: serde::Serializer>(reason: &DispatchReason, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(reason.as_str())
+}
+
+/// How thread messages reached a run, as its timeline names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TakenIn {
+    /// They started it.
+    Started,
+    /// They joined it at a turn boundary.
+    Steered,
+    /// They waited for the run before, and started this one after it.
+    Collected,
+}
+
+/// A channel run's admission: where it comes from in its session, and
+/// what the session fixes for it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ChannelAdmission {
+    pub session: ChannelSessionKey,
+    pub connection_id: ChannelConnectionId,
+    pub conversation_id: ChannelConversationId,
+    pub thread_key: String,
+    /// The newest message it takes in: the one that woke it.
+    pub origin_message_id: ChannelMessageId,
+    #[serde(serialize_with = "reason_str")]
+    pub reason: DispatchReason,
+    /// Its place among the session's runs, from 1.
+    pub session_sequence: u32,
+    /// The earliest run whose turns its prompt includes: itself when none.
+    pub history_start_run_id: RunId,
+    /// The tools fixed for the session, offered by every run in it.
+    pub offer: Offer,
+    pub taken_in: TakenIn,
+    /// The messages that woke it, oldest first.
+    pub message_ids: Vec<ChannelMessageId>,
 }
 
 /// The contract's `RunUsage`: the run's committed turns' tokens, summed
@@ -152,6 +216,8 @@ pub struct Run {
     pub agent_name: Option<String>,
     pub session_id: SessionId,
     pub trigger: RunTrigger,
+    /// Where a channel run came from; `None` for any other.
+    pub channel: Option<RunChannel>,
     pub status: RunStatus,
     pub input: String,
     pub output: Option<String>,
@@ -172,7 +238,7 @@ pub struct OrganizationRun {
 }
 
 /// What a run is started with.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NewRun {
     pub agent_id: AgentId,
     pub session_id: SessionId,
@@ -183,6 +249,8 @@ pub struct NewRun {
     /// change to either doesn't change a run under way.
     pub model: crate::model_store::RunModel,
     pub instructions: String,
+    /// A channel run's session and origin; `None` for any other.
+    pub channel: Option<ChannelAdmission>,
 }
 
 /// A job the store queues in the transaction of the change that needs it.
@@ -200,26 +268,30 @@ pub enum RunEventType {
     RunQueued,
     RunStarted,
     MessageAssistant,
+    ChannelMessagesReceived,
     ToolCallStarted,
     ToolCallCompleted,
     ToolCallFailed,
     ApprovalRequested,
     ApprovalResolved,
+    RunStayedSilent,
     RunCompleted,
     RunFailed,
     RunCancelled,
 }
 
 impl RunEventType {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::RunQueued,
         Self::RunStarted,
         Self::MessageAssistant,
+        Self::ChannelMessagesReceived,
         Self::ToolCallStarted,
         Self::ToolCallCompleted,
         Self::ToolCallFailed,
         Self::ApprovalRequested,
         Self::ApprovalResolved,
+        Self::RunStayedSilent,
         Self::RunCompleted,
         Self::RunFailed,
         Self::RunCancelled,
@@ -230,11 +302,13 @@ impl RunEventType {
             Self::RunQueued => "run.queued",
             Self::RunStarted => "run.started",
             Self::MessageAssistant => "message.assistant",
+            Self::ChannelMessagesReceived => "channel_messages.received",
             Self::ToolCallStarted => "tool_call.started",
             Self::ToolCallCompleted => "tool_call.completed",
             Self::ToolCallFailed => "tool_call.failed",
             Self::ApprovalRequested => "approval.requested",
             Self::ApprovalResolved => "approval.resolved",
+            Self::RunStayedSilent => "run.stayed_silent",
             Self::RunCompleted => "run.completed",
             Self::RunFailed => "run.failed",
             Self::RunCancelled => "run.cancelled",

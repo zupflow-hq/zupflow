@@ -22,11 +22,15 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::{Arguments, QueryBuilder, Row, Sqlite, SqliteConnection, Transaction};
 use uuid::Uuid;
 use zupflow_core::audit::Audit;
+use zupflow_core::channels::handling::inbound_job;
+use zupflow_core::channels::provider::InboundEvent;
 use zupflow_core::channels::store::{
-    AppCreation, AppFilter, AppSecretsRecord, BreakerOutcome, ChannelEditor, ChannelError, ChannelSession,
-    ChannelSessionKey, ChannelStore, ConnectionChanges, ConnectionFilter, ConversationFilter, LevelChange, MadeApp,
-    MessageFilter, NewApp, NewInstall, NewManager, NewMessage, RecordedMessage, SealedVersion, TokenReplacement,
+    AppCreation, AppFilter, AppSecretsRecord, ChannelEditor, ChannelError, ChannelSession, ChannelStore,
+    ConnectionChanges, ConnectionFilter, ConversationFilter, DeliveryOutcome, DispatchOutcome, InboundContext,
+    LevelChange, MadeApp, MessageFilter, NewApp, NewConversation, NewDelivery, NewDispatch, NewInstall, NewManager,
+    NewMessage, NewPerson, RecordedMessage, SealedVersion, SessionTemplate, TokenReplacement,
 };
+use zupflow_core::channels::thread::origin_keys;
 use zupflow_core::channels::{
     AgentChannel, AgentChannelSettings, AgentMessages, AppStatus, Audience, BreakerSettings, CHANNEL_TOOLS, ChannelApp,
     ChannelAppManager, ChannelConnection, ChannelConversation, ChannelMessage, ChannelPerson, ChannelProviderKind,
@@ -37,14 +41,16 @@ use zupflow_core::channels::{
 use zupflow_core::connect::{ConnectSession, ConnectSessionStatus};
 use zupflow_core::ids::{
     AgentChannelId, AgentId, ChannelAppId, ChannelAppManagerId, ChannelConnectionId, ChannelConversationId,
-    ChannelMessageId, ChannelPersonId, ConnectSessionId, MemberId, OrganizationId, RunId, SessionId, ToolCallId,
-    UserId, WorkspaceId,
+    ChannelMessageId, ChannelPersonId, ConnectSessionId, MemberId, OrganizationId, RunId, ToolCallId, UserId,
+    WorkspaceId,
 };
 use zupflow_core::installations::ShortId;
 use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::organizations::User;
 use zupflow_core::policy::ToolLevel;
 use zupflow_core::runs::QueuedJob;
+use zupflow_core::runs::store::StoreError;
+use zupflow_core::runs::transition::Steer;
 use zupflow_core::scope::Scope;
 use zupflow_core::time::Timestamp;
 use zupflow_core::webhooks::WebhookEventType;
@@ -52,6 +58,7 @@ use zupflow_core::workspaces::Page;
 
 use crate::Database;
 use crate::connect::session_columns;
+use crate::job_queue::insert_job_at;
 
 const MINUTE_MS: i64 = 60 * 1000;
 /// Why an app whose making job is gone or buried failed.
@@ -122,7 +129,7 @@ macro_rules! connection_select {
     () => {
         "SELECT c.id, c.organization_id, c.workspace_id, c.provider, c.app_id, a.agent_id, c.short_id, c.label, \
          c.handler, c.status, c.team_id, c.team_name, c.enterprise_id, c.identity_external_id, c.handle, \
-         c.granted_scopes, c.credential_version, c.connected_at, c.last_event_at, c.created_at, c.updated_at \
+         c.identity_bot_id, c.granted_scopes, c.credential_version, c.connected_at, c.last_event_at, c.created_at, c.updated_at \
          FROM channel_connections c LEFT JOIN channel_apps a \
          ON a.organization_id = c.organization_id AND a.workspace_id = c.workspace_id AND a.id = c.app_id"
     };
@@ -317,6 +324,7 @@ fn connection_from(row: &SqliteRow) -> Result<ChannelConnection, ChannelError> {
         identity: Identity {
             external_id: text(row, "identity_external_id")?,
             handle: text(row, "handle")?,
+            bot_id: row.try_get("identity_bot_id").map_err(read)?,
         },
         granted_scopes: json_list(row, "granted_scopes")?,
         credential_version: version.map(small).transpose()?,
@@ -414,18 +422,6 @@ fn agent_channel_from(row: &SqliteRow) -> Result<AgentChannel, ChannelError> {
         },
         created_at: at(row, "created_at")?,
         updated_at: at(row, "updated_at")?,
-    })
-}
-
-fn session_from(row: &SqliteRow) -> Result<ChannelSession, ChannelError> {
-    Ok(ChannelSession {
-        key: ChannelSessionKey::from_uuid(uuid(row, "id")?),
-        agent_channel_id: AgentChannelId::from_uuid(uuid(row, "agent_channel_id")?),
-        conversation_id: ChannelConversationId::from_uuid(uuid(row, "conversation_id")?),
-        thread_key: text(row, "thread_key")?,
-        session_id: SessionId::from_uuid(uuid(row, "session_id")?),
-        active_run_id: maybe_uuid(row, "active_run_id")?.map(RunId::from_uuid),
-        last_run_id: maybe_uuid(row, "last_run_id")?.map(RunId::from_uuid),
     })
 }
 
@@ -572,7 +568,7 @@ async fn admin_allowed(
 }
 
 async fn announce(
-    transaction: &mut Transaction<'static, Sqlite>,
+    transaction: &mut SqliteConnection,
     organization_id: OrganizationId,
     workspace_id: WorkspaceId,
     kind: WebhookEventType,
@@ -870,7 +866,7 @@ async fn fail_app(
 
 /// Sets a connection's status, announced when it changes.
 async fn set_connection_status(
-    transaction: &mut Transaction<'static, Sqlite>,
+    transaction: &mut SqliteConnection,
     organization_id: OrganizationId,
     workspace_id: WorkspaceId,
     connection: &ChannelConnection,
@@ -889,7 +885,7 @@ async fn set_connection_status(
     .bind(organization_id.uuid())
     .bind(workspace_id.uuid())
     .bind(connection.id.uuid())
-    .execute(&mut **transaction)
+    .execute(&mut *transaction)
     .await
     .map_err(failed("set_connection_status"))?;
     announce(
@@ -1140,7 +1136,9 @@ async fn conversation_id_for(
     sqlx::query(
         "INSERT INTO channel_conversations (id, organization_id, workspace_id, connection_id, external_id, kind, \
          name, is_external, identity_is_member, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT (organization_id, workspace_id, connection_id, external_id) DO NOTHING",
+         ON CONFLICT (organization_id, workspace_id, connection_id, external_id) DO UPDATE \
+         SET is_external = 1, updated_at = excluded.updated_at \
+         WHERE excluded.is_external AND NOT channel_conversations.is_external",
     )
     .bind(ChannelConversationId::generate().uuid())
     .bind(organization_id.uuid())
@@ -1181,8 +1179,11 @@ async fn person_id_for(
 ) -> Result<Uuid, ChannelError> {
     sqlx::query(
         "INSERT INTO channel_people (id, organization_id, workspace_id, connection_id, external_id, handle, \
-         display_name, email, is_automated, first_seen_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT (organization_id, workspace_id, connection_id, external_id) DO NOTHING",
+         display_name, email, is_automated, team_id, first_seen_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (organization_id, workspace_id, connection_id, external_id) DO UPDATE \
+         SET team_id = excluded.team_id, updated_at = excluded.updated_at \
+         WHERE excluded.team_id IS NOT NULL AND channel_people.team_id IS NOT excluded.team_id",
     )
     .bind(ChannelPersonId::generate().uuid())
     .bind(organization_id.uuid())
@@ -1193,6 +1194,7 @@ async fn person_id_for(
     .bind(person.display_name.as_deref())
     .bind(person.email.as_deref())
     .bind(person.is_automated)
+    .bind(person.team_id.as_deref())
     .bind(now.millis())
     .bind(now.millis())
     .execute(&mut *connection)
@@ -1225,6 +1227,451 @@ async fn find_message_in(
         .await
         .map_err(failed("find_message"))?;
     message_from(&row.ok_or_else(|| read("a message gone inside its own transaction"))?)
+}
+
+/// Records a message with its conversation and author, each saved once,
+/// inside the caller's transaction: [`ChannelStore::record_message`].
+async fn record_message_in(
+    transaction: &mut SqliteConnection,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    connection_id: ChannelConnectionId,
+    message: &NewMessage,
+    now: Timestamp,
+) -> Result<RecordedMessage, ChannelError> {
+    let inbound = message.direction == Direction::Inbound;
+    if inbound != message.author.is_some() || (inbound && (message.run_id.is_some() || message.tool_call_id.is_some()))
+    {
+        return Err(read("a message whose direction doesn't match its author or run"));
+    }
+    if find_connection_in(&mut *transaction, organization_id, workspace_id, connection_id)
+        .await?
+        .is_none()
+    {
+        return Err(ChannelError::ConnectionNotFound);
+    }
+    let conversation_id = conversation_id_for(
+        transaction,
+        organization_id,
+        workspace_id,
+        connection_id,
+        &message.conversation,
+        now,
+    )
+    .await?;
+    let seen: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM channel_messages \
+         WHERE organization_id = ? AND workspace_id = ? AND conversation_id = ? AND external_id = ?",
+    )
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(conversation_id.uuid())
+    .bind(&message.external_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(failed("record_message"))?;
+    if let Some(seen) = seen {
+        if !inbound {
+            // A send that meets its own echo, recorded first: the send
+            // knows its run and its hops, and the higher hop holds, so a
+            // late or repeated record never lowers it.
+            sqlx::query(
+                "UPDATE channel_messages SET agent_hop = max(agent_hop, ?), run_id = coalesce(run_id, ?), \
+                 tool_call_id = coalesce(tool_call_id, ?) \
+                 WHERE organization_id = ? AND workspace_id = ? AND conversation_id = ? AND id = ? \
+                 AND direction = 'outbound'",
+            )
+            .bind(i64::from(message.agent_hop))
+            .bind(message.run_id.map(|id| id.uuid()))
+            .bind(message.tool_call_id.map(|id| id.uuid()))
+            .bind(organization_id.uuid())
+            .bind(workspace_id.uuid())
+            .bind(conversation_id.uuid())
+            .bind(seen)
+            .execute(&mut *transaction)
+            .await
+            .map_err(failed("record_message"))?;
+        }
+        let message = find_message_in(transaction, organization_id, workspace_id, seen).await?;
+        return Ok(RecordedMessage { message, new: false });
+    }
+    let author = match &message.author {
+        Some(person) => {
+            Some(person_id_for(transaction, organization_id, workspace_id, connection_id, person, now).await?)
+        }
+        None => None,
+    };
+    let retention = settings_in(&mut *transaction, organization_id)
+        .await?
+        .values
+        .message_retention_days;
+    let expires_at = now.millis().saturating_add(i64::from(retention).saturating_mul(DAY_MS));
+    sqlx::query(
+        "INSERT INTO channel_messages (id, organization_id, workspace_id, connection_id, conversation_id, \
+         external_id, thread_key, direction, author_person_id, text, mentions, run_id, tool_call_id, agent_hop, \
+         sent_at, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(message.id.uuid())
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(connection_id.uuid())
+    .bind(conversation_id.uuid())
+    .bind(&message.external_id)
+    .bind(&message.thread_key)
+    .bind(message.direction.as_str())
+    .bind(author)
+    .bind(&message.text)
+    .bind(to_json(&message.mentions)?)
+    .bind(message.run_id.map(|id| id.uuid()))
+    .bind(message.tool_call_id.map(|id| id.uuid()))
+    .bind(i64::from(message.agent_hop))
+    .bind(message.sent_at.millis())
+    .bind(now.millis())
+    .bind(expires_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(failed("record_message"))?;
+    sqlx::query(
+        "UPDATE channel_conversations SET last_message_at = max(coalesce(last_message_at, ?1), ?1), \
+         updated_at = ?2 WHERE organization_id = ?3 AND workspace_id = ?4 AND connection_id = ?5 AND id = ?6",
+    )
+    .bind(message.sent_at.millis())
+    .bind(now.millis())
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(connection_id.uuid())
+    .bind(conversation_id.uuid())
+    .execute(&mut *transaction)
+    .await
+    .map_err(failed("record_message"))?;
+    announce(
+        transaction,
+        organization_id,
+        workspace_id,
+        if inbound {
+            WebhookEventType::ChannelMessageReceived
+        } else {
+            WebhookEventType::ChannelMessageSent
+        },
+        serde_json::json!({
+            "object": "channel_message", "id": message.id, "connection_id": connection_id,
+            "conversation_id": conversation_id,
+        }),
+        now,
+    )
+    .await?;
+    let recorded = find_message_in(transaction, organization_id, workspace_id, message.id.uuid()).await?;
+    Ok(RecordedMessage {
+        message: recorded,
+        new: true,
+    })
+}
+
+/// The run store's error, as the channel store reports it.
+fn from_run_store(error: StoreError) -> ChannelError {
+    match error {
+        StoreError::NotFound => ChannelError::ConversationNotFound,
+        StoreError::AgentNotFound => ChannelError::AgentNotFound,
+        StoreError::Unavailable => ChannelError::Unavailable,
+        other => {
+            tracing::error!(event = "channels.run_store_refused", error = %other);
+            ChannelError::Unavailable
+        }
+    }
+}
+
+/// The organization's breaker settings, for the channel runs.
+pub(crate) async fn breaker_settings(
+    connection: &mut SqliteConnection,
+    organization_id: OrganizationId,
+) -> Result<BreakerSettings, StoreError> {
+    settings_in(connection, organization_id)
+        .await
+        .map(|settings| settings.values)
+        .map_err(|_| StoreError::Unavailable)
+}
+
+/// A delivery recorded for the first time, through the app's live
+/// connection: [`ChannelStore::record_delivery`].
+async fn receive(
+    transaction: &mut SqliteConnection,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    app_id: ChannelAppId,
+    delivery: &NewDelivery,
+    now: Timestamp,
+) -> Result<DeliveryOutcome, ChannelError> {
+    let Some(connection) = live_connection_of(&mut *transaction, organization_id, workspace_id, app_id).await? else {
+        return Ok(DeliveryOutcome::Ignored);
+    };
+    // Another team's event, or one naming none, is never this connection's.
+    if delivery.team_id.as_deref() != Some(connection.team.id.as_str()) {
+        return Ok(DeliveryOutcome::Ignored);
+    }
+    sqlx::query(
+        "UPDATE channel_connections SET last_event_at = ? WHERE organization_id = ? AND workspace_id = ? AND id = ?",
+    )
+    .bind(now.millis())
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(connection.id.uuid())
+    .execute(&mut *transaction)
+    .await
+    .map_err(failed("record_delivery"))?;
+    let message = match &delivery.event {
+        InboundEvent::Uninstalled => {
+            set_connection_status(
+                transaction,
+                organization_id,
+                workspace_id,
+                &connection,
+                ConnectionStatus::ReconnectRequired,
+                now,
+            )
+            .await?;
+            return Ok(DeliveryOutcome::Uninstalled);
+        }
+        InboundEvent::Other => return Ok(DeliveryOutcome::Ignored),
+        InboundEvent::Message(message) => message,
+    };
+    if connection.status != ConnectionStatus::Connected {
+        return Ok(DeliveryOutcome::Ignored);
+    }
+    // Its own post, known by its user or by its bot ID: either can come
+    // alone (Slack leaves the user out of a post signed with a persona).
+    let by_user = message.author_external_id.as_deref() == Some(connection.identity.external_id.as_str());
+    let by_bot = message.author_bot_id.is_some() && message.author_bot_id == connection.identity.bot_id;
+    let own = by_user || by_bot;
+    if by_user
+        && connection.identity.bot_id.is_none()
+        && let Some(bot_id) = &message.author_bot_id
+    {
+        // Learned from the first post that carries both, so a later one
+        // that carries the bot ID alone is still known as its own.
+        sqlx::query(
+            "UPDATE channel_connections SET identity_bot_id = ?, updated_at = ? \
+             WHERE organization_id = ? AND workspace_id = ? AND id = ? AND identity_bot_id IS NULL",
+        )
+        .bind(bot_id)
+        .bind(now.millis())
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(connection.id.uuid())
+        .execute(&mut *transaction)
+        .await
+        .map_err(failed("record_delivery"))?;
+    }
+    let author = match (&message.author_external_id, own) {
+        (_, true) => None,
+        (Some(external_id), false) => Some(NewPerson {
+            external_id: external_id.clone(),
+            handle: None,
+            display_name: None,
+            email: None,
+            is_automated: message.author_is_automated,
+            team_id: message.author_team_id.clone(),
+        }),
+        // Nobody wrote it: nothing to record.
+        (None, false) => return Ok(DeliveryOutcome::Ignored),
+    };
+    let new = NewMessage {
+        id: ChannelMessageId::generate(),
+        conversation: NewConversation {
+            external_id: message.conversation_external_id.clone(),
+            kind: message.conversation_kind,
+            name: None,
+            is_external: message.conversation_is_external,
+            identity_is_member: true,
+        },
+        direction: if own { Direction::Outbound } else { Direction::Inbound },
+        author,
+        external_id: message.external_id.clone(),
+        thread_key: message.thread_key.clone(),
+        text: message.text.clone(),
+        mentions: message.mentions.clone(),
+        run_id: None,
+        tool_call_id: None,
+        agent_hop: 0,
+        sent_at: message.sent_at,
+    };
+    let recorded = record_message_in(transaction, organization_id, workspace_id, connection.id, &new, now).await?;
+    if recorded.new {
+        let job = inbound_job(recorded.message.id).ok_or(ChannelError::Unavailable)?;
+        insert_job_at(
+            &mut *transaction,
+            &Scope::Workspace(organization_id, workspace_id),
+            &job.kind,
+            job.payload,
+            job.options,
+            now.millis(),
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(event = "channels.inbound_job_not_queued", %error);
+            ChannelError::Unavailable
+        })?;
+    }
+    Ok(DeliveryOutcome::Message {
+        connection_id: connection.id,
+        message_id: recorded.message.id,
+        new: recorded.new,
+    })
+}
+
+/// [`ChannelStore::inbound_context`], on one read.
+async fn inbound_context_in(
+    transaction: &mut SqliteConnection,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    message_id: ChannelMessageId,
+) -> Result<Option<InboundContext>, ChannelError> {
+    let row = sqlx::query(
+        "SELECT g.handled_at, p.external_id, p.email, p.team_id FROM channel_messages g LEFT JOIN channel_people p \
+         ON p.organization_id = g.organization_id AND p.workspace_id = g.workspace_id \
+         AND p.connection_id = g.connection_id AND p.id = g.author_person_id \
+         WHERE g.organization_id = ? AND g.workspace_id = ? AND g.id = ?",
+    )
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(message_id.uuid())
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(failed("inbound_context"))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let handled = maybe_at(&row, "handled_at")?.is_some();
+    let author_external_id: Option<String> = row.try_get("external_id").map_err(read)?;
+    let author_email: Option<String> = row.try_get("email").map_err(read)?;
+    let author_team_id: Option<String> = row.try_get("team_id").map_err(read)?;
+    let message = find_message_in(&mut *transaction, organization_id, workspace_id, message_id.uuid()).await?;
+    let connection = find_connection_in(&mut *transaction, organization_id, workspace_id, message.connection_id)
+        .await?
+        .ok_or_else(|| read("a message's connection gone inside a read"))?;
+    let conversation = sqlx::query(FIND_CONVERSATION)
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(message.connection_id.uuid())
+        .bind(message.conversation_id.uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(failed("inbound_context"))?
+        .as_ref()
+        .map(conversation_from)
+        .transpose()?
+        .ok_or_else(|| read("a message's conversation gone inside a read"))?;
+    let channel = find_agent_channel_on(&mut *transaction, organization_id, workspace_id, connection.id).await?;
+    let agent_active = match &channel {
+        Some(channel) => {
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM agents WHERE organization_id = ? AND workspace_id = ? AND id = ?",
+            )
+            .bind(organization_id.uuid())
+            .bind(workspace_id.uuid())
+            .bind(channel.agent_id.uuid())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(failed("inbound_context"))?;
+            status.as_deref() == Some("active")
+        }
+        None => false,
+    };
+    // Another agent of the workspace in the same team: its own connection's
+    // identity wrote the message (by its user or its bot ID), and its own
+    // record of sending it says how many hops led to it. Until that send is
+    // recorded, the hops are unknown, never none.
+    let author_agent = match &author_external_id {
+        Some(external_id) if *external_id != connection.identity.external_id => {
+            let other = sqlx::query(
+                "SELECT h.id AS agent_channel_id, c.id AS connection_id FROM channel_connections c \
+                 JOIN agent_channels h ON h.organization_id = c.organization_id \
+                 AND h.workspace_id = c.workspace_id AND h.connection_id = c.id \
+                 WHERE c.organization_id = ? AND c.workspace_id = ? AND c.team_id = ? \
+                 AND (c.identity_external_id = ? OR c.identity_bot_id = ?) AND c.status <> 'disconnected' \
+                 AND c.id <> ?",
+            )
+            .bind(organization_id.uuid())
+            .bind(workspace_id.uuid())
+            .bind(&connection.team.id)
+            .bind(external_id)
+            .bind(external_id)
+            .bind(connection.id.uuid())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(failed("inbound_context"))?;
+            match other {
+                Some(other) => {
+                    let hop: Option<i64> = sqlx::query_scalar(
+                        "SELECT g.agent_hop FROM channel_messages g JOIN channel_conversations v \
+                         ON v.organization_id = g.organization_id AND v.workspace_id = g.workspace_id \
+                         AND v.id = g.conversation_id \
+                         WHERE g.organization_id = ? AND g.workspace_id = ? AND g.connection_id = ? \
+                         AND v.external_id = ? AND g.external_id = ? AND g.direction = 'outbound' \
+                         AND g.run_id IS NOT NULL",
+                    )
+                    .bind(organization_id.uuid())
+                    .bind(workspace_id.uuid())
+                    .bind(uuid(&other, "connection_id")?)
+                    .bind(&conversation.external_id)
+                    .bind(&message.external_id)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(failed("inbound_context"))?;
+                    Some((
+                        AgentChannelId::from_uuid(uuid(&other, "agent_channel_id")?),
+                        hop.map(small).transpose()?,
+                    ))
+                }
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    let (_, thread_origin_key) = origin_keys(
+        &connection.team.id,
+        &conversation.external_id,
+        &message.external_id,
+        &message.thread_key,
+    );
+    let last_addressed: Option<Uuid> = sqlx::query_scalar(
+        "SELECT agent_channel_id FROM channel_dispatches \
+         WHERE organization_id = ? AND workspace_id = ? AND thread_origin_key = ? \
+         AND reason IN ('direct_message', 'mentioned') ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(&thread_origin_key)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(failed("inbound_context"))?;
+    let in_thread = match &channel {
+        Some(channel) => crate::channel_runs::find_session_in(
+            &mut *transaction,
+            organization_id,
+            workspace_id,
+            channel.id,
+            conversation.id,
+            &message.thread_key,
+        )
+        .await
+        .map_err(from_run_store)?
+        .map(|session| session.key),
+        None => None,
+    };
+    Ok(Some(InboundContext {
+        message,
+        handled,
+        connection,
+        conversation,
+        author_external_id,
+        author_email,
+        author_team_id,
+        channel,
+        agent_active,
+        author_agent,
+        last_addressed: last_addressed.map(AgentChannelId::from_uuid),
+        in_thread,
+    }))
 }
 
 #[async_trait]
@@ -2018,14 +2465,21 @@ impl ChannelStore for SqliteChannelStore {
                     return Err(ChannelError::InstallChanged);
                 }
                 sqlx::query(
+                    // The same identity keeps the bot ID learned from its
+                    // posts when the install reports none.
                     "UPDATE channel_connections SET team_name = ?, enterprise_id = ?, identity_external_id = ?, \
-                     handle = ?, granted_scopes = ?, credential_version = ?, connected_at = ?, updated_at = ? \
+                     handle = ?, identity_bot_id = CASE WHEN identity_external_id = ? \
+                     THEN coalesce(?, identity_bot_id) ELSE ? END, granted_scopes = ?, credential_version = ?, \
+                     connected_at = ?, updated_at = ? \
                      WHERE organization_id = ? AND workspace_id = ? AND id = ?",
                 )
                 .bind(install.team.name.as_deref())
                 .bind(install.team.enterprise_id.as_deref())
                 .bind(&install.identity.external_id)
                 .bind(&install.identity.handle)
+                .bind(&install.identity.external_id)
+                .bind(install.identity.bot_id.as_deref())
+                .bind(install.identity.bot_id.as_deref())
                 .bind(&scopes)
                 .bind(i64::from(install.credential.version))
                 .bind(now.millis())
@@ -2064,8 +2518,8 @@ impl ChannelStore for SqliteChannelStore {
                 sqlx::query(
                     "INSERT INTO channel_connections (id, organization_id, workspace_id, provider, app_id, short_id, \
                      label, handler, status, team_id, team_name, enterprise_id, identity_external_id, handle, \
-                     granted_scopes, credential_version, connected_at, created_at, updated_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, 'mention', 'connected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     identity_bot_id, granted_scopes, credential_version, connected_at, created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, 'mention', 'connected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(install.connection_id.uuid())
                 .bind(organization_id.uuid())
@@ -2079,6 +2533,7 @@ impl ChannelStore for SqliteChannelStore {
                 .bind(install.team.enterprise_id.as_deref())
                 .bind(&install.identity.external_id)
                 .bind(&install.identity.handle)
+                .bind(install.identity.bot_id.as_deref())
                 .bind(&scopes)
                 .bind(i64::from(install.credential.version))
                 .bind(now.millis())
@@ -2327,123 +2782,18 @@ impl ChannelStore for SqliteChannelStore {
         message: &NewMessage,
         now: Timestamp,
     ) -> Result<RecordedMessage, ChannelError> {
-        let inbound = message.direction == Direction::Inbound;
-        if inbound != message.author.is_some()
-            || (inbound && (message.run_id.is_some() || message.tool_call_id.is_some()))
-        {
-            return Err(read("a message whose direction doesn't match its author or run"));
-        }
         let mut transaction = self.immediate("record_message").await?;
-        if find_connection_in(&mut transaction, organization_id, workspace_id, connection_id)
-            .await?
-            .is_none()
-        {
-            return Err(ChannelError::ConnectionNotFound);
-        }
-        let conversation_id = conversation_id_for(
+        let recorded = record_message_in(
             &mut transaction,
             organization_id,
             workspace_id,
             connection_id,
-            &message.conversation,
+            message,
             now,
         )
         .await?;
-        let seen: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM channel_messages \
-             WHERE organization_id = ? AND workspace_id = ? AND conversation_id = ? AND external_id = ?",
-        )
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(conversation_id.uuid())
-        .bind(&message.external_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(failed("record_message"))?;
-        if let Some(seen) = seen {
-            let message = find_message_in(&mut transaction, organization_id, workspace_id, seen).await?;
-            transaction.commit().await.map_err(failed("record_message"))?;
-            return Ok(RecordedMessage { message, new: false });
-        }
-        let author = match &message.author {
-            Some(person) => Some(
-                person_id_for(
-                    &mut transaction,
-                    organization_id,
-                    workspace_id,
-                    connection_id,
-                    person,
-                    now,
-                )
-                .await?,
-            ),
-            None => None,
-        };
-        let retention = settings_in(&mut transaction, organization_id)
-            .await?
-            .values
-            .message_retention_days;
-        let expires_at = now.millis().saturating_add(i64::from(retention).saturating_mul(DAY_MS));
-        sqlx::query(
-            "INSERT INTO channel_messages (id, organization_id, workspace_id, connection_id, conversation_id, \
-             external_id, thread_key, direction, author_person_id, text, mentions, run_id, tool_call_id, agent_hop, \
-             sent_at, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(message.id.uuid())
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(connection_id.uuid())
-        .bind(conversation_id.uuid())
-        .bind(&message.external_id)
-        .bind(&message.thread_key)
-        .bind(message.direction.as_str())
-        .bind(author)
-        .bind(&message.text)
-        .bind(to_json(&message.mentions)?)
-        .bind(message.run_id.map(|id| id.uuid()))
-        .bind(message.tool_call_id.map(|id| id.uuid()))
-        .bind(i64::from(message.agent_hop))
-        .bind(message.sent_at.millis())
-        .bind(now.millis())
-        .bind(expires_at)
-        .execute(&mut *transaction)
-        .await
-        .map_err(failed("record_message"))?;
-        sqlx::query(
-            "UPDATE channel_conversations SET last_message_at = max(coalesce(last_message_at, ?1), ?1), \
-             updated_at = ?2 WHERE organization_id = ?3 AND workspace_id = ?4 AND connection_id = ?5 AND id = ?6",
-        )
-        .bind(message.sent_at.millis())
-        .bind(now.millis())
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(connection_id.uuid())
-        .bind(conversation_id.uuid())
-        .execute(&mut *transaction)
-        .await
-        .map_err(failed("record_message"))?;
-        announce(
-            &mut transaction,
-            organization_id,
-            workspace_id,
-            if inbound {
-                WebhookEventType::ChannelMessageReceived
-            } else {
-                WebhookEventType::ChannelMessageSent
-            },
-            serde_json::json!({
-                "object": "channel_message", "id": message.id, "connection_id": connection_id,
-                "conversation_id": conversation_id,
-            }),
-            now,
-        )
-        .await?;
-        let recorded = find_message_in(&mut transaction, organization_id, workspace_id, message.id.uuid()).await?;
         transaction.commit().await.map_err(failed("record_message"))?;
-        Ok(RecordedMessage {
-            message: recorded,
-            new: true,
-        })
+        Ok(recorded)
     }
 
     async fn record_inbound_event(
@@ -2749,220 +3099,132 @@ impl ChannelStore for SqliteChannelStore {
         Ok(())
     }
 
-    async fn open_session(
+    async fn record_delivery(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        app_id: ChannelAppId,
+        delivery: &NewDelivery,
+        now: Timestamp,
+    ) -> Result<DeliveryOutcome, ChannelError> {
+        let mut transaction = self.immediate("record_delivery").await?;
+        let app = sqlx::query("SELECT 1 FROM channel_apps WHERE organization_id = ? AND workspace_id = ? AND id = ?")
+            .bind(organization_id.uuid())
+            .bind(workspace_id.uuid())
+            .bind(app_id.uuid())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(failed("record_delivery"))?;
+        if app.is_none() {
+            return Err(ChannelError::AppNotFound);
+        }
+        let recorded = sqlx::query(
+            "INSERT INTO channel_inbound_events (id, organization_id, workspace_id, app_id, provider_event_id, kind, \
+             received_at) VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (organization_id, workspace_id, app_id, provider_event_id) DO NOTHING",
+        )
+        .bind(Uuid::now_v7())
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(app_id.uuid())
+        .bind(&delivery.provider_event_id)
+        .bind(&delivery.kind)
+        .bind(now.millis())
+        .execute(&mut *transaction)
+        .await
+        .map_err(failed("record_delivery"))?;
+        let outcome = if recorded.rows_affected() == 0 {
+            DeliveryOutcome::Duplicate
+        } else {
+            receive(&mut transaction, organization_id, workspace_id, app_id, delivery, now).await?
+        };
+        transaction.commit().await.map_err(failed("record_delivery"))?;
+        Ok(outcome)
+    }
+
+    async fn inbound_context(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        message_id: ChannelMessageId,
+    ) -> Result<Option<InboundContext>, ChannelError> {
+        let mut transaction = self.database.pool().begin().await.map_err(failed("inbound_context"))?;
+        let context = inbound_context_in(&mut transaction, organization_id, workspace_id, message_id).await?;
+        transaction.commit().await.map_err(failed("inbound_context"))?;
+        Ok(context)
+    }
+
+    async fn mark_handled(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        message_id: ChannelMessageId,
+        now: Timestamp,
+    ) -> Result<(), ChannelError> {
+        sqlx::query(
+            "UPDATE channel_messages SET handled_at = coalesce(handled_at, ?) \
+             WHERE organization_id = ? AND workspace_id = ? AND id = ?",
+        )
+        .bind(now.millis())
+        .bind(organization_id.uuid())
+        .bind(workspace_id.uuid())
+        .bind(message_id.uuid())
+        .execute(self.database.pool())
+        .await
+        .map_err(failed("mark_handled"))?;
+        Ok(())
+    }
+
+    async fn dispatch(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        dispatch: &NewDispatch,
+        template: Option<&SessionTemplate>,
+        now: Timestamp,
+    ) -> Result<DispatchOutcome, ChannelError> {
+        let mut transaction = self.immediate("dispatch").await?;
+        let outcome =
+            crate::channel_runs::dispatch_in(&mut transaction, organization_id, workspace_id, dispatch, template, now)
+                .await
+                .map_err(from_run_store)?;
+        transaction.commit().await.map_err(failed("dispatch"))?;
+        Ok(outcome)
+    }
+
+    async fn steerable(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+    ) -> Result<Option<Steer>, ChannelError> {
+        let mut transaction = self.database.pool().begin().await.map_err(failed("steerable"))?;
+        let steer = crate::channel_runs::steerable_in(&mut transaction, organization_id, workspace_id, run_id)
+            .await
+            .map_err(from_run_store)?;
+        transaction.commit().await.map_err(failed("steerable"))?;
+        Ok(steer)
+    }
+
+    async fn find_session(
         &self,
         organization_id: OrganizationId,
         workspace_id: WorkspaceId,
         agent_channel_id: AgentChannelId,
         conversation_id: ChannelConversationId,
         thread_key: &str,
-        now: Timestamp,
-    ) -> Result<ChannelSession, ChannelError> {
-        let mut transaction = self.immediate("open_session").await?;
-        let channel_connection: Option<Uuid> = sqlx::query_scalar(
-            "SELECT connection_id FROM agent_channels WHERE organization_id = ? AND workspace_id = ? AND id = ?",
+    ) -> Result<Option<ChannelSession>, ChannelError> {
+        let mut connection = self.database.pool().acquire().await.map_err(failed("find_session"))?;
+        crate::channel_runs::find_session_in(
+            &mut connection,
+            organization_id,
+            workspace_id,
+            agent_channel_id,
+            conversation_id,
+            thread_key,
         )
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(agent_channel_id.uuid())
-        .fetch_optional(&mut *transaction)
         .await
-        .map_err(failed("open_session"))?;
-        let channel_connection = channel_connection.ok_or(ChannelError::AgentChannelNotFound)?;
-        // The thread is one of the agent channel's own connection's.
-        let conversation = sqlx::query(
-            "SELECT 1 FROM channel_conversations \
-             WHERE organization_id = ? AND workspace_id = ? AND connection_id = ? AND id = ?",
-        )
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(channel_connection)
-        .bind(conversation_id.uuid())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(failed("open_session"))?;
-        if conversation.is_none() {
-            return Err(ChannelError::ConversationNotFound);
-        }
-        sqlx::query(
-            "INSERT INTO channel_sessions (id, organization_id, workspace_id, agent_channel_id, conversation_id, \
-             thread_key, session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT (organization_id, workspace_id, agent_channel_id, conversation_id, thread_key) DO NOTHING",
-        )
-        .bind(ChannelSessionKey::generate().uuid())
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(agent_channel_id.uuid())
-        .bind(conversation_id.uuid())
-        .bind(thread_key)
-        .bind(SessionId::generate().uuid())
-        .bind(now.millis())
-        .bind(now.millis())
-        .execute(&mut *transaction)
-        .await
-        .map_err(failed("open_session"))?;
-        let row = sqlx::query(
-            "SELECT id, agent_channel_id, conversation_id, thread_key, session_id, active_run_id, last_run_id \
-             FROM channel_sessions WHERE organization_id = ? AND workspace_id = ? AND agent_channel_id = ? \
-             AND conversation_id = ? AND thread_key = ?",
-        )
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(agent_channel_id.uuid())
-        .bind(conversation_id.uuid())
-        .bind(thread_key)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(failed("open_session"))?;
-        let session = session_from(&row)?;
-        transaction.commit().await.map_err(failed("open_session"))?;
-        Ok(session)
-    }
-
-    async fn claim_session_run(
-        &self,
-        organization_id: OrganizationId,
-        workspace_id: WorkspaceId,
-        session: ChannelSessionKey,
-        run_id: RunId,
-        now: Timestamp,
-    ) -> Result<bool, ChannelError> {
-        let mut transaction = self.immediate("claim_session_run").await?;
-        // One statement decides: only a session with no active run takes this one.
-        let claimed = sqlx::query(
-            "UPDATE channel_sessions SET active_run_id = ?, updated_at = ? \
-             WHERE organization_id = ? AND workspace_id = ? AND id = ? AND active_run_id IS NULL",
-        )
-        .bind(run_id.uuid())
-        .bind(now.millis())
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(session.uuid())
-        .execute(&mut *transaction)
-        .await
-        .map_err(failed("claim_session_run"))?;
-        if claimed.rows_affected() == 0 {
-            let exists =
-                sqlx::query("SELECT 1 FROM channel_sessions WHERE organization_id = ? AND workspace_id = ? AND id = ?")
-                    .bind(organization_id.uuid())
-                    .bind(workspace_id.uuid())
-                    .bind(session.uuid())
-                    .fetch_optional(&mut *transaction)
-                    .await
-                    .map_err(failed("claim_session_run"))?;
-            if exists.is_none() {
-                return Err(ChannelError::SessionNotFound);
-            }
-        }
-        transaction.commit().await.map_err(failed("claim_session_run"))?;
-        Ok(claimed.rows_affected() == 1)
-    }
-
-    async fn release_session_run(
-        &self,
-        organization_id: OrganizationId,
-        workspace_id: WorkspaceId,
-        session: ChannelSessionKey,
-        run_id: RunId,
-        now: Timestamp,
-    ) -> Result<bool, ChannelError> {
-        let released = sqlx::query(
-            "UPDATE channel_sessions SET active_run_id = NULL, last_run_id = ?1, updated_at = ?2 \
-             WHERE organization_id = ?3 AND workspace_id = ?4 AND id = ?5 AND active_run_id = ?1",
-        )
-        .bind(run_id.uuid())
-        .bind(now.millis())
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(session.uuid())
-        .execute(self.database.pool())
-        .await
-        .map_err(failed("release_session_run"))?;
-        Ok(released.rows_affected() == 1)
-    }
-
-    async fn count_breaker_run(
-        &self,
-        organization_id: OrganizationId,
-        workspace_id: WorkspaceId,
-        conversation_id: ChannelConversationId,
-        now: Timestamp,
-    ) -> Result<BreakerOutcome, ChannelError> {
-        let mut transaction = self.immediate("count_breaker_run").await?;
-        let row = sqlx::query(
-            "SELECT connection_id, breaker_window_start, breaker_count, paused_until FROM channel_conversations \
-             WHERE organization_id = ? AND workspace_id = ? AND id = ?",
-        )
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(conversation_id.uuid())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(failed("count_breaker_run"))?
-        .ok_or(ChannelError::ConversationNotFound)?;
-        if let Some(until) = maybe_at(&row, "paused_until")?
-            && until.millis() > now.millis()
-        {
-            return Ok(BreakerOutcome::Paused { until });
-        }
-        let settings = settings_in(&mut transaction, organization_id).await?.values;
-        let window_start = maybe_at(&row, "breaker_window_start")?;
-        let count: i64 = row.try_get("breaker_count").map_err(read)?;
-        let window_ms = i64::from(settings.breaker_window_minutes) * MINUTE_MS;
-        let in_window = window_start.is_some_and(|start| start.millis().saturating_add(window_ms) > now.millis());
-        let (start, count) = if in_window {
-            (
-                window_start.map_or(now.millis(), Timestamp::millis),
-                count.saturating_add(1),
-            )
-        } else {
-            (now.millis(), 1)
-        };
-        let outcome = if count > i64::from(settings.breaker_runs) {
-            let until = Timestamp::from_millis(
-                now.millis()
-                    .saturating_add(i64::from(settings.breaker_pause_minutes) * MINUTE_MS),
-            );
-            BreakerOutcome::Tripped { paused_until: until }
-        } else {
-            BreakerOutcome::Counted { count: small(count)? }
-        };
-        // A trip starts a new window once the pause is over.
-        let (start, count, paused_until) = match outcome {
-            BreakerOutcome::Tripped { paused_until } => (None, 0, Some(paused_until.millis())),
-            _ => (Some(start), count, None),
-        };
-        sqlx::query(
-            "UPDATE channel_conversations SET breaker_window_start = ?, breaker_count = ?, paused_until = ?, \
-             updated_at = ? WHERE organization_id = ? AND workspace_id = ? AND id = ?",
-        )
-        .bind(start)
-        .bind(count)
-        .bind(paused_until)
-        .bind(now.millis())
-        .bind(organization_id.uuid())
-        .bind(workspace_id.uuid())
-        .bind(conversation_id.uuid())
-        .execute(&mut *transaction)
-        .await
-        .map_err(failed("count_breaker_run"))?;
-        if let BreakerOutcome::Tripped { paused_until } = outcome {
-            let connection_id = ChannelConnectionId::from_uuid(uuid(&row, "connection_id")?);
-            announce(
-                &mut transaction,
-                organization_id,
-                workspace_id,
-                WebhookEventType::ChannelConversationPaused,
-                serde_json::json!({
-                    "object": "channel_conversation", "id": conversation_id, "connection_id": connection_id,
-                    "paused_until": paused_until,
-                }),
-                now,
-            )
-            .await?;
-        }
-        transaction.commit().await.map_err(failed("count_breaker_run"))?;
-        Ok(outcome)
+        .map_err(from_run_store)
     }
 
     async fn list_tool_levels(&self, organization_id: OrganizationId) -> Result<Vec<ChannelToolLevel>, ChannelError> {
@@ -3186,6 +3448,7 @@ mod tests {
                 agents: &crate::SqliteAgentStore::new(database.clone()),
                 connect: &crate::SqliteConnectStore::new(database.clone()),
                 jobs: &crate::SqliteJobQueue::new(database.clone()),
+                runs: &crate::SqliteRunStore::new(database.clone()),
             },
             prepare(database),
         )
@@ -3533,6 +3796,12 @@ mod tests {
             );
         }
         assert!(audited.checked > 80, "found only {} statements", audited.checked);
+        // The channel runs, which both stores call into, hold to the same
+        // rules, with no exception at all.
+        let runs = audit(include_str!("channel_runs.rs"));
+        assert!(runs.problems.is_empty(), "{:#?}", runs.problems);
+        assert!(runs.exempted.is_empty(), "{:#?}", runs.exempted);
+        assert!(runs.checked > 25, "found only {} statements", runs.checked);
     }
 
     /// The audit reads each statement on its own: one beside a scoped one,

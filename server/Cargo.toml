@@ -8,6 +8,7 @@ members = ["crates/*"]
 # build and test those. A new product crate is added here too.
 default-members = [
     "crates/zupflow-basic",
+    "crates/zupflow-channels",
     "crates/zupflow-conformance",
     "crates/zupflow-core",
     "crates/zupflow-mcp",
@@ -58,6 +59,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v7"] }
 # No features: `local-identity` is compiled in only where a crate asks for it.
 zupflow-basic = { path = "crates/zupflow-basic", default-features = false }
+zupflow-channels = { path = "crates/zupflow-channels" }
 zupflow-conformance = { path = "crates/zupflow-conformance" }
 zupflow-core = { path = "crates/zupflow-core" }
 zupflow-mcp = { path = "crates/zupflow-mcp" }

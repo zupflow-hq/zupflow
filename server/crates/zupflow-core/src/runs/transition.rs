@@ -16,6 +16,8 @@ use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 
 use crate::audit::AuditActor;
+use crate::channels::store::ChannelDispatchKey;
+use crate::ids::ChannelMessageId;
 use crate::ids::{
     AgentId, ApiKeyId, InstallationId, ModelConnectionId, ModelId, OrganizationId, RunId, SessionId, ToolCallId,
     WorkspaceId,
@@ -23,7 +25,8 @@ use crate::ids::{
 use crate::runs::digest::{Sha256Digest, digest_json};
 use crate::runs::names::Offer;
 use crate::runs::state::{BoundTarget, CallDecision, ClaimantId, Continuation, InvocationId, RequestId, Usage, ser};
-use crate::runs::{ApprovalDecision, CallOutcome, CallState, Failure, RunStatus, RunTrigger};
+use crate::runs::{ApprovalDecision, CallOutcome, CallState, ChannelAdmission, Failure, RunStatus, RunTrigger};
+use crate::time::Timestamp;
 
 /// The domain of transition IDs.
 pub const TRANSITION_DOMAIN: &str = "zupflow.run.transition.v1";
@@ -154,7 +157,7 @@ pub struct Closing {
 }
 
 /// The run, its first job and `run.queued`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Admit {
     pub agent_id: AgentId,
     pub session_id: SessionId,
@@ -167,6 +170,9 @@ pub struct Admit {
     pub connection_id: ModelConnectionId,
     pub instructions: String,
     pub execution_version: u32,
+    /// A channel run's session and origin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<ChannelAdmission>,
 }
 
 /// A worker takes the run: owner epoch raised to `epoch`, owner claimant set
@@ -197,6 +203,34 @@ pub struct PrepareModel {
     /// run admitted before organizations had models.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_version: Option<u32>,
+    /// Thread messages joining a channel run before this turn's first
+    /// attempt: one new user turn, at the end of the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steer: Option<Steer>,
+}
+
+/// Waiting messages a channel run takes in at a turn boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Steer {
+    /// The user turn, rendered from the thread.
+    pub text: String,
+    /// The waiting dispatches it takes, each still waiting in the run's
+    /// session when the store applies it.
+    pub dispatches: Vec<ChannelDispatchKey>,
+    /// The messages that woke the agent, for the timeline.
+    pub message_ids: Vec<ChannelMessageId>,
+    /// The newest thread message the turn includes: the session's
+    /// conversation has taken in everything up to it.
+    pub seen: SeenMessage,
+}
+
+/// A thread message a session's conversation has taken in, everything
+/// before it too, in the order messages arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SeenMessage {
+    pub id: ChannelMessageId,
+    /// When it arrived.
+    pub at: Timestamp,
 }
 
 /// A call as a turn records it.

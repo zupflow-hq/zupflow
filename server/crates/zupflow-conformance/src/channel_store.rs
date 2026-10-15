@@ -6,7 +6,8 @@
 //! It checks the rules that must hold across concurrent changes: one live
 //! app per agent per manager, one live connection per app, an agent channel
 //! only on its own agent's app, a manager's tokens replaced once per version
-//! read, one active run per session, and the conversation breaker's count.
+//! read, one active run per session, the conversation breaker's count of
+//! the runs that start, and each message read once in a run session.
 //! A message is read back byte for byte as it was recorded. Every change is
 //! made only by an editor who still may, and an agent's apps go with it.
 //! An app is made at least once: an attempt marks it before the provider is
@@ -20,31 +21,44 @@
 //! workspace and one in each other workspace, and three queued runs of the
 //! first agent.
 
-use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
-use zupflow_core::agents::{AgentError, AgentStore};
+use zupflow_core::agents::{AgentChanges, AgentError, AgentStatus, AgentStore};
+use zupflow_core::audit::AuditActor;
+use zupflow_core::channels::handling::{DispatchReason, INBOUND_JOB, message_of_job};
+use zupflow_core::channels::provider::{InboundEvent, NormalizedMessage};
 use zupflow_core::channels::store::{
-    AppCreation, AppFilter, BreakerOutcome, ChannelEditor, ChannelError, ChannelStore, ConnectionChanges,
-    ConnectionFilter, ConversationFilter, LevelChange, MadeApp, MessageFilter, NewApp, NewConversation, NewInstall,
-    NewManager, NewMessage, NewPerson, SealedVersion, TokenReplacement,
+    AppCreation, AppFilter, ChannelEditor, ChannelError, ChannelStore, ConnectionChanges, ConnectionFilter,
+    ConversationFilter, DeliveryOutcome, DispatchOutcome, LevelChange, MadeApp, MessageFilter, NewApp, NewConversation,
+    NewDelivery, NewDispatch, NewInstall, NewManager, NewMessage, NewPerson, SealedVersion, SessionTemplate,
+    TokenReplacement,
 };
+use zupflow_core::channels::thread::{STEER_HEADER, origin_keys};
 use zupflow_core::channels::{
-    AgentChannelSettings, AppStatus, BreakerSettings, ChannelProviderKind, ConnectTarget, ConnectionStatus,
-    ConnectionTeam, ConversationKind, Direction, Identity, InboundRef, ManagerMethod,
+    AgentChannelSettings, AppStatus, BreakerSettings, ChannelMessage, ChannelProviderKind, ConnectTarget,
+    ConnectionStatus, ConnectionTeam, ConversationKind, Direction, HandlerKind, Identity, InboundRef, ManagerMethod,
 };
 use zupflow_core::connect::{ConnectIntent, ConnectSessionStatus, ConnectStore, NewConnectSession, ReferenceHash};
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{
-    AgentId, ApiKeyId, ChannelAppId, ChannelAppManagerId, ChannelConnectionId, ChannelConversationId, ChannelMessageId,
-    ConnectSessionId, MemberId, OrganizationId, RunId, UserId, WorkspaceId,
+    AgentChannelId, AgentId, ApiKeyId, ChannelAppId, ChannelAppManagerId, ChannelConnectionId, ChannelConversationId,
+    ChannelMessageId, ConnectSessionId, MemberId, ModelConnectionId, ModelId, OrganizationId, RunId, UserId,
+    WorkspaceId,
 };
 use zupflow_core::jobs::{JobOptions, JobQueue};
 use zupflow_core::keys::{Sealed, WrappedKey};
+use zupflow_core::model_store::RunModel;
+use zupflow_core::models::Message;
 use zupflow_core::policy::ToolLevel;
 use zupflow_core::runs::QueuedJob;
+use zupflow_core::runs::RunTrigger;
+use zupflow_core::runs::names::Offer;
+use zupflow_core::runs::reducer::cancel;
+use zupflow_core::runs::state::RequestId;
+use zupflow_core::runs::store::{Applied, RunStore};
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
 
@@ -83,6 +97,8 @@ pub struct Stores<'a> {
     pub connect: &'a dyn ConnectStore,
     /// The queue `create_app` queues its job on, in the same store.
     pub jobs: &'a dyn JobQueue,
+    /// The runs a session starts, in the same store.
+    pub runs: &'a dyn RunStore,
 }
 
 pub async fn run(stores: Stores<'_>, prepare: Prepare) {
@@ -94,8 +110,10 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     removes_apps_and_connections_keeping_history(&stores, &prepare).await;
     deletes_an_agents_apps_with_it(&stores, &prepare).await;
     records_messages_once_and_byte_for_byte(&stores, &prepare).await;
+    records_deliveries_once(&stores, &prepare).await;
     starts_one_run_per_session(&stores, &prepare).await;
     counts_the_breaker_under_concurrency(&stores, &prepare).await;
+    counts_runs_and_reads_each_message_once(&stores, &prepare).await;
     links_a_team_through_a_connect_session(&stores, &prepare).await;
     keeps_workspaces_and_organizations_apart(&stores, &prepare).await;
     makes_an_app_at_least_once(&stores, &prepare).await;
@@ -239,6 +257,7 @@ fn install(connection_id: ChannelConnectionId, team: &str, version: u32) -> NewI
         identity: Identity {
             external_id: "U0CONFORM".to_owned(),
             handle: "scribe".to_owned(),
+            bot_id: None,
         },
         granted_scopes: vec!["chat:write".to_owned()],
         label: "Scribe".to_owned(),
@@ -291,6 +310,7 @@ fn message(external_id: &str, conversation: &str, text: &str, sent_at: i64) -> N
             display_name: Some("Dana".to_owned()),
             email: Some("dana@northwind.example".to_owned()),
             is_automated: false,
+            team_id: Some("T0NORTH".to_owned()),
         }),
         external_id: external_id.to_owned(),
         thread_key: "1700000000.000100".to_owned(),
@@ -1137,63 +1157,220 @@ async fn records_messages_once_and_byte_for_byte(stores: &Stores<'_>, prepare: &
     );
 }
 
+fn template() -> SessionTemplate {
+    SessionTemplate {
+        model: RunModel {
+            model_id: ModelId::generate(),
+            connection_id: ModelConnectionId::generate(),
+            provider_model_id: "model-a".to_owned(),
+        },
+        instructions: "You are answering in Slack.\n\nBe brief.".to_owned(),
+        offer: Offer::default(),
+        history_budget: 1_000,
+    }
+}
+
+/// A dispatch of the message with `external_id` in conversation C0SUPPORT.
+fn dispatch_of(message: ChannelMessageId, agent_channel_id: AgentChannelId, external_id: &str) -> NewDispatch {
+    let (origin_key, thread_origin_key) = origin_keys("T0NORTH", "C0SUPPORT", external_id, "1700000000.000100");
+    NewDispatch {
+        message_id: message,
+        agent_channel_id,
+        origin_key,
+        thread_origin_key,
+        agent_hop: 0,
+        handler: HandlerKind::Mention,
+        reason: DispatchReason::Mentioned,
+    }
+}
+
+async fn recorded(
+    stores: &Stores<'_>,
+    t: &Tenant,
+    connection: ChannelConnectionId,
+    external_id: &str,
+    text: &str,
+) -> ChannelMessage {
+    stores
+        .channels
+        .record_message(
+            t.organization_id,
+            t.sandbox,
+            connection,
+            &message(external_id, "C0SUPPORT", text, 1_000),
+            now(),
+        )
+        .await
+        .unwrap()
+        .message
+}
+
 async fn starts_one_run_per_session(stores: &Stores<'_>, prepare: &Prepare) {
     let t = tenant(prepare).await;
     let (org, ws) = (t.organization_id, t.sandbox);
     let (_, _, connection) = installed(stores, &t, ws, t.agent).await;
-    let recorded = stores
-        .channels
-        .record_message(org, ws, connection, &message("1.1", "C0SUPPORT", "hi", 1_000), now())
-        .await
-        .unwrap();
     let channel = stores.channels.list_agent_channels(org, ws, t.agent).await.unwrap()[0].clone();
-    let conversation = recorded.message.conversation_id;
-    let open = || {
-        stores
-            .channels
-            .open_session(org, ws, channel.id, conversation, "1.1", now())
+    let mut messages = Vec::new();
+    for (n, text) in ["first", "second", "third"].iter().enumerate() {
+        messages.push(recorded(stores, &t, connection, &format!("1.{n}"), text).await);
+    }
+    let template = template();
+    let (template_ref, messages_ref, channel_id) = (&template, &messages, channel.id);
+    let dispatch = |n: usize| {
+        let dispatch = dispatch_of(messages_ref[n].id, channel_id, &format!("1.{n}"));
+        async move {
+            stores
+                .channels
+                .dispatch(org, ws, &dispatch, Some(template_ref), now())
+                .await
+        }
     };
-    let (a, b) = tokio::join!(open(), open());
-    let (a, b) = (a.unwrap(), b.unwrap());
-    assert_eq!(a, b, "one session per agent channel and thread");
-    assert_ne!(open().await.unwrap().key, {
+    let (a, b, c) = tokio::join!(dispatch(0), dispatch(1), dispatch(2));
+    let outcomes = [a.unwrap(), b.unwrap(), c.unwrap()];
+    let started: Vec<RunId> = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            DispatchOutcome::Started { run_id } => Some(*run_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started.len(),
+        1,
+        "one run per session under concurrent dispatches: {outcomes:?}"
+    );
+    // Each other one waits for the run, or, when the run's turn read it
+    // already (its message is older than the one that started it), is read.
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, DispatchOutcome::Waiting | DispatchOutcome::AlreadyRead))
+            .count(),
+        2,
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        dispatch(0).await,
+        Ok(DispatchOutcome::Duplicate),
+        "one dispatch per agent and message"
+    );
+    let first = started[0];
+    let session = stores
+        .channels
+        .find_session(org, ws, channel.id, messages[0].conversation_id, "1700000000.000100")
+        .await
+        .unwrap()
+        .expect("the thread's session");
+    assert_eq!((session.active_run_id, session.run_count), (Some(first), 1));
+
+    let run = stores.runs.find_run(org, ws, first).await.unwrap().unwrap();
+    assert_eq!(run.trigger, RunTrigger::Channel);
+    assert_eq!(run.session_id, session.session_id);
+    let from = run.channel.clone().expect("where the run came from");
+    assert_eq!(
+        (from.connection_id, from.thread_key.as_str()),
+        (connection, "1700000000.000100")
+    );
+    assert!(run.input.contains("[Dana] "), "{}", run.input);
+    let snapshot = stores.runs.find_snapshot(org, ws, first).await.unwrap().unwrap();
+    let context = snapshot.session.clone().expect("a channel run's session");
+    assert!(context.history.is_empty(), "the session's first run continues nothing");
+    assert_eq!(context.offer, template.offer);
+    assert_eq!(snapshot.instructions, template.instructions);
+
+    // The messages that waited are steered into the run at its next turn.
+    let steer = stores.channels.steerable(org, ws, first).await.unwrap();
+    let waiting = 3 - run.input.matches("[Dana]").count();
+    if waiting > 0 {
+        let steer = steer.expect("waiting messages to steer");
+        assert!(steer.text.starts_with(STEER_HEADER), "{}", steer.text);
+        assert_eq!(steer.dispatches.len(), waiting);
+    }
+
+    // The run's end frees the session and collects what waited into one run.
+    let cancel = cancel(
+        org,
+        ws,
+        &snapshot,
+        RequestId::from_uuid(uuid::Uuid::now_v7()),
+        RunTrigger::Api,
+        AuditActor::ApiKey {
+            id: t.sandbox_key,
+            name: "Test".to_owned(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        stores.runs.apply(org, ws, &cancel).await,
+        Ok(Applied::Committed(_))
+    ));
+    let after = stores
+        .channels
+        .find_session(org, ws, channel.id, messages[0].conversation_id, "1700000000.000100")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.last_run_id, Some(first));
+    if waiting == 0 {
+        assert_eq!(after.active_run_id, None);
+        return;
+    }
+    let collected = after.active_run_id.expect("a run collecting what waited");
+    assert_ne!(collected, first);
+    assert_eq!(after.run_count, 2);
+    let next = stores.runs.find_snapshot(org, ws, collected).await.unwrap().unwrap();
+    assert_eq!(
+        next.session.expect("its session").history,
+        vec![Message::User {
+            text: run.input.clone()
+        }],
+        "the next run continues the session byte for byte"
+    );
+    assert_eq!(
         stores
-            .channels
-            .open_session(org, ws, channel.id, conversation, "2.2", now())
+            .runs
+            .find_run(org, ws, collected)
             .await
             .unwrap()
-            .key
-    });
-
-    let claim = |run: RunId| stores.channels.claim_session_run(org, ws, a.key, run, now());
-    let (x, y, z) = tokio::join!(claim(t.runs[0]), claim(t.runs[1]), claim(t.runs[2]));
-    let claims = [x.unwrap(), y.unwrap(), z.unwrap()];
-    assert_eq!(
-        claims.iter().filter(|c| **c).count(),
-        1,
-        "one active run per session under concurrent starts"
+            .unwrap()
+            .session_id,
+        run.session_id
     );
-    let holder = t.runs[claims.iter().position(|c| *c).unwrap()];
-    let other = *t.runs.iter().find(|run| **run != holder).unwrap();
-    let release = |run: RunId| stores.channels.release_session_run(org, ws, a.key, run, now());
-    assert_eq!(release(other).await, Ok(false), "only the holder frees a session");
-    assert_eq!(release(holder).await, Ok(true));
-    let freed = open().await.unwrap();
-    assert_eq!((freed.active_run_id, freed.last_run_id), (None, Some(holder)));
-    assert_eq!(claim(other).await, Ok(true));
+    assert_eq!(
+        stores.channels.steerable(org, ws, first).await,
+        Ok(None),
+        "an ended run takes nothing in"
+    );
+}
+
+/// A message in its own thread of C0SUPPORT.
+async fn threaded(
+    stores: &Stores<'_>,
+    t: &Tenant,
+    connection: ChannelConnectionId,
+    external_id: &str,
+) -> ChannelMessage {
+    let mut new = message(external_id, "C0SUPPORT", "again", 1_000);
+    new.thread_key = external_id.to_owned();
+    stores
+        .channels
+        .record_message(t.organization_id, t.sandbox, connection, &new, now())
+        .await
+        .unwrap()
+        .message
 }
 
 async fn counts_the_breaker_under_concurrency(stores: &Stores<'_>, prepare: &Prepare) {
     let t = tenant(prepare).await;
     let (org, ws) = (t.organization_id, t.sandbox);
     let (_, _, connection) = installed(stores, &t, ws, t.agent).await;
-    let conversation = stores
-        .channels
-        .record_message(org, ws, connection, &message("1.1", "C0SUPPORT", "hi", 1_000), now())
-        .await
-        .unwrap()
-        .message
-        .conversation_id;
+    let channel = stores.channels.list_agent_channels(org, ws, t.agent).await.unwrap()[0].clone();
+    // Each in its own thread: each dispatch starts its own session's run.
+    let mut messages = Vec::new();
+    for n in 0..8 {
+        messages.push(threaded(stores, &t, connection, &format!("2.{n}")).await);
+    }
+    let conversation = messages[0].conversation_id;
     let settings = BreakerSettings {
         breaker_runs: 5,
         ..BreakerSettings::default()
@@ -1203,20 +1380,28 @@ async fn counts_the_breaker_under_concurrency(stores: &Stores<'_>, prepare: &Pre
         .save_channel_settings(org, t.admin, &settings, t.admin_user, now(), &by_suite)
         .await
         .unwrap();
-    let count = || stores.channels.count_breaker_run(org, ws, conversation, now());
-    let outcomes = futures_join_all((0..8).map(|_| count())).await;
-    let mut counted = HashSet::new();
-    let (mut tripped, mut paused) = (0, 0);
+    let template = template();
+    let dispatches: Vec<NewDispatch> = (0..8)
+        .map(|n| dispatch_of(messages[n].id, channel.id, &format!("2.{n}")))
+        .collect();
+    let outcomes = futures_join_all(
+        dispatches
+            .iter()
+            .map(|dispatch| stores.channels.dispatch(org, ws, dispatch, Some(&template), now())),
+    )
+    .await;
+    let (mut started, mut tripped, mut paused) = (0, 0, 0);
     for outcome in outcomes {
         match outcome.unwrap() {
-            BreakerOutcome::Counted { count } => assert!(counted.insert(count), "each run counted once"),
-            BreakerOutcome::Tripped { .. } => tripped += 1,
-            BreakerOutcome::Paused { .. } => paused += 1,
+            DispatchOutcome::Started { .. } => started += 1,
+            DispatchOutcome::Paused { tripped: true, .. } => tripped += 1,
+            DispatchOutcome::Paused { tripped: false, .. } => paused += 1,
+            other => panic!("each dispatch is new, and its session idle: {other:?}"),
         }
     }
     assert_eq!(
-        (counted, tripped, paused),
-        ((1..=5).collect::<HashSet<_>>(), 1, 2),
+        (started, tripped, paused),
+        (5, 1, 2),
         "the breaker counts every run once, trips once and holds the pause"
     );
     let read = stores
@@ -1226,6 +1411,371 @@ async fn counts_the_breaker_under_concurrency(stores: &Stores<'_>, prepare: &Pre
         .unwrap()
         .unwrap();
     assert!(read.paused_until.is_some());
+}
+
+/// The breaker counts the runs that start, collected ones included, never
+/// the messages they take in; a message an earlier turn read is settled as
+/// read; and nothing is dispatched to an agent that isn't active.
+async fn counts_runs_and_reads_each_message_once(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let (_, _, connection) = installed(stores, &t, ws, t.agent).await;
+    let channel = stores.channels.list_agent_channels(org, ws, t.agent).await.unwrap()[0].clone();
+    let settings = BreakerSettings {
+        breaker_runs: 2,
+        ..BreakerSettings::default()
+    };
+    stores
+        .channels
+        .save_channel_settings(org, t.admin, &settings, t.admin_user, now(), &by_suite)
+        .await
+        .unwrap();
+    let mut messages = Vec::new();
+    for (n, text) in ["first", "second", "third", "fourth"].iter().enumerate() {
+        messages.push(recorded(stores, &t, connection, &format!("3.{n}"), text).await);
+    }
+    let template = template();
+    let dispatch = |n: usize| {
+        let dispatch = dispatch_of(messages[n].id, channel.id, &format!("3.{n}"));
+        let template = &template;
+        async move {
+            stores
+                .channels
+                .dispatch(org, ws, &dispatch, Some(template), now())
+                .await
+        }
+    };
+    // The second's job runs first: its turn reads the first too.
+    let Ok(DispatchOutcome::Started { run_id: first }) = dispatch(1).await else {
+        panic!("the session's first run");
+    };
+    let input = stores.runs.find_run(org, ws, first).await.unwrap().unwrap().input;
+    assert_eq!(
+        (input.matches("first").count(), input.matches("second").count()),
+        (1, 1),
+        "{input}"
+    );
+    assert!(!input.contains("not to you"), "both mention the agent: {input}");
+    assert_eq!(
+        dispatch(0).await,
+        Ok(DispatchOutcome::AlreadyRead),
+        "the first's late job finds it read"
+    );
+    // Two more wait, and one collected run takes both in: one run counted.
+    assert_eq!(dispatch(2).await, Ok(DispatchOutcome::Waiting));
+    assert_eq!(dispatch(3).await, Ok(DispatchOutcome::Waiting));
+    let snapshot = stores.runs.find_snapshot(org, ws, first).await.unwrap().unwrap();
+    let cancel = cancel(
+        org,
+        ws,
+        &snapshot,
+        RequestId::from_uuid(uuid::Uuid::now_v7()),
+        RunTrigger::Api,
+        AuditActor::ApiKey {
+            id: t.sandbox_key,
+            name: "Test".to_owned(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        stores.runs.apply(org, ws, &cancel).await,
+        Ok(Applied::Committed(_))
+    ));
+    let session = stores
+        .channels
+        .find_session(org, ws, channel.id, messages[0].conversation_id, "1700000000.000100")
+        .await
+        .unwrap()
+        .unwrap();
+    let collected = session.active_run_id.expect("one run collecting both");
+    let next = stores.runs.find_run(org, ws, collected).await.unwrap().unwrap();
+    assert!(
+        next.input.contains("third") && next.input.contains("fourth") && !next.input.contains("second"),
+        "{}",
+        next.input
+    );
+    let conversation = stores
+        .channels
+        .find_conversation(org, ws, connection, messages[0].conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(conversation.paused_until, None, "two runs, within the breaker");
+    // The ended run's transcript continues the next one.
+    let context = stores
+        .runs
+        .find_snapshot(org, ws, collected)
+        .await
+        .unwrap()
+        .unwrap()
+        .session
+        .unwrap();
+    assert_eq!(context.history, vec![Message::User { text: input }]);
+
+    // A third run, in another thread, goes over it.
+    let other = threaded(stores, &t, connection, "3.9").await;
+    let Ok(DispatchOutcome::Paused { tripped: true, .. }) = stores
+        .channels
+        .dispatch(
+            org,
+            ws,
+            &dispatch_of(other.id, channel.id, "3.9"),
+            Some(&template),
+            now(),
+        )
+        .await
+    else {
+        panic!("the third run trips the breaker");
+    };
+
+    // Nothing reaches an agent that's paused, however the job read it.
+    stores
+        .agents
+        .update_agent(
+            org,
+            ws,
+            t.agent,
+            &AgentChanges {
+                status: Some(AgentStatus::Paused),
+                ..AgentChanges::default()
+            },
+            &|_| by_suite_in(ws),
+        )
+        .await
+        .unwrap();
+    let late = threaded(stores, &t, connection, "3.10").await;
+    assert_eq!(
+        stores
+            .channels
+            .dispatch(
+                org,
+                ws,
+                &dispatch_of(late.id, channel.id, "3.10"),
+                Some(&template),
+                now()
+            )
+            .await,
+        Ok(DispatchOutcome::Inactive)
+    );
+}
+
+/// A delivery is recorded once per provider event, read only through the
+/// app's live connection in its own team, and a new message queues its
+/// inbound job in the same transaction.
+async fn records_deliveries_once(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let (_, app, connection) = installed(stores, &t, ws, t.agent).await;
+    let normalized = |ts: &str, author: &str| NormalizedMessage {
+        conversation_external_id: "C0SUPPORT".to_owned(),
+        conversation_kind: ConversationKind::Channel,
+        conversation_is_external: false,
+        author_external_id: Some(author.to_owned()),
+        author_bot_id: None,
+        author_team_id: Some("T0NORTH".to_owned()),
+        author_is_automated: false,
+        external_id: ts.to_owned(),
+        thread_key: ts.to_owned(),
+        text: "<@U0CONFORM> hi".to_owned(),
+        mentions: vec!["U0CONFORM".to_owned()],
+        sent_at: Timestamp::from_millis(5_000),
+    };
+    let delivery = |id: &str, team: Option<&str>, event: InboundEvent| NewDelivery {
+        provider_event_id: id.to_owned(),
+        kind: "message".to_owned(),
+        team_id: team.map(str::to_owned),
+        event,
+    };
+    let deliver =
+        |delivery: NewDelivery| async move { stores.channels.record_delivery(org, ws, app, &delivery, now()).await };
+    let first = deliver(delivery(
+        "Ev1",
+        Some("T0NORTH"),
+        InboundEvent::Message(Box::new(normalized("5.1", "U0DANA"))),
+    ))
+    .await;
+    let Ok(DeliveryOutcome::Message {
+        connection_id,
+        message_id,
+        new: true,
+    }) = first
+    else {
+        panic!("a new message: {first:?}");
+    };
+    assert_eq!(connection_id, connection);
+    assert_eq!(
+        deliver(delivery(
+            "Ev1",
+            Some("T0NORTH"),
+            InboundEvent::Message(Box::new(normalized("5.1", "U0DANA")))
+        ))
+        .await,
+        Ok(DeliveryOutcome::Duplicate)
+    );
+    assert_eq!(
+        deliver(delivery(
+            "Ev2",
+            Some("T0NORTH"),
+            InboundEvent::Message(Box::new(normalized("5.1", "U0DANA")))
+        ))
+        .await,
+        Ok(DeliveryOutcome::Message {
+            connection_id,
+            message_id,
+            new: false
+        }),
+        "the same message delivered as another event is saved once"
+    );
+    for team in [Some("T0ELSEWHERE"), None] {
+        assert_eq!(
+            deliver(delivery(
+                &format!("Ev-{team:?}"),
+                team,
+                InboundEvent::Message(Box::new(normalized("5.2", "U0DANA")))
+            ))
+            .await,
+            Ok(DeliveryOutcome::Ignored),
+            "another team's event, or one naming none"
+        );
+    }
+    let own = deliver(delivery(
+        "Ev3",
+        Some("T0NORTH"),
+        InboundEvent::Message(Box::new(normalized("5.3", "U0CONFORM"))),
+    ))
+    .await;
+    let Ok(DeliveryOutcome::Message { message_id: own, .. }) = own else {
+        panic!("its own message: {own:?}");
+    };
+    let context = stores
+        .channels
+        .inbound_context(org, ws, message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(context.message.direction, Direction::Inbound);
+    assert_eq!(context.author_external_id.as_deref(), Some("U0DANA"));
+    assert!(!context.handled && context.agent_active);
+    assert_eq!(context.channel.map(|channel| channel.agent_id), Some(t.agent));
+    assert_eq!(
+        stores
+            .channels
+            .inbound_context(org, ws, own)
+            .await
+            .unwrap()
+            .unwrap()
+            .message
+            .direction,
+        Direction::Outbound
+    );
+    stores.channels.mark_handled(org, ws, message_id, now()).await.unwrap();
+    assert!(
+        stores
+            .channels
+            .inbound_context(org, ws, message_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .handled
+    );
+    // Each new message queued its inbound job, naming it alone.
+    let kind = Name::new(INBOUND_JOB).unwrap();
+    let mut queued = Vec::new();
+    while let Some(job) = stores
+        .jobs
+        .claim_next(std::slice::from_ref(&kind), Duration::from_secs(60))
+        .await
+        .unwrap()
+    {
+        assert_eq!(job.scope, Scope::Workspace(org, ws));
+        queued.push(message_of_job(&job.payload).unwrap());
+        stores.jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+    }
+    assert!(queued.contains(&message_id) && queued.contains(&own), "{queued:?}");
+    assert_eq!(queued.len(), 2);
+    // Its own posts by its bot ID too: learned from the first that carries
+    // its user and its bot ID, and known by the bot ID alone after.
+    let direction_of = |outcome: Result<DeliveryOutcome, ChannelError>| async move {
+        let Ok(DeliveryOutcome::Message { message_id, .. }) = outcome else {
+            panic!("a message: {outcome:?}");
+        };
+        let context = stores
+            .channels
+            .inbound_context(org, ws, message_id)
+            .await
+            .unwrap()
+            .unwrap();
+        (context.message.direction, context)
+    };
+    let mut both = normalized("5.6", "U0CONFORM");
+    both.author_bot_id = Some("B0CONFORM".to_owned());
+    both.author_is_automated = true;
+    let (direction, _) =
+        direction_of(deliver(delivery("Ev6", Some("T0NORTH"), InboundEvent::Message(Box::new(both)))).await).await;
+    assert_eq!(direction, Direction::Outbound);
+    assert_eq!(
+        stores
+            .channels
+            .find_connection(org, ws, connection)
+            .await
+            .unwrap()
+            .unwrap()
+            .identity
+            .bot_id
+            .as_deref(),
+        Some("B0CONFORM")
+    );
+    let mut alone = normalized("5.7", "B0CONFORM");
+    alone.author_bot_id = Some("B0CONFORM".to_owned());
+    alone.author_is_automated = true;
+    let (direction, _) =
+        direction_of(deliver(delivery("Ev7", Some("T0NORTH"), InboundEvent::Message(Box::new(alone)))).await).await;
+    assert_eq!(direction, Direction::Outbound, "its own post, by its bot ID alone");
+    // Someone of another team, in a shared conversation: their team and the
+    // conversation's sharing are kept.
+    let mut guest = normalized("5.8", "U0GUEST");
+    guest.author_team_id = Some("T0PARTNER".to_owned());
+    guest.conversation_is_external = true;
+    let (direction, context) =
+        direction_of(deliver(delivery("Ev8", Some("T0NORTH"), InboundEvent::Message(Box::new(guest)))).await).await;
+    assert_eq!(direction, Direction::Inbound);
+    assert_eq!(context.author_team_id.as_deref(), Some("T0PARTNER"));
+    assert!(context.conversation.is_external);
+    let (_, context) = direction_of(
+        deliver(delivery(
+            "Ev9",
+            Some("T0NORTH"),
+            InboundEvent::Message(Box::new(normalized("5.9", "U0DANA"))),
+        ))
+        .await,
+    )
+    .await;
+    assert!(context.conversation.is_external, "once shared, it stays so");
+    assert_eq!(context.author_team_id.as_deref(), Some("T0NORTH"));
+    // Uninstalled in the team: the connection needs reconnecting, and reads no more messages.
+    assert_eq!(
+        deliver(delivery("Ev4", Some("T0NORTH"), InboundEvent::Uninstalled)).await,
+        Ok(DeliveryOutcome::Uninstalled)
+    );
+    assert_eq!(
+        stores
+            .channels
+            .find_connection(org, ws, connection)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ConnectionStatus::ReconnectRequired
+    );
+    assert_eq!(
+        deliver(delivery(
+            "Ev5",
+            Some("T0NORTH"),
+            InboundEvent::Message(Box::new(normalized("5.5", "U0DANA")))
+        ))
+        .await,
+        Ok(DeliveryOutcome::Ignored)
+    );
 }
 
 /// Joins futures without a dependency: polled together on one task.
@@ -1333,11 +1883,20 @@ async fn keeps_workspaces_and_organizations_apart(stores: &Stores<'_>, prepare: 
         .unwrap();
     let conversation = recorded.message.conversation_id;
     let channel = stores.channels.list_agent_channels(org, ws, t.agent).await.unwrap()[0].clone();
-    let session = stores
+    let started = stores
         .channels
-        .open_session(org, ws, channel.id, conversation, "1.1", now())
+        .dispatch(
+            org,
+            ws,
+            &dispatch_of(recorded.message.id, channel.id, "1.1"),
+            Some(&template()),
+            now(),
+        )
         .await
         .unwrap();
+    let DispatchOutcome::Started { run_id } = started else {
+        panic!("a run: {started:?}");
+    };
     let c = stores.channels;
     // The same IDs, through the sibling workspace of the same organization
     // and through another organization's own workspace: nothing.
@@ -1398,22 +1957,45 @@ async fn keeps_workspaces_and_organizations_apart(stores: &Stores<'_>, prepare: 
             Err(ChannelError::AgentNotFound)
         );
         assert_eq!(
-            c.open_session(org, ws, channel.id, conversation, "1.1", now())
-                .await
-                .err(),
-            Some(ChannelError::AgentChannelNotFound)
+            c.find_session(org, ws, channel.id, conversation, "1700000000.000100")
+                .await,
+            Ok(None),
+            "{place}"
         );
         assert_eq!(
-            c.claim_session_run(org, ws, session.key, t.runs[0], now()).await,
-            Err(ChannelError::SessionNotFound)
+            c.dispatch(
+                org,
+                ws,
+                &dispatch_of(recorded.message.id, channel.id, "9.9"),
+                Some(&template()),
+                now()
+            )
+            .await,
+            Err(ChannelError::ConversationNotFound),
+            "{place}"
+        );
+        assert_eq!(c.steerable(org, ws, run_id).await, Ok(None), "{place}");
+        assert_eq!(
+            c.inbound_context(org, ws, recorded.message.id).await,
+            Ok(None),
+            "{place}"
         );
         assert_eq!(
-            c.release_session_run(org, ws, session.key, t.runs[0], now()).await,
-            Ok(false)
-        );
-        assert_eq!(
-            c.count_breaker_run(org, ws, conversation, now()).await,
-            Err(ChannelError::ConversationNotFound)
+            c.record_delivery(
+                org,
+                ws,
+                app,
+                &NewDelivery {
+                    provider_event_id: "Ev-elsewhere".to_owned(),
+                    kind: "message".to_owned(),
+                    team_id: Some("T0NORTH".to_owned()),
+                    event: InboundEvent::Uninstalled,
+                },
+                now()
+            )
+            .await,
+            Err(ChannelError::AppNotFound),
+            "{place}"
         );
         assert_eq!(
             c.install_app(

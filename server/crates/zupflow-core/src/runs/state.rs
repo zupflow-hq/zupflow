@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::ids::{
     ApiKeyId, InstallationId, ModelConnectionId, ModelId, OrganizationId, RunId, ToolCallId, WorkspaceId,
 };
-use crate::models::TokenUsage;
+use crate::models::{Message, TokenUsage};
 use crate::policy::{Decision, Verdict};
 use crate::runs::digest::Sha256Digest;
 use crate::runs::names::Offer;
@@ -360,6 +360,28 @@ pub struct CommittedTurn {
     pub text: Option<String>,
 }
 
+/// Thread messages that joined a run at a turn boundary: one user turn,
+/// before the turn it names, as it was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteeredTurn {
+    pub turn: u32,
+    pub text: String,
+}
+
+/// What a channel run continues and keeps: its session's conversation so
+/// far, the tools fixed for the session, and the thread messages that
+/// joined it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionContext {
+    /// The turns of the session's earlier runs from its history start,
+    /// exactly as they were sent ([`super::history::transcript`]).
+    pub history: Vec<Message>,
+    /// The tools every run in the session offers, in its order.
+    pub offer: Offer,
+    /// In order of turn.
+    pub steers: Vec<SteeredTurn>,
+}
+
 /// A run as committed: everything [`super::reducer::advance`] reads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
@@ -382,6 +404,8 @@ pub struct Snapshot {
     pub calls: Vec<CallRecord>,
     /// Every model attempt, by turn and attempt.
     pub model_attempts: Vec<ModelAttempt>,
+    /// A channel run's session; `None` for any other run.
+    pub session: Option<SessionContext>,
 }
 
 impl Snapshot {

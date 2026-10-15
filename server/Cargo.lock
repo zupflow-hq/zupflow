@@ -2968,6 +2968,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "zupflow-channels"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "hmac",
+ "serde_json",
+ "sha2 0.11.0",
+ "zupflow-core",
+]
+
+[[package]]
 name = "zupflow-conformance"
 version = "0.0.0"
 dependencies = [
@@ -2992,6 +3003,7 @@ dependencies = [
  "url",
  "uuid",
  "zupflow-basic",
+ "zupflow-channels",
  "zupflow-core",
  "zupflow-mcp",
  "zupflow-outbound",
@@ -3106,6 +3118,7 @@ dependencies = [
  "uuid",
  "zeroize",
  "zupflow-basic",
+ "zupflow-channels",
  "zupflow-core",
  "zupflow-mcp",
  "zupflow-oidc",

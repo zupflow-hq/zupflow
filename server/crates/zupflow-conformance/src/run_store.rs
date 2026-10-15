@@ -221,6 +221,7 @@ fn new_run(agent_id: AgentId, input: &str) -> NewRun {
         input: input.to_owned(),
         model: run_model(),
         instructions: "Be brief.".to_owned(),
+        channel: None,
     }
 }
 
@@ -1465,6 +1466,7 @@ async fn refuses_a_stale_or_expired_owner(stores: &Stores<'_>, a: Tenant, agent_
                 request_digest: Sha256Digest::of(b"request"),
                 offer: offer(),
                 key_version: Some(1),
+                steer: None,
             }),
         )
     };
@@ -1577,6 +1579,7 @@ async fn refuses_steps_without_their_guards(stores: &Stores<'_>, a: Tenant, agen
         request_digest: Sha256Digest::of(b"request"),
         offer: offer(),
         key_version: Some(1),
+        steer: None,
     });
     for (guards, why) in [
         (Guards::default(), "a worker's step without its owner"),
@@ -1607,6 +1610,7 @@ async fn refuses_steps_without_their_guards(stores: &Stores<'_>, a: Tenant, agen
             request_digest: Sha256Digest::of(b"request"),
             offer: offer(),
             key_version: Some(1),
+            steer: None,
         }),
     )
     .await;

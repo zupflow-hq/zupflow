@@ -15,6 +15,9 @@
 //! zupflow-contract-server reset <database>          restore the reference fixture
 //! zupflow-contract-server expire-connect <database> <organization> <workspace> <session>
 //!                                                   expire one pending session in that exact scope
+//! zupflow-contract-server channel-app-secrets <database> <app>
+//!                                                   what the channel provider holds for a made app, as
+//!                                                   JSON: its inbound reference and signing secret
 //! zupflow-contract-server operations                the operations the API serves, comma-separated
 //! ```
 //!
@@ -286,6 +289,7 @@ async fn serve(path: &str, serving: Serving) -> Result<(), String> {
         model_catalog: Arc::new(ScriptedProviders),
         connect: Arc::new(SqliteConnectStore::new(database.clone())),
         channels: Arc::new(zupflow_sqlite::SqliteChannelStore::new(database.clone())),
+        channel_provider: std::sync::Arc::new(zupflow_channels::fake::FakeChannelProvider),
         channel_provisioner: Arc::new(
             zupflow_basic::scripted_channel_provisioner::ScriptedChannelProvisioner::default(),
         ),
@@ -334,9 +338,11 @@ async fn serve(path: &str, serving: Serving) -> Result<(), String> {
         Vec::new()
     };
     // Apps are made by a job after `202`, with the scripted provisioner,
-    // which reaches nothing: its worker runs in every mode.
+    // which reaches nothing, and new messages are answered by theirs: both
+    // workers run in every mode.
     let mut workers = workers;
     workers.push(tokio::spawn(zupflow_server::channels::run_worker(state.clone())));
+    workers.push(tokio::spawn(zupflow_server::channel_inbound::run_worker(state.clone())));
     let served = axum::serve(listener, zupflow_server::app(state, guard))
         .await
         .map_err(|error| error.to_string());
@@ -1525,6 +1531,75 @@ async fn expire_connect_command(path: &str, organization: &str, workspace: &str,
     result
 }
 
+/// What the channel provider holds for a made app: the suite signs its
+/// deliveries with it, as the provider would. Development only: the app's
+/// scope is read by its ID here, which the API never does.
+async fn channel_app_secrets_command(path: &str, app: &str) -> Result<(), String> {
+    use zupflow_core::channels::store::ChannelStore;
+    use zupflow_core::workspaces::WorkspaceStore;
+
+    let app_id = app
+        .parse::<zupflow_core::ids::ChannelAppId>()
+        .map_err(|_| "invalid channel app ID".to_owned())?;
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .busy_timeout(std::time::Duration::from_secs(5));
+    let pool = SqlitePool::connect_with(options)
+        .await
+        .map_err(|_| "can't open existing fixture database".to_owned())?;
+    let scope: Option<(uuid::Uuid, uuid::Uuid)> =
+        sqlx::query_as("SELECT organization_id, workspace_id FROM channel_apps WHERE id = ?")
+            .bind(app_id.uuid())
+            .fetch_optional(&pool)
+            .await
+            .map_err(|_| "can't read the fixture database".to_owned())?;
+    pool.close().await;
+    let (organization_id, workspace_id) = scope
+        .map(|(organization, workspace)| {
+            (
+                OrganizationId::from_uuid(organization),
+                WorkspaceId::from_uuid(workspace),
+            )
+        })
+        .ok_or_else(|| "no such channel app".to_owned())?;
+    let database = open(path).await?;
+    let secret = database
+        .instance_secret("secret_key")
+        .await
+        .map_err(|error| error.to_string())?;
+    let environment = SqliteWorkspaceStore::new(database.clone())
+        .find_workspace(organization_id, workspace_id)
+        .await
+        .map_err(|error| format!("{error:?}"))?
+        .ok_or_else(|| "no such workspace".to_owned())?
+        .environment;
+    let record = zupflow_sqlite::SqliteChannelStore::new(database)
+        .app_secrets(organization_id, workspace_id, app_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "no such channel app".to_owned())?;
+    let sealed = record.secrets.ok_or_else(|| "the app isn't made yet".to_owned())?;
+    let context =
+        EncryptionContext::channel_app_secret(organization_id, workspace_id, environment, app_id, sealed.version);
+    let opened = zupflow_core::keys::open(&LocalKeyService::from_server_secret(&secret), &context, &sealed.sealed)
+        .await
+        .map_err(|error| format!("open: {error:?}"))?;
+    let secrets: Value = serde_json::from_slice(opened.expose()).map_err(|error| error.to_string())?;
+    let signing_secret = secrets
+        .get("signing_secret")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "no signing secret".to_owned())?;
+    #[allow(clippy::print_stdout)]
+    {
+        println!(
+            "{}",
+            json!({ "inbound_ref": record.inbound_ref.expose(), "signing_secret": signing_secret })
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1538,6 +1613,7 @@ async fn main() -> ExitCode {
         ["expire-connect", database, organization, workspace, session] => {
             expire_connect_command(database, organization, workspace, session).await
         }
+        ["channel-app-secrets", database, app] => channel_app_secrets_command(database, app).await,
         ["operations"] => {
             #[allow(clippy::print_stdout)]
             {
@@ -1546,7 +1622,7 @@ async fn main() -> ExitCode {
             Ok(())
         }
         _ => Err(
-            "usage: zupflow-contract-server serve <database> [--console <origin>] [--local-app <host>=<certificate.pem>]... | reset <database> | expire-connect <database> <organization> <workspace> <session> | operations"
+            "usage: zupflow-contract-server serve <database> [--console <origin>] [--local-app <host>=<certificate.pem>]... | reset <database> | expire-connect <database> <organization> <workspace> <session> | channel-app-secrets <database> <app> | operations"
                 .to_owned(),
         ),
     };

@@ -12,12 +12,45 @@
 //! follow-up in a thread the agent was addressed in. A later handler is a
 //! second implementation of the trait, with no change to the job or the store.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
+use serde_json::{Value, json};
 
 use super::store::ChannelSessionKey;
 use super::{HandlerKind, ThreadFollowUp};
 use crate::error::ApiError;
 use crate::ids::{AgentChannelId, AgentId, ChannelMessageId, ChannelPersonId};
+use crate::jobs::JobOptions;
+use crate::runs::QueuedJob;
+use crate::scope::Name;
+
+/// The kind of the job a new message queues, in the transaction that
+/// records it, for the inbound job to decide who answers it.
+pub const INBOUND_JOB: &str = "channel_inbound";
+
+/// How many times the inbound job is tried. Each step is idempotent: a
+/// message handled before stops at once, and a dispatch is unique per agent
+/// and message.
+pub const INBOUND_JOB_ATTEMPTS: u32 = 5;
+
+/// The inbound job for a new message: its payload names the message only.
+pub fn inbound_job(message_id: ChannelMessageId) -> Option<QueuedJob> {
+    Some(QueuedJob {
+        kind: Name::new(INBOUND_JOB).ok()?,
+        payload: json!({ "message_id": message_id }).to_string().into_bytes(),
+        options: JobOptions {
+            delay: Duration::ZERO,
+            max_attempts: INBOUND_JOB_ATTEMPTS,
+        },
+    })
+}
+
+/// The message an inbound job's payload names.
+pub fn message_of_job(payload: &[u8]) -> Option<ChannelMessageId> {
+    let payload: Value = serde_json::from_slice(payload).ok()?;
+    ChannelMessageId::parse(payload.get("message_id")?.as_str()?).ok()
+}
 
 /// Decides which agents answer a new inbound message. It proposes; the
 /// inbound job enforces every rule before and after it.
@@ -110,6 +143,21 @@ impl DispatchReason {
             Self::Mentioned => "mentioned",
             Self::ThreadFollowUp => "thread_follow_up",
         }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "direct_message" => Some(Self::DirectMessage),
+            "mentioned" => Some(Self::Mentioned),
+            "thread_follow_up" => Some(Self::ThreadFollowUp),
+            _ => None,
+        }
+    }
+
+    /// Whether the agent was addressed: a DM or a mention, which make it the
+    /// thread's last addressed agent.
+    pub fn addresses(self) -> bool {
+        matches!(self, Self::DirectMessage | Self::Mentioned)
     }
 }
 
@@ -259,6 +307,15 @@ mod tests {
         assert_eq!(woken, vec![last.agent_channel_id, always.agent_channel_id]);
         // A reply addressed to someone else wakes no one else.
         assert!(decide(&message(false, &["U9"]), &thread, &all).is_empty());
+    }
+
+    #[test]
+    fn queues_a_job_naming_the_message_only() {
+        let id = ChannelMessageId::generate();
+        let job = inbound_job(id).expect("a job");
+        assert_eq!(job.kind.as_str(), INBOUND_JOB);
+        assert_eq!(message_of_job(&job.payload), Some(id));
+        assert_eq!(message_of_job(b"{}"), None);
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub mod handling;
 pub mod provider;
 pub mod provision;
 pub mod store;
+pub mod thread;
 
 use serde::Serialize;
 
@@ -312,6 +313,12 @@ pub struct ConnectionTeam {
 pub struct Identity {
     pub external_id: String,
     pub handle: String,
+    /// Where the provider has one, the bot ID its posts may carry instead
+    /// of `external_id` (Slack's `bot_id`, beside its `bot_user_id`): as the
+    /// install reported it, or learned from its first post that carried
+    /// both. Its own posts are known by either. Not shown.
+    #[serde(skip)]
+    pub bot_id: Option<String>,
 }
 
 /// An installed app: one team, one identity, one agent. Never its tokens.

@@ -74,8 +74,8 @@ struct RunView {
     agent_name: String,
     session_id: SessionId,
     trigger: &'static str,
-    /// Where a channel run came from. Always null: this server starts no channel runs yet.
-    channel: Option<()>,
+    /// Where a channel run came from; null for any other.
+    channel: Option<zupflow_core::runs::RunChannel>,
     status: &'static str,
     input: String,
     output: Option<String>,
@@ -94,7 +94,7 @@ fn run_view(run: Run) -> RunView {
         agent_name: run.agent_name.unwrap_or_else(|| DELETED_AGENT.to_owned()),
         session_id: run.session_id,
         trigger: run.trigger.as_str(),
-        channel: None,
+        channel: run.channel,
         status: run.status.as_str(),
         input: run.input,
         output: run.output,
@@ -667,6 +667,7 @@ async fn start_run(
             input,
             model,
             instructions: agent.instructions,
+            channel: None,
         },
     );
     let receipt = match state

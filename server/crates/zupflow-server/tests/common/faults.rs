@@ -626,6 +626,11 @@ impl Kit {
         }
     }
 
+    /// The server's database file, for what a test sets up that no API does.
+    pub fn database(&self) -> &std::path::Path {
+        &self.database
+    }
+
     /// `worker`'s own state: the real engine's, stopping where `faults` says.
     pub fn state(&self, worker: Worker) -> AppState {
         worker_state(&self.base, &self.faults, worker)

@@ -168,7 +168,7 @@ async fn endpoint_in_environment(
 }
 
 async fn insert_event(
-    transaction: &mut Transaction<'static, Sqlite>,
+    transaction: &mut SqliteConnection,
     organization_id: OrganizationId,
     event: &NewWebhookEvent,
 ) -> Result<bool, WebhookError> {
@@ -183,7 +183,7 @@ async fn insert_event(
     .bind(&event.kind)
     .bind(&event.body)
     .bind(event.created_at.millis())
-    .execute(&mut **transaction)
+    .execute(&mut *transaction)
     .await
     .map_err(failed("insert_event"))?;
     if inserted.rows_affected() == 1 {
@@ -193,7 +193,7 @@ async fn insert_event(
     let here = sqlx::query("SELECT 1 FROM webhook_events WHERE organization_id = ? AND id = ?")
         .bind(organization_id.uuid())
         .bind(event.id.uuid())
-        .fetch_optional(&mut **transaction)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(failed("insert_event"))?;
     if here.is_none() {
@@ -204,7 +204,7 @@ async fn insert_event(
 }
 
 async fn insert_attempt(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut SqliteConnection,
     organization_id: OrganizationId,
     delivery_id: WebhookDeliveryId,
     attempt: &Attempt,
@@ -221,7 +221,7 @@ async fn insert_attempt(
     .bind(attempt.error.as_deref().map(safe_delivery_error))
     .bind(attempt.at.millis())
     .bind(i64::try_from(attempt.duration_ms).unwrap_or(i64::MAX))
-    .execute(&mut **transaction)
+    .execute(&mut *transaction)
     .await
     .map_err(failed("insert_attempt"))?;
     Ok(())
@@ -230,7 +230,7 @@ async fn insert_attempt(
 /// Records the immutable event, its scoped deliveries and their jobs inside
 /// the transition's transaction. A failed enqueue rolls the transition back.
 pub(crate) async fn record_event(
-    transaction: &mut Transaction<'static, Sqlite>,
+    transaction: &mut SqliteConnection,
     organization_id: OrganizationId,
     event: &NewWebhookEvent,
 ) -> Result<Vec<WebhookDeliveryId>, WebhookError> {
@@ -240,7 +240,7 @@ pub(crate) async fn record_event(
             .bind(organization_id.uuid())
             .bind(workspace_id.uuid())
             .bind(event.environment.as_str())
-            .fetch_optional(&mut **transaction)
+            .fetch_optional(&mut *transaction)
             .await
             .map_err(failed("record_event"))?;
         if here.is_none() {
@@ -257,7 +257,7 @@ pub(crate) async fn record_event(
     )
     .bind(organization_id.uuid())
     .bind(event.environment.as_str())
-    .fetch_all(&mut **transaction)
+    .fetch_all(&mut *transaction)
     .await
     .map_err(failed("record_event"))?;
     let kind = WebhookEventType::parse(&event.kind);
@@ -279,14 +279,14 @@ pub(crate) async fn record_event(
         .bind(event.id.uuid())
         .bind(Timestamp::now().millis())
         .bind(Timestamp::now().millis())
-        .execute(&mut **transaction)
+        .execute(&mut *transaction)
         .await
         .map_err(failed("record_event"))?;
         let Some(job) = delivery_job(delivery_id) else {
             return Err(WebhookError::Unavailable);
         };
         insert_job(
-            &mut **transaction,
+            &mut *transaction,
             &Scope::Organization(organization_id),
             &job.kind,
             job.payload,
@@ -305,7 +305,7 @@ pub(crate) async fn record_event(
 
 /// Captures only routing fields while the workspace and transition are locked.
 pub(crate) async fn record_lifecycle(
-    transaction: &mut Transaction<'static, Sqlite>,
+    transaction: &mut SqliteConnection,
     organization_id: OrganizationId,
     workspace_id: zupflow_core::ids::WorkspaceId,
     kind: WebhookEventType,
@@ -315,7 +315,7 @@ pub(crate) async fn record_lifecycle(
     let row = sqlx::query("SELECT environment, external_id FROM workspaces WHERE organization_id = ? AND id = ?")
         .bind(organization_id.uuid())
         .bind(workspace_id.uuid())
-        .fetch_optional(&mut **transaction)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(failed("lifecycle_workspace"))?
         .ok_or(WebhookError::NotFound)?;

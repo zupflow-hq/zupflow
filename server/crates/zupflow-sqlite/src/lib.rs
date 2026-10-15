@@ -27,6 +27,7 @@ mod agents;
 mod api_keys;
 mod apps;
 mod audit;
+mod channel_runs;
 mod channels;
 mod connect;
 mod database;
