@@ -6,6 +6,7 @@
  */
 import type {
   AccountConnection,
+  AgentChannelId,
   AgentGrant,
   AgentId,
   AgentStatus,
@@ -15,9 +16,25 @@ import type {
   AppKind,
   AuditEvent,
   AuthTemplate,
+  ChannelAppId,
+  ChannelAppManagerId,
+  ChannelAppManagerMethod,
+  ChannelAppManagerStatus,
+  ChannelAppStatus,
+  ChannelConnectionId,
+  ChannelConnectionStatus,
+  ChannelConversationId,
+  ChannelConversationKind,
+  ChannelHandler,
+  ChannelMessageDirection,
+  ChannelMessageId,
+  ChannelPersonId,
+  ChannelProvider,
+  ChannelWakeReason,
   ConnectIntent,
   ConnectSessionId,
   ConnectSessionStatus,
+  ConnectTarget,
   Environment,
   GrantId,
   InstallationId,
@@ -32,10 +49,12 @@ import type {
   ModelStatus,
   NewToolLevel,
   OrganizationId,
+  PutAgentChannelInput,
   RunError,
   RunEvent,
   RunId,
   RunStatus,
+  RunTrigger,
   RunUsage,
   SessionId,
   ToolCallId,
@@ -213,7 +232,10 @@ export interface ConnectSessionRow {
    */
   reference_hash: string | null;
   environment: Environment;
-  app_id: AppId;
+  /** The app it installs; null for a channel session, which has a `target`. */
+  app_id: AppId | null;
+  /** What a channel session sets up, and what it made once completed; null for an app's session. */
+  target: ConnectTarget | null;
   configuration_version: number;
   intent: ConnectIntent;
   installation_id: InstallationId | null;
@@ -325,7 +347,9 @@ export interface RunRow {
   workspace_id: WorkspaceId;
   agent_id: AgentId;
   session_id: SessionId;
-  trigger: "api" | "console";
+  trigger: RunTrigger;
+  /** Where a channel run came from. */
+  channel: RunChannelRow | null;
   status: RunStatus;
   input: string;
   output: string | null;
@@ -343,6 +367,15 @@ export interface RunRow {
   prompt_tokens: number;
   /** Remaining simulation steps for live runs. Empty once terminal. */
   plan: RunStep[];
+}
+
+export interface RunChannelRow {
+  connection_id: ChannelConnectionId;
+  conversation_id: ChannelConversationId;
+  thread_key: string;
+  origin_message_id: ChannelMessageId | null;
+  reason: ChannelWakeReason;
+  silent_reason: string | null;
 }
 
 /** A run's model and its route, as resolved when the run was created. */
@@ -420,6 +453,173 @@ export type WebhookDeliveryAttemptRow = {
   delivery_id: WebhookDeliveryId;
 } & WebhookDeliveryAttempt;
 
+// ---------------------------------------------------------------------------
+// Channels. Every row is workspace-scoped except tool levels and settings,
+// which are the organization's.
+
+/**
+ * A team linked so Zupflow can make apps there. The tokens themselves are
+ * never stored by the mock, not even sealed: only what responses show.
+ */
+export interface ChannelAppManagerRow {
+  id: ChannelAppManagerId;
+  organization_id: OrganizationId;
+  workspace_id: WorkspaceId;
+  provider: ChannelProvider;
+  method: ChannelAppManagerMethod;
+  /** Learned from the first install; every later install must match it. */
+  team_id: string | null;
+  team_name: string | null;
+  status: ChannelAppManagerStatus;
+  token_last4: string;
+  token_updated_at: string;
+  credential_version: number;
+  token_expires_at: string | null;
+  created_by_user_id: UserId | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One agent's generated app. */
+export interface ChannelAppRow {
+  id: ChannelAppId;
+  organization_id: OrganizationId;
+  workspace_id: WorkspaceId;
+  manager_id: ChannelAppManagerId;
+  agent_id: AgentId;
+  provider: ChannelProvider;
+  external_app_id: string | null;
+  /**
+   * Where the provider delivers this app's events: `/channels/inbound/{inbound_ref}`.
+   * 32 random base32 characters, unique across every tenant.
+   */
+  inbound_ref: string;
+  /**
+   * The fake provider's signing secret for this app, kept so the mock can
+   * check signatures: the backend seals it. Never in a response.
+   */
+  signing_secret: string;
+  status: ChannelAppStatus;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChannelConnectionRow {
+  id: ChannelConnectionId;
+  organization_id: OrganizationId;
+  workspace_id: WorkspaceId;
+  provider: ChannelProvider;
+  app_id: ChannelAppId | null;
+  /** Drawn from the workspace's installation short IDs. */
+  short_id: string;
+  label: string;
+  handler: ChannelHandler;
+  status: ChannelConnectionStatus;
+  team_id: string;
+  team_name: string | null;
+  enterprise_id: string | null;
+  identity_external_id: string;
+  handle: string;
+  granted_scopes: string[];
+  connected_at: string | null;
+  last_event_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChannelConversationRow {
+  id: ChannelConversationId;
+  organization_id: OrganizationId;
+  workspace_id: WorkspaceId;
+  connection_id: ChannelConnectionId;
+  external_id: string;
+  kind: ChannelConversationKind;
+  name: string | null;
+  is_external: boolean;
+  identity_is_member: boolean;
+  last_message_at: string | null;
+  paused_until: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChannelPersonRow {
+  id: ChannelPersonId;
+  organization_id: OrganizationId;
+  workspace_id: WorkspaceId;
+  connection_id: ChannelConnectionId;
+  external_id: string;
+  handle: string | null;
+  display_name: string | null;
+  email: string | null;
+  is_automated: boolean;
+  first_seen_at: string;
+  updated_at: string;
+}
+
+export interface ChannelMessageRow {
+  id: ChannelMessageId;
+  organization_id: OrganizationId;
+  workspace_id: WorkspaceId;
+  connection_id: ChannelConnectionId;
+  conversation_id: ChannelConversationId;
+  external_id: string;
+  thread_key: string;
+  direction: ChannelMessageDirection;
+  /** Null exactly for outbound messages. */
+  author_person_id: ChannelPersonId | null;
+  text: string;
+  mentions: string[];
+  run_id: RunId | null;
+  tool_call_id: ToolCallId | null;
+  agent_hop: number;
+  sent_at: string;
+  edited_at: string | null;
+  deleted_at: string | null;
+  created_at: string;
+}
+
+export type AgentChannelRow = {
+  id: AgentChannelId;
+  organization_id: OrganizationId;
+  workspace_id: WorkspaceId;
+  agent_id: AgentId;
+  connection_id: ChannelConnectionId;
+  created_at: string;
+  updated_at: string;
+} & PutAgentChannelInput;
+
+/** A channel tool level someone set. Natural key (organization_id, provider, tool); a tool without one has its default. */
+export interface ChannelToolLevelRow {
+  organization_id: OrganizationId;
+  provider: ChannelProvider;
+  tool: string;
+  level: ToolLevel;
+  updated_at: string;
+  updated_by_user_id: UserId | null;
+}
+
+/** The organization's channel settings once saved. */
+export interface ChannelSettingsRow {
+  organization_id: OrganizationId;
+  breaker_runs: number;
+  breaker_window_minutes: number;
+  breaker_pause_minutes: number;
+  message_retention_days: number;
+  updated_at: string;
+  updated_by_user_id: UserId | null;
+}
+
+/** A verified delivery to one app, for dedupe. Natural key (organization_id, workspace_id, app_id, provider_event_id). */
+export interface ChannelInboundEventRow {
+  organization_id: OrganizationId;
+  workspace_id: WorkspaceId;
+  app_id: ChannelAppId;
+  provider_event_id: string;
+  received_at: string;
+}
+
 export interface Db {
   schema: number;
   users: User[];
@@ -461,6 +661,16 @@ export interface Db {
   webhook_events: WebhookEventRow[];
   webhook_deliveries: WebhookDeliveryRow[];
   webhook_delivery_attempts: WebhookDeliveryAttemptRow[];
+  channel_app_managers: ChannelAppManagerRow[];
+  channel_apps: ChannelAppRow[];
+  channel_connections: ChannelConnectionRow[];
+  channel_conversations: ChannelConversationRow[];
+  channel_people: ChannelPersonRow[];
+  channel_messages: ChannelMessageRow[];
+  agent_channels: AgentChannelRow[];
+  channel_tool_levels: ChannelToolLevelRow[];
+  channel_settings: ChannelSettingsRow[];
+  channel_inbound_events: ChannelInboundEventRow[];
   audit: Omit<AuditEvent, "workspace">[];
   /** Idempotency keys (decision 0016), each scoped to its organization, workspace and the caller that sent it. */
   idempotency_keys: IdempotencyRow[];

@@ -392,7 +392,12 @@ export function refuseWaitingOn(
     if (!sameWorkspace(run, scope) || run.status !== "waiting_for_approval") continue;
     const events = timelineOf(db, run);
     const requested = [...events].reverse().find((event) => event.type === "approval.requested");
-    if (requested?.type !== "approval.requested" || requested.data.installation_id !== installationId) continue;
+    if (
+      requested?.type !== "approval.requested" ||
+      !("installation_id" in requested.data) ||
+      requested.data.installation_id !== installationId
+    )
+      continue;
     const callId = requested.data.call_id;
     if (events.some((event) => event.type === "approval.resolved" && event.data.call_id === callId)) continue;
     const step = run.plan.find((s) => s.kind === "tool_call" && s.call.call_id === callId);

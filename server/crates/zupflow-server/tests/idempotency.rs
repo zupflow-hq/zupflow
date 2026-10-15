@@ -251,3 +251,36 @@ async fn leaves_console_only_routes_to_refuse_api_keys() {
         .await;
     assert_eq!((status, code(&body)), (StatusCode::FORBIDDEN, "console_only"));
 }
+
+/// A provider's callback carries no credential: an `Idempotency-Key` on it is
+/// ignored, so the route answers, not the middleware's `401`. A stand-in
+/// handler serves the route until the backend does.
+#[tokio::test]
+async fn leaves_a_provider_callback_to_its_route() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let server = Server::new().await;
+    let app = axum::Router::new()
+        .route(
+            "/channels/inbound/{inbound_ref}",
+            axum::routing::post(|| async { axum::Json(json!({ "challenge": null })) }),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            server.state.clone(),
+            zupflow_server::idempotency::idempotency,
+        ))
+        .with_state(server.state.clone());
+    for key in ["provider-retry-1", "provider-retry-1"] {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/channels/inbound/abcdefghijklmnopqrstuvwxyz234567")
+            .header("Idempotency-Key", key)
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"type":"url_verification","challenge":"c"}"#))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}

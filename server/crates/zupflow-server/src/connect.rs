@@ -311,6 +311,8 @@ struct SessionView {
     workspace_id: WorkspaceId,
     environment: Environment,
     app: InstallationAppView,
+    /// What a channel session sets up. Always null: this server makes app sessions only.
+    target: Option<()>,
     intent: ConnectIntent,
     installation_id: Option<InstallationId>,
     label: String,
@@ -381,6 +383,7 @@ async fn session_view(
         workspace_id: session.workspace_id,
         environment: session.environment,
         app: installation_app_view(&app, session.app),
+        target: None,
         intent: session.intent,
         installation_id: session.installation_id,
         label: session.label.clone(),

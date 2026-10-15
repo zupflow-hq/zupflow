@@ -1,6 +1,7 @@
 import type {
   AcceptToolChangeInput,
   Agent,
+  AgentChannel,
   AgentGrant,
   AgentId,
   ApiKey,
@@ -13,6 +14,21 @@ import type {
   AuditListQuery,
   AuthorizeConnectResult,
   AvailableApp,
+  ChannelApp,
+  ChannelAppId,
+  ChannelAppListQuery,
+  ChannelAppManager,
+  ChannelAppManagerId,
+  ChannelConnection,
+  ChannelConnectionId,
+  ChannelConnectionListQuery,
+  ChannelConversation,
+  ChannelConversationId,
+  ChannelConversationListQuery,
+  ChannelMessage,
+  ChannelMessageListQuery,
+  ChannelSettings,
+  ChannelToolLevel,
   ClientConfiguration,
   ConnectResult,
   ConnectSession,
@@ -21,6 +37,8 @@ import type {
   CreateAgentInput,
   CreateApiKeyInput,
   CreateAppInput,
+  CreateChannelAppInput,
+  CreateChannelAppManagerInput,
   CreateConnectSessionInput,
   CreatedApiKey,
   CreatedConnectSession,
@@ -36,6 +54,7 @@ import type {
   Environment,
   GrantId,
   Installation,
+  InstallationConnectResult,
   InstallationId,
   InstallationTool,
   Invitation,
@@ -55,6 +74,7 @@ import type {
   PageQuery,
   ProviderModel,
   ProviderModelListQuery,
+  PutAgentChannelInput,
   RemoveMemberQuery,
   ReplaceModelConnectionKeyInput,
   ResolveApprovalInput,
@@ -68,6 +88,10 @@ import type {
   UpdateAgentInput,
   UpdateAppInput,
   UpdateAppToolLevelsInput,
+  UpdateChannelAppManagerInput,
+  UpdateChannelConnectionInput,
+  UpdateChannelSettingsInput,
+  UpdateChannelToolLevelsInput,
   UpdateConfigurationInput,
   UpdateConnectSettingsInput,
   UpdateDefaultModelInput,
@@ -288,8 +312,15 @@ export function createClient(transport: Transport) {
      */
     connect: {
       get: (reference: string) => get<ConnectSession>(`/v1/connect/sessions/${enc(reference)}`),
-      submitCredentials: (reference: string, input: SubmitConnectCredentialsInput, options?: PostOptions) =>
-        post<ConnectResult>(`/v1/connect/sessions/${enc(reference)}/credentials`, input, options),
+      /**
+       * Answers what the session made: an installation for an app's session (the default type), an
+       * app manager for a `channel_app_manager` session.
+       */
+      submitCredentials: <R extends ConnectResult = InstallationConnectResult>(
+        reference: string,
+        input: SubmitConnectCredentialsInput,
+        options?: PostOptions,
+      ) => post<R>(`/v1/connect/sessions/${enc(reference)}/credentials`, input, options),
       authorize: (reference: string, options?: PostOptions) =>
         post<AuthorizeConnectResult>(`/v1/connect/sessions/${enc(reference)}/authorize`, undefined, options),
       cancel: (reference: string, options?: PostOptions) =>
@@ -460,6 +491,93 @@ export function createClient(transport: Transport) {
     audit: {
       list: (organizationId: OrganizationId, query: AuditListQuery = {}) =>
         getPage<AuditEvent>(`${org(organizationId)}/audit-events`, { ...query }),
+    },
+
+    /**
+     * Teams linked so Zupflow can make apps for the workspace's agents there.
+     * Tokens are write-only: a manager shows whether its configuration token
+     * is set and its last four characters.
+     */
+    channelAppManagers: {
+      list: (workspaceId: WorkspaceId, query: PageQuery = {}) =>
+        getPage<ChannelAppManager>(`${ws(workspaceId)}/channel-app-managers`, { ...query }),
+      create: (workspaceId: WorkspaceId, input: CreateChannelAppManagerInput, options?: PostOptions) =>
+        post<ChannelAppManager>(`${ws(workspaceId)}/channel-app-managers`, input, options),
+      get: (workspaceId: WorkspaceId, managerId: ChannelAppManagerId) =>
+        get<ChannelAppManager>(`${ws(workspaceId)}/channel-app-managers/${enc(managerId)}`),
+      /** Replace both tokens; the manager is active again. */
+      update: (workspaceId: WorkspaceId, managerId: ChannelAppManagerId, input: UpdateChannelAppManagerInput) =>
+        send<ChannelAppManager>("PATCH", `${ws(workspaceId)}/channel-app-managers/${enc(managerId)}`, input),
+      delete: (workspaceId: WorkspaceId, managerId: ChannelAppManagerId) =>
+        send<void>("DELETE", `${ws(workspaceId)}/channel-app-managers/${enc(managerId)}`),
+    },
+
+    /** Each agent's own generated app in a linked team. */
+    channelApps: {
+      list: (workspaceId: WorkspaceId, query: ChannelAppListQuery = {}) =>
+        getPage<ChannelApp>(`${ws(workspaceId)}/channel-apps`, { ...query }),
+      /** Answers with the app `creating`; read it again to follow it to `awaiting_install`. */
+      create: (workspaceId: WorkspaceId, input: CreateChannelAppInput, options?: PostOptions) =>
+        post<ChannelApp>(`${ws(workspaceId)}/channel-apps`, input, options),
+      get: (workspaceId: WorkspaceId, appId: ChannelAppId) =>
+        get<ChannelApp>(`${ws(workspaceId)}/channel-apps/${enc(appId)}`),
+      delete: (workspaceId: WorkspaceId, appId: ChannelAppId) =>
+        send<void>("DELETE", `${ws(workspaceId)}/channel-apps/${enc(appId)}`),
+    },
+
+    /** Installed apps: the identity an agent acts as in a team, its conversations and messages. */
+    channelConnections: {
+      list: (workspaceId: WorkspaceId, query: ChannelConnectionListQuery = {}) =>
+        getPage<ChannelConnection>(`${ws(workspaceId)}/channel-connections`, { ...query }),
+      get: (workspaceId: WorkspaceId, connectionId: ChannelConnectionId) =>
+        get<ChannelConnection>(`${ws(workspaceId)}/channel-connections/${enc(connectionId)}`),
+      update: (workspaceId: WorkspaceId, connectionId: ChannelConnectionId, input: UpdateChannelConnectionInput) =>
+        send<ChannelConnection>("PATCH", `${ws(workspaceId)}/channel-connections/${enc(connectionId)}`, input),
+      delete: (workspaceId: WorkspaceId, connectionId: ChannelConnectionId) =>
+        send<void>("DELETE", `${ws(workspaceId)}/channel-connections/${enc(connectionId)}`),
+      conversations: (
+        workspaceId: WorkspaceId,
+        connectionId: ChannelConnectionId,
+        query: ChannelConversationListQuery = {},
+      ) =>
+        getPage<ChannelConversation>(`${ws(workspaceId)}/channel-connections/${enc(connectionId)}/conversations`, {
+          ...query,
+        }),
+      messages: (
+        workspaceId: WorkspaceId,
+        connectionId: ChannelConnectionId,
+        conversationId: ChannelConversationId,
+        query: ChannelMessageListQuery = {},
+      ) =>
+        getPage<ChannelMessage>(
+          `${ws(workspaceId)}/channel-connections/${enc(connectionId)}/conversations/${enc(conversationId)}/messages`,
+          { ...query },
+        ),
+    },
+
+    /** What an agent does on each of its own channel connections. */
+    agentChannels: {
+      list: (workspaceId: WorkspaceId, agentId: AgentId) =>
+        get<AgentChannel[]>(`${ws(workspaceId)}/agents/${enc(agentId)}/channels`),
+      put: (
+        workspaceId: WorkspaceId,
+        agentId: AgentId,
+        connectionId: ChannelConnectionId,
+        input: PutAgentChannelInput,
+      ) => send<AgentChannel>("PUT", `${ws(workspaceId)}/agents/${enc(agentId)}/channels/${enc(connectionId)}`, input),
+      delete: (workspaceId: WorkspaceId, agentId: AgentId, connectionId: ChannelConnectionId) =>
+        send<void>("DELETE", `${ws(workspaceId)}/agents/${enc(agentId)}/channels/${enc(connectionId)}`),
+    },
+
+    /** The organization's channel tool levels, conversation breaker and message retention. */
+    channelSettings: {
+      get: (organizationId: OrganizationId) => get<ChannelSettings>(`${org(organizationId)}/channel-settings`),
+      update: (organizationId: OrganizationId, input: UpdateChannelSettingsInput) =>
+        send<ChannelSettings>("PUT", `${org(organizationId)}/channel-settings`, input),
+      toolLevels: (organizationId: OrganizationId) =>
+        get<ChannelToolLevel[]>(`${org(organizationId)}/channel-tool-levels`),
+      setToolLevels: (organizationId: OrganizationId, input: UpdateChannelToolLevelsInput) =>
+        send<ChannelToolLevel[]>("PUT", `${org(organizationId)}/channel-tool-levels`, input),
     },
   };
 }

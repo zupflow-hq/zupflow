@@ -143,7 +143,7 @@ pub async fn run(
     assert_eq!(
         completed["data"],
         json!({ "object": "connect_session", "id": session.id,
-        "status": "completed", "installation_id": created.installation_id, "failure_code": null })
+        "status": "completed", "installation_id": created.installation_id, "target": null, "failure_code": null })
     );
     for (org, ws) in [
         (b.organization_id, a.sandbox),
@@ -371,7 +371,7 @@ pub async fn run(
         assert_eq!(
             found[0]["data"],
             json!({ "object": "connect_session", "id": session.id,
-            "status": "expired", "installation_id": null, "failure_code": null })
+            "status": "expired", "installation_id": null, "target": null, "failure_code": null })
         );
     }
     let (racing, _) = start(connect, &a, expiry).await;

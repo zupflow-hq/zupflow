@@ -1,6 +1,9 @@
 //! `Idempotency-Key` for every `POST` (decision 0016): one middleware, so no
 //! handler, service or table knows about it.
 //!
+//! - A route a provider calls (the channels' inbound endpoint) is left
+//!   alone before anything else: it holds no credential, and the provider's
+//!   own event ID deduplicates it.
 //! - The caller is resolved first, exactly as the handler will resolve it, so
 //!   `401` and `404` are never replayed past their checks; then a malformed
 //!   key answers `400 invalid_idempotency_key`, before the route's own checks.
@@ -65,7 +68,7 @@ fn unavailable() -> Response {
 /// (`x-zupflow-callers` without `api_key`); a test holds the two equal. A key
 /// on one passes straight through, so the route answers `403 console_only`
 /// whatever key or organization the request names.
-pub const NOT_FOR_API_KEYS: [&str; 9] = [
+pub const NOT_FOR_API_KEYS: [&str; 10] = [
     "/v1/organizations",
     "/v1/me/invitations/{invitation}/accept",
     "/v1/me/invitations/{invitation}/decline",
@@ -75,7 +78,15 @@ pub const NOT_FOR_API_KEYS: [&str; 9] = [
     "/v1/connect/sessions/{reference}/credentials",
     "/v1/connect/sessions/{reference}/authorize",
     "/v1/connect/sessions/{reference}/cancel",
+    "/channels/inbound/{inbound_ref}",
 ];
+
+/// `POST` routes a provider calls, as the contract lists their callers
+/// (`x-zupflow-callers` of `provider` only); a test holds the two equal. They
+/// carry no credential to key a request to, so the middleware passes them
+/// through before resolving a caller: an `Idempotency-Key` a provider sends
+/// is ignored, never answered `401`.
+pub const PROVIDER_ROUTES: [&str; 1] = ["/channels/inbound/{inbound_ref}"];
 
 /// Who is calling, in the environment they act in: a member on an
 /// organization route acts in none.
@@ -186,6 +197,9 @@ pub async fn idempotency(State(state): State<AppState>, request: Request, next: 
     else {
         return next.run(request).await;
     };
+    if PROVIDER_ROUTES.contains(&template.as_str()) {
+        return next.run(request).await;
+    }
     let (mut parts, body) = request.into_parts();
     let scope = match scope_of(&state, &mut parts, &template).await {
         Ok(Some(scope)) => scope,

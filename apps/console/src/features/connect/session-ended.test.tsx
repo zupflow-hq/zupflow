@@ -11,11 +11,12 @@ const app = {
   owner_scope: "organization",
   icon: { glyph: "Fn", color: "#4D7C0F" },
   auth_type: "mcp_oauth",
-} as ConnectSession["app"];
+} as NonNullable<ConnectSession["app"]>;
 
 const ended = (failure_code: string | null, return_url: string | null = null) => ({
   id: "cs_0000000000000000000001" as ConnectSession["id"],
   app,
+  target: null,
   status: "failed" as const,
   failure_code,
   return_url,

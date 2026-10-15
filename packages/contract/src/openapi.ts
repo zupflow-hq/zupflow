@@ -100,7 +100,11 @@ function parameters(route: (typeof routes)[number]) {
       }))
     : [];
   // Every POST takes an idempotency key (decision 0016); PUT, PATCH and DELETE are safe to repeat as they are.
-  const idempotency = route.method === "post" ? [{ $ref: "#/components/parameters/IdempotencyKey" }] : [];
+  // A provider's callback is the exception: its own event ID is the key.
+  const idempotency =
+    route.method === "post" && !route.callers.includes("provider")
+      ? [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      : [];
   return [...path, ...query, ...idempotency];
 }
 
@@ -109,6 +113,7 @@ const SECURITY: Record<Caller, Record<string, string[]>> = {
   api_key: { apiKey: [] },
   connect: {},
   public: {},
+  provider: {},
 };
 
 /** Console calls to a workspace route also name its organization (decision 0023); API keys carry their own. */
@@ -177,7 +182,7 @@ function webhooks() {
 export function buildOpenApi() {
   const paths: Record<string, Record<string, unknown>> = {};
   for (const route of routes) {
-    const { status, data, list, paginated } = route.response;
+    const { status, data, list, paginated, unwrapped } = route.response;
     const dataSchema = data ? (list ? { type: "array", items: schemaOf(data) } : schemaOf(data)) : null;
     const operation: Record<string, unknown> = {
       operationId: route.operationId,
@@ -190,13 +195,18 @@ export function buildOpenApi() {
           status === 204
             ? { description: "Done" }
             : {
-                description: "OK",
-                content: { "application/json": { schema: envelope(dataSchema, Boolean(paginated)) } },
+                description: status === 202 ? "Accepted: a job finishes it" : "OK",
+                content: {
+                  "application/json": {
+                    schema: unwrapped && dataSchema ? dataSchema : envelope(dataSchema, Boolean(paginated)),
+                  },
+                },
               },
         default: { $ref: "#/components/responses/Error" },
       },
     };
     if (route.showsSecretOnce) operation["x-zupflow-shows-secret-once"] = true;
+    if (unwrapped) operation["x-zupflow-unwrapped"] = true;
     if (route.body) {
       operation.requestBody = { required: true, content: { "application/json": { schema: schemaOf(route.body) } } };
     }

@@ -41,6 +41,15 @@ import { HttpResponse, http } from "msw";
 import { z } from "zod";
 import { checkedAuthTemplate, sameOrigin } from "./auth-templates";
 import { defaultToolsFor } from "./catalog";
+import {
+  authorizeChannel,
+  channelSessionTarget,
+  consentChannel,
+  createChannelHandlers,
+  deleteAgentChannels,
+  deleteWorkspaceChannels,
+  submitChannelCredentials,
+} from "./channels";
 import { keyedDigest, newApiKeySecret } from "./credentials";
 import { cancelScheduledRun, db, resetDb, scheduleRun } from "./db";
 import {
@@ -50,10 +59,12 @@ import {
   announceLifecycle,
   announceSession,
   appInScope,
+  assertConsoleMayAct,
   assertPublicHttps,
   audit,
   authenticate,
   body,
+  clampedInt,
   configurationStatus,
   consoleOnly,
   consoleOrgAccess,
@@ -69,6 +80,8 @@ import {
   type OrgAccess,
   ok,
   orgAccess,
+  paginate,
+  param,
   RESERVED_ORG_SLUGS,
   requireEnvironment,
   requireRole,
@@ -91,6 +104,7 @@ import {
   toRunEvent,
   toUser,
   toWorkspace,
+  validated,
   type WorkspaceAccess,
   withdrawUngrantable,
   withExpiry,
@@ -169,6 +183,19 @@ function emptyUsageCounts(): UsageCounts {
 /** How long past its link's expiry a used link still shows its outcome. */
 export const OUTCOME_GRACE_MS = 5 * MINUTE;
 
+/** A session's return URL must be on its environment's allowlist, exactly. */
+function assertReturnUrl(access: WorkspaceAccess, returnUrl: string | null) {
+  if (!returnUrl) return;
+  const settings = db().connect_settings.find(
+    (c) => c.organization_id === access.org.id && c.environment === access.workspace.environment,
+  );
+  if (!settings?.return_urls.includes(returnUrl)) {
+    throw new ApiFailure(422, "return_url_not_allowed", "That return URL isn't on the allowlist.", {
+      return_url: `Add it to the ${access.workspace.environment} return URLs first.`,
+    });
+  }
+}
+
 /**
  * A link shows its session while it's pending, and once it ended until
  * `OUTCOME_GRACE_MS` past the link's expiry (the OAuth callback sends the
@@ -185,11 +212,6 @@ function assertLinkShows(session: ConnectSessionRow) {
 export const NO_SIGN_IN_HOST = "no-sign-in.example";
 /** The host of an MCP server the mock can't reach: sign-in through it answers `provider_unavailable`. */
 export const UNREACHABLE_HOST = "unreachable.example";
-
-function param(params: Record<string, string | readonly string[] | undefined>, key: string): string {
-  const value = params[key];
-  return typeof value === "string" ? value : "";
-}
 
 /**
  * An ID in a request body. A malformed one is accepted here and simply matches
@@ -312,16 +334,6 @@ function availableApps(access: WorkspaceAccess): AvailableApp[] {
  * accounts. Starting runs and Connect sessions there is for the customer's
  * backend, with an API key.
  */
-function assertConsoleMayAct(access: WorkspaceAccess, action: string) {
-  if (access.kind === "console" && access.workspace.environment === "production") {
-    throw new ApiFailure(
-      403,
-      "console_read_only_in_production",
-      `The Console can't ${action} in Production. Your product does that through the API.`,
-    );
-  }
-}
-
 function findOrgApp(access: OrgAccess, appId: string): AppRow {
   const app = db().apps.find(
     (a) => a.id === appId && a.organization_id === access.org.id && a.owner_workspace_id === null,
@@ -552,9 +564,9 @@ function assertSessionPending(session: ConnectSessionRow) {
 
 /** The session's own tenant: every statement after hosted Connect attributes a session goes through these. */
 function sessionScope(session: ConnectSessionRow) {
-  const { organization_id, workspace_id } = session;
+  const { organization_id, workspace_id, app_id } = session;
   return {
-    app: () => appInScope(session),
+    app: () => (app_id === null ? undefined : appInScope({ organization_id, workspace_id, app_id })),
     workspace: () => db().workspaces.find((w) => w.organization_id === organization_id && w.id === workspace_id),
     installation: () =>
       db().installations.find(
@@ -638,7 +650,10 @@ function assertTransitionScope(
 ) {
   if (session.organization_id !== organizationId || session.workspace_id !== workspaceId)
     throw notFound("Connect session");
-  if (appInScope({ organization_id: organizationId, workspace_id: workspaceId, app_id: session.app_id }) !== app)
+  if (
+    session.app_id === null ||
+    appInScope({ organization_id: organizationId, workspace_id: workspaceId, app_id: session.app_id }) !== app
+  )
     throw notFound("App");
 }
 
@@ -750,12 +765,6 @@ function webhookSecret(env: Environment) {
   return `whsec_${env === "production" ? "live" : "test"}_${token(32)}`;
 }
 
-/** An integer query parameter clamped to 1..max; missing or not an integer means the default. */
-function clampedInt(url: URL, name: string, fallback: number, max: number): number {
-  const value = Number(url.searchParams.get(name) ?? fallback);
-  return Number.isInteger(value) ? Math.min(Math.max(value, 1), max) : fallback;
-}
-
 /** A tool list's cursor: the page's last name, base64url-encoded. */
 function encodeToolCursor(name: string): string {
   const binary = Array.from(new TextEncoder().encode(name), (b) => String.fromCharCode(b)).join("");
@@ -773,13 +782,6 @@ function toolCursorName(cursor: string): string {
   throw new ApiFailure(400, "validation_failed", "Some fields are invalid.", {
     cursor: "Not a cursor from this list.",
   });
-}
-
-function paginate<T>(items: T[], cursor: string | null, limit: number) {
-  const offset = cursor ? Number.parseInt(atob(cursor), 10) || 0 : 0;
-  const page = items.slice(offset, offset + limit);
-  const next = offset + limit < items.length ? btoa(String(offset + limit)) : null;
-  return { page, meta: { pagination: { next_cursor: next, total: items.length } } };
 }
 
 function findWebhook(access: OrgAccess, endpointId: WebhookEndpointId) {
@@ -1484,6 +1486,7 @@ export function createHandlers(apiBase: string) {
           else delete d.run_events[key];
         }
         d.runs = d.runs.filter((r) => !here(r));
+        deleteWorkspaceChannels(d, workspace);
         d.grants = d.grants.filter((g) => !here(g));
         d.agents = d.agents.filter((a) => !here(a));
         d.installations = d.installations.filter((i) => !here(i));
@@ -2065,8 +2068,38 @@ export function createHandlers(apiBase: string) {
         const access = workspaceAccess(request, param(params, "ws"));
         requireRole(access, DEVELOPERS, "start Connect sessions");
         assertConsoleMayAct(access, "connect accounts");
-        const input = await body(
-          request,
+        const json = await body(request, z.unknown());
+        if (typeof json === "object" && json !== null && "target" in json) {
+          // A channel session: it links a team, or installs an agent's app.
+          const channel = channelSessionTarget(access, json);
+          assertReturnUrl(access, channel.return_url);
+          const now = Date.now();
+          const reference = newReference();
+          const session: ConnectSessionRow = {
+            id: newId("connect_session"),
+            organization_id: access.org.id,
+            workspace_id: access.workspace.id,
+            reference_hash: await hashReference(reference),
+            environment: access.workspace.environment,
+            app_id: null,
+            target: channel.target,
+            configuration_version: 0,
+            intent: "create",
+            installation_id: null,
+            label: channel.label,
+            status: "pending",
+            return_url: channel.return_url,
+            requested_scopes: [],
+            created_at: new Date(now).toISOString(),
+            expires_at: new Date(now + 15 * MINUTE).toISOString(),
+            completed_at: null,
+            failure_code: null,
+          };
+          db().connect_sessions.unshift(session);
+          return created({ ...toConnectSession(session), url: `${window.location.origin}/connect/${reference}` });
+        }
+        const input = validated(
+          json,
           z.object({
             app_id: idOf("app"),
             intent: z.enum(["create", "reconnect"]),
@@ -2106,16 +2139,7 @@ export function createHandlers(apiBase: string) {
           }
           label = existing.label;
         }
-        if (input.return_url) {
-          const settings = db().connect_settings.find(
-            (c) => c.organization_id === access.org.id && c.environment === access.workspace.environment,
-          );
-          if (!settings?.return_urls.includes(input.return_url)) {
-            throw new ApiFailure(422, "return_url_not_allowed", "That return URL isn't on the allowlist.", {
-              return_url: `Add it to the ${access.workspace.environment} return URLs first.`,
-            });
-          }
-        }
+        assertReturnUrl(access, input.return_url);
         // Both already resolved within this organization and workspace by `availableApps`.
         const app = appInScope({
           organization_id: access.org.id,
@@ -2132,6 +2156,7 @@ export function createHandlers(apiBase: string) {
           reference_hash: await hashReference(reference),
           environment: access.workspace.environment,
           app_id: input.app_id,
+          target: null,
           configuration_version: config?.version ?? 1,
           intent: input.intent,
           installation_id: input.installation_id,
@@ -2175,6 +2200,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/connect/sessions/:reference/credentials"),
       route(async ({ request, params }) => {
         const session = await findSessionByReferenceCrossTenant(param(params, "reference"));
+        if (session.target) return ok(await submitChannelCredentials(session, request));
         assertSessionPending(session);
         const app = assertStillEligible(session);
         if (app.auth.type !== "token") {
@@ -2222,6 +2248,7 @@ export function createHandlers(apiBase: string) {
       u("/v1/connect/sessions/:reference/authorize"),
       route(async ({ params }) => {
         const session = await findSessionByReferenceCrossTenant(param(params, "reference"));
+        if (session.target) return ok(authorizeChannel(session, param(params, "reference")));
         assertSessionPending(session);
         const app = assertStillEligible(session);
         if (app.auth.type === "token") {
@@ -2247,6 +2274,10 @@ export function createHandlers(apiBase: string) {
       u("/v1/connect/sessions/:reference/simulate-consent"),
       route(async ({ params, request }) => {
         const session = await findSessionByReferenceCrossTenant(param(params, "reference"));
+        if (session.target) {
+          const consent = await body(request, z.object({ decision: z.enum(["approved", "denied"]) }).loose());
+          return ok(consentChannel(session, consent.decision));
+        }
         assertSessionPending(session);
         const app = assertStillEligible(session);
         const input = await body(
@@ -2367,6 +2398,8 @@ export function createHandlers(apiBase: string) {
         const row = findAgent(access, idParam(params, "agent"));
         const d = db();
         d.grants = d.grants.filter((g) => !(inWorkspace(g, access.workspace) && g.agent_id === row.id));
+        // Its apps are deleted with it, their connections disconnected.
+        deleteAgentChannels(d, row, new Date().toISOString());
         d.agents = d.agents.filter((a) => a !== row);
         audit(access, "agent.deleted", { type: "agent", id: row.id, name: row.name }, { workspace: access.workspace });
         return noContent();
@@ -2603,6 +2636,7 @@ export function createHandlers(apiBase: string) {
           agent_id: agent.id,
           session_id: newId("session"),
           trigger: access.kind === "api_key" ? "api" : "console",
+          channel: null,
           status: "queued",
           input: input.input,
           output: null,
@@ -3623,6 +3657,8 @@ export function createHandlers(apiBase: string) {
         return HttpResponse.json({ data: { reset: true }, meta: null, error: null });
       }),
     ),
+
+    ...createChannelHandlers(u, (session) => toConnectSession(session)),
   ];
 }
 

@@ -22,6 +22,7 @@ import type {
   WorkspaceId,
 } from "@zupflow/sdk";
 import { CATALOG, type CatalogEntry } from "./catalog";
+import { seedChannels } from "./channel-seed";
 import { newId } from "./ids";
 import type {
   AgentRow,
@@ -554,6 +555,16 @@ export function seed(nowMs: number = Date.now()): Db {
     webhook_events: [],
     webhook_deliveries: [],
     webhook_delivery_attempts: [],
+    channel_app_managers: [],
+    channel_apps: [],
+    channel_connections: [],
+    channel_conversations: [],
+    channel_people: [],
+    channel_messages: [],
+    agent_channels: [],
+    channel_tool_levels: [],
+    channel_settings: [],
+    channel_inbound_events: [],
     audit: [] as Db["audit"],
     idempotency_keys: [],
     // Secure randomness, not the seed's: this key is a secret.
@@ -689,6 +700,7 @@ export function seed(nowMs: number = Date.now()): Db {
     reference_hash: null,
     environment: "production",
     app_id: stripe.id,
+    target: null,
     configuration_version: 1,
     intent: "reconnect",
     installation_id: acmeBilling.id,
@@ -721,6 +733,7 @@ export function seed(nowMs: number = Date.now()): Db {
 
   seedLarkspur(db, nowMs);
   seedFernhill(db, nowMs);
+  seedChannels(db, nowMs);
   seedTools(db, nowMs, sandboxTaskboard);
   seedLevels(db, nowMs, { google, taskboard, stripe, github }, jordan.id);
   seedWebhookHistory(db, nowMs);
@@ -1215,6 +1228,7 @@ function seedLarkspur(db: Db, nowMs: number) {
     reference_hash: null,
     environment: "production",
     app_id: app.id,
+    target: null,
     configuration_version: 1,
     intent: "create",
     installation_id: installation.id,
@@ -1455,6 +1469,7 @@ function seedRuns(db: Db, rng: Rng, nowMs: number, specs: RunSeed[]) {
         agent_id: spec.agent.id,
         session_id: newId("session", { rng, at: createdMs }),
         trigger: rng() < 0.9 ? "api" : "console",
+        channel: null,
         status: "queued",
         input: spec.prompts[Math.floor(rng() * spec.prompts.length)] ?? "Hello",
         output: null,
@@ -1525,6 +1540,7 @@ function seedConnectSessions(
       reference_hash: null,
       environment: spec.ws.environment,
       app_id: spec.app.id,
+      target: null,
       configuration_version: spec.installation.configuration_version,
       intent: "create",
       installation_id: spec.installation.id,

@@ -14,6 +14,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { hostedFailure } from "@/features/connect/failure";
 import { ConnectFrame, ConnectOutcome } from "@/features/connect/frame";
 import { returnUrlFor, SessionEnded } from "@/features/connect/session-ended";
+import { connectSubject } from "@/features/connect/subject";
 import { useDocumentTitle } from "@/features/context";
 import { useHostedConnectSession } from "@/features/queries";
 import { api } from "@/lib/api";
@@ -36,7 +37,7 @@ function HostedConnectPage() {
   // The link's last segment is the session's reference: possession authorizes this page.
   const { reference } = Route.useParams();
   const session = useHostedConnectSession(reference);
-  useDocumentTitle(session.data ? `Connect ${session.data.app.name}` : "Connect");
+  useDocumentTitle(session.data?.app ? `Connect ${session.data.app.name}` : "Connect");
 
   // A failed re-read keeps the session it already had: it may still be pending.
   if (session.isError && !session.data) {
@@ -66,14 +67,30 @@ function HostedConnectPage() {
       </ConnectFrame>
     );
   }
+  const { app } = session.data;
+  if (app === null) {
+    // A channel session: linking a team or installing an agent's app has no page here yet.
+    return (
+      <ConnectFrame>
+        <ConnectOutcome
+          icon={<XCircleIcon className="size-9 text-destructive" />}
+          title={`${connectSubject(session.data)} can't be set up on this page yet`}
+          body="Nothing was changed. Start again from the app that sent you here."
+        />
+      </ConnectFrame>
+    );
+  }
   return (
     <ConnectFrame>
-      <ConnectBody session={session.data} reference={reference} />
+      <ConnectBody session={{ ...session.data, app }} reference={reference} />
     </ConnectFrame>
   );
 }
 
-function ConnectBody({ session, reference }: { session: ConnectSession; reference: string }) {
+/** An app's session: the only kind this page connects so far. */
+type AppConnectSession = ConnectSession & { app: NonNullable<ConnectSession["app"]> };
+
+function ConnectBody({ session, reference }: { session: AppConnectSession; reference: string }) {
   const queryClient = useQueryClient();
   const refresh = () => queryClient.invalidateQueries({ queryKey: qk.hostedConnect(reference) });
   const cancel = useMutation({ mutationFn: () => api.connect.cancel(reference), onSettled: refresh });
@@ -148,7 +165,7 @@ function OAuthStart({
   reference,
   onFailed,
 }: {
-  session: ConnectSession;
+  session: AppConnectSession;
   reference: string;
   /** Re-reads the session: a start the provider's side refused fails it, and the page shows why. */
   onFailed: () => Promise<void>;
@@ -183,6 +200,7 @@ function OAuthStart({
             : // The server's words are for the app's developer; the person here gets what they can do.
               hostedFailure({
                 app: session.app,
+                target: session.target,
                 failure_code: authorize.error instanceof ZupflowApiError ? authorize.error.code : null,
               }).body}
         </p>
@@ -208,7 +226,7 @@ function TokenForm({
   auth,
   onDone,
 }: {
-  session: ConnectSession;
+  session: AppConnectSession;
   reference: string;
   auth: TokenAuthTemplate;
   onDone: () => void;

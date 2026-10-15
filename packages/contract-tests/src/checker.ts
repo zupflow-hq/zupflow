@@ -55,6 +55,18 @@ export function createResponseChecker(options: ResponseCheckerOptions): Response
       }
       return;
     }
+    if (route.response.unwrapped && response.ok) {
+      // A provider's callback answers in the provider's format: the body is the data, with no envelope.
+      if (response.status !== route.response.status) {
+        violations.push(`${where}: answered ${response.status}, contract says ${route.response.status}`);
+      }
+      const raw: unknown = await response.json();
+      const parsed = route.response.data?.safeParse(raw);
+      if (parsed && !parsed.success) violations.push(`${where}: ${z.prettifyError(parsed.error)}`);
+      else if (parsed && !isDeepStrictEqual(parsed.data, raw)) violations.push(`${where}: fields beyond the contract`);
+      if (violations.length === before) succeeded.add(route.operationId);
+      return;
+    }
     const body = (await response.json()) as { data: unknown; meta: unknown; error: unknown };
     if (!response.ok) {
       const error = ApiErrorBody.safeParse(body.error);

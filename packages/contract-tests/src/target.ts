@@ -17,6 +17,12 @@
  */
 export type Persona = "owner" | "developer" | "viewer" | "outsider";
 
+/** What a channel provider holds for one generated app: where it delivers events, and the secret it signs them with. */
+export interface ChannelAppSecrets {
+  inbound_ref: string;
+  signing_secret: string;
+}
+
 export interface Target {
   /** Where the API is mounted; route paths are appended to it. */
   baseUrl: string;
@@ -32,6 +38,13 @@ export interface Target {
    * never sends that request.
    */
   operations?: readonly string[];
+  /**
+   * What the channel provider knows about one of the server's generated apps
+   * (`chapp_…`): read out of band, as the provider holds it, never through
+   * the API, which shows neither. Cases that deliver provider events are
+   * skipped, naming `receiveChannelEvent`, without it.
+   */
+  channelAppSecrets?: (app: string) => Promise<ChannelAppSecrets>;
 }
 
 /**
@@ -92,6 +105,16 @@ export interface Target {
  * - Connect settings with at least one return URL or allowed origin.
  * - Sandbox Connect settings that allow the return URL
  *   `http://localhost:3000/settings/integrations`.
+ * - Channels in `acme`, `beta-labs` and `acme-sandbox`: each a linked Slack
+ *   team (an `active` app manager), one agent's `installed` app with its
+ *   `connected` connection, that agent's channel on it with the defaults
+ *   except tools `read_thread`, `reply` and `send_message` (approval for
+ *   `send_message`), a person, and two conversations: `support` (a channel,
+ *   with a three-message thread, one message the agent's own) and a DM with
+ *   one message. In `acme-sandbox`, a second active agent with no app.
+ *   Channel tool levels and channel settings at their defaults (never saved).
+ *   The channel provider accepts any configuration token and refresh token,
+ *   and refuses one containing `invalid`.
  *
  * Organization `larkspur`, owned by the outsider, with workspaces `harbor`
  * (Production) and `harbor-sandbox` (Sandbox). In `harbor`: an agent with a
@@ -103,7 +126,7 @@ export interface Target {
  * than `INVITATION_TTL_DAYS` ago: expired. Each organization's real IDs are
  * aimed at the other.
  * The Production webhook has the same five delivery scenarios, all non-test
- * events belonging to `harbor`.
+ * events belonging to `harbor`. `harbor` has channels as `acme` does.
  *
  * Every Sandbox workspace the suite uses as one (`acme-sandbox`,
  * `qa-playground`, `harbor-sandbox`) offers at least one catalog app.

@@ -1,4 +1,5 @@
 import type { ConnectSession } from "@zupflow/sdk";
+import { connectSubject } from "./subject";
 
 /**
  * What the person on hosted Connect can do after a failure: start again from
@@ -20,9 +21,9 @@ const FROM = "the app that sent you here";
  * their account: they aren't the developer, can't change the app's setup,
  * and only need to know whether starting again can help.
  */
-export function hostedFailure(session: Pick<ConnectSession, "app" | "failure_code">): HostedFailure {
-  const app = session.app.name;
-  const mcp = session.app.auth_type === "mcp_oauth";
+export function hostedFailure(session: Pick<ConnectSession, "app" | "target" | "failure_code">): HostedFailure {
+  const app = connectSubject(session);
+  const mcp = session.app?.auth_type === "mcp_oauth";
   switch (session.failure_code) {
     case "consent_denied":
       return {

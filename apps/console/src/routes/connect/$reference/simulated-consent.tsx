@@ -9,6 +9,7 @@ import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { ConnectFrame } from "@/features/connect/frame";
+import { connectSubject } from "@/features/connect/subject";
 import { useHostedConnectSession } from "@/features/queries";
 import { config } from "@/lib/env";
 import { errorMessage } from "@/lib/errors";
@@ -77,9 +78,9 @@ function SimulatedConsentPage() {
           }}
         >
           <div className="flex items-center gap-3">
-            <AppIcon icon={session.data.app.icon} size="lg" />
+            <AppIcon icon={session.data.app?.icon ?? { glyph: "#", color: "#64748b" }} size="lg" />
             <div>
-              <h1 className="font-semibold">Sign in to {session.data.app.name}</h1>
+              <h1 className="font-semibold">Sign in to {connectSubject(session.data)}</h1>
               <p className="text-sm text-muted-foreground">to continue to the requesting app</p>
             </div>
           </div>

@@ -8,10 +8,17 @@
  */
 import { INVITATION_TTL_DAYS, matchRoute, routes, WEBHOOK_EVENT_TYPES } from "@zupflow/contract";
 import {
+  type AgentChannel,
   type AgentId,
   type ApiKeyId,
   type AppId,
   type AuthTemplate,
+  agentChannelDefaults,
+  CHANNEL_SETTINGS_DEFAULTS,
+  CHANNEL_TOOL_NAMES,
+  CHANNEL_TOOLS,
+  type ChannelAppId,
+  type ChannelAppManagerConnectResult,
   type CreateConnectSessionInput,
   createClient,
   createHttpTransport,
@@ -19,7 +26,9 @@ import {
   type MemberId,
   type ModelConnectionId,
   type OrganizationId,
+  type PutAgentChannelInput,
   type UpdateAppInput,
+  type UpdateChannelToolLevelsInput,
   type UpdateInstallationInput,
   type WebhookDeliveryId,
   type WebhookDeliverySummary,
@@ -44,6 +53,36 @@ async function failure(promise: Promise<unknown>) {
     throw error;
   }
   throw new Error("Expected the request to fail");
+}
+
+/** A Slack configuration token and its refresh token: the fixture's provider accepts any without `invalid`. */
+const TOKENS = {
+  configuration_token: "xoxe.xoxp-1-contract-token-0001",
+  refresh_token: "xoxe-1-contract-refresh-0001",
+} as const;
+
+/** An agent channel's settings, as `put` takes them. */
+const settingsOf = ({
+  id: _id,
+  workspace_id: _workspace,
+  agent_id: _agent,
+  connection_id: _connection,
+  created_at: _created,
+  updated_at: _updated,
+  ...settings
+}: AgentChannel): PutAgentChannelInput => settings;
+
+/**
+ * Slack's request signature, computed here independently of any server: `v0=`
+ * and the hex HMAC-SHA256 of `v0:{timestamp}:{body}` under the signing secret.
+ */
+async function slackSignature(secret: string, timestamp: string, body: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [
+    "sign",
+  ]);
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(`v0:${timestamp}:${body}`)));
+  return `v0=${Array.from(mac, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
 /** The hosted Connect reference: the last segment of the session's link. */
@@ -150,6 +189,75 @@ export function contractSuite(target: Target) {
       return loadTenant(owner, fx.organization, "beta-labs", "qa-playground");
     };
     const larkspur = () => loadTenant(as("outsider"), fx.otherOrganization, "harbor", "harbor-sandbox");
+
+    /** What the channel provider holds for an app: skips the case, naming the operation, when the target can't say. */
+    const secretsOf = async (app: ChannelAppId) => {
+      if (!target.channelAppSecrets) throw new NotServed("receiveChannelEvent");
+      return target.channelAppSecrets(app);
+    };
+    /**
+     * Delivers a provider event to an app's inbound endpoint as Slack would:
+     * signed with the app's signing secret and the current time, unless the
+     * case says otherwise.
+     */
+    const deliver = async (
+      app: ChannelAppId,
+      event: Record<string, unknown>,
+      sent: { secret?: string; timestamp?: number; ref?: string } = {},
+    ) => {
+      const secrets = await secretsOf(app);
+      const raw = JSON.stringify(event);
+      const timestamp = String(sent.timestamp ?? Math.floor(Date.now() / 1000));
+      return servedFetch(`${target.baseUrl}/channels/inbound/${sent.ref ?? secrets.inbound_ref}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Slack-Request-Timestamp": timestamp,
+          "X-Slack-Signature": await slackSignature(sent.secret ?? secrets.signing_secret, timestamp, raw),
+        },
+        body: raw,
+      });
+    };
+    /** An app read until its job has made it (or failed): a server makes it after answering `202`. */
+    const madeApp = async (workspaceId: WorkspaceId, app: ChannelAppId) => {
+      for (let attempt = 0; attempt < 50; attempt++) {
+        const read = await owner.channelApps.get(workspaceId, app);
+        if (read.status !== "creating") return read;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      throw new Error(`${app} is still being made`);
+    };
+    /** A workspace's fixture channel: its linked team, the installed app, its connection and the agent's channel. */
+    const installedIn = async (workspaceId: WorkspaceId, client: ZupflowClient = owner) => {
+      const connection = must(
+        (await client.channelConnections.list(workspaceId, { limit: 100 })).items.find((c) => c.status === "connected"),
+        "connected channel connection",
+      );
+      const app = await client.channelApps.get(workspaceId, must(connection.app_id, "the connection's app"));
+      const agentId = must(connection.agent_id, "the connection's agent");
+      return {
+        connection,
+        app,
+        agentId,
+        manager: await client.channelAppManagers.get(workspaceId, app.manager_id),
+        agentChannel: must(
+          (await client.agentChannels.list(workspaceId, agentId)).find((c) => c.connection_id === connection.id),
+          "the agent's channel",
+        ),
+        conversations: (await client.channelConnections.conversations(workspaceId, connection.id, { limit: 100 }))
+          .items,
+      };
+    };
+    /** An active agent of the workspace with no app yet. */
+    const applessAgent = async (workspaceId: WorkspaceId) => {
+      const apps = (await owner.channelApps.list(workspaceId, { limit: 100 })).items;
+      return must(
+        (await owner.agents.list(workspaceId)).find(
+          (a) => a.status === "active" && !apps.some((p) => p.agent_id === a.id),
+        ),
+        "active agent with no app",
+      );
+    };
 
     beforeEach(async () => {
       await target.reset();
@@ -394,6 +502,55 @@ export function contractSuite(target: Target) {
         await owner.agents.delete(sandbox.id, modelled.id);
         await owner.models.delete(org, model.id);
         await owner.modelConnections.delete(org, connection.id);
+
+        // Channels: a team linked and an agent's app made in the Sandbox, then the fixture's install read and
+        // changed, then removals.
+        await owner.channelAppManagers.list(sandbox.id);
+        const manager = await owner.channelAppManagers.create(sandbox.id, {
+          provider: "slack",
+          method: "configuration_token",
+          ...TOKENS,
+        });
+        await owner.channelAppManagers.get(sandbox.id, manager.id);
+        await owner.channelAppManagers.update(sandbox.id, manager.id, TOKENS);
+        const channelAgent = await owner.agents.create(sandbox.id, {
+          name: "Contract channel",
+          description: "",
+          instructions: "Be brief.",
+        });
+        const channelApp = await owner.channelApps.create(sandbox.id, {
+          agent_id: channelAgent.id,
+          manager_id: manager.id,
+        });
+        await owner.channelApps.list(sandbox.id);
+        await owner.channelApps.get(sandbox.id, channelApp.id);
+        const installed = await installedIn(sandbox.id);
+        await owner.channelConnections.get(sandbox.id, installed.connection.id);
+        await owner.channelConnections.update(sandbox.id, installed.connection.id, {
+          label: installed.connection.label,
+        });
+        const conversation = must(installed.conversations[0], "conversation in acme-sandbox");
+        await owner.channelConnections.messages(sandbox.id, installed.connection.id, conversation.id);
+        await owner.agentChannels.put(
+          sandbox.id,
+          installed.agentId,
+          installed.connection.id,
+          settingsOf(installed.agentChannel),
+        );
+        await owner.channelSettings.toolLevels(org);
+        await owner.channelSettings.setToolLevels(org, {
+          provider: "slack",
+          levels: [{ tool: "react", level: "allow" }],
+        });
+        await owner.channelSettings.get(org);
+        await owner.channelSettings.update(org, CHANNEL_SETTINGS_DEFAULTS);
+        await owner.agentChannels.delete(sandbox.id, installed.agentId, installed.connection.id);
+        await owner.channelConnections.delete(sandbox.id, installed.connection.id);
+        await owner.channelApps.delete(sandbox.id, channelApp.id);
+        await owner.channelAppManagers.delete(sandbox.id, manager.id);
+        await owner.agents.delete(sandbox.id, channelAgent.id);
+        // The provider's endpoint last: it needs what the provider knows of an app, which only the target can say.
+        await deliver(installed.app.id, { type: "url_verification", challenge: "contract" });
       }
     });
 
@@ -1383,7 +1540,7 @@ export function contractSuite(target: Target) {
             return_url: null,
           });
           expect(session.requested_scopes).toEqual(["read", "write"]);
-          expect(session.app.auth_type).toBe("mcp_oauth");
+          expect(session.app?.auth_type).toBe("mcp_oauth");
           const pasted = await failure(
             owner.connect.submitCredentials(referenceOf(session), { values: { token: "t" } }),
           );
@@ -2559,6 +2716,7 @@ export function contractSuite(target: Target) {
           expect(row.event.data).toMatchObject({
             status: "completed",
             installation_id: result.installation.id,
+            target: null,
             failure_code: null,
           });
         expect(snapshots.find((row) => row.event.type === "connect_session.failed")?.event.data).toEqual({
@@ -2566,6 +2724,7 @@ export function contractSuite(target: Target) {
           id: cancelled.id,
           status: "cancelled",
           installation_id: null,
+          target: null,
           failure_code: null,
         });
         await owner.workspaces.update(qa(), { external_id: "lifecycle-renamed" });
@@ -3571,6 +3730,689 @@ export function contractSuite(target: Target) {
       });
     });
 
+    describe("channels", () => {
+      const sandbox = () => fx.workspaces.acmeSandbox.id;
+      const link = (workspaceId: WorkspaceId, client: ZupflowClient = owner, tokens: typeof TOKENS = TOKENS) =>
+        client.channelAppManagers.create(workspaceId, { provider: "slack", method: "configuration_token", ...tokens });
+      /** A refusal as `status code`, or `succeeded`. */
+      const answer = async (promise: Promise<unknown>) => {
+        try {
+          await promise;
+          return "succeeded";
+        } catch (error) {
+          if (!(error instanceof ZupflowApiError)) throw error;
+          return `${error.status} ${error.code}`;
+        }
+      };
+      /** An answer from the provider's endpoint, as `status code` for a refusal. */
+      const delivered = async (response: Response) => {
+        const body = (await response.json()) as { error?: { code: string } };
+        return response.ok ? body : `${response.status} ${body.error?.code}`;
+      };
+
+      it("links a team through hosted Connect, checking its tokens with the provider first", async () => {
+        // Channel sessions need a server that serves channels; one that serves only app sessions skips this.
+        const managers = (await owner.channelAppManagers.list(sandbox(), { limit: 100 })).items;
+        const hook = (
+          await owner.webhooks.create(fx.organization, {
+            environment: "sandbox",
+            url: "https://hooks.northwind.example/channels",
+            description: "Channels",
+            events: ["channel_app_manager.status_changed", "connect_session.completed"],
+          })
+        ).endpoint;
+        const session = await owner.connectSessions.create(sandbox(), {
+          target: { kind: "channel_app_manager", provider: "slack" },
+          return_url: null,
+        });
+        expect([session.app, session.target]).toEqual([
+          null,
+          { kind: "channel_app_manager", provider: "slack", manager: null },
+        ]);
+        const reference = referenceOf(session);
+        expect((await owner.connect.get(reference)).target).toEqual(session.target);
+        // A team is linked by pasting tokens, never through the provider's consent page.
+        expect(await answer(owner.connect.authorize(reference))).toBe("422 wrong_auth_type");
+        const refused = await failure(
+          owner.connect.submitCredentials(reference, {
+            values: { configuration_token: "xoxe.xoxp-1-invalid-0000", refresh_token: TOKENS.refresh_token },
+          }),
+        );
+        expect([refused.status, refused.code, Object.keys(refused.fields ?? {})]).toEqual([
+          422,
+          "invalid_configuration_token",
+          ["configuration_token"],
+        ]);
+        expect((await owner.channelAppManagers.list(sandbox(), { limit: 100 })).items).toEqual(managers);
+
+        const result = await owner.connect.submitCredentials<ChannelAppManagerConnectResult>(reference, {
+          values: { ...TOKENS },
+        });
+        const manager = result.channel_app_manager;
+        expect(result.session.status).toBe("completed");
+        expect(result.session.target).toEqual({ kind: "channel_app_manager", provider: "slack", manager: manager.id });
+        expect(manager).toMatchObject({
+          workspace_id: sandbox(),
+          provider: "slack",
+          method: "configuration_token",
+          status: "active",
+          app_count: 0,
+          configuration_token: { set: true, last4: TOKENS.configuration_token.slice(-4) },
+        });
+        expect(await owner.channelAppManagers.get(sandbox(), manager.id)).toEqual(manager);
+        const shown = JSON.stringify([result, await owner.channelAppManagers.list(sandbox(), { limit: 100 })]);
+        expect(shown).not.toContain(TOKENS.configuration_token);
+        expect(shown).not.toContain(TOKENS.refresh_token);
+        expect(await answer(owner.connect.submitCredentials(reference, { values: { ...TOKENS } }))).toBe(
+          "409 session_not_pending",
+        );
+        // A backend learns what the session linked from its events, without polling.
+        const deliveries = (await owner.webhooks.deliveries(fx.organization, hook.id, { limit: 100 })).items;
+        const events = await Promise.all(
+          deliveries.map(async (d) => (await owner.webhooks.delivery(fx.organization, hook.id, d.id)).event),
+        );
+        // Both events can share a millisecond, so their delivery order isn't fixed.
+        const byType = events.map((e) => [e.type, e.data]).sort(([a], [b]) => String(a).localeCompare(String(b)));
+        expect(byType).toEqual([
+          ["channel_app_manager.status_changed", { object: "channel_app_manager", id: manager.id, status: "active" }],
+          [
+            "connect_session.completed",
+            {
+              object: "connect_session",
+              id: session.id,
+              status: "completed",
+              installation_id: null,
+              target: { kind: "channel_app_manager", provider: "slack", manager: manager.id },
+              failure_code: null,
+            },
+          ],
+        ]);
+      });
+
+      it("makes an agent's app, then offers its install on the provider's page", async () => {
+        const ws = sandbox();
+        const { manager } = await installedIn(ws);
+        const agent = await applessAgent(ws);
+        const accepted = await owner.channelApps.create(ws, { agent_id: agent.id, manager_id: manager.id });
+        expect(accepted).toMatchObject({
+          workspace_id: ws,
+          agent_id: agent.id,
+          manager_id: manager.id,
+          provider: "slack",
+          status: "creating",
+          connection_id: null,
+        });
+        const app = await madeApp(ws, accepted.id);
+        expect(app.status).toBe("awaiting_install");
+        expect(app.external_app_id).not.toBeNull();
+        expect((await owner.channelAppManagers.get(ws, manager.id)).app_count).toBe(2);
+        // One live app per agent in a team.
+        expect(await answer(owner.channelApps.create(ws, { agent_id: agent.id, manager_id: manager.id }))).toBe(
+          "409 channel_app_exists",
+        );
+        expect((await owner.channelApps.list(ws, { agent_id: agent.id })).items.map((a) => a.id)).toEqual([app.id]);
+        expect((await owner.channelApps.list(ws, { manager_id: manager.id })).items.map((a) => a.id)).toContain(app.id);
+
+        const session = await owner.connectSessions.create(ws, {
+          target: { kind: "channel_app", app: app.id },
+          return_url: null,
+        });
+        expect([session.app, session.target, session.label]).toEqual([
+          null,
+          { kind: "channel_app", provider: "slack", app: app.id, connection: null },
+          agent.name,
+        ]);
+        const reference = referenceOf(session);
+        // An app is installed by allowing it on the provider's page, never with pasted tokens.
+        expect(await answer(owner.connect.submitCredentials(reference, { values: { ...TOKENS } }))).toBe(
+          "422 wrong_auth_type",
+        );
+        expect((await owner.connect.authorize(reference)).authorization_url).toMatch(/^https?:\/\//);
+        expect((await owner.connect.get(reference)).status).toBe("pending");
+      });
+
+      it("never links teams or makes apps from the Console in Production; the backend's key does", async () => {
+        const acme = fx.workspaces.acme.id;
+        const { manager, app, connection, agentId } = await installedIn(acme);
+        const agent = await applessAgent(acme);
+        const before = JSON.stringify([
+          await owner.channelAppManagers.list(acme, { limit: 100 }),
+          await owner.channelApps.list(acme, { limit: 100 }),
+        ]);
+        for (const attempt of [
+          () => link(acme),
+          () => owner.channelAppManagers.update(acme, manager.id, TOKENS),
+          () => owner.channelApps.create(acme, { agent_id: agent.id, manager_id: manager.id }),
+          () =>
+            owner.connectSessions.create(acme, {
+              target: { kind: "channel_app_manager", provider: "slack" },
+              return_url: null,
+            }),
+          () => owner.connectSessions.create(acme, { target: { kind: "channel_app", app: app.id }, return_url: null }),
+        ]) {
+          expect(await answer(attempt())).toBe("403 console_read_only_in_production");
+        }
+        expect(
+          JSON.stringify([
+            await owner.channelAppManagers.list(acme, { limit: 100 }),
+            await owner.channelApps.list(acme, { limit: 100 }),
+          ]),
+        ).toBe(before);
+
+        const production = withKey(
+          (await owner.apiKeys.create(fx.organization, { name: "Channels backend", environment: "production" })).secret,
+        );
+        const linked = await link(acme, production);
+        expect([linked.status, linked.created_by]).toEqual(["active", null]);
+        expect((await production.channelAppManagers.update(acme, manager.id, TOKENS)).status).toBe("active");
+        expect((await production.channelApps.create(acme, { agent_id: agent.id, manager_id: linked.id })).status).toBe(
+          "creating",
+        );
+        const session = await production.connectSessions.create(acme, {
+          target: { kind: "channel_app_manager", provider: "slack" },
+          return_url: null,
+        });
+        expect(session.environment).toBe("production");
+
+        // A key reaches its own environment's channels only, and never another organization's.
+        const sandboxKey = withKey(
+          (await owner.apiKeys.create(fx.organization, { name: "Channels sandbox", environment: "sandbox" })).secret,
+        );
+        const own = await installedIn(sandbox());
+        const harbor = await larkspur();
+        const foreign = must(harbor.channel, "harbor's channels");
+        // Channels only: the keys' own use is recorded, rightly, on the organization's key list.
+        const unchanged = async () => {
+          const outsider = as("outsider");
+          const hw = harbor.workspace.id;
+          return JSON.stringify([
+            (await owner.channelAppManagers.list(acme, { limit: 100 })).items,
+            (await owner.channelApps.list(acme, { limit: 100 })).items,
+            (await owner.channelConnections.list(acme, { limit: 100 })).items,
+            await owner.agentChannels.list(acme, agentId),
+            (await owner.channelAppManagers.list(sandbox(), { limit: 100 })).items,
+            (await outsider.channelAppManagers.list(hw, { limit: 100 })).items,
+            (await outsider.channelConnections.messages(hw, foreign.connection.id, foreign.conversation.id)).items,
+          ]);
+        };
+        const beforeKeys = await unchanged();
+        for (const [what, attempt] of [
+          ["list managers", () => sandboxKey.channelAppManagers.list(acme)],
+          ["link a team", () => link(acme, sandboxKey)],
+          ["get manager", () => sandboxKey.channelAppManagers.get(acme, manager.id)],
+          ["replace tokens", () => sandboxKey.channelAppManagers.update(acme, manager.id, TOKENS)],
+          ["unlink team", () => sandboxKey.channelAppManagers.delete(acme, manager.id)],
+          ["list apps", () => sandboxKey.channelApps.list(acme)],
+          ["get app", () => sandboxKey.channelApps.get(acme, app.id)],
+          ["delete app", () => sandboxKey.channelApps.delete(acme, app.id)],
+          ["list connections", () => sandboxKey.channelConnections.list(acme)],
+          ["get connection", () => sandboxKey.channelConnections.get(acme, connection.id)],
+          ["rename connection", () => sandboxKey.channelConnections.update(acme, connection.id, { label: "Moved" })],
+          ["conversations", () => sandboxKey.channelConnections.conversations(acme, connection.id)],
+          ["agent channels", () => sandboxKey.agentChannels.list(acme, agentId)],
+          ["remove agent channel", () => sandboxKey.agentChannels.delete(acme, agentId, connection.id)],
+          ["Production key, Sandbox connection", () => production.channelConnections.get(sandbox(), own.connection.id)],
+          ["Production key, Sandbox team", () => production.channelAppManagers.delete(sandbox(), own.manager.id)],
+          [
+            "Production key, Sandbox app install",
+            () =>
+              production.connectSessions.create(sandbox(), {
+                target: { kind: "channel_app", app: own.app.id },
+                return_url: null,
+              }),
+          ],
+          [
+            "other organization's team",
+            () => production.channelAppManagers.get(harbor.workspace.id, foreign.manager.id),
+          ],
+          [
+            "other organization's messages",
+            () =>
+              production.channelConnections.messages(
+                harbor.workspace.id,
+                foreign.connection.id,
+                foreign.conversation.id,
+              ),
+          ],
+          [
+            "other organization's team through own workspace",
+            () => production.channelAppManagers.update(acme, foreign.manager.id, TOKENS),
+          ],
+        ] as const) {
+          expect(await answer(attempt()), what).toBe("404 not_found");
+        }
+        expect(await unchanged(), "channels after the other environment's and organization's attempts").toBe(
+          beforeKeys,
+        );
+
+        // Organization settings: keys read them; only the Console's admins change them.
+        expect(await production.channelSettings.get(fx.organization)).toEqual(
+          await owner.channelSettings.get(fx.organization),
+        );
+        expect(await sandboxKey.channelSettings.toolLevels(fx.organization)).toEqual(
+          await owner.channelSettings.toolLevels(fx.organization),
+        );
+        for (const attempt of [
+          () => production.channelSettings.update(fx.organization, CHANNEL_SETTINGS_DEFAULTS),
+          () =>
+            production.channelSettings.setToolLevels(fx.organization, {
+              provider: "slack",
+              levels: [{ tool: "react", level: "deny" }],
+            }),
+        ]) {
+          expect(await answer(attempt())).toBe("403 console_only");
+        }
+      });
+
+      it("keeps tokens write-only and refuses ones the provider refuses", async () => {
+        const ws = sandbox();
+        const first = { configuration_token: "xoxe.xoxp-1-write-only-9f3k", refresh_token: "xoxe-1-refresh-a8d2" };
+        const second = { configuration_token: "xoxe.xoxp-1-replaced-q7w2", refresh_token: "xoxe-1-refresh-c4v6" };
+        const manager = await link(ws, owner, first as typeof TOKENS);
+        expect(manager.configuration_token).toMatchObject({ set: true, last4: "9f3k" });
+        const replaced = await owner.channelAppManagers.update(ws, manager.id, second);
+        expect(replaced.configuration_token).toMatchObject({ set: true, last4: "q7w2" });
+        const refusedCreate = await failure(
+          link(ws, owner, { ...TOKENS, configuration_token: "xoxe.xoxp-1-invalid-1111" } as unknown as typeof TOKENS),
+        );
+        expect([refusedCreate.status, refusedCreate.code, Object.keys(refusedCreate.fields ?? {})]).toEqual([
+          422,
+          "invalid_configuration_token",
+          ["configuration_token"],
+        ]);
+        expect(
+          await answer(
+            owner.channelAppManagers.update(ws, manager.id, { ...second, configuration_token: "xoxe.invalid-2222" }),
+          ),
+        ).toBe("422 invalid_configuration_token");
+        expect(await answer(owner.channelAppManagers.update(ws, manager.id, { ...second, refresh_token: "" }))).toBe(
+          "400 validation_failed",
+        );
+        expect((await owner.channelAppManagers.get(ws, manager.id)).configuration_token.last4).toBe("q7w2");
+        expect((await owner.channelAppManagers.list(ws, { limit: 100 })).items).toHaveLength(2);
+        const shown = JSON.stringify([
+          await owner.channelAppManagers.list(ws, { limit: 100 }),
+          await owner.channelApps.list(ws, { limit: 100 }),
+          await owner.channelConnections.list(ws, { limit: 100 }),
+          await owner.audit.list(fx.organization, { limit: 100 }),
+        ]);
+        for (const value of [...Object.values(first), ...Object.values(second)]) expect(shown).not.toContain(value);
+      });
+
+      it("unlinks a team only once its apps are gone, and a removed app reads as 404", async () => {
+        const ws = sandbox();
+        const { manager, app, connection, agentId, conversations } = await installedIn(ws);
+        expect(await answer(owner.channelAppManagers.delete(ws, manager.id))).toBe("409 in_use");
+        await owner.channelApps.delete(ws, app.id);
+        expect(await answer(owner.channelApps.get(ws, app.id))).toBe("404 not_found");
+        expect(await answer(owner.channelApps.delete(ws, app.id))).toBe("404 not_found");
+        expect((await owner.channelApps.list(ws, { limit: 100 })).items.map((a) => a.id)).not.toContain(app.id);
+        // Its connection is disconnected, its history kept, and the agent's channel on it removed.
+        expect((await owner.channelConnections.get(ws, connection.id)).status).toBe("disconnected");
+        const conversation = must(conversations[0], "conversation");
+        expect((await owner.channelConnections.messages(ws, connection.id, conversation.id)).items).not.toEqual([]);
+        expect((await owner.agentChannels.list(ws, agentId)).map((c) => c.connection_id)).not.toContain(connection.id);
+        expect(await answer(owner.agentChannels.put(ws, agentId, connection.id, agentChannelDefaults()))).toBe(
+          "409 channel_connection_disconnected",
+        );
+        expect((await owner.channelAppManagers.get(ws, manager.id)).app_count).toBe(0);
+        await owner.channelAppManagers.delete(ws, manager.id);
+        expect(await answer(owner.channelAppManagers.get(ws, manager.id))).toBe("404 not_found");
+      });
+
+      it("removes a connection with its history, and its app waits to be installed again", async () => {
+        const ws = sandbox();
+        const { app, connection, agentId, conversations } = await installedIn(ws);
+        await owner.channelConnections.delete(ws, connection.id);
+        expect(await answer(owner.channelConnections.get(ws, connection.id))).toBe("404 not_found");
+        expect(await answer(owner.channelConnections.conversations(ws, connection.id))).toBe("404 not_found");
+        const conversation = must(conversations[0], "conversation");
+        expect(await answer(owner.channelConnections.messages(ws, connection.id, conversation.id))).toBe(
+          "404 not_found",
+        );
+        expect(await owner.channelApps.get(ws, app.id)).toMatchObject({
+          status: "awaiting_install",
+          connection_id: null,
+        });
+        expect((await owner.agentChannels.list(ws, agentId)).map((c) => c.connection_id)).not.toContain(connection.id);
+      });
+
+      it("deletes an agent's apps with the agent", async () => {
+        const ws = sandbox();
+        const { manager, app, connection, agentId } = await installedIn(ws);
+        await owner.agents.delete(ws, agentId);
+        expect(await answer(owner.channelApps.get(ws, app.id))).toBe("404 not_found");
+        expect((await owner.channelConnections.get(ws, connection.id)).status).toBe("disconnected");
+        expect((await owner.channelAppManagers.get(ws, manager.id)).app_count).toBe(0);
+        expect(await answer(owner.agentChannels.list(ws, agentId))).toBe("404 not_found");
+      });
+
+      it("holds an agent's channel to the organization's tool levels and its own rules", async () => {
+        const ws = sandbox();
+        const { connection, agentId, agentChannel, conversations } = await installedIn(ws);
+        const beta = must((await betaLabs()).channel, "beta-labs channels");
+        const harbor = must((await larkspur()).channel, "harbor channels");
+        const base = agentChannelDefaults();
+        const put = (change: Partial<PutAgentChannelInput>, agent: AgentId = agentId) =>
+          owner.agentChannels.put(ws, agent, connection.id, { ...base, ...change });
+        const before = await owner.agentChannels.list(ws, agentId);
+        for (const [change, refused] of [
+          [{ tools: ["post_anywhere"] }, "422 unknown_tool"],
+          [{ tools: ["reply"], approval_required: ["react"] }, "422 approval_outside_grant"],
+          [{ tools: ["delete_message"] }, "422 tool_denied"],
+          [{ tools: ["send_message"] }, "422 approval_required_by_policy"],
+          [{ senders: "listed", sender_list: [] }, "422 sender_list_required"],
+          [{ senders: "listed", sender_list: ["dana@acme.example", "DANA@acme.example"] }, "422 duplicate_sender"],
+          // Another workspace's conversation, or another organization's, is one this connection hasn't seen.
+          [{ audience: "listed", audience_conversations: [beta.conversation.id] }, "422 unknown_conversation"],
+          [{ audience: "listed", audience_conversations: [harbor.conversation.id] }, "422 unknown_conversation"],
+          [{ max_agent_hops: 6 }, "400 validation_failed"],
+          [{ max_agent_hops: 0 }, "400 validation_failed"],
+          [{ senders: "listed", sender_list: ["not an address"] }, "400 validation_failed"],
+          [{ persona: { name: "Scribe", avatar_url: "http://cdn.acme.example/scribe.png" } }, "400 validation_failed"],
+          [{ persona: { name: " ", avatar_url: null } }, "400 validation_failed"],
+          [
+            {
+              senders: "listed",
+              sender_list: Array.from({ length: 501 }, (_, i) => `person${i}@acme.example`),
+            },
+            "400 validation_failed",
+          ],
+        ] as [Partial<PutAgentChannelInput>, string][]) {
+          expect(await answer(put(change)), JSON.stringify(change)).toBe(refused);
+        }
+        expect(await owner.agentChannels.list(ws, agentId)).toEqual(before);
+
+        const support = must(
+          conversations.find((c) => c.kind === "channel"),
+          "channel conversation",
+        );
+        const input: PutAgentChannelInput = {
+          ...base,
+          tools: ["read_thread", "reply", "send_message"],
+          approval_required: ["send_message"],
+          audience: "listed",
+          audience_conversations: [support.id],
+          persona: { name: "Scribe", avatar_url: null },
+          thread_follow_up: "always",
+          agent_messages: "mentions",
+          max_agent_hops: 5,
+          mid_run: "collect",
+          senders: "listed",
+          sender_list: ["dana@acme.example"],
+          reply_with_output: false,
+        };
+        const saved = await owner.agentChannels.put(ws, agentId, connection.id, input);
+        expect(saved).toMatchObject({ id: agentChannel.id, agent_id: agentId, connection_id: connection.id, ...input });
+        expect(await owner.agentChannels.list(ws, agentId)).toContainEqual(saved);
+
+        // The organization's levels decide: allowed, a tool needs no approval; denied, it can't be given.
+        await owner.channelSettings.setToolLevels(fx.organization, {
+          provider: "slack",
+          levels: [
+            { tool: "send_message", level: "allow" },
+            { tool: "reply", level: "deny" },
+          ],
+        });
+        expect(await answer(put({ tools: ["send_message"] }))).toBe("succeeded");
+        expect(await answer(put({ tools: ["reply"] }))).toBe("422 tool_denied");
+
+        // Only the agent whose app it is has a channel on a connection.
+        const other = await applessAgent(ws);
+        expect(await answer(put({}, other.id))).toBe("422 not_agents_app");
+        await owner.agentChannels.delete(ws, agentId, connection.id);
+        expect(await answer(owner.agentChannels.delete(ws, agentId, connection.id))).toBe("404 not_found");
+        expect((await owner.agentChannels.list(ws, agentId)).map((c) => c.connection_id)).not.toContain(connection.id);
+        expect(await answer(put({}))).toBe("succeeded");
+      });
+
+      it("keeps channel tool levels and settings at Zupflow's defaults until an admin saves them", async () => {
+        const org = fx.organization;
+        const levels = await owner.channelSettings.toolLevels(org);
+        expect(levels.map((l) => [l.provider, l.tool, l.level, l.effect, l.confirmed, l.updated_at])).toEqual(
+          CHANNEL_TOOL_NAMES.map((tool) => [
+            "slack",
+            tool,
+            CHANNEL_TOOLS[tool].level,
+            CHANNEL_TOOLS[tool].effect,
+            false,
+            null,
+          ]),
+        );
+        const settings = await owner.channelSettings.get(org);
+        expect(settings).toEqual({
+          organization_id: org,
+          ...CHANNEL_SETTINGS_DEFAULTS,
+          updated_at: null,
+          updated_by: null,
+        });
+
+        // Developers read them; only admins change them.
+        const developer = as("developer");
+        expect(await developer.channelSettings.get(org)).toEqual(settings);
+        expect(await developer.channelSettings.toolLevels(org)).toEqual(levels);
+        expect(
+          await answer(developer.channelSettings.update(org, { ...CHANNEL_SETTINGS_DEFAULTS, breaker_runs: 5 })),
+        ).toBe("403 forbidden");
+        expect(
+          await answer(
+            developer.channelSettings.setToolLevels(org, {
+              provider: "slack",
+              levels: [{ tool: "react", level: "deny" }],
+            }),
+          ),
+        ).toBe("403 forbidden");
+
+        for (const [input, refused] of [
+          [{ provider: "slack", levels: [{ tool: "post_anywhere", level: "allow" }] }, "422 unknown_tool"],
+          [{ provider: "slack", levels: [] }, "400 validation_failed"],
+          [
+            {
+              provider: "slack",
+              levels: [
+                { tool: "react", level: "allow" },
+                { tool: "react", level: "deny" },
+              ],
+            },
+            "400 validation_failed",
+          ],
+        ] as [UpdateChannelToolLevelsInput, string][]) {
+          expect(await answer(owner.channelSettings.setToolLevels(org, input)), JSON.stringify(input)).toBe(refused);
+        }
+        for (const change of [
+          { breaker_runs: 0 },
+          { breaker_runs: 201 },
+          { breaker_window_minutes: 1441 },
+          { breaker_pause_minutes: 0 },
+          { message_retention_days: 366 },
+        ]) {
+          expect(
+            await answer(owner.channelSettings.update(org, { ...CHANNEL_SETTINGS_DEFAULTS, ...change })),
+            JSON.stringify(change),
+          ).toBe("400 validation_failed");
+        }
+        expect(await owner.channelSettings.toolLevels(org)).toEqual(levels);
+        expect(await owner.channelSettings.get(org)).toEqual(settings);
+
+        const me = (await owner.me.get()).user;
+        const saved = await owner.channelSettings.update(org, {
+          ...CHANNEL_SETTINGS_DEFAULTS,
+          breaker_runs: 5,
+          message_retention_days: 90,
+        });
+        expect(saved).toMatchObject({ breaker_runs: 5, message_retention_days: 90, updated_by: { id: me.id } });
+        expect(saved.updated_at).not.toBeNull();
+        const set = await owner.channelSettings.setToolLevels(org, {
+          provider: "slack",
+          levels: [{ tool: "delete_message", level: "approve" }],
+        });
+        expect(set.filter((l) => l.confirmed).map((l) => [l.tool, l.level, l.updated_by?.id])).toEqual([
+          ["delete_message", "approve", me.id],
+        ]);
+        // Another organization's stay its own.
+        const outsider = as("outsider");
+        expect(await outsider.channelSettings.get(fx.otherOrganization)).toMatchObject({
+          ...CHANNEL_SETTINGS_DEFAULTS,
+          updated_at: null,
+        });
+        expect((await outsider.channelSettings.toolLevels(fx.otherOrganization)).some((l) => l.confirmed)).toBe(false);
+      });
+
+      it("lists a connection's conversations and messages, searched and paged on the server", async () => {
+        const ws = sandbox();
+        const { connection } = await installedIn(ws);
+        const id = connection.id;
+        const all = (await owner.channelConnections.conversations(ws, id, { limit: 100 })).items;
+        expect(all.map((c) => c.kind).sort()).toEqual(["channel", "dm"]);
+        expect(all.every((c) => c.workspace_id === ws && c.connection_id === id)).toBe(true);
+        const support = (await owner.channelConnections.conversations(ws, id, { q: "SUPP" })).items;
+        expect(support.map((c) => c.name)).toEqual(["support"]);
+        expect((await owner.channelConnections.conversations(ws, id, { kind: "dm" })).items.map((c) => c.kind)).toEqual(
+          ["dm"],
+        );
+        expect((await owner.channelConnections.conversations(ws, id, { q: "no such conversation" })).items).toEqual([]);
+        const first = await owner.channelConnections.conversations(ws, id, { limit: 1 });
+        const next = must(first.pagination.next_cursor, "next page");
+        const second = await owner.channelConnections.conversations(ws, id, { limit: 1, cursor: next });
+        expect([...first.items, ...second.items]).toEqual(all);
+        expect(second.pagination.next_cursor).toBeNull();
+
+        const thread = must(support[0], "support");
+        const messages = (await owner.channelConnections.messages(ws, id, thread.id, { limit: 100 })).items;
+        expect(messages.map((m) => m.direction).sort()).toEqual(["inbound", "inbound", "outbound"]);
+        expect(messages.find((m) => m.direction === "outbound")?.author).toBeNull();
+        expect(messages.filter((m) => m.direction === "inbound").every((m) => m.author !== null)).toBe(true);
+        const sent = messages.map((m) => m.sent_at);
+        expect(sent).toEqual([...sent].sort().reverse());
+        const key = must(messages[0], "message").thread_key;
+        expect((await owner.channelConnections.messages(ws, id, thread.id, { thread: key })).items).toEqual(messages);
+        expect(
+          (await owner.channelConnections.messages(ws, id, thread.id, { thread: "1000000000.000001" })).items,
+        ).toEqual([]);
+        const paged = await owner.channelConnections.messages(ws, id, thread.id, { limit: 2 });
+        expect(paged.items).toEqual(messages.slice(0, 2));
+        // Another workspace's conversation, even of the same organization, isn't found through this connection.
+        const beta = must((await betaLabs()).channel, "beta-labs channels");
+        expect(await answer(owner.channelConnections.messages(ws, id, beta.conversation.id))).toBe("404 not_found");
+      });
+
+      it("reads only events signed by the app they're delivered to", async () => {
+        const ws = sandbox();
+        const { app, connection, conversations } = await installedIn(ws);
+        const secrets = await secretsOf(app.id);
+        const other = await installedIn(fx.workspaces.acme.id);
+        const otherSecrets = await secretsOf(other.app.id);
+        // The API never shows what the provider holds.
+        const shown = JSON.stringify([
+          await owner.channelApps.get(ws, app.id),
+          await owner.channelApps.list(ws, { limit: 100 }),
+          await owner.channelConnections.get(ws, connection.id),
+          await owner.channelAppManagers.list(ws, { limit: 100 }),
+          await owner.audit.list(fx.organization, { limit: 100 }),
+        ]);
+        expect(shown).not.toContain(secrets.signing_secret);
+        expect(shown).not.toContain(secrets.inbound_ref);
+
+        expect(await delivered(await deliver(app.id, { type: "url_verification", challenge: "c-0001" }))).toEqual({
+          challenge: "c-0001",
+        });
+        const ts = (Date.now() / 1000).toFixed(6);
+        const message = (eventId: string, extra: Record<string, unknown> = {}) => ({
+          type: "event_callback",
+          event_id: eventId,
+          team_id: connection.team.id,
+          event: {
+            type: "message",
+            channel: "C0CONTRACT1",
+            channel_type: "channel",
+            user: "U0CONTRACT1",
+            text: `<@${connection.identity.external_id}> is the build green?`,
+            ts,
+            ...extra,
+          },
+        });
+        const now = Math.floor(Date.now() / 1000);
+        // Every refusal answers alike whether or not the reference names an app: nothing tells a prober it exists.
+        const whole = async (response: Response) => `${response.status} ${JSON.stringify(await response.json())}`;
+        const unknown = { ref: "a".repeat(32) };
+        const stale = now - 6 * 60;
+        const badSignature = await whole(
+          await deliver(app.id, message("Ev0001"), { secret: "not-the-signing-secret" }),
+        );
+        expect(badSignature).toMatch(/^401 .*"invalid_signature"/);
+        for (const [what, sent] of [
+          ["another app's secret", deliver(app.id, message("Ev0001"), { secret: otherSecrets.signing_secret })],
+          ["to an app that doesn't exist", deliver(app.id, message("Ev0001"), unknown)],
+          [
+            "to an app that doesn't exist, with a bad signature",
+            deliver(app.id, message("Ev0001"), { ...unknown, secret: "not-the-signing-secret" }),
+          ],
+        ] as const) {
+          expect(await whole(await sent), what).toBe(badSignature);
+        }
+        const tooOld = await whole(await deliver(app.id, message("Ev0001"), { timestamp: stale }));
+        expect(tooOld).toMatch(/^401 .*"stale_request"/);
+        for (const [what, sent] of [
+          ["from the future", deliver(app.id, message("Ev0001"), { timestamp: now + 6 * 60 })],
+          [
+            "too old, to an app that doesn't exist",
+            deliver(app.id, message("Ev0001"), { ...unknown, timestamp: stale }),
+          ],
+          [
+            "too old, with a bad signature",
+            deliver(app.id, message("Ev0001"), { timestamp: stale, secret: "not-the-signing-secret" }),
+          ],
+        ] as const) {
+          expect(await whole(await sent), what).toBe(tooOld);
+        }
+        const found = async () =>
+          (await owner.channelConnections.conversations(ws, connection.id, { limit: 100 })).items.find(
+            (c) => c.external_id === "C0CONTRACT1",
+          );
+        expect(await found()).toBeUndefined();
+
+        // Delivered twice, and again as a mention: one message.
+        expect(await delivered(await deliver(app.id, message("Ev0001")))).toEqual({ challenge: null });
+        await deliver(app.id, message("Ev0001"));
+        await deliver(app.id, message("Ev0002", { type: "app_mention" }));
+        // Another team's event, delivered to this app, is ignored.
+        await deliver(app.id, { ...message("Ev0003", { ts: "1000000000.000003" }), team_id: "T0ELSEWHERE" });
+        // So is one that names no team: the check can't be skipped by leaving it out.
+        const { team_id: _team, ...teamless } = message("Ev0006", { ts: "1000000000.000006" });
+        expect(await delivered(await deliver(app.id, teamless))).toEqual({ challenge: null });
+        const conversation = must(await found(), "the delivered conversation");
+        expect(conversation).toMatchObject({ workspace_id: ws, connection_id: connection.id, kind: "channel" });
+        const received = (await owner.channelConnections.messages(ws, connection.id, conversation.id)).items;
+        expect(received).toHaveLength(1);
+        expect(received[0]).toMatchObject({
+          direction: "inbound",
+          external_id: ts,
+          thread_key: ts,
+          mentions: [connection.identity.external_id],
+          agent_hop: 0,
+          run_id: null,
+        });
+        // Nothing reached another workspace's connection.
+        const elsewhere = (await owner.channelConnections.conversations(fx.workspaces.acme.id, other.connection.id))
+          .items;
+        expect(elsewhere.some((c) => c.external_id === "C0CONTRACT1")).toBe(false);
+        expect(conversations.length + 1).toBe(
+          (await owner.channelConnections.conversations(ws, connection.id, { limit: 100 })).items.length,
+        );
+
+        // Uninstalled in the team: the connection needs reconnecting, and reads no more messages.
+        await deliver(app.id, {
+          type: "event_callback",
+          event_id: "Ev0004",
+          team_id: connection.team.id,
+          event: { type: "app_uninstalled" },
+        });
+        expect((await owner.channelConnections.get(ws, connection.id)).status).toBe("reconnect_required");
+        await deliver(app.id, message("Ev0005", { ts: "1000000000.000005" }));
+        expect((await owner.channelConnections.messages(ws, connection.id, conversation.id)).items).toHaveLength(1);
+      });
+    });
+
     describe("the viewer role", () => {
       it("reads what a developer reads", async () => {
         const reads = (c: ZupflowClient) => async () => {
@@ -3633,6 +4475,8 @@ export function contractSuite(target: Target) {
         // Read only by the model provider changes, which are dropped when the target doesn't serve them.
         const connection = () => must(t.connection, "model connection");
         const model = () => must(t.model, "model");
+        // Read only by the channel changes, which are dropped when the target doesn't serve them.
+        const channel = () => must(t.channel, "channels");
         const changes: [string, () => Promise<unknown>][] = [
           ["updateOrganization", () => c.organizations.update(t.org, { name: "Viewed" })],
           ["inviteMember", () => c.members.invite(t.org, { email: "v@northwind.example", role: "developer" })],
@@ -3708,6 +4552,46 @@ export function contractSuite(target: Target) {
           ],
           ["startRun", () => c.runs.create(w, t.agent.id, { input: "hi" })],
           ["cancelRun", () => c.runs.cancel(w, t.run.id)],
+          // Channels: Sandbox for what the Console may only do there, and Production's own objects otherwise.
+          [
+            "createChannelAppManager",
+            () => c.channelAppManagers.create(sandbox, { provider: "slack", method: "configuration_token", ...TOKENS }),
+          ],
+          ["updateChannelAppManager", () => c.channelAppManagers.update(w, channel().manager.id, TOKENS)],
+          [
+            "createChannelApp",
+            () => c.channelApps.create(w, { agent_id: t.agent.id, manager_id: channel().manager.id }),
+          ],
+          [
+            "updateChannelConnection",
+            () => c.channelConnections.update(w, channel().connection.id, { label: "Viewed" }),
+          ],
+          [
+            "putAgentChannel",
+            () =>
+              c.agentChannels.put(
+                w,
+                channel().agentChannel.agent_id,
+                channel().connection.id,
+                settingsOf(channel().agentChannel),
+              ),
+          ],
+          [
+            "deleteAgentChannel",
+            () => c.agentChannels.delete(w, channel().agentChannel.agent_id, channel().connection.id),
+          ],
+          ["deleteChannelConnection", () => c.channelConnections.delete(w, channel().connection.id)],
+          ["deleteChannelApp", () => c.channelApps.delete(w, channel().app.id)],
+          ["deleteChannelAppManager", () => c.channelAppManagers.delete(w, channel().manager.id)],
+          [
+            "updateChannelToolLevels",
+            () =>
+              c.channelSettings.setToolLevels(t.org, { provider: "slack", levels: [{ tool: "react", level: "deny" }] }),
+          ],
+          [
+            "updateChannelSettings",
+            () => c.channelSettings.update(t.org, { ...CHANNEL_SETTINGS_DEFAULTS, breaker_runs: 5 }),
+          ],
           ["deleteGrant", () => c.grants.delete(w, t.agent.id, t.grant.id)],
           ["deleteAgent", () => c.agents.delete(w, t.agent.id)],
           [
@@ -3832,6 +4716,8 @@ export function contractSuite(target: Target) {
           "deleteWebhook",
           "testWebhook",
           "resendWebhookDelivery",
+          "updateChannelToolLevels",
+          "updateChannelSettings",
         ]);
         const t = await northwind();
         const changes = changesBy(as("developer"), t, await sandboxKey());

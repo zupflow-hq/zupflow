@@ -192,13 +192,155 @@
           "updated_at"
         ]
       },
+      "AgentChannel": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/AgentChannelId"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/WorkspaceId"
+          },
+          "agent_id": {
+            "$ref": "#/components/schemas/AgentId"
+          },
+          "connection_id": {
+            "$ref": "#/components/schemas/ChannelConnectionId"
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "approval_required": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "audience": {
+            "type": "string",
+            "enum": [
+              "origin",
+              "listed",
+              "anywhere"
+            ]
+          },
+          "audience_conversations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChannelConversationId"
+            }
+          },
+          "persona": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChannelPersona"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "answers_dms": {
+            "type": "boolean"
+          },
+          "answers_mentions": {
+            "type": "boolean"
+          },
+          "thread_follow_up": {
+            "type": "string",
+            "enum": [
+              "off",
+              "when_last_addressed",
+              "always"
+            ]
+          },
+          "agent_messages": {
+            "type": "string",
+            "enum": [
+              "ignore",
+              "mentions"
+            ]
+          },
+          "max_agent_hops": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "mid_run": {
+            "type": "string",
+            "enum": [
+              "steer",
+              "collect"
+            ]
+          },
+          "senders": {
+            "type": "string",
+            "enum": [
+              "anyone",
+              "listed"
+            ]
+          },
+          "sender_list": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "allow_automated": {
+            "type": "boolean"
+          },
+          "allow_external": {
+            "type": "boolean"
+          },
+          "reply_with_output": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Instant"
+          }
+        },
+        "required": [
+          "id",
+          "workspace_id",
+          "agent_id",
+          "connection_id",
+          "tools",
+          "approval_required",
+          "audience",
+          "audience_conversations",
+          "persona",
+          "answers_dms",
+          "answers_mentions",
+          "thread_follow_up",
+          "agent_messages",
+          "max_agent_hops",
+          "mid_run",
+          "senders",
+          "sender_list",
+          "allow_automated",
+          "allow_external",
+          "reply_with_output",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "AgentChannelId": {
+        "type": "string",
+        "pattern": "^agch_[0-9A-Za-z]{22}$"
+      },
       "AgentId": {
         "type": "string",
         "pattern": "^agt_[0-9A-Za-z]{22}$"
       },
       "AnyId": {
         "type": "string",
-        "pattern": "^(org|ws|usr|mem|app|inst|cs|agt|grt|run|rev|call|ses|key|we|evt|whd|aud|mcn|mdl)_[0-9A-Za-z]{22}$"
+        "pattern": "^(org|ws|usr|mem|app|inst|cs|agt|grt|run|rev|call|ses|key|we|evt|whd|aud|mcn|mdl|chmgr|chapp|chcon|agch|conv|chmsg|person)_[0-9A-Za-z]{22}$"
       },
       "ApiKey": {
         "type": "object",
@@ -666,6 +808,1122 @@
           "configuration"
         ]
       },
+      "ChannelApp": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ChannelAppId"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/WorkspaceId"
+          },
+          "manager_id": {
+            "$ref": "#/components/schemas/ChannelAppManagerId"
+          },
+          "agent_id": {
+            "$ref": "#/components/schemas/AgentId"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ChannelProvider"
+          },
+          "external_app_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "creating",
+              "awaiting_install",
+              "installed",
+              "updating",
+              "deleting",
+              "deleted",
+              "failed"
+            ]
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChannelConnectionId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Instant"
+          }
+        },
+        "required": [
+          "id",
+          "workspace_id",
+          "manager_id",
+          "agent_id",
+          "provider",
+          "external_app_id",
+          "status",
+          "last_error",
+          "connection_id",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "ChannelAppId": {
+        "type": "string",
+        "pattern": "^chapp_[0-9A-Za-z]{22}$"
+      },
+      "ChannelAppManager": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ChannelAppManagerId"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/WorkspaceId"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ChannelProvider"
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "configuration_token"
+            ]
+          },
+          "team": {
+            "$ref": "#/components/schemas/ChannelTeam"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "token_expired",
+              "disconnected"
+            ]
+          },
+          "configuration_token": {
+            "$ref": "#/components/schemas/SecretState"
+          },
+          "token_expires_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "app_count": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/User"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Instant"
+          }
+        },
+        "required": [
+          "id",
+          "workspace_id",
+          "provider",
+          "method",
+          "team",
+          "status",
+          "configuration_token",
+          "token_expires_at",
+          "app_count",
+          "created_by",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "ChannelAppManagerConnectResult": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "$ref": "#/components/schemas/ConnectSession"
+          },
+          "channel_app_manager": {
+            "$ref": "#/components/schemas/ChannelAppManager"
+          }
+        },
+        "required": [
+          "session",
+          "channel_app_manager"
+        ]
+      },
+      "ChannelAppManagerId": {
+        "type": "string",
+        "pattern": "^chmgr_[0-9A-Za-z]{22}$"
+      },
+      "ChannelAppManagerStatusChangedWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "channel_app_manager.status_changed"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "channel_app_manager"
+              },
+              "id": {
+                "$ref": "#/components/schemas/ChannelAppManagerId"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "token_expired",
+                  "disconnected"
+                ]
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
+      },
+      "ChannelAppStatusChangedWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "channel_app.status_changed"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "channel_app"
+              },
+              "id": {
+                "$ref": "#/components/schemas/ChannelAppId"
+              },
+              "agent_id": {
+                "$ref": "#/components/schemas/AgentId"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "creating",
+                  "awaiting_install",
+                  "installed",
+                  "updating",
+                  "deleting",
+                  "deleted",
+                  "failed"
+                ]
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "agent_id",
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
+      },
+      "ChannelConnection": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ChannelConnectionId"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/WorkspaceId"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ChannelProvider"
+          },
+          "app_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChannelAppId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "short_id": {
+            "$ref": "#/components/schemas/InstallationShortId"
+          },
+          "label": {
+            "type": "string"
+          },
+          "handler": {
+            "type": "string",
+            "enum": [
+              "mention"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "connected",
+              "reconnect_required",
+              "disconnected"
+            ]
+          },
+          "team": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "enterprise_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "enterprise_id"
+            ]
+          },
+          "identity": {
+            "type": "object",
+            "properties": {
+              "external_id": {
+                "type": "string"
+              },
+              "handle": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "external_id",
+              "handle"
+            ]
+          },
+          "granted_scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "connected_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_event_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Instant"
+          }
+        },
+        "required": [
+          "id",
+          "workspace_id",
+          "provider",
+          "app_id",
+          "agent_id",
+          "short_id",
+          "label",
+          "handler",
+          "status",
+          "team",
+          "identity",
+          "granted_scopes",
+          "connected_at",
+          "last_event_at",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "ChannelConnectionConnectResult": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "$ref": "#/components/schemas/ConnectSession"
+          },
+          "channel_connection": {
+            "$ref": "#/components/schemas/ChannelConnection"
+          }
+        },
+        "required": [
+          "session",
+          "channel_connection"
+        ]
+      },
+      "ChannelConnectionId": {
+        "type": "string",
+        "pattern": "^chcon_[0-9A-Za-z]{22}$"
+      },
+      "ChannelConnectionStatusChangedWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "channel_connection.status_changed"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "channel_connection"
+              },
+              "id": {
+                "$ref": "#/components/schemas/ChannelConnectionId"
+              },
+              "app_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ChannelAppId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "connected",
+                  "reconnect_required",
+                  "disconnected"
+                ]
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "app_id",
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
+      },
+      "ChannelConversation": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ChannelConversationId"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/WorkspaceId"
+          },
+          "connection_id": {
+            "$ref": "#/components/schemas/ChannelConnectionId"
+          },
+          "external_id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "channel",
+              "private_channel",
+              "dm",
+              "group_dm"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_external": {
+            "type": "boolean"
+          },
+          "identity_is_member": {
+            "type": "boolean"
+          },
+          "last_message_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "paused_until": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          }
+        },
+        "required": [
+          "id",
+          "workspace_id",
+          "connection_id",
+          "external_id",
+          "kind",
+          "name",
+          "is_external",
+          "identity_is_member",
+          "last_message_at",
+          "paused_until",
+          "created_at"
+        ]
+      },
+      "ChannelConversationId": {
+        "type": "string",
+        "pattern": "^conv_[0-9A-Za-z]{22}$"
+      },
+      "ChannelConversationPausedWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "channel_conversation.paused"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "channel_conversation"
+              },
+              "id": {
+                "$ref": "#/components/schemas/ChannelConversationId"
+              },
+              "connection_id": {
+                "$ref": "#/components/schemas/ChannelConnectionId"
+              },
+              "paused_until": {
+                "$ref": "#/components/schemas/Instant"
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "connection_id",
+              "paused_until"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
+      },
+      "ChannelInboundAnswer": {
+        "type": "object",
+        "properties": {
+          "challenge": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "challenge"
+        ]
+      },
+      "ChannelMessage": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ChannelMessageId"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/WorkspaceId"
+          },
+          "connection_id": {
+            "$ref": "#/components/schemas/ChannelConnectionId"
+          },
+          "conversation_id": {
+            "$ref": "#/components/schemas/ChannelConversationId"
+          },
+          "external_id": {
+            "type": "string"
+          },
+          "thread_key": {
+            "type": "string"
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "inbound",
+              "outbound"
+            ]
+          },
+          "author": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChannelPerson"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "mentions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tool_call_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolCallId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "agent_hop": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "sent_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "edited_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "deleted_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          }
+        },
+        "required": [
+          "id",
+          "workspace_id",
+          "connection_id",
+          "conversation_id",
+          "external_id",
+          "thread_key",
+          "direction",
+          "author",
+          "text",
+          "mentions",
+          "run_id",
+          "tool_call_id",
+          "agent_hop",
+          "sent_at",
+          "edited_at",
+          "deleted_at",
+          "created_at"
+        ]
+      },
+      "ChannelMessageId": {
+        "type": "string",
+        "pattern": "^chmsg_[0-9A-Za-z]{22}$"
+      },
+      "ChannelMessageReceivedWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "channel_message.received"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "channel_message"
+              },
+              "id": {
+                "$ref": "#/components/schemas/ChannelMessageId"
+              },
+              "connection_id": {
+                "$ref": "#/components/schemas/ChannelConnectionId"
+              },
+              "conversation_id": {
+                "$ref": "#/components/schemas/ChannelConversationId"
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "connection_id",
+              "conversation_id"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
+      },
+      "ChannelMessageSentWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "channel_message.sent"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "channel_message"
+              },
+              "id": {
+                "$ref": "#/components/schemas/ChannelMessageId"
+              },
+              "connection_id": {
+                "$ref": "#/components/schemas/ChannelConnectionId"
+              },
+              "conversation_id": {
+                "$ref": "#/components/schemas/ChannelConversationId"
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "connection_id",
+              "conversation_id"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
+      },
+      "ChannelPerson": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ChannelPersonId"
+          },
+          "handle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_automated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "handle",
+          "display_name",
+          "is_automated"
+        ]
+      },
+      "ChannelPersona": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "avatar_url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uri"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "avatar_url"
+        ]
+      },
+      "ChannelPersonId": {
+        "type": "string",
+        "pattern": "^person_[0-9A-Za-z]{22}$"
+      },
+      "ChannelProvider": {
+        "type": "string",
+        "enum": [
+          "slack"
+        ]
+      },
+      "ChannelSettings": {
+        "type": "object",
+        "properties": {
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "breaker_runs": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "breaker_window_minutes": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "breaker_pause_minutes": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "message_retention_days": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updated_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/User"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "organization_id",
+          "breaker_runs",
+          "breaker_window_minutes",
+          "breaker_pause_minutes",
+          "message_retention_days",
+          "updated_at",
+          "updated_by"
+        ]
+      },
+      "ChannelTeam": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ]
+      },
+      "ChannelToolLevel": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "$ref": "#/components/schemas/ChannelProvider"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "allow",
+              "approve",
+              "deny"
+            ]
+          },
+          "confirmed": {
+            "type": "boolean"
+          },
+          "effect": {
+            "type": "string",
+            "enum": [
+              "read",
+              "write",
+              "destructive"
+            ]
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updated_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/User"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "provider",
+          "tool",
+          "level",
+          "confirmed",
+          "effect",
+          "updated_at",
+          "updated_by"
+        ]
+      },
       "ClientConfiguration": {
         "type": "object",
         "properties": {
@@ -854,18 +2112,16 @@
         ]
       },
       "ConnectResult": {
-        "type": "object",
-        "properties": {
-          "session": {
-            "$ref": "#/components/schemas/ConnectSession"
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/InstallationConnectResult"
           },
-          "installation": {
-            "$ref": "#/components/schemas/Installation"
+          {
+            "$ref": "#/components/schemas/ChannelAppManagerConnectResult"
+          },
+          {
+            "$ref": "#/components/schemas/ChannelConnectionConnectResult"
           }
-        },
-        "required": [
-          "session",
-          "installation"
         ]
       },
       "ConnectSession": {
@@ -881,7 +2137,24 @@
             "$ref": "#/components/schemas/Environment"
           },
           "app": {
-            "$ref": "#/components/schemas/InstallationApp"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InstallationApp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "target": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConnectTarget"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "intent": {
             "type": "string",
@@ -978,6 +2251,7 @@
           "workspace_id",
           "environment",
           "app",
+          "target",
           "intent",
           "installation_id",
           "label",
@@ -1040,6 +2314,16 @@
                   }
                 ]
               },
+              "target": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ConnectTarget"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
               "failure_code": {
                 "type": [
                   "string",
@@ -1052,6 +2336,7 @@
               "id",
               "status",
               "installation_id",
+              "target",
               "failure_code"
             ]
           }
@@ -1116,6 +2401,16 @@
                   }
                 ]
               },
+              "target": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ConnectTarget"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
               "failure_code": {
                 "type": [
                   "string",
@@ -1128,6 +2423,7 @@
               "id",
               "status",
               "installation_id",
+              "target",
               "failure_code"
             ]
           }
@@ -1183,6 +2479,68 @@
           "updated_at"
         ]
       },
+      "ConnectTarget": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "channel_app_manager"
+              },
+              "provider": {
+                "$ref": "#/components/schemas/ChannelProvider"
+              },
+              "manager": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ChannelAppManagerId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "provider",
+              "manager"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "channel_app"
+              },
+              "provider": {
+                "$ref": "#/components/schemas/ChannelProvider"
+              },
+              "app": {
+                "$ref": "#/components/schemas/ChannelAppId"
+              },
+              "connection": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ChannelConnectionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "provider",
+              "app",
+              "connection"
+            ]
+          }
+        ]
+      },
       "CreatedApiKey": {
         "type": "object",
         "properties": {
@@ -1211,7 +2569,24 @@
             "$ref": "#/components/schemas/Environment"
           },
           "app": {
-            "$ref": "#/components/schemas/InstallationApp"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InstallationApp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "target": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConnectTarget"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "intent": {
             "type": "string",
@@ -1312,6 +2687,7 @@
           "workspace_id",
           "environment",
           "app",
+          "target",
           "intent",
           "installation_id",
           "label",
@@ -1639,6 +3015,21 @@
           "type",
           "workspace",
           "data"
+        ]
+      },
+      "InstallationConnectResult": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "$ref": "#/components/schemas/ConnectSession"
+          },
+          "installation": {
+            "$ref": "#/components/schemas/Installation"
+          }
+        },
+        "required": [
+          "session",
+          "installation"
         ]
       },
       "InstallationDisconnectedWebhookEvent": {
@@ -2451,7 +3842,18 @@
             "type": "string",
             "enum": [
               "api",
-              "console"
+              "console",
+              "channel"
+            ]
+          },
+          "channel": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunChannel"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "status": {
@@ -2521,6 +3923,7 @@
           "agent_name",
           "session_id",
           "trigger",
+          "channel",
           "status",
           "input",
           "output",
@@ -2674,7 +4077,18 @@
             "type": "string",
             "enum": [
               "api",
-              "console"
+              "console",
+              "channel"
+            ]
+          },
+          "channel": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunChannel"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "status": {
@@ -2741,6 +4155,7 @@
           "agent_name",
           "session_id",
           "trigger",
+          "channel",
           "status",
           "input",
           "output",
@@ -2809,6 +4224,52 @@
           "type",
           "workspace",
           "data"
+        ]
+      },
+      "RunChannel": {
+        "type": "object",
+        "properties": {
+          "connection_id": {
+            "$ref": "#/components/schemas/ChannelConnectionId"
+          },
+          "conversation_id": {
+            "$ref": "#/components/schemas/ChannelConversationId"
+          },
+          "thread_key": {
+            "type": "string"
+          },
+          "origin_message_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChannelMessageId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "direct_message",
+              "mentioned",
+              "thread_follow_up"
+            ]
+          },
+          "silent_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "connection_id",
+          "conversation_id",
+          "thread_key",
+          "origin_message_id",
+          "reason",
+          "silent_reason"
         ]
       },
       "RunCompletedWebhookEvent": {
@@ -3063,35 +4524,134 @@
               },
               "type": {
                 "type": "string",
-                "const": "tool_call.started"
+                "const": "channel_messages.received"
               },
               "data": {
                 "type": "object",
                 "properties": {
-                  "call_id": {
-                    "$ref": "#/components/schemas/ToolCallId"
+                  "outcome": {
+                    "type": "string",
+                    "enum": [
+                      "started",
+                      "steered",
+                      "collected"
+                    ]
                   },
-                  "installation_id": {
-                    "$ref": "#/components/schemas/InstallationId"
+                  "connection_id": {
+                    "$ref": "#/components/schemas/ChannelConnectionId"
                   },
-                  "installation_label": {
-                    "type": "string"
+                  "conversation_id": {
+                    "$ref": "#/components/schemas/ChannelConversationId"
                   },
-                  "app_name": {
-                    "type": "string"
-                  },
-                  "tool": {
-                    "type": "string"
-                  },
-                  "arguments": {}
+                  "message_ids": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/ChannelMessageId"
+                    }
+                  }
                 },
                 "required": [
-                  "call_id",
-                  "installation_id",
-                  "installation_label",
-                  "app_name",
-                  "tool",
-                  "arguments"
+                  "outcome",
+                  "connection_id",
+                  "conversation_id",
+                  "message_ids"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "run_id",
+              "workspace_id",
+              "sequence",
+              "created_at",
+              "type",
+              "data"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/RunEventId"
+              },
+              "run_id": {
+                "$ref": "#/components/schemas/RunId"
+              },
+              "workspace_id": {
+                "$ref": "#/components/schemas/WorkspaceId"
+              },
+              "sequence": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "created_at": {
+                "$ref": "#/components/schemas/Instant"
+              },
+              "type": {
+                "type": "string",
+                "const": "tool_call.started"
+              },
+              "data": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "call_id": {
+                        "$ref": "#/components/schemas/ToolCallId"
+                      },
+                      "installation_id": {
+                        "$ref": "#/components/schemas/InstallationId"
+                      },
+                      "installation_label": {
+                        "type": "string"
+                      },
+                      "app_name": {
+                        "type": "string"
+                      },
+                      "tool": {
+                        "type": "string"
+                      },
+                      "arguments": {}
+                    },
+                    "required": [
+                      "call_id",
+                      "installation_id",
+                      "installation_label",
+                      "app_name",
+                      "tool",
+                      "arguments"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "call_id": {
+                        "$ref": "#/components/schemas/ToolCallId"
+                      },
+                      "channel_connection_id": {
+                        "$ref": "#/components/schemas/ChannelConnectionId"
+                      },
+                      "connection_label": {
+                        "type": "string"
+                      },
+                      "provider": {
+                        "$ref": "#/components/schemas/ChannelProvider"
+                      },
+                      "tool": {
+                        "type": "string"
+                      },
+                      "arguments": {}
+                    },
+                    "required": [
+                      "call_id",
+                      "channel_connection_id",
+                      "connection_label",
+                      "provider",
+                      "tool",
+                      "arguments"
+                    ]
+                  }
                 ]
               }
             },
@@ -3130,36 +4690,73 @@
                 "const": "tool_call.completed"
               },
               "data": {
-                "type": "object",
-                "properties": {
-                  "call_id": {
-                    "$ref": "#/components/schemas/ToolCallId"
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "call_id": {
+                        "$ref": "#/components/schemas/ToolCallId"
+                      },
+                      "installation_id": {
+                        "$ref": "#/components/schemas/InstallationId"
+                      },
+                      "installation_label": {
+                        "type": "string"
+                      },
+                      "app_name": {
+                        "type": "string"
+                      },
+                      "tool": {
+                        "type": "string"
+                      },
+                      "result": {},
+                      "duration_ms": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "call_id",
+                      "installation_id",
+                      "installation_label",
+                      "app_name",
+                      "tool",
+                      "result",
+                      "duration_ms"
+                    ]
                   },
-                  "installation_id": {
-                    "$ref": "#/components/schemas/InstallationId"
-                  },
-                  "installation_label": {
-                    "type": "string"
-                  },
-                  "app_name": {
-                    "type": "string"
-                  },
-                  "tool": {
-                    "type": "string"
-                  },
-                  "result": {},
-                  "duration_ms": {
-                    "type": "number"
+                  {
+                    "type": "object",
+                    "properties": {
+                      "call_id": {
+                        "$ref": "#/components/schemas/ToolCallId"
+                      },
+                      "channel_connection_id": {
+                        "$ref": "#/components/schemas/ChannelConnectionId"
+                      },
+                      "connection_label": {
+                        "type": "string"
+                      },
+                      "provider": {
+                        "$ref": "#/components/schemas/ChannelProvider"
+                      },
+                      "tool": {
+                        "type": "string"
+                      },
+                      "result": {},
+                      "duration_ms": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "call_id",
+                      "channel_connection_id",
+                      "connection_label",
+                      "provider",
+                      "tool",
+                      "result",
+                      "duration_ms"
+                    ]
                   }
-                },
-                "required": [
-                  "call_id",
-                  "installation_id",
-                  "installation_label",
-                  "app_name",
-                  "tool",
-                  "result",
-                  "duration_ms"
                 ]
               }
             },
@@ -3198,38 +4795,77 @@
                 "const": "tool_call.failed"
               },
               "data": {
-                "type": "object",
-                "properties": {
-                  "call_id": {
-                    "$ref": "#/components/schemas/ToolCallId"
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "call_id": {
+                        "$ref": "#/components/schemas/ToolCallId"
+                      },
+                      "installation_id": {
+                        "$ref": "#/components/schemas/InstallationId"
+                      },
+                      "installation_label": {
+                        "type": "string"
+                      },
+                      "app_name": {
+                        "type": "string"
+                      },
+                      "tool": {
+                        "type": "string"
+                      },
+                      "error": {
+                        "$ref": "#/components/schemas/RunError"
+                      },
+                      "duration_ms": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "call_id",
+                      "installation_id",
+                      "installation_label",
+                      "app_name",
+                      "tool",
+                      "error",
+                      "duration_ms"
+                    ]
                   },
-                  "installation_id": {
-                    "$ref": "#/components/schemas/InstallationId"
-                  },
-                  "installation_label": {
-                    "type": "string"
-                  },
-                  "app_name": {
-                    "type": "string"
-                  },
-                  "tool": {
-                    "type": "string"
-                  },
-                  "error": {
-                    "$ref": "#/components/schemas/RunError"
-                  },
-                  "duration_ms": {
-                    "type": "number"
+                  {
+                    "type": "object",
+                    "properties": {
+                      "call_id": {
+                        "$ref": "#/components/schemas/ToolCallId"
+                      },
+                      "channel_connection_id": {
+                        "$ref": "#/components/schemas/ChannelConnectionId"
+                      },
+                      "connection_label": {
+                        "type": "string"
+                      },
+                      "provider": {
+                        "$ref": "#/components/schemas/ChannelProvider"
+                      },
+                      "tool": {
+                        "type": "string"
+                      },
+                      "error": {
+                        "$ref": "#/components/schemas/RunError"
+                      },
+                      "duration_ms": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "call_id",
+                      "channel_connection_id",
+                      "connection_label",
+                      "provider",
+                      "tool",
+                      "error",
+                      "duration_ms"
+                    ]
                   }
-                },
-                "required": [
-                  "call_id",
-                  "installation_id",
-                  "installation_label",
-                  "app_name",
-                  "tool",
-                  "error",
-                  "duration_ms"
                 ]
               }
             },
@@ -3268,32 +4904,65 @@
                 "const": "approval.requested"
               },
               "data": {
-                "type": "object",
-                "properties": {
-                  "call_id": {
-                    "$ref": "#/components/schemas/ToolCallId"
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "call_id": {
+                        "$ref": "#/components/schemas/ToolCallId"
+                      },
+                      "installation_id": {
+                        "$ref": "#/components/schemas/InstallationId"
+                      },
+                      "installation_label": {
+                        "type": "string"
+                      },
+                      "app_name": {
+                        "type": "string"
+                      },
+                      "tool": {
+                        "type": "string"
+                      },
+                      "arguments": {}
+                    },
+                    "required": [
+                      "call_id",
+                      "installation_id",
+                      "installation_label",
+                      "app_name",
+                      "tool",
+                      "arguments"
+                    ]
                   },
-                  "installation_id": {
-                    "$ref": "#/components/schemas/InstallationId"
-                  },
-                  "installation_label": {
-                    "type": "string"
-                  },
-                  "app_name": {
-                    "type": "string"
-                  },
-                  "tool": {
-                    "type": "string"
-                  },
-                  "arguments": {}
-                },
-                "required": [
-                  "call_id",
-                  "installation_id",
-                  "installation_label",
-                  "app_name",
-                  "tool",
-                  "arguments"
+                  {
+                    "type": "object",
+                    "properties": {
+                      "call_id": {
+                        "$ref": "#/components/schemas/ToolCallId"
+                      },
+                      "channel_connection_id": {
+                        "$ref": "#/components/schemas/ChannelConnectionId"
+                      },
+                      "connection_label": {
+                        "type": "string"
+                      },
+                      "provider": {
+                        "$ref": "#/components/schemas/ChannelProvider"
+                      },
+                      "tool": {
+                        "type": "string"
+                      },
+                      "arguments": {}
+                    },
+                    "required": [
+                      "call_id",
+                      "channel_connection_id",
+                      "connection_label",
+                      "provider",
+                      "tool",
+                      "arguments"
+                    ]
+                  }
                 ]
               }
             },
@@ -3352,6 +5021,52 @@
                   "call_id",
                   "decision",
                   "api_key_id"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "run_id",
+              "workspace_id",
+              "sequence",
+              "created_at",
+              "type",
+              "data"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/RunEventId"
+              },
+              "run_id": {
+                "$ref": "#/components/schemas/RunId"
+              },
+              "workspace_id": {
+                "$ref": "#/components/schemas/WorkspaceId"
+              },
+              "sequence": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "created_at": {
+                "$ref": "#/components/schemas/Instant"
+              },
+              "type": {
+                "type": "string",
+                "const": "run.stayed_silent"
+              },
+              "data": {
+                "type": "object",
+                "properties": {
+                  "reason": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "reason"
                 ]
               }
             },
@@ -4267,6 +5982,12 @@
               "run.waiting_for_approval",
               "run.cancelled",
               "app.tools_changed",
+              "channel_message.received",
+              "channel_message.sent",
+              "channel_app_manager.status_changed",
+              "channel_app.status_changed",
+              "channel_connection.status_changed",
+              "channel_conversation.paused",
               "webhook.test"
             ]
           },
@@ -4415,6 +6136,12 @@
               "run.waiting_for_approval",
               "run.cancelled",
               "app.tools_changed",
+              "channel_message.received",
+              "channel_message.sent",
+              "channel_app_manager.status_changed",
+              "channel_app.status_changed",
+              "channel_connection.status_changed",
+              "channel_conversation.paused",
               "webhook.test"
             ]
           },
@@ -4553,7 +6280,13 @@
                 "run.failed",
                 "run.waiting_for_approval",
                 "run.cancelled",
-                "app.tools_changed"
+                "app.tools_changed",
+                "channel_message.received",
+                "channel_message.sent",
+                "channel_app_manager.status_changed",
+                "channel_app.status_changed",
+                "channel_connection.status_changed",
+                "channel_conversation.paused"
               ]
             }
           },
@@ -4636,6 +6369,24 @@
           },
           {
             "$ref": "#/components/schemas/AppToolsChangedWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ChannelMessageReceivedWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ChannelMessageSentWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ChannelAppManagerStatusChangedWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ChannelAppStatusChangedWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ChannelConnectionStatusChangedWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ChannelConversationPausedWebhookEvent"
           },
           {
             "$ref": "#/components/schemas/WebhookTestWebhookEvent"
@@ -8748,44 +10499,104 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "properties": {
-                  "app_id": {
-                    "$ref": "#/components/schemas/AppId"
-                  },
-                  "intent": {
-                    "type": "string",
-                    "enum": [
-                      "create",
-                      "reconnect"
-                    ]
-                  },
-                  "label": {
-                    "type": "string"
-                  },
-                  "installation_id": {
-                    "anyOf": [
-                      {
-                        "$ref": "#/components/schemas/InstallationId"
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "app_id": {
+                        "$ref": "#/components/schemas/AppId"
                       },
-                      {
-                        "type": "null"
+                      "intent": {
+                        "type": "string",
+                        "enum": [
+                          "create",
+                          "reconnect"
+                        ]
+                      },
+                      "label": {
+                        "type": "string"
+                      },
+                      "installation_id": {
+                        "anyOf": [
+                          {
+                            "$ref": "#/components/schemas/InstallationId"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "return_url": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       }
+                    },
+                    "required": [
+                      "app_id",
+                      "intent",
+                      "label",
+                      "installation_id",
+                      "return_url"
                     ]
                   },
-                  "return_url": {
-                    "type": [
-                      "string",
-                      "null"
+                  {
+                    "type": "object",
+                    "properties": {
+                      "target": {
+                        "oneOf": [
+                          {
+                            "type": "object",
+                            "properties": {
+                              "kind": {
+                                "type": "string",
+                                "const": "channel_app_manager"
+                              },
+                              "provider": {
+                                "$ref": "#/components/schemas/ChannelProvider"
+                              }
+                            },
+                            "required": [
+                              "kind",
+                              "provider"
+                            ]
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "kind": {
+                                "type": "string",
+                                "const": "channel_app"
+                              },
+                              "app": {
+                                "$ref": "#/components/schemas/ChannelAppId"
+                              }
+                            },
+                            "required": [
+                              "kind",
+                              "app"
+                            ]
+                          }
+                        ]
+                      },
+                      "return_url": {
+                        "anyOf": [
+                          {
+                            "type": "string",
+                            "format": "uri"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "target",
+                      "return_url"
                     ]
                   }
-                },
-                "required": [
-                  "app_id",
-                  "intent",
-                  "label",
-                  "installation_id",
-                  "return_url"
                 ]
               }
             }
@@ -12214,7 +14025,13 @@
                         "run.failed",
                         "run.waiting_for_approval",
                         "run.cancelled",
-                        "app.tools_changed"
+                        "app.tools_changed",
+                        "channel_message.received",
+                        "channel_message.sent",
+                        "channel_app_manager.status_changed",
+                        "channel_app.status_changed",
+                        "channel_connection.status_changed",
+                        "channel_conversation.paused"
                       ]
                     }
                   }
@@ -12332,7 +14149,13 @@
                         "run.failed",
                         "run.waiting_for_approval",
                         "run.cancelled",
-                        "app.tools_changed"
+                        "app.tools_changed",
+                        "channel_message.received",
+                        "channel_message.sent",
+                        "channel_app_manager.status_changed",
+                        "channel_app.status_changed",
+                        "channel_connection.status_changed",
+                        "channel_conversation.paused"
                       ]
                     }
                   },
@@ -12563,6 +14386,12 @@
                 "run.waiting_for_approval",
                 "run.cancelled",
                 "app.tools_changed",
+                "channel_message.received",
+                "channel_message.sent",
+                "channel_app_manager.status_changed",
+                "channel_app.status_changed",
+                "channel_connection.status_changed",
+                "channel_conversation.paused",
                 "webhook.test"
               ]
             }
@@ -12952,6 +14781,2036 @@
           },
           "default": {
             "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{ws}/channel-app-managers": {
+      "get": {
+        "operationId": "listChannelAppManagers",
+        "summary": "The workspace's linked teams, newest first",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Page size, 1 to 100 (default 25); values outside are clamped, and a non-integer means the default.",
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ChannelAppManager"
+                      }
+                    },
+                    "meta": {
+                      "$ref": "#/components/schemas/Meta"
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createChannelAppManager",
+        "summary": "Link a team with a configuration token, so Zupflow can create apps for the workspace's agents there. Developers and API keys; the Console can't in Production (`403 console_read_only_in_production`). A token the provider refuses is `422 invalid_configuration_token`",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ChannelAppManager"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "provider": {
+                    "$ref": "#/components/schemas/ChannelProvider"
+                  },
+                  "method": {
+                    "type": "string",
+                    "enum": [
+                      "configuration_token"
+                    ]
+                  },
+                  "configuration_token": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096
+                  },
+                  "refresh_token": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096
+                  }
+                },
+                "required": [
+                  "provider",
+                  "method",
+                  "configuration_token",
+                  "refresh_token"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{ws}/channel-app-managers/{manager}": {
+      "get": {
+        "operationId": "getChannelAppManager",
+        "summary": "A linked team",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "manager",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ChannelAppManagerId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ChannelAppManager"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "updateChannelAppManager",
+        "summary": "Replace a linked team's tokens; it's `active` again. Developers and API keys; the Console can't in Production",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "manager",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ChannelAppManagerId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ChannelAppManager"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "configuration_token": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096
+                  },
+                  "refresh_token": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096
+                  }
+                },
+                "required": [
+                  "configuration_token",
+                  "refresh_token"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteChannelAppManager",
+        "summary": "Unlink a team and forget its tokens. Refused while it has apps that aren't deleted: `409 in_use`",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "manager",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ChannelAppManagerId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Done"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{ws}/channel-apps": {
+      "get": {
+        "operationId": "listChannelApps",
+        "summary": "The workspace's generated apps, newest first; deleted ones aren't listed",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Page size, 1 to 100 (default 25); values outside are clamped, and a non-integer means the default.",
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          },
+          {
+            "name": "agent_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Only this agent's apps. A malformed or unknown ID matches nothing.",
+              "$ref": "#/components/schemas/AgentId"
+            }
+          },
+          {
+            "name": "manager_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Only this manager's apps. A malformed or unknown ID matches nothing.",
+              "$ref": "#/components/schemas/ChannelAppManagerId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ChannelApp"
+                      }
+                    },
+                    "meta": {
+                      "$ref": "#/components/schemas/Meta"
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createChannelApp",
+        "summary": "Make an agent's own app in a linked team. Answers `202` with the app `creating`; a job makes it with the provider. Developers and API keys; the Console can't in Production",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Accepted: a job finishes it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ChannelApp"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "agent_id": {
+                    "$ref": "#/components/schemas/AgentId"
+                  },
+                  "manager_id": {
+                    "$ref": "#/components/schemas/ChannelAppManagerId"
+                  }
+                },
+                "required": [
+                  "agent_id",
+                  "manager_id"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{ws}/channel-apps/{app}": {
+      "get": {
+        "operationId": "getChannelApp",
+        "summary": "A generated app; a deleted one is `404`",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "app",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ChannelAppId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ChannelApp"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteChannelApp",
+        "summary": "Remove an agent's app: its token is revoked and the provider's app deleted, its connection disconnected and the agent's channel on it removed",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "app",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ChannelAppId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Done"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{ws}/channel-connections": {
+      "get": {
+        "operationId": "listChannelConnections",
+        "summary": "The workspace's channel connections, newest first",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Page size, 1 to 100 (default 25); values outside are clamped, and a non-integer means the default.",
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          },
+          {
+            "name": "agent_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Only this agent's connections. A malformed or unknown ID matches nothing.",
+              "$ref": "#/components/schemas/AgentId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ChannelConnection"
+                      }
+                    },
+                    "meta": {
+                      "$ref": "#/components/schemas/Meta"
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{ws}/channel-connections/{channel_connection}": {
+      "get": {
+        "operationId": "getChannelConnection",
+        "summary": "A channel connection",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "channel_connection",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ChannelConnectionId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ChannelConnection"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "updateChannelConnection",
+        "summary": "Rename a channel connection, or set its handler",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "channel_connection",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ChannelConnectionId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ChannelConnection"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "label": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 40
+                  },
+                  "handler": {
+                    "type": "string",
+                    "enum": [
+                      "mention"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteChannelConnection",
+        "summary": "Disconnect: the token is revoked, and the connection, its conversations, messages and agent channel removed. Its app waits for a new install",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "channel_connection",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ChannelConnectionId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Done"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{ws}/channel-connections/{channel_connection}/conversations": {
+      "get": {
+        "operationId": "listChannelConversations",
+        "summary": "The conversations a connection has seen messages in, most recent first; `q` searches names",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "channel_connection",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ChannelConnectionId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Page size, 1 to 100 (default 25); values outside are clamped, and a non-integer means the default.",
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "channel",
+                "private_channel",
+                "dm",
+                "group_dm"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ChannelConversation"
+                      }
+                    },
+                    "meta": {
+                      "$ref": "#/components/schemas/Meta"
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{ws}/channel-connections/{channel_connection}/conversations/{conversation}/messages": {
+      "get": {
+        "operationId": "listChannelMessages",
+        "summary": "A conversation's messages, newest first; `thread` keeps one thread's",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "channel_connection",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ChannelConnectionId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "conversation",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ChannelConversationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Page size, 1 to 100 (default 25); values outside are clamped, and a non-integer means the default.",
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          },
+          {
+            "name": "thread",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ChannelMessage"
+                      }
+                    },
+                    "meta": {
+                      "$ref": "#/components/schemas/Meta"
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{ws}/agents/{agent}/channels": {
+      "get": {
+        "operationId": "listAgentChannels",
+        "summary": "An agent's channels: one per connection of its own apps",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "agent",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/AgentId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/AgentChannel"
+                      }
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{ws}/agents/{agent}/channels/{channel_connection}": {
+      "put": {
+        "operationId": "putAgentChannel",
+        "summary": "Set an agent's channel on one of its own connections, creating it if it isn't there",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "agent",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/AgentId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "channel_connection",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ChannelConnectionId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/AgentChannel"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "tools": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "approval_required": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "audience": {
+                    "type": "string",
+                    "enum": [
+                      "origin",
+                      "listed",
+                      "anywhere"
+                    ]
+                  },
+                  "audience_conversations": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/ChannelConversationId"
+                    }
+                  },
+                  "persona": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 80
+                          },
+                          "avatar_url": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "pattern": "^https:\\/\\/\\S+$"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "avatar_url"
+                        ]
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "answers_dms": {
+                    "type": "boolean"
+                  },
+                  "answers_mentions": {
+                    "type": "boolean"
+                  },
+                  "thread_follow_up": {
+                    "type": "string",
+                    "enum": [
+                      "off",
+                      "when_last_addressed",
+                      "always"
+                    ]
+                  },
+                  "agent_messages": {
+                    "type": "string",
+                    "enum": [
+                      "ignore",
+                      "mentions"
+                    ]
+                  },
+                  "max_agent_hops": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5
+                  },
+                  "mid_run": {
+                    "type": "string",
+                    "enum": [
+                      "steer",
+                      "collect"
+                    ]
+                  },
+                  "senders": {
+                    "type": "string",
+                    "enum": [
+                      "anyone",
+                      "listed"
+                    ]
+                  },
+                  "sender_list": {
+                    "maxItems": 500,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "maxLength": 320,
+                      "format": "email",
+                      "pattern": "^(?:[A-Za-z0-9_'+\\-]+\\.)*[A-Za-z0-9_'+\\-]*[A-Za-z0-9_+-]@(?:[A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"
+                    }
+                  },
+                  "allow_automated": {
+                    "type": "boolean"
+                  },
+                  "allow_external": {
+                    "type": "boolean"
+                  },
+                  "reply_with_output": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "tools",
+                  "approval_required",
+                  "audience",
+                  "audience_conversations",
+                  "persona",
+                  "answers_dms",
+                  "answers_mentions",
+                  "thread_follow_up",
+                  "agent_messages",
+                  "max_agent_hops",
+                  "mid_run",
+                  "senders",
+                  "sender_list",
+                  "allow_automated",
+                  "allow_external",
+                  "reply_with_output"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteAgentChannel",
+        "summary": "Stop an agent answering on a connection; the connection stays",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "agent",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/AgentId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "channel_connection",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ChannelConnectionId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Done"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{org}/channel-tool-levels": {
+      "get": {
+        "operationId": "listChannelToolLevels",
+        "summary": "The organization's level for every channel tool, by provider",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ChannelToolLevel"
+                      }
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "operationId": "updateChannelToolLevels",
+        "summary": "Set channel tool levels: owners and admins, from the Console",
+        "security": [
+          {
+            "consoleSession": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ChannelToolLevel"
+                      }
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "provider": {
+                    "$ref": "#/components/schemas/ChannelProvider"
+                  },
+                  "levels": {
+                    "minItems": 1,
+                    "maxItems": 14,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "tool": {
+                          "type": "string"
+                        },
+                        "level": {
+                          "type": "string",
+                          "enum": [
+                            "allow",
+                            "approve",
+                            "deny"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "tool",
+                        "level"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "provider",
+                  "levels"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{org}/channel-settings": {
+      "get": {
+        "operationId": "getChannelSettings",
+        "summary": "The organization's conversation breaker and message retention",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ChannelSettings"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "operationId": "updateChannelSettings",
+        "summary": "Set the conversation breaker and message retention: owners and admins, from the Console",
+        "security": [
+          {
+            "consoleSession": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ChannelSettings"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "breaker_runs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200
+                  },
+                  "breaker_window_minutes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1440
+                  },
+                  "breaker_pause_minutes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1440
+                  },
+                  "message_retention_days": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 365
+                  }
+                },
+                "required": [
+                  "breaker_runs",
+                  "breaker_window_minutes",
+                  "breaker_pause_minutes",
+                  "message_retention_days"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/channels/inbound/{inbound_ref}": {
+      "post": {
+        "operationId": "receiveChannelEvent",
+        "summary": "Where a provider delivers one app's events. Slack signs each request (`X-Slack-Signature`, `X-Slack-Request-Timestamp`) with the app's signing secret: an unknown reference, a bad signature or a timestamp more than five minutes off is `401`, before anything is stored. A delivery seen before (by its event ID) is answered again without effect. Not idempotency-keyed: the provider's event ID is the key",
+        "security": [
+          {}
+        ],
+        "x-zupflow-callers": [
+          "provider"
+        ],
+        "parameters": [
+          {
+            "name": "inbound_ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The app's inbound reference: 32 random characters, set when the app is made. Not an ID."
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelInboundAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-zupflow-unwrapped": true,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type"
+                ],
+                "additionalProperties": {}
+              }
+            }
           }
         }
       }
@@ -13627,6 +17486,414 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/AppToolsChangedWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "channel_message.received": {
+      "post": {
+        "operationId": "webhook_channel_message_received",
+        "summary": "`channel_message.received`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "channel_message.received"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelMessageReceivedWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "channel_message.sent": {
+      "post": {
+        "operationId": "webhook_channel_message_sent",
+        "summary": "`channel_message.sent`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "channel_message.sent"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelMessageSentWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "channel_app_manager.status_changed": {
+      "post": {
+        "operationId": "webhook_channel_app_manager_status_changed",
+        "summary": "`channel_app_manager.status_changed`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "channel_app_manager.status_changed"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelAppManagerStatusChangedWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "channel_app.status_changed": {
+      "post": {
+        "operationId": "webhook_channel_app_status_changed",
+        "summary": "`channel_app.status_changed`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "channel_app.status_changed"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelAppStatusChangedWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "channel_connection.status_changed": {
+      "post": {
+        "operationId": "webhook_channel_connection_status_changed",
+        "summary": "`channel_connection.status_changed`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "channel_connection.status_changed"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelConnectionStatusChangedWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "channel_conversation.paused": {
+      "post": {
+        "operationId": "webhook_channel_conversation_paused",
+        "summary": "`channel_conversation.paused`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "channel_conversation.paused"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelConversationPausedWebhookEvent"
               }
             }
           }

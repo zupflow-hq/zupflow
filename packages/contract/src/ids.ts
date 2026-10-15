@@ -30,6 +30,13 @@ export const ID_PREFIXES = {
   audit_event: "aud",
   model_connection: "mcn",
   model: "mdl",
+  channel_app_manager: "chmgr",
+  channel_app: "chapp",
+  channel_connection: "chcon",
+  agent_channel: "agch",
+  channel_conversation: "conv",
+  channel_message: "chmsg",
+  channel_person: "person",
 } as const;
 
 export type IdKind = keyof typeof ID_PREFIXES;
@@ -61,6 +68,13 @@ export type WebhookDeliveryId = Id<"webhook_delivery">;
 export type AuditEventId = Id<"audit_event">;
 export type ModelConnectionId = Id<"model_connection">;
 export type ModelId = Id<"model">;
+export type ChannelAppManagerId = Id<"channel_app_manager">;
+export type ChannelAppId = Id<"channel_app">;
+export type ChannelConnectionId = Id<"channel_connection">;
+export type AgentChannelId = Id<"agent_channel">;
+export type ChannelConversationId = Id<"channel_conversation">;
+export type ChannelMessageId = Id<"channel_message">;
+export type ChannelPersonId = Id<"channel_person">;
 
 /** The 22-character base62 body every ID shares. */
 const BODY = /^[0-9A-Za-z]{22}$/;

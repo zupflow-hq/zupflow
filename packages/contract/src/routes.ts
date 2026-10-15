@@ -11,10 +11,13 @@ export type Method = "get" | "post" | "put" | "patch" | "delete";
 
 /**
  * Who may call a route: a Console member's session, an organization's API
- * key, hosted Connect, authorized by a session's reference alone, or anyone
- * (`public`: no credential, and an answer that holds only public values).
+ * key, hosted Connect, authorized by a session's reference alone, anyone
+ * (`public`: no credential, and an answer that holds only public values), or
+ * a channel provider delivering events (`provider`: authorized by its
+ * signature over the request, checked with the receiving app's signing
+ * secret before anything is read).
  */
-export type Caller = "console" | "api_key" | "connect" | "public";
+export type Caller = "console" | "api_key" | "connect" | "public" | "provider";
 
 export interface Route {
   operationId: string;
@@ -26,8 +29,18 @@ export interface Route {
   params: Record<string, z.ZodType>;
   query?: z.ZodObject;
   body?: z.ZodType;
-  /** `data` is the response's `data`; `list` wraps it in an array; `paginated` adds `meta.pagination`. */
-  response: { status: 200 | 201 | 204; data?: z.ZodType; list?: boolean; paginated?: boolean };
+  /**
+   * `data` is the response's `data`; `list` wraps it in an array; `paginated` adds `meta.pagination`.
+   * `unwrapped` answers `data` as the whole body, in the caller's format, with no envelope: only for
+   * a provider's callbacks.
+   */
+  response: {
+    status: 200 | 201 | 202 | 204;
+    data?: z.ZodType;
+    list?: boolean;
+    paginated?: boolean;
+    unwrapped?: true;
+  };
   /**
    * The response shows a secret once. Idempotency records that its key
    * completed but never saves the body, so a retry answers
@@ -46,9 +59,12 @@ const both: Caller[] = ["console", "api_key"];
 const consoleOnly: Caller[] = ["console"];
 const connect: Caller[] = ["connect"];
 const anyone: Caller[] = ["public"];
+const provider: Caller[] = ["provider"];
 
 const ok = (data: z.ZodType, extra: Partial<Route["response"]> = {}) => ({ status: 200 as const, data, ...extra });
 const created = (data: z.ZodType) => ({ status: 201 as const, data });
+/** Accepted: a job finishes the work; read the object to follow it. */
+const accepted = (data: z.ZodType) => ({ status: 202 as const, data });
 const noContent = { status: 204 as const };
 
 export const routes: readonly Route[] = [
@@ -1039,6 +1055,243 @@ export const routes: readonly Route[] = [
     callers: both,
     params: { ...org, hook: idSchema("webhook_endpoint") },
     response: ok(s.WebhookDelivery),
+  },
+  // Channels. Workspace-scoped, except tool levels and settings (the
+  // organization's). An API key reads and changes only its own environment's
+  // workspaces (another's is `404`).
+  {
+    operationId: "listChannelAppManagers",
+    method: "get",
+    path: "/v1/workspaces/{ws}/channel-app-managers",
+    summary: "The workspace's linked teams, newest first",
+    callers: both,
+    params: ws,
+    query: s.PageQuery,
+    response: ok(s.ChannelAppManager, { list: true, paginated: true }),
+  },
+  {
+    operationId: "createChannelAppManager",
+    method: "post",
+    path: "/v1/workspaces/{ws}/channel-app-managers",
+    summary:
+      "Link a team with a configuration token, so Zupflow can create apps for the workspace's agents there. Developers and API keys; the Console can't in Production (`403 console_read_only_in_production`). A token the provider refuses is `422 invalid_configuration_token`",
+    callers: both,
+    params: ws,
+    body: s.CreateChannelAppManagerInput,
+    response: created(s.ChannelAppManager),
+  },
+  {
+    operationId: "getChannelAppManager",
+    method: "get",
+    path: "/v1/workspaces/{ws}/channel-app-managers/{manager}",
+    summary: "A linked team",
+    callers: both,
+    params: { ...ws, manager: idSchema("channel_app_manager") },
+    response: ok(s.ChannelAppManager),
+  },
+  {
+    operationId: "updateChannelAppManager",
+    method: "patch",
+    path: "/v1/workspaces/{ws}/channel-app-managers/{manager}",
+    summary:
+      "Replace a linked team's tokens; it's `active` again. Developers and API keys; the Console can't in Production",
+    callers: both,
+    params: { ...ws, manager: idSchema("channel_app_manager") },
+    body: s.UpdateChannelAppManagerInput,
+    response: ok(s.ChannelAppManager),
+  },
+  {
+    operationId: "deleteChannelAppManager",
+    method: "delete",
+    path: "/v1/workspaces/{ws}/channel-app-managers/{manager}",
+    summary: "Unlink a team and forget its tokens. Refused while it has apps that aren't deleted: `409 in_use`",
+    callers: both,
+    params: { ...ws, manager: idSchema("channel_app_manager") },
+    response: noContent,
+  },
+  {
+    operationId: "listChannelApps",
+    method: "get",
+    path: "/v1/workspaces/{ws}/channel-apps",
+    summary: "The workspace's generated apps, newest first; deleted ones aren't listed",
+    callers: both,
+    params: ws,
+    query: s.ChannelAppListQuery,
+    response: ok(s.ChannelApp, { list: true, paginated: true }),
+  },
+  {
+    operationId: "createChannelApp",
+    method: "post",
+    path: "/v1/workspaces/{ws}/channel-apps",
+    summary:
+      "Make an agent's own app in a linked team. Answers `202` with the app `creating`; a job makes it with the provider. Developers and API keys; the Console can't in Production",
+    callers: both,
+    params: ws,
+    body: s.CreateChannelAppInput,
+    response: accepted(s.ChannelApp),
+  },
+  {
+    operationId: "getChannelApp",
+    method: "get",
+    path: "/v1/workspaces/{ws}/channel-apps/{app}",
+    summary: "A generated app; a deleted one is `404`",
+    callers: both,
+    params: { ...ws, app: idSchema("channel_app") },
+    response: ok(s.ChannelApp),
+  },
+  {
+    operationId: "deleteChannelApp",
+    method: "delete",
+    path: "/v1/workspaces/{ws}/channel-apps/{app}",
+    summary:
+      "Remove an agent's app: its token is revoked and the provider's app deleted, its connection disconnected and the agent's channel on it removed",
+    callers: both,
+    params: { ...ws, app: idSchema("channel_app") },
+    response: noContent,
+  },
+  {
+    operationId: "listChannelConnections",
+    method: "get",
+    path: "/v1/workspaces/{ws}/channel-connections",
+    summary: "The workspace's channel connections, newest first",
+    callers: both,
+    params: ws,
+    query: s.ChannelConnectionListQuery,
+    response: ok(s.ChannelConnection, { list: true, paginated: true }),
+  },
+  {
+    operationId: "getChannelConnection",
+    method: "get",
+    path: "/v1/workspaces/{ws}/channel-connections/{channel_connection}",
+    summary: "A channel connection",
+    callers: both,
+    params: { ...ws, channel_connection: idSchema("channel_connection") },
+    response: ok(s.ChannelConnection),
+  },
+  {
+    operationId: "updateChannelConnection",
+    method: "patch",
+    path: "/v1/workspaces/{ws}/channel-connections/{channel_connection}",
+    summary: "Rename a channel connection, or set its handler",
+    callers: both,
+    params: { ...ws, channel_connection: idSchema("channel_connection") },
+    body: s.UpdateChannelConnectionInput,
+    response: ok(s.ChannelConnection),
+  },
+  {
+    operationId: "deleteChannelConnection",
+    method: "delete",
+    path: "/v1/workspaces/{ws}/channel-connections/{channel_connection}",
+    summary:
+      "Disconnect: the token is revoked, and the connection, its conversations, messages and agent channel removed. Its app waits for a new install",
+    callers: both,
+    params: { ...ws, channel_connection: idSchema("channel_connection") },
+    response: noContent,
+  },
+  {
+    operationId: "listChannelConversations",
+    method: "get",
+    path: "/v1/workspaces/{ws}/channel-connections/{channel_connection}/conversations",
+    summary: "The conversations a connection has seen messages in, most recent first; `q` searches names",
+    callers: both,
+    params: { ...ws, channel_connection: idSchema("channel_connection") },
+    query: s.ChannelConversationListQuery,
+    response: ok(s.ChannelConversation, { list: true, paginated: true }),
+  },
+  {
+    operationId: "listChannelMessages",
+    method: "get",
+    path: "/v1/workspaces/{ws}/channel-connections/{channel_connection}/conversations/{conversation}/messages",
+    summary: "A conversation's messages, newest first; `thread` keeps one thread's",
+    callers: both,
+    params: {
+      ...ws,
+      channel_connection: idSchema("channel_connection"),
+      conversation: idSchema("channel_conversation"),
+    },
+    query: s.ChannelMessageListQuery,
+    response: ok(s.ChannelMessage, { list: true, paginated: true }),
+  },
+  {
+    operationId: "listAgentChannels",
+    method: "get",
+    path: "/v1/workspaces/{ws}/agents/{agent}/channels",
+    summary: "An agent's channels: one per connection of its own apps",
+    callers: both,
+    params: { ...ws, agent: idSchema("agent") },
+    response: ok(s.AgentChannel, { list: true }),
+  },
+  {
+    operationId: "putAgentChannel",
+    method: "put",
+    path: "/v1/workspaces/{ws}/agents/{agent}/channels/{channel_connection}",
+    summary: "Set an agent's channel on one of its own connections, creating it if it isn't there",
+    callers: both,
+    params: { ...ws, agent: idSchema("agent"), channel_connection: idSchema("channel_connection") },
+    body: s.PutAgentChannelInput,
+    response: ok(s.AgentChannel),
+  },
+  {
+    operationId: "deleteAgentChannel",
+    method: "delete",
+    path: "/v1/workspaces/{ws}/agents/{agent}/channels/{channel_connection}",
+    summary: "Stop an agent answering on a connection; the connection stays",
+    callers: both,
+    params: { ...ws, agent: idSchema("agent"), channel_connection: idSchema("channel_connection") },
+    response: noContent,
+  },
+  {
+    operationId: "listChannelToolLevels",
+    method: "get",
+    path: "/v1/organizations/{org}/channel-tool-levels",
+    summary: "The organization's level for every channel tool, by provider",
+    callers: both,
+    params: org,
+    response: ok(s.ChannelToolLevel, { list: true }),
+  },
+  {
+    operationId: "updateChannelToolLevels",
+    method: "put",
+    path: "/v1/organizations/{org}/channel-tool-levels",
+    summary: "Set channel tool levels: owners and admins, from the Console",
+    callers: consoleOnly,
+    params: org,
+    body: s.UpdateChannelToolLevelsInput,
+    response: ok(s.ChannelToolLevel, { list: true }),
+  },
+  {
+    operationId: "getChannelSettings",
+    method: "get",
+    path: "/v1/organizations/{org}/channel-settings",
+    summary: "The organization's conversation breaker and message retention",
+    callers: both,
+    params: org,
+    response: ok(s.ChannelSettings),
+  },
+  {
+    operationId: "updateChannelSettings",
+    method: "put",
+    path: "/v1/organizations/{org}/channel-settings",
+    summary: "Set the conversation breaker and message retention: owners and admins, from the Console",
+    callers: consoleOnly,
+    params: org,
+    body: s.UpdateChannelSettingsInput,
+    response: ok(s.ChannelSettings),
+  },
+  {
+    operationId: "receiveChannelEvent",
+    method: "post",
+    path: "/channels/inbound/{inbound_ref}",
+    summary:
+      "Where a provider delivers one app's events. Slack signs each request (`X-Slack-Signature`, `X-Slack-Request-Timestamp`) with the app's signing secret: an unknown reference, a bad signature or a timestamp more than five minutes off is `401`, before anything is stored. A delivery seen before (by its event ID) is answered again without effect. Not idempotency-keyed: the provider's event ID is the key",
+    callers: provider,
+    params: {
+      inbound_ref: z
+        .string()
+        .describe("The app's inbound reference: 32 random characters, set when the app is made. Not an ID."),
+    },
+    body: s.ChannelInboundEvent,
+    response: { status: 200, data: s.ChannelInboundAnswer, unwrapped: true },
   },
 ];
 

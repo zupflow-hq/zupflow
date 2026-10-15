@@ -52,6 +52,30 @@ fn knows_every_post_route_an_api_key_cannot_call() {
     assert_eq!(known, not_for_keys);
 }
 
+/// The routes the middleware leaves to their provider are exactly the ones
+/// only a provider calls.
+#[test]
+fn knows_every_route_a_provider_calls() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packages/contract/openapi.json");
+    let document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let provider: BTreeSet<String> = document["paths"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(_, operations)| {
+            operations["post"]["x-zupflow-callers"]
+                .as_array()
+                .is_some_and(|callers| callers.iter().all(|caller| caller == "provider"))
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+    let known: BTreeSet<String> = zupflow_server::idempotency::PROVIDER_ROUTES
+        .iter()
+        .map(|path| (*path).to_owned())
+        .collect();
+    assert_eq!(known, provider);
+}
+
 /// `SERVED_OPERATIONS` is exactly what the router answers: asked without a
 /// credential, a served route answers 401 (or, for hosted Connect, its own
 /// 404, and for a public route, 200) and any other contract route the API's 404 or 405, so the list can't claim a route that isn't there or miss

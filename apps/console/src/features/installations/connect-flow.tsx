@@ -4,6 +4,7 @@ import { CheckCircle2Icon, ExternalLinkIcon, XCircleIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { connectSubject } from "@/features/connect/subject";
 import { useCreateConnectSession, useWatchedConnectSession } from "@/features/queries";
 import { errorMessage } from "@/lib/errors";
 import { qk } from "@/lib/query-keys";
@@ -30,7 +31,7 @@ const FAILURE_COPY: Record<string, string> = {
 
 /** Why a session failed, in words that fit how its app signs in. */
 function failureCopy(session: ConnectSession, code: string): string {
-  if (code === "token_exchange_failed" && session.app.auth_type === "mcp_oauth") {
+  if (code === "token_exchange_failed" && session.app?.auth_type === "mcp_oauth") {
     return "The app's server didn't accept the sign-in. Start again; if it keeps failing, ask the server's owner to check its sign-in.";
   }
   return FAILURE_COPY[code] ?? `The provider returned ${code}.`;
@@ -171,9 +172,11 @@ export function ConnectProgress({
         <CheckCircle2Icon className="size-8 text-success" />
         <div className="space-y-1">
           <p className="font-medium">
-            {s.app.name} · {s.label} {s.intent === "reconnect" ? "reconnected" : "connected"}
+            {connectSubject(s)} · {s.label} {s.intent === "reconnect" ? "reconnected" : "connected"}
           </p>
-          <p className="text-sm text-muted-foreground">Agents still need a grant before they can use it.</p>
+          {s.target === null ? (
+            <p className="text-sm text-muted-foreground">Agents still need a grant before they can use it.</p>
+          ) : null}
         </div>
         <Button onClick={() => onDone(s)}>{doneLabel}</Button>
       </div>

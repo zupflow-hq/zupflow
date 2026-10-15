@@ -127,6 +127,8 @@ async fn record_outcome(
         serde_json::json!({
             "object": "connect_session", "id": session.id, "status": session.status,
             "installation_id": if completed { session.installation_id } else { None },
+            // Channel sessions aren't served yet: every session is an app's, with no target.
+            "target": null,
             "failure_code": session.failure_code,
         }),
         at,

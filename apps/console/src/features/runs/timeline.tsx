@@ -1,4 +1,4 @@
-import type { Run, RunEvent, ToolCallRef } from "@zupflow/sdk";
+import { CHANNEL_PROVIDER_NAMES, type Run, type RunEvent, type ToolCallRef } from "@zupflow/sdk";
 import {
   BanIcon,
   CheckIcon,
@@ -93,6 +93,13 @@ function Row({
   );
 }
 
+/** Where a call goes: an installation's app and label, or a channel connection's provider and label. */
+function toolTarget(ref: ToolCallRef): string {
+  return "installation_id" in ref
+    ? `${ref.app_name} · ${ref.installation_label}`
+    : `${CHANNEL_PROVIDER_NAMES[ref.provider]} · ${ref.connection_label}`;
+}
+
 function ToolCard({ item, live }: { item: Extract<Item, { kind: "tool" }>; live: boolean }) {
   const [open, setOpen] = useState(false);
   const failed = item.finished?.type === "tool_call.failed";
@@ -103,9 +110,7 @@ function ToolCard({ item, live }: { item: Extract<Item, { kind: "tool" }>; live:
           className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform", open && "rotate-90")}
         />
         <code className="font-medium">{item.ref.tool}</code>
-        <span className="min-w-0 flex-1 truncate text-muted-foreground">
-          {item.ref.app_name} · {item.ref.installation_label}
-        </span>
+        <span className="min-w-0 flex-1 truncate text-muted-foreground">{toolTarget(item.ref)}</span>
         {item.finished ? (
           <span
             className={cn("tabular shrink-0 font-mono text-xs", failed ? "text-destructive" : "text-muted-foreground")}
@@ -234,7 +239,7 @@ export function RunTimeline({ run, events }: { run: Run; events: RunEvent[] }) {
                   className={cn("rounded-lg border p-3", pending ? "border-warning/60 bg-warning-soft/60" : "bg-card")}
                 >
                   <p className="text-sm font-medium">
-                    Wants to call <code>{e.data.tool}</code> on {e.data.app_name} · {e.data.installation_label}
+                    Wants to call <code>{e.data.tool}</code> on {toolTarget(e.data)}
                   </p>
                   <p className="mb-2 text-sm text-muted-foreground">
                     {pending
