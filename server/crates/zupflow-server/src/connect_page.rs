@@ -270,7 +270,11 @@ async fn page(State(state): State<AppState>, reference: Result<Path<String>, Pat
 
 /// The session's app, in the session's own scope.
 async fn session_app(state: &AppState, session: &ConnectSession) -> Result<App, Unrendered> {
-    let found = match session.app {
+    // A channel session has no app: the page shows its generic face.
+    let Some(installed) = session.app else {
+        return Err(Unrendered::Gone);
+    };
+    let found = match installed {
         InstalledApp::Catalog(id) => state.apps.find_organization_app(session.organization_id, id).await,
         InstalledApp::Workspace(id) => {
             state

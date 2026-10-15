@@ -9,6 +9,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
+use zupflow_core::channels::provision::AppProvisioner;
 use zupflow_core::identity::Identity;
 use zupflow_core::model_providers::ModelProviderCatalog;
 use zupflow_core::models::ModelProvider;
@@ -16,7 +17,7 @@ use zupflow_core::outbound::OutboundHttp;
 use zupflow_core::runs::store::Durability;
 use zupflow_oidc::{OidcConfig, OidcIdentity};
 
-use crate::config::{Config, IdentityMode, ModelProviderMode};
+use crate::config::{ChannelProvisionerMode, Config, IdentityMode, ModelProviderMode};
 use crate::sign_in::SignInSettings;
 use crate::{AppState, RequestGuard};
 
@@ -142,6 +143,28 @@ pub fn model_catalog(config: &Config, outbound: &Arc<dyn OutboundHttp>) -> Arc<d
     }
 }
 
+/// What makes agents' apps in linked teams: the scripted provisioner for
+/// local work, or, unset, nothing, so no team can be linked.
+pub fn channel_provisioner(config: &Config) -> Arc<dyn AppProvisioner> {
+    match config.channel_provisioner {
+        ChannelProvisionerMode::None => {
+            tracing::info!(
+                event = "server.no_channel_provisioner",
+                "No channel provisioner is configured (ZUPFLOW_CHANNEL_PROVISIONER): teams can't be linked"
+            );
+            Arc::new(zupflow_basic::scripted_channel_provisioner::NoChannelProvisioner)
+        }
+        ChannelProvisionerMode::Scripted => {
+            tracing::warn!(
+                event = "server.scripted_channel_provisioner",
+                "Channel apps are made by the scripted provisioner (ZUPFLOW_CHANNEL_PROVISIONER=scripted): \
+                 for local work only"
+            );
+            Arc::new(zupflow_basic::scripted_channel_provisioner::ScriptedChannelProvisioner::default())
+        }
+    }
+}
+
 /// The outbound HTTP client every call to a provider, an MCP server or a
 /// webhook endpoint goes through.
 pub fn outbound() -> Result<zupflow_outbound::SafeHttpClient, BootstrapError> {
@@ -169,12 +192,14 @@ pub async fn serve(
     let worker = tokio::spawn(crate::discovery::run_worker(state.clone()));
     let runner = tokio::spawn(crate::run_engine::run_worker(state.clone()));
     let deliverer = tokio::spawn(crate::webhook_delivery::run_workers(state.clone()));
+    let provisioner = tokio::spawn(crate::channels::run_worker(state.clone()));
     let served = axum::serve(listener, crate::app(state, guard))
         .with_graceful_shutdown(shutdown)
         .await;
     worker.abort();
     runner.abort();
     deliverer.abort();
+    provisioner.abort();
     served.map_err(BootstrapError::Serve)
 }
 

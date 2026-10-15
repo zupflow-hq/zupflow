@@ -103,6 +103,8 @@ impl Server {
             model_store: Arc::new(zupflow_sqlite::SqliteModelStore::new(database.clone())),
             model_catalog: Arc::new(zupflow_basic::no_providers::NoProviders),
             connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
+            channels: Arc::new(zupflow_sqlite::SqliteChannelStore::new(database.clone())),
+            channel_provisioner: Arc::new(zupflow_basic::scripted_channel_provisioner::NoChannelProvisioner),
             jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
             tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),
             cache: Arc::new(zupflow_basic::memory_cache::MemoryCache::default()),

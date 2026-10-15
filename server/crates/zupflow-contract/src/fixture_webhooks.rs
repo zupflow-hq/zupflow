@@ -29,7 +29,8 @@ pub async fn seed(
     if workspaces.is_empty() {
         return Err("webhook history needs a workspace".to_owned());
     }
-    let mut transaction = pool.begin().await.map_err(failed)?;
+    // Immediate: a deferred one that reads first can't write once a serving process has.
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await.map_err(failed)?;
     for (index, (state, count, test)) in scenarios.into_iter().enumerate() {
         let workspace_id = workspaces[index % workspaces.len()];
         let (workspace, subject) = if test {

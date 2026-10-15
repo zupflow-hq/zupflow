@@ -152,7 +152,7 @@ fn checked_email(value: Option<String>, fields: &mut Fields) -> Option<String> {
     }
 }
 
-fn valid_email(email: &str) -> bool {
+pub(crate) fn valid_email(email: &str) -> bool {
     let Some((local, domain)) = email.split_once('@') else {
         return false;
     };

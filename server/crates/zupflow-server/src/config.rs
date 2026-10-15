@@ -49,6 +49,20 @@ pub struct Config {
     /// organization can use is its own: connections and models are added
     /// through the API, never configured here.
     pub model_provider: ModelProviderMode,
+    /// `ZUPFLOW_CHANNEL_PROVISIONER`: what makes agents' apps in linked
+    /// teams. Unset, nothing does: linking a team answers `501`, and a new
+    /// app fails `provisioner_unavailable`. `scripted` is the deterministic
+    /// stand-in for local work and tests, never a deployment's: it calls no
+    /// provider, refuses tokens containing `invalid`, and makes apps at once.
+    pub channel_provisioner: ChannelProvisionerMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelProvisionerMode {
+    /// No provisioner: linking a team answers `501`.
+    None,
+    /// The scripted provisioner in `zupflow-basic`.
+    Scripted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +121,8 @@ pub enum ConfigError {
     InvalidConsoleOrigin,
     #[error("ZUPFLOW_MODEL_PROVIDER must be `providers`, `scripted` (local work only), or unset for none")]
     UnknownModelProvider,
+    #[error("ZUPFLOW_CHANNEL_PROVISIONER must be `scripted` (local work only), or unset for none")]
+    UnknownChannelProvisioner,
     #[error("ZUPFLOW_IDENTITY must be `local` or `oidc`")]
     UnknownIdentity,
     #[error("ZUPFLOW_IDENTITY is required: set it to `oidc`, or to `local` for one person on their own machine")]
@@ -210,6 +226,11 @@ impl Config {
             Some("scripted") => ModelProviderMode::Scripted,
             Some(_) => return Err(ConfigError::UnknownModelProvider),
         };
+        let channel_provisioner = match set("ZUPFLOW_CHANNEL_PROVISIONER")?.as_deref() {
+            None => ChannelProvisionerMode::None,
+            Some("scripted") => ChannelProvisionerMode::Scripted,
+            Some(_) => return Err(ConfigError::UnknownChannelProvisioner),
+        };
         Ok(Self {
             listen,
             log,
@@ -220,6 +241,7 @@ impl Config {
             console_origin,
             public_url,
             model_provider,
+            channel_provisioner,
         })
     }
 
@@ -488,6 +510,25 @@ mod tests {
                     "ZUPFLOW_MODELS is no longer read: organizations add their own models under Model providers; \
                      unset it"
                 )
+            );
+        }
+    }
+
+    #[test]
+    fn makes_channel_apps_with_the_scripted_provisioner_only_when_asked() {
+        let provisioner = |value: &'static str| oidc_with(&[("ZUPFLOW_CHANNEL_PROVISIONER", value)]);
+        assert_eq!(
+            oidc_with(&[]).expect("defaults").channel_provisioner,
+            ChannelProvisionerMode::None
+        );
+        assert_eq!(
+            provisioner("scripted").expect("scripted").channel_provisioner,
+            ChannelProvisionerMode::Scripted
+        );
+        for value in ["fake", "slack", "Scripted"] {
+            assert!(
+                matches!(provisioner(value), Err(ConfigError::UnknownChannelProvisioner)),
+                "{value}"
             );
         }
     }

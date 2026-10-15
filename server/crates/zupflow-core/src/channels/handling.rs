@@ -1,0 +1,269 @@
+//! Inbound handling: which agents answer a new message on a connection.
+//!
+//! Every new message goes to its connection's [`MessageHandler`], which only
+//! decides which agents answer. The inbound job does everything around it,
+//! before and after, so a handler can't skip a rule: it never sees an agent
+//! the author isn't allowed to reach (the job filters candidates by the
+//! sender rules, automated accounts, other agents and the hop limit), and it
+//! can't start a run itself (the job records each dispatch, counts the
+//! conversation's breaker and starts the run).
+//!
+//! [`MentionHandler`] is the only handler built: a DM, a mention, or a
+//! follow-up in a thread the agent was addressed in. A later handler is a
+//! second implementation of the trait, with no change to the job or the store.
+
+use async_trait::async_trait;
+
+use super::store::ChannelSessionKey;
+use super::{HandlerKind, ThreadFollowUp};
+use crate::error::ApiError;
+use crate::ids::{AgentChannelId, AgentId, ChannelMessageId, ChannelPersonId};
+
+/// Decides which agents answer a new inbound message. It proposes; the
+/// inbound job enforces every rule before and after it.
+#[async_trait]
+pub trait MessageHandler: Send + Sync {
+    fn kind(&self) -> HandlerKind;
+
+    /// Pure for [`MentionHandler`]. A handler that calls a model would do it
+    /// here, inside the job, never inside the provider's acknowledgement.
+    async fn decide(&self, input: &HandlerInput<'_>) -> Result<Vec<Dispatch>, ApiError>;
+}
+
+/// What a handler decides from. The scope is the job's, from the app the
+/// event was delivered to; the candidates are already filtered.
+#[derive(Debug, Clone)]
+pub struct HandlerInput<'a> {
+    pub message: &'a InboundMessage,
+    pub thread: &'a ThreadState,
+    /// Agents that may answer this author here, already filtered by the job.
+    pub candidates: &'a [Candidate],
+}
+
+/// A new message, as the provider normalized it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundMessage {
+    pub id: ChannelMessageId,
+    /// The provider's key for the message across connections (team, conversation, time).
+    pub origin_key: String,
+    pub thread_key: String,
+    pub author: Author,
+    /// A DM to this connection's identity.
+    pub is_direct: bool,
+    /// The provider's IDs of who it mentions, in order.
+    pub mentions: Vec<String>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Author {
+    Person(ChannelPersonId),
+    /// An app or integration posting automatically.
+    Automated(ChannelPersonId),
+    /// Another agent of the workspace, posting through its own connection,
+    /// with the hops that led to its message.
+    Agent {
+        agent_channel_id: AgentChannelId,
+        hop: u32,
+    },
+}
+
+/// What the job knows of the thread across every agent of the workspace.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThreadState {
+    /// The agent most recently woken by a DM or a mention in this thread.
+    pub last_addressed: Option<AgentChannelId>,
+}
+
+/// An agent that may answer: its channel on the connection and what it answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub agent_channel_id: AgentChannelId,
+    pub agent_id: AgentId,
+    /// The provider's ID of the identity this agent answers as.
+    pub identity: String,
+    pub answers_dms: bool,
+    pub answers_mentions: bool,
+    pub thread_follow_up: ThreadFollowUp,
+    /// Its session in this thread, when it's already answering in it.
+    pub in_thread: Option<ChannelSessionKey>,
+}
+
+/// One agent the handler proposes, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dispatch {
+    pub agent_channel_id: AgentChannelId,
+    pub reason: DispatchReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchReason {
+    DirectMessage,
+    Mentioned,
+    ThreadFollowUp,
+}
+
+impl DispatchReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectMessage => "direct_message",
+            Self::Mentioned => "mentioned",
+            Self::ThreadFollowUp => "thread_follow_up",
+        }
+    }
+}
+
+/// Wakes an agent on a DM to its identity, a mention of it, or a reply in a
+/// thread it's answering in that mentions nobody: with the default, only
+/// when it was the last agent addressed there.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MentionHandler;
+
+impl MentionHandler {
+    /// The decision itself, with nothing to wait for.
+    pub fn decide_now(input: &HandlerInput<'_>) -> Vec<Dispatch> {
+        let message = input.message;
+        input
+            .candidates
+            .iter()
+            .filter_map(|candidate| {
+                let follows = candidate.in_thread.is_some()
+                    && message.mentions.is_empty()
+                    && match candidate.thread_follow_up {
+                        ThreadFollowUp::Off => false,
+                        ThreadFollowUp::WhenLastAddressed => {
+                            input.thread.last_addressed == Some(candidate.agent_channel_id)
+                        }
+                        ThreadFollowUp::Always => true,
+                    };
+                let reason = if message.is_direct && candidate.answers_dms {
+                    DispatchReason::DirectMessage
+                } else if candidate.answers_mentions && message.mentions.contains(&candidate.identity) {
+                    DispatchReason::Mentioned
+                } else if follows {
+                    DispatchReason::ThreadFollowUp
+                } else {
+                    return None;
+                };
+                Some(Dispatch {
+                    agent_channel_id: candidate.agent_channel_id,
+                    reason,
+                })
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl MessageHandler for MentionHandler {
+    fn kind(&self) -> HandlerKind {
+        HandlerKind::Mention
+    }
+
+    async fn decide(&self, input: &HandlerInput<'_>) -> Result<Vec<Dispatch>, ApiError> {
+        Ok(Self::decide_now(input))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use super::*;
+
+    fn candidate(identity: &str, follow_up: ThreadFollowUp, in_thread: bool) -> Candidate {
+        Candidate {
+            agent_channel_id: AgentChannelId::generate(),
+            agent_id: AgentId::generate(),
+            identity: identity.to_owned(),
+            answers_dms: true,
+            answers_mentions: true,
+            thread_follow_up: follow_up,
+            in_thread: in_thread.then(|| ChannelSessionKey::from_uuid(Uuid::now_v7())),
+        }
+    }
+
+    fn message(is_direct: bool, mentions: &[&str]) -> InboundMessage {
+        InboundMessage {
+            id: ChannelMessageId::generate(),
+            origin_key: "T1/C1/1.000001".to_owned(),
+            thread_key: "1.000000".to_owned(),
+            author: Author::Person(ChannelPersonId::generate()),
+            is_direct,
+            mentions: mentions.iter().map(|m| (*m).to_owned()).collect(),
+            text: "hello".to_owned(),
+        }
+    }
+
+    fn decide(message: &InboundMessage, thread: &ThreadState, candidates: &[Candidate]) -> Vec<Dispatch> {
+        MentionHandler::decide_now(&HandlerInput {
+            message,
+            thread,
+            candidates,
+        })
+    }
+
+    #[test]
+    fn answers_a_direct_message_when_the_agent_answers_dms() {
+        let mut agent = candidate("U1", ThreadFollowUp::WhenLastAddressed, false);
+        let dm = message(true, &[]);
+        assert_eq!(
+            decide(&dm, &ThreadState::default(), std::slice::from_ref(&agent)),
+            vec![Dispatch {
+                agent_channel_id: agent.agent_channel_id,
+                reason: DispatchReason::DirectMessage
+            }]
+        );
+        agent.answers_dms = false;
+        assert!(decide(&dm, &ThreadState::default(), &[agent]).is_empty());
+    }
+
+    #[test]
+    fn answers_a_mention_of_its_own_identity_only() {
+        let billing = candidate("U1", ThreadFollowUp::WhenLastAddressed, false);
+        let support = candidate("U2", ThreadFollowUp::WhenLastAddressed, false);
+        let both = [billing.clone(), support.clone()];
+        assert_eq!(
+            decide(&message(false, &["U1"]), &ThreadState::default(), &both),
+            vec![Dispatch {
+                agent_channel_id: billing.agent_channel_id,
+                reason: DispatchReason::Mentioned
+            }]
+        );
+        assert_eq!(
+            decide(&message(false, &["U2", "U1"]), &ThreadState::default(), &both).len(),
+            2
+        );
+        assert!(decide(&message(false, &["U9"]), &ThreadState::default(), &both).is_empty());
+        let mut quiet = billing;
+        quiet.answers_mentions = false;
+        assert!(decide(&message(false, &["U1"]), &ThreadState::default(), &[quiet]).is_empty());
+    }
+
+    #[test]
+    fn follows_up_in_a_thread_only_as_set() {
+        let last = candidate("U1", ThreadFollowUp::WhenLastAddressed, true);
+        let earlier = candidate("U2", ThreadFollowUp::WhenLastAddressed, true);
+        let always = candidate("U3", ThreadFollowUp::Always, true);
+        let never = candidate("U4", ThreadFollowUp::Off, true);
+        let outside = candidate("U5", ThreadFollowUp::Always, false);
+        let thread = ThreadState {
+            last_addressed: Some(last.agent_channel_id),
+        };
+        let all = [last.clone(), earlier, always.clone(), never, outside];
+        let woken: Vec<AgentChannelId> = decide(&message(false, &[]), &thread, &all)
+            .into_iter()
+            .inspect(|dispatch| assert_eq!(dispatch.reason, DispatchReason::ThreadFollowUp))
+            .map(|dispatch| dispatch.agent_channel_id)
+            .collect();
+        assert_eq!(woken, vec![last.agent_channel_id, always.agent_channel_id]);
+        // A reply addressed to someone else wakes no one else.
+        assert!(decide(&message(false, &["U9"]), &thread, &all).is_empty());
+    }
+
+    #[test]
+    fn is_the_mention_handler() {
+        assert_eq!(MentionHandler.kind(), HandlerKind::Mention);
+        assert_eq!(DispatchReason::ThreadFollowUp.as_str(), "thread_follow_up");
+    }
+}

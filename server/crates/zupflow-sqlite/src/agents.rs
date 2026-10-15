@@ -437,6 +437,16 @@ impl AgentStore for SqliteAgentStore {
             .await
             .map_err(failed("delete_agent"))?;
         let agent = agent_from(&row.ok_or(AgentError::AgentNotFound)?)?;
+        // Its channel apps go with it, announced, in this transaction.
+        crate::channels::remove_agent_apps(
+            &mut transaction,
+            organization_id,
+            workspace_id,
+            agent_id,
+            Timestamp::now(),
+        )
+        .await
+        .map_err(|_| AgentError::Unavailable)?;
         // Its grants reference it with a cascading key: they go in this one statement.
         sqlx::query("DELETE FROM agents WHERE organization_id = ? AND workspace_id = ? AND id = ?")
             .bind(organization_id.uuid())

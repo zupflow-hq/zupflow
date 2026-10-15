@@ -51,6 +51,10 @@ pub struct AppState {
     /// provider adapters, or the scripted providers for local work.
     pub model_catalog: Arc<dyn zupflow_core::model_providers::ModelProviderCatalog>,
     pub connect: Arc<dyn ConnectStore>,
+    /// Linked teams, agents' generated apps, channel connections and what they've seen.
+    pub channels: Arc<dyn zupflow_core::channels::store::ChannelStore>,
+    /// Makes, changes and deletes agents' apps in linked teams.
+    pub channel_provisioner: Arc<dyn zupflow_core::channels::provision::AppProvisioner>,
     /// Seals the secrets Zupflow holds (decision 0033).
     pub keys: Arc<dyn KeyService>,
     /// Background work: tool discovery and runs.

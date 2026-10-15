@@ -30,9 +30,11 @@
 //! opt-in `local-apps` feature, which nothing turns on by default). Without
 //! it, nothing
 //! leaves the machine: the fixture's providers answer from memory, no model
-//! answers runs, and no background work runs.
+//! answers runs, and the only background work is making channel apps with the
+//! scripted provisioner, which reaches nothing.
 
 mod fixture_apps;
+mod fixture_channels;
 mod fixture_models;
 mod fixture_runs;
 mod fixture_webhooks;
@@ -283,6 +285,10 @@ async fn serve(path: &str, serving: Serving) -> Result<(), String> {
         model_store: Arc::new(SqliteModelStore::new(database.clone())),
         model_catalog: Arc::new(ScriptedProviders),
         connect: Arc::new(SqliteConnectStore::new(database.clone())),
+        channels: Arc::new(zupflow_sqlite::SqliteChannelStore::new(database.clone())),
+        channel_provisioner: Arc::new(
+            zupflow_basic::scripted_channel_provisioner::ScriptedChannelProvisioner::default(),
+        ),
         jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
         tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),
         cache: Arc::new(zupflow_basic::memory_cache::MemoryCache::default()),
@@ -327,6 +333,10 @@ async fn serve(path: &str, serving: Serving) -> Result<(), String> {
     } else {
         Vec::new()
     };
+    // Apps are made by a job after `202`, with the scripted provisioner,
+    // which reaches nothing: its worker runs in every mode.
+    let mut workers = workers;
+    workers.push(tokio::spawn(zupflow_server::channels::run_worker(state.clone())));
     let served = axum::serve(listener, zupflow_server::app(state, guard))
         .await
         .map_err(|error| error.to_string());
@@ -1081,12 +1091,102 @@ async fn reset(path: &str) -> Result<(), String> {
         .await
         .map_err(|error| fail("paused agent")(&error))?;
 
+    // Channels in `acme`, `beta-labs`, `acme-sandbox` and Larkspur's `harbor`,
+    // each for its seeded agent; and in `acme` and `acme-sandbox` an active
+    // agent with no app yet, for the suite to add to a team.
+    for slug in ["acme", "acme-sandbox"] {
+        let (workspace, _) = workspace_id(slug)?;
+        agents
+            .create_agent(
+                northwind.id,
+                workspace,
+                AgentId::generate(),
+                &NewAgent {
+                    name: "Release notes writer".to_owned(),
+                    description: "Not on any channel yet.".to_owned(),
+                    model_id: None,
+                    instructions: "Summarize what changed, briefly.".to_owned(),
+                },
+                &|created: &Agent| {
+                    by_fixture(
+                        AuditAction::AgentCreated,
+                        AuditTarget::new(AuditObject::Agent(created.id), &created.name),
+                        AuditPlace::Workspace(workspace),
+                    )
+                },
+            )
+            .await
+            .map_err(|error| fail("app-less agent")(&error))?;
+    }
+    let channels = zupflow_sqlite::SqliteChannelStore::new(database.clone());
+    for (label, slug, team, people) in [
+        (
+            "Marketing",
+            "acme",
+            ("T0ACME7Q2K", "Acme"),
+            &[
+                ("U0ACME01", "Dana Whitfield", "dana", "dana@acme.example"),
+                ("U0ACME02", "Luis Romero", "luis", "luis@acme.example"),
+            ][..],
+        ),
+        (
+            "Google",
+            "beta-labs",
+            ("T0BETA4M8C", "Beta Labs"),
+            &[("U0BETA01", "Ines Park", "ines", "ines@betalabs.example")][..],
+        ),
+        (
+            "Engineering",
+            "acme-sandbox",
+            ("T0ACMESBX1", "Acme (test)"),
+            &[("U0ASBX01", "Jordan Lee", "jordan", "jordan@northwind.example")][..],
+        ),
+        (
+            "Harbor",
+            "harbor",
+            ("T0HARB0R9Z", "Harbor"),
+            &[("U0HARB01", "Rowan Ellis", "rowan", "rowan@larkspur.example")][..],
+        ),
+    ] {
+        let (_, organization, workspace, _, agent_id) = seeded_agents
+            .iter()
+            .find(|seeded| seeded.0 == label)
+            .copied()
+            .ok_or_else(|| format!("agent of {label}"))?;
+        let (_, environment) = workspace_id(slug)?;
+        let agent = agents
+            .find_agent(organization, workspace, agent_id)
+            .await
+            .map_err(|error| fail(label)(&error))?
+            .ok_or_else(|| format!("agent of {label}"))?;
+        let (editor, linked_by) = if organization == northwind.id {
+            (owner_member.id, owner.id)
+        } else {
+            (outsider_member.id, outsider.id)
+        };
+        fixture_channels::seed(
+            &channels,
+            &sealing,
+            &fixture_channels::Seed {
+                organization_id: organization,
+                workspace_id: workspace,
+                environment,
+                editor,
+                linked_by,
+                agent,
+                team,
+                people,
+            },
+        )
+        .await?;
+    }
+
     // Runs, as the run engine leaves them: a finished one for the agent of
     // `acme`, `beta-labs`, `acme-sandbox`, `qa-playground` and `harbor`, and in `beta-labs` one
     // waiting for approval of `send_email`; `qa-playground` also waits for
     // `echo_write`, giving the shared suite a fixed pending call in each environment.
     // None is queued or running, so
-    // nothing moves on its own (the contract server runs no worker).
+    // nothing moves on its own (without `--local-app`, the contract server runs no run worker).
     let runs = SqliteRunStore::new(database.clone());
     for (label, tool, waiting) in [
         ("Marketing", "search_files", false),
@@ -1207,7 +1307,8 @@ async fn reset(path: &str) -> Result<(), String> {
                 ConnectSessionId::generate(),
                 &NewConnectSession {
                     environment,
-                    app,
+                    app: Some(app),
+                    target: None,
                     configuration_version: 1,
                     intent: ConnectIntent::Create,
                     installation_id: None,

@@ -14,6 +14,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::audit::Audit;
+use crate::channels::ConnectTarget;
 use crate::environment::Environment;
 use crate::ids::{ConnectSessionId, InstallationId, OrganizationId, WorkspaceId};
 use crate::installations::{ConnectedAccount, Installation, InstalledApp, NewCredential, TemplateSnapshot};
@@ -98,8 +99,12 @@ pub struct ConnectSession {
     pub workspace_id: WorkspaceId,
     /// The workspace's, when the session started.
     pub environment: Environment,
-    pub app: InstalledApp,
-    /// The app configuration's version when the session started.
+    /// The app an app's session installs; `None` for a channel session.
+    pub app: Option<InstalledApp>,
+    /// What a channel session sets up; `None` for an app's session. Exactly
+    /// one of `app` and `target` is set.
+    pub target: Option<ConnectTarget>,
+    /// The app configuration's version when the session started; 0 for a channel session.
     pub configuration_version: u32,
     pub intent: ConnectIntent,
     /// The installation a reconnect renews, or the one a completed create
@@ -132,11 +137,14 @@ impl ConnectSession {
     }
 }
 
-/// A new session: everything but its ID, scope, status and times.
+/// A new session: everything but its ID, scope, status and times. Exactly
+/// one of `app` and `target` is set; a channel target names no manager or
+/// connection yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewConnectSession {
     pub environment: Environment,
-    pub app: InstalledApp,
+    pub app: Option<InstalledApp>,
+    pub target: Option<ConnectTarget>,
     pub configuration_version: u32,
     pub intent: ConnectIntent,
     pub installation_id: Option<InstallationId>,

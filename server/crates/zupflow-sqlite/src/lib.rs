@@ -5,6 +5,7 @@
 //! - [`SqliteApiKeyStore`]: API keys, by keyed hash.
 //! - [`SqliteAuditStore`]: the audit log, which every store writes with the change it records.
 //! - [`SqliteAppStore`]: catalog apps and workspace apps.
+//! - [`SqliteChannelStore`]: linked teams, generated apps, channel connections and what they've seen.
 //! - [`SqliteConnectStore`]: Connect settings and sessions.
 //! - [`SqliteIdempotencyStore`]: idempotency keys for `POST`.
 //! - [`SqliteInstallationStore`]: installations and their sealed credentials.
@@ -26,6 +27,7 @@ mod agents;
 mod api_keys;
 mod apps;
 mod audit;
+mod channels;
 mod connect;
 mod database;
 mod idempotency;
@@ -45,6 +47,7 @@ pub use agents::SqliteAgentStore;
 pub use api_keys::SqliteApiKeyStore;
 pub use apps::SqliteAppStore;
 pub use audit::SqliteAuditStore;
+pub use channels::SqliteChannelStore;
 pub use connect::SqliteConnectStore;
 pub use database::{Database, DatabaseError};
 pub use idempotency::SqliteIdempotencyStore;
