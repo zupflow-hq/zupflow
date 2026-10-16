@@ -28,6 +28,17 @@
 //! Then the message is marked handled. A message's text is never logged.
 //! The job has its own worker loop ([`run_worker`]).
 //!
+//! **Catching up.** A provider tells an app nothing of a conversation until
+//! it's in it, so the mention that got an agent added to a channel would go
+//! unheard. Its own join queues [`CATCH_UP_JOB`] in the transaction that
+//! records it; the job ([`catch_up`]) reads, with the connection's token,
+//! the messages sent there in the [`CATCH_UP_WINDOW`] before the join
+//! ([`CATCH_UP_LIMIT`] at most), and records each one that mentions the
+//! connection, not its own, as the delivery it would have been: a message
+//! recorded before (heard already, or caught up by an earlier join) is
+//! never queued again, so nothing is answered twice. The same worker runs
+//! it.
+//!
 //! [`ChannelStore::attribute_app_by_inbound_ref_cross_tenant`]: zupflow_core::channels::store::ChannelStore::attribute_app_by_inbound_ref_cross_tenant
 
 use std::time::Duration;
@@ -43,16 +54,19 @@ use serde_json::json;
 use zeroize::Zeroizing;
 use zupflow_core::agents::AgentStatus;
 use zupflow_core::channels::handling::{
-    Author, Candidate, DispatchReason, HandlerInput, INBOUND_JOB, INBOUND_JOB_ATTEMPTS, InboundMessage, MentionHandler,
-    MessageHandler, ThreadState, message_of_job,
+    Author, CATCH_UP_JOB, CATCH_UP_LIMIT, CATCH_UP_WINDOW, Candidate, CatchUp, DispatchReason, HandlerInput,
+    INBOUND_JOB, INBOUND_JOB_ATTEMPTS, InboundMessage, MentionHandler, MessageHandler, ThreadState, catch_up_of_job,
+    message_of_job,
 };
-use zupflow_core::channels::provider::{InboundDelivery, InboundRefusal, InboundRequest};
+use zupflow_core::channels::provider::{
+    InboundDelivery, InboundEvent, InboundRefusal, InboundRequest, ProviderCallError,
+};
 use zupflow_core::channels::store::{
     DeliveryOutcome, DispatchOutcome, InboundContext, NewDelivery, NewDispatch, SessionTemplate,
 };
 use zupflow_core::channels::thread::{instructions, origin_keys, preface};
 use zupflow_core::channels::{
-    AgentChannel, AgentMessages, ConversationKind, Direction, HandlerKind, InboundRef, Senders,
+    AgentChannel, AgentMessages, ConnectionStatus, ConversationKind, Direction, HandlerKind, InboundRef, Senders,
 };
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{ChannelAppId, ChannelMessageId, OrganizationId, WorkspaceId};
@@ -255,6 +269,9 @@ async fn receive(
             message_id,
         } => {
             tracing::info!(event = "channels.message_changed", %organization_id, %workspace_id, %app_id, %connection_id, %message_id);
+        }
+        DeliveryOutcome::Joined { connection_id } => {
+            tracing::info!(event = "channels.conversation_joined", %organization_id, %workspace_id, %app_id, %connection_id);
         }
         DeliveryOutcome::Duplicate | DeliveryOutcome::Ignored | DeliveryOutcome::Message { .. } => {}
     }
@@ -614,13 +631,168 @@ async fn handle_message(
         .map_err(|_| "store_unavailable")
 }
 
-/// Claims and handles one inbound job, if one is due. Whether one was.
+/// What became of a catch-up job.
+enum CaughtUp {
+    /// Read, and what mentions the connection recorded: how many messages.
+    Done(usize),
+    /// Nothing to read: the connection gone, no longer connected, or not
+    /// the app's any more; or the provider can't say, or refused for good.
+    NotRead(&'static str),
+    /// Rate limited: wait this long, without using an attempt.
+    Wait(Duration),
+    /// Worth trying again.
+    Retry(&'static str),
+}
+
+/// Reads what was said in a conversation just before the connection joined
+/// it, and records each message that mentions it as the delivery it would
+/// have been: see the module's notes. Every step names the job's
+/// organization and workspace.
+async fn catch_up(
+    state: &AppState,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    job: &CatchUp,
+) -> CaughtUp {
+    let connection = match state
+        .channels
+        .find_connection(organization_id, workspace_id, job.connection_id)
+        .await
+    {
+        Ok(Some(connection)) => connection,
+        Ok(None) => return CaughtUp::NotRead("connection_gone"),
+        Err(_) => return CaughtUp::Retry("store_unavailable"),
+    };
+    if connection.status != ConnectionStatus::Connected || connection.app_id != Some(job.app_id) {
+        return CaughtUp::NotRead("not_connected");
+    }
+    let token = match crate::channel_reply::connection_token(state, organization_id, workspace_id, connection.id).await
+    {
+        Ok(Some(token)) => token,
+        Ok(None) => return CaughtUp::NotRead("no_token"),
+        Err(why) => return CaughtUp::Retry(why),
+    };
+    let window = i64::try_from(CATCH_UP_WINDOW.as_millis()).unwrap_or(i64::MAX);
+    let joined_at = job.conversation.joined_at;
+    let since = zupflow_core::time::Timestamp::from_millis(joined_at.millis().saturating_sub(window));
+    let messages = match state
+        .channel_provider
+        .recent_messages(
+            state.outbound.as_ref(),
+            &token,
+            &job.conversation,
+            since,
+            CATCH_UP_LIMIT,
+        )
+        .await
+    {
+        Ok(messages) => messages,
+        Err(ProviderCallError::RateLimited { retry_after_secs }) => {
+            return CaughtUp::Wait(Duration::from_secs(retry_after_secs));
+        }
+        Err(ProviderCallError::Unavailable | ProviderCallError::OutcomeUnknown) => {
+            return CaughtUp::Retry("provider_unavailable");
+        }
+        Err(ProviderCallError::TokenRefused) => return CaughtUp::NotRead("token_refused"),
+        Err(ProviderCallError::Unsupported) => return CaughtUp::NotRead("unsupported"),
+        Err(ProviderCallError::Refused(code)) => return CaughtUp::NotRead(code),
+    };
+    let identity = &connection.identity;
+    let mut recorded = 0;
+    for message in messages {
+        let own = message.author_external_id.as_deref() == Some(identity.external_id.as_str())
+            || (message.author_bot_id.is_some() && message.author_bot_id == identity.bot_id);
+        // What was said to it in the window before it joined, and nothing else.
+        if own
+            || message.conversation_external_id != job.conversation.conversation_external_id
+            || message.sent_at < since
+            || message.sent_at > joined_at
+            || !message.mentions.contains(&identity.external_id)
+        {
+            continue;
+        }
+        let delivery = NewDelivery {
+            // Its own event ID, apart from any Slack sent: a message heard
+            // already is still recorded once, by its own ID.
+            provider_event_id: format!("catch_up:{}:{}", message.conversation_external_id, message.external_id),
+            kind: "message".to_owned(),
+            team_id: Some(connection.team.id.clone()),
+            event: InboundEvent::Message(Box::new(message)),
+        };
+        match state
+            .channels
+            .record_delivery(organization_id, workspace_id, job.app_id, &delivery, state.clock.now())
+            .await
+        {
+            Ok(DeliveryOutcome::Message {
+                connection_id,
+                message_id,
+                new: true,
+            }) => {
+                recorded += 1;
+                tracing::info!(event = "channels.message_caught_up", %organization_id, %workspace_id, app_id = %job.app_id, %connection_id, %message_id);
+            }
+            Ok(_) => {}
+            Err(_) => return CaughtUp::Retry("store_unavailable"),
+        }
+    }
+    CaughtUp::Done(recorded)
+}
+
+/// Handles one claimed catch-up job: completed, postponed, tried again, or
+/// buried after its last attempt.
+async fn handle_catch_up(state: &AppState, job: Job) {
+    let Job {
+        id,
+        scope,
+        payload,
+        attempt,
+        lease,
+        ..
+    } = job;
+    let (Scope::Workspace(organization_id, workspace_id), Some(catch_up_job)) = (scope, catch_up_of_job(&payload))
+    else {
+        tracing::error!(event = "channels.malformed_job", kind = CATCH_UP_JOB);
+        if let Ok(reason) = Name::new("malformed") {
+            let _ = state.jobs.bury(&scope, id, &lease, &reason).await;
+        }
+        return;
+    };
+    let connection_id = catch_up_job.connection_id;
+    let finished = match catch_up(state, organization_id, workspace_id, &catch_up_job).await {
+        CaughtUp::Done(recorded) => {
+            tracing::info!(event = "channels.caught_up", %organization_id, %workspace_id, %connection_id, recorded);
+            state.jobs.complete(&scope, id, &lease).await
+        }
+        CaughtUp::NotRead(why) => {
+            tracing::info!(event = "channels.catch_up_not_read", %organization_id, %workspace_id, %connection_id, code = why);
+            state.jobs.complete(&scope, id, &lease).await
+        }
+        CaughtUp::Wait(after) => state.jobs.postpone(&scope, id, &lease, after).await,
+        CaughtUp::Retry(why) => {
+            tracing::warn!(event = "channels.catch_up_retry", %organization_id, %workspace_id, %connection_id, why, attempt);
+            match Name::new(why) {
+                Ok(reason) => {
+                    let after = Duration::from_secs(5 * u64::from(attempt.max(1)));
+                    state.jobs.retry(&scope, id, &lease, after, &reason).await.map(|_| ())
+                }
+                Err(_) => state.jobs.complete(&scope, id, &lease).await,
+            }
+        }
+    };
+    if let Err(error) = finished {
+        tracing::warn!(event = "channels.catch_up_finish_failed", %organization_id, %workspace_id, %connection_id, %error);
+    }
+}
+
+/// Claims and handles one inbound or catch-up job, if one is due. Whether
+/// one was.
 pub async fn work_once(state: &AppState) -> bool {
-    let Ok(kind) = Name::new(INBOUND_JOB) else {
+    let (Ok(inbound), Ok(catching_up)) = (Name::new(INBOUND_JOB), Name::new(CATCH_UP_JOB)) else {
         return false;
     };
     // Cross-tenant by design: a worker takes the next job of any scope.
-    let job = match state.jobs.claim_next(std::slice::from_ref(&kind), LEASE).await {
+    let job = match state.jobs.claim_next(&[inbound, catching_up], LEASE).await {
         Ok(Some(job)) => job,
         Ok(None) => return false,
         Err(error) => {
@@ -628,7 +800,11 @@ pub async fn work_once(state: &AppState) -> bool {
             return false;
         }
     };
-    handle(state, job).await;
+    if job.kind.as_str() == CATCH_UP_JOB {
+        handle_catch_up(state, job).await;
+    } else {
+        handle(state, job).await;
+    }
     true
 }
 

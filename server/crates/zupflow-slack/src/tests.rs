@@ -12,7 +12,7 @@ use zupflow_core::channels::ChannelProviderKind;
 use zupflow_core::channels::ConversationKind;
 use zupflow_core::channels::provider::{
     ChannelProvider, DeletedMessage, EditedMessage, InboundDelivery, InboundEvent, InboundRefusal, InboundRequest,
-    MessageRef, NormalizedMessage, OutgoingPost, ProviderCallError, ProviderPerson,
+    JoinedConversation, MessageRef, NormalizedMessage, OutgoingPost, ProviderCallError, ProviderPerson,
 };
 use zupflow_core::channels::provision::{
     AppManifest, AppProvisioner, ConsentExchange, ConsentRequest, InstallStep, ManagerTokens, ProvisionError,
@@ -928,6 +928,37 @@ fn removal_is_read_and_everything_else_ignored() {
     );
     // Not an event callback, and no event ID: nothing to record.
     assert_eq!(read("app_rate_limited"), InboundDelivery::Ignored);
+}
+
+/// A join names who joined which channel, of which kind, and when: what
+/// tells an app it was added, so it can catch up. A channel of a kind it
+/// doesn't know is nothing.
+#[test]
+fn a_join_is_read_with_its_channel_and_member() {
+    assert_eq!(
+        read("member_joined_channel"),
+        delivered(
+            "Ev0MEMBER001",
+            "member_joined_channel",
+            InboundEvent::Joined(Box::new(JoinedConversation {
+                conversation_external_id: "C0PRIVATE".to_owned(),
+                conversation_kind: ConversationKind::PrivateChannel,
+                conversation_is_external: true,
+                member_external_id: "UBOT00001".to_owned(),
+                joined_at: at("1760000900.000100"),
+            }))
+        )
+    );
+    let body = std::fs::read_to_string(format!(
+        "{}/fixtures/events/member_joined_channel.json",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("the fixture exists")
+    .replace(r#""channel_type": "G""#, r#""channel_type": "D""#);
+    assert_eq!(
+        SlackChannelProvider::default().read(body.as_bytes(), mention_time()),
+        Ok(delivered("Ev0MEMBER001", "member_joined_channel", InboundEvent::Other))
+    );
 }
 
 #[test]

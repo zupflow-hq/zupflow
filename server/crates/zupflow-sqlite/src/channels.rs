@@ -22,7 +22,7 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::{Arguments, QueryBuilder, Row, Sqlite, SqliteConnection, Transaction};
 use uuid::Uuid;
 use zupflow_core::audit::Audit;
-use zupflow_core::channels::handling::inbound_job;
+use zupflow_core::channels::handling::{catch_up_job, inbound_job};
 use zupflow_core::channels::provider::InboundEvent;
 use zupflow_core::channels::store::{
     AppCreation, AppFilter, AppSecretsRecord, ChannelEditor, ChannelError, ChannelSession, ChannelStore,
@@ -1712,6 +1712,32 @@ async fn receive(
             return Ok(DeliveryOutcome::Uninstalled);
         }
         InboundEvent::Other => return Ok(DeliveryOutcome::Ignored),
+        InboundEvent::Joined(joined) => {
+            // Only the connection's own join: it's what a provider says when
+            // the agent is added to a conversation it wasn't hearing.
+            if connection.status != ConnectionStatus::Connected
+                || joined.member_external_id != connection.identity.external_id
+            {
+                return Ok(DeliveryOutcome::Ignored);
+            }
+            let job = catch_up_job(app_id, connection.id, joined).ok_or(ChannelError::Unavailable)?;
+            insert_job_at(
+                &mut *transaction,
+                &Scope::Workspace(organization_id, workspace_id),
+                &job.kind,
+                job.payload,
+                job.options,
+                now.millis(),
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(event = "channels.catch_up_job_not_queued", %error);
+                ChannelError::Unavailable
+            })?;
+            return Ok(DeliveryOutcome::Joined {
+                connection_id: connection.id,
+            });
+        }
         InboundEvent::Edited(edited) => {
             if connection.status != ConnectionStatus::Connected {
                 return Ok(DeliveryOutcome::Ignored);

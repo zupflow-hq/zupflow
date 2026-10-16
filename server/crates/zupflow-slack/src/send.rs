@@ -438,6 +438,33 @@ impl SlackClient {
         Ok(messages_page(&answer))
     }
 
+    /// `conversations.history`'s first page between `oldest` and `latest`
+    /// (each a `ts`, both included), newest first, each message as Slack
+    /// wrote it: for reading them as the events they would have been.
+    pub async fn history_objects(
+        &self,
+        http: &dyn OutboundHttp,
+        token: &str,
+        channel: &str,
+        (oldest, latest): (&str, &str),
+        limit: u32,
+    ) -> Result<Vec<Map<String, Value>>, SlackError> {
+        let limit = limit.clamp(1, PAGE_MAX).to_string();
+        let form = vec![
+            ("channel", channel),
+            ("limit", limit.as_str()),
+            ("oldest", oldest),
+            ("latest", latest),
+            ("inclusive", "true"),
+        ];
+        let answer = call(http, &self.api, "conversations.history", Auth::Bearer(token), &form).await?;
+        Ok(answer
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(|messages| messages.iter().filter_map(Value::as_object).cloned().collect())
+            .unwrap_or_default())
+    }
+
     /// `conversations.replies`: a page of a thread, its root first, from
     /// `oldest` (a `ts`) on, with each message's metadata.
     #[allow(clippy::too_many_arguments)]

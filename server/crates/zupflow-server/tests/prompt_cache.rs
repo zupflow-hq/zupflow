@@ -23,6 +23,8 @@ mod faults;
 #[path = "common/run_setup.rs"]
 mod run_setup;
 
+use std::time::Duration;
+
 use axum::http::{Method, StatusCode};
 use common::{PROVIDER_KEY, Server, call};
 use faults::{Point, Worker};
@@ -378,6 +380,26 @@ async fn continues_each_turn_through_rounds_of_tool_calls() {
             assert_eq!(totals[field], finished["usage"][run_field], "{}: {field}", path.name());
         }
     }
+}
+
+/// The organization's usage counts a run on the day the server's clock
+/// says it ran: its report's days are read on that clock too, never the
+/// wall clock, so a run near midnight is never left out.
+#[tokio::test]
+async fn counts_usage_on_the_servers_own_days() {
+    let (kind, model) = PATHS[0];
+    let path = on(kind, model).await;
+    // Two days past the wall clock: outside its two-day window entirely.
+    path.setup.kit.clock.advance(Duration::from_secs(2 * 24 * 60 * 60));
+    let input = path.asking(&[&[("lookup", json!({ "n": 1 }))]]).await;
+    let run = path.setup.start(&input).await;
+    path.work().await;
+    let finished = path.setup.get(run).await;
+    assert_eq!(finished["status"], "completed", "{finished}");
+    assert!(finished["usage"]["input_tokens"].as_u64().unwrap() > 0);
+    let totals = path.usage_totals().await;
+    assert_eq!(totals["input_tokens"], finished["usage"]["input_tokens"]);
+    assert_eq!(totals["runs"], 1, "{totals}");
 }
 
 #[tokio::test]

@@ -17,13 +17,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+use super::provider::JoinedConversation;
 use super::store::ChannelSessionKey;
-use super::{HandlerKind, ThreadFollowUp};
+use super::{ConversationKind, HandlerKind, ThreadFollowUp};
 use crate::error::ApiError;
-use crate::ids::{AgentChannelId, AgentId, ChannelMessageId, ChannelPersonId};
+use crate::ids::{AgentChannelId, AgentId, ChannelAppId, ChannelConnectionId, ChannelMessageId, ChannelPersonId};
 use crate::jobs::JobOptions;
 use crate::runs::QueuedJob;
 use crate::scope::Name;
+use crate::time::Timestamp;
 
 /// The kind of the job a new message queues, in the transaction that
 /// records it, for the inbound job to decide who answers it.
@@ -50,6 +52,78 @@ pub fn inbound_job(message_id: ChannelMessageId) -> Option<QueuedJob> {
 pub fn message_of_job(payload: &[u8]) -> Option<ChannelMessageId> {
     let payload: Value = serde_json::from_slice(payload).ok()?;
     ChannelMessageId::parse(payload.get("message_id")?.as_str()?).ok()
+}
+
+/// The kind of the job a connection's own join queues, in the transaction
+/// that records it: a provider tells an app nothing of a conversation until
+/// it's in it, so the mention that got it added there would go unheard.
+/// The job reads what was said there just before the join
+/// ([`CATCH_UP_WINDOW`], [`CATCH_UP_LIMIT`]) and records each message that
+/// mentions the connection as a delivery would, which queues its inbound
+/// job; a message recorded before is never queued again, so nothing is
+/// answered twice.
+pub const CATCH_UP_JOB: &str = "channel_catch_up";
+
+/// How far before its join a connection looks back.
+pub const CATCH_UP_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// How many messages it reads, at most: one page, within the least a
+/// provider's history call gives an app.
+pub const CATCH_UP_LIMIT: u32 = 15;
+
+/// How many times the catch-up job is tried; a rate limit waits without
+/// using one.
+pub const CATCH_UP_JOB_ATTEMPTS: u32 = 5;
+
+/// What a catch-up job names: references only, never a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatchUp {
+    pub app_id: ChannelAppId,
+    pub connection_id: ChannelConnectionId,
+    pub conversation: JoinedConversation,
+}
+
+/// The catch-up job for a connection's join.
+pub fn catch_up_job(
+    app_id: ChannelAppId,
+    connection_id: ChannelConnectionId,
+    joined: &JoinedConversation,
+) -> Option<QueuedJob> {
+    Some(QueuedJob {
+        kind: Name::new(CATCH_UP_JOB).ok()?,
+        payload: json!({
+            "app_id": app_id,
+            "connection_id": connection_id,
+            "conversation": joined.conversation_external_id,
+            "conversation_kind": joined.conversation_kind.as_str(),
+            "conversation_is_external": joined.conversation_is_external,
+            "member": joined.member_external_id,
+            "joined_at": joined.joined_at.millis(),
+        })
+        .to_string()
+        .into_bytes(),
+        options: JobOptions {
+            delay: Duration::ZERO,
+            max_attempts: CATCH_UP_JOB_ATTEMPTS,
+        },
+    })
+}
+
+/// What a catch-up job's payload names.
+pub fn catch_up_of_job(payload: &[u8]) -> Option<CatchUp> {
+    let payload: Value = serde_json::from_slice(payload).ok()?;
+    let text = |name: &str| payload.get(name).and_then(Value::as_str);
+    Some(CatchUp {
+        app_id: ChannelAppId::parse(text("app_id")?).ok()?,
+        connection_id: ChannelConnectionId::parse(text("connection_id")?).ok()?,
+        conversation: JoinedConversation {
+            conversation_external_id: text("conversation")?.to_owned(),
+            conversation_kind: ConversationKind::parse(text("conversation_kind")?)?,
+            conversation_is_external: payload.get("conversation_is_external")?.as_bool()?,
+            member_external_id: text("member")?.to_owned(),
+            joined_at: Timestamp::from_millis(payload.get("joined_at")?.as_i64()?),
+        },
+    })
 }
 
 /// Decides which agents answer a new inbound message. It proposes; the
@@ -316,6 +390,30 @@ mod tests {
         assert_eq!(job.kind.as_str(), INBOUND_JOB);
         assert_eq!(message_of_job(&job.payload), Some(id));
         assert_eq!(message_of_job(b"{}"), None);
+    }
+
+    #[test]
+    fn names_a_joined_conversation_in_its_catch_up_job() {
+        let app_id = ChannelAppId::generate();
+        let connection_id = ChannelConnectionId::generate();
+        let joined = JoinedConversation {
+            conversation_external_id: "C0GENERAL".to_owned(),
+            conversation_kind: ConversationKind::PrivateChannel,
+            conversation_is_external: true,
+            member_external_id: "U0BOT".to_owned(),
+            joined_at: Timestamp::from_millis(1_760_000_000_123),
+        };
+        let job = catch_up_job(app_id, connection_id, &joined).expect("its kind is a valid name");
+        assert_eq!(job.kind.as_str(), CATCH_UP_JOB);
+        assert_eq!(
+            catch_up_of_job(&job.payload),
+            Some(CatchUp {
+                app_id,
+                connection_id,
+                conversation: joined
+            })
+        );
+        assert_eq!(catch_up_of_job(b"{}"), None);
     }
 
     #[test]

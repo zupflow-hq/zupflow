@@ -22,7 +22,8 @@
 //! | `message` `message_changed`, edited by its author (`message.edited`) | [`InboundEvent::Edited`] |
 //! | `message` `message_deleted` | [`InboundEvent::Deleted`] |
 //! | `app_uninstalled`, `tokens_revoked` | [`InboundEvent::Uninstalled`] |
-//! | `app_mention`, other changes (a thread's reply count, an unfurl), anything else (joins, topic changes, `app_rate_limited`) | [`InboundEvent::Other`] |
+//! | `member_joined_channel` | [`InboundEvent::Joined`] |
+//! | `app_mention`, other changes (a thread's reply count, an unfurl), anything else (topic changes, `app_rate_limited`) | [`InboundEvent::Other`] |
 //!
 //! A message's conversation is its `channel`, of the kind its
 //! `channel_type` names (a message that names none is `Other`: its kind is
@@ -47,6 +48,14 @@
 //! text (a reply counted on its thread's first message, a link unfurled):
 //! without `message.edited` it's `Other`.
 //!
+//! A join names its `channel` and its kind (`channel_type` `C`, public, or
+//! `G`, private), who joined (`user`) and when (`event_ts`). Slack sends an
+//! app nothing from a channel until its bot user is in it, so the mention
+//! that got it added goes unheard; once its own join arrives,
+//! [`ChannelProvider::recent_messages`] reads the conversation's history
+//! (`conversations.history`, one page), each message read as the `message`
+//! event it would have been.
+//!
 //! Text stays in Slack's markup; a run renders it when it takes it in
 //! ([`zupflow_core::channels::thread::plain_text`]).
 
@@ -56,8 +65,8 @@ use serde_json::{Map, Value};
 use sha2::Sha256;
 use zupflow_core::channels::provider::{
     ChannelProvider, DeletedMessage, EditedMessage, INBOUND_TOLERANCE_SECONDS, InboundDelivery, InboundEvent,
-    InboundRefusal, InboundRequest, MessageRef, NormalizedMessage, OutgoingPost, ProviderCallError, ProviderPerson,
-    SignatureHeaders,
+    InboundRefusal, InboundRequest, JoinedConversation, MessageRef, NormalizedMessage, OutgoingPost, ProviderCallError,
+    ProviderPerson, SignatureHeaders,
 };
 use zupflow_core::channels::{ChannelProviderKind, ConversationKind};
 use zupflow_core::outbound::OutboundHttp;
@@ -152,6 +161,61 @@ fn conversation_kind(event: &Map<String, Value>) -> Option<ConversationKind> {
         "mpim" => Some(ConversationKind::GroupDm),
         _ => None,
     }
+}
+
+/// What `channel_type` a message of `kind` names: the inverse of
+/// [`conversation_kind`].
+fn channel_type(kind: ConversationKind) -> &'static str {
+    match kind {
+        ConversationKind::Channel => "channel",
+        ConversationKind::PrivateChannel => "group",
+        ConversationKind::Dm => "im",
+        ConversationKind::GroupDm => "mpim",
+    }
+}
+
+/// A join: who joined which channel, and when. `None` for one Zupflow
+/// doesn't read: a channel of a kind it doesn't know, or a field longer
+/// than Slack sends.
+fn joined(event: &Map<String, Value>, shared: bool, now: Timestamp) -> Option<JoinedConversation> {
+    let channel = field(event, "channel", FIELD_MAX)?;
+    let user = field(event, "user", FIELD_MAX)?;
+    let kind = match event.get("channel_type").and_then(Value::as_str)? {
+        "C" => ConversationKind::Channel,
+        "G" => ConversationKind::PrivateChannel,
+        _ => return None,
+    };
+    Some(JoinedConversation {
+        conversation_external_id: channel.to_owned(),
+        conversation_kind: kind,
+        conversation_is_external: shared,
+        member_external_id: user.to_owned(),
+        joined_at: field(event, "event_ts", FIELD_MAX).and_then(ts_time).unwrap_or(now),
+    })
+}
+
+/// A message read from a conversation's history, as the `message` event
+/// it would have been in `conversation`: `None` for one a delivery
+/// wouldn't read as a new message (a join, a topic change).
+fn history_message(
+    message: &Map<String, Value>,
+    conversation: &JoinedConversation,
+    now: Timestamp,
+) -> Option<NormalizedMessage> {
+    match message.get("subtype").and_then(Value::as_str) {
+        None | Some("thread_broadcast" | "file_share" | "me_message" | "bot_message") => {}
+        Some(_) => return None,
+    }
+    let mut message = message.clone();
+    message.insert(
+        "channel".to_owned(),
+        Value::String(conversation.conversation_external_id.clone()),
+    );
+    message.insert(
+        "channel_type".to_owned(),
+        Value::String(channel_type(conversation.conversation_kind).to_owned()),
+    );
+    new_message(&message, conversation.conversation_is_external, now)
 }
 
 /// A thread key: the thread a message replies in, else its own `ts`, or
@@ -261,6 +325,9 @@ fn event(event: &Map<String, Value>, shared: bool, now: Timestamp) -> InboundEve
             Some(_) => InboundEvent::Other,
         },
         Some("app_uninstalled" | "tokens_revoked") => InboundEvent::Uninstalled,
+        Some("member_joined_channel") => {
+            joined(event, shared, now).map_or(InboundEvent::Other, |joined| InboundEvent::Joined(Box::new(joined)))
+        }
         _ => InboundEvent::Other,
     }
 }
@@ -536,6 +603,45 @@ impl ChannelProvider for SlackChannelProvider {
             .open_dm(http, token, person_external_id)
             .await
             .map_err(|error| call_error(error, false))
+    }
+
+    /// `conversations.history` from `since` up to the join, one page of
+    /// `limit` at most, newest first: each message read as the `message`
+    /// event it would have been.
+    async fn recent_messages(
+        &self,
+        http: &dyn OutboundHttp,
+        token: &str,
+        conversation: &JoinedConversation,
+        since: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<NormalizedMessage>, ProviderCallError> {
+        let ts = |at: Timestamp| {
+            let millis = at.millis().max(0);
+            format!("{}.{:06}", millis / 1000, (millis % 1000) * 1000)
+        };
+        // Up to the join: what was said after it arrives as events, and
+        // mustn't push what came before off the one page.
+        let (oldest, latest) = (ts(since), ts(conversation.joined_at));
+        let messages = self
+            .client
+            .history_objects(
+                http,
+                token,
+                &conversation.conversation_external_id,
+                (&oldest, &latest),
+                limit,
+            )
+            .await
+            .map_err(|error| call_error(error, false))?;
+        Ok(messages
+            .iter()
+            // A message whose `ts` isn't a time can't be placed in the window.
+            .filter(|message| message.get("ts").and_then(Value::as_str).and_then(ts_time).is_some())
+            .filter_map(|message| history_message(message, conversation, since))
+            .filter(|message| message.sent_at >= since && message.sent_at <= conversation.joined_at)
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .collect())
     }
 
     /// `assistant.threads.setStatus`: a short status while working, and an

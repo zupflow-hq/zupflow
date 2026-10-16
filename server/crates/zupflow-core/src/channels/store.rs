@@ -429,6 +429,9 @@ pub enum DeliveryOutcome {
         message_id: ChannelMessageId,
         new: bool,
     },
+    /// The connection's own identity joined a conversation: its catch-up
+    /// job ([`CATCH_UP_JOB`](super::handling::CATCH_UP_JOB)) is queued.
+    Joined { connection_id: ChannelConnectionId },
 }
 
 /// What the inbound job decides from, read in the message's scope.
@@ -1100,7 +1103,11 @@ pub trait ChannelStore: Send + Sync {
     /// reconnected (announced); a message on a connected connection is saved
     /// with its conversation and author, once ([`Self::record_message`]'s
     /// rules), and a new one queues its inbound job
-    /// ([`super::handling::inbound_job`]) in the same transaction.
+    /// ([`super::handling::inbound_job`]) in the same transaction. The
+    /// connection's own identity joining a conversation, on a connected
+    /// connection, queues its catch-up job
+    /// ([`super::handling::catch_up_job`]) in the same transaction
+    /// (`Joined`); anyone else's join is `Ignored`.
     async fn record_delivery(
         &self,
         organization_id: OrganizationId,

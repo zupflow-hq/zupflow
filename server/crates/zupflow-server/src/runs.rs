@@ -487,7 +487,7 @@ async fn get_usage(
         return Err(environment_mismatch());
     }
     let days = clamped_int(query.get("days").map(String::as_str), USAGE_DAYS, MAX_USAGE_DAYS);
-    let today = day_of(Timestamp::now());
+    let today = day_of(state.clock.now());
     let first = today - (days - 1);
     let counted = state
         .runs

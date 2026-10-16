@@ -79,8 +79,24 @@ pub enum InboundEvent {
     Deleted(Box<DeletedMessage>),
     /// The app was removed from the team, or its tokens revoked.
     Uninstalled,
+    /// Someone joined a conversation: the connection's own identity, when
+    /// it's added to a channel, so it can catch up on what was said to it
+    /// before (see [`ChannelProvider::recent_messages`]).
+    Joined(Box<JoinedConversation>),
     /// Something Zupflow doesn't act on: recorded once, nothing more.
     Other,
+}
+
+/// Someone joining a conversation, as the provider normalized it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinedConversation {
+    pub conversation_external_id: String,
+    pub conversation_kind: ConversationKind,
+    /// Shared with another organization's team (Slack Connect).
+    pub conversation_is_external: bool,
+    /// Who joined: the provider's ID for them.
+    pub member_external_id: String,
+    pub joined_at: Timestamp,
 }
 
 /// A message as the provider normalized it.
@@ -279,6 +295,23 @@ pub trait ChannelProvider: Send + Sync {
         _token: &str,
         _person_external_id: &str,
     ) -> Result<String, ProviderCallError> {
+        Err(ProviderCallError::Unsupported)
+    }
+
+    /// The newest messages of a conversation the connection just joined,
+    /// sent at `since` or later, at most `limit`, newest first, read as the
+    /// provider would deliver them: what was said there before the
+    /// connection could hear it. Only messages a delivery would read as
+    /// [`InboundEvent::Message`]; `Unsupported` (the default) when the
+    /// provider can't say.
+    async fn recent_messages(
+        &self,
+        _http: &dyn OutboundHttp,
+        _token: &str,
+        _conversation: &JoinedConversation,
+        _since: Timestamp,
+        _limit: u32,
+    ) -> Result<Vec<NormalizedMessage>, ProviderCallError> {
         Err(ProviderCallError::Unsupported)
     }
 

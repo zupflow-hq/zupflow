@@ -1060,6 +1060,8 @@ async fn deliver(server: &Server, delivery: &zupflow_slack::fake::Delivery) -> (
 /// with a model to answer with: where Slack sends its events, what they're
 /// signed with, and the bot user it answers as.
 struct Answering {
+    user: &'static str,
+    team: &'static str,
     t: Tenant,
     agent: String,
     connection: String,
@@ -1069,17 +1071,33 @@ struct Answering {
 }
 
 async fn answering(server: &Server, slack: &FakeSlack) -> Answering {
-    let t = tenant(server, "alice", "acme").await;
-    server.default_model("alice", &t.org, "sandbox").await;
-    slack.issue_configuration_token(CONFIGURATION_TOKEN, REFRESH_TOKEN, TEAM);
-    let (status, linked) = link(server, &t, "alice", CONFIGURATION_TOKEN, REFRESH_TOKEN).await;
+    answering_as(server, slack, "alice", "acme", TEAM).await
+}
+
+/// [`answering`], for `user`'s own organization `slug`, in its own team.
+async fn answering_as(
+    server: &Server,
+    slack: &FakeSlack,
+    user: &'static str,
+    slug: &str,
+    team: &'static str,
+) -> Answering {
+    let t = tenant(server, user, slug).await;
+    server.default_model(user, &t.org, "sandbox").await;
+    let (configuration_token, refresh_token) = if team == TEAM {
+        (CONFIGURATION_TOKEN.to_owned(), REFRESH_TOKEN.to_owned())
+    } else {
+        (format!("xoxe.xoxp-1-{slug}-config"), format!("xoxe-1-{slug}-refresh"))
+    };
+    slack.issue_configuration_token(&configuration_token, &refresh_token, team);
+    let (status, linked) = link(server, &t, user, &configuration_token, &refresh_token).await;
     assert_eq!(status, StatusCode::CREATED, "{linked}");
     let manager = linked["data"]["id"].as_str().unwrap().to_owned();
-    let agent = agent(server, &t, "alice", "Scribe").await;
-    let (app, external) = made_app(server, &t, "alice", &agent, &manager).await;
-    let reference = install_session(server, &t, "alice", &app).await;
+    let agent = agent(server, &t, user, "Scribe").await;
+    let (app, external) = made_app(server, &t, user, &agent, &manager).await;
+    let reference = install_session(server, &t, user, &app).await;
     let (_, query) = authorize(server, &reference).await;
-    let code = slack.allow(&external, TEAM, "Acme");
+    let code = slack.allow(&external, team, slug);
     let (status, _, _) = server
         .visit(&callback(&format!("code={code}&state={}", query["state"])))
         .await;
@@ -1087,7 +1105,7 @@ async fn answering(server: &Server, slack: &FakeSlack) -> Answering {
     let (_, connections) = server
         .send(
             call(
-                "alice",
+                user,
                 Method::GET,
                 format!("/v1/workspaces/{}/channel-connections", t.ws),
             )
@@ -1102,6 +1120,8 @@ async fn answering(server: &Server, slack: &FakeSlack) -> Answering {
         .to_owned();
     let bot_user = slack.installs().pop().unwrap().bot_user_id;
     Answering {
+        user,
+        team,
         t,
         agent,
         connection,
@@ -1118,7 +1138,7 @@ fn now_seconds() -> i64 {
 /// A message event as Slack delivers it to the app, signed now.
 fn message_event(to: &Answering, event_id: &str, event: Value, shared: bool) -> zupflow_slack::fake::Delivery {
     let body = json!({
-        "type": "event_callback", "team_id": TEAM, "api_app_id": "A0FAKE", "event_id": event_id,
+        "type": "event_callback", "team_id": to.team, "api_app_id": "A0FAKE", "event_id": event_id,
         "event_time": now_seconds(), "is_ext_shared_channel": shared, "event": event,
     })
     .to_string();
@@ -1149,7 +1169,7 @@ async fn channel_runs(server: &Server, to: &Answering) -> Vec<Value> {
     let (status, body) = server
         .send(
             call(
-                "alice",
+                to.user,
                 Method::GET,
                 format!("/v1/workspaces/{}/runs?agent_id={}&limit=100", to.t.ws, to.agent),
             )
@@ -1290,6 +1310,258 @@ async fn answers_a_mention_in_its_thread_through_slack() {
     answer_all(&server).await;
     assert_eq!(slack.calls_to("users.info").len(), 1);
     assert_eq!(slack.calls_to("chat.postMessage").len(), 2);
+}
+
+/// Slack's join of `user` to a channel at `at` (seconds), signed now.
+fn joined_event(to: &Answering, event_id: &str, channel: &str, user: &str, at: i64) -> Delivery {
+    let ts = format!("{at}.000900");
+    message_event(
+        to,
+        event_id,
+        json!({
+            "type": "member_joined_channel", "user": user, "channel": channel, "channel_type": "C",
+            "team": to.team, "inviter": "U0ALICE", "event_ts": ts,
+        }),
+        false,
+    )
+}
+
+/// Slack sends an app nothing from a channel it isn't in, so the mention
+/// that gets it added there is never delivered. Its own join reads the
+/// channel's history from ten minutes before, one page of 15, and answers
+/// that mention once, in its thread: never a message older than that,
+/// one that doesn't mention it, nor a join's own notice; never again on a
+/// second join, or when the mention is delivered after all; and never for
+/// someone else's join. Another organization's connection, linked to its
+/// own team, reads nothing and answers nothing.
+#[tokio::test]
+async fn answers_the_mention_that_added_it_to_a_channel_once() {
+    let (server, slack) = slack_server().await;
+    let to = answering(&server, &slack).await;
+    let other = answering_as(&server, &slack, "bob", "globex", "T0GLOBEX").await;
+    slack.add_user(json!({
+        "id": "U0ALICE", "name": "alice", "deleted": false, "is_bot": false,
+        "profile": { "display_name": "Alice", "real_name": "Alice Moreau", "email": "alice@acme.example" },
+    }));
+    let now = now_seconds();
+    let mention = format!("{}.000100", now - 60);
+    let bot = &to.bot_user;
+    slack.add_message("C0NEW", &mention, "U0ALICE", &format!("<@{bot}> let's talk?"), None);
+    slack.add_message(
+        "C0NEW",
+        &format!("{}.000100", now - 11 * 60),
+        "U0ALICE",
+        &format!("<@{bot}> anyone?"),
+        None,
+    );
+    slack.add_message(
+        "C0NEW",
+        &format!("{}.000100", now - 30),
+        "U0ALICE",
+        "<@U0CAROL> not you",
+        None,
+    );
+    slack.add_message(
+        "C0NEW",
+        &format!("{}.000200", now - 1),
+        bot,
+        &format!("<@{bot}> has joined the channel"),
+        Some("channel_join"),
+    );
+
+    // Someone else joining reads nothing.
+    let (status, _) = deliver(&server, &joined_event(&to, "Ev0ALICEJOINS", "C0NEW", "U0ALICE", now)).await;
+    assert_eq!(status, StatusCode::OK);
+    answer_all(&server).await;
+    assert!(slack.calls_to("conversations.history").is_empty());
+
+    // A busy channel: a page's worth said after the join, before the
+    // catch-up reads, never pushes out what was said before it.
+    for seq in 0..16 {
+        slack.add_message(
+            "C0NEW",
+            &format!("{now}.{:06}", 1000 + seq),
+            "U0ALICE",
+            &format!("<@{bot}> later {seq}"),
+            None,
+        );
+    }
+    let (status, answer) = deliver(&server, &joined_event(&to, "Ev0JOINED", "C0NEW", bot, now)).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    answer_all(&server).await;
+    let read = slack.calls_to("conversations.history");
+    assert_eq!(read.len(), 1);
+    assert_eq!(read[0].form["channel"], "C0NEW");
+    assert_eq!(read[0].form["limit"], "15");
+    assert_eq!(
+        read[0].form["latest"],
+        format!("{now}.000000"),
+        "up to the join, to the millisecond"
+    );
+    assert_eq!(
+        read[0].form["oldest"]
+            .split('.')
+            .next()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap(),
+        now - 10 * 60,
+        "ten minutes before the join"
+    );
+    let install = slack
+        .installs()
+        .into_iter()
+        .find(|install| install.bot_user_id == *bot)
+        .unwrap();
+    assert_eq!(
+        read[0].authorization.as_deref(),
+        Some(format!("Bearer {}", install.token).as_str())
+    );
+
+    let runs = channel_runs(&server, &to).await;
+    assert_eq!(runs.len(), 1, "the mention, once: {runs:?}");
+    assert_eq!(runs[0]["status"], "completed", "{}", runs[0]);
+    assert!(runs[0]["input"].as_str().unwrap().contains("let's talk?"));
+    let replies: Vec<_> = slack
+        .messages()
+        .into_iter()
+        .filter(|message| message.channel == "C0NEW" && !message.by_person)
+        .collect();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].thread_ts.as_deref(), Some(mention.as_str()), "in its thread");
+    // Only what was said to it is kept: nothing else of the channel's history.
+    let pool = database(&server).await;
+    let kept: Vec<(String, String)> = sqlx::query_as(
+        "SELECT g.direction, g.external_id FROM channel_messages g JOIN channel_conversations c \
+         ON c.organization_id = g.organization_id AND c.workspace_id = g.workspace_id AND c.id = g.conversation_id \
+         WHERE c.external_id = 'C0NEW' ORDER BY g.external_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        kept,
+        [
+            ("inbound".to_owned(), mention.clone()),
+            ("outbound".to_owned(), replies[0].ts.clone())
+        ]
+    );
+
+    // A second join reads again, and answers nothing again; nor does the
+    // mention's own delivery, should Slack send it after all.
+    let (status, _) = deliver(&server, &joined_event(&to, "Ev0JOINEDAGAIN", "C0NEW", bot, now)).await;
+    assert_eq!(status, StatusCode::OK);
+    posted(
+        &server,
+        &to,
+        "Ev0LATE",
+        json!({
+            "type": "message", "user": "U0ALICE", "team": TEAM, "channel": "C0NEW", "channel_type": "channel",
+            "text": format!("<@{bot}> let's talk?"), "ts": mention, "event_ts": mention,
+        }),
+        false,
+    )
+    .await;
+    answer_all(&server).await;
+    assert_eq!(slack.calls_to("conversations.history").len(), 2);
+    assert_eq!(channel_runs(&server, &to).await.len(), 1);
+    assert_eq!(slack.calls_to("chat.postMessage").len(), 1);
+
+    // The other organization's connection: its own join of the same
+    // channel ID, in its own team, reads with its own token only, and
+    // nothing of the first one's reaches it.
+    assert!(channel_runs(&server, &other).await.is_empty());
+    let (status, _) = deliver(
+        &server,
+        &joined_event(&other, "Ev0OTHERJOINED", "C0NEW", &other.bot_user, now),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    answer_all(&server).await;
+    let other_install = slack
+        .installs()
+        .into_iter()
+        .find(|install| install.bot_user_id == other.bot_user)
+        .unwrap();
+    let read = slack.calls_to("conversations.history");
+    assert_eq!(read.len(), 3);
+    assert_eq!(
+        read[2].authorization.as_deref(),
+        Some(format!("Bearer {}", other_install.token).as_str())
+    );
+    assert!(
+        channel_runs(&server, &other).await.is_empty(),
+        "nothing mentions its agent"
+    );
+    assert_eq!(channel_runs(&server, &to).await.len(), 1);
+    // A join delivered to the first app but naming the other's team is
+    // never the first connection's.
+    let crossed = message_event(
+        &to,
+        "Ev0CROSSED",
+        json!({
+            "type": "member_joined_channel", "user": bot, "channel": "C0ELSEWHERE", "channel_type": "C",
+            "team": other.team, "event_ts": format!("{now}.000950"),
+        }),
+        false,
+    );
+    let body: Value = serde_json::from_str(&crossed.body).unwrap();
+    let mut body = body;
+    body["team_id"] = json!(other.team);
+    let body = body.to_string();
+    let crossed = Delivery {
+        signature: zupflow_slack::events::sign(to.signing_secret.as_bytes(), &crossed.timestamp, body.as_bytes()),
+        body,
+        ..crossed
+    };
+    let (status, _) = deliver(&server, &crossed).await;
+    assert_eq!(status, StatusCode::OK);
+    answer_all(&server).await;
+    assert_eq!(
+        slack.calls_to("conversations.history").len(),
+        3,
+        "another team's join reads nothing"
+    );
+}
+
+/// A rate limit on the history read waits as long as Slack asks, without
+/// using an attempt, and the mention is answered once Slack answers.
+#[tokio::test]
+async fn waits_out_a_rate_limit_before_catching_up() {
+    let (server, slack) = slack_server().await;
+    let to = answering(&server, &slack).await;
+    let now = now_seconds();
+    let mention = format!("{}.000100", now - 5);
+    slack.add_message(
+        "C0NEW",
+        &mention,
+        "U0ALICE",
+        &format!("<@{}> hello?", to.bot_user),
+        None,
+    );
+    slack.fail_next("conversations.history", Fault::RateLimited { secs: 60 });
+    let (status, _) = deliver(&server, &joined_event(&to, "Ev0JOINED", "C0NEW", &to.bot_user, now)).await;
+    assert_eq!(status, StatusCode::OK);
+    answer_all(&server).await;
+    assert!(channel_runs(&server, &to).await.is_empty(), "waiting");
+    let pool = database(&server).await;
+    let (state, attempts, run_at): (String, i64, i64) =
+        sqlx::query_as("SELECT state, attempts, run_at FROM jobs WHERE kind = 'channel_catch_up'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (state.as_str(), attempts),
+        ("queued", 0),
+        "a rate limit uses no attempt"
+    );
+    assert!(run_at >= (now + 55) * 1000, "as long as Slack asked");
+    sqlx::query("UPDATE jobs SET run_at = 0 WHERE kind = 'channel_catch_up'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    answer_all(&server).await;
+    assert_eq!(channel_runs(&server, &to).await.len(), 1);
 }
 
 /// A reply whose answer was lost is found by its run's ID, never posted

@@ -627,9 +627,14 @@ nothing is made; `scripted` is a stand-in for local work and tests only.
    from its consent page to `{ZUPFLOW_PUBLIC_URL}/connect/oauth/callback`, so
    with `slack` the server refuses to start unless `ZUPFLOW_PUBLIC_URL` is an
    `https://` origin, and Slack must be able to reach it. For local work, run
-   a tunnel to `127.0.0.1:8080` (any HTTPS tunnel will do) and set
-   `ZUPFLOW_PUBLIC_URL` to the tunnel's origin; it must stay the same for as
-   long as its apps live, since their manifests name it.
+   an HTTPS tunnel to `127.0.0.1:8080` and set `ZUPFLOW_PUBLIC_URL` to the
+   tunnel's origin; it must stay the same for as long as its apps live, since
+   their manifests name it. Run that server with `oidc` sign-in: with
+   `local`, every request is the owner, so the server answers only requests
+   addressed to a loopback host, and a tunnel's requests get `403
+   host_not_allowed`. Never make a tunnel pass them on as `Host:
+   127.0.0.1:8080`: the tunnel's URL is in every app's manifest, and anyone
+   who has it would act as the owner.
 2. **Generate a configuration token.** A Slack workspace admin opens
    [api.slack.com/apps](https://api.slack.com/apps), and under *Your App
    Configuration Tokens* generates one for the workspace. Slack shows an
@@ -657,8 +662,19 @@ expired, pasting new ones finishes it. A Slack rate limit postpones the job
 for as long as Slack asked, without using an attempt.
 
 Once installed, the app's events arrive at its inbound endpoint, read in
-Slack's terms (`zupflow_slack::SlackChannelProvider`): a mention is read once,
-from its `message` event (its `app_mention` is recorded and nothing more);
+Slack's terms (`zupflow_slack::SlackChannelProvider`). Slack sends an app
+nothing from a channel its bot user isn't in, so the mention that gets an
+agent added to a channel is never delivered: its own `member_joined_channel`
+queues a catch-up job, which reads the channel's history from ten minutes
+before the join up to it (`conversations.history`, one page of 15, a rate limit
+waited out without using an attempt) and takes each message there that
+mentions the agent as if Slack had delivered it. A message recorded before is
+never taken again, so a second join, or the mention's own delivery, answers
+nothing twice. Apps made before this subscribe to the join with their next
+manifest update (any change to their agent's name or description).
+
+A mention is read once, from its `message` event (its `app_mention` is
+recorded and nothing more);
 edits and deletions change nothing a model was sent; a message in a channel
 shared with another organization (Slack Connect) is read with its author's
 own team, so it wakes the agent only when the agent allows people of other

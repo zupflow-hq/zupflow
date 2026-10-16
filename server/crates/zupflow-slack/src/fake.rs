@@ -111,6 +111,10 @@ pub struct FakeMessage {
     pub metadata: Option<Value>,
     pub deleted: bool,
     pub reactions: Vec<String>,
+    /// Posted by a person, not an app: history shows it with no `bot_id`.
+    pub by_person: bool,
+    /// Its `subtype` (`channel_join`, say), for one that isn't a plain post.
+    pub subtype: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -218,6 +222,26 @@ impl FakeSlack {
             },
         );
         code
+    }
+
+    /// What a person wrote in `channel` at `ts`, kept as Slack keeps it:
+    /// history reads it, and no event is sent (as none is to an app not in
+    /// the channel). A `subtype` makes it something other than a plain post
+    /// (`channel_join`, say).
+    pub fn add_message(&self, channel: &str, ts: &str, user: &str, text: &str, subtype: Option<&str>) {
+        self.state().messages.push(FakeMessage {
+            channel: channel.to_owned(),
+            ts: ts.to_owned(),
+            thread_ts: None,
+            user: user.to_owned(),
+            text: text.to_owned(),
+            blocks: Value::Null,
+            metadata: None,
+            deleted: false,
+            reactions: Vec::new(),
+            by_person: true,
+            subtype: subtype.map(str::to_owned),
+        });
     }
 
     /// `users.info` answers this user.
@@ -543,6 +567,8 @@ impl FakeSlack {
                     metadata,
                     deleted: false,
                     reactions: Vec::new(),
+                    by_person: false,
+                    subtype: None,
                 };
                 state.messages.push(message);
                 Ok(ok(
@@ -610,7 +636,11 @@ impl FakeSlack {
                 let channel = form("channel");
                 let oldest = form("oldest");
                 let thread = call.form.get("ts").cloned();
-                let after = |ts: &str| oldest.is_empty() || ts.parse::<f64>().ok() >= oldest.parse::<f64>().ok();
+                let latest = form("latest");
+                let after = |ts: &str| {
+                    (oldest.is_empty() || ts.parse::<f64>().ok() >= oldest.parse::<f64>().ok())
+                        && (latest.is_empty() || ts.parse::<f64>().ok() <= latest.parse::<f64>().ok())
+                };
                 let mut messages: Vec<Value> = state
                     .messages
                     .iter()
@@ -622,8 +652,13 @@ impl FakeSlack {
                     .map(|message| {
                         let mut value = json!({
                             "type": "message", "ts": message.ts, "user": message.user, "text": message.text,
-                            "bot_id": format!("B{}", message.user),
                         });
+                        if !message.by_person {
+                            value["bot_id"] = json!(format!("B{}", message.user));
+                        }
+                        if let Some(subtype) = &message.subtype {
+                            value["subtype"] = json!(subtype);
+                        }
                         if let Some(thread_ts) = &message.thread_ts {
                             value["thread_ts"] = json!(thread_ts);
                         }
@@ -636,7 +671,14 @@ impl FakeSlack {
                     })
                     .collect();
                 if thread.is_none() {
-                    messages.reverse();
+                    // Newest first, as Slack's history is.
+                    messages.sort_by(|a, b| {
+                        let ts = |message: &Value| message["ts"].as_str().unwrap_or_default().parse::<f64>().ok();
+                        ts(b).partial_cmp(&ts(a)).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+                if let Some(limit) = call.form.get("limit").and_then(|limit| limit.parse::<usize>().ok()) {
+                    messages.truncate(limit);
                 }
                 Ok(ok(
                     json!({ "messages": messages, "has_more": false, "response_metadata": { "next_cursor": "" } }),

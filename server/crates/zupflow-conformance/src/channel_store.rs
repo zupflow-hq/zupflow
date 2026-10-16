@@ -32,9 +32,9 @@ use std::time::Duration;
 
 use zupflow_core::agents::{AgentChanges, AgentError, AgentStatus, AgentStore};
 use zupflow_core::audit::AuditActor;
-use zupflow_core::channels::handling::{DispatchReason, INBOUND_JOB, message_of_job};
+use zupflow_core::channels::handling::{CATCH_UP_JOB, DispatchReason, INBOUND_JOB, catch_up_of_job, message_of_job};
 use zupflow_core::channels::provider::{
-    DeletedMessage, EditedMessage, InboundEvent, NormalizedMessage, ProviderPerson,
+    DeletedMessage, EditedMessage, InboundEvent, JoinedConversation, NormalizedMessage, ProviderPerson,
 };
 use zupflow_core::channels::reply::{ChannelReply, REPLY_JOB};
 use zupflow_core::channels::store::{
@@ -120,6 +120,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     deletes_an_agents_apps_with_it(&stores, &prepare).await;
     records_messages_once_and_byte_for_byte(&stores, &prepare).await;
     records_deliveries_once(&stores, &prepare).await;
+    catches_up_only_on_its_own_join(&stores, &prepare).await;
     starts_one_run_per_session(&stores, &prepare).await;
     counts_the_breaker_under_concurrency(&stores, &prepare).await;
     counts_runs_and_reads_each_message_once(&stores, &prepare).await;
@@ -1807,6 +1808,120 @@ async fn records_deliveries_once(stores: &Stores<'_>, prepare: &Prepare) {
         ))
         .await,
         Ok(DeliveryOutcome::Ignored)
+    );
+}
+
+/// A connection's own join to a conversation queues its catch-up job, in its
+/// own workspace and naming its own app and connection, in the transaction
+/// that records it; anyone else's join, another team's, a repeated event,
+/// and a join to a connection that isn't connected queue nothing; and a
+/// join is never recorded through another workspace's scope.
+async fn catches_up_only_on_its_own_join(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let (_, app, connection) = installed(stores, &t, ws, t.agent).await;
+    let (_, sibling_app, _) = installed(stores, &t, t.sibling, t.sibling_agent).await;
+    let joined = |member: &str| JoinedConversation {
+        conversation_external_id: "C0NEW".to_owned(),
+        conversation_kind: ConversationKind::PrivateChannel,
+        conversation_is_external: false,
+        member_external_id: member.to_owned(),
+        joined_at: Timestamp::from_millis(9_000),
+    };
+    let delivery = |id: &str, team: &str, member: &str| NewDelivery {
+        provider_event_id: id.to_owned(),
+        kind: "member_joined_channel".to_owned(),
+        team_id: Some(team.to_owned()),
+        event: InboundEvent::Joined(Box::new(joined(member))),
+    };
+    let deliver = |workspace_id: WorkspaceId, app_id: ChannelAppId, delivery: NewDelivery| async move {
+        stores
+            .channels
+            .record_delivery(org, workspace_id, app_id, &delivery, now())
+            .await
+    };
+    assert_eq!(
+        deliver(ws, app, delivery("EvJ1", "T0NORTH", "U0DANA")).await,
+        Ok(DeliveryOutcome::Ignored),
+        "someone else's join"
+    );
+    assert_eq!(
+        deliver(ws, app, delivery("EvJ2", "T0ELSEWHERE", "U0CONFORM")).await,
+        Ok(DeliveryOutcome::Ignored),
+        "another team's"
+    );
+    assert_eq!(
+        deliver(t.sibling, app, delivery("EvJ3", "T0NORTH", "U0CONFORM")).await,
+        Err(ChannelError::AppNotFound),
+        "never through another workspace"
+    );
+    assert_eq!(
+        deliver(ws, app, delivery("EvJ4", "T0NORTH", "U0CONFORM")).await,
+        Ok(DeliveryOutcome::Joined {
+            connection_id: connection
+        })
+    );
+    assert_eq!(
+        deliver(ws, app, delivery("EvJ4", "T0NORTH", "U0CONFORM")).await,
+        Ok(DeliveryOutcome::Duplicate)
+    );
+    let job = claim_in(stores, CATCH_UP_JOB, Scope::Workspace(org, ws))
+        .await
+        .expect("its catch-up job");
+    let catch_up = catch_up_of_job(&job.payload).expect("names its join");
+    assert_eq!(
+        (catch_up.app_id, catch_up.connection_id, &catch_up.conversation),
+        (app, connection, &joined("U0CONFORM"))
+    );
+    stores.jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+    assert!(
+        claim_in(stores, CATCH_UP_JOB, Scope::Workspace(org, ws))
+            .await
+            .is_none(),
+        "one job, for its own join alone"
+    );
+    assert!(
+        claim_in(stores, CATCH_UP_JOB, Scope::Workspace(org, t.sibling))
+            .await
+            .is_none(),
+        "nothing in the sibling workspace"
+    );
+    // The sibling's own join is its own: in its workspace, naming its app.
+    assert!(matches!(
+        deliver(t.sibling, sibling_app, delivery("EvJ5", "T0NORTH", "U0CONFORM")).await,
+        Ok(DeliveryOutcome::Joined { .. })
+    ));
+    let job = claim_in(stores, CATCH_UP_JOB, Scope::Workspace(org, t.sibling))
+        .await
+        .expect("the sibling's catch-up job");
+    assert_eq!(
+        catch_up_of_job(&job.payload).map(|catch_up| catch_up.app_id),
+        Some(sibling_app)
+    );
+    stores.jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+    // Not connected any more: its join queues nothing.
+    assert_eq!(
+        deliver(
+            ws,
+            app,
+            NewDelivery {
+                provider_event_id: "EvJ7".to_owned(),
+                kind: "app_uninstalled".to_owned(),
+                team_id: Some("T0NORTH".to_owned()),
+                event: InboundEvent::Uninstalled,
+            }
+        )
+        .await,
+        Ok(DeliveryOutcome::Uninstalled)
+    );
+    assert_eq!(
+        deliver(ws, app, delivery("EvJ8", "T0NORTH", "U0CONFORM")).await,
+        Ok(DeliveryOutcome::Ignored)
+    );
+    assert!(
+        claim_in(stores, CATCH_UP_JOB, Scope::Workspace(org, ws))
+            .await
+            .is_none()
     );
 }
 

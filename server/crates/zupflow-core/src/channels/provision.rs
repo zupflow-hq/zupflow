@@ -61,6 +61,8 @@ pub const SLACK_EVENTS: &[&str] = &[
     "message.mpim",
     "app_uninstalled",
     "tokens_revoked",
+    // Its own join to a channel, to catch up on the mention that added it.
+    "member_joined_channel",
 ];
 
 /// The longest app name a provider takes.
