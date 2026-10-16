@@ -915,3 +915,402 @@ async fn shows_no_sandbox_badge_in_production() {
     let (_, _, html) = open(&server.app, &format!("/connect/{sandbox}")).await;
     assert!(html.contains("<span class=\"env-badge\">Sandbox</span>"));
 }
+
+// --- The public host under `local` sign-in --------------------------------------
+
+/// A tunnel's origin, as `ZUPFLOW_PUBLIC_URL` names it, and the `Host` it sends.
+const TUNNEL: &str = "https://tunnel.example";
+const TUNNEL_HOST: &str = "tunnel.example";
+const LOOPBACK: &str = "localhost:8080";
+
+/// The guard `main` builds for `local` sign-in on port 8080, with
+/// `ZUPFLOW_PUBLIC_URL` set to `public_url` or unset.
+fn local_guard(public_url: Option<&str>) -> RequestGuard {
+    let config = zupflow_server::config::Config::from_vars(|name| {
+        Ok(match name {
+            "ZUPFLOW_IDENTITY" => Some("local".to_owned()),
+            "ZUPFLOW_PUBLIC_URL" => public_url.map(str::to_owned),
+            _ => None,
+        })
+    })
+    .unwrap();
+    zupflow_server::bootstrap::guard(&config)
+}
+
+/// A request addressed to `host`, with `headers` and, for a body, JSON.
+fn addressed(host: &str, method: Method, uri: &str, headers: &[(&str, &str)], body: Option<Value>) -> Request<Body> {
+    let mut request = Request::builder().method(method).uri(uri).header("Host", host);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    match body {
+        Some(body) => request
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string())),
+        None => request.body(Body::empty()),
+    }
+    .unwrap()
+}
+
+/// The status and the body as text.
+async fn answer(app: &axum::Router, request: Request<Body>) -> (StatusCode, String) {
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn refused_for_host((status, body): &(StatusCode, String)) -> bool {
+    *status == StatusCode::FORBIDDEN
+        && serde_json::from_str::<Value>(body).is_ok_and(|body| body["error"]["code"] == "host_not_allowed")
+}
+
+/// Every route the guard lets the public host reach is one the router serves:
+/// none answers the router's own `404` or `405`.
+#[tokio::test]
+async fn admits_the_public_host_only_for_routes_the_router_serves() {
+    let server = Server::new().await;
+    let t = tenant(&server, &[]).await;
+    let (_, reference) = start(&server, &t, Value::Null).await;
+    for (method, template) in zupflow_server::guard::PUBLIC_HOST_ROUTES {
+        let uri = template
+            .replace("{reference}", &reference)
+            .replace("{inbound_ref}", "abcdefghijklmnopqrstuvwxyz234567");
+        let method = Method::from_bytes(method.as_bytes()).unwrap();
+        let (status, body) = answer(&server.app, addressed(LOOPBACK, method, &uri, &[], None)).await;
+        assert_ne!(status, StatusCode::METHOD_NOT_ALLOWED, "{template}");
+        assert!(!body.contains("There's nothing at this path."), "{template}: {body}");
+    }
+}
+
+/// With `local` sign-in and `ZUPFLOW_PUBLIC_URL` set, the tunnel's host
+/// reaches hosted Connect, and nothing a Console or API caller uses, however
+/// the path is spelled.
+#[tokio::test]
+async fn admits_the_public_host_for_hosted_connect_alone_under_local_sign_in() {
+    let server = Server::with_identity(Arc::new(zupflow_basic::local_identity::LocalIdentity)).await;
+    let t = tenant(&server, &[]).await;
+    let (session, reference) = start(&server, &t, Value::Null).await;
+    let app = zupflow_server::app(server.state.clone(), local_guard(Some(TUNNEL)));
+    let hosted = format!("/v1/connect/sessions/{reference}");
+
+    // Hosted Connect, on the tunnel's host as a browser or the provider sends it.
+    for host in [TUNNEL_HOST, "tunnel.example:443", "TUNNEL.example"] {
+        for uri in [
+            format!("/connect/{reference}"),
+            "/connect/assets/page.js?v=1".to_owned(),
+            "/connect/assets/page.css".to_owned(),
+            "/connect/assets/icon.svg".to_owned(),
+            hosted.clone(),
+        ] {
+            let (status, body) = answer(&app, addressed(host, Method::GET, &uri, &[], None)).await;
+            assert_eq!(status, StatusCode::OK, "{host} {uri}: {body}");
+        }
+        let (status, body) = answer(&app, addressed(host, Method::GET, &hosted, &[("Origin", TUNNEL)], None)).await;
+        assert_eq!(status, StatusCode::OK, "{host}: {body}");
+        // Answered by the route itself: a token app has no consent, and the callback no such `state`.
+        for (method, uri) in [
+            (Method::POST, format!("{hosted}/authorize")),
+            (Method::GET, "/connect/oauth/callback?state=unknown&code=x".to_owned()),
+        ] {
+            let answered = answer(&app, addressed(host, method, &uri, &[], None)).await;
+            assert!(!refused_for_host(&answered), "{host} {uri}: {answered:?}");
+        }
+    }
+
+    // A Console or API route on the tunnel's host is refused, credential or not.
+    let org = t.org.as_str();
+    let sandbox = t.sandbox.as_str();
+    let refused: Vec<(Method, String, Option<Value>)> = vec![
+        (Method::GET, "/v1/me".to_owned(), None),
+        (Method::GET, "/v1/sign-in-settings".to_owned(), None),
+        (Method::GET, "/health".to_owned(), None),
+        (Method::GET, format!("/v1/organizations/{org}"), None),
+        (
+            Method::GET,
+            format!("/v1/organizations/{org}/connect-settings/sandbox"),
+            None,
+        ),
+        (
+            Method::PUT,
+            format!("/v1/organizations/{org}/connect-settings/sandbox"),
+            Some(json!({ "return_urls": [], "allowed_origins": [TUNNEL] })),
+        ),
+        (
+            Method::POST,
+            "/v1/organizations".to_owned(),
+            Some(json!({ "name": "Tunnelled", "slug": "tunnelled" })),
+        ),
+        (
+            Method::GET,
+            format!("/v1/workspaces/{sandbox}/connect-sessions/{session}"),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/v1/workspaces/{sandbox}/connect-sessions"),
+            Some(json!({ "app_id": t.app, "intent": "create", "label": "Tunnelled" })),
+        ),
+        // Path tricks around the admitted routes.
+        (Method::GET, format!("{hosted}/../../../me"), None),
+        (Method::GET, format!("{hosted}%2F..%2F..%2F..%2Fme"), None),
+        (Method::GET, "/connect/..%2F..%2Fv1%2Fme".to_owned(), None),
+        (Method::GET, "/connect/%2e%2e".to_owned(), None),
+        (Method::GET, "/v1%2Fme".to_owned(), None),
+        (Method::GET, format!("/connect/{reference}/extra"), None),
+        (Method::GET, format!("/connect/{reference}/"), None),
+        (Method::POST, format!("{hosted}/cancel/extra"), None),
+        (
+            Method::POST,
+            "/channels/inbound/abcdefghijklmnopqrstuvwxyz234567/extra".to_owned(),
+            None,
+        ),
+        (Method::GET, format!("/V1/connect/sessions/{reference}"), None),
+        (Method::GET, format!("/CONNECT/{reference}"), None),
+        (Method::POST, format!("{hosted}/CANCEL"), None),
+        (Method::GET, "//v1/me".to_owned(), None),
+        (Method::GET, "/v1//me".to_owned(), None),
+        (Method::GET, format!("/connect//{reference}"), None),
+        (Method::GET, format!("/v1/connect/sessions//{reference}"), None),
+        // An admitted path with a method it doesn't serve.
+        (Method::DELETE, hosted.clone(), None),
+        (Method::POST, format!("/connect/{reference}"), None),
+        (Method::GET, format!("{hosted}/cancel"), None),
+        (Method::OPTIONS, format!("{hosted}/cancel"), None),
+    ];
+    for (method, uri, body) in refused {
+        for headers in [&[][..], &[("Authorization", "Bearer test:alice")][..]] {
+            let answered = answer(
+                &app,
+                addressed(TUNNEL_HOST, method.clone(), &uri, headers, body.clone()),
+            )
+            .await;
+            assert!(refused_for_host(&answered), "{method} {uri}: {answered:?}");
+        }
+    }
+
+    // The origin check stands: a foreign origin on an admitted route is refused.
+    let (status, body) = answer(
+        &app,
+        addressed(
+            TUNNEL_HOST,
+            Method::POST,
+            &format!("{hosted}/cancel"),
+            &[("Origin", "https://elsewhere.example")],
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("origin_not_allowed"), "{body}");
+
+    // The link completes through the tunnel, with an idempotency key, as Connect.
+    let (status, body) = answer(
+        &app,
+        addressed(
+            TUNNEL_HOST,
+            Method::POST,
+            &format!("{hosted}/credentials"),
+            &[("Origin", TUNNEL), ("Idempotency-Key", "tunnel-1")],
+            Some(json!({ "values": { "api_key": "tk_ok" } })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Loopback still reaches everything, as the owner; nothing above acted as them.
+    let (status, me) = answer(&app, addressed(LOOPBACK, Method::GET, "/v1/me", &[], None)).await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    let me: Value = serde_json::from_str(&me).unwrap();
+    assert_eq!(me["data"]["user"]["email"], "owner@local.invalid", "{me}");
+    let slugs: Vec<&str> = me["data"]["organizations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|organization| organization["slug"].as_str().unwrap())
+        .collect();
+    assert_eq!(slugs, ["northwind"]);
+    let (status, sessions) = answer(
+        &app,
+        addressed(
+            LOOPBACK,
+            Method::GET,
+            &format!("/v1/workspaces/{sandbox}/connect-sessions"),
+            &[("Zupflow-Organization", org)],
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sessions}");
+    let sessions: Value = serde_json::from_str(&sessions).unwrap();
+    assert_eq!(sessions["data"].as_array().unwrap().len(), 1, "{sessions}");
+}
+
+/// Under `local` a request with no credential is the owner. On the public
+/// host it is no one: a route there that asked for a caller would be refused,
+/// whether it asks for any caller, a Console user or a Console session.
+#[tokio::test]
+async fn never_resolves_the_local_owner_on_the_public_host() {
+    use axum::routing::{get, post};
+    use zupflow_server::auth::{Caller, ConsoleSession, ConsoleUser};
+
+    async fn caller(caller: Caller) -> String {
+        match caller {
+            Caller::Console(user) => user.email,
+            Caller::ApiKey(_) => "an API key".to_owned(),
+        }
+    }
+    async fn console_user(ConsoleUser(user): ConsoleUser) -> String {
+        user.email
+    }
+    async fn console_session(session: ConsoleSession) -> String {
+        session.user.email
+    }
+
+    let server = Server::with_identity(Arc::new(zupflow_basic::local_identity::LocalIdentity)).await;
+    let org = server.organization("owner", "northwind").await;
+    let (status, key) = server
+        .send(
+            call("owner", Method::POST, format!("/v1/organizations/{org}/api-keys"))
+                .body(json!({ "name": "Backend", "environment": "sandbox" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{key}");
+    let key = format!("Bearer {}", key["data"]["secret"].as_str().unwrap());
+    // Handlers that resolve a caller, at paths the public host reaches.
+    let probe = axum::Router::new()
+        .route("/v1/connect/sessions/{reference}", get(caller))
+        .route("/connect/{reference}", get(console_user))
+        .route("/channels/inbound/{inbound_ref}", post(console_session))
+        .with_state(server.state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            local_guard(Some(TUNNEL)),
+            zupflow_server::guard::guard,
+        ));
+    for (method, uri) in [
+        (Method::GET, "/v1/connect/sessions/Abc123"),
+        (Method::GET, "/connect/Abc123"),
+        (Method::POST, "/channels/inbound/abc234"),
+    ] {
+        let (status, body) = answer(&probe, addressed(LOOPBACK, method.clone(), uri, &[], None)).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::OK, "owner@local.invalid"),
+            "{uri}"
+        );
+        for headers in [
+            &[][..],
+            &[("Authorization", "Bearer anything")][..],
+            &[("Authorization", key.as_str())][..],
+        ] {
+            let answered = answer(&probe, addressed(TUNNEL_HOST, method.clone(), uri, headers, None)).await;
+            assert!(refused_for_host(&answered), "{uri} {headers:?}: {answered:?}");
+        }
+    }
+}
+
+/// A proxy or tunnel in front may route on a different `Host` than the one
+/// the guard checks: two `Host` headers, or an absolute-form target naming
+/// another host, are refused, so neither can pass the tunnel off as loopback.
+#[tokio::test]
+async fn refuses_a_host_named_two_ways() {
+    let server = Server::with_identity(Arc::new(zupflow_basic::local_identity::LocalIdentity)).await;
+    let app = zupflow_server::app(server.state.clone(), local_guard(Some(TUNNEL)));
+    for (first, second) in [(TUNNEL_HOST, LOOPBACK), (LOOPBACK, TUNNEL_HOST), (LOOPBACK, LOOPBACK)] {
+        let request = Request::builder()
+            .uri("/v1/me")
+            .header("Host", first)
+            .header("Host", second)
+            .body(Body::empty())
+            .unwrap();
+        let answered = answer(&app, request).await;
+        assert!(refused_for_host(&answered), "{first}, {second}: {answered:?}");
+    }
+    for (target, host) in [
+        ("http://tunnel.example/v1/me", LOOPBACK),
+        ("http://localhost:8080/v1/me", TUNNEL_HOST),
+    ] {
+        let answered = answer(&app, addressed(host, Method::GET, target, &[], None)).await;
+        assert!(refused_for_host(&answered), "{target} {host}: {answered:?}");
+    }
+    // The same host both ways is still loopback.
+    let (status, body) = answer(
+        &app,
+        addressed(LOOPBACK, Method::GET, "http://localhost:8080/v1/me", &[], None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// With `ZUPFLOW_PUBLIC_URL` unset, the public URL is the loopback origin:
+/// any other host is refused on every route, hosted Connect and inbound included.
+#[tokio::test]
+async fn admits_no_other_host_without_a_public_url() {
+    let server = Server::with_identity(Arc::new(zupflow_basic::local_identity::LocalIdentity)).await;
+    let t = tenant(&server, &[]).await;
+    let (_, reference) = start(&server, &t, Value::Null).await;
+    let app = zupflow_server::app(server.state.clone(), local_guard(None));
+    let uris = [
+        (Method::GET, format!("/connect/{reference}")),
+        (Method::GET, format!("/v1/connect/sessions/{reference}")),
+        (
+            Method::POST,
+            "/channels/inbound/abcdefghijklmnopqrstuvwxyz234567".to_owned(),
+        ),
+        (Method::GET, "/v1/me".to_owned()),
+    ];
+    for (method, uri) in &uris {
+        let answered = answer(&app, addressed(TUNNEL_HOST, method.clone(), uri, &[], None)).await;
+        assert!(refused_for_host(&answered), "{uri}: {answered:?}");
+    }
+    for (method, uri) in &uris[..2] {
+        let (status, body) = answer(&app, addressed(LOOPBACK, method.clone(), uri, &[], None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    }
+}
+
+/// With `oidc` sign-in nothing changes: any host, and a signed-in user is
+/// themselves on the public host as on any other.
+#[tokio::test]
+async fn changes_nothing_with_oidc_sign_in() {
+    use axum::routing::get;
+    use zupflow_server::auth::Caller;
+
+    async fn caller(caller: Caller) -> String {
+        match caller {
+            Caller::Console(user) => user.email,
+            Caller::ApiKey(_) => "an API key".to_owned(),
+        }
+    }
+
+    let server = Server::new().await;
+    let t = tenant(&server, &[]).await;
+    let (_, reference) = start(&server, &t, Value::Null).await;
+    // As `main` composes it for `oidc`.
+    let guard = RequestGuard::with_origins(&[]).with_public_url(TUNNEL);
+    let app = zupflow_server::app(server.state.clone(), guard.clone());
+    let alice = [("Authorization", "Bearer test:alice")];
+    for uri in ["/v1/me".to_owned(), format!("/v1/organizations/{}", t.org)] {
+        let (status, body) = answer(&app, addressed(TUNNEL_HOST, Method::GET, &uri, &alice, None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    }
+    let (status, body) = answer(
+        &app,
+        addressed(TUNNEL_HOST, Method::GET, &format!("/connect/{reference}"), &[], None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let probe = axum::Router::new()
+        .route("/v1/connect/sessions/{reference}", get(caller))
+        .with_state(server.state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            guard,
+            zupflow_server::guard::guard,
+        ));
+    let (status, body) = answer(
+        &probe,
+        addressed(TUNNEL_HOST, Method::GET, "/v1/connect/sessions/Abc123", &alice, None),
+    )
+    .await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "alice@people.example"));
+}

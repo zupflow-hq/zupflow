@@ -1789,3 +1789,96 @@ async fn refuses_an_approved_call_whose_connection_was_removed() {
     );
     assert!(world.chat.posted_by_apps().is_empty());
 }
+
+/// With `local` sign-in, `ZUPFLOW_PUBLIC_URL`'s host (a tunnel) reaches an
+/// app's inbound endpoint, which the provider's signature authorizes, and
+/// still nothing a Console or API caller uses.
+#[tokio::test]
+async fn takes_deliveries_through_the_public_host_under_local_sign_in() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    use zupflow_channels::fake::{SLACK_HEADERS, sign};
+
+    let mut world = main_world().await;
+    world.api = zupflow_server::app(
+        world.setup.kit.state(faults::Worker::Api),
+        zupflow_server::RequestGuard::local(8080, &[]).with_public_url("https://tunnel.example"),
+    );
+    let main = world.main.clone();
+    let deliver = |host: &'static str, uri: String, body: Value, secret: Vec<u8>| {
+        let signed = sign(&body, &secret, world.now());
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Host", host)
+            .header("Content-Type", "application/json")
+            .header(SLACK_HEADERS.timestamp, signed.timestamp)
+            .header(SLACK_HEADERS.signature, signed.signature)
+            .body(Body::from(signed.body))
+            .unwrap();
+        let api = world.api.clone();
+        async move {
+            let response = api.oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+        }
+    };
+    let inbound = format!("/channels/inbound/{}", main.inbound_ref);
+    let check = json!({ "type": "url_verification", "challenge": "c-tunnel" });
+    let message = json!({
+        "type": "event_callback", "event_id": "EvTunnel1", "team_id": TEAM,
+        "event": {
+            "type": "message", "channel": SUPPORT, "channel_type": "channel", "user": ANA,
+            "text": "through the tunnel", "ts": "1800000000.000101",
+        },
+    });
+
+    for host in ["tunnel.example", "localhost:8080"] {
+        let (status, answer) = deliver(host, inbound.clone(), check.clone(), main.signing_secret.clone()).await;
+        assert_eq!(
+            (status, answer),
+            (StatusCode::OK, json!({ "challenge": "c-tunnel" })),
+            "{host}"
+        );
+    }
+    let (status, answer) = deliver("tunnel.example", inbound.clone(), message, main.signing_secret.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    // Still only what the app's own secret signs.
+    let (status, refused) = deliver(
+        "tunnel.example",
+        inbound.clone(),
+        check.clone(),
+        b"not-its-secret".to_vec(),
+    )
+    .await;
+    assert_eq!(
+        (status, code(&refused)),
+        (StatusCode::UNAUTHORIZED, "invalid_signature")
+    );
+    // Nothing else, however it's spelled.
+    for uri in [
+        format!("{inbound}/"),
+        format!("{inbound}/x"),
+        format!("/channels//inbound/{}", main.inbound_ref),
+        format!("/Channels/inbound/{}", main.inbound_ref),
+        format!("/channels/inbound/{}%2F..%2F..%2Fv1%2Forganizations", main.inbound_ref),
+        "/v1/organizations".to_owned(),
+        format!("/v1/organizations/{}/agents", world.setup.org),
+    ] {
+        let (status, refused) = deliver(
+            "tunnel.example",
+            uri.clone(),
+            check.clone(),
+            main.signing_secret.clone(),
+        )
+        .await;
+        assert_eq!(
+            (status, code(&refused)),
+            (StatusCode::FORBIDDEN, "host_not_allowed"),
+            "{uri}"
+        );
+    }
+}
