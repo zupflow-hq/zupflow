@@ -354,8 +354,16 @@ fn admission(
         Some(Ok(origin)) if guard.public.as_deref() == Some(normalized(&origin).as_str()) && hosted_connect(path) => {
             Ok(admitted)
         }
-        Some(_) => {
-            tracing::warn!(event = "guard.origin_refused");
+        Some(origin) => {
+            // Which origin and what kind of route, so a refusal can be traced
+            // to its sender. Never the path: hosted Connect's carries the
+            // session's reference, a bearer link.
+            tracing::warn!(
+                event = "guard.origin_refused",
+                origin = %loggable_origin(origin.as_deref().ok()),
+                method = loggable_method(method),
+                route = route_kind(path),
+            );
             Err(Failure(ApiError::new(
                 403,
                 "origin_not_allowed",
@@ -365,9 +373,83 @@ fn admission(
     }
 }
 
+/// An `Origin` header as it may be logged: the browser's serialized origin
+/// (scheme, host and port, or `null`), so printable ASCII and short. Anything
+/// else is replaced rather than echoed into the log.
+fn loggable_origin(origin: Option<&str>) -> String {
+    match origin {
+        Some(origin)
+            if !origin.is_empty() && origin.len() <= 255 && origin.bytes().all(|byte| byte.is_ascii_graphic()) =>
+        {
+            origin.to_owned()
+        }
+        _ => "<unreadable>".to_owned(),
+    }
+}
+
+/// A method as it may be logged: the standard ones by name, any extension
+/// method (of any length a client sends) as `other`.
+fn loggable_method(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::HEAD => "HEAD",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::PATCH => "PATCH",
+        Method::DELETE => "DELETE",
+        Method::OPTIONS => "OPTIONS",
+        _ => "other",
+    }
+}
+
+/// The kind of route a request names, for logs that must not carry its path.
+fn route_kind(path: &str) -> &'static str {
+    if hosted_connect(path) {
+        "hosted_connect"
+    } else if path.starts_with("/channels/") {
+        "channels"
+    } else if path.starts_with("/v1/") {
+        "api"
+    } else {
+        "other"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logs_origins_only_as_browsers_serialize_them() {
+        assert_eq!(loggable_origin(Some("https://app.example")), "https://app.example");
+        assert_eq!(loggable_origin(Some("null")), "null");
+        assert_eq!(loggable_origin(Some("https://a.example\nforged=1")), "<unreadable>");
+        assert_eq!(loggable_origin(Some("https://a.example evil")), "<unreadable>");
+        assert_eq!(loggable_origin(Some(&"a".repeat(255))), "a".repeat(255));
+        assert_eq!(loggable_origin(Some(&"a".repeat(256))), "<unreadable>");
+        assert_eq!(loggable_origin(Some("")), "<unreadable>");
+        assert_eq!(loggable_origin(None), "<unreadable>");
+    }
+
+    #[test]
+    fn logs_extension_methods_as_other() {
+        assert_eq!(loggable_method(&Method::POST), "POST");
+        let long = Method::from_bytes("X".repeat(4096).as_bytes()).expect("a token is a method");
+        assert_eq!(loggable_method(&long), "other");
+    }
+
+    #[test]
+    fn names_route_kinds_without_their_paths() {
+        let reference = "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z";
+        assert_eq!(route_kind(&format!("/connect/{reference}")), "hosted_connect");
+        assert_eq!(
+            route_kind(&format!("/v1/connect/sessions/{reference}/authorize")),
+            "hosted_connect"
+        );
+        assert_eq!(route_kind("/channels/inbound/abc"), "channels");
+        assert_eq!(route_kind("/v1/me"), "api");
+        assert_eq!(route_kind("/health"), "other");
+    }
 
     #[test]
     fn matches_each_public_route_exactly() {
