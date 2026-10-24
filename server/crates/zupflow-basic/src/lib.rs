@@ -14,6 +14,8 @@ pub mod local_keys;
 pub mod memory_cache;
 pub mod no_model;
 pub mod no_providers;
+// Makes channel apps by fixed rules, for tests and the contract server only.
+#[cfg(any(test, feature = "scripted-channels"))]
 pub mod scripted_channel_provisioner;
 pub mod scripted_model;
 pub mod scripted_providers;

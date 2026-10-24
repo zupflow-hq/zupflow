@@ -73,6 +73,7 @@ use crate::input::{Body, Fields, Object};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/v1/workspaces/{ws}/channel-providers", get(list_providers))
         .route(
             "/v1/workspaces/{ws}/channel-app-managers",
             get(list_managers).post(create_manager),
@@ -589,8 +590,8 @@ pub(crate) fn provision_failure(error: ProvisionError, provider: ChannelProvider
             501,
             "channel_providers_not_configured",
             format!(
-                "This deployment isn't set up to reach {name}, so it can't link teams. Ask its operator to configure \
-                 ZUPFLOW_CHANNEL_PROVISIONER."
+                "This deployment can't reach {name}, so it can't link teams there. {}",
+                setup_hint(provider)
             ),
         )
         .into(),
@@ -604,6 +605,15 @@ pub(crate) fn provision_failure(error: ProvisionError, provider: ChannelProvider
             format!("{name} asked to wait {retry_after_secs} seconds before it's asked again. Try again then."),
         )
         .into(),
+    }
+}
+
+/// What a deployment's operator does so the server reaches a provider.
+fn setup_hint(provider: ChannelProviderKind) -> &'static str {
+    match provider {
+        ChannelProviderKind::Slack => {
+            "Ask its operator to set ZUPFLOW_PUBLIC_URL to the https:// address Slack reaches it at."
+        }
     }
 }
 
@@ -743,6 +753,29 @@ fn filter_id<T>(query: &BTreeMap<String, String>, name: &str, parse: impl Fn(&st
 
 // --- Linked teams -------------------------------------------------------------
 
+/// The providers this server reaches, so the workspace links teams only
+/// there: the same for every workspace, read by anyone who can read one.
+async fn list_providers(
+    State(state): State<AppState>,
+    caller: Caller,
+    headers: HeaderMap,
+    Path(ws): Path<String>,
+) -> Result<Response, Failure> {
+    WorkspaceAccess::resolve(&state, caller, &headers, &ws).await?;
+    let providers = &state.channel_providers;
+    let available = providers
+        .available()
+        .into_iter()
+        .map(|kind| {
+            json!({
+                "provider": kind.as_str(),
+                "methods": [providers.provisioner(kind).method().as_str()],
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(envelope(StatusCode::OK, available))
+}
+
 async fn list_managers(
     State(state): State<AppState>,
     caller: Caller,
@@ -868,15 +901,15 @@ async fn new_manager(
     tokens: &ManagerTokens,
     created_by: Option<zupflow_core::ids::UserId>,
 ) -> Result<NewManager, Failure> {
-    let checked = state
-        .channel_provisioner
+    let provisioner = state.channel_providers.provisioner(provider);
+    let checked = provisioner
         .check_tokens(state.outbound.as_ref(), provider, tokens)
         .await
         .map_err(|error| provision_failure(error, provider))?;
     let credential = seal_tokens(state, scope, manager_id, FIRST_VERSION, tokens).await?;
     Ok(NewManager {
         provider,
-        method: state.channel_provisioner.method(),
+        method: provisioner.method(),
         credential,
         token_last4: crate::connect::last4(&tokens.configuration_token),
         token_expires_at: checked.expires_at,
@@ -994,7 +1027,8 @@ async fn update_manager(
         return Err(ApiError::internal().into());
     };
     let checked = state
-        .channel_provisioner
+        .channel_providers
+        .provisioner(manager.provider)
         .check_tokens(state.outbound.as_ref(), manager.provider, &tokens)
         .await
         .map_err(|error| provision_failure(error, manager.provider))?;
@@ -1372,7 +1406,8 @@ async fn delete_connection(
     tracing::info!(event = "channels.connection_deleted", %organization_id, %workspace_id, connection_id = %connection.id);
     if let Some(token) = token
         && let Err(error) = state
-            .channel_provisioner
+            .channel_providers
+            .provisioner(connection.provider)
             .revoke_install(state.outbound.as_ref(), &token)
             .await
     {
@@ -2448,7 +2483,8 @@ async fn clean_up(
         workspace_id,
         app_id,
     } = scope;
-    let (http, provisioner) = (state.outbound.as_ref(), state.channel_provisioner.as_ref());
+    let provisioner = state.channel_providers.provisioner(creation.app.provider);
+    let http = state.outbound.as_ref();
     let recorded = creation.app.external_app_id.as_deref();
     let made = match recorded {
         Some(external_app_id) => Some(external_app_id.to_owned()),
@@ -2485,14 +2521,21 @@ async fn clean_up(
 /// What this attempt made, deleted at the provider and forgotten: for an app
 /// deleted or failed meanwhile, or whose secrets couldn't be kept. Left for
 /// the next attempt when the provider can't be reached.
-async fn discard(state: &AppState, scope: AppScope, tokens: &ManagerTokens, external_app_id: &str) {
+async fn discard(
+    state: &AppState,
+    scope: AppScope,
+    provider: ChannelProviderKind,
+    tokens: &ManagerTokens,
+    external_app_id: &str,
+) {
     let AppScope {
         organization_id,
         workspace_id,
         app_id,
     } = scope;
     match state
-        .channel_provisioner
+        .channel_providers
+        .provisioner(provider)
         .delete(state.outbound.as_ref(), tokens, external_app_id)
         .await
     {
@@ -2650,7 +2693,8 @@ async fn provision(
     let redirect_url = crate::app_configurations::redirect_uri(&state.public_url);
     let manifest = manifest_for(&agent, events_url, redirect_url);
     let created = match state
-        .channel_provisioner
+        .channel_providers
+        .provisioner(creation.app.provider)
         .create(state.outbound.as_ref(), &tokens, &manifest)
         .await
     {
@@ -2680,11 +2724,11 @@ async fn provision(
         Err(ChannelError::AppNotReady | ChannelError::AppNotFound) => {
             // Deleted or failed while the provider made it.
             tracing::warn!(event = "channels.app_made_after_removal", %organization_id, %workspace_id, %app_id);
-            discard(state, scope, &tokens, &created.external_app_id).await;
+            discard(state, scope, creation.app.provider, &tokens, &created.external_app_id).await;
             return Outcome::Done;
         }
         Err(_) => {
-            discard(state, scope, &tokens, &created.external_app_id).await;
+            discard(state, scope, creation.app.provider, &tokens, &created.external_app_id).await;
             return retry("store_unavailable", "unavailable").await;
         }
     }
@@ -2694,7 +2738,7 @@ async fn provision(
     }) {
         Ok(bytes) => Zeroizing::new(bytes),
         Err(_) => {
-            discard(state, scope, &tokens, &created.external_app_id).await;
+            discard(state, scope, creation.app.provider, &tokens, &created.external_app_id).await;
             return fail("unavailable").await;
         }
     };
@@ -2702,7 +2746,7 @@ async fn provision(
         EncryptionContext::channel_app_secret(organization_id, workspace_id, environment, app_id, FIRST_VERSION);
     let Ok(sealed) = keys::seal(state.keys.as_ref(), &context, &plaintext).await else {
         // Its secrets can't be kept, so neither can it.
-        discard(state, scope, &tokens, &created.external_app_id).await;
+        discard(state, scope, creation.app.provider, &tokens, &created.external_app_id).await;
         return retry("keys_unavailable", "unavailable").await;
     };
     let made = MadeApp {
@@ -2718,7 +2762,7 @@ async fn provision(
         Ok(_) => {}
         Err(ChannelError::AppNotReady | ChannelError::AppNotFound) => {
             tracing::warn!(event = "channels.app_made_after_removal", %organization_id, %workspace_id, %app_id);
-            discard(state, scope, &tokens, &created.external_app_id).await;
+            discard(state, scope, creation.app.provider, &tokens, &created.external_app_id).await;
             return Outcome::Done;
         }
         // Perhaps recorded all the same: the next attempt reads which.

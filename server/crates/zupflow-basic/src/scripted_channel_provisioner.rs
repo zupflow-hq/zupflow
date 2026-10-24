@@ -20,8 +20,9 @@
 //!
 //! It never sends a request: the [`OutboundHttp`] each call is given goes unused.
 //!
-//! [`NoChannelProvisioner`] is the provisioner of a deployment that reaches
-//! no provider: every call is `NotConfigured`.
+//! Compiled only with this crate's `scripted-channels` feature, which only
+//! tests and the development-only contract server turn on: a deployment's
+//! build can't register what it doesn't contain.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -285,61 +286,6 @@ impl AppProvisioner for ScriptedChannelProvisioner {
     }
 }
 
-/// The provisioner of a deployment that reaches no channel provider.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoChannelProvisioner;
-
-#[async_trait]
-impl AppProvisioner for NoChannelProvisioner {
-    fn method(&self) -> ManagerMethod {
-        ManagerMethod::ConfigurationToken
-    }
-
-    async fn check_tokens(
-        &self,
-        _: &dyn OutboundHttp,
-        _: ChannelProviderKind,
-        _: &ManagerTokens,
-    ) -> Result<CheckedTokens, ProvisionError> {
-        Err(ProvisionError::NotConfigured)
-    }
-
-    async fn rotate_tokens(&self, _: &dyn OutboundHttp, _: &ManagerTokens) -> Result<RotatedTokens, ProvisionError> {
-        Err(ProvisionError::NotConfigured)
-    }
-
-    async fn create(
-        &self,
-        _: &dyn OutboundHttp,
-        _: &ManagerTokens,
-        _: &AppManifest,
-    ) -> Result<CreatedApp, ProvisionError> {
-        Err(ProvisionError::NotConfigured)
-    }
-
-    async fn find(&self, _: &dyn OutboundHttp, _: &ManagerTokens, _: &str) -> Result<Option<String>, ProvisionError> {
-        Err(ProvisionError::NotConfigured)
-    }
-
-    async fn update(
-        &self,
-        _: &dyn OutboundHttp,
-        _: &ManagerTokens,
-        _: &str,
-        _: &AppManifest,
-    ) -> Result<(), ProvisionError> {
-        Err(ProvisionError::NotConfigured)
-    }
-
-    async fn delete(&self, _: &dyn OutboundHttp, _: &ManagerTokens, _: &str) -> Result<(), ProvisionError> {
-        Err(ProvisionError::NotConfigured)
-    }
-
-    fn consent_url(&self, _: &ConsentRequest<'_>) -> Result<String, ProvisionError> {
-        Err(ProvisionError::NotConfigured)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -453,23 +399,5 @@ mod tests {
         );
         assert_eq!(p.find(&NoRequests, &good, events_url).await, Ok(None));
         assert!(p.apps()[0].deleted);
-    }
-
-    #[tokio::test]
-    async fn without_a_provider_does_nothing() {
-        let good = tokens("xoxe.xoxp-1-good", "xoxe-1-good");
-        assert_eq!(
-            NoChannelProvisioner
-                .check_tokens(&NoRequests, ChannelProviderKind::Slack, &good)
-                .await,
-            Err(ProvisionError::NotConfigured)
-        );
-        assert_eq!(
-            NoChannelProvisioner
-                .create(&NoRequests, &good, &manifest("https://a"))
-                .await
-                .err(),
-            Some(ProvisionError::NotConfigured)
-        );
     }
 }

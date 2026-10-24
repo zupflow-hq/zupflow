@@ -3,10 +3,13 @@
 //!
 //! `POST /channels/inbound/{inbound_ref}` is called by the provider, with no
 //! credential: the delivery's signature, by the app's own signing secret,
-//! authorizes it. The timestamp is checked first, before the reference is
-//! looked up; then a reference that names no app is checked against a
-//! secret no app has, so it costs and answers exactly what a bad signature
-//! does. Only a verified body is read. The app's reference is the one
+//! authorizes it. Every provider the server reaches is served on the same
+//! route: the timestamp is checked first, before the reference is looked
+//! up, and refused when no provider here would take it; then the app's own
+//! provider (the one it was made with) verifies and reads the delivery. A
+//! reference that names no app, or an app of a provider the server doesn't
+//! reach, is checked against a secret no app has, so it costs and answers
+//! exactly what a bad signature does. Only a verified body is read. The app's reference is the one
 //! cross-tenant read ([`ChannelStore::attribute_app_by_inbound_ref_cross_tenant`]);
 //! everything after it names the organization and workspace it returned.
 //! The provider's format is answered as it expects: `200` with the body
@@ -59,14 +62,15 @@ use zupflow_core::channels::handling::{
     message_of_job,
 };
 use zupflow_core::channels::provider::{
-    InboundDelivery, InboundEvent, InboundRefusal, InboundRequest, ProviderCallError,
+    ChannelProvider, InboundDelivery, InboundEvent, InboundRefusal, InboundRequest, ProviderCallError,
 };
 use zupflow_core::channels::store::{
     DeliveryOutcome, DispatchOutcome, InboundContext, NewDelivery, NewDispatch, SessionTemplate,
 };
 use zupflow_core::channels::thread::{instructions, origin_keys, preface};
 use zupflow_core::channels::{
-    AgentChannel, AgentMessages, ConnectionStatus, ConversationKind, Direction, HandlerKind, InboundRef, Senders,
+    AgentChannel, AgentMessages, ChannelProviderKind, ConnectionStatus, ConversationKind, Direction, HandlerKind,
+    InboundRef, Senders,
 };
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{ChannelAppId, ChannelMessageId, OrganizationId, WorkspaceId};
@@ -148,13 +152,19 @@ struct OpenedSecrets {
     signing_secret: String,
 }
 
+/// An app a delivery names, in its scope, with its provider and signing secret.
+struct InboundApp {
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    app_id: ChannelAppId,
+    provider: ChannelProviderKind,
+    signing_secret: Zeroizing<Vec<u8>>,
+}
+
 /// The app a reference names, in its scope, with its signing secret: `None`
 /// when it names none that can be checked against (unknown, deleted, or not
 /// made yet). `Err` when the store or the keys can't be read.
-async fn app_of(
-    state: &AppState,
-    inbound_ref: &str,
-) -> Result<Option<(OrganizationId, WorkspaceId, ChannelAppId, Zeroizing<Vec<u8>>)>, Failure> {
+async fn app_of(state: &AppState, inbound_ref: &str) -> Result<Option<InboundApp>, Failure> {
     let Some(reference) = InboundRef::parse(inbound_ref) else {
         return Ok(None);
     };
@@ -177,6 +187,7 @@ async fn app_of(
     ) else {
         return Ok(None);
     };
+    let provider = record.provider;
     let Some(secrets) = record.secrets else {
         return Ok(None);
     };
@@ -199,7 +210,13 @@ async fn app_of(
     })?;
     // The same buffer, wiped when it's dropped.
     let signing_secret = Zeroizing::new(secrets.signing_secret.into_bytes());
-    Ok(Some((organization_id, workspace_id, app_id, signing_secret)))
+    Ok(Some(InboundApp {
+        organization_id,
+        workspace_id,
+        app_id,
+        provider,
+        signing_secret,
+    }))
 }
 
 async fn receive(
@@ -208,23 +225,61 @@ async fn receive(
     headers: HeaderMap,
     body: ProviderEventBody,
 ) -> Result<Response, Failure> {
-    let provider = state.channel_provider.as_ref();
-    let names = provider.signature_headers();
     let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
-    let request = InboundRequest {
-        timestamp: header(names.timestamp),
-        signature: header(names.signature),
-        body: body.raw(),
+    let request_for = |provider: &dyn ChannelProvider| {
+        let names = provider.signature_headers();
+        InboundRequest {
+            timestamp: header(names.timestamp),
+            signature: header(names.signature),
+            body: body.raw(),
+        }
     };
     let now = state.clock.now();
-    // Before anything is looked up.
-    provider.check_timestamp(&request, now).map_err(refusal)?;
+    // Before anything is looked up: a timestamp no provider here takes. The
+    // first that takes it only stands in for an unknown app's; the app's own
+    // provider verifies it, timestamp again included, so this is no check
+    // of its freshness.
+    let mut fresh = None;
+    let mut refused = None;
+    for provider in state.channel_providers.providers() {
+        match provider.check_timestamp(&request_for(provider.as_ref()), now) {
+            Ok(()) => {
+                fresh = Some(provider);
+                break;
+            }
+            Err(why) => {
+                refused.get_or_insert(why);
+            }
+        }
+    }
+    let Some(fresh) = fresh else {
+        return Err(refused.map_or_else(unsigned, refusal));
+    };
     let app = app_of(&state, &inbound_ref).await?;
+    // Its own provider verifies it; an app of one this server doesn't reach
+    // is answered as an unknown one.
+    let app = app.filter(|app| {
+        let reached = state.channel_providers.is_available(app.provider);
+        if !reached {
+            tracing::warn!(event = "channels.inbound_provider_unavailable", organization_id = %app.organization_id, workspace_id = %app.workspace_id, app_id = %app.app_id, provider = app.provider.as_str());
+        }
+        reached
+    });
+    let provider = app
+        .as_ref()
+        .map_or(fresh, |app| state.channel_providers.provider(app.provider));
+    let request = request_for(provider.as_ref());
     let secret: &[u8] = app
         .as_ref()
-        .map_or(UNKNOWN_APP_SECRET, |(.., secret)| secret.as_slice());
+        .map_or(UNKNOWN_APP_SECRET, |app| app.signing_secret.as_slice());
     let verified = provider.verify(&request, secret, now);
-    let Some((organization_id, workspace_id, app_id, _)) = app else {
+    let Some(InboundApp {
+        organization_id,
+        workspace_id,
+        app_id,
+        ..
+    }) = app
+    else {
         return Err(unsigned());
     };
     verified.map_err(refusal)?;
@@ -676,7 +731,8 @@ async fn catch_up(
     let joined_at = job.conversation.joined_at;
     let since = zupflow_core::time::Timestamp::from_millis(joined_at.millis().saturating_sub(window));
     let messages = match state
-        .channel_provider
+        .channel_providers
+        .provider(connection.provider)
         .recent_messages(
             state.outbound.as_ref(),
             &token,
@@ -857,6 +913,8 @@ pub async fn run_worker(state: AppState) {
 
 #[cfg(test)]
 mod tests {
+    use zupflow_core::time::Timestamp;
+
     use super::*;
 
     #[test]
@@ -870,5 +928,44 @@ mod tests {
             let Failure(error) = refusal(refused);
             assert_eq!((error.status, error.code), (status, code));
         }
+    }
+
+    /// What the first provider to take a delivery's timestamp stands for
+    /// leans on this: each provider's `verify` refuses a stale timestamp
+    /// itself, however well the delivery is signed for it.
+    #[test]
+    fn every_provider_refuses_a_stale_delivery_signed_by_its_app() {
+        type Signed = (String, String, Vec<u8>);
+        const SECRET: &[u8] = b"signing-secret";
+        let body = serde_json::json!({ "type": "url_verification", "challenge": "c" });
+        let slack = |at: Timestamp| -> Signed {
+            let raw = body.to_string().into_bytes();
+            let timestamp = (at.millis() / 1000).to_string();
+            let signature = zupflow_slack::events::sign(SECRET, &timestamp, &raw);
+            (timestamp, signature, raw)
+        };
+        let fake = |at: Timestamp| -> Signed {
+            let signed = zupflow_channels::fake::sign(&body, SECRET, at);
+            (signed.timestamp, signed.signature, signed.body)
+        };
+        let now = Timestamp::from_millis(1_800_000_000_000);
+        let tolerance = zupflow_core::channels::provider::INBOUND_TOLERANCE_SECONDS * 1000;
+        let refuses_stale = |provider: &dyn ChannelProvider, sign: &dyn Fn(Timestamp) -> Signed| {
+            let verify = |at: Timestamp| {
+                let (timestamp, signature, raw) = sign(at);
+                let request = InboundRequest {
+                    timestamp: Some(&timestamp),
+                    signature: Some(&signature),
+                    body: &raw,
+                };
+                provider.verify(&request, SECRET, now)
+            };
+            assert_eq!(verify(now), Ok(()));
+            for stale in [now.millis() - tolerance - 1000, now.millis() + tolerance + 1000] {
+                assert_eq!(verify(Timestamp::from_millis(stale)), Err(InboundRefusal::Stale));
+            }
+        };
+        refuses_stale(&zupflow_slack::SlackChannelProvider::default(), &slack);
+        refuses_stale(&zupflow_channels::fake::FakeChannelProvider::default(), &fake);
     }
 }

@@ -190,6 +190,8 @@ pub struct AppCreation {
 /// What the inbound endpoint and the install need of an app: never shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppSecretsRecord {
+    /// The provider the app was made with: what reads its deliveries.
+    pub provider: ChannelProviderKind,
     pub inbound_ref: InboundRef,
     pub client_id: Option<String>,
     /// `None` until the provider has made the app.

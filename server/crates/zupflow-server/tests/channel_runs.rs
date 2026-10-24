@@ -64,6 +64,34 @@ fn reasons(runs: &[Value]) -> Vec<&str> {
         .collect()
 }
 
+/// Each app's deliveries are read by the provider it was made with: once
+/// the server no longer reaches that provider, a delivery signed by the
+/// app's own secret answers as one to an unknown app, and nothing is read.
+#[tokio::test]
+async fn reads_an_apps_deliveries_only_with_its_own_providers_reach() {
+    let mut world = main_world().await;
+    let main = world.main.clone();
+    let check = json!({ "type": "url_verification", "challenge": "c-1" });
+    let (status, answer) = world.deliver_signed(&main, &check, None).await;
+    assert_eq!((status, &answer["challenge"]), (StatusCode::OK, &json!("c-1")));
+
+    let mut state = world.setup.kit.state(faults::Worker::Api);
+    state.channel_providers = zupflow_core::channels::registry::ChannelProviders::none();
+    world.api = zupflow_server::app(state, zupflow_server::RequestGuard::default());
+    let (status, refused) = world.deliver_signed(&main, &check, None).await;
+    assert_eq!(
+        (status, code(&refused)),
+        (StatusCode::UNAUTHORIZED, "invalid_signature")
+    );
+    let unknown = "a".repeat(32);
+    let (status, unknown) = world.deliver_to(&unknown, &check, &main.signing_secret).await;
+    assert_eq!(
+        (status, code(&unknown)),
+        (StatusCode::UNAUTHORIZED, "invalid_signature"),
+        "answered as an app of a provider it doesn't reach"
+    );
+}
+
 #[tokio::test]
 async fn answers_a_mention_a_follow_up_in_its_thread_and_a_dm() {
     let world = main_world().await;

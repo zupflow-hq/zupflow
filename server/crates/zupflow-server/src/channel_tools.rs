@@ -38,11 +38,12 @@
 //! agent is working ([`Working`]): best effort, refreshed every 10 seconds,
 //! never retried, and never a reason for a run to fail.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 use zeroize::Zeroizing;
-use zupflow_core::channels::provider::{MessageRef, OutgoingPost, ProviderCallError};
+use zupflow_core::channels::provider::{ChannelProvider, MessageRef, OutgoingPost, ProviderCallError};
 use zupflow_core::channels::store::{
     ConversationFilter, KnownPerson, MessageFilter, NewConversation, NewMessage, RunChannelContext, SENDS_PER_HOUR,
     SendSlot,
@@ -57,6 +58,7 @@ use zupflow_core::ids::{
     ChannelConnectionId, ChannelConversationId, ChannelMessageId, ChannelPersonId, OrganizationId, RunId, ToolCallId,
     WorkspaceId,
 };
+use zupflow_core::outbound::OutboundHttp;
 use zupflow_core::policy::{Rule, ToolLevel};
 use zupflow_core::runs::digest::channel_call_digest;
 use zupflow_core::runs::names::OfferedTool;
@@ -954,7 +956,7 @@ async fn make(state: &AppState, send: &ChannelSendRequest) -> Result<SendOutcome
             post(state, send, &run, &token, &at, &text).await
         }
         Target::Direct { person, text } => {
-            let provider = state.channel_provider.as_ref();
+            let provider = state.channel_providers.provider(run.connection.provider);
             let opened = provider
                 .open_direct(state.outbound.as_ref(), &token, &person.external_id)
                 .await;
@@ -975,7 +977,7 @@ async fn make(state: &AppState, send: &ChannelSendRequest) -> Result<SendOutcome
             message,
             action,
         } => {
-            let provider = state.channel_provider.as_ref();
+            let provider = state.channel_providers.provider(run.connection.provider);
             let http = state.outbound.as_ref();
             let reference = MessageRef {
                 conversation_external_id: &conversation.external_id,
@@ -1046,7 +1048,7 @@ async fn post(
         text,
         send_id: &send_id,
     };
-    let provider = state.channel_provider.as_ref();
+    let provider = state.channel_providers.provider(run.connection.provider);
     let http = state.outbound.as_ref();
     let attempted_at = state.clock.now();
     let posted = match provider.post(http, token, &outgoing).await {
@@ -1423,7 +1425,8 @@ pub(crate) async fn settle_lapsed(
         send_id: &send_id,
     };
     match state
-        .channel_provider
+        .channel_providers
+        .provider(run.connection.provider)
         .find_sent(state.outbound.as_ref(), &token, &outgoing, attempted_at)
         .await
     {
@@ -1450,11 +1453,36 @@ pub(crate) async fn settle_lapsed(
 
 // --- Typing --------------------------------------------------------------------
 
+/// A thread that shows its agent working: the connection's own provider,
+/// and what it's told with.
+#[derive(Clone)]
+struct Shown {
+    provider: Arc<dyn ChannelProvider>,
+    http: Arc<dyn OutboundHttp>,
+    token: Zeroizing<String>,
+    conversation_external_id: String,
+    thread_key: String,
+}
+
+impl Shown {
+    async fn show(&self, working: bool) -> bool {
+        self.provider
+            .show_working(
+                self.http.as_ref(),
+                &self.token,
+                &self.conversation_external_id,
+                &self.thread_key,
+                working,
+            )
+            .await
+    }
+}
+
 /// The thread showing that a channel run's agent is working, kept alive in
 /// the background until [`Working::stop`]. Best effort throughout.
 pub(crate) struct Working {
     task: tokio::task::JoinHandle<()>,
-    clear: Option<(AppState, Zeroizing<String>, String, String)>,
+    clear: Option<Shown>,
 }
 
 impl Working {
@@ -1487,42 +1515,37 @@ impl Working {
         let token = connection_token(state, organization_id, workspace_id, origin.connection_id)
             .await
             .ok()??;
-        let thread_key = origin.thread_key.clone();
-        let external_id = conversation.external_id;
-        let shown = state
-            .channel_provider
-            .show_working(state.outbound.as_ref(), &token, &external_id, &thread_key, true)
-            .await;
-        if !shown {
+        let shown = Shown {
+            // The connection's own provider shows it.
+            provider: state.channel_providers.provider(connection.provider),
+            http: state.outbound.clone(),
+            token,
+            conversation_external_id: conversation.external_id,
+            thread_key: origin.thread_key.clone(),
+        };
+        if !shown.show(true).await {
             return None;
         }
         let task = {
-            let (state, token, external_id, thread_key) =
-                (state.clone(), token.clone(), external_id.clone(), thread_key.clone());
+            let shown = shown.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(WORKING_EVERY).await;
-                    state
-                        .channel_provider
-                        .show_working(state.outbound.as_ref(), &token, &external_id, &thread_key, true)
-                        .await;
+                    shown.show(true).await;
                 }
             })
         };
         Some(Self {
             task,
-            clear: Some((state.clone(), token, external_id, thread_key)),
+            clear: Some(shown),
         })
     }
 
     /// Stops showing it.
     pub(crate) async fn stop(mut self) {
         self.task.abort();
-        if let Some((state, token, external_id, thread_key)) = self.clear.take() {
-            state
-                .channel_provider
-                .show_working(state.outbound.as_ref(), &token, &external_id, &thread_key, false)
-                .await;
+        if let Some(shown) = self.clear.take() {
+            shown.show(false).await;
         }
     }
 }

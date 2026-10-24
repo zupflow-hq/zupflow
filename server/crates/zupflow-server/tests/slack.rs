@@ -21,6 +21,7 @@ use axum::http::{Method, StatusCode};
 use common::{Server, call, code};
 use serde_json::{Value, json};
 use zupflow_core::channels::provision::SLACK_SCOPES;
+use zupflow_core::channels::registry::ChannelProviders;
 use zupflow_core::ids::ChannelAppManagerId;
 use zupflow_server::RequestGuard;
 use zupflow_slack::fake::{Delivery, FakeSlack, Fault};
@@ -36,8 +37,10 @@ async fn slack_server() -> (Server, Arc<FakeSlack>) {
     let mut server = Server::new().await;
     let slack = Arc::new(FakeSlack::new());
     server.state.outbound = slack.clone();
-    server.state.channel_provisioner = Arc::new(SlackProvisioner::new(FakeSlack::api()));
-    server.state.channel_provider = Arc::new(SlackChannelProvider::new(FakeSlack::api()));
+    server.state.channel_providers = ChannelProviders::none().with(
+        Arc::new(SlackProvisioner::new(FakeSlack::api())),
+        Arc::new(SlackChannelProvider::new(FakeSlack::api())),
+    );
     server.state.public_url = PUBLIC.to_owned();
     server.app = zupflow_server::app(server.state.clone(), RequestGuard::default());
     (server, slack)

@@ -13,6 +13,9 @@
 //!   an installed connection: verifying and reading its events.
 //! - [`provision`]: [`provision::AppProvisioner`], which creates, changes
 //!   and deletes one agent's app in one team.
+//! - [`registry`]: [`registry::ChannelProviders`], every provider a server
+//!   reaches at once, by kind: each team, app and connection uses the pair
+//!   of the provider it was stored with.
 //! - [`store`]: [`store::ChannelStore`], everything above as stored.
 //! - [`tools`]: the channel tools and `stay_silent`, as a session offers them.
 //!
@@ -24,6 +27,7 @@
 pub mod handling;
 pub mod provider;
 pub mod provision;
+pub mod registry;
 pub mod reply;
 pub mod store;
 pub mod thread;

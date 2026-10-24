@@ -53,7 +53,7 @@ pub use guard::RequestGuard;
 /// The contract's operations this server serves so far, by `operationId`. The
 /// shared contract suite skips, by name, any case that needs another one; a
 /// test holds this list equal to the routes the router actually answers.
-pub const SERVED_OPERATIONS: [&str; 120] = [
+pub const SERVED_OPERATIONS: [&str; 121] = [
     "getSignInSettings",
     "getViewer",
     "listInvitations",
@@ -151,6 +151,7 @@ pub const SERVED_OPERATIONS: [&str; 120] = [
     "deleteModel",
     "getDefaultModel",
     "updateDefaultModel",
+    "listChannelProviders",
     "listChannelAppManagers",
     "createChannelAppManager",
     "getChannelAppManager",

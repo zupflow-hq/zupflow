@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{ConnectionStatus, ConversationKind};
+use super::{ChannelProviderKind, ConnectionStatus, ConversationKind};
 use crate::ids::{ChannelConnectionId, ChannelMessageId, RunId};
 use crate::jobs::JobOptions;
 use crate::runs::QueuedJob;
@@ -79,6 +79,8 @@ pub fn run_of_job(payload: &[u8]) -> Option<RunId> {
 /// scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelReply {
+    /// The connection's provider: what posts the answer.
+    pub provider: ChannelProviderKind,
     pub connection_id: ChannelConnectionId,
     pub connection_status: ConnectionStatus,
     pub conversation_external_id: String,

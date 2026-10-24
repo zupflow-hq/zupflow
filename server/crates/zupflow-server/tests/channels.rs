@@ -18,8 +18,8 @@ use axum::http::{Method, StatusCode};
 use common::{Server, call, code, send_to};
 use serde_json::{Value, json};
 use zupflow_basic::scripted_channel_provisioner::ScriptedChannelProvisioner;
-use zupflow_core::channels::AppStatus;
 use zupflow_core::channels::store::AppCreation;
+use zupflow_core::channels::{AppStatus, ChannelProviderKind};
 use zupflow_core::ids::{ChannelAppId, OrganizationId, WorkspaceId};
 use zupflow_core::keys::{DataKey, EncryptionContext, KeyError, KeyService, WrappedKey};
 use zupflow_core::scope::Name;
@@ -143,6 +143,57 @@ async fn links_a_team_and_makes_an_agents_app_with_a_job() {
         unlinked = server.send(unlink()).await;
     }
     assert_eq!(unlinked.0, StatusCode::NO_CONTENT, "{}", unlinked.1);
+}
+
+/// Every provider the server reaches is listed, and linking a team of one
+/// it doesn't answers `501`, without asking anyone about the tokens.
+#[tokio::test]
+async fn lists_the_providers_it_reaches_and_links_teams_of_no_other() {
+    let mut server = Server::new().await;
+    let org = server.organization("alice", "acme").await;
+    let ws = server.workspace("alice", &org, "acme-sandbox", "sandbox").await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let providers = || call("bob", Method::GET, format!("/v1/workspaces/{ws}/channel-providers")).naming(&org);
+    server.member("alice", &org, "bob", "viewer").await;
+    let (status, listed) = server.send(providers()).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(
+        listed["data"],
+        json!([{ "provider": "slack", "methods": ["configuration_token"] }])
+    );
+    let (status, linked) = server.send(link(&ws, &org, "alice", CONFIGURATION_TOKEN)).await;
+    assert_eq!(status, StatusCode::CREATED, "{linked}");
+    let manager = linked["data"]["id"].as_str().unwrap().to_owned();
+
+    server.state.channel_providers = zupflow_core::channels::registry::ChannelProviders::none();
+    server.app = zupflow_server::app(server.state.clone(), zupflow_server::RequestGuard::default());
+    let (status, listed) = server.send(providers()).await;
+    assert_eq!((status, listed["data"].clone()), (StatusCode::OK, json!([])));
+    // Not even a token Slack would refuse is checked: nothing reaches Slack.
+    for attempt in [
+        link(&ws, &org, "alice", "xoxe.xoxp-1-INVALID"),
+        call("alice", Method::PATCH, format!("{}/{manager}", managers(&ws)))
+            .naming(&org)
+            .body(json!({ "configuration_token": CONFIGURATION_TOKEN, "refresh_token": REFRESH_TOKEN })),
+    ] {
+        let (status, refused) = server.send(attempt).await;
+        assert_eq!(
+            (status, code(&refused)),
+            (StatusCode::NOT_IMPLEMENTED, "channel_providers_not_configured")
+        );
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("Slack") && message.contains("ZUPFLOW_PUBLIC_URL"),
+            "{message}"
+        );
+    }
+    // The team it linked stays, and so does reading it.
+    let (status, _) = server
+        .send(call("alice", Method::GET, format!("{}/{manager}", managers(&ws))).naming(&org))
+        .await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -308,7 +359,10 @@ impl Driven {
             refusals: AtomicU32::new(0),
         });
         let mut state = server.state.clone();
-        state.channel_provisioner = Arc::new(provider.clone());
+        state.channel_providers = state.channel_providers.clone().with(
+            Arc::new(provider.clone()),
+            state.channel_providers.provider(ChannelProviderKind::Slack),
+        );
         state.keys = keys.clone();
         let router = zupflow_server::app(state.clone(), zupflow_server::RequestGuard::default());
         let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", server.directory.join("zupflow.sqlite").display()))

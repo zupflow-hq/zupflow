@@ -35,7 +35,9 @@ use serde_json::{Value, json};
 use zupflow_core::audit::{AuditAction, AuditActor, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::channels::provision::{ProvisionError, RELEASE_CHANNEL_APP, RotatedTokens, SYNC_CHANNEL_APP};
 use zupflow_core::channels::store::{ChannelError, TokenReplacement};
-use zupflow_core::channels::{AppStatus, ChannelAppManager, ManagerStatus, RETENTION_JOB, TOKEN_LIFETIME_MS};
+use zupflow_core::channels::{
+    AppStatus, ChannelAppManager, ChannelProviderKind, ManagerStatus, RETENTION_JOB, TOKEN_LIFETIME_MS,
+};
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{ChannelAppId, ChannelAppManagerId, ChannelConnectionId, OrganizationId, WorkspaceId};
 use zupflow_core::jobs::{Job, JobOptions};
@@ -331,7 +333,7 @@ async fn rotate(
             if manager.status == ManagerStatus::Active && manager.credential_version == version
                 && credential.version == version
     );
-    let (Some(credential), true) = (credential, current) else {
+    let (Some(manager), Some(credential), true) = (manager, credential, current) else {
         return Next::Done;
     };
     let Some(tokens) = open_tokens(
@@ -347,7 +349,8 @@ async fn rotate(
         return later("keys_unavailable").await;
     };
     let rotated = match state
-        .channel_provisioner
+        .channel_providers
+        .provisioner(manager.provider)
         .rotate_tokens(state.outbound.as_ref(), &tokens)
         .await
     {
@@ -532,7 +535,8 @@ pub(crate) async fn sync(
         return Next::Done;
     }
     match state
-        .channel_provisioner
+        .channel_providers
+        .provisioner(app.provider)
         .update(state.outbound.as_ref(), &tokens, external_app_id, &manifest)
         .await
     {
@@ -567,6 +571,7 @@ async fn revoke_connection(
     organization_id: OrganizationId,
     workspace_id: WorkspaceId,
     environment: Environment,
+    provider: ChannelProviderKind,
     connection_id: ChannelConnectionId,
 ) -> Result<(), Next> {
     let sealed = match state
@@ -594,7 +599,8 @@ async fn revoke_connection(
     };
     let token = Zeroizing::new(std::mem::take(&mut connection.token));
     match state
-        .channel_provisioner
+        .channel_providers
+        .provisioner(provider)
         .revoke_install(state.outbound.as_ref(), &token)
         .await
     {
@@ -637,7 +643,15 @@ async fn release(
         Err(()) => return Next::Retry("store_unavailable"),
     };
     if let Some(connection_id) = connection_id
-        && let Err(next) = revoke_connection(state, organization_id, workspace_id, environment, connection_id).await
+        && let Err(next) = revoke_connection(
+            state,
+            organization_id,
+            workspace_id,
+            environment,
+            app.provider,
+            connection_id,
+        )
+        .await
     {
         return next;
     }
@@ -664,7 +678,8 @@ async fn release(
         Err(why) => return Next::Retry(why),
     };
     match state
-        .channel_provisioner
+        .channel_providers
+        .provisioner(app.provider)
         .delete(state.outbound.as_ref(), &tokens, external_app_id)
         .await
     {

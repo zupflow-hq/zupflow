@@ -530,6 +530,11 @@ async fn makes_one_live_app_per_agent_per_manager(stores: &Stores<'_>, prepare: 
         "no secrets before the provider makes the app"
     );
     assert_eq!(
+        secrets.provider,
+        ChannelProviderKind::Slack,
+        "an app's secrets name the provider that reads its deliveries"
+    );
+    assert_eq!(
         stores
             .channels
             .attribute_app_by_inbound_ref_cross_tenant(&secrets.inbound_ref)
@@ -3199,6 +3204,7 @@ async fn replies_to_an_answer_until_it_is_sent(stores: &Stores<'_>, prepare: &Pr
     assert_eq!(
         reply,
         ChannelReply {
+            provider: ChannelProviderKind::Slack,
             connection_id: connection,
             connection_status: ConnectionStatus::Connected,
             conversation_external_id: "C0SUPPORT".to_owned(),

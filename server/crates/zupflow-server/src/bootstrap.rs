@@ -9,7 +9,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
-use zupflow_core::channels::provision::AppProvisioner;
+use zupflow_core::channels::ChannelProviderKind;
+use zupflow_core::channels::registry::ChannelProviders;
 use zupflow_core::identity::Identity;
 use zupflow_core::model_providers::ModelProviderCatalog;
 use zupflow_core::models::ModelProvider;
@@ -17,7 +18,7 @@ use zupflow_core::outbound::OutboundHttp;
 use zupflow_core::runs::store::Durability;
 use zupflow_oidc::{OidcConfig, OidcIdentity};
 
-use crate::config::{ChannelProvisionerMode, Config, IdentityMode, ModelProviderMode};
+use crate::config::{Config, IdentityMode, ModelProviderMode};
 use crate::sign_in::SignInSettings;
 use crate::{AppState, RequestGuard};
 
@@ -143,51 +144,43 @@ pub fn model_catalog(config: &Config, outbound: &Arc<dyn OutboundHttp>) -> Arc<d
     }
 }
 
-/// What makes agents' apps in linked teams: Slack, the scripted provisioner
-/// for local work, or, unset, nothing, so no team can be linked.
-pub fn channel_provisioner(config: &Config) -> Arc<dyn AppProvisioner> {
-    match config.channel_provisioner {
-        ChannelProvisionerMode::None => {
-            tracing::info!(
-                event = "server.no_channel_provisioner",
-                "No channel provisioner is configured (ZUPFLOW_CHANNEL_PROVISIONER): teams can't be linked"
-            );
-            Arc::new(zupflow_basic::scripted_channel_provisioner::NoChannelProvisioner)
-        }
-        ChannelProvisionerMode::Scripted => {
-            tracing::warn!(
-                event = "server.scripted_channel_provisioner",
-                "Channel apps are made by the scripted provisioner (ZUPFLOW_CHANNEL_PROVISIONER=scripted): \
-                 for local work only"
-            );
-            Arc::new(zupflow_basic::scripted_channel_provisioner::ScriptedChannelProvisioner::default())
-        }
-        ChannelProvisionerMode::Slack => {
-            tracing::info!(
-                event = "server.slack_channel_provisioner",
-                api = config.slack_api.method_url(""),
-                "Channel apps are made in Slack with each linked team's configuration token"
-            );
-            Arc::new(zupflow_slack::SlackProvisioner::new(config.slack_api.clone()))
-        }
+/// Every channel provider this server reaches, at once: each linked team,
+/// app and connection uses the one it was made with. No setting picks one.
+///
+/// - **Slack**, whenever `ZUPFLOW_PUBLIC_URL` is an `https://` origin
+///   ([`Config::reaches_slack`]): apps made through Slack's manifest API with
+///   each linked team's configuration token, deliveries read in Slack's
+///   format, people read with `users.info` and answers posted with
+///   `chat.postMessage`, at `ZUPFLOW_SLACK_API_URL`. Otherwise Slack isn't
+///   available: linking a Slack team answers `501`, and the server starts
+///   all the same.
+///
+/// None holds a credential: each delivery is checked with its own app's
+/// signing secret, and each call made with its own team's or connection's
+/// token. The scripted provisioner and the fake provider are never here:
+/// they're compiled only into tests and the development-only contract
+/// server, which build their own [`ChannelProviders`].
+pub fn channel_providers(config: &Config) -> ChannelProviders {
+    let mut providers = ChannelProviders::none();
+    if config.reaches_slack() {
+        tracing::info!(
+            event = "server.channel_provider",
+            provider = ChannelProviderKind::Slack.as_str(),
+            api = config.slack_api.method_url(""),
+            "Agents' Slack apps are made with each linked team's configuration token"
+        );
+        providers = providers.with(
+            Arc::new(zupflow_slack::SlackProvisioner::new(config.slack_api.clone())),
+            Arc::new(zupflow_slack::SlackChannelProvider::new(config.slack_api.clone())),
+        );
+    } else {
+        tracing::info!(
+            event = "server.channel_provider_unavailable",
+            provider = ChannelProviderKind::Slack.as_str(),
+            "Slack isn't available: it needs ZUPFLOW_PUBLIC_URL set to an https:// origin Slack can reach"
+        );
     }
-}
-
-/// What reads deliveries to agents' apps' inbound endpoints, and what a
-/// connection calls with its token: Slack with
-/// `ZUPFLOW_CHANNEL_PROVISIONER=slack` (people read with `users.info`,
-/// answers posted with `chat.postMessage`, at `ZUPFLOW_SLACK_API_URL`);
-/// otherwise the fake provider, which reads deliveries in Slack's format
-/// and calls no one. Either holds no credential: each delivery is checked
-/// with its own app's signing secret, and each call made with its own
-/// connection's token.
-pub fn channel_provider(config: &Config) -> Arc<dyn zupflow_core::channels::provider::ChannelProvider> {
-    match config.channel_provisioner {
-        ChannelProvisionerMode::Slack => Arc::new(zupflow_slack::SlackChannelProvider::new(config.slack_api.clone())),
-        ChannelProvisionerMode::None | ChannelProvisionerMode::Scripted => {
-            Arc::new(zupflow_channels::fake::FakeChannelProvider::default())
-        }
-    }
+    providers
 }
 
 /// The outbound HTTP client every call to a provider, an MCP server or a

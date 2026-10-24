@@ -626,9 +626,11 @@ impl Kit {
         }
     }
 
-    /// Every worker and the API reach channels through `provider` from now.
+    /// Every worker and the API reach `provider`'s kind of channels through
+    /// it from now, with the same provisioner.
     pub fn use_channel_provider(&mut self, provider: Arc<dyn zupflow_core::channels::provider::ChannelProvider>) {
-        self.base.channel_provider = provider;
+        let providers = &self.base.channel_providers;
+        self.base.channel_providers = providers.clone().with(providers.provisioner(provider.kind()), provider);
         self.api = zupflow_server::app(
             worker_state(&self.base, &self.faults, Worker::Api),
             RequestGuard::default(),

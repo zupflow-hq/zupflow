@@ -12,7 +12,7 @@ use sqlx::{Row, SqliteConnection};
 use uuid::Uuid;
 use zupflow_core::channels::reply::{ChannelReply, lookup_stale, reply_job};
 use zupflow_core::channels::store::{ChannelError, PersonLookup};
-use zupflow_core::channels::{ConnectionStatus, ConversationKind};
+use zupflow_core::channels::{ChannelProviderKind, ConnectionStatus, ConversationKind};
 use zupflow_core::ids::{
     ChannelConnectionId, ChannelConversationId, ChannelMessageId, ChannelPersonId, OrganizationId, RunId, WorkspaceId,
 };
@@ -163,7 +163,7 @@ pub(super) async fn reply_of(
     let mut transaction = store.database.pool().begin().await.map_err(failed("reply_of"))?;
     let row = sqlx::query(
         "SELECT r.status, r.output, r.silent_reason, r.finished_at, r.channel_connection_id, r.channel_thread_key, \
-         c.status AS connection_status, v.external_id AS conversation, v.kind, v.is_external \
+         c.provider, c.status AS connection_status, v.external_id AS conversation, v.kind, v.is_external \
          FROM runs r \
          JOIN channel_connections c ON c.organization_id = r.organization_id \
          AND c.workspace_id = r.workspace_id AND c.id = r.channel_connection_id \
@@ -213,7 +213,9 @@ pub(super) async fn reply_of(
     let connection_status: String = row.try_get("connection_status").map_err(read)?;
     let kind: String = row.try_get("kind").map_err(read)?;
     let finished_at: Option<i64> = row.try_get("finished_at").map_err(read)?;
+    let provider: String = row.try_get("provider").map_err(read)?;
     Ok(Some(ChannelReply {
+        provider: ChannelProviderKind::parse(&provider).ok_or_else(|| read("an unknown channel provider"))?,
         connection_id,
         connection_status: ConnectionStatus::parse(&connection_status)
             .ok_or_else(|| read("an unknown connection status"))?,
