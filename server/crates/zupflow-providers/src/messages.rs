@@ -10,11 +10,22 @@
 //!   `tool_use_id`, with `is_error` for an error outcome, in the `user`
 //!   message after the calls, before any text.
 //! - Tools are `{ name, description, input_schema }`.
+//! - Cache breakpoints (`cache_control`, the default five-minute lifetime),
+//!   three at most of the four Messages takes: on the system block (on the
+//!   last tool when there are no instructions), so every run of an agent
+//!   shares the tools and instructions; on the last block of the last
+//!   message, so the next turn reads this one from the cache; and on the
+//!   last block of the message before the latest answer, where the turn
+//!   before put its last one, so a turn that added more than the twenty
+//!   blocks Messages looks back over still finds it. The system is then a
+//!   list of one `text` block.
 //! - The answer is its `tool_use` blocks, else its text; a `thinking` block
 //!   is not kept, so later turns go without it, as Messages accepts when
 //!   every one is left out. `stop_reason` `max_tokens` (a cut-off call or
 //!   answer isn't one), `refusal` and any other that isn't an answer fail
-//!   the turn. Tokens read include those read from or written to a cache.
+//!   the turn. Tokens read are `input_tokens` with those read from
+//!   (`cache_read_input_tokens`) and written to
+//!   (`cache_creation_input_tokens`) the cache, which it counts apart.
 
 use crate::MAX_OUTPUT_TOKENS;
 use serde_json::{Map, Value, json};
@@ -57,6 +68,21 @@ fn blocks(message: &Message) -> (&'static str, Vec<Value>) {
     }
 }
 
+/// Marks a block as a cache breakpoint: the prompt up to and including it
+/// is cached.
+fn mark(block: &mut Value) {
+    if let Value::Object(block) = block {
+        block.insert("cache_control".to_owned(), json!({ "type": "ephemeral" }));
+    }
+}
+
+/// Marks the last block of the message at `index`, if it has one.
+fn mark_last_block(messages: &mut [(&'static str, Vec<Value>)], index: usize) {
+    if let Some(block) = messages.get_mut(index).and_then(|(_, blocks)| blocks.last_mut()) {
+        mark(block);
+    }
+}
+
 /// The request body for a turn.
 pub fn request(turn: &Turn<'_>) -> Value {
     let mut messages: Vec<(&'static str, Vec<Value>)> = Vec::new();
@@ -67,6 +93,14 @@ pub fn request(turn: &Turn<'_>) -> Value {
             _ => messages.push((role, content)),
         }
     }
+    if let Some(answered) = messages.iter().rposition(|(role, _)| *role == "assistant")
+        && let Some(before) = answered.checked_sub(1)
+    {
+        mark_last_block(&mut messages, before);
+    }
+    if let Some(last) = messages.len().checked_sub(1) {
+        mark_last_block(&mut messages, last);
+    }
     let messages: Vec<Value> = messages
         .into_iter()
         .map(|(role, content)| json!({ "role": role, "content": content }))
@@ -75,11 +109,13 @@ pub fn request(turn: &Turn<'_>) -> Value {
     body.insert("model".to_owned(), json!(turn.model));
     body.insert("max_tokens".to_owned(), json!(MAX_OUTPUT_TOKENS));
     if !turn.instructions.is_empty() {
-        body.insert("system".to_owned(), json!(turn.instructions));
+        let mut system = json!({ "type": "text", "text": turn.instructions });
+        mark(&mut system);
+        body.insert("system".to_owned(), json!([system]));
     }
     body.insert("messages".to_owned(), Value::Array(messages));
     if !turn.tools.is_empty() {
-        let tools: Vec<Value> = turn
+        let mut tools: Vec<Value> = turn
             .tools
             .iter()
             .map(|tool| {
@@ -92,6 +128,11 @@ pub fn request(turn: &Turn<'_>) -> Value {
                 Value::Object(out)
             })
             .collect();
+        if turn.instructions.is_empty()
+            && let Some(last) = tools.last_mut()
+        {
+            mark(last);
+        }
         body.insert("tools".to_owned(), Value::Array(tools));
     }
     Value::Object(body)
@@ -140,12 +181,18 @@ pub fn completion(body: &[u8]) -> Result<Completion, ProviderError> {
         }
     }
     let usage = answer.get("usage").unwrap_or(&Value::Null);
-    let usage = TokenUsage {
-        input_tokens: tokens(usage, "input_tokens")
-            .saturating_add(tokens(usage, "cache_creation_input_tokens"))
-            .saturating_add(tokens(usage, "cache_read_input_tokens")),
-        output_tokens: tokens(usage, "output_tokens"),
-    };
+    let (read, written) = (
+        tokens(usage, "cache_read_input_tokens"),
+        tokens(usage, "cache_creation_input_tokens"),
+    );
+    let usage = TokenUsage::new(
+        tokens(usage, "input_tokens")
+            .saturating_add(read)
+            .saturating_add(written),
+        tokens(usage, "output_tokens"),
+        read,
+        written,
+    );
     let text = Some(text).filter(|text| !text.trim().is_empty());
     let reply = if !calls.is_empty() {
         Reply::ToolCalls { text, calls }

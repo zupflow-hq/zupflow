@@ -1,4 +1,13 @@
-import type { Environment, ModelListQuery, RunListQuery, WebhookDeliveryListQuery } from "@zupflow/sdk";
+import type {
+  ChannelAppListQuery,
+  ChannelConnectionListQuery,
+  ChannelConversationListQuery,
+  ChannelMessageListQuery,
+  Environment,
+  ModelListQuery,
+  RunListQuery,
+  WebhookDeliveryListQuery,
+} from "@zupflow/sdk";
 
 /**
  * Every workspace-scoped key starts with `["ws", workspaceId]`, so invalidating
@@ -40,6 +49,9 @@ export const qk = {
     ["org", orgId, "model-providers", "models", query] as const,
   defaultModel: (orgId: string, env: Environment) => ["org", orgId, "model-providers", "default", env] as const,
   audit: (orgId: string, workspaceId?: string) => ["org", orgId, "audit", workspaceId ?? "all"] as const,
+  /** The organization's channel tool levels and settings. */
+  channelToolLevels: (orgId: string) => ["org", orgId, "channels", "tool-levels"] as const,
+  channelSettings: (orgId: string) => ["org", orgId, "channels", "settings"] as const,
 
   workspace: (wsId: string) => ["ws", wsId] as const,
   workspaceApps: (wsId: string) => ["ws", wsId, "apps"] as const,
@@ -57,6 +69,26 @@ export const qk = {
   runs: (wsId: string, query: RunListQuery = {}) => ["ws", wsId, "runs", "list", query] as const,
   run: (wsId: string, id: string) => ["ws", wsId, "runs", id] as const,
   runEvents: (wsId: string, id: string) => ["ws", wsId, "runs", id, "events"] as const,
+  /** Every channel key starts here, so a change to one refreshes linked teams, apps and connections together. */
+  channels: (wsId: string) => ["ws", wsId, "channels"] as const,
+  channelAppManagers: (wsId: string) => ["ws", wsId, "channels", "managers"] as const,
+  channelAppManager: (wsId: string, id: string) => ["ws", wsId, "channels", "manager", id] as const,
+  channelApps: (wsId: string, query: ChannelAppListQuery = {}) => ["ws", wsId, "channels", "apps", query] as const,
+  channelApp: (wsId: string, id: string) => ["ws", wsId, "channels", "app", id] as const,
+  channelConnections: (wsId: string, query: ChannelConnectionListQuery = {}) =>
+    ["ws", wsId, "channels", "connections", query] as const,
+  channelConnection: (wsId: string, id: string) => ["ws", wsId, "channels", "connection", id] as const,
+  channelConversations: (wsId: string, connectionId: string, query: Omit<ChannelConversationListQuery, "cursor">) =>
+    ["ws", wsId, "channels", "connection", connectionId, "conversations", query] as const,
+  channelConversationLookup: (wsId: string, connectionId: string, conversationId: string) =>
+    ["ws", wsId, "channels", "connection", connectionId, "conversation", conversationId] as const,
+  channelMessages: (
+    wsId: string,
+    connectionId: string,
+    conversationId: string,
+    query: Omit<ChannelMessageListQuery, "cursor">,
+  ) => ["ws", wsId, "channels", "connection", connectionId, "messages", conversationId, query] as const,
+  agentChannels: (wsId: string, agentId: string) => ["ws", wsId, "channels", "agent", agentId] as const,
 
   hostedConnect: (reference: string) => ["connect", reference] as const,
 };

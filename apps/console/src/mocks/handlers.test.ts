@@ -18,13 +18,15 @@ import {
   type ResponseChecker,
 } from "@zupflow/contract-tests";
 import {
-  type ConnectResult,
+  agentChannelDefaults,
+  type ChannelConnectionConnectResult,
   createClient,
   createHttpTransport,
   EXPIRED_INVITATION_SHOWN_DAYS,
   ID_PREFIXES,
   INVITATION_LIST_LIMIT,
   INVITATION_TTL_DAYS,
+  type InstallationConnectResult,
   type InstallationId,
   type InstallationTool,
   type OrganizationId,
@@ -34,6 +36,7 @@ import {
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { signUp } from "./accounts";
+import { slackSignature } from "./channels";
 import * as credentials from "./credentials";
 import { db, resetDb } from "./db";
 import { createHandlers, NO_SIGN_IN_HOST, OUTCOME_GRACE_MS, UNREACHABLE_HOST } from "./handlers";
@@ -160,6 +163,7 @@ describe("Connect lifecycle snapshots", () => {
         id: newId("connect_session"),
         status: "cancelled" as const,
         installation_id: null,
+        target: null,
         failure_code: null,
       },
     };
@@ -743,6 +747,14 @@ contractSuite({
       outsider: () => userByEmail("rowan@larkspur.example"),
     }[persona]()}`,
   reset: async () => resetDb(),
+  // The fake provider's own record of an app: what Slack would hold, read from the mock's database.
+  channelAppSecrets: async (app) => {
+    const row = must(
+      db().channel_apps.find((a) => a.id === app),
+      app,
+    );
+    return { inbound_ref: row.inbound_ref, signing_secret: row.signing_secret };
+  },
 });
 
 describe("API-key creation authority changes", () => {
@@ -1079,7 +1091,7 @@ describe("Connect (simulated consent)", () => {
     const sandbox = ws("acme-sandbox");
     const transport = createHttpTransport({ baseUrl: API, getToken: async () => null });
     const consent = async (session: { url: string }) =>
-      transport.request<ConnectResult>({
+      transport.request<InstallationConnectResult>({
         method: "POST",
         path: `/v1/connect/sessions/${referenceOf(session)}/simulate-consent`,
         body: { decision: "approved", email: "reconnect@acme.example" },
@@ -1155,7 +1167,7 @@ describe("Connect (simulated consent)", () => {
     const transport = createHttpTransport({ baseUrl: API, getToken: async () => null });
     const consent = async (reference: string, email: string) =>
       (
-        await transport.request<ConnectResult>({
+        await transport.request<InstallationConnectResult>({
           method: "POST",
           path: `/v1/connect/sessions/${reference}/simulate-consent`,
           body: { decision: "approved", email },
@@ -1418,7 +1430,8 @@ describe("calls waiting on an installation that goes", () => {
       "waiting run",
     );
     const requested = [...timelineOf(db(), run)].reverse().find((e) => e.type === "approval.requested");
-    if (requested?.type !== "approval.requested") throw new Error("Missing pending call");
+    if (requested?.type !== "approval.requested" || !("installation_id" in requested.data))
+      throw new Error("Missing pending call");
     return { run, callId: requested.data.call_id, installationId: requested.data.installation_id };
   }
 
@@ -1455,7 +1468,8 @@ describe("calls waiting on an installation that goes", () => {
       others.push(foreign);
       for (const other of [sibling, foreign]) {
         const pending = [...timelineOf(db(), other)].reverse().find((e) => e.type === "approval.requested");
-        if (pending?.type !== "approval.requested") throw new Error("Missing pending call");
+        if (pending?.type !== "approval.requested" || !("installation_id" in pending.data))
+          throw new Error("Missing pending call");
         pending.data.installation_id = installationId;
       }
       const before = others.map((r) => [r.id, r.status, timelineOf(db(), r).length]);
@@ -2833,7 +2847,7 @@ describe("two organizations", () => {
       status: "pending",
       expires_at: new Date(Date.now() + 60_000).toISOString(),
     });
-    expect((await owner.connect.get(second)).app.name).not.toBe(echo.name);
+    expect((await owner.connect.get(second)).app?.name).not.toBe(echo.name);
     const refused = await failure(owner.connect.submitCredentials(second, { values: { token: "abc123" } }));
     expect(refused.code).toBe("app_not_eligible");
   });
@@ -3867,6 +3881,48 @@ describe("model providers", () => {
     expect((await owner.models.getDefault(northwind(), "sandbox")).model?.name).not.toMatch(/^Poisoned/);
   });
 
+  it("counts what a run's provider read from and wrote to its prompt cache, and sums it into usage", async () => {
+    const { runRoute } = await import("./model-scope");
+    const finished = db().runs.filter((r) => r.organization_id === northwind() && r.status === "completed");
+    const multiTurn = finished.filter((r) => r.usage.tool_calls > 0);
+    expect(multiTurn.length).toBeGreaterThan(0);
+    for (const run of finished) {
+      const { input_tokens, cache_read_input_tokens, cache_write_input_tokens } = run.usage;
+      expect(cache_read_input_tokens + cache_write_input_tokens).toBeLessThanOrEqual(input_tokens);
+    }
+    for (const run of multiTurn) {
+      // Every turn after the first sends the one before it again: the provider serves that from its cache.
+      expect(run.usage.cache_read_input_tokens).toBeGreaterThan(0);
+      const kind = runRoute(db(), run)?.connection.kind;
+      const claude =
+        kind === "anthropic" || (kind === "openrouter" && run.model.provider_model_id.startsWith("anthropic/"));
+      // OpenAI and OpenRouter's other models cache on their own and report no writes.
+      if (!claude) expect(run.usage.cache_write_input_tokens).toBe(0);
+    }
+    for (const environment of ["sandbox", "production"] as const) {
+      const report = await owner.organizations.usage(northwind(), environment, 90);
+      const since = must(report.days[0]).date;
+      const workspaces = new Set(
+        db()
+          .workspaces.filter((w) => w.organization_id === northwind() && w.environment === environment)
+          .map((w) => w.id),
+      );
+      const counted = db().runs.filter(
+        (r) =>
+          r.organization_id === northwind() && workspaces.has(r.workspace_id) && r.created_at.slice(0, 10) >= since,
+      );
+      for (const field of [
+        "tool_calls",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_write_input_tokens",
+      ] as const) {
+        expect(report.totals[field], `${environment} ${field}`).toBe(counted.reduce((n, r) => n + r.usage[field], 0));
+      }
+    }
+  });
+
   it("starts a run on its agent's model, and fails it when the provider refuses the connection's key", async () => {
     const { advanceRun } = await import("./runner");
     const qa = ws("qa-playground");
@@ -4019,5 +4075,283 @@ describe("model providers", () => {
       ["model.created", "sandbox"],
       ["model_connection.created", "sandbox"],
     ]);
+  });
+});
+
+describe("channels", () => {
+  const sandbox = () => ws("acme-sandbox");
+  const consent = (session: { url: string }, decision: "approved" | "denied") =>
+    createHttpTransport({ baseUrl: API, getToken: async () => null }).request<ChannelConnectionConnectResult>({
+      method: "POST",
+      path: `/v1/connect/sessions/${referenceOf(session)}/simulate-consent`,
+      body: { decision },
+    });
+  /** The fixture's linked team in a workspace. */
+  const managerIn = (workspace: { id: WorkspaceId; organization_id: OrganizationId }) =>
+    must(
+      db().channel_app_managers.find((m) => inWorkspace(m, workspace)),
+      "channel app manager",
+    );
+  /** An active agent of the workspace with no app yet. */
+  const applessAgent = (workspace: { id: WorkspaceId; organization_id: OrganizationId }) =>
+    must(
+      db().agents.find(
+        (a) =>
+          inWorkspace(a, workspace) && a.status === "active" && !db().channel_apps.some((p) => p.agent_id === a.id),
+      ),
+      "agent with no app",
+    );
+  const eventTypes = (since: number) =>
+    db()
+      .webhook_events.slice(since)
+      .map((e) => [e.body.type, e.body.data]);
+
+  it("installs an agent's app on consent: a connection, its short ID, the agent's channel and the events", async () => {
+    const workspace = sandbox();
+    const agent = applessAgent(workspace);
+    const manager = managerIn(workspace);
+    const events = db().webhook_events.length;
+    const accepted = await owner.channelApps.create(workspace.id, { agent_id: agent.id, manager_id: manager.id });
+    const session = await owner.connectSessions.create(workspace.id, {
+      target: { kind: "channel_app", app: accepted.id },
+      return_url: null,
+    });
+    const { data } = await consent(session, "approved");
+    const connection = data.channel_connection;
+    expect(connection).toMatchObject({
+      workspace_id: workspace.id,
+      app_id: accepted.id,
+      agent_id: agent.id,
+      status: "connected",
+      label: agent.name,
+      team: { id: manager.team_id },
+    });
+    expect(data.session).toMatchObject({
+      status: "completed",
+      target: { kind: "channel_app", provider: "slack", app: accepted.id, connection: connection.id },
+    });
+    expect(await owner.channelApps.get(workspace.id, accepted.id)).toMatchObject({
+      status: "installed",
+      connection_id: connection.id,
+    });
+    // Its short ID comes from the installations' pool: no channel tool shares a name with an app tool.
+    const shortIds = db()
+      .installations.filter((i) => inWorkspace(i, workspace))
+      .map((i) => i.short_id);
+    expect(shortIds).not.toContain(connection.short_id);
+    expect(
+      db().installation_short_ids.some((s) => inWorkspace(s, workspace) && s.short_id === connection.short_id),
+    ).toBe(true);
+    const channels = await owner.agentChannels.list(workspace.id, agent.id);
+    expect(channels.map(({ id: _, created_at: _c, updated_at: _u, ...rest }) => rest)).toEqual([
+      { workspace_id: workspace.id, agent_id: agent.id, connection_id: connection.id, ...agentChannelDefaults() },
+    ]);
+    expect(eventTypes(events)).toEqual([
+      [
+        "channel_app.status_changed",
+        { object: "channel_app", id: accepted.id, agent_id: agent.id, status: "awaiting_install" },
+      ],
+      [
+        "channel_connection.status_changed",
+        { object: "channel_connection", id: connection.id, app_id: accepted.id, status: "connected" },
+      ],
+      [
+        "channel_app.status_changed",
+        { object: "channel_app", id: accepted.id, agent_id: agent.id, status: "installed" },
+      ],
+      ["connect_session.completed", expect.objectContaining({ object: "connect_session", id: session.id })],
+    ]);
+    // A used session can't be consented again.
+    expect((await failure(consent(session, "approved"))).code).toBe("session_not_pending");
+  });
+
+  it("installs nothing when the app isn't allowed", async () => {
+    const workspace = sandbox();
+    const agent = applessAgent(workspace);
+    const accepted = await owner.channelApps.create(workspace.id, {
+      agent_id: agent.id,
+      manager_id: managerIn(workspace).id,
+    });
+    const connections = db().channel_connections.length;
+    const session = await owner.connectSessions.create(workspace.id, {
+      target: { kind: "channel_app", app: accepted.id },
+      return_url: null,
+    });
+    expect((await failure(consent(session, "denied"))).code).toBe("consent_denied");
+    expect(await owner.connectSessions.get(workspace.id, session.id)).toMatchObject({
+      status: "failed",
+      failure_code: "consent_denied",
+    });
+    expect(db().channel_connections).toHaveLength(connections);
+    expect((await owner.channelApps.get(workspace.id, accepted.id)).status).toBe("awaiting_install");
+  });
+
+  it("refuses apps and installs while the app isn't made or the team's token has expired", async () => {
+    const workspace = sandbox();
+    const agent = applessAgent(workspace);
+    const manager = managerIn(workspace);
+    const accepted = await owner.channelApps.create(workspace.id, { agent_id: agent.id, manager_id: manager.id });
+    const row = must(db().channel_apps.find((a) => a.id === accepted.id));
+    row.status = "creating";
+    const install = () =>
+      owner.connectSessions.create(workspace.id, {
+        target: { kind: "channel_app", app: accepted.id },
+        return_url: null,
+      });
+    expect((await failure(install())).code).toBe("channel_app_not_ready");
+    row.status = "awaiting_install";
+    const session = await owner.connectSessions.create(workspace.id, {
+      target: { kind: "channel_app", app: accepted.id },
+      return_url: null,
+    });
+    must(db().channel_app_managers.find((m) => m.id === manager.id)).status = "token_expired";
+    expect((await failure(install())).code).toBe("channel_app_manager_inactive");
+    // A session made before the token expired can't install either.
+    expect((await failure(consent(session, "approved"))).code).toBe("app_not_eligible");
+    const other = must(
+      db().agents.find((a) => inWorkspace(a, workspace) && a.id !== agent.id),
+      "another agent",
+    );
+    expect(
+      (await failure(owner.channelApps.create(workspace.id, { agent_id: other.id, manager_id: manager.id }))).code,
+    ).toBe("channel_app_manager_inactive");
+    // New tokens make it active again, with the next credential version.
+    const version = manager.credential_version;
+    const events = db().webhook_events.length;
+    const renewed = await owner.channelAppManagers.update(workspace.id, manager.id, {
+      configuration_token: "xoxe.xoxp-1-renewed-0042",
+      refresh_token: "xoxe-1-renewed-0043",
+    });
+    expect(renewed.status).toBe("active");
+    expect(must(db().channel_app_managers.find((m) => m.id === manager.id)).credential_version).toBe(version + 1);
+    expect(eventTypes(events)).toEqual([
+      ["channel_app_manager.status_changed", { object: "channel_app_manager", id: manager.id, status: "active" }],
+    ]);
+  });
+
+  it("stores no token, and keeps the inbound endpoint out of idempotency", async () => {
+    const workspace = sandbox();
+    const tokens = { configuration_token: "xoxe.xoxp-1-never-stored-5k2m", refresh_token: "xoxe-1-never-stored-r9x1" };
+    await owner.channelAppManagers.create(workspace.id, {
+      provider: "slack",
+      method: "configuration_token",
+      ...tokens,
+    });
+    const stored = JSON.stringify(db());
+    expect(stored).not.toContain(tokens.configuration_token);
+    expect(stored).not.toContain(tokens.refresh_token);
+
+    const app = must(db().channel_apps.find((a) => inWorkspace(a, workspace)));
+    const raw = JSON.stringify({
+      type: "event_callback",
+      event_id: "Ev0MOCK1",
+      team_id: must(db().channel_connections.find((c) => inWorkspace(c, workspace))).team_id,
+      event: { type: "message", channel: "C0MOCK", user: "U0MOCK", text: "hi", ts: "1700000000.000100" },
+    });
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const signature = await slackSignature(app.signing_secret, timestamp, raw);
+    const keys = db().idempotency_keys.length;
+    for (let i = 0; i < 2; i++) {
+      const response = await fetch(`${API}/channels/inbound/${app.inbound_ref}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "provider-retry-0001",
+          "X-Slack-Request-Timestamp": timestamp,
+          "X-Slack-Signature": signature,
+        },
+        body: raw,
+      });
+      expect(await response.json()).toEqual({ challenge: null });
+    }
+    expect(db().idempotency_keys).toHaveLength(keys);
+    // Deduplicated by the provider's event ID, within the app's own scope.
+    expect(db().channel_inbound_events.filter((e) => e.provider_event_id === "Ev0MOCK1")).toEqual([
+      expect.objectContaining({
+        organization_id: app.organization_id,
+        workspace_id: app.workspace_id,
+        app_id: app.id,
+      }),
+    ]);
+    expect(db().channel_messages.filter((m) => m.external_id === "1700000000.000100")).toHaveLength(1);
+  });
+
+  it("deletes a workspace's channels with it, and no other workspace's", async () => {
+    const workspace = sandbox();
+    const others = () =>
+      JSON.stringify(
+        [
+          db().channel_app_managers,
+          db().channel_apps,
+          db().channel_connections,
+          db().channel_conversations,
+          db().channel_messages,
+          db().channel_people,
+          db().agent_channels,
+        ].map((rows) => rows.filter((r) => !inWorkspace(r, workspace))),
+      );
+    const before = others();
+    expect(db().channel_apps.some((a) => inWorkspace(a, workspace))).toBe(true);
+    await owner.workspaces.delete(workspace.id);
+    for (const rows of [
+      db().channel_app_managers,
+      db().channel_apps,
+      db().channel_connections,
+      db().channel_conversations,
+      db().channel_messages,
+      db().channel_people,
+      db().agent_channels,
+      db().channel_inbound_events,
+    ]) {
+      expect(rows.some((r) => inWorkspace(r, workspace))).toBe(false);
+    }
+    expect(others()).toBe(before);
+  });
+
+  it("seeds channel runs whose messages and sends link back to them, in their own workspace", async () => {
+    const workspace = sandbox();
+    const runs = (await owner.runs.list(workspace.id, { limit: 100 })).items.filter((r) => r.trigger === "channel");
+    expect(runs.map((r) => r.channel?.reason).sort()).toEqual(["direct_message", "mentioned", "thread_follow_up"]);
+    const connection = must(runs[0]?.channel, "channel").connection_id;
+    const conversations = (await owner.channelConnections.conversations(workspace.id, connection, { limit: 100 }))
+      .items;
+    const messages = (
+      await Promise.all(
+        conversations.map((c) => owner.channelConnections.messages(workspace.id, connection, c.id, { limit: 100 })),
+      )
+    ).flatMap((page) => page.items);
+    for (const run of runs) {
+      const channel = must(run.channel, "channel");
+      const origin = must(
+        messages.find((m) => m.id === channel.origin_message_id),
+        "origin message",
+      );
+      expect(origin).toMatchObject({ direction: "inbound", conversation_id: channel.conversation_id });
+      expect(run.usage.cache_read_input_tokens + run.usage.cache_write_input_tokens).toBeLessThanOrEqual(
+        run.usage.input_tokens,
+      );
+      const events = await owner.runs.events(workspace.id, run.id);
+      expect(events[1]).toMatchObject({
+        type: "channel_messages.received",
+        data: { outcome: "started", message_ids: [origin.id] },
+      });
+      const silent = events.find((e) => e.type === "run.stayed_silent");
+      expect(silent?.type === "run.stayed_silent" ? silent.data.reason : null).toBe(channel.silent_reason);
+      for (const sent of messages.filter((m) => m.run_id === run.id)) {
+        expect(sent.direction).toBe("outbound");
+        if (sent.tool_call_id === null) {
+          expect(sent.text).toBe(run.output);
+        } else {
+          expect(events.some((e) => e.type === "tool_call.started" && e.data.call_id === sent.tool_call_id)).toBe(true);
+        }
+      }
+    }
+    expect(messages.filter((m) => m.direction === "outbound").every((m) => runs.some((r) => r.id === m.run_id))).toBe(
+      true,
+    );
+    // Another workspace's runs don't name this workspace's messages.
+    const acmeRuns = (await owner.runs.list(ws("acme").id, { limit: 100 })).items.filter((r) => r.channel);
+    expect(acmeRuns.length).toBeGreaterThan(0);
+    expect(acmeRuns.some((r) => messages.some((m) => m.id === r.channel?.origin_message_id))).toBe(false);
   });
 });

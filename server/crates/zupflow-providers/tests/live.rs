@@ -7,6 +7,12 @@
 //! - `ZUPFLOW_LIVE_ANTHROPIC_KEY` (and `ZUPFLOW_LIVE_ANTHROPIC_MODEL`, default `claude-haiku-4-5`)
 //! - `ZUPFLOW_LIVE_OPENROUTER_KEY` (and `ZUPFLOW_LIVE_OPENROUTER_MODEL`, default `openai/gpt-5-mini`)
 //!
+//! Each also sends one conversation twice, the second time one turn longer,
+//! with instructions long enough for every provider to cache, and prints
+//! the tokens each turn read from the cache; for Anthropic and Claude
+//! through OpenRouter, which cache at the breakpoints the adapters mark,
+//! the second turn must read the first from the cache.
+//!
 //! A call costs a few cents at most. Run one with
 //! `ZUPFLOW_LIVE_OPENROUTER_KEY=… cargo test -p zupflow-providers --test live -- --nocapture`.
 
@@ -15,7 +21,7 @@
 use std::sync::Arc;
 
 use zupflow_core::model_providers::{ProviderKey, ProviderKind};
-use zupflow_core::models::ProviderAccess;
+use zupflow_core::models::{Message, ModelProvider, ProviderAccess, Reply, ToolSpec, Turn};
 use zupflow_providers::{HttpModelProvider, HttpProviderCatalog};
 
 /// A key no provider accepts, of the shape they take.
@@ -41,13 +47,59 @@ async fn live(kind: ProviderKind, default_model: &str) {
         &refused,
     )
     .await;
-    zupflow_conformance::model_provider::run(
-        &HttpModelProvider::new(outbound),
-        &ProviderAccess { kind, key: &key },
-        &refused,
-        &model,
-    )
-    .await;
+    let provider = HttpModelProvider::new(outbound);
+    zupflow_conformance::model_provider::run(&provider, &ProviderAccess { kind, key: &key }, &refused, &model).await;
+    caches(&provider, kind, &key, &model).await;
+}
+
+/// Two turns of one conversation: the second reads the first from the
+/// cache where the adapter marks breakpoints.
+async fn caches(provider: &HttpModelProvider, kind: ProviderKind, key: &ProviderKey, model: &str) {
+    // Past every provider's least cacheable prompt (4,096 tokens at most).
+    let instructions: String = (0..1200)
+        .map(|n| format!("Rule {n}: answer in one short sentence.\n"))
+        .collect();
+    let tools = [ToolSpec {
+        name: "lookup".to_owned(),
+        description: "Looks a word up.".to_owned(),
+        input_schema: serde_json::json!({ "type": "object", "properties": { "word": { "type": "string" } } }),
+    }];
+    let cache_key = "zf_live0000000000000000000000000000";
+    let mut messages = vec![Message::User {
+        text: "Say hello.".to_owned(),
+    }];
+    let mut usages = Vec::new();
+    for _ in 0..2 {
+        let turn = Turn {
+            model,
+            instructions: &instructions,
+            messages: &messages,
+            tools: &tools,
+            cache_key: Some(cache_key),
+        };
+        let answer = provider.complete(&ProviderAccess { kind, key }, &turn).await.unwrap();
+        usages.push(answer.usage);
+        let text = match answer.reply {
+            Reply::Text(text) => Some(text),
+            Reply::ToolCalls { text, .. } => text,
+        };
+        messages.push(Message::Assistant {
+            text: Some(text.unwrap_or_else(|| "Hello.".to_owned())),
+            tool_calls: Vec::new(),
+        });
+        messages.push(Message::User {
+            text: "Say it again.".to_owned(),
+        });
+    }
+    eprintln!("{} {model}: {usages:?}", kind.name());
+    let at_breakpoints =
+        kind == ProviderKind::Anthropic || (kind == ProviderKind::OpenRouter && model.starts_with("anthropic/"));
+    if at_breakpoints {
+        assert!(
+            usages[1].cache_read_input_tokens > 0,
+            "the second turn read the first from the cache: {usages:?}"
+        );
+    }
 }
 
 #[tokio::test]

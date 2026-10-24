@@ -165,6 +165,11 @@ export async function body<T extends z.ZodType>(request: Request, schema: T): Pr
   } catch {
     throw new ApiFailure(400, "invalid_json", "The request body is not valid JSON.");
   }
+  return validated(json, schema);
+}
+
+/** A parsed body checked against one schema: `400 validation_failed` naming each field otherwise. */
+export function validated<T extends z.ZodType>(json: unknown, schema: T): z.infer<T> {
   const parsed = schema.safeParse(json);
   if (!parsed.success) {
     const fields: Record<string, string> = {};
@@ -175,6 +180,25 @@ export async function body<T extends z.ZodType>(request: Request, schema: T): Pr
     throw new ApiFailure(400, "validation_failed", "Some fields are invalid.", fields);
   }
   return parsed.data;
+}
+
+export function param(params: Record<string, string | readonly string[] | undefined>, key: string): string {
+  const value = params[key];
+  return typeof value === "string" ? value : "";
+}
+
+/** An integer query parameter clamped to 1..max; missing or not an integer means the default. */
+export function clampedInt(url: URL, name: string, fallback: number, max: number): number {
+  const value = Number(url.searchParams.get(name) ?? fallback);
+  return Number.isInteger(value) ? Math.min(Math.max(value, 1), max) : fallback;
+}
+
+/** One page of a list, by offset: the cursor is opaque to callers. */
+export function paginate<T>(items: T[], cursor: string | null, limit: number) {
+  const offset = cursor ? Number.parseInt(atob(cursor), 10) || 0 : 0;
+  const page = items.slice(offset, offset + limit);
+  const next = offset + limit < items.length ? btoa(String(offset + limit)) : null;
+  return { page, meta: { pagination: { next_cursor: next, total: items.length } } };
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +448,7 @@ export function announceSession(
         id: session.id,
         status: session.status,
         installation_id: session.status === "completed" ? session.installation_id : null,
+        target: session.target,
         failure_code: session.failure_code,
       },
     },
@@ -438,6 +463,17 @@ export function requireRole(access: OrgAccess, roles: MemberRole[], action: stri
       403,
       "forbidden",
       `Your role (${access.membership.role}) can't ${action}. Ask an organization owner.`,
+    );
+  }
+}
+
+/** The Console doesn't act in Production: the customer's product does, through the API. */
+export function assertConsoleMayAct(access: WorkspaceAccess, action: string) {
+  if (access.kind === "console" && access.workspace.environment === "production") {
+    throw new ApiFailure(
+      403,
+      "console_read_only_in_production",
+      `The Console can't ${action} in Production. Your product does that through the API.`,
     );
   }
 }
@@ -811,21 +847,29 @@ export function toGrant({ organization_id: _organization, ...grant }: GrantRow):
 }
 
 export function toConnectSession(s: ConnectSessionRow, withAuth = false): ConnectSession {
-  const app = appInScope(s);
+  const appId = s.app_id;
+  const app =
+    appId === null
+      ? undefined
+      : appInScope({ organization_id: s.organization_id, workspace_id: s.workspace_id, app_id: appId });
   return {
     id: s.id,
     workspace_id: s.workspace_id,
     environment: s.environment,
-    app: app
-      ? toInstallationApp(app)
-      : {
-          id: s.app_id,
-          name: "Removed app",
-          key: "removed",
-          owner_scope: "organization",
-          icon: { glyph: "?", color: "#64748b" },
-          auth_type: "token",
-        },
+    app:
+      appId === null
+        ? null
+        : app
+          ? toInstallationApp(app)
+          : {
+              id: appId,
+              name: "Removed app",
+              key: "removed",
+              owner_scope: "organization",
+              icon: { glyph: "?", color: "#64748b" },
+              auth_type: "token",
+            },
+    target: s.target,
     intent: s.intent,
     installation_id: s.installation_id,
     label: s.label,
@@ -876,7 +920,7 @@ export function toAgent(a: AgentRow): Agent {
 export function toRun(r: RunRow): Run {
   const agent = db().agents.find((a) => sameWorkspace(a, r) && a.id === r.agent_id);
   // The run's model shows in its `run.started` event, not on the run.
-  const { plan: _plan, organization_id: _organization, model: _model, ...rest } = r;
+  const { plan: _plan, organization_id: _organization, model: _model, prompt_tokens: _prompt, ...rest } = r;
   return { ...rest, agent_name: agent?.name ?? "Deleted agent" };
 }
 

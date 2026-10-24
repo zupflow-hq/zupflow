@@ -95,6 +95,16 @@ export type ConnectIntent = z.infer<typeof ConnectIntent>;
 export const ConnectSessionStatus = z.enum(["pending", "completed", "expired", "cancelled", "failed"]);
 export type ConnectSessionStatus = z.infer<typeof ConnectSessionStatus>;
 
+/**
+ * The communication channels an agent can be reached on. A registry, like
+ * model providers: adding one is an entry here and a provider on the server.
+ */
+export const CHANNEL_PROVIDERS = ["slack"] as const;
+export const ChannelProvider = named("ChannelProvider", z.enum(CHANNEL_PROVIDERS));
+export type ChannelProvider = z.infer<typeof ChannelProvider>;
+/** Each channel provider's name, as people know it. */
+export const CHANNEL_PROVIDER_NAMES: Record<ChannelProvider, string> = { slack: "Slack" };
+
 // ---------------------------------------------------------------------------
 // Console sign-in (decision 0020)
 
@@ -708,11 +718,40 @@ export type AcceptToolChangeInput = z.infer<typeof AcceptToolChangeInput>;
 export const UpdateInstallationInput = z.object({ label: z.string() });
 export type UpdateInstallationInput = z.infer<typeof UpdateInstallationInput>;
 
+/**
+ * What a channel Connect session sets up, instead of an app's installation.
+ * `channel_app_manager` links a team so Zupflow can create apps in it (in
+ * Slack, by pasting a configuration token); `manager` is the app manager it
+ * made, once completed. `channel_app` installs one agent's generated app in
+ * that team; `connection` is the connection it made, once completed. Both
+ * name their `provider`.
+ */
+export const ConnectTarget = named(
+  "ConnectTarget",
+  z.discriminatedUnion("kind", [
+    z.object({
+      kind: z.literal("channel_app_manager"),
+      provider: ChannelProvider,
+      manager: idSchema("channel_app_manager").nullable(),
+    }),
+    z.object({
+      kind: z.literal("channel_app"),
+      provider: ChannelProvider,
+      app: idSchema("channel_app"),
+      connection: idSchema("channel_connection").nullable(),
+    }),
+  ]),
+);
+export type ConnectTarget = z.infer<typeof ConnectTarget>;
+
 const connectSessionFields = {
   id: idSchema("connect_session"),
   workspace_id: idSchema("workspace"),
   environment: Environment,
-  app: InstallationApp,
+  /** The app it installs; null for a channel session, which has a `target` instead. */
+  app: InstallationApp.nullable(),
+  /** What a channel session sets up; null for an app's session. */
+  target: ConnectTarget.nullable(),
   intent: ConnectIntent,
   installation_id: idSchema("installation").nullable(),
   label: z.string(),
@@ -750,20 +789,44 @@ export const CreatedConnectSession = named(
 );
 export type CreatedConnectSession = z.infer<typeof CreatedConnectSession>;
 
-export const CreateConnectSessionInput = z.object({
+export const CreateAppConnectSessionInput = z.object({
   app_id: idSchema("app"),
   intent: ConnectIntent,
   label: z.string(),
   installation_id: idSchema("installation").nullable(),
   return_url: z.string().nullable(),
 });
+export type CreateAppConnectSessionInput = z.infer<typeof CreateAppConnectSessionInput>;
+
+/**
+ * A channel session. `channel_app_manager` links a team for the provider
+ * (Slack: a configuration token, pasted on the hosted page); `channel_app`
+ * installs that generated app, which must be `awaiting_install` or
+ * `installed` (a reinstall), else `409 channel_app_not_ready`. Developers
+ * and API keys only; the Console can't start one in Production
+ * (`403 console_read_only_in_production`).
+ */
+export const CreateChannelConnectSessionInput = z.object({
+  target: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("channel_app_manager"), provider: ChannelProvider }),
+    z.object({ kind: z.literal("channel_app"), app: idSchema("channel_app") }),
+  ]),
+  return_url: z.url().nullable(),
+});
+export type CreateChannelConnectSessionInput = z.infer<typeof CreateChannelConnectSessionInput>;
+
+/** An app's session (`app_id`), or a channel's (`target`). */
+export const CreateConnectSessionInput = z.union([CreateAppConnectSessionInput, CreateChannelConnectSessionInput]);
 export type CreateConnectSessionInput = z.infer<typeof CreateConnectSessionInput>;
 
 export const SubmitConnectCredentialsInput = z.object({ values: z.record(z.string(), z.string()) });
 export type SubmitConnectCredentialsInput = z.infer<typeof SubmitConnectCredentialsInput>;
 
-export const ConnectResult = named("ConnectResult", z.object({ session: ConnectSession, installation: Installation }));
-export type ConnectResult = z.infer<typeof ConnectResult>;
+export const InstallationConnectResult = named(
+  "InstallationConnectResult",
+  z.object({ session: ConnectSession, installation: Installation }),
+);
+export type InstallationConnectResult = z.infer<typeof InstallationConnectResult>;
 
 export const AuthorizeConnectResult = named(
   "AuthorizeConnectResult",
@@ -1159,16 +1222,581 @@ export const UpdateAppToolLevelsInput = z.object({
 export type UpdateAppToolLevelsInput = z.infer<typeof UpdateAppToolLevelsInput>;
 
 // ---------------------------------------------------------------------------
+// Channels: agents reached in a team's chat (Slack first). Everything is
+// workspace-scoped except tool levels and channel settings, which are the
+// organization's. Zupflow's own names avoid "bot": a connection acts as its
+// identity, and people or apps posting automatically are automated accounts.
+
+/**
+ * How Zupflow creates apps in a team: `configuration_token`, an app
+ * configuration token and its refresh token, pasted by a team admin.
+ */
+export const ChannelAppManagerMethod = z.enum(["configuration_token"]);
+export type ChannelAppManagerMethod = z.infer<typeof ChannelAppManagerMethod>;
+/** `token_expired`: the token can't be rotated any more; paste a new one. */
+export const ChannelAppManagerStatus = z.enum(["active", "token_expired", "disconnected"]);
+export type ChannelAppManagerStatus = z.infer<typeof ChannelAppManagerStatus>;
+
+/** The provider's team (in Slack, a workspace): learned from the first install, then every install must match it. */
+export const ChannelTeam = named("ChannelTeam", z.object({ id: z.string().nullable(), name: z.string().nullable() }));
+export type ChannelTeam = z.infer<typeof ChannelTeam>;
+
+/**
+ * How Zupflow makes apps for this workspace's agents in one team. The tokens
+ * are write-only: `configuration_token` says whether one is set and its last
+ * four characters, never its value; the refresh token isn't shown at all.
+ */
+export const ChannelAppManager = named(
+  "ChannelAppManager",
+  z.object({
+    id: idSchema("channel_app_manager"),
+    workspace_id: idSchema("workspace"),
+    provider: ChannelProvider,
+    method: ChannelAppManagerMethod,
+    team: ChannelTeam,
+    status: ChannelAppManagerStatus,
+    configuration_token: SecretState,
+    /** When the configuration token is next due to be rotated; null when it isn't known. */
+    token_expires_at: instant.nullable(),
+    /** Apps it made that aren't deleted. */
+    app_count: z.number().int(),
+    /** Who linked the team; null when they're gone. */
+    created_by: User.nullable(),
+    created_at: instant,
+    updated_at: instant,
+  }),
+);
+export type ChannelAppManager = z.infer<typeof ChannelAppManager>;
+
+/**
+ * Links a team with a configuration token and its refresh token, both
+ * checked with the provider first (`422 invalid_configuration_token`,
+ * `fields.configuration_token`). Developers and API keys; the Console can't
+ * in Production (`403 console_read_only_in_production`).
+ */
+/** A token as pasted: 1 to 4,096 characters, surrounding spaces ignored. */
+const channelToken = z.string().trim().min(1).max(4096);
+
+export const CreateChannelAppManagerInput = z.object({
+  provider: ChannelProvider,
+  method: ChannelAppManagerMethod,
+  configuration_token: channelToken,
+  refresh_token: channelToken,
+});
+export type CreateChannelAppManagerInput = z.infer<typeof CreateChannelAppManagerInput>;
+
+/** Replaces both tokens, checked as on creating; the manager is `active` again. */
+export const UpdateChannelAppManagerInput = z.object({
+  configuration_token: channelToken,
+  refresh_token: channelToken,
+});
+export type UpdateChannelAppManagerInput = z.infer<typeof UpdateChannelAppManagerInput>;
+
+/**
+ * `creating` until the job has made the app with the provider, then
+ * `awaiting_install` until someone allows it in the team (a `channel_app`
+ * Connect session), then `installed`. `updating` while a changed agent name
+ * or description is sent; `deleting`, then `deleted`, once removed; `failed`
+ * with `last_error` when the provider refused it.
+ */
+export const ChannelAppStatus = z.enum([
+  "creating",
+  "awaiting_install",
+  "installed",
+  "updating",
+  "deleting",
+  "deleted",
+  "failed",
+]);
+export type ChannelAppStatus = z.infer<typeof ChannelAppStatus>;
+
+/**
+ * One agent's own app in one team, generated from the agent's name and
+ * description, so each agent has its own identity there. Its secrets
+ * (client secret, signing secret) are never shown. A deleted app reads as
+ * `404`.
+ */
+export const ChannelApp = named(
+  "ChannelApp",
+  z.object({
+    id: idSchema("channel_app"),
+    workspace_id: idSchema("workspace"),
+    manager_id: idSchema("channel_app_manager"),
+    agent_id: idSchema("agent"),
+    provider: ChannelProvider,
+    /** The provider's ID for the app (Slack: `A0…`), once created. */
+    external_app_id: z.string().nullable(),
+    status: ChannelAppStatus,
+    /** Why it failed: a stable code, never the provider's text. */
+    last_error: z.string().nullable(),
+    /** The connection its install made; null until installed. */
+    connection_id: idSchema("channel_connection").nullable(),
+    created_at: instant,
+    updated_at: instant,
+  }),
+);
+export type ChannelApp = z.infer<typeof ChannelApp>;
+
+export const ChannelAppListQuery = PageQuery.extend({
+  agent_id: idSchema("agent").optional().describe("Only this agent's apps. A malformed or unknown ID matches nothing."),
+  manager_id: idSchema("channel_app_manager")
+    .optional()
+    .describe("Only this manager's apps. A malformed or unknown ID matches nothing."),
+});
+export type ChannelAppListQuery = z.infer<typeof ChannelAppListQuery>;
+
+/**
+ * Makes the agent's app in the manager's team. Answers `202` with the app
+ * `creating`: a job makes it with the provider, then it's
+ * `awaiting_install`. One live app per agent per manager
+ * (`409 channel_app_exists`); the manager must be `active`
+ * (`409 channel_app_manager_inactive`). Developers and API keys; the Console
+ * can't in Production.
+ */
+export const CreateChannelAppInput = z.object({
+  agent_id: idSchema("agent"),
+  manager_id: idSchema("channel_app_manager"),
+});
+export type CreateChannelAppInput = z.infer<typeof CreateChannelAppInput>;
+
+export const ChannelConnectionStatus = z.enum(["connected", "reconnect_required", "disconnected"]);
+export type ChannelConnectionStatus = z.infer<typeof ChannelConnectionStatus>;
+/** Which messages wake the connection's agent: `mention`, DMs, mentions and thread follow-ups. */
+export const ChannelHandler = z.enum(["mention"]);
+export type ChannelHandler = z.infer<typeof ChannelHandler>;
+
+/**
+ * An installed app: one team, one identity (in Slack, the app's bot user),
+ * one agent. Its short ID comes from the same pool as installations', so a
+ * channel tool never shares a name with an app tool.
+ */
+export const ChannelConnection = named(
+  "ChannelConnection",
+  z.object({
+    id: idSchema("channel_connection"),
+    workspace_id: idSchema("workspace"),
+    provider: ChannelProvider,
+    /** The generated app it installed. */
+    app_id: idSchema("channel_app").nullable(),
+    /** The agent it belongs to: its app's. */
+    agent_id: idSchema("agent").nullable(),
+    short_id: InstallationShortId,
+    label: z.string(),
+    handler: ChannelHandler,
+    status: ChannelConnectionStatus,
+    team: z.object({ id: z.string(), name: z.string().nullable(), enterprise_id: z.string().nullable() }),
+    /** Who the agent is in the team: the provider's ID and handle. */
+    identity: z.object({ external_id: z.string(), handle: z.string() }),
+    granted_scopes: z.array(z.string()),
+    connected_at: instant.nullable(),
+    last_event_at: instant.nullable(),
+    created_at: instant,
+    updated_at: instant,
+  }),
+);
+export type ChannelConnection = z.infer<typeof ChannelConnection>;
+
+export const ChannelConnectionListQuery = PageQuery.extend({
+  agent_id: idSchema("agent")
+    .optional()
+    .describe("Only this agent's connections. A malformed or unknown ID matches nothing."),
+});
+export type ChannelConnectionListQuery = z.infer<typeof ChannelConnectionListQuery>;
+
+/** A label of 1 to 40 characters, and the handler. */
+export const UpdateChannelConnectionInput = z.object({
+  label: z.string().trim().min(1).max(40).optional(),
+  handler: ChannelHandler.optional(),
+});
+export type UpdateChannelConnectionInput = z.infer<typeof UpdateChannelConnectionInput>;
+
+export const ChannelConversationKind = z.enum(["channel", "private_channel", "dm", "group_dm"]);
+export type ChannelConversationKind = z.infer<typeof ChannelConversationKind>;
+
+/** A conversation the connection has seen a message in. */
+export const ChannelConversation = named(
+  "ChannelConversation",
+  z.object({
+    id: idSchema("channel_conversation"),
+    workspace_id: idSchema("workspace"),
+    connection_id: idSchema("channel_connection"),
+    /** The provider's ID for it (Slack: the channel ID). */
+    external_id: z.string(),
+    kind: ChannelConversationKind,
+    /** Null for a DM, and when the provider doesn't say. */
+    name: z.string().nullable(),
+    /** Shared with another organization (Slack Connect). */
+    is_external: z.boolean(),
+    /** Whether the connection's identity is in it. */
+    identity_is_member: z.boolean(),
+    last_message_at: instant.nullable(),
+    /** The conversation breaker paused agents here until then; null when it isn't paused. */
+    paused_until: instant.nullable(),
+    created_at: instant,
+  }),
+);
+export type ChannelConversation = z.infer<typeof ChannelConversation>;
+
+/** Most recent message first. `q` matches the name, case-insensitively. */
+export const ChannelConversationListQuery = PageQuery.extend({
+  q: z.string().optional(),
+  kind: ChannelConversationKind.optional(),
+});
+export type ChannelConversationListQuery = z.infer<typeof ChannelConversationListQuery>;
+
+export const ChannelMessageDirection = z.enum(["inbound", "outbound"]);
+export type ChannelMessageDirection = z.infer<typeof ChannelMessageDirection>;
+
+/** Who wrote a message, as the connection saw them. */
+export const ChannelPerson = named(
+  "ChannelPerson",
+  z.object({
+    id: idSchema("channel_person"),
+    handle: z.string().nullable(),
+    display_name: z.string().nullable(),
+    /** Posts automatically: an app, or another agent. */
+    is_automated: z.boolean(),
+  }),
+);
+export type ChannelPerson = z.infer<typeof ChannelPerson>;
+
+/**
+ * A message in a conversation, as the agent reads it: its text rendered
+ * once, when it arrived, and never rewritten. Kept for the organization's
+ * retention period.
+ */
+export const ChannelMessage = named(
+  "ChannelMessage",
+  z.object({
+    id: idSchema("channel_message"),
+    workspace_id: idSchema("workspace"),
+    connection_id: idSchema("channel_connection"),
+    conversation_id: idSchema("channel_conversation"),
+    /** The provider's ID for it (Slack: its `ts`). */
+    external_id: z.string(),
+    /** The thread it's in: its root's external ID; empty for a DM's top level. */
+    thread_key: z.string(),
+    direction: ChannelMessageDirection,
+    /** Null for the connection's own (outbound) messages. */
+    author: ChannelPerson.nullable(),
+    text: z.string(),
+    /** The provider's IDs of the people and identities it mentions, in order. */
+    mentions: z.array(z.string()),
+    /** Outbound: the run that sent it. */
+    run_id: idSchema("run").nullable(),
+    /** Outbound: the tool call that sent it; null when it was the run's output. */
+    tool_call_id: idSchema("tool_call").nullable(),
+    /** How many agent turns led to it: 0 when a person wrote it. */
+    agent_hop: z.number().int(),
+    sent_at: instant,
+    edited_at: instant.nullable(),
+    deleted_at: instant.nullable(),
+    created_at: instant,
+  }),
+);
+export type ChannelMessage = z.infer<typeof ChannelMessage>;
+
+/** Newest first. `thread` keeps one thread's messages. */
+export const ChannelMessageListQuery = PageQuery.extend({ thread: z.string().optional() });
+export type ChannelMessageListQuery = z.infer<typeof ChannelMessageListQuery>;
+
+/** Where the agent may send: the conversation it was woken in, that and the listed ones, or anywhere it's a member. */
+export const ChannelAudience = z.enum(["origin", "listed", "anywhere"]);
+export type ChannelAudience = z.infer<typeof ChannelAudience>;
+/** Whether replies in a thread wake the agent without a mention: never, when it was the last addressed, or always. */
+export const ThreadFollowUp = z.enum(["off", "when_last_addressed", "always"]);
+export type ThreadFollowUp = z.infer<typeof ThreadFollowUp>;
+/** Other agents' messages: ignored, or answered when they mention this one (up to `max_agent_hops`). */
+export const AgentMessages = z.enum(["ignore", "mentions"]);
+export type AgentMessages = z.infer<typeof AgentMessages>;
+/** Who may wake the agent: anyone in the team, or only the people in `sender_list`. */
+export const ChannelSenders = z.enum(["anyone", "listed"]);
+export type ChannelSenders = z.infer<typeof ChannelSenders>;
+/** Messages that arrive while a run is busy in the thread: joined into it (`steer`) or answered after it (`collect`). */
+export const MidRun = z.enum(["steer", "collect"]);
+export type MidRun = z.infer<typeof MidRun>;
+
+export const ChannelPersona = named("ChannelPersona", z.object({ name: z.string(), avatar_url: z.url().nullable() }));
+export type ChannelPersona = z.infer<typeof ChannelPersona>;
+
+const agentChannelSettings = {
+  /** Channel tools the agent may call here. */
+  tools: z.array(z.string()),
+  /** Subset of `tools` that pause the run for approval. */
+  approval_required: z.array(z.string()),
+  audience: ChannelAudience,
+  /** With `listed`: conversations of this connection it may send to, besides the one it was woken in. */
+  audience_conversations: z.array(idSchema("channel_conversation")),
+  /** How its messages are signed, where the provider allows it; null uses the app's own name and icon. */
+  persona: ChannelPersona.nullable(),
+  answers_dms: z.boolean(),
+  answers_mentions: z.boolean(),
+  thread_follow_up: ThreadFollowUp,
+  agent_messages: AgentMessages,
+  /** 1 to 5: an agent's message carries one more hop than the run that sent it. */
+  max_agent_hops: z.number().int(),
+  mid_run: MidRun,
+  senders: ChannelSenders,
+  /** With `listed`: email addresses, each once (compared without case). */
+  sender_list: z.array(z.string()),
+  /** Whether automated accounts (apps, integrations) may wake it. */
+  allow_automated: z.boolean(),
+  /** Whether people from other organizations in shared conversations (Slack Connect) may wake it. */
+  allow_external: z.boolean(),
+  /** Post a channel run's answer in the thread it came from. Runs started through the API never post on their own. */
+  reply_with_output: z.boolean(),
+};
+
+/** An agent on one of its own connections: its channel tools and what it answers. */
+export const AgentChannel = named(
+  "AgentChannel",
+  z.object({
+    id: idSchema("agent_channel"),
+    workspace_id: idSchema("workspace"),
+    agent_id: idSchema("agent"),
+    connection_id: idSchema("channel_connection"),
+    ...agentChannelSettings,
+    created_at: instant,
+    updated_at: instant,
+  }),
+);
+export type AgentChannel = z.infer<typeof AgentChannel>;
+
+/**
+ * Every setting, replacing what was there. The connection must be the
+ * agent's own app's (`422 not_agents_app`) and not disconnected
+ * (`409 channel_connection_disconnected`). Tools must be channel tools
+ * (`422 unknown_tool`), none the organization denies (`422 tool_denied`),
+ * each it sets to `approve` in `approval_required`
+ * (`422 approval_required_by_policy`), and `approval_required` within
+ * `tools` (`422 approval_outside_grant`). `senders: listed` needs a
+ * `sender_list` (`422 sender_list_required`) of addresses each once
+ * (`422 duplicate_sender`); `audience_conversations` must be this
+ * connection's (`422 unknown_conversation`).
+ */
+export const PutAgentChannelInput = z.object({
+  ...agentChannelSettings,
+  /** A name of 1 to 80 characters, and an `https://` avatar or none. */
+  persona: z
+    .object({
+      name: z.string().trim().min(1).max(80),
+      avatar_url: z
+        .string()
+        .regex(/^https:\/\/\S+$/)
+        .nullable(),
+    })
+    .nullable(),
+  max_agent_hops: z.number().int().min(1).max(5),
+  /** Up to 500 addresses of up to 320 characters. */
+  sender_list: z.array(z.email().max(320)).max(500),
+});
+export type PutAgentChannelInput = z.infer<typeof PutAgentChannelInput>;
+
+/** What an agent channel starts with when an install creates it: a fresh copy each call. */
+export function agentChannelDefaults(): PutAgentChannelInput {
+  return {
+    tools: [],
+    approval_required: [],
+    audience: "origin",
+    audience_conversations: [],
+    persona: null,
+    answers_dms: true,
+    answers_mentions: true,
+    thread_follow_up: "when_last_addressed",
+    agent_messages: "ignore",
+    max_agent_hops: 3,
+    mid_run: "steer",
+    senders: "anyone",
+    sender_list: [],
+    allow_automated: false,
+    allow_external: false,
+    reply_with_output: true,
+  };
+}
+
+/**
+ * The tools every channel gives an agent, with what each does and its level
+ * until the organization sets one. Sending anywhere but the thread waits
+ * for approval; deleting is denied.
+ */
+export const CHANNEL_TOOLS = {
+  list_conversations: { effect: "read", level: "allow" },
+  get_conversation: { effect: "read", level: "allow" },
+  read_messages: { effect: "read", level: "allow" },
+  read_thread: { effect: "read", level: "allow" },
+  search_messages: { effect: "read", level: "allow" },
+  find_people: { effect: "read", level: "allow" },
+  get_person: { effect: "read", level: "allow" },
+  get_attachment: { effect: "read", level: "allow" },
+  reply: { effect: "write", level: "allow" },
+  send_message: { effect: "write", level: "approve" },
+  send_direct_message: { effect: "write", level: "approve" },
+  react: { effect: "write", level: "allow" },
+  edit_message: { effect: "write", level: "allow" },
+  delete_message: { effect: "destructive", level: "deny" },
+} as const satisfies Record<string, { effect: ToolEffect; level: ToolLevel }>;
+export type ChannelToolName = keyof typeof CHANNEL_TOOLS;
+export const CHANNEL_TOOL_NAMES = Object.keys(CHANNEL_TOOLS) as ChannelToolName[];
+
+/**
+ * The organization's level for one channel tool, in both environments.
+ * Unlike an app's suggested level, a channel tool's default is Zupflow's
+ * own and in force until someone sets another (`confirmed`).
+ */
+export const ChannelToolLevel = named(
+  "ChannelToolLevel",
+  z.object({
+    provider: ChannelProvider,
+    tool: z.string(),
+    level: ToolLevel,
+    /** Set by a person; false while it's the default. */
+    confirmed: z.boolean(),
+    effect: ToolEffect,
+    updated_at: instant.nullable(),
+    /** Who set it; null for the default, or when they're gone. */
+    updated_by: User.nullable(),
+  }),
+);
+export type ChannelToolLevel = z.infer<typeof ChannelToolLevel>;
+
+/**
+ * Sets levels by tool name, each confirmed; 1 to the provider's tool count,
+ * each tool once, every one a channel tool (`422 unknown_tool`). Agent
+ * channels already holding a tool aren't rewritten when its level tightens:
+ * a denied call is refused when it's made.
+ */
+export const UpdateChannelToolLevelsInput = z.object({
+  provider: ChannelProvider,
+  levels: z
+    .array(z.object({ tool: z.string(), level: ToolLevel }))
+    .min(1)
+    .max(CHANNEL_TOOL_NAMES.length),
+});
+export type UpdateChannelToolLevelsInput = z.infer<typeof UpdateChannelToolLevelsInput>;
+
+/**
+ * The organization's channel settings, both environments. The conversation
+ * breaker pauses agents in a conversation for `breaker_pause_minutes` after
+ * `breaker_runs` runs within `breaker_window_minutes`; messages are kept
+ * `message_retention_days`. Until saved, the defaults, with `updated_at` null.
+ */
+export const ChannelSettings = named(
+  "ChannelSettings",
+  z.object({
+    organization_id: idSchema("organization"),
+    breaker_runs: z.number().int(),
+    breaker_window_minutes: z.number().int(),
+    breaker_pause_minutes: z.number().int(),
+    message_retention_days: z.number().int(),
+    updated_at: instant.nullable(),
+    updated_by: User.nullable(),
+  }),
+);
+export type ChannelSettings = z.infer<typeof ChannelSettings>;
+
+export const CHANNEL_SETTINGS_DEFAULTS = {
+  breaker_runs: 20,
+  breaker_window_minutes: 10,
+  breaker_pause_minutes: 10,
+  message_retention_days: 30,
+} as const;
+
+/** Runs 1 to 200, minutes 1 to 1440, retention 1 to 365 days. */
+export const UpdateChannelSettingsInput = z.object({
+  breaker_runs: z.number().int().min(1).max(200),
+  breaker_window_minutes: z.number().int().min(1).max(1440),
+  breaker_pause_minutes: z.number().int().min(1).max(1440),
+  message_retention_days: z.number().int().min(1).max(365),
+});
+export type UpdateChannelSettingsInput = z.infer<typeof UpdateChannelSettingsInput>;
+
+/** A hosted Connect session that finished, with what it made. */
+export const ChannelAppManagerConnectResult = named(
+  "ChannelAppManagerConnectResult",
+  z.object({ session: ConnectSession, channel_app_manager: ChannelAppManager }),
+);
+export type ChannelAppManagerConnectResult = z.infer<typeof ChannelAppManagerConnectResult>;
+export const ChannelConnectionConnectResult = named(
+  "ChannelConnectionConnectResult",
+  z.object({ session: ConnectSession, channel_connection: ChannelConnection }),
+);
+export type ChannelConnectionConnectResult = z.infer<typeof ChannelConnectionConnectResult>;
+/** What a finished hosted Connect session made: an installation, an app manager or a channel connection. */
+export const ConnectResult = named(
+  "ConnectResult",
+  z.union([InstallationConnectResult, ChannelAppManagerConnectResult, ChannelConnectionConnectResult]),
+);
+export type ConnectResult = z.infer<typeof ConnectResult>;
+
+/**
+ * What the inbound endpoint answers the provider, in the provider's format,
+ * not the envelope. Slack's URL check gets its `challenge` back; anything
+ * else, null.
+ */
+export const ChannelInboundAnswer = named("ChannelInboundAnswer", z.object({ challenge: z.string().nullable() }));
+export type ChannelInboundAnswer = z.infer<typeof ChannelInboundAnswer>;
+/** The provider's event, as it sends it: verified against its signature before anything is read. */
+export const ChannelInboundEvent = z.looseObject({ type: z.string() });
+
+// ---------------------------------------------------------------------------
 // Runs
 
-export const RunUsage = named(
-  "RunUsage",
-  z.object({ input_tokens: z.number().int(), output_tokens: z.number().int(), tool_calls: z.number().int() }),
-);
+/**
+ * The tokens a run's model read and wrote, as its provider counted them, and
+ * the calls it sent. `input_tokens` is every token the model read, those
+ * served from the provider's prompt cache and those written to it included,
+ * whichever provider served the run; the two cache counts are parts of it.
+ */
+const tokenFields = {
+  input_tokens: z
+    .number()
+    .int()
+    .describe("Every token the model read, those read from or written to the provider's prompt cache included."),
+  output_tokens: z.number().int().describe("Every token the model wrote."),
+  cache_read_input_tokens: z
+    .number()
+    .int()
+    .describe("The part of `input_tokens` the provider served from its prompt cache."),
+  cache_write_input_tokens: z
+    .number()
+    .int()
+    .describe(
+      "The part of `input_tokens` the provider wrote to its prompt cache. Providers that cache on their own report none.",
+    ),
+};
+
+export const RunUsage = named("RunUsage", z.object({ ...tokenFields, tool_calls: z.number().int() }));
 export type RunUsage = z.infer<typeof RunUsage>;
 
+/**
+ * Why a run failed, by stable `code`. Among them: `empty_output`, a channel
+ * run that ended with no answer twice and never called `stay_silent`.
+ */
 export const RunError = named("RunError", z.object({ code: z.string(), message: z.string() }));
 export type RunError = z.infer<typeof RunError>;
+
+/** What woke the agent: a DM, a mention, or a reply in a thread it follows. */
+export const ChannelWakeReason = z.enum(["direct_message", "mentioned", "thread_follow_up"]);
+export type ChannelWakeReason = z.infer<typeof ChannelWakeReason>;
+
+/** Where a channel run came from. */
+export const RunChannel = named(
+  "RunChannel",
+  z.object({
+    connection_id: idSchema("channel_connection"),
+    conversation_id: idSchema("channel_conversation"),
+    thread_key: z.string(),
+    /** The message that started it; null once retention removed it. */
+    origin_message_id: idSchema("channel_message").nullable(),
+    reason: ChannelWakeReason,
+    /** The reason the agent gave `stay_silent`; null when it answered. */
+    silent_reason: z.string().nullable(),
+  }),
+);
+export type RunChannel = z.infer<typeof RunChannel>;
+
+export const RunTrigger = z.enum(["api", "console", "channel"]);
+export type RunTrigger = z.infer<typeof RunTrigger>;
 
 const runFields = {
   id: idSchema("run"),
@@ -1176,7 +1804,9 @@ const runFields = {
   agent_id: idSchema("agent"),
   agent_name: z.string(),
   session_id: idSchema("session"),
-  trigger: z.enum(["api", "console"]),
+  trigger: RunTrigger,
+  /** Where a `channel` run came from; null for any other. */
+  channel: RunChannel.nullable(),
   status: RunStatus,
   input: z.string(),
   output: z.string().nullable(),
@@ -1223,14 +1853,33 @@ export const OrganizationRunListQuery = z.object({
 });
 export type OrganizationRunListQuery = z.infer<typeof OrganizationRunListQuery>;
 
-export const ToolCallRef = z.object({
+/** A call to a tool of one of the workspace's installations. */
+export const InstallationToolCallRef = z.object({
   call_id: idSchema("tool_call"),
   installation_id: idSchema("installation"),
   installation_label: z.string(),
   app_name: z.string(),
   tool: z.string(),
 });
+export type InstallationToolCallRef = z.infer<typeof InstallationToolCallRef>;
+/** A call to a channel tool, through one of the agent's channel connections. */
+export const ChannelToolCallRef = z.object({
+  call_id: idSchema("tool_call"),
+  channel_connection_id: idSchema("channel_connection"),
+  connection_label: z.string(),
+  provider: ChannelProvider,
+  tool: z.string(),
+});
+export type ChannelToolCallRef = z.infer<typeof ChannelToolCallRef>;
+/** The tool a call targets: an installation's, or a channel connection's, never both. */
+export const ToolCallRef = z.union([InstallationToolCallRef, ChannelToolCallRef]);
 export type ToolCallRef = z.infer<typeof ToolCallRef>;
+const toolCall = <S extends z.ZodRawShape>(shape: S) =>
+  z.union([InstallationToolCallRef.extend(shape), ChannelToolCallRef.extend(shape)]);
+
+/** What became of channel messages a run took in: they started it, joined it mid-run, or were collected after it. */
+export const ChannelMessagesOutcome = z.enum(["started", "steered", "collected"]);
+export type ChannelMessagesOutcome = z.infer<typeof ChannelMessagesOutcome>;
 
 export const ApprovalDecision = z.enum(["approved", "denied"]);
 export type ApprovalDecision = z.infer<typeof ApprovalDecision>;
@@ -1265,10 +1914,19 @@ export const RunEvent = named(
       }),
     ),
     runEvent("message.assistant", z.object({ text: z.string() })),
-    runEvent("tool_call.started", ToolCallRef.extend({ arguments: z.unknown() })),
-    runEvent("tool_call.completed", ToolCallRef.extend({ result: z.unknown(), duration_ms: z.number() })),
-    runEvent("tool_call.failed", ToolCallRef.extend({ error: RunError, duration_ms: z.number() })),
-    runEvent("approval.requested", ToolCallRef.extend({ arguments: z.unknown() })),
+    runEvent(
+      "channel_messages.received",
+      z.object({
+        outcome: ChannelMessagesOutcome,
+        connection_id: idSchema("channel_connection"),
+        conversation_id: idSchema("channel_conversation"),
+        message_ids: z.array(idSchema("channel_message")),
+      }),
+    ),
+    runEvent("tool_call.started", toolCall({ arguments: z.unknown() })),
+    runEvent("tool_call.completed", toolCall({ result: z.unknown(), duration_ms: z.number() })),
+    runEvent("tool_call.failed", toolCall({ error: RunError, duration_ms: z.number() })),
+    runEvent("approval.requested", toolCall({ arguments: z.unknown() })),
     runEvent(
       "approval.resolved",
       z.object({
@@ -1278,6 +1936,7 @@ export const RunEvent = named(
         api_key_id: idSchema("api_key"),
       }),
     ),
+    runEvent("run.stayed_silent", z.object({ reason: z.string() })),
     runEvent("run.completed", z.object({ usage: RunUsage })),
     runEvent("run.failed", z.object({ error: RunError })),
     runEvent("run.cancelled", z.object({ cancelled_by: z.string() })),
@@ -1358,12 +2017,19 @@ export const WEBHOOK_EVENT_TYPES = [
   "run.waiting_for_approval",
   "run.cancelled",
   "app.tools_changed",
+  "channel_message.received",
+  "channel_message.sent",
+  "channel_app_manager.status_changed",
+  "channel_app.status_changed",
+  "channel_connection.status_changed",
+  "channel_conversation.paused",
 ] as const;
 /**
  * The event types an endpoint can subscribe to. `webhook.test` is sent only
  * by the test button. `app.tools_changed` is sent when a listing of a
  * connected installation's tools changes one or more of them, once per
- * listing.
+ * listing. `channel_app_manager.status_changed` is also sent, as `active`,
+ * when a team is linked, through the API or hosted Connect.
  */
 export const WebhookEventType = z.enum(WEBHOOK_EVENT_TYPES);
 export type WebhookEventType = z.infer<typeof WebhookEventType>;
@@ -1387,13 +2053,26 @@ const connectSessionData = <S extends z.ZodType>(status: S) =>
     object: z.literal("connect_session"),
     id: idSchema("connect_session"),
     status,
-    /** The installation it created or reconnected; null when it didn't finish. */
+    /** The installation it created or reconnected; null for a channel session, and when it didn't finish. */
     installation_id: idSchema("installation").nullable(),
+    /**
+     * A channel session's target, with what it made once completed: the app
+     * manager it linked, or the connection it installed. Null for an app's
+     * session.
+     */
+    target: ConnectTarget.nullable(),
     /** Why it didn't finish, e.g. `consent_denied`; null when it completed. */
     failure_code: z.string().nullable(),
   });
 const runData = <S extends z.ZodType>(status: S) =>
   z.object({ object: z.literal("run"), id: idSchema("run"), agent_id: idSchema("agent"), status });
+
+const channelMessageData = z.object({
+  object: z.literal("channel_message"),
+  id: idSchema("channel_message"),
+  connection_id: idSchema("channel_connection"),
+  conversation_id: idSchema("channel_conversation"),
+});
 
 const webhookEventName = (type: string) =>
   `${type.replace(/(^|[._])([a-z])/g, (_, __, c: string) => c.toUpperCase())}WebhookEvent`;
@@ -1451,6 +2130,49 @@ export const WebhookEvent = named(
     webhookEvent(
       "app.tools_changed",
       installationData(InstallationStatus.extract(["connected"])),
+      WebhookEventWorkspace,
+    ),
+    // A message reached one of the workspace's channel connections, or one of its agents sent one.
+    webhookEvent("channel_message.received", channelMessageData, WebhookEventWorkspace),
+    webhookEvent("channel_message.sent", channelMessageData, WebhookEventWorkspace),
+    webhookEvent(
+      "channel_app_manager.status_changed",
+      z.object({
+        object: z.literal("channel_app_manager"),
+        id: idSchema("channel_app_manager"),
+        status: ChannelAppManagerStatus,
+      }),
+      WebhookEventWorkspace,
+    ),
+    webhookEvent(
+      "channel_app.status_changed",
+      z.object({
+        object: z.literal("channel_app"),
+        id: idSchema("channel_app"),
+        agent_id: idSchema("agent"),
+        status: ChannelAppStatus,
+      }),
+      WebhookEventWorkspace,
+    ),
+    webhookEvent(
+      "channel_connection.status_changed",
+      z.object({
+        object: z.literal("channel_connection"),
+        id: idSchema("channel_connection"),
+        app_id: idSchema("channel_app").nullable(),
+        status: ChannelConnectionStatus,
+      }),
+      WebhookEventWorkspace,
+    ),
+    // The conversation breaker paused agents in a conversation until `paused_until`.
+    webhookEvent(
+      "channel_conversation.paused",
+      z.object({
+        object: z.literal("channel_conversation"),
+        id: idSchema("channel_conversation"),
+        connection_id: idSchema("channel_connection"),
+        paused_until: instant,
+      }),
       WebhookEventWorkspace,
     ),
     // The test button's event belongs to no workspace.
@@ -1660,15 +2382,15 @@ export const AuditListQuery = z.object({
 });
 export type AuditListQuery = z.infer<typeof AuditListQuery>;
 
-export const UsageDay = named(
-  "UsageDay",
-  z.object({
-    date: z.iso.date(),
-    runs: z.number().int(),
-    failed_runs: z.number().int(),
-    tool_calls: z.number().int(),
-  }),
-);
+const usageCounts = {
+  runs: z.number().int(),
+  failed_runs: z.number().int(),
+  tool_calls: z.number().int(),
+  ...tokenFields,
+};
+
+/** One UTC day of runs created that day, with their calls and tokens. */
+export const UsageDay = named("UsageDay", z.object({ date: z.iso.date(), ...usageCounts }));
 export type UsageDay = z.infer<typeof UsageDay>;
 
 export const UsageReport = named(
@@ -1676,7 +2398,7 @@ export const UsageReport = named(
   z.object({
     environment: Environment,
     days: z.array(UsageDay),
-    totals: z.object({ runs: z.number().int(), failed_runs: z.number().int(), tool_calls: z.number().int() }),
+    totals: z.object(usageCounts),
   }),
 );
 export type UsageReport = z.infer<typeof UsageReport>;

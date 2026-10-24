@@ -53,10 +53,16 @@ pub enum WebhookEventType {
     RunWaitingForApproval,
     RunCancelled,
     AppToolsChanged,
+    ChannelMessageReceived,
+    ChannelMessageSent,
+    ChannelAppManagerStatusChanged,
+    ChannelAppStatusChanged,
+    ChannelConnectionStatusChanged,
+    ChannelConversationPaused,
 }
 
 impl WebhookEventType {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 16] = [
         Self::InstallationConnected,
         Self::InstallationReconnectRequired,
         Self::InstallationDisconnected,
@@ -67,6 +73,12 @@ impl WebhookEventType {
         Self::RunWaitingForApproval,
         Self::RunCancelled,
         Self::AppToolsChanged,
+        Self::ChannelMessageReceived,
+        Self::ChannelMessageSent,
+        Self::ChannelAppManagerStatusChanged,
+        Self::ChannelAppStatusChanged,
+        Self::ChannelConnectionStatusChanged,
+        Self::ChannelConversationPaused,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -81,6 +93,12 @@ impl WebhookEventType {
             Self::RunWaitingForApproval => "run.waiting_for_approval",
             Self::RunCancelled => "run.cancelled",
             Self::AppToolsChanged => "app.tools_changed",
+            Self::ChannelMessageReceived => "channel_message.received",
+            Self::ChannelMessageSent => "channel_message.sent",
+            Self::ChannelAppManagerStatusChanged => "channel_app_manager.status_changed",
+            Self::ChannelAppStatusChanged => "channel_app.status_changed",
+            Self::ChannelConnectionStatusChanged => "channel_connection.status_changed",
+            Self::ChannelConversationPaused => "channel_conversation.paused",
         }
     }
 

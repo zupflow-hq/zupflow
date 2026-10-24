@@ -37,6 +37,7 @@ fi
 export ZUPFLOW_CONTRACT_URL="http://127.0.0.1:$port"
 export ZUPFLOW_CONTRACT_RESET_COMMAND="'$bin' reset '$database'"
 export ZUPFLOW_CONTRACT_OPERATIONS="$("$bin" operations)"
+export ZUPFLOW_CONTRACT_CHANNEL_APP_SECRETS_COMMAND="'$bin' channel-app-secrets '$database' {app}"
 export ZUPFLOW_CONTRACT_TOKEN_OWNER="contract:owner"
 export ZUPFLOW_CONTRACT_TOKEN_DEVELOPER="contract:developer"
 export ZUPFLOW_CONTRACT_TOKEN_VIEWER="contract:viewer"

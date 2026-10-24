@@ -49,6 +49,30 @@ pub struct Config {
     /// organization can use is its own: connections and models are added
     /// through the API, never configured here.
     pub model_provider: ModelProviderMode,
+    /// `ZUPFLOW_CHANNEL_PROVISIONER`: what makes agents' apps in linked
+    /// teams. Unset, nothing does: linking a team answers `501`, and a new
+    /// app fails `provisioner_unavailable`. `scripted` is the deterministic
+    /// stand-in for local work and tests, never a deployment's: it calls no
+    /// provider, refuses tokens containing `invalid`, and makes apps at once.
+    /// `slack` makes them in Slack with each linked team's configuration
+    /// token: it needs `ZUPFLOW_PUBLIC_URL` to be an `https://` origin Slack
+    /// can reach, where it delivers events and sends people back from
+    /// installing.
+    pub channel_provisioner: ChannelProvisionerMode,
+    /// `ZUPFLOW_SLACK_API_URL`: where Slack's Web API is reached, an
+    /// `https://` base with no query (`https://slack.com/api` by default).
+    /// For a proxy in front of Slack, or a stand-in in tests.
+    pub slack_api: zupflow_slack::SlackApi,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelProvisionerMode {
+    /// No provisioner: linking a team answers `501`.
+    None,
+    /// The scripted provisioner in `zupflow-basic`.
+    Scripted,
+    /// Slack, with each linked team's configuration token (`zupflow-slack`).
+    Slack,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +131,15 @@ pub enum ConfigError {
     InvalidConsoleOrigin,
     #[error("ZUPFLOW_MODEL_PROVIDER must be `providers`, `scripted` (local work only), or unset for none")]
     UnknownModelProvider,
+    #[error("ZUPFLOW_CHANNEL_PROVISIONER must be `slack`, `scripted` (local work only), or unset for none")]
+    UnknownChannelProvisioner,
+    #[error(
+        "ZUPFLOW_CHANNEL_PROVISIONER=slack needs ZUPFLOW_PUBLIC_URL set to an https:// origin Slack can reach, \
+         such as https://zupflow.example (a tunnel's, for local work)"
+    )]
+    SlackNeedsPublicUrl,
+    #[error("ZUPFLOW_SLACK_API_URL must be an https:// URL like https://slack.com/api, with no query")]
+    InvalidSlackApiUrl,
     #[error("ZUPFLOW_IDENTITY must be `local` or `oidc`")]
     UnknownIdentity,
     #[error("ZUPFLOW_IDENTITY is required: set it to `oidc`, or to `local` for one person on their own machine")]
@@ -210,6 +243,20 @@ impl Config {
             Some("scripted") => ModelProviderMode::Scripted,
             Some(_) => return Err(ConfigError::UnknownModelProvider),
         };
+        let channel_provisioner = match set("ZUPFLOW_CHANNEL_PROVISIONER")?.as_deref() {
+            None => ChannelProvisionerMode::None,
+            Some("scripted") => ChannelProvisionerMode::Scripted,
+            Some("slack") => ChannelProvisionerMode::Slack,
+            Some(_) => return Err(ConfigError::UnknownChannelProvisioner),
+        };
+        // Slack delivers events and sends people back only to a public HTTPS address.
+        if channel_provisioner == ChannelProvisionerMode::Slack && !public_url.starts_with("https://") {
+            return Err(ConfigError::SlackNeedsPublicUrl);
+        }
+        let slack_api = match set("ZUPFLOW_SLACK_API_URL")? {
+            Some(value) => zupflow_slack::SlackApi::new(value.trim()).map_err(|_| ConfigError::InvalidSlackApiUrl)?,
+            None => zupflow_slack::SlackApi::default(),
+        };
         Ok(Self {
             listen,
             log,
@@ -220,6 +267,8 @@ impl Config {
             console_origin,
             public_url,
             model_provider,
+            channel_provisioner,
+            slack_api,
         })
     }
 
@@ -488,6 +537,70 @@ mod tests {
                     "ZUPFLOW_MODELS is no longer read: organizations add their own models under Model providers; \
                      unset it"
                 )
+            );
+        }
+    }
+
+    #[test]
+    fn makes_channel_apps_with_the_scripted_provisioner_only_when_asked() {
+        let provisioner = |value: &'static str| oidc_with(&[("ZUPFLOW_CHANNEL_PROVISIONER", value)]);
+        assert_eq!(
+            oidc_with(&[]).expect("defaults").channel_provisioner,
+            ChannelProvisionerMode::None
+        );
+        assert_eq!(
+            provisioner("scripted").expect("scripted").channel_provisioner,
+            ChannelProvisionerMode::Scripted
+        );
+        for value in ["fake", "Slack", "Scripted"] {
+            assert!(
+                matches!(provisioner(value), Err(ConfigError::UnknownChannelProvisioner)),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn makes_channel_apps_in_slack_only_from_a_public_https_address() {
+        let public = [
+            ("ZUPFLOW_CHANNEL_PROVISIONER", "slack"),
+            ("ZUPFLOW_PUBLIC_URL", "https://zupflow.example"),
+        ];
+        let config = oidc_with(&public).expect("slack");
+        assert_eq!(config.channel_provisioner, ChannelProvisionerMode::Slack);
+        assert_eq!(config.slack_api, zupflow_slack::SlackApi::default());
+        assert_eq!(
+            config.slack_api.method_url("auth.test"),
+            "https://slack.com/api/auth.test"
+        );
+        for url in [None, Some("http://zupflow.example")] {
+            let mut vars = vec![("ZUPFLOW_CHANNEL_PROVISIONER", "slack")];
+            if let Some(url) = url {
+                vars.push(("ZUPFLOW_PUBLIC_URL", url));
+            }
+            assert!(
+                matches!(oidc_with(&vars), Err(ConfigError::SlackNeedsPublicUrl)),
+                "{url:?}"
+            );
+        }
+        let mut proxied = public.to_vec();
+        proxied.push(("ZUPFLOW_SLACK_API_URL", "https://slack-proxy.example/api/"));
+        let config = oidc_with(&proxied).expect("a proxy");
+        assert_eq!(
+            config.slack_api.method_url("auth.test"),
+            "https://slack-proxy.example/api/auth.test"
+        );
+        for url in [
+            "http://slack-proxy.example/api",
+            "https://slack-proxy.example/api?x=1",
+            "https://user:pass@slack-proxy.example/api",
+            "slack.com",
+        ] {
+            let mut vars = public.to_vec();
+            vars.push(("ZUPFLOW_SLACK_API_URL", url));
+            assert!(
+                matches!(oidc_with(&vars), Err(ConfigError::InvalidSlackApiUrl)),
+                "{url}"
             );
         }
     }

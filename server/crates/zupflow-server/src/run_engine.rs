@@ -10,10 +10,21 @@
 //! and workspace: the store's clock time, a claimant of this worker's own,
 //! IDs for the calls and the send claim, the tools offered to the model
 //! (each granted tool of each installation, named
-//! `<app_key>_<short_id>_<tool_name>` and frozen with the model attempt,
-//! decision 0047), the floor's and the [`ApprovalPolicy`]'s decision on
-//! each call, and, before a call is sent, its installation, grant and
-//! pinned definition read again.
+//! `<app_key>_<short_id>_<tool_name>`, decision 0047), the floor's and the
+//! [`ApprovalPolicy`]'s decision on each call, and, before a call is sent,
+//! its installation, grant and pinned definition read again.
+//!
+//! The tools are read once a run, for its first model attempt, and frozen
+//! with it: every later attempt offers the same list with the same
+//! descriptions ([`frozen_offer`]), so each turn's request starts with the
+//! one before and the provider's prompt cache holds. What changes meanwhile
+//! (a grant edited or revoked, a policy, a tool gone, an installation
+//! renamed, disconnected or removed) never changes the list: a call to a
+//! tool no longer allowed is refused when it's decided or sent, with a
+//! fixed message, and a tool granted since waits for the next run. Each
+//! turn is sent with the agent's prompt cache key ([`prompt_cache_key`]),
+//! the same for every run of the agent with the same tools, outside the
+//! request's digest.
 //!
 //! The job queue's lease and the run's claim go together: the job's lease
 //! is extended before every step that keeps the claim, and once a step
@@ -43,14 +54,14 @@ use zupflow_core::ids::{AgentId, InstallationId, ModelId, OrganizationId, RunId,
 use zupflow_core::installations::{Installation, InstallationStatus, InstalledApp};
 use zupflow_core::jobs::{Job, JobId, LeaseToken, Retry};
 use zupflow_core::model_store::{ModelStatus, RouteState};
-use zupflow_core::models::{ProviderAccess, ProviderError, validate_completion};
+use zupflow_core::models::{ProviderAccess, ProviderError, Turn, prompt_cache_key, validate_completion};
 use zupflow_core::policy::{CallApp, Decision, GrantedAs, OrganizationLevel, ToolCall, Verdict, floor};
 use zupflow_core::runs::digest::{Sha256Digest, call_digest};
-use zupflow_core::runs::names::{Candidate, Offer, OfferedTool, build_offer};
+use zupflow_core::runs::names::{Candidate, Offer, OfferedTool, ToolHost, build_offer};
 use zupflow_core::runs::reducer::{
     Facts, Gone, Idle, InstallationCheck, Io, Limits, MODEL_FAILED, MODEL_KEY_INVALID, MODEL_UNAVAILABLE, ModelAnswer,
     ModelRequest, ModelResult, Plan, SendCheck, SendRequest, SendResult, Unanswered, UnansweredWhy, advance,
-    calls_to_decide, fail_abandoned, may_park_on, refuse_waiting,
+    calls_to_decide, fail_abandoned, frozen_offer, may_park_on, refuse_waiting,
 };
 use zupflow_core::runs::state::{CallDecision, CallRecord, CallVerdict, ClaimantId, InvocationId, RequestId, Snapshot};
 use zupflow_core::runs::store::{
@@ -63,6 +74,7 @@ use zupflow_core::tools::{RegisteredTool, ToolError};
 use zupflow_mcp::CallError;
 
 use crate::auth::AppState;
+use crate::channel_tools;
 use crate::mcp_access::{self, Unreachable};
 use crate::model_access::{self, Unopened};
 use crate::run_observe;
@@ -265,6 +277,15 @@ impl<P: ToolPort> Driver<'_, P> {
         self.state.runs.as_ref()
     }
 
+    fn reads(&self) -> AgentReads<'_> {
+        AgentReads {
+            state: self.state,
+            organization_id: self.organization_id,
+            workspace_id: self.workspace_id,
+            agent_id: self.agent_id,
+        }
+    }
+
     /// Keeps the job's lease as long as the claim's; `false` once it's lost:
     /// another worker has the job.
     async fn extend_job(&self) -> bool {
@@ -278,6 +299,23 @@ impl<P: ToolPort> Driver<'_, P> {
         let mut model: Option<ModelAnswer> = None;
         let mut sent: Option<SendResult> = None;
         let mut reach: Option<P::Reach> = None;
+        let mut working: Option<channel_tools::Working> = None;
+        let outcome = self
+            .steps_until_done(&mut model, &mut sent, &mut reach, &mut working)
+            .await;
+        if let Some(working) = working {
+            working.stop().await;
+        }
+        outcome
+    }
+
+    async fn steps_until_done(
+        &mut self,
+        model: &mut Option<ModelAnswer>,
+        sent: &mut Option<SendResult>,
+        reach: &mut Option<P::Reach>,
+        working: &mut Option<channel_tools::Working>,
+    ) -> Outcome {
         // Every step commits or reloads; a run that keeps conflicting is
         // given back rather than worked forever.
         let budget = self.limits.max_steps_per_claim.saturating_mul(4).saturating_add(16);
@@ -300,9 +338,9 @@ impl<P: ToolPort> Driver<'_, P> {
                         attempt: answer.attempt,
                     })
             }) {
-                model = None;
+                *model = None;
             }
-            let facts = match self.facts(&snapshot, model.as_ref(), sent.as_ref(), &mut reach).await {
+            let facts = match self.facts(&snapshot, model.as_ref(), sent.as_ref(), reach).await {
                 Ok(facts) => facts,
                 Err(why) => return Outcome::Retry(why),
             };
@@ -316,7 +354,7 @@ impl<P: ToolPort> Driver<'_, P> {
             let (request, then) = match plan {
                 Plan::Apply { request, then } => (request, then),
                 Plan::Idle(Idle::Recorded) => {
-                    sent = None;
+                    *sent = None;
                     continue;
                 }
                 Plan::Idle(Idle::Finished | Idle::AwaitingApproval) => return Outcome::Complete,
@@ -361,7 +399,7 @@ impl<P: ToolPort> Driver<'_, P> {
                             self.steps = 0;
                         }
                         // The send claim isn't this outcome's to record.
-                        Conflict::SendClaim => sent = None,
+                        Conflict::SendClaim => *sent = None,
                     }
                     continue;
                 }
@@ -378,8 +416,8 @@ impl<P: ToolPort> Driver<'_, P> {
             self.steps = self.steps.saturating_add(1);
             match operation {
                 Operation::Claim(claim) => self.claim = Some(claim.epoch),
-                Operation::RecordOutcome(_) => sent = None,
-                Operation::CommitTurn(_) | Operation::Yield(_) | Operation::Finish(_) => model = None,
+                Operation::RecordOutcome(_) => *sent = None,
+                Operation::CommitTurn(_) | Operation::Yield(_) | Operation::Finish(_) => *model = None,
                 _ => {}
             }
             // A step that released the claim dealt with the job too.
@@ -388,7 +426,22 @@ impl<P: ToolPort> Driver<'_, P> {
                 .owner
                 .is_some_and(|owner| owner.renew_lease_ms.is_none());
             match then {
-                Io::CallModel(asked) => model = Some(self.ask(&snapshot, &asked).await),
+                Io::CallModel(asked) => {
+                    // The thread shows the agent working while its model
+                    // answers: best effort, never a reason to fail.
+                    if working.is_none()
+                        && let Some(session) = &snapshot.session
+                    {
+                        *working = channel_tools::Working::start(
+                            self.state,
+                            self.organization_id,
+                            self.workspace_id,
+                            &session.origin,
+                        )
+                        .await;
+                    }
+                    *model = Some(self.ask(&snapshot, &asked).await);
+                }
                 Io::SendCall(send) => {
                     let started = std::time::Instant::now();
                     let outcome = match reach.take() {
@@ -419,7 +472,28 @@ impl<P: ToolPort> Driver<'_, P> {
                         started.elapsed(),
                     )
                     .await;
-                    sent = Some(sent_result(&send, outcome));
+                    *sent = Some(sent_result(&send, outcome));
+                }
+                Io::SendChannel(send) => {
+                    let started = std::time::Instant::now();
+                    let outcome = channel_tools::send(self.state, &send).await;
+                    run_observe::channel_sent(
+                        self.state,
+                        self.organization_id,
+                        self.workspace_id,
+                        self.environment,
+                        self.run_id,
+                        &send,
+                        &outcome,
+                        started.elapsed(),
+                    )
+                    .await;
+                    *sent = Some(SendResult {
+                        call_id: send.call_id,
+                        attempt: send.attempt,
+                        invocation_id: send.invocation_id,
+                        outcome,
+                    });
                 }
                 Io::Nothing if released => return Outcome::Leave,
                 Io::Nothing => {}
@@ -456,18 +530,54 @@ impl<P: ToolPort> Driver<'_, P> {
         }
         match control.continuation {
             Continuation::NeedModel { .. } => {
-                facts.offer = Some(self.offer().await?);
+                facts.offer = self.offer_unless_frozen(snapshot).await?;
                 facts.model_route = self.model_route(snapshot).await?;
+                // A channel run takes in what arrived in its thread since,
+                // at this turn boundary only: the reducer joins it to a
+                // turn's first attempt and nothing else.
+                if snapshot.session.is_some() {
+                    facts.steer = self
+                        .state
+                        .channels
+                        .steerable(self.organization_id, self.workspace_id, self.run_id)
+                        .await
+                        .map_err(|_| "store_unavailable")?;
+                }
             }
             Continuation::AwaitModel { .. } => match model.map(|answer| &answer.result) {
                 None => {
-                    facts.offer = Some(self.offer().await?);
+                    facts.offer = self.offer_unless_frozen(snapshot).await?;
                     facts.model_route = self.model_route(snapshot).await?;
                 }
                 Some(ModelResult::Answered(completion)) => {
                     let wanted = calls_to_decide(snapshot, completion, &self.limits).map_err(|_| "run_inconsistent")?;
+                    // What the run changed, and what this turn's earlier
+                    // calls would change, count against its changes.
+                    let mut changes = zupflow_core::runs::reducer::channel_changes(snapshot);
                     for (position, tool) in wanted {
-                        facts.decisions.push((position, self.decide_offered(tool).await?));
+                        let decision = match tool.host() {
+                            ToolHost::Channel(_) => {
+                                let arguments = asked_arguments(completion, position);
+                                let decided = channel_tools::decide(
+                                    self.state,
+                                    self.organization_id,
+                                    self.workspace_id,
+                                    self.run_id,
+                                    &tool.tool,
+                                    &arguments,
+                                    Some(changes),
+                                )
+                                .await?;
+                                if channel_tool_changes(&tool.tool)
+                                    && !matches!(decided.verdict, CallVerdict::Deny { .. })
+                                {
+                                    changes = changes.saturating_add(1);
+                                }
+                                decided
+                            }
+                            _ => self.decide_offered(tool).await?,
+                        };
+                        facts.decisions.push((position, decision));
                     }
                     let asked = match &completion.reply {
                         zupflow_core::models::Reply::ToolCalls { calls, .. } => calls.len(),
@@ -489,7 +599,48 @@ impl<P: ToolPort> Driver<'_, P> {
                 }
                 _ => {}
             },
-            Continuation::AwaitApproval { .. } | Continuation::AwaitCall { .. } | Continuation::Done => {}
+            // A channel post whose sender stopped is settled by finding it,
+            // rather than left unknown.
+            Continuation::AwaitCall { call_id, attempt } => {
+                let lapsed = snapshot
+                    .call(call_id)
+                    .filter(|call| call.state == CallState::Started)
+                    .and_then(|call| {
+                        call.attempt(attempt)
+                            .filter(|sending| !sending.outcome_recorded && sending.send_lease_until <= facts.now)
+                            .map(|sending| (call, sending))
+                    });
+                if let Some((call, sending)) = lapsed
+                    && call.target.as_ref().is_some_and(|target| target.channel().is_some())
+                {
+                    let lease = i64::try_from(self.limits.send_lease_ms).unwrap_or(i64::MAX);
+                    let attempted_at = zupflow_core::time::Timestamp::from_millis(
+                        sending
+                            .send_lease_until
+                            .millis()
+                            .saturating_sub(lease)
+                            .saturating_sub(60_000),
+                    );
+                    let settled = channel_tools::settle_lapsed(
+                        self.state,
+                        self.organization_id,
+                        self.workspace_id,
+                        self.run_id,
+                        call,
+                        attempted_at,
+                    )
+                    .await;
+                    if let Some(outcome) = settled {
+                        facts.sent = Some(SendResult {
+                            call_id,
+                            attempt,
+                            invocation_id: sending.invocation_id,
+                            outcome,
+                        });
+                    }
+                }
+            }
+            Continuation::AwaitApproval { .. } | Continuation::Done => {}
         }
         Ok(facts)
     }
@@ -583,7 +734,11 @@ impl<P: ToolPort> Driver<'_, P> {
                 );
             }
         };
-        let turn = asked.as_turn();
+        let cache_key = prompt_cache_key(self.organization_id, self.workspace_id, self.agent_id, &asked.tools);
+        let turn = Turn {
+            cache_key: Some(&cache_key),
+            ..asked.as_turn()
+        };
         let access = ProviderAccess {
             kind: reach.kind,
             key: &reach.key,
@@ -717,12 +872,230 @@ impl<P: ToolPort> Driver<'_, P> {
         }
     }
 
-    /// The tools to offer the next model attempt: each granted tool of each
+    /// The tools to offer the run's first model attempt, read now; `None`
+    /// once an attempt froze them, since every later one offers those.
+    async fn offer_unless_frozen(&self, snapshot: &Snapshot) -> Result<Option<Offer>, &'static str> {
+        if frozen_offer(snapshot).is_some() {
+            return Ok(None);
+        }
+        self.reads().offer().await.map(Some)
+    }
+
+    /// The floor's and then the policy's decision on a call to an offered
+    /// tool, read now.
+    async fn decide_offered(&self, tool: &OfferedTool) -> Result<CallDecision, &'static str> {
+        let Some(installation_id) = tool.installation_id else {
+            return Ok(not_granted(&tool.tool, self.state.approvals.name()));
+        };
+        let Some(installation) = self.reads().installation(installation_id).await? else {
+            // Deleted since it was offered, and its grants with it.
+            return Ok(not_granted(&tool.tool, self.state.approvals.name()));
+        };
+        let call = self.tool_call(&installation, &tool.tool).await?;
+        Ok(CallDecision::from(&self.decide(&call).await))
+    }
+
+    /// A call checked again just before it's sent: its installation, the
+    /// floor and the policy, and the tool's pinned definition. When it would
+    /// be sent, its server is reached now, so a credential that needs
+    /// reconnecting refuses it before it's recorded as sent.
+    async fn send_check(&self, call: &CallRecord) -> Result<(SendCheck, Option<P::Reach>), &'static str> {
+        let Some(target) = &call.target else {
+            // An open call always has a target; the reducer says so.
+            return Err("run_inconsistent");
+        };
+        if target.channel().is_some() {
+            let check = channel_tools::send_check(
+                self.state,
+                self.organization_id,
+                self.workspace_id,
+                self.run_id,
+                call,
+                false,
+            )
+            .await?;
+            return Ok((check, None));
+        }
+        let Some(installation_id) = target.installation_id else {
+            return Err("run_inconsistent");
+        };
+        let Some(installation) = self.reads().installation(installation_id).await? else {
+            let decision = call.decision.clone().ok_or("run_inconsistent")?;
+            return Ok((
+                SendCheck {
+                    call_id: call.id,
+                    installation: InstallationCheck::Removed,
+                    definition_sha256: None,
+                    decision,
+                },
+                None,
+            ));
+        };
+        let registered = self.reads().registry(&installation).await?;
+        let definition = registered
+            .get(&target.tool)
+            .map(|tool| Sha256Digest::from_bytes(tool.pinned.hash));
+        let tool_call = self.tool_call_with(&installation, &target.tool, &registered).await?;
+        let decision = CallDecision::from(&self.decide(&tool_call).await);
+        let mut opened = None;
+        let check = match installation.status {
+            InstallationStatus::Disconnected => InstallationCheck::Disconnected,
+            InstallationStatus::ReconnectRequired => InstallationCheck::ReconnectRequired,
+            InstallationStatus::Connected => {
+                let sends = match &decision.verdict {
+                    CallVerdict::Allow => true,
+                    CallVerdict::RequireApproval { .. } => call.state == CallState::Approved,
+                    CallVerdict::Deny { .. } => false,
+                } && definition.is_some_and(|definition| {
+                    Some(call_digest(
+                        installation_id,
+                        &target.app_key,
+                        &target.tool,
+                        &definition,
+                        &call.arguments,
+                    )) == call.call_digest
+                });
+                if sends {
+                    match self
+                        .tools
+                        .reach(self.organization_id, self.workspace_id, &installation)
+                        .await
+                    {
+                        Ok(reach) => {
+                            opened = Some(reach);
+                            InstallationCheck::Usable
+                        }
+                        Err(Unreachable::Retry(why)) => return Err(why),
+                        // Removed or disconnected since it was read: say so,
+                        // and the run goes on.
+                        Err(unreachable) if unreachable.needs_reconnect() => {
+                            match self.reads().installation(installation.id).await? {
+                                None => InstallationCheck::Removed,
+                                Some(now) if now.status == InstallationStatus::Disconnected => {
+                                    InstallationCheck::Disconnected
+                                }
+                                Some(_) => InstallationCheck::ReconnectRequired,
+                            }
+                        }
+                        Err(unreachable) => {
+                            tracing::warn!(event = "runs.installation_unreachable", organization_id = %self.organization_id, workspace_id = %self.workspace_id, installation_id = %installation.id, why = unreachable.why());
+                            InstallationCheck::Unusable
+                        }
+                    }
+                } else {
+                    InstallationCheck::Usable
+                }
+            }
+        };
+        Ok((
+            SendCheck {
+                call_id: call.id,
+                installation: check,
+                definition_sha256: definition,
+                decision,
+            },
+            opened,
+        ))
+    }
+
+    /// A call waiting for approval, checked before the run parks on it: only
+    /// whether its installation is still there and connected counts, so
+    /// nobody is asked about a call that can't be made (decision 0047). Its
+    /// server isn't reached, and its decision stays the one recorded.
+    async fn parking_check(&self, call: &CallRecord) -> Result<SendCheck, &'static str> {
+        let (Some(target), Some(decision)) = (&call.target, &call.decision) else {
+            // A call waiting for approval always has both; the store says so.
+            return Err("run_inconsistent");
+        };
+        if target.channel().is_some() {
+            return channel_tools::send_check(
+                self.state,
+                self.organization_id,
+                self.workspace_id,
+                self.run_id,
+                call,
+                true,
+            )
+            .await;
+        }
+        let Some(installation_id) = target.installation_id else {
+            return Err("run_inconsistent");
+        };
+        let installation = match self.reads().installation(installation_id).await? {
+            None => InstallationCheck::Removed,
+            Some(found) if found.status == InstallationStatus::Disconnected => InstallationCheck::Disconnected,
+            Some(_) => InstallationCheck::Usable,
+        };
+        Ok(SendCheck {
+            call_id: call.id,
+            installation,
+            definition_sha256: Some(target.definition_sha256),
+            decision: decision.clone(),
+        })
+    }
+
+    /// The policy's view of one call to `tool` through `installation`, read
+    /// now: the grant, the registry and the organization's level.
+    async fn tool_call(&self, installation: &Installation, tool: &str) -> Result<ToolCall, &'static str> {
+        let registered = self.reads().registry(installation).await?;
+        self.tool_call_with(installation, tool, &registered).await
+    }
+
+    async fn tool_call_with(
+        &self,
+        installation: &Installation,
+        tool: &str,
+        registered: &BTreeMap<String, RegisteredTool>,
+    ) -> Result<ToolCall, &'static str> {
+        let grants = match self
+            .state
+            .agents
+            .list_grants(self.organization_id, self.workspace_id, self.agent_id)
+            .await
+        {
+            Ok(grants) => grants,
+            Err(zupflow_core::agents::AgentError::Unavailable) => return Err("store_unavailable"),
+            Err(_) => Vec::new(),
+        };
+        let grant = grants
+            .iter()
+            .find(|grant| grant.installation_id == installation.id && grant.tools.iter().any(|name| name == tool));
+        let levels = self.reads().levels(installation, &[tool.to_owned()]).await;
+        Ok(self.reads().policy_call(
+            installation,
+            tool,
+            grant.map(|grant| grant.approval_required.iter().any(|name| name == tool)),
+            registered.get(tool),
+            &levels,
+        ))
+    }
+
+    /// Floor, then policy.
+    async fn decide(&self, call: &ToolCall) -> Decision {
+        match floor(call, self.state.approvals.name()) {
+            Some(decision) => decision,
+            None => self.state.approvals.decide(call).await,
+        }
+    }
+}
+
+/// What an agent's runs read in its organization and workspace: the tools
+/// it's offered and what decides on a call to one. A channel session reads
+/// its tools here too, once, when it starts.
+pub(crate) struct AgentReads<'a> {
+    pub(crate) state: &'a AppState,
+    pub(crate) organization_id: OrganizationId,
+    pub(crate) workspace_id: WorkspaceId,
+    pub(crate) agent_id: AgentId,
+}
+
+impl AgentReads<'_> {
+    /// The tools to offer the run's first model attempt: each granted tool of each
     /// installation that neither the floor nor the policy refuses, named
     /// after its app's key, its installation's short ID and itself, and
     /// described with its pinned definition. A deleted or disconnected
     /// installation offers nothing (decision 0047).
-    async fn offer(&self) -> Result<Offer, &'static str> {
+    pub(crate) async fn offer(&self) -> Result<Offer, &'static str> {
         let grants = match self
             .state
             .agents
@@ -792,136 +1165,18 @@ impl<P: ToolPort> Driver<'_, P> {
         let built = build_offer(candidates);
         for clash in &built.clashes {
             let installations: Vec<String> = clash.entries.iter().map(|(id, _)| id.to_string()).collect();
-            tracing::warn!(event = "runs.tool_names_clash", organization_id = %self.organization_id, workspace_id = %self.workspace_id, run_id = %self.run_id, name = %clash.name, installations = ?installations);
+            tracing::warn!(event = "runs.tool_names_clash", organization_id = %self.organization_id, workspace_id = %self.workspace_id, agent_id = %self.agent_id, name = %clash.name, installations = ?installations);
         }
         for excluded in &built.excluded {
-            tracing::warn!(event = "runs.tool_not_named", organization_id = %self.organization_id, workspace_id = %self.workspace_id, run_id = %self.run_id, installation_id = %excluded.installation_id, why = ?excluded.why);
+            tracing::warn!(event = "runs.tool_not_named", organization_id = %self.organization_id, workspace_id = %self.workspace_id, agent_id = %self.agent_id, installation_id = %excluded.installation_id, why = ?excluded.why);
         }
         Ok(built.offer)
     }
 
-    /// The floor's and then the policy's decision on a call to an offered
-    /// tool, read now.
-    async fn decide_offered(&self, tool: &OfferedTool) -> Result<CallDecision, &'static str> {
-        let Some(installation) = self.installation(tool.installation_id).await? else {
-            // Deleted since it was offered, and its grants with it.
-            return Ok(not_granted(&tool.tool, self.state.approvals.name()));
-        };
-        let call = self.tool_call(&installation, &tool.tool).await?;
-        Ok(CallDecision::from(&self.decide(&call).await))
-    }
-
-    /// A call checked again just before it's sent: its installation, the
-    /// floor and the policy, and the tool's pinned definition. When it would
-    /// be sent, its server is reached now, so a credential that needs
-    /// reconnecting refuses it before it's recorded as sent.
-    async fn send_check(&self, call: &CallRecord) -> Result<(SendCheck, Option<P::Reach>), &'static str> {
-        let Some(target) = &call.target else {
-            // An open call always has a target; the reducer says so.
-            return Err("run_inconsistent");
-        };
-        let Some(installation) = self.installation(target.installation_id).await? else {
-            let decision = call.decision.clone().ok_or("run_inconsistent")?;
-            return Ok((
-                SendCheck {
-                    call_id: call.id,
-                    installation: InstallationCheck::Removed,
-                    definition_sha256: None,
-                    decision,
-                },
-                None,
-            ));
-        };
-        let registered = self.registry(&installation).await?;
-        let definition = registered
-            .get(&target.tool)
-            .map(|tool| Sha256Digest::from_bytes(tool.pinned.hash));
-        let tool_call = self.tool_call_with(&installation, &target.tool, &registered).await?;
-        let decision = CallDecision::from(&self.decide(&tool_call).await);
-        let mut opened = None;
-        let check = match installation.status {
-            InstallationStatus::Disconnected => InstallationCheck::Disconnected,
-            InstallationStatus::ReconnectRequired => InstallationCheck::ReconnectRequired,
-            InstallationStatus::Connected => {
-                let sends = match &decision.verdict {
-                    CallVerdict::Allow => true,
-                    CallVerdict::RequireApproval { .. } => call.state == CallState::Approved,
-                    CallVerdict::Deny { .. } => false,
-                } && definition.is_some_and(|definition| {
-                    Some(call_digest(
-                        target.installation_id,
-                        &target.app_key,
-                        &target.tool,
-                        &definition,
-                        &call.arguments,
-                    )) == call.call_digest
-                });
-                if sends {
-                    match self
-                        .tools
-                        .reach(self.organization_id, self.workspace_id, &installation)
-                        .await
-                    {
-                        Ok(reach) => {
-                            opened = Some(reach);
-                            InstallationCheck::Usable
-                        }
-                        Err(Unreachable::Retry(why)) => return Err(why),
-                        // Removed or disconnected since it was read: say so,
-                        // and the run goes on.
-                        Err(unreachable) if unreachable.needs_reconnect() => {
-                            match self.installation(installation.id).await? {
-                                None => InstallationCheck::Removed,
-                                Some(now) if now.status == InstallationStatus::Disconnected => {
-                                    InstallationCheck::Disconnected
-                                }
-                                Some(_) => InstallationCheck::ReconnectRequired,
-                            }
-                        }
-                        Err(unreachable) => {
-                            tracing::warn!(event = "runs.installation_unreachable", organization_id = %self.organization_id, workspace_id = %self.workspace_id, installation_id = %installation.id, why = unreachable.why());
-                            InstallationCheck::Unusable
-                        }
-                    }
-                } else {
-                    InstallationCheck::Usable
-                }
-            }
-        };
-        Ok((
-            SendCheck {
-                call_id: call.id,
-                installation: check,
-                definition_sha256: definition,
-                decision,
-            },
-            opened,
-        ))
-    }
-
-    /// A call waiting for approval, checked before the run parks on it: only
-    /// whether its installation is still there and connected counts, so
-    /// nobody is asked about a call that can't be made (decision 0047). Its
-    /// server isn't reached, and its decision stays the one recorded.
-    async fn parking_check(&self, call: &CallRecord) -> Result<SendCheck, &'static str> {
-        let (Some(target), Some(decision)) = (&call.target, &call.decision) else {
-            // A call waiting for approval always has both; the store says so.
-            return Err("run_inconsistent");
-        };
-        let installation = match self.installation(target.installation_id).await? {
-            None => InstallationCheck::Removed,
-            Some(found) if found.status == InstallationStatus::Disconnected => InstallationCheck::Disconnected,
-            Some(_) => InstallationCheck::Usable,
-        };
-        Ok(SendCheck {
-            call_id: call.id,
-            installation,
-            definition_sha256: Some(target.definition_sha256),
-            decision: decision.clone(),
-        })
-    }
-
-    async fn installation(&self, installation_id: InstallationId) -> Result<Option<Installation>, &'static str> {
+    pub(crate) async fn installation(
+        &self,
+        installation_id: InstallationId,
+    ) -> Result<Option<Installation>, &'static str> {
         self.state
             .installations
             .find_installation(self.organization_id, self.workspace_id, installation_id)
@@ -949,42 +1204,6 @@ impl<P: ToolPort> Driver<'_, P> {
         found
             .map(|app| app.map(|app| (app.key, app.name)))
             .map_err(|_| "store_unavailable")
-    }
-
-    /// The policy's view of one call to `tool` through `installation`, read
-    /// now: the grant, the registry and the organization's level.
-    async fn tool_call(&self, installation: &Installation, tool: &str) -> Result<ToolCall, &'static str> {
-        let registered = self.registry(installation).await?;
-        self.tool_call_with(installation, tool, &registered).await
-    }
-
-    async fn tool_call_with(
-        &self,
-        installation: &Installation,
-        tool: &str,
-        registered: &BTreeMap<String, RegisteredTool>,
-    ) -> Result<ToolCall, &'static str> {
-        let grants = match self
-            .state
-            .agents
-            .list_grants(self.organization_id, self.workspace_id, self.agent_id)
-            .await
-        {
-            Ok(grants) => grants,
-            Err(zupflow_core::agents::AgentError::Unavailable) => return Err("store_unavailable"),
-            Err(_) => Vec::new(),
-        };
-        let grant = grants
-            .iter()
-            .find(|grant| grant.installation_id == installation.id && grant.tools.iter().any(|name| name == tool));
-        let levels = self.levels(installation, &[tool.to_owned()]).await;
-        Ok(self.policy_call(
-            installation,
-            tool,
-            grant.map(|grant| grant.approval_required.iter().any(|name| name == tool)),
-            registered.get(tool),
-            &levels,
-        ))
     }
 
     fn policy_call(
@@ -1081,14 +1300,22 @@ impl<P: ToolPort> Driver<'_, P> {
             Err(_) => Levels::Unreadable,
         }
     }
+}
 
-    /// Floor, then policy.
-    async fn decide(&self, call: &ToolCall) -> Decision {
-        match floor(call, self.state.approvals.name()) {
-            Some(decision) => decision,
-            None => self.state.approvals.decide(call).await,
-        }
+/// The arguments the model gave the call at `position` of its answer.
+fn asked_arguments(completion: &zupflow_core::models::Completion, position: u32) -> Map<String, Value> {
+    match &completion.reply {
+        zupflow_core::models::Reply::ToolCalls { calls, .. } => usize::try_from(position)
+            .ok()
+            .and_then(|index| calls.get(index))
+            .map(|call| call.arguments.clone())
+            .unwrap_or_default(),
+        zupflow_core::models::Reply::Text(_) => Map::new(),
     }
+}
+
+fn channel_tool_changes(tool: &str) -> bool {
+    zupflow_core::channels::tools::writes(tool)
 }
 
 /// The floor's answer for a tool no grant names any more.

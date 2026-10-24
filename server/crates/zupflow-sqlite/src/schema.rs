@@ -68,6 +68,7 @@ const TABLES: &[(&str, Scoping)] = &[
     ("run_transitions", Scoping::Workspace),
     ("run_turns", Scoping::Workspace),
     ("run_model_attempts", Scoping::Workspace),
+    ("run_steered_turns", Scoping::Workspace),
     ("run_call_attempts", Scoping::Workspace),
     // An event names its workspace, except the test button's, which has none.
     ("webhook_endpoints", Scoping::Organization),
@@ -80,6 +81,25 @@ const TABLES: &[(&str, Scoping)] = &[
     ("model_connection_credentials", Scoping::Organization),
     ("models", Scoping::Organization),
     ("default_models", Scoping::Organization),
+    // Channels: the organization's tool levels and settings; everything
+    // else is a workspace's. An app names its agent and manager without
+    // referencing them, as history that outlives both.
+    ("channel_tool_levels", Scoping::Organization),
+    ("channel_settings", Scoping::Organization),
+    ("channel_app_managers", Scoping::Workspace),
+    ("channel_app_manager_credentials", Scoping::Workspace),
+    ("channel_apps", Scoping::Workspace),
+    ("channel_app_secrets", Scoping::Workspace),
+    ("channel_inbound_events", Scoping::Workspace),
+    ("channel_connections", Scoping::Workspace),
+    ("channel_connection_credentials", Scoping::Workspace),
+    ("channel_conversations", Scoping::Workspace),
+    ("channel_people", Scoping::Workspace),
+    ("channel_messages", Scoping::Workspace),
+    ("channel_send_slots", Scoping::Workspace),
+    ("agent_channels", Scoping::Workspace),
+    ("channel_sessions", Scoping::Workspace),
+    ("channel_dispatches", Scoping::Workspace),
     // A deleted workspace's events stay in the log.
     ("audit_events", Scoping::History),
 ];
@@ -100,6 +120,15 @@ struct ForeignKey {
 
 /// A database in a directory of its own, removed with everything in it
 /// (the WAL and shared-memory files too) when the test is done.
+/// Whether `table` is declared workspace-scoped; `None` for a name that
+/// isn't a declared table.
+pub(crate) fn workspace_scoped(table: &str) -> Option<bool> {
+    TABLES
+        .iter()
+        .find(|(name, _)| *name == table)
+        .map(|(_, scoping)| matches!(scoping, Scoping::Workspace))
+}
+
 pub(crate) struct Temporary {
     pub(crate) database: Database,
     pub(crate) directory: TemporaryDirectory,
@@ -828,4 +857,194 @@ async fn keeps_tools_through_migration_0033_and_holds_definitions_to_the_ceiling
         insert("over", over).await.is_err(),
         "a definition over the ceiling is refused"
     );
+}
+
+/// Migration 0035 rebuilds `connect_sessions` with foreign keys off: every
+/// session keeps what it held, its authorization in progress stays with it,
+/// the indexes are back, and foreign keys are on again once it's done.
+#[tokio::test]
+async fn keeps_connect_sessions_and_their_authorizations_through_migration_0035() {
+    use std::str::FromStr;
+
+    use sqlx::sqlite::SqliteConnectOptions;
+
+    let directory = TemporaryDirectory::new();
+    let earlier = directory.0.join("migrations");
+    std::fs::create_dir(&earlier).unwrap();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.as_str() < "0035" {
+            std::fs::copy(&path, earlier.join(&name)).unwrap();
+        }
+    }
+    let options = SqliteConnectOptions::from_str("sqlite:")
+        .unwrap()
+        .filename(directory.file())
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+    sqlx::migrate::Migrator::new(earlier.as_path())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    let blob = |n: u8| {
+        let mut id = [0u8; 16];
+        id[15] = n;
+        id.to_vec()
+    };
+    let hash = |n: u8| vec![n; 32];
+    for statement in [
+        "INSERT INTO organizations (id, name, slug, created_at) VALUES (?1, 'Org', 'org', 0)",
+        "INSERT INTO workspaces (id, organization_id, environment, name, slug, created_at) \
+         VALUES (?2, ?1, 'sandbox', 'W', 'w', 0)",
+        "INSERT INTO apps (id, organization_id, kind, name, key, description, icon_glyph, icon_color, auth, tools, \
+         version, created_at, updated_at) \
+         VALUES (?3, ?1, 'mcp', 'T', 'tools', '', 'T', '#0E7490', '{}', '[]', 1, 0, 0)",
+        "INSERT INTO workspace_apps (id, organization_id, workspace_id, kind, name, key, description, icon_glyph, \
+         icon_color, auth, tools, version, created_at, updated_at) \
+         VALUES (?4, ?1, ?2, 'mcp', 'O', 'own', '', 'O', '#0E7490', '{}', '[]', 1, 0, 0)",
+        "INSERT INTO installation_short_ids (id, organization_id, workspace_id, short_id, created_at) \
+         VALUES (?5, ?1, ?2, 'abcdef', 0)",
+        "INSERT INTO installations (id, organization_id, workspace_id, catalog_app_id, short_id, label, status, \
+         configuration_version, granted_scopes, created_at, updated_at) \
+         VALUES (?6, ?1, ?2, ?3, 'abcdef', 'Main', 'connected', 1, '[]', 0, 0)",
+        // A pending session of a catalog app, with its authorization in progress.
+        "INSERT INTO connect_sessions (id, organization_id, workspace_id, environment, catalog_app_id, \
+         configuration_version, intent, label, status, return_url, requested_scopes, reference_hash, created_at, \
+         expires_at, authorization_attempt) \
+         VALUES (?7, ?1, ?2, 'sandbox', ?3, 1, 'create', 'Main', 'pending', 'https://back.example/done', \
+         '[\"read\"]', ?9, 10, 20, 1)",
+        "INSERT INTO connect_authorizations (id, organization_id, workspace_id, session_id, attempt, state_hash, \
+         key_id, wrapped_key, nonce, ciphertext, created_at) \
+         VALUES (?11, ?1, ?2, ?7, 1, ?12, 'k', x'00', x'000000000000000000000000', x'00', 11)",
+        // A completed reconnect of a workspace app's installation, and a failed one.
+        "INSERT INTO connect_sessions (id, organization_id, workspace_id, environment, workspace_app_id, \
+         configuration_version, intent, installation_id, label, status, requested_scopes, reference_hash, \
+         created_at, expires_at, completed_at, failure_code) \
+         VALUES (?8, ?1, ?2, 'sandbox', ?4, 2, 'reconnect', ?6, 'Main', 'completed', '[]', ?10, 30, 40, 35, NULL)",
+        "INSERT INTO connect_sessions (id, organization_id, workspace_id, environment, catalog_app_id, \
+         configuration_version, intent, label, status, requested_scopes, reference_hash, created_at, expires_at, \
+         failure_code) \
+         VALUES (?13, ?1, ?2, 'sandbox', ?3, 1, 'create', 'Late', 'failed', '[]', ?14, 50, 60, 'access_denied')",
+    ] {
+        sqlx::query(statement)
+            .bind(blob(1))
+            .bind(blob(2))
+            .bind(blob(3))
+            .bind(blob(4))
+            .bind(blob(5))
+            .bind(blob(6))
+            .bind(blob(7))
+            .bind(blob(8))
+            .bind(hash(9))
+            .bind(hash(10))
+            .bind(blob(11))
+            .bind(hash(12))
+            .bind(blob(13))
+            .bind(hash(14))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    let before: Vec<SessionRow> = sqlx::query_as(SESSIONS).fetch_all(&pool).await.unwrap();
+    assert_eq!(before.len(), 3);
+    pool.close().await;
+
+    let database = Database::open(&directory.file()).await.unwrap();
+    let pool = database.pool();
+    let after: Vec<SessionRow> = sqlx::query_as(SESSIONS).fetch_all(pool).await.unwrap();
+    assert_eq!(after, before, "every session kept as it was");
+    let targets: Vec<(Option<String>, Option<Vec<u8>>)> =
+        sqlx::query_as("SELECT target_kind, target_app_id FROM connect_sessions ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert!(
+        targets.iter().all(|target| *target == (None, None)),
+        "an app's session has no target"
+    );
+    let authorization: (Vec<u8>, Vec<u8>, i64, Vec<u8>) =
+        sqlx::query_as("SELECT id, session_id, attempt, state_hash FROM connect_authorizations")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        authorization,
+        (blob(11), blob(7), 1, hash(12)),
+        "the authorization in progress stays with its session"
+    );
+    let violations: i64 = sqlx::query_scalar("SELECT count(*) FROM pragma_foreign_key_check")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(violations, 0);
+    let mut indexes: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_index_list('connect_sessions') WHERE origin = 'c'")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    indexes.sort();
+    assert_eq!(
+        indexes,
+        ["connect_sessions_by_workspace", "connect_sessions_pending_expiry"]
+    );
+    // Every connection enforces foreign keys again: holding as many as the
+    // pool opens reaches each.
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let mut connection = pool.acquire().await.unwrap();
+        let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        assert_eq!(enabled, 1);
+        held.push(connection);
+    }
+    drop(held);
+    // The rebuilt table is still the authorization's parent: its session's
+    // authorization goes with it.
+    sqlx::query("DELETE FROM connect_sessions WHERE organization_id = ? AND workspace_id = ? AND id = ?")
+        .bind(blob(1))
+        .bind(blob(2))
+        .bind(blob(7))
+        .execute(pool)
+        .await
+        .unwrap();
+    let authorizations: i64 = sqlx::query_scalar("SELECT count(*) FROM connect_authorizations")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(authorizations, 0, "an authorization goes with its session");
+}
+
+/// Every column a session held before 0035, in order.
+const SESSIONS: &str = "SELECT id, organization_id, workspace_id, environment, catalog_app_id, workspace_app_id, \
+     configuration_version, intent, installation_id, label, status, return_url, requested_scopes, reference_hash, \
+     created_at, expires_at, completed_at, failure_code, authorization_attempt FROM connect_sessions ORDER BY id";
+
+#[derive(Debug, PartialEq, sqlx::FromRow)]
+struct SessionRow {
+    id: Vec<u8>,
+    organization_id: Vec<u8>,
+    workspace_id: Vec<u8>,
+    environment: String,
+    catalog_app_id: Option<Vec<u8>>,
+    workspace_app_id: Option<Vec<u8>>,
+    configuration_version: i64,
+    intent: String,
+    installation_id: Option<Vec<u8>>,
+    label: String,
+    status: String,
+    return_url: Option<String>,
+    requested_scopes: String,
+    reference_hash: Vec<u8>,
+    created_at: i64,
+    expires_at: i64,
+    completed_at: Option<i64>,
+    failure_code: Option<String>,
+    authorization_attempt: i64,
 }

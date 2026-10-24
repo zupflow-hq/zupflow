@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::ids::{AgentId, OrganizationId, WorkspaceId};
 use crate::model_providers::{ProviderKey, ProviderKind};
+use crate::runs::digest::digest_json;
 
 // ---------------------------------------------------------------------------
 // Calling a model
@@ -38,7 +40,7 @@ pub struct ToolSpec {
 }
 
 /// A tool call a model asked for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelToolCall {
     /// The model's own ID for the call, unique in the conversation: what a
     /// tool result answers. Opaque; never shown in the API.
@@ -48,8 +50,10 @@ pub struct ModelToolCall {
     pub arguments: serde_json::Map<String, serde_json::Value>,
 }
 
-/// One message of a conversation with a model.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One message of a conversation with a model. Kept as JSON once a channel
+/// run ends (its transcript), and read back exactly as it was.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
 pub enum Message {
     /// What the run was started with.
     User { text: String },
@@ -68,6 +72,11 @@ pub enum Message {
 }
 
 /// One turn: everything a model is sent.
+///
+/// A run's turns only ever grow at the end: the same model, instructions and
+/// tools (frozen at the run's first model attempt), and the conversation of
+/// the turn before with what came of it after. That keeps every turn's
+/// request a prefix of the next one, which providers cache.
 #[derive(Debug, Clone, Copy)]
 pub struct Turn<'a> {
     /// The provider's own model ID, as the run's model names it.
@@ -76,6 +85,50 @@ pub struct Turn<'a> {
     pub instructions: &'a str,
     pub messages: &'a [Message],
     pub tools: &'a [ToolSpec],
+    /// What a provider that caches prompts by prefix on its own routes the
+    /// turn by, so turns sharing a prefix reach the same cache
+    /// ([`prompt_cache_key`]): never a secret, and the same for every run of
+    /// an agent with the same tools. `None` sends none.
+    pub cache_key: Option<&'a str>,
+}
+
+/// The domain of [`prompt_cache_key`]'s digest.
+pub const PROMPT_CACHE_KEY_DOMAIN: &str = "zupflow.prompt_cache_key.v1";
+
+/// The longest [`prompt_cache_key`]: within what providers take.
+pub const MAX_PROMPT_CACHE_KEY: usize = 64;
+
+/// The prompt cache key of an agent's turns offering `tools`: `zf_` and 32
+/// hex characters of a digest over the organization, the workspace, the
+/// agent and the tools, so every run of the agent with the same tools
+/// shares it, and nothing else does. A digest, so it names nothing the
+/// provider could read; no key, credential or input is in it.
+pub fn prompt_cache_key(
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    agent_id: AgentId,
+    tools: &[ToolSpec],
+) -> String {
+    let tools: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            })
+        })
+        .collect();
+    let digest = digest_json(
+        PROMPT_CACHE_KEY_DOMAIN,
+        &serde_json::json!({
+            "organization_id": organization_id,
+            "workspace_id": workspace_id,
+            "agent_id": agent_id,
+            "tools": tools,
+        }),
+    );
+    format!("zf_{}", &digest.to_hex()[..32])
 }
 
 /// Where a turn goes: the run's connection's provider and its key, opened
@@ -88,10 +141,39 @@ pub struct ProviderAccess<'a> {
 }
 
 /// Tokens a turn took, as the provider counts them.
+///
+/// `input_tokens` is every token the model read, whichever provider: those
+/// it read from the provider's prompt cache and those it wrote to it are
+/// parts of it, never added on top. Anthropic reports the three apart (its
+/// own `input_tokens` is only what's after the last cache breakpoint), so
+/// its adapter adds them up; OpenAI's and OpenRouter's `prompt_tokens`
+/// already count them. Build one with [`TokenUsage::new`], which keeps the
+/// parts within the whole.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// The part of `input_tokens` read from the provider's prompt cache.
+    pub cache_read_input_tokens: u64,
+    /// The part of `input_tokens` written to the provider's prompt cache.
+    /// Providers that cache on their own (OpenAI) report none.
+    pub cache_write_input_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Usage as a provider reported it: `input` in all, `read` of it from
+    /// the cache and `written` to it. Parts a provider reported past the
+    /// whole are cut to fit, so read and written never add up to more than
+    /// the input.
+    pub fn new(input: u64, output: u64, read: u64, written: u64) -> Self {
+        let read = read.min(input);
+        Self {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: read,
+            cache_write_input_tokens: written.min(input - read),
+        }
+    }
 }
 
 /// What a model answered.
@@ -330,6 +412,7 @@ mod tests {
             instructions: "",
             messages,
             tools,
+            cache_key: None,
         })
     }
 
@@ -390,6 +473,7 @@ mod tests {
             instructions: "",
             messages: &messages,
             tools: &[],
+            cache_key: None,
         };
         let answer = |ids: &[&str]| Completion {
             reply: match calls(ids) {
@@ -419,5 +503,63 @@ mod tests {
         };
         assert_eq!(validate_completion(&turn, &named("x".repeat(MAX_CALL_NAME))), Ok(()));
         assert!(validate_completion(&turn, &named("x".repeat(MAX_CALL_NAME + 1))).is_err());
+    }
+
+    #[test]
+    fn keeps_cache_counts_within_the_input() {
+        assert_eq!(
+            TokenUsage::new(100, 7, 60, 30),
+            TokenUsage {
+                input_tokens: 100,
+                output_tokens: 7,
+                cache_read_input_tokens: 60,
+                cache_write_input_tokens: 30,
+            }
+        );
+        let past = TokenUsage::new(100, 7, 90, 30);
+        assert_eq!((past.cache_read_input_tokens, past.cache_write_input_tokens), (90, 10));
+        let over = TokenUsage::new(10, 0, 50, 50);
+        assert_eq!((over.cache_read_input_tokens, over.cache_write_input_tokens), (10, 0));
+    }
+
+    #[test]
+    fn keys_a_prompt_cache_by_agent_and_tools_only() {
+        use crate::ids::{AgentId, OrganizationId, WorkspaceId};
+
+        let (org, ws, agent) = (OrganizationId::generate(), WorkspaceId::generate(), AgentId::generate());
+        let tools = [tool("search")];
+        let key = prompt_cache_key(org, ws, agent, &tools);
+        assert!(
+            key.starts_with("zf_") && key.len() == 35 && key.len() <= MAX_PROMPT_CACHE_KEY,
+            "{key}"
+        );
+        assert!(key[3..].bytes().all(|b| b.is_ascii_hexdigit()), "{key}");
+        assert_eq!(key, prompt_cache_key(org, ws, agent, &tools), "the same every run");
+        for id in [org.to_string(), ws.to_string(), agent.to_string()] {
+            assert!(!key.contains(&id), "names nothing the provider could read");
+        }
+        assert_ne!(
+            key,
+            prompt_cache_key(org, ws, AgentId::generate(), &tools),
+            "another agent"
+        );
+        assert_ne!(
+            key,
+            prompt_cache_key(org, WorkspaceId::generate(), agent, &tools),
+            "another workspace"
+        );
+        assert_ne!(
+            key,
+            prompt_cache_key(OrganizationId::generate(), ws, agent, &tools),
+            "another organization"
+        );
+        assert_ne!(key, prompt_cache_key(org, ws, agent, &[tool("other")]), "other tools");
+        let mut described = tool("search");
+        described.description = "Searches.".to_owned();
+        assert_ne!(
+            key,
+            prompt_cache_key(org, ws, agent, &[described]),
+            "a changed description"
+        );
     }
 }

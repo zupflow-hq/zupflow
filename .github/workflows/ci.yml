@@ -15,7 +15,8 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # The full check and the browser runs take about 25 minutes.
+    timeout-minutes: 40
     steps:
       # The debug builds, the contract fixtures and the browser fill the
       # runner's disk; drop toolchains this job never uses.

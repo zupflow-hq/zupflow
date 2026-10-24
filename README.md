@@ -32,6 +32,8 @@ server/           The Rust backend — a Cargo workspace
   crates/zupflow-mcp/         A minimal MCP client: lists a server's tools through the safe path
   crates/zupflow-providers/   The model provider adapters: OpenAI-compatible chat completions (OpenAI,
                               OpenRouter) and Anthropic Messages, and each provider's model list
+  crates/zupflow-channels/    Channel providers: for now the fake one, which reads deliveries in Slack's
+                              format and signs them as Slack does, with an in-memory team chat for tests
   crates/zupflow-contract/    Development only: the server and fixture the contract suite runs against
   crates/zupflow-taskboard/   Development only: Taskboard, a fake MCP app with its own OAuth, for end-to-end runs
   crates/zupflow-conformance/ The suites every implementation of a trait must pass
@@ -285,6 +287,21 @@ error result flagged as one) is written in each protocol and read back with
 its stop reason and token counts; a Claude model's thinking isn't kept
 between turns.
 
+Each turn's request starts with the one before it exactly (the same tools
+and instructions, then the earlier messages as sent) so providers serve it
+from their prompt cache. Anthropic, and Claude through OpenRouter
+(`anthropic/` models, sent with `text` parts), cache only at breakpoints:
+`cache_control` marks the instructions (the last tool without them), the
+last message and the message before the latest answer, where the turn before
+put its last one (three of the four allowed, five-minute lifetime); through
+OpenRouter tools aren't marked and an empty text isn't either. OpenAI
+and OpenRouter cache on their own and get a `prompt_cache_key`: `zf_` and a
+digest of the organization, workspace, agent and tool list, so an agent's
+runs share it and it names nothing. Token counts keep what a turn read from
+the cache and wrote to it as parts of its input tokens
+(`cache_read_input_tokens`, `cache_write_input_tokens`), on each model
+attempt, turn and run and in usage.
+
 A key is checked by listing models, so it must be allowed to: an OpenAI
 restricted key needs read access to Models (OpenRouter's list is public, so
 its `/api/v1/key` is asked first). OpenAI lists IDs only, so names are made
@@ -336,8 +353,9 @@ longer read: set, it stops startup. For local work and tests,
 `zupflow-basic` (the mock's provider fixtures: any key of the right shape is
 accepted, one containing `invalid` refused) and answers runs with the
 scripted model, which serves every listed model that can call tools and calls
-a tool for each line `call <tool> <json-object>` of a run's input (otherwise
-it answers `You said: …`), so runs are deterministic. Never use it in a
+a tool for each line `call <tool> <json-object>` of a run's input, a line
+`then` starting the next round of calls once the round before is answered
+(otherwise it answers `You said: …`), so runs are deterministic. Never use it in a
 deployment: it turns what a run's input says into tool calls. Any other value
 stops startup; the server logs which applies. `pnpm --filter @zupflow/server
 dev` sets it.
@@ -348,7 +366,12 @@ request as its provider would and answering in its format; it can refuse a
 key, drop a model, fail turns with a status or a timeout, and repeat the key
 it received in everything it answers, which proves the key never reaches a
 run, its events, the audit log, the API or the logs
-(`server/crates/zupflow-server/tests/model_calls.rs`). Live tests against the
+(`server/crates/zupflow-server/tests/model_calls.rs`). It keeps each
+request's bytes, checks breakpoints as each provider does, and fakes each
+provider's prompt cache, so tests check that every turn of a run continues
+the one before and reads it from the cache on every provider path, through
+tool calls, an approval pause, a worker restart, a retry and a key rotation
+(`tests/prompt_cache.rs`); each adapter also has a golden test of its bytes. Live tests against the
 real providers are opt-in: `ZUPFLOW_LIVE_OPENAI_KEY`,
 `ZUPFLOW_LIVE_ANTHROPIC_KEY` or `ZUPFLOW_LIVE_OPENROUTER_KEY` (and optionally
 `ZUPFLOW_LIVE_<KIND>_MODEL`) run the catalog and model suites with
@@ -362,12 +385,19 @@ in the same process takes each run forward as an explicit state machine
 (decision 0046): a pure reducer plans each step from the run as committed,
 the run store commits it in one transaction with its events, webhook
 announcements, audit rows and jobs, and only then does the worker make the
-one call the step allows. Every turn, the model is offered the agent's
-granted tools that neither the floor nor the policy refuses, each named
+one call the step allows. The model is offered the agent's granted tools
+that neither the floor nor the policy refuses, each named
 `<app_key>_<short_id>_<tool_name>` after its app's key and its
 installation's short ID and described with the installation's label
-(`taskboard_k7m2qd_create_task`, decision 0047), frozen for that model
-request; a name the model uses is looked up in that offer, never parsed.
+(`taskboard_k7m2qd_create_task`, decision 0047), read once for the run's
+first model attempt and frozen for the whole run, so every turn offers the
+same list and the provider's prompt cache holds; a name the model uses is
+looked up in that offer, never parsed. A grant narrowed, a policy changed,
+a tool gone or an installation renamed, disconnected or removed meanwhile
+leaves the list as it was: a call to a tool no longer allowed is refused when
+it's decided or sent, one to a tool whose definition changed since (a change
+accepted mid-run) as no longer available in this run, and a tool granted since
+waits for the next run.
 Each call it asks for is decided (floor, then policy) and recorded with its
 policy, mode and rule; allowed calls go only to their own installation's MCP
 server through the safe outbound path, with its credential injected last. A
@@ -424,7 +454,8 @@ failing on the assertion that names it (`cargo test -p zupflow-server --test
 run_faults -- --ignored`), or as a seed in the races' regressions, until the
 change that closes it; none is open today.
 
-Usage is served too: runs, failed runs and tool calls per UTC day in one
+Usage is served too: runs, failed runs, tool calls and tokens (input, output,
+and the input's parts read from and written to a prompt cache) per UTC day in one
 environment (`?environment=`, required; `days` 1 to 90, 14 by default), every
 day listed; an API key reads its own environment's only. A workspace's
 `runs_last_24h` counts the runs started in it in the last 24 hours. Usage
@@ -557,6 +588,105 @@ a listing that repeats the credential is refused. The listing and suggested
 catalog tool levels commit in the same transaction. Jobs wait in the
 database's queue, so a restart picks them up again.
 
+A team's chat reaches a workspace's agents through each agent's app. The
+provider delivers to `POST /channels/inbound/{inbound_ref}`; the timestamp is
+checked before anything is looked up, an unknown reference answers exactly as
+a bad signature does, and only a body signed by that app's own secret is read.
+A delivery may be up to 1 MiB, on that route alone. The delivery is recorded
+once per app, and a new message queues the inbound job in the same
+transaction; the job has a worker loop of its own, so making apps never holds
+it up. The connection knows its own posts by its user or its bot ID, and any
+post with a bot ID is an app's. The job decides who answers (a DM, a mention,
+or a reply in a thread the agent was last addressed in, after the sender
+rules, people of other organizations only when the agent allows them, and
+another agent's message only once its sender recorded how many hops led to
+it, while that's under the limit) and starts a run in the thread's session,
+one at a time. Every run that starts, collected ones included, counts against
+the conversation's breaker in the transaction that starts it. Each run of a
+session continues
+the ones before it byte for byte, so the provider's prompt cache holds across
+runs: the session fixes its model, instructions (a fixed channel preface, then
+the agent's own) and tools when it starts, every message reaches the model
+once (a late job finds its message read), rendered when it's taken in (at most
+8,000 characters a turn), each run's transcript is kept as sent when it ends,
+and the history is trimmed by whole runs, a quarter of its budget (60% of the
+model's context window) at a time, so the cache misses once per trim. Messages that
+arrive mid-run join it at its next turn boundary (`steer`) or wait and start
+one run after it (`collect`). `tests/channel_runs.rs` drives all of it through
+the route with a fake team chat, and `tests/channel_prompt_cache.rs` checks the
+prefix turn by turn on the Anthropic and OpenAI paths.
+
+### Agents in Slack
+
+With `ZUPFLOW_CHANNEL_PROVISIONER=slack`, each agent gets its own Slack app,
+made and kept in step through Slack's manifest API (`zupflow-slack`). Unset,
+nothing is made; `scripted` is a stand-in for local work and tests only.
+
+1. **Give the server a public HTTPS address.** Slack sends each app's events
+   to `{ZUPFLOW_PUBLIC_URL}/channels/inbound/{reference}` and the browser back
+   from its consent page to `{ZUPFLOW_PUBLIC_URL}/connect/oauth/callback`, so
+   with `slack` the server refuses to start unless `ZUPFLOW_PUBLIC_URL` is an
+   `https://` origin, and Slack must be able to reach it. For local work,
+   point any HTTPS tunnel at `127.0.0.1:8080` without rewriting the `Host`
+   header, and set `ZUPFLOW_PUBLIC_URL` to the tunnel's origin; it must stay
+   the same for as long as its apps live, since their manifests name it. With
+   `local` sign-in, the tunnel's host reaches only Slack's inbound endpoint
+   (`/channels/inbound/…`) and the hosted Connect pages, their API and the
+   OAuth callback, which what the request carries authorizes (Slack's
+   signature, the link's reference or `state`), and never as the local owner;
+   every Console and API route stays on loopback. Never use a tunnel that
+   rewrites `Host` (to `127.0.0.1` or `localhost`, say) with `local` sign-in:
+   every request through it would be the owner, so anyone who found its
+   address would have the whole API.
+2. **Generate a configuration token.** A Slack workspace admin opens
+   [api.slack.com/apps](https://api.slack.com/apps), and under *Your App
+   Configuration Tokens* generates one for the workspace. Slack shows an
+   access token (`xoxe.xoxp-…`) and a refresh token (`xoxe-…`).
+3. **Link the team.** Paste both in the Console (*Link a Slack team*) or
+   on a hosted Connect page for a `channel_app_manager` session. The server
+   checks them with Slack, seals them, and from then on rotates them itself, an
+   hour before each pair's 12-hour life ends (at once for a pasted pair, whose
+   age it can't know), one rotation per pair however many workers run. A pair
+   Slack refuses leaves the team `token_expired` (with a
+   `channel_app_manager.status_changed` webhook), and someone pastes a new one.
+4. **Give an agent its app, and install it.** Making the app is a background
+   job, in two steps: the app is made without its events, its secrets
+   stored, and then its events subscribed, since Slack checks the events URL
+   with a request signed by the app's own secret. Installing it is a hosted
+   Connect session (`channel_app`) whose page sends the person to Slack's
+   consent page with the app's own client. The install must be in the team
+   the configuration token belongs to.
+
+Renaming an agent, or changing its description, updates its app's manifest;
+disconnecting revokes its bot token. Deleting the app revokes its bot token
+and then deletes it at Slack with the team's configuration token, so the team
+can't be unlinked until that's done (`409 in_use`); if the team's tokens
+expired, pasting new ones finishes it. A Slack rate limit postpones the job
+for as long as Slack asked, without using an attempt.
+
+Once installed, the app's events arrive at its inbound endpoint, read in
+Slack's terms (`zupflow_slack::SlackChannelProvider`): a mention is read once,
+from its `message` event (its `app_mention` is recorded and nothing more);
+edits and deletions change nothing a model was sent; a message in a channel
+shared with another organization (Slack Connect) is read with its author's
+own team, so it wakes the agent only when the agent allows people of other
+organizations; and any post with a `bot_id` is an app's. Only for a message
+the agent may answer does the inbound job ask Slack about people with
+`users.info`: the author's email when a sender list is checked, and once the
+message wakes the agent, its author and the people it mentions (ten at
+most), so runs read them by name (an ID when Slack can't say). A name, once
+read, is kept; someone Slack doesn't show, and an email a sender list
+matches, are asked about again a day later. A run's answer is posted in its
+thread with `chat.postMessage` by a job of its own, carrying the run's ID, so
+a post whose answer was lost is found before it's sent again; a rate limit is
+waited out for a day after the run at most.
+
+`ZUPFLOW_SLACK_API_URL` points the calls somewhere other than
+`https://slack.com/api` (a stand-in, say); it must be `https://`, and consent
+pages are sent to `/oauth/v2/authorize` at the same origin. Without `slack`,
+deliveries are read by the fake provider, which calls no one, so nothing is
+posted back.
+
 ### The contract suite against the backend
 
 ```bash
@@ -608,6 +738,11 @@ server/target/debug/zupflow-contract-server reset "$fixture_dir/contract.sqlite"
 server/target/debug/zupflow-contract-server serve "$fixture_dir/contract.sqlite" \
   --console http://localhost:5181
 ```
+
+`channel-app-secrets <database> <app>` prints what the channel provider holds
+for one made app (its inbound reference and signing secret), so the suite can
+sign deliveries as the provider would; `pnpm contract:backend` passes it to
+the suite.
 
 `reset` is a development command that replaces that database's fixture,
 never a backend HTTP endpoint. `serve --console` answers CORS for that origin

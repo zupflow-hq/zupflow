@@ -5,7 +5,14 @@
  * after.
  */
 import { TERMINAL_RUN_STATUSES } from "@zupflow/contract";
-import { ENVIRONMENTS, type OrganizationId, ZupflowApiError, type ZupflowClient } from "@zupflow/sdk";
+import {
+  type AgentId,
+  type ChannelAppManagerId,
+  ENVIRONMENTS,
+  type OrganizationId,
+  ZupflowApiError,
+  type ZupflowClient,
+} from "@zupflow/sdk";
 import { expect } from "vitest";
 import { must } from "./fixture";
 import { notServedIn } from "./served";
@@ -72,6 +79,30 @@ export async function loadTenant(
     model: await ifServed(async () => must((await client.models.list(org, { limit: 1 })).items[0], "model")),
     hook: must((await client.webhooks.list(org))[0], "webhook"),
     member: must((await client.members.list(org))[0], "member"),
+    // Channels, where the target serves them: the fixture's linked team, its installed app and connection.
+    channel: await ifServed(async () => {
+      const connection = must(
+        (await client.channelConnections.list(w)).items.find((c) => c.status === "connected"),
+        `channel connection in ${workspaceSlug}`,
+      );
+      const agentId = must(connection.agent_id, "the connection's agent");
+      return {
+        manager: must((await client.channelAppManagers.list(w)).items[0], `channel app manager in ${workspaceSlug}`),
+        app: must(
+          (await client.channelApps.list(w)).items.find((a) => a.id === connection.app_id),
+          `channel app in ${workspaceSlug}`,
+        ),
+        connection,
+        conversation: must(
+          (await client.channelConnections.conversations(w, connection.id)).items[0],
+          `conversation in ${workspaceSlug}`,
+        ),
+        agentChannel: must(
+          (await client.agentChannels.list(w, agentId)).find((c) => c.connection_id === connection.id),
+          `agent channel in ${workspaceSlug}`,
+        ),
+      };
+    }),
   };
 }
 export type Tenant = Awaited<ReturnType<typeof loadTenant>>;
@@ -117,13 +148,212 @@ export async function snapshotOf(client: ZupflowClient, t: Tenant): Promise<stri
     await ifServed(() => client.modelConnections.list(t.org)),
     await ifServed(() => client.models.list(t.org, { limit: 100 })),
     await ifServed(() => Promise.all(ENVIRONMENTS.map((env) => client.models.getDefault(t.org, env)))),
+    await ifServed(() => channelSnapshot(client, t, agents)),
     await client.webhooks.list(t.org),
     await client.audit.list(t.org, { limit: 100 }),
   ]);
 }
 
+/** Everything the tenant's channels hold, as its members read it. */
+async function channelSnapshot(client: ZupflowClient, t: Tenant, agents: { id: AgentId }[]) {
+  const w = t.workspace.id;
+  const connections = (await client.channelConnections.list(w, { limit: 100 })).items;
+  const conversations = await Promise.all(
+    connections.map(async (c) => ({
+      connection: c.id,
+      conversations: await Promise.all(
+        (await client.channelConnections.conversations(w, c.id, { limit: 100 })).items.map(async (conversation) => ({
+          conversation,
+          messages: (await client.channelConnections.messages(w, c.id, conversation.id, { limit: 100 })).items,
+        })),
+      ),
+    })),
+  );
+  return [
+    (await client.channelAppManagers.list(w, { limit: 100 })).items,
+    (await client.channelApps.list(w, { limit: 100 })).items,
+    connections,
+    conversations,
+    await Promise.all(agents.map((a) => client.agentChannels.list(w, a.id))),
+    await client.channelSettings.toolLevels(t.org),
+    await client.channelSettings.get(t.org),
+  ];
+}
+
+/**
+ * What the attacker makes in its own Sandbox before the victim's state is
+ * read, so attempts can pair one of the victim's IDs with one of its own:
+ * a linked team and an agent. Null when the target doesn't serve channels.
+ */
+export interface Prepared {
+  manager: ChannelAppManagerId;
+  agent: AgentId;
+}
+
+async function prepare(r: ZupflowClient, own: Tenant): Promise<Prepared | null> {
+  if (!own.channel) return null;
+  const manager = await r.channelAppManagers.create(own.sandbox.id, {
+    provider: "slack",
+    method: "configuration_token",
+    configuration_token: "xoxe.xoxp-1-attacker-own-0000",
+    refresh_token: "xoxe-1-attacker-own-0000",
+  });
+  const agent = await r.agents.create(own.sandbox.id, { name: "Attacker", description: "", instructions: "" });
+  return { manager: manager.id, agent: agent.id };
+}
+
+/** Channel attempts: the victim's linked team, app, connection, conversation and agent channel. */
+function channelAttempts(
+  r: ZupflowClient,
+  own: Tenant,
+  v: Tenant,
+  prepared: Prepared | null,
+): [string, () => Promise<unknown>][] {
+  const c = v.channel;
+  const mine = own.channel;
+  if (!c || !mine) return [];
+  const w = v.workspace.id;
+  const ow = own.workspace.id;
+  const tokens = { configuration_token: "xoxe.xoxp-1-attacker-0000", refresh_token: "xoxe-1-attacker-0000" };
+  const settings = { ...c.agentChannel, tools: [], approval_required: [], sender_list: [] };
+  const {
+    id: _id,
+    workspace_id: _ws,
+    agent_id: _agent,
+    connection_id: _conn,
+    created_at: _c,
+    updated_at: _u,
+    ...input
+  } = settings;
+  return [
+    ["[victim workspace] list channel app managers", () => r.channelAppManagers.list(w)],
+    [
+      "[victim workspace] link a team",
+      () => r.channelAppManagers.create(w, { provider: "slack", method: "configuration_token", ...tokens }),
+    ],
+    ["[victim workspace] get channel app manager", () => r.channelAppManagers.get(w, c.manager.id)],
+    ["[victim workspace] replace team tokens", () => r.channelAppManagers.update(w, c.manager.id, tokens)],
+    ["[victim workspace] unlink team", () => r.channelAppManagers.delete(w, c.manager.id)],
+    ["[victim workspace] list channel apps", () => r.channelApps.list(w)],
+    [
+      "[victim workspace] add agent to Slack",
+      () => r.channelApps.create(w, { agent_id: v.agent.id, manager_id: c.manager.id }),
+    ],
+    ["[victim workspace] get channel app", () => r.channelApps.get(w, c.app.id)],
+    ["[victim workspace] delete channel app", () => r.channelApps.delete(w, c.app.id)],
+    ["[victim workspace] list channel connections", () => r.channelConnections.list(w)],
+    ["[victim workspace] get channel connection", () => r.channelConnections.get(w, c.connection.id)],
+    [
+      "[victim workspace] rename channel connection",
+      () => r.channelConnections.update(w, c.connection.id, { label: "Owned" }),
+    ],
+    ["[victim workspace] delete channel connection", () => r.channelConnections.delete(w, c.connection.id)],
+    ["[victim workspace] list conversations", () => r.channelConnections.conversations(w, c.connection.id)],
+    ["[victim workspace] list messages", () => r.channelConnections.messages(w, c.connection.id, c.conversation.id)],
+    ["[victim workspace] list agent channels", () => r.agentChannels.list(w, c.agentChannel.agent_id)],
+    [
+      "[victim workspace] set agent channel",
+      () => r.agentChannels.put(w, c.agentChannel.agent_id, c.connection.id, input),
+    ],
+    [
+      "[victim workspace] remove agent channel",
+      () => r.agentChannels.delete(w, c.agentChannel.agent_id, c.connection.id),
+    ],
+    [
+      "[victim workspace] install channel app",
+      () => r.connectSessions.create(w, { target: { kind: "channel_app", app: c.app.id }, return_url: null }),
+    ],
+    ["[victim org] channel tool levels", () => r.channelSettings.toolLevels(v.org)],
+    [
+      "[victim org] set channel tool levels",
+      () =>
+        r.channelSettings.setToolLevels(v.org, {
+          provider: "slack",
+          levels: [{ tool: "delete_message", level: "allow" }],
+        }),
+    ],
+    ["[victim org] channel settings", () => r.channelSettings.get(v.org)],
+    [
+      "[victim org] set channel settings",
+      () =>
+        r.channelSettings.update(v.org, {
+          breaker_runs: 200,
+          breaker_window_minutes: 1,
+          breaker_pause_minutes: 1,
+          message_retention_days: 365,
+        }),
+    ],
+    // The victim's channel IDs, through the attacker's own workspace.
+    ["[own workspace] channel app manager via own workspace", () => r.channelAppManagers.get(ow, c.manager.id)],
+    [
+      "[own workspace] replace victim team tokens",
+      () => r.channelAppManagers.update(own.sandbox.id, c.manager.id, tokens),
+    ],
+    ["[own workspace] unlink victim team", () => r.channelAppManagers.delete(ow, c.manager.id)],
+    ["[own workspace] channel app via own workspace", () => r.channelApps.get(ow, c.app.id)],
+    ["[own workspace] delete victim channel app", () => r.channelApps.delete(ow, c.app.id)],
+    // Through the attacker's Sandbox, so Production's read-only refusal can't answer first. Each of the two
+    // lookups is tried alone: the victim's agent with a team the attacker linked, and the attacker's own agent
+    // with the victim's team, as well as both of the victim's.
+    [
+      "[own workspace] app for victim agent in victim team",
+      () => r.channelApps.create(own.sandbox.id, { agent_id: v.agent.id, manager_id: c.manager.id }),
+    ],
+    ...(prepared
+      ? ([
+          [
+            "[own workspace] app for victim agent in own team",
+            () => r.channelApps.create(own.sandbox.id, { agent_id: v.agent.id, manager_id: prepared.manager }),
+          ],
+          [
+            "[own workspace] app for own agent in victim team",
+            () => r.channelApps.create(own.sandbox.id, { agent_id: prepared.agent, manager_id: c.manager.id }),
+          ],
+        ] as [string, () => Promise<unknown>][])
+      : []),
+    ["[own workspace] channel connection via own workspace", () => r.channelConnections.get(ow, c.connection.id)],
+    [
+      "[own workspace] rename victim channel connection",
+      () => r.channelConnections.update(ow, c.connection.id, { label: "Owned" }),
+    ],
+    ["[own workspace] delete victim channel connection", () => r.channelConnections.delete(ow, c.connection.id)],
+    ["[own workspace] victim conversations", () => r.channelConnections.conversations(ow, c.connection.id)],
+    [
+      "[own workspace] victim messages through own connection",
+      () => r.channelConnections.messages(ow, mine.connection.id, c.conversation.id),
+    ],
+    [
+      "[own workspace] victim messages through victim connection",
+      () => r.channelConnections.messages(ow, c.connection.id, c.conversation.id),
+    ],
+    ["[own workspace] victim agent's channels", () => r.agentChannels.list(ow, c.agentChannel.agent_id)],
+    [
+      "[own workspace] own agent on victim connection",
+      () => r.agentChannels.put(ow, mine.agentChannel.agent_id, c.connection.id, input),
+    ],
+    [
+      "[own workspace] victim agent on own connection",
+      () => r.agentChannels.put(ow, c.agentChannel.agent_id, mine.connection.id, input),
+    ],
+    [
+      "[own workspace] remove victim agent channel",
+      () => r.agentChannels.delete(ow, c.agentChannel.agent_id, c.connection.id),
+    ],
+    [
+      "[own workspace] install victim channel app",
+      () =>
+        r.connectSessions.create(own.sandbox.id, { target: { kind: "channel_app", app: c.app.id }, return_url: null }),
+    ],
+  ];
+}
+
 /** Every route class, aimed at `victim`'s real IDs, directly and through the attacker's own organization. */
-export function attempts(r: ZupflowClient, own: Tenant, victim: Tenant): [string, () => Promise<unknown>][] {
+export function attempts(
+  r: ZupflowClient,
+  own: Tenant,
+  victim: Tenant,
+  prepared: Prepared | null = null,
+): [string, () => Promise<unknown>][] {
   const v = victim;
   const w = v.workspace.id;
   const callId = "call_031DCp7XSYxLgDmAT3Dc7r" as const;
@@ -299,6 +529,7 @@ export function attempts(r: ZupflowClient, own: Tenant, victim: Tenant): [string
     ["[victim org] test webhook", () => r.webhooks.sendTest(v.org, v.hook.id)],
     ["[victim org] delete webhook", () => r.webhooks.delete(v.org, v.hook.id)],
     ...victimModelAttempts,
+    ...channelAttempts(r, own, v, prepared),
     // The victim's child IDs, through the attacker's own organization and workspace.
     ["[own org] org app via own org", () => r.organizationApps.get(own.org, v.orgApp.id)],
     [
@@ -448,8 +679,10 @@ export async function expectSealed(
   victimClient: ZupflowClient,
   { victimOrgPaths = true, sameOrganization = false }: SealOptions = {},
 ) {
+  // The attacker's own objects are made first, so the victim's state is read after them.
+  const prepared = await prepare(attacker, own);
   const before = await snapshotOf(victimClient, victim);
-  for (const [what, attempt] of attempts(attacker, own, victim)) {
+  for (const [what, attempt] of attempts(attacker, own, victim, prepared)) {
     if (!victimOrgPaths && what.startsWith("[victim org]")) continue;
     if (sameOrganization && !what.startsWith("[own workspace]")) continue;
     let answer: string = "succeeded";

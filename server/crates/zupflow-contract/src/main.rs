@@ -15,6 +15,9 @@
 //! zupflow-contract-server reset <database>          restore the reference fixture
 //! zupflow-contract-server expire-connect <database> <organization> <workspace> <session>
 //!                                                   expire one pending session in that exact scope
+//! zupflow-contract-server channel-app-secrets <database> <app>
+//!                                                   what the channel provider holds for a made app, as
+//!                                                   JSON: its inbound reference and signing secret
 //! zupflow-contract-server operations                the operations the API serves, comma-separated
 //! ```
 //!
@@ -30,9 +33,11 @@
 //! opt-in `local-apps` feature, which nothing turns on by default). Without
 //! it, nothing
 //! leaves the machine: the fixture's providers answer from memory, no model
-//! answers runs, and no background work runs.
+//! answers runs, and the only background work is making channel apps with the
+//! scripted provisioner, which reaches nothing.
 
 mod fixture_apps;
+mod fixture_channels;
 mod fixture_models;
 mod fixture_runs;
 mod fixture_webhooks;
@@ -283,6 +288,11 @@ async fn serve(path: &str, serving: Serving) -> Result<(), String> {
         model_store: Arc::new(SqliteModelStore::new(database.clone())),
         model_catalog: Arc::new(ScriptedProviders),
         connect: Arc::new(SqliteConnectStore::new(database.clone())),
+        channels: Arc::new(zupflow_sqlite::SqliteChannelStore::new(database.clone())),
+        channel_provider: std::sync::Arc::new(zupflow_channels::fake::FakeChannelProvider::default()),
+        channel_provisioner: Arc::new(
+            zupflow_basic::scripted_channel_provisioner::ScriptedChannelProvisioner::default(),
+        ),
         jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
         tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),
         cache: Arc::new(zupflow_basic::memory_cache::MemoryCache::default()),
@@ -327,6 +337,12 @@ async fn serve(path: &str, serving: Serving) -> Result<(), String> {
     } else {
         Vec::new()
     };
+    // Apps are made by a job after `202`, with the scripted provisioner,
+    // which reaches nothing, and new messages are answered by theirs: both
+    // workers run in every mode.
+    let mut workers = workers;
+    workers.push(tokio::spawn(zupflow_server::channels::run_worker(state.clone())));
+    workers.push(tokio::spawn(zupflow_server::channel_inbound::run_worker(state.clone())));
     let served = axum::serve(listener, zupflow_server::app(state, guard))
         .await
         .map_err(|error| error.to_string());
@@ -1081,12 +1097,102 @@ async fn reset(path: &str) -> Result<(), String> {
         .await
         .map_err(|error| fail("paused agent")(&error))?;
 
+    // Channels in `acme`, `beta-labs`, `acme-sandbox` and Larkspur's `harbor`,
+    // each for its seeded agent; and in `acme` and `acme-sandbox` an active
+    // agent with no app yet, for the suite to add to a team.
+    for slug in ["acme", "acme-sandbox"] {
+        let (workspace, _) = workspace_id(slug)?;
+        agents
+            .create_agent(
+                northwind.id,
+                workspace,
+                AgentId::generate(),
+                &NewAgent {
+                    name: "Release notes writer".to_owned(),
+                    description: "Not on any channel yet.".to_owned(),
+                    model_id: None,
+                    instructions: "Summarize what changed, briefly.".to_owned(),
+                },
+                &|created: &Agent| {
+                    by_fixture(
+                        AuditAction::AgentCreated,
+                        AuditTarget::new(AuditObject::Agent(created.id), &created.name),
+                        AuditPlace::Workspace(workspace),
+                    )
+                },
+            )
+            .await
+            .map_err(|error| fail("app-less agent")(&error))?;
+    }
+    let channels = zupflow_sqlite::SqliteChannelStore::new(database.clone());
+    for (label, slug, team, people) in [
+        (
+            "Marketing",
+            "acme",
+            ("T0ACME7Q2K", "Acme"),
+            &[
+                ("U0ACME01", "Dana Whitfield", "dana", "dana@acme.example"),
+                ("U0ACME02", "Luis Romero", "luis", "luis@acme.example"),
+            ][..],
+        ),
+        (
+            "Google",
+            "beta-labs",
+            ("T0BETA4M8C", "Beta Labs"),
+            &[("U0BETA01", "Ines Park", "ines", "ines@betalabs.example")][..],
+        ),
+        (
+            "Engineering",
+            "acme-sandbox",
+            ("T0ACMESBX1", "Acme (test)"),
+            &[("U0ASBX01", "Jordan Lee", "jordan", "jordan@northwind.example")][..],
+        ),
+        (
+            "Harbor",
+            "harbor",
+            ("T0HARB0R9Z", "Harbor"),
+            &[("U0HARB01", "Rowan Ellis", "rowan", "rowan@larkspur.example")][..],
+        ),
+    ] {
+        let (_, organization, workspace, _, agent_id) = seeded_agents
+            .iter()
+            .find(|seeded| seeded.0 == label)
+            .copied()
+            .ok_or_else(|| format!("agent of {label}"))?;
+        let (_, environment) = workspace_id(slug)?;
+        let agent = agents
+            .find_agent(organization, workspace, agent_id)
+            .await
+            .map_err(|error| fail(label)(&error))?
+            .ok_or_else(|| format!("agent of {label}"))?;
+        let (editor, linked_by) = if organization == northwind.id {
+            (owner_member.id, owner.id)
+        } else {
+            (outsider_member.id, outsider.id)
+        };
+        fixture_channels::seed(
+            &channels,
+            &sealing,
+            &fixture_channels::Seed {
+                organization_id: organization,
+                workspace_id: workspace,
+                environment,
+                editor,
+                linked_by,
+                agent,
+                team,
+                people,
+            },
+        )
+        .await?;
+    }
+
     // Runs, as the run engine leaves them: a finished one for the agent of
     // `acme`, `beta-labs`, `acme-sandbox`, `qa-playground` and `harbor`, and in `beta-labs` one
     // waiting for approval of `send_email`; `qa-playground` also waits for
     // `echo_write`, giving the shared suite a fixed pending call in each environment.
     // None is queued or running, so
-    // nothing moves on its own (the contract server runs no worker).
+    // nothing moves on its own (without `--local-app`, the contract server runs no run worker).
     let runs = SqliteRunStore::new(database.clone());
     for (label, tool, waiting) in [
         ("Marketing", "search_files", false),
@@ -1207,7 +1313,8 @@ async fn reset(path: &str) -> Result<(), String> {
                 ConnectSessionId::generate(),
                 &NewConnectSession {
                     environment,
-                    app,
+                    app: Some(app),
+                    target: None,
                     configuration_version: 1,
                     intent: ConnectIntent::Create,
                     installation_id: None,
@@ -1424,6 +1531,75 @@ async fn expire_connect_command(path: &str, organization: &str, workspace: &str,
     result
 }
 
+/// What the channel provider holds for a made app: the suite signs its
+/// deliveries with it, as the provider would. Development only: the app's
+/// scope is read by its ID here, which the API never does.
+async fn channel_app_secrets_command(path: &str, app: &str) -> Result<(), String> {
+    use zupflow_core::channels::store::ChannelStore;
+    use zupflow_core::workspaces::WorkspaceStore;
+
+    let app_id = app
+        .parse::<zupflow_core::ids::ChannelAppId>()
+        .map_err(|_| "invalid channel app ID".to_owned())?;
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .busy_timeout(std::time::Duration::from_secs(5));
+    let pool = SqlitePool::connect_with(options)
+        .await
+        .map_err(|_| "can't open existing fixture database".to_owned())?;
+    let scope: Option<(uuid::Uuid, uuid::Uuid)> =
+        sqlx::query_as("SELECT organization_id, workspace_id FROM channel_apps WHERE id = ?")
+            .bind(app_id.uuid())
+            .fetch_optional(&pool)
+            .await
+            .map_err(|_| "can't read the fixture database".to_owned())?;
+    pool.close().await;
+    let (organization_id, workspace_id) = scope
+        .map(|(organization, workspace)| {
+            (
+                OrganizationId::from_uuid(organization),
+                WorkspaceId::from_uuid(workspace),
+            )
+        })
+        .ok_or_else(|| "no such channel app".to_owned())?;
+    let database = open(path).await?;
+    let secret = database
+        .instance_secret("secret_key")
+        .await
+        .map_err(|error| error.to_string())?;
+    let environment = SqliteWorkspaceStore::new(database.clone())
+        .find_workspace(organization_id, workspace_id)
+        .await
+        .map_err(|error| format!("{error:?}"))?
+        .ok_or_else(|| "no such workspace".to_owned())?
+        .environment;
+    let record = zupflow_sqlite::SqliteChannelStore::new(database)
+        .app_secrets(organization_id, workspace_id, app_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "no such channel app".to_owned())?;
+    let sealed = record.secrets.ok_or_else(|| "the app isn't made yet".to_owned())?;
+    let context =
+        EncryptionContext::channel_app_secret(organization_id, workspace_id, environment, app_id, sealed.version);
+    let opened = zupflow_core::keys::open(&LocalKeyService::from_server_secret(&secret), &context, &sealed.sealed)
+        .await
+        .map_err(|error| format!("open: {error:?}"))?;
+    let secrets: Value = serde_json::from_slice(opened.expose()).map_err(|error| error.to_string())?;
+    let signing_secret = secrets
+        .get("signing_secret")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "no signing secret".to_owned())?;
+    #[allow(clippy::print_stdout)]
+    {
+        println!(
+            "{}",
+            json!({ "inbound_ref": record.inbound_ref.expose(), "signing_secret": signing_secret })
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1437,6 +1613,7 @@ async fn main() -> ExitCode {
         ["expire-connect", database, organization, workspace, session] => {
             expire_connect_command(database, organization, workspace, session).await
         }
+        ["channel-app-secrets", database, app] => channel_app_secrets_command(database, app).await,
         ["operations"] => {
             #[allow(clippy::print_stdout)]
             {
@@ -1445,7 +1622,7 @@ async fn main() -> ExitCode {
             Ok(())
         }
         _ => Err(
-            "usage: zupflow-contract-server serve <database> [--console <origin>] [--local-app <host>=<certificate.pem>]... | reset <database> | expire-connect <database> <organization> <workspace> <session> | operations"
+            "usage: zupflow-contract-server serve <database> [--console <origin>] [--local-app <host>=<certificate.pem>]... | reset <database> | expire-connect <database> <organization> <workspace> <session> | channel-app-secrets <database> <app> | operations"
                 .to_owned(),
         ),
     };

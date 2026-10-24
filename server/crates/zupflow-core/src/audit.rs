@@ -23,8 +23,9 @@ use uuid::Uuid;
 
 use crate::environment::Environment;
 use crate::ids::{
-    AgentId, ApiKeyId, AppId, AuditEventId, InstallationId, MemberId, ModelConnectionId, ModelId, OrganizationId,
-    RunId, UserId, WebhookDeliveryId, WebhookEndpointId, WorkspaceId,
+    AgentChannelId, AgentId, ApiKeyId, AppId, AuditEventId, ChannelAppId, ChannelAppManagerId, ChannelConnectionId,
+    InstallationId, MemberId, ModelConnectionId, ModelId, OrganizationId, RunId, UserId, WebhookDeliveryId,
+    WebhookEndpointId, WorkspaceId,
 };
 use crate::time::Timestamp;
 use crate::workspaces::Page;
@@ -134,6 +135,15 @@ pub enum AuditObject {
     ToolPolicy,
     /// An environment's Connect settings, which have no ID.
     ConnectSettings,
+    /// A linked team: how Zupflow makes apps for a workspace's agents there.
+    ChannelAppManager(ChannelAppManagerId),
+    ChannelApp(ChannelAppId),
+    ChannelConnection(ChannelConnectionId),
+    AgentChannel(AgentChannelId),
+    /// The organization's channel tool levels, which have no ID.
+    ChannelToolLevels,
+    /// The organization's channel settings, which have no ID.
+    ChannelSettings,
 }
 
 impl AuditObject {
@@ -155,6 +165,12 @@ impl AuditObject {
             Self::DefaultModel(_) => "default_model",
             Self::ToolPolicy => "tool_policy",
             Self::ConnectSettings => "connect_settings",
+            Self::ChannelAppManager(_) => "channel_app_manager",
+            Self::ChannelApp(_) => "channel_app",
+            Self::ChannelConnection(_) => "channel_connection",
+            Self::AgentChannel(_) => "agent_channel",
+            Self::ChannelToolLevels => "channel_tool_levels",
+            Self::ChannelSettings => "channel_settings",
         }
     }
 
@@ -174,7 +190,11 @@ impl AuditObject {
             Self::ModelConnection(id) => Some(id.uuid()),
             Self::Model(id) => Some(id.uuid()),
             Self::DefaultModel(id) => id.map(|id| id.uuid()),
-            Self::ToolPolicy | Self::ConnectSettings => None,
+            Self::ChannelAppManager(id) => Some(id.uuid()),
+            Self::ChannelApp(id) => Some(id.uuid()),
+            Self::ChannelConnection(id) => Some(id.uuid()),
+            Self::AgentChannel(id) => Some(id.uuid()),
+            Self::ToolPolicy | Self::ConnectSettings | Self::ChannelToolLevels | Self::ChannelSettings => None,
         }
     }
 
@@ -196,6 +216,12 @@ impl AuditObject {
             ("default_model", uuid) => Self::DefaultModel(uuid.map(ModelId::from_uuid)),
             ("tool_policy", None) => Self::ToolPolicy,
             ("connect_settings", None) => Self::ConnectSettings,
+            ("channel_app_manager", Some(uuid)) => Self::ChannelAppManager(ChannelAppManagerId::from_uuid(uuid)),
+            ("channel_app", Some(uuid)) => Self::ChannelApp(ChannelAppId::from_uuid(uuid)),
+            ("channel_connection", Some(uuid)) => Self::ChannelConnection(ChannelConnectionId::from_uuid(uuid)),
+            ("agent_channel", Some(uuid)) => Self::AgentChannel(AgentChannelId::from_uuid(uuid)),
+            ("channel_tool_levels", None) => Self::ChannelToolLevels,
+            ("channel_settings", None) => Self::ChannelSettings,
             _ => return None,
         })
     }
@@ -252,7 +278,14 @@ impl Serialize for AuditTarget {
             AuditObject::ModelConnection(id) => target.serialize_field("id", id)?,
             AuditObject::Model(id) => target.serialize_field("id", id)?,
             AuditObject::DefaultModel(id) => target.serialize_field("id", id)?,
-            AuditObject::ToolPolicy | AuditObject::ConnectSettings => target.serialize_field("id", &None::<()>)?,
+            AuditObject::ChannelAppManager(id) => target.serialize_field("id", id)?,
+            AuditObject::ChannelApp(id) => target.serialize_field("id", id)?,
+            AuditObject::ChannelConnection(id) => target.serialize_field("id", id)?,
+            AuditObject::AgentChannel(id) => target.serialize_field("id", id)?,
+            AuditObject::ToolPolicy
+            | AuditObject::ConnectSettings
+            | AuditObject::ChannelToolLevels
+            | AuditObject::ChannelSettings => target.serialize_field("id", &None::<()>)?,
         }
         target.serialize_field("name", &self.name)?;
         target.end()
@@ -343,6 +376,22 @@ actions! {
     ModelUpdated => "model.updated",
     ModelDeleted => "model.deleted",
     DefaultModelUpdated => "default_model.updated",
+    /// A team linked, from the API or through hosted Connect.
+    ChannelAppManagerCreated => "channel_app_manager.created",
+    /// Its tokens replaced.
+    ChannelAppManagerUpdated => "channel_app_manager.updated",
+    ChannelAppManagerDeleted => "channel_app_manager.deleted",
+    ChannelAppCreated => "channel_app.created",
+    ChannelAppDeleted => "channel_app.deleted",
+    /// An app installed through hosted Connect.
+    ChannelConnectionConnected => "channel_connection.connected",
+    /// Renamed, or its handler set.
+    ChannelConnectionUpdated => "channel_connection.updated",
+    ChannelConnectionDeleted => "channel_connection.deleted",
+    AgentChannelUpdated => "agent_channel.updated",
+    AgentChannelDeleted => "agent_channel.deleted",
+    ChannelToolLevelsUpdated => "channel_tool_levels.updated",
+    ChannelSettingsUpdated => "channel_settings.updated",
 }
 
 impl Serialize for AuditAction {
@@ -506,6 +555,12 @@ mod tests {
             AuditObject::DefaultModel(None),
             AuditObject::ToolPolicy,
             AuditObject::ConnectSettings,
+            AuditObject::ChannelAppManager(ChannelAppManagerId::from_uuid(uuid)),
+            AuditObject::ChannelApp(ChannelAppId::from_uuid(uuid)),
+            AuditObject::ChannelConnection(ChannelConnectionId::from_uuid(uuid)),
+            AuditObject::AgentChannel(AgentChannelId::from_uuid(uuid)),
+            AuditObject::ChannelToolLevels,
+            AuditObject::ChannelSettings,
         ] {
             assert_eq!(AuditObject::from_stored(object.kind(), object.uuid()), Some(object));
         }

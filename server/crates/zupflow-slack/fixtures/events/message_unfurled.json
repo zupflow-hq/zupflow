@@ -1,0 +1,29 @@
+{
+  "team_id": "T0FAKE001",
+  "api_app_id": "A0FAKE00001",
+  "event": {
+    "type": "message",
+    "subtype": "message_changed",
+    "hidden": true,
+    "message": {
+      "type": "message",
+      "user": "U0ALICE01",
+      "text": "See <https://docs.example/start>",
+      "ts": "1760000600.000100",
+      "attachments": [{ "id": 1, "title": "Getting started", "from_url": "https://docs.example/start" }]
+    },
+    "previous_message": {
+      "type": "message",
+      "user": "U0ALICE01",
+      "text": "See <https://docs.example/start>",
+      "ts": "1760000600.000100"
+    },
+    "channel": "C0GENERAL",
+    "ts": "1760000601.000200",
+    "event_ts": "1760000601.000200",
+    "channel_type": "channel"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0UNFURL001",
+  "event_time": 1760000601
+}

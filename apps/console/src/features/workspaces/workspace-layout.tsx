@@ -18,6 +18,7 @@ export function WorkspaceLayout() {
     { label: "Overview", href: base, exact: true },
     { label: "Agents", href: `${base}/agents` },
     { label: "Installations", href: `${base}/installations` },
+    { label: "Channels", href: `${base}/channels` },
     { label: "Runs", href: `${base}/runs` },
     { label: "Apps", href: `${base}/apps` },
     { label: "Connect sessions", href: `${base}/connect-sessions` },

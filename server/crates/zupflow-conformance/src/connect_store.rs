@@ -59,7 +59,8 @@ pub(super) async fn tenant(prepare: &Prepare) -> Tenant {
 pub(super) fn new(app: InstalledApp, reference: &Reference) -> NewConnectSession {
     NewConnectSession {
         environment: Environment::Sandbox,
-        app,
+        app: Some(app),
+        target: None,
         configuration_version: 2,
         intent: ConnectIntent::Create,
         installation_id: None,

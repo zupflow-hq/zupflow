@@ -221,6 +221,7 @@ fn new_run(agent_id: AgentId, input: &str) -> NewRun {
         input: input.to_owned(),
         model: run_model(),
         instructions: "Be brief.".to_owned(),
+        channel: None,
     }
 }
 
@@ -517,6 +518,8 @@ async fn answer_request(
         usage: TokenUsage {
             input_tokens: 10,
             output_tokens: 3,
+            cache_read_input_tokens: 6,
+            cache_write_input_tokens: 2,
         },
     };
     let mut facts = facts(stores, who, Some(epoch));
@@ -1114,7 +1117,7 @@ async fn walks_a_run_through_every_step(stores: &Stores<'_>, a: Tenant, agent_a:
     let target = read.target.as_ref().expect("a target");
     assert_eq!(
         (
-            target.installation_id,
+            target.installation_id.expect("an app tool"),
             target.installation_short_id.as_str(),
             target.app_key.as_str(),
             target.tool.as_str()
@@ -1137,6 +1140,11 @@ async fn walks_a_run_through_every_step(stores: &Stores<'_>, a: Tenant, agent_a:
     );
     let run = stores.runs.find_run(org, a.workspace, at.run).await.unwrap().unwrap();
     assert_eq!((run.usage.input_tokens, run.usage.output_tokens), (10, 3));
+    assert_eq!(
+        (run.usage.cache_read_input_tokens, run.usage.cache_write_input_tokens),
+        (6, 2),
+        "the parts of the input read from and written to the provider's cache"
+    );
 
     // The read: authorized, sent, recorded.
     let send = authorize(stores, at, who, epoch, allow()).await;
@@ -1264,7 +1272,13 @@ async fn walks_a_run_through_every_step(stores: &Stores<'_>, a: Tenant, agent_a:
     );
     assert_eq!(
         done.events[1].data,
-        json!({ "usage": { "input_tokens": 20, "output_tokens": 6, "tool_calls": 2 } }),
+        json!({ "usage": {
+            "input_tokens": 20,
+            "output_tokens": 6,
+            "cache_read_input_tokens": 12,
+            "cache_write_input_tokens": 4,
+            "tool_calls": 2,
+        } }),
         "the run's totals"
     );
     assert_eq!(
@@ -1452,6 +1466,7 @@ async fn refuses_a_stale_or_expired_owner(stores: &Stores<'_>, a: Tenant, agent_
                 request_digest: Sha256Digest::of(b"request"),
                 offer: offer(),
                 key_version: Some(1),
+                steer: None,
             }),
         )
     };
@@ -1564,6 +1579,7 @@ async fn refuses_steps_without_their_guards(stores: &Stores<'_>, a: Tenant, agen
         request_digest: Sha256Digest::of(b"request"),
         offer: offer(),
         key_version: Some(1),
+        steer: None,
     });
     for (guards, why) in [
         (Guards::default(), "a worker's step without its owner"),
@@ -1594,6 +1610,7 @@ async fn refuses_steps_without_their_guards(stores: &Stores<'_>, a: Tenant, agen
             request_digest: Sha256Digest::of(b"request"),
             offer: offer(),
             key_version: Some(1),
+            steer: None,
         }),
     )
     .await;
@@ -3111,7 +3128,7 @@ async fn writes_all_or_nothing(stores: &Stores<'_>, a: Tenant, agent_a: AgentId)
     let redigest = |call: &mut NewCall| {
         let target = call.target.clone().unwrap();
         call.call_digest = Some(call_digest(
-            target.installation_id,
+            target.installation_id.expect("an app tool"),
             &target.app_key,
             &target.tool,
             &target.definition_sha256,
@@ -3120,12 +3137,12 @@ async fn writes_all_or_nothing(stores: &Stores<'_>, a: Tenant, agent_a: AgentId)
     };
     for (operation, why) in [
         (
-            forge(&|call: &mut NewCall| call.target.as_mut().unwrap().installation_id = personal()),
+            forge(&|call: &mut NewCall| call.target.as_mut().unwrap().installation_id = Some(personal())),
             "a call sent to another installation than its name means",
         ),
         (
             forge(&|call: &mut NewCall| {
-                call.target.as_mut().unwrap().installation_id = personal();
+                call.target.as_mut().unwrap().installation_id = Some(personal());
                 redigest(call);
             }),
             "a call sent elsewhere, digested to match",
@@ -3191,6 +3208,7 @@ async fn writes_all_or_nothing(stores: &Stores<'_>, a: Tenant, agent_a: AgentId)
             calls: Vec::<NewCall>::new(),
             next: Continuation::NeedModel { turn: 1 },
             ending: None,
+            silent: None,
         }),
     )
     .await;
@@ -3477,14 +3495,13 @@ async fn counts_usage_per_day(
             UsageDay {
                 day,
                 runs: 2,
-                failed_runs: 0,
-                tool_calls: 0
+                ..UsageDay::default()
             },
             UsageDay {
                 day: day + 2,
                 runs: 1,
                 failed_runs: 1,
-                tool_calls: 0
+                ..UsageDay::default()
             },
         ],
         "runs per UTC day, in order, of the environment's workspaces only; a day without runs left out"

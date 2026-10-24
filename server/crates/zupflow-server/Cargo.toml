@@ -42,16 +42,19 @@ regex = "1"
 url = "2"
 zeroize.workspace = true
 zupflow-basic.workspace = true
+zupflow-channels.workspace = true
 zupflow-core.workspace = true
 zupflow-mcp.workspace = true
 zupflow-oidc.workspace = true
 zupflow-outbound.workspace = true
 zupflow-providers.workspace = true
+zupflow-slack.workspace = true
 zupflow-sqlite = { workspace = true, optional = true }
 
 [dev-dependencies]
 zupflow-basic = { workspace = true, features = ["local-identity"] }
 zupflow-providers = { workspace = true, features = ["fake"] }
+zupflow-slack = { workspace = true, features = ["fake"] }
 zupflow-sqlite.workspace = true
 aws-lc-rs.workspace = true
 jsonwebtoken.workspace = true

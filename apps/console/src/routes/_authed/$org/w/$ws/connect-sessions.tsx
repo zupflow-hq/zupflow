@@ -5,9 +5,13 @@ import { PageContainer, PageHeader, Panel } from "@/components/app/page";
 import { ConnectSessionStatusPill } from "@/components/app/status";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { connectSubject } from "@/features/connect/subject";
 import { useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { useConnectSessions } from "@/features/queries";
 import { shortId } from "@/lib/format";
+
+/** A channel session's icon: it sets up a channel, not an app. */
+const CHANNEL_ICON = { glyph: "#", color: "#64748b" };
 
 export const Route = createFileRoute("/_authed/$org/w/$ws/connect-sessions")({
   staticData: { crumb: "Connect sessions" },
@@ -59,43 +63,48 @@ function ConnectSessionsPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {sessions.data.map((s) => (
-                  <TableRow key={s.id} className="hover:bg-transparent">
-                    <TableCell className="w-full max-w-0 py-3 pl-4">
-                      <div className="flex items-center gap-3">
-                        <AppIcon icon={s.app.icon} size="sm" />
-                        <div className="min-w-0">
-                          <p className="truncate font-medium">
-                            {s.status === "completed" && s.installation_id ? (
-                              <Link
-                                to="/$org/w/$ws/installations/$installationId"
-                                params={{ org: org.slug, ws: ws.id, installationId: s.installation_id }}
-                                className="hover:underline"
-                              >
-                                {s.app.name} · {s.label}
-                              </Link>
-                            ) : (
-                              `${s.app.name} · ${s.label}`
-                            )}
-                          </p>
-                          <p className="font-mono text-xs text-muted-foreground">{shortId(s.id)}</p>
+                {sessions.data.map((s) => {
+                  const appName = connectSubject(s);
+                  return (
+                    <TableRow key={s.id} className="hover:bg-transparent">
+                      <TableCell className="w-full max-w-0 py-3 pl-4">
+                        <div className="flex items-center gap-3">
+                          <AppIcon icon={s.app?.icon ?? CHANNEL_ICON} size="sm" />
+                          <div className="min-w-0">
+                            <p className="truncate font-medium">
+                              {s.status === "completed" && s.installation_id ? (
+                                <Link
+                                  to="/$org/w/$ws/installations/$installationId"
+                                  params={{ org: org.slug, ws: ws.id, installationId: s.installation_id }}
+                                  className="hover:underline"
+                                >
+                                  {appName} · {s.label}
+                                </Link>
+                              ) : (
+                                `${appName} · ${s.label}`
+                              )}
+                            </p>
+                            <p className="font-mono text-xs text-muted-foreground">{shortId(s.id)}</p>
+                          </div>
                         </div>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex flex-col items-start gap-1">
-                        <ConnectSessionStatusPill status={s.status} />
-                        {s.failure_code ? (
-                          <code className="text-[11px] text-muted-foreground">{s.failure_code}</code>
-                        ) : null}
-                      </div>
-                    </TableCell>
-                    <TableCell className="hidden text-muted-foreground capitalize md:table-cell">{s.intent}</TableCell>
-                    <TableCell className="hidden pr-4 text-muted-foreground sm:table-cell">
-                      <RelativeTime iso={s.created_at} />
-                    </TableCell>
-                  </TableRow>
-                ))}
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex flex-col items-start gap-1">
+                          <ConnectSessionStatusPill status={s.status} />
+                          {s.failure_code ? (
+                            <code className="text-[11px] text-muted-foreground">{s.failure_code}</code>
+                          ) : null}
+                        </div>
+                      </TableCell>
+                      <TableCell className="hidden text-muted-foreground capitalize md:table-cell">
+                        {s.intent}
+                      </TableCell>
+                      <TableCell className="hidden pr-4 text-muted-foreground sm:table-cell">
+                        <RelativeTime iso={s.created_at} />
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
           )}

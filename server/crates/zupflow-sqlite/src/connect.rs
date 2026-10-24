@@ -8,12 +8,16 @@ use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 use uuid::Uuid;
 use zupflow_core::audit::Audit;
+use zupflow_core::channels::{ChannelProviderKind, ConnectTarget};
 use zupflow_core::connect::{
     Authorization, Completion, ConnectError, ConnectIntent, ConnectSession, ConnectSessionStatus, ConnectSettings,
     ConnectStore, NewConnectSession, ReferenceHash, SESSION_TTL_MS,
 };
 use zupflow_core::environment::Environment;
-use zupflow_core::ids::{AppId, ConnectSessionId, InstallationId, OrganizationId, WorkspaceId};
+use zupflow_core::ids::{
+    AppId, ChannelAppId, ChannelAppManagerId, ChannelConnectionId, ConnectSessionId, InstallationId, OrganizationId,
+    WorkspaceId,
+};
 use zupflow_core::installations::{Installation, InstallationError, InstalledApp, NewInstallation};
 use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::time::Timestamp;
@@ -49,17 +53,85 @@ macro_rules! columns {
     () => {
         "id, organization_id, workspace_id, environment, catalog_app_id, workspace_app_id, configuration_version, \
          intent, installation_id, label, status, return_url, requested_scopes, created_at, expires_at, \
-         completed_at, failure_code, authorization_attempt"
+         completed_at, failure_code, authorization_attempt, target_kind, target_provider, target_app_id, \
+         target_manager_id, target_connection_id"
     };
 }
 
-fn session_from(row: &SqliteRow) -> Result<ConnectSession, ConnectError> {
+/// The columns, for the channel store's statements on sessions.
+pub(crate) use columns as session_columns;
+
+/// A channel session's target, as its columns hold it.
+fn target_from(row: &SqliteRow) -> Result<Option<ConnectTarget>, ConnectError> {
+    let kind: Option<String> = row.try_get("target_kind").map_err(read)?;
+    let Some(kind) = kind else {
+        return Ok(None);
+    };
+    let provider: Option<String> = row.try_get("target_provider").map_err(read)?;
+    let provider = provider
+        .as_deref()
+        .and_then(ChannelProviderKind::parse)
+        .ok_or_else(|| read("a target of no known provider"))?;
+    let app: Option<Uuid> = row.try_get("target_app_id").map_err(read)?;
+    let manager: Option<Uuid> = row.try_get("target_manager_id").map_err(read)?;
+    let connection: Option<Uuid> = row.try_get("target_connection_id").map_err(read)?;
+    match kind.as_str() {
+        "channel_app_manager" => Ok(Some(ConnectTarget::ChannelAppManager {
+            provider,
+            manager: manager.map(ChannelAppManagerId::from_uuid),
+        })),
+        "channel_app" => Ok(Some(ConnectTarget::ChannelApp {
+            provider,
+            app: ChannelAppId::from_uuid(app.ok_or_else(|| read("an app's target with no app"))?),
+            connection: connection.map(ChannelConnectionId::from_uuid),
+        })),
+        _ => Err(read("an unknown target")),
+    }
+}
+
+/// A target's columns: kind, provider, app, manager, connection.
+type TargetColumns = (
+    Option<&'static str>,
+    Option<&'static str>,
+    Option<Uuid>,
+    Option<Uuid>,
+    Option<Uuid>,
+);
+
+/// A target as its columns store it.
+pub(crate) fn target_columns(target: Option<&ConnectTarget>) -> TargetColumns {
+    match target {
+        None => (None, None, None, None, None),
+        Some(ConnectTarget::ChannelAppManager { provider, manager }) => (
+            Some("channel_app_manager"),
+            Some(provider.as_str()),
+            None,
+            manager.map(|id| id.uuid()),
+            None,
+        ),
+        Some(ConnectTarget::ChannelApp {
+            provider,
+            app,
+            connection,
+        }) => (
+            Some("channel_app"),
+            Some(provider.as_str()),
+            Some(app.uuid()),
+            None,
+            connection.map(|id| id.uuid()),
+        ),
+    }
+}
+
+pub(crate) fn session_from(row: &SqliteRow) -> Result<ConnectSession, ConnectError> {
     let catalog: Option<Uuid> = row.try_get("catalog_app_id").map_err(read)?;
     let own: Option<Uuid> = row.try_get("workspace_app_id").map_err(read)?;
-    let app = match (catalog, own) {
-        (Some(id), None) => InstalledApp::Catalog(AppId::from_uuid(id)),
-        (None, Some(id)) => InstalledApp::Workspace(AppId::from_uuid(id)),
-        _ => return Err(read("a session of no app, or of two")),
+    let target = target_from(row)?;
+    let app = match (catalog, own, &target) {
+        (Some(id), None, None) => Some(InstalledApp::Catalog(AppId::from_uuid(id))),
+        (None, Some(id), None) => Some(InstalledApp::Workspace(AppId::from_uuid(id))),
+        (None, None, Some(_)) => None,
+        _ => return Err(read("a session of no app or target, or of two")),
     };
     let text = |column: &str| -> Result<String, ConnectError> { row.try_get(column).map_err(read) };
     let version: i64 = row.try_get("configuration_version").map_err(read)?;
@@ -72,6 +144,7 @@ fn session_from(row: &SqliteRow) -> Result<ConnectSession, ConnectError> {
         workspace_id: WorkspaceId::from_uuid(row.try_get("workspace_id").map_err(read)?),
         environment: Environment::parse(&text("environment")?).ok_or_else(|| read("an unknown environment"))?,
         app,
+        target,
         configuration_version: u32::try_from(version).map_err(read)?,
         intent: ConnectIntent::parse(&text("intent")?).ok_or_else(|| read("an unknown intent"))?,
         installation_id: installation.map(InstallationId::from_uuid),
@@ -107,7 +180,7 @@ async fn forget_authorization(
 }
 
 /// A terminal session exposes a result installation only after completion.
-async fn record_outcome(
+pub(crate) async fn record_outcome(
     transaction: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     organization_id: OrganizationId,
     workspace_id: WorkspaceId,
@@ -127,6 +200,7 @@ async fn record_outcome(
         serde_json::json!({
             "object": "connect_session", "id": session.id, "status": session.status,
             "installation_id": if completed { session.installation_id } else { None },
+            "target": session.target,
             "failure_code": session.failure_code,
         }),
         at,
@@ -226,9 +300,19 @@ impl ConnectStore for SqliteConnectStore {
         now: Timestamp,
     ) -> Result<ConnectSession, ConnectError> {
         let (catalog_app_id, workspace_app_id) = match session.app {
-            InstalledApp::Catalog(id) => (Some(id.uuid()), None),
-            InstalledApp::Workspace(id) => (None, Some(id.uuid())),
+            Some(InstalledApp::Catalog(id)) => (Some(id.uuid()), None),
+            Some(InstalledApp::Workspace(id)) => (None, Some(id.uuid())),
+            None => (None, None),
         };
+        let (target_kind, target_provider, target_app_id, target_manager_id, target_connection_id) =
+            target_columns(session.target.as_ref());
+        // A new channel session names nothing it made yet.
+        if session.app.is_some() == session.target.is_some()
+            || target_manager_id.is_some()
+            || target_connection_id.is_some()
+        {
+            return Err(read("a new session names one app or one fresh target"));
+        }
         let scopes = serde_json::to_string(&session.requested_scopes).map_err(read)?;
         let expires_at = Timestamp::from_millis(now.millis() + SESSION_TTL_MS);
         // The scope is bound from the trust context; the workspace row only has
@@ -236,9 +320,11 @@ impl ConnectStore for SqliteConnectStore {
         let inserted = sqlx::query(
             "INSERT INTO connect_sessions (id, organization_id, workspace_id, environment, catalog_app_id, \
              workspace_app_id, configuration_version, intent, installation_id, label, status, return_url, \
-             requested_scopes, reference_hash, created_at, expires_at) \
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ? \
-             FROM workspaces WHERE organization_id = ? AND id = ? AND environment = ?",
+             requested_scopes, reference_hash, created_at, expires_at, target_kind, target_provider, target_app_id) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ? \
+             FROM workspaces WHERE organization_id = ? AND id = ? AND environment = ? \
+             AND (? IS NULL OR EXISTS (SELECT 1 FROM channel_apps a WHERE a.organization_id = workspaces.organization_id \
+             AND a.workspace_id = workspaces.id AND a.id = ? AND a.status <> 'deleted'))",
         )
         .bind(session_id.uuid())
         .bind(organization_id.uuid())
@@ -255,9 +341,14 @@ impl ConnectStore for SqliteConnectStore {
         .bind(session.reference_hash.0.as_slice())
         .bind(now.millis())
         .bind(expires_at.millis())
+        .bind(target_kind)
+        .bind(target_provider)
+        .bind(target_app_id)
         .bind(organization_id.uuid())
         .bind(workspace_id.uuid())
         .bind(session.environment.as_str())
+        .bind(target_app_id)
+        .bind(target_app_id)
         .execute(self.database.pool())
         .await
         .map_err(failed("create_session"))?;
@@ -270,6 +361,7 @@ impl ConnectStore for SqliteConnectStore {
             workspace_id,
             environment: session.environment,
             app: session.app,
+            target: session.target,
             configuration_version: session.configuration_version,
             intent: session.intent,
             installation_id: session.installation_id,
@@ -372,10 +464,14 @@ impl ConnectStore for SqliteConnectStore {
         if session.status_at(now) != ConnectSessionStatus::Pending {
             return Err(ConnectError::NotPending);
         }
+        // Only an app's session completes with an installation; a channel's completes through the channel store.
+        let Some(app) = session.app else {
+            return Err(ConnectError::NotFound);
+        };
         let installation = match session.intent {
             ConnectIntent::Create => {
                 let installation = NewInstallation {
-                    app: session.app,
+                    app,
                     label: session.label.clone(),
                     configuration_version: completion.configuration_version,
                     account: completion.account.clone(),
@@ -885,7 +981,8 @@ mod tests {
         let now = Timestamp::now();
         let input = NewConnectSession {
             environment: Environment::Sandbox,
-            app: InstalledApp::Catalog(t.catalog_app),
+            app: Some(InstalledApp::Catalog(t.catalog_app)),
+            target: None,
             configuration_version: 1,
             intent: ConnectIntent::Create,
             installation_id: None,

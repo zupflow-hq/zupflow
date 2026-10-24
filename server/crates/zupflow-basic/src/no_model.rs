@@ -34,6 +34,7 @@ mod tests {
             instructions: "",
             messages: &messages,
             tools: &[],
+            cache_key: None,
         };
         let key = zupflow_core::model_providers::ProviderKey::new("sk-test-long-suite-0000-xx".to_owned());
         let access = ProviderAccess {

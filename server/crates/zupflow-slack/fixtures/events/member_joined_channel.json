@@ -1,0 +1,17 @@
+{
+  "team_id": "T0FAKE001",
+  "api_app_id": "A0FAKE00001",
+  "event": {
+    "type": "member_joined_channel",
+    "user": "UBOT00001",
+    "channel": "C0PRIVATE",
+    "channel_type": "G",
+    "team": "T0FAKE001",
+    "inviter": "U0ALICE01",
+    "event_ts": "1760000900.000100"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0MEMBER001",
+  "event_time": 1760000900,
+  "is_ext_shared_channel": true
+}

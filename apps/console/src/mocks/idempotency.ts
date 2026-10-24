@@ -105,8 +105,9 @@ export async function idempotently(request: Request, params: Params, handle: () 
   const path = url.pathname.slice(Math.max(0, url.pathname.indexOf("/v1/")));
   const route = request.method === "POST" ? matchRoute("POST", path) : undefined;
   const key = request.headers.get(IDEMPOTENCY_HEADER);
-  // Mock-only routes have no contract entry, and a request without a key just runs.
-  if (!route || key === null) return handle();
+  // Mock-only routes have no contract entry, a provider's callback is keyed by its own event ID, and a
+  // request without a key just runs.
+  if (!route || key === null || route.callers.includes("provider")) return handle();
 
   const scope = await scopeOf(route, request, params);
   if (!IDEMPOTENCY_KEY_PATTERN.test(key)) {

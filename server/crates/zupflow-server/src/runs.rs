@@ -74,6 +74,8 @@ struct RunView {
     agent_name: String,
     session_id: SessionId,
     trigger: &'static str,
+    /// Where a channel run came from; null for any other.
+    channel: Option<zupflow_core::runs::RunChannel>,
     status: &'static str,
     input: String,
     output: Option<String>,
@@ -92,6 +94,7 @@ fn run_view(run: Run) -> RunView {
         agent_name: run.agent_name.unwrap_or_else(|| DELETED_AGENT.to_owned()),
         session_id: run.session_id,
         trigger: run.trigger.as_str(),
+        channel: run.channel,
         status: run.status.as_str(),
         input: run.input,
         output: run.output,
@@ -410,6 +413,38 @@ struct UsageCounts {
     runs: u64,
     failed_runs: u64,
     tool_calls: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_write_input_tokens: u64,
+}
+
+impl UsageCounts {
+    fn of(day: &zupflow_core::runs::UsageDay) -> Self {
+        Self {
+            runs: day.runs,
+            failed_runs: day.failed_runs,
+            tool_calls: day.tool_calls,
+            input_tokens: day.input_tokens,
+            output_tokens: day.output_tokens,
+            cache_read_input_tokens: day.cache_read_input_tokens,
+            cache_write_input_tokens: day.cache_write_input_tokens,
+        }
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.runs = self.runs.saturating_add(other.runs);
+        self.failed_runs = self.failed_runs.saturating_add(other.failed_runs);
+        self.tool_calls = self.tool_calls.saturating_add(other.tool_calls);
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_add(other.cache_read_input_tokens);
+        self.cache_write_input_tokens = self
+            .cache_write_input_tokens
+            .saturating_add(other.cache_write_input_tokens);
+    }
 }
 
 #[derive(Serialize)]
@@ -431,7 +466,7 @@ struct UsageReport {
 const MAX_USAGE_DAYS: i64 = 90;
 const USAGE_DAYS: i64 = 14;
 
-/// Runs, failed runs and tool calls per UTC day in one environment: the last
+/// Runs, failed runs, tool calls and tokens per UTC day in one environment: the last
 /// `days` days, today included, each listed even when it had no runs. Every
 /// member reads it; an API key, its own environment's only.
 async fn get_usage(
@@ -452,7 +487,7 @@ async fn get_usage(
         return Err(environment_mismatch());
     }
     let days = clamped_int(query.get("days").map(String::as_str), USAGE_DAYS, MAX_USAGE_DAYS);
-    let today = day_of(Timestamp::now());
+    let today = day_of(state.clock.now());
     let first = today - (days - 1);
     let counted = state
         .runs
@@ -469,14 +504,8 @@ async fn get_usage(
         let counts = counted
             .iter()
             .find(|counted| counted.day == day)
-            .map_or_else(UsageCounts::default, |counted| UsageCounts {
-                runs: counted.runs,
-                failed_runs: counted.failed_runs,
-                tool_calls: counted.tool_calls,
-            });
-        totals.runs += counts.runs;
-        totals.failed_runs += counts.failed_runs;
-        totals.tool_calls += counts.tool_calls;
+            .map_or_else(UsageCounts::default, UsageCounts::of);
+        totals.add(&counts);
         let date = Timestamp::from_millis(day * 86_400_000).to_string();
         list.push(UsageDayView {
             date: date[..10].to_owned(),
@@ -638,6 +667,7 @@ async fn start_run(
             input,
             model,
             instructions: agent.instructions,
+            channel: None,
         },
     );
     let receipt = match state

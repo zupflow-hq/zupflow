@@ -1,0 +1,29 @@
+{
+  "token": "ZZZZZZWSxiZZZ2yIvs3peJ",
+  "team_id": "T0FAKE001",
+  "api_app_id": "A0FAKE00001",
+  "event": {
+    "type": "app_mention",
+    "client_msg_id": "1c5bd0d9-6d2a-4f7a-9cc2-1f2b6a0f7b1e",
+    "user": "U0ALICE01",
+    "text": "<@UBOT00001> can you summarize <#C0GENERAL|general> for <@U0BOB0002>?",
+    "ts": "1760000100.000200",
+    "team": "T0FAKE001",
+    "channel": "C0GENERAL",
+    "event_ts": "1760000100.000200"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0MENTION01",
+  "event_time": 1760000100,
+  "authorizations": [
+    {
+      "enterprise_id": null,
+      "team_id": "T0FAKE001",
+      "user_id": "UBOT00001",
+      "is_bot": true,
+      "is_enterprise_install": false
+    }
+  ],
+  "is_ext_shared_channel": false,
+  "event_context": "4-eyJldCI6ImFwcF9tZW50aW9uIn0"
+}

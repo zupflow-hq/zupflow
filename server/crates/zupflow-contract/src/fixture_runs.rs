@@ -148,6 +148,7 @@ pub async fn seed(
             input: format!("Use {tool} to find this week's open items."),
             model,
             instructions: "Be brief.".to_owned(),
+            channel: None,
         },
     );
     runs.apply(organization_id, workspace_id, &admission)
@@ -210,10 +211,8 @@ pub async fn seed(
                     arguments,
                 }],
             },
-            TokenUsage {
-                input_tokens: 420,
-                output_tokens: 18,
-            },
+            // Read from and written to the provider's prompt cache.
+            TokenUsage::new(420, 18, 0, 400),
             &decision,
         )
         .await?;
@@ -269,10 +268,8 @@ pub async fn seed(
         .answer(
             &built.offer,
             Reply::Text(format!("{tool}: 3 open items")),
-            TokenUsage {
-                input_tokens: 510,
-                output_tokens: 12,
-            },
+            // Read from and written to the provider's prompt cache.
+            TokenUsage::new(510, 12, 400, 90),
             &decision,
         )
         .await

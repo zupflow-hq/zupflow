@@ -57,7 +57,7 @@ export function RunTable({
                     {shortId(run.id)}
                     {run.workspace ? <span className="@2xl:hidden"> · {run.workspace.name}</span> : null}
                     {showAgent ? <span className="@2xl:hidden"> · {run.agent_name}</span> : null}
-                    {run.trigger === "console" ? " · console" : ""}
+                    {run.trigger === "console" ? " · console" : run.trigger === "channel" ? " · channel" : ""}
                   </p>
                 </TableCell>
                 {showWorkspace ? (

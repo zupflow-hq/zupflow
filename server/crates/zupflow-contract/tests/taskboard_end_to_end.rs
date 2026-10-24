@@ -2117,7 +2117,7 @@ async fn connect_lifecycle_delivers_signed_immutable_outcomes() {
             .unwrap();
         assert_eq!(
             event["data"],
-            json!({ "object": "connect_session", "id": session["id"], "status": "completed", "installation_id": installation, "failure_code": null })
+            json!({ "object": "connect_session", "id": session["id"], "status": "completed", "installation_id": installation, "target": null, "failure_code": null })
         );
     }
     for (session, status, failure) in [
@@ -2130,7 +2130,7 @@ async fn connect_lifecycle_delivers_signed_immutable_outcomes() {
             .unwrap();
         assert_eq!(
             event["data"],
-            json!({ "object": "connect_session", "id": session["id"], "status": status, "installation_id": null, "failure_code": failure })
+            json!({ "object": "connect_session", "id": session["id"], "status": status, "installation_id": null, "target": null, "failure_code": failure })
         );
     }
     assert_eq!(

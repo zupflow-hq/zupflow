@@ -90,6 +90,18 @@ kinds! {
     ModelConnection, ModelConnectionId => "model_connection", "mcn";
     /// A model an organization added from one of its model connections.
     Model, ModelId => "model", "mdl";
+    /// How Zupflow makes apps for a workspace's agents in one channel team.
+    ChannelAppManager, ChannelAppManagerId => "channel_app_manager", "chmgr";
+    /// One agent's generated app in one channel team.
+    ChannelApp, ChannelAppId => "channel_app", "chapp";
+    /// An installed channel app: one team, one identity, one agent.
+    ChannelConnection, ChannelConnectionId => "channel_connection", "chcon";
+    /// An agent's settings on one of its own channel connections.
+    AgentChannel, AgentChannelId => "agent_channel", "agch";
+    ChannelConversation, ChannelConversationId => "channel_conversation", "conv";
+    ChannelMessage, ChannelMessageId => "channel_message", "chmsg";
+    /// Someone a channel connection has seen write.
+    ChannelPerson, ChannelPersonId => "channel_person", "person";
 }
 
 /// An object's identifier, typed by its kind.

@@ -4,9 +4,14 @@ import { WEBHOOK_DELIVERY_TYPES, WEBHOOK_EVENT_TYPES, WebhookEvent } from "./sch
 /** Every key an event's `data` may carry, per object: what routes it, never content. */
 const ALLOWED_DATA: Record<string, readonly string[]> = {
   installation: ["object", "id", "app_id", "status"],
-  connect_session: ["object", "id", "status", "installation_id", "failure_code"],
+  connect_session: ["object", "id", "status", "installation_id", "target", "failure_code"],
   run: ["object", "id", "agent_id", "status"],
   webhook_endpoint: ["object", "id"],
+  channel_message: ["object", "id", "connection_id", "conversation_id"],
+  channel_app_manager: ["object", "id", "status"],
+  channel_app: ["object", "id", "agent_id", "status"],
+  channel_connection: ["object", "id", "app_id", "status"],
+  channel_conversation: ["object", "id", "connection_id", "paused_until"],
 };
 
 describe("webhook events", () => {

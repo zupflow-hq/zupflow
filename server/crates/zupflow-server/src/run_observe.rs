@@ -26,7 +26,7 @@ use zupflow_core::environment::Environment;
 use zupflow_core::ids::{OrganizationId, RunId, ToolCallId, WorkspaceId};
 use zupflow_core::metrics::{Measurement, ToolCallOutcome};
 use zupflow_core::runs::RunEventType;
-use zupflow_core::runs::reducer::SendRequest;
+use zupflow_core::runs::reducer::{ChannelSendRequest, SendRequest};
 use zupflow_core::runs::store::Receipt;
 use zupflow_core::runs::transition::{
     Authorization, Operation, RunEnding, SendOutcome, TransitionRequest, YieldReason,
@@ -117,6 +117,54 @@ pub async fn sent(
         .await;
 }
 
+/// After a channel call came back to its sender: as [`sent`], naming the
+/// run's connection.
+#[allow(clippy::too_many_arguments)]
+pub async fn channel_sent(
+    state: &AppState,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    environment: Environment,
+    run_id: RunId,
+    send: &ChannelSendRequest,
+    outcome: &SendOutcome,
+    latency: Duration,
+) {
+    let kind = outcome_kind(outcome);
+    let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
+    macro_rules! line {
+        ($macro:ident) => {
+            tracing::$macro!(
+                event = "runs.call_answered",
+                %organization_id,
+                %workspace_id,
+                %environment,
+                %run_id,
+                call_id = %send.call_id,
+                attempt = send.attempt,
+                channel_connection_id = %send.connection_id,
+                tool = %send.tool,
+                outcome = kind.as_str(),
+                latency_ms,
+            )
+        };
+    }
+    if kind.is_failure() {
+        line!(warn);
+    } else {
+        line!(info);
+    }
+    state
+        .metrics
+        .record(
+            organization_id,
+            workspace_id,
+            environment,
+            Measurement::ToolCall { outcome: kind, latency },
+        )
+        .await;
+}
+
 /// How a send came back, as a metric's label names it.
 pub fn outcome_kind(outcome: &SendOutcome) -> ToolCallOutcome {
     match outcome {
@@ -127,6 +175,7 @@ pub fn outcome_kind(outcome: &SendOutcome) -> ToolCallOutcome {
         SendOutcome::Withheld => ToolCallOutcome::Withheld,
         SendOutcome::Unknown => ToolCallOutcome::Unknown,
         SendOutcome::Unauthorized => ToolCallOutcome::Unauthorized,
+        SendOutcome::Refused { .. } => ToolCallOutcome::Rejected,
     }
 }
 

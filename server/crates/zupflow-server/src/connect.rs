@@ -23,6 +23,7 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 use zupflow_core::apps::{App, AuthTemplate, Configuration, ConfigurationStatus, TokenInput, TokenPlacement};
 use zupflow_core::audit::{AuditAction, AuditActor, AuditEntry, AuditPlace, AuditTarget};
+use zupflow_core::channels::ConnectTarget;
 use zupflow_core::connect::{
     Completion, ConnectError, ConnectIntent, ConnectSession, ConnectSessionStatus, ConnectSettings, NewConnectSession,
     Reference, ReferenceHash,
@@ -306,11 +307,14 @@ async fn update_settings(
 
 /// The contract's `ConnectSession`, and with `url` its `CreatedConnectSession`.
 #[derive(Serialize)]
-struct SessionView {
+pub(crate) struct SessionView {
     id: ConnectSessionId,
     workspace_id: WorkspaceId,
     environment: Environment,
-    app: InstallationAppView,
+    /// The app an app's session connects; null for a channel session.
+    app: Option<InstallationAppView>,
+    /// What a channel session sets up; null for an app's session.
+    target: Option<ConnectTarget>,
     intent: ConnectIntent,
     installation_id: Option<InstallationId>,
     label: String,
@@ -328,9 +332,12 @@ struct SessionView {
     url: Option<String>,
 }
 
-/// A session's app, read in the session's own scope.
-async fn app_of(state: &AppState, session: &ConnectSession) -> Result<App, Failure> {
-    let app = match session.app {
+/// A session's app, read in the session's own scope; `None` for a channel session.
+async fn app_of(state: &AppState, session: &ConnectSession) -> Result<Option<App>, Failure> {
+    let Some(installed) = session.app else {
+        return Ok(None);
+    };
+    let app = match installed {
         InstalledApp::Catalog(id) => state.apps.find_organization_app(session.organization_id, id).await,
         InstalledApp::Workspace(id) => {
             state
@@ -340,7 +347,7 @@ async fn app_of(state: &AppState, session: &ConnectSession) -> Result<App, Failu
         }
     }
     .map_err(app_failure)?;
-    app.ok_or_else(|| {
+    app.map(Some).ok_or_else(|| {
         tracing::error!(event = "connect.app_missing", session_id = %session.id);
         Failure(ApiError::internal())
     })
@@ -368,7 +375,7 @@ pub(crate) async fn expected_account(
     Ok(installation.and_then(|installation| installation.connection.map(|connection| connection.account)))
 }
 
-async fn session_view(
+pub(crate) async fn session_view(
     state: &AppState,
     session: ConnectSession,
     hosted: bool,
@@ -380,7 +387,11 @@ async fn session_view(
         id: session.id,
         workspace_id: session.workspace_id,
         environment: session.environment,
-        app: installation_app_view(&app, session.app),
+        app: app
+            .as_ref()
+            .zip(session.app)
+            .map(|(app, installed)| installation_app_view(app, installed)),
+        target: session.target,
         intent: session.intent,
         installation_id: session.installation_id,
         label: session.label.clone(),
@@ -390,7 +401,7 @@ async fn session_view(
         expires_at: session.expires_at,
         completed_at: session.completed_at,
         failure_code: session.failure_code.clone(),
-        auth: hosted.then(|| app.auth.clone()),
+        auth: app.filter(|_| hosted).map(|app| app.auth),
         requested_scopes: session.requested_scopes.clone(),
         expected_account,
         url,
@@ -526,6 +537,10 @@ async fn create_session(
         .into());
     }
     let body = body.object()?;
+    if body.0.contains_key("target") {
+        // A channel session: it links a team, or installs an agent's app.
+        return crate::channels::create_channel_session(&state, &access, &body).await;
+    }
     let mut fields = Fields::default();
     let app_id = body.string("app_id", &mut fields);
     let intent = body.string("intent", &mut fields).and_then(|value| {
@@ -628,24 +643,7 @@ async fn create_session(
             (Some(installation_id), existing.label)
         }
     };
-    if let Some(url) = &return_url {
-        let settings = state
-            .connect
-            .find_settings(organization_id, workspace.environment)
-            .await
-            .map_err(connect_failure)?;
-        if !settings.return_urls.contains(url) {
-            let mut error = ApiError::new(422, "return_url_not_allowed", "That return URL isn't on the allowlist.");
-            error.fields = Some(
-                [(
-                    "return_url".to_owned(),
-                    format!("Add it to the {} return URLs first.", workspace.environment.as_str()),
-                )]
-                .into(),
-            );
-            return Err(error.into());
-        }
-    }
+    allowed_return_url(&state, &access, return_url.as_deref()).await?;
     let reference = Reference::generate().map_err(connect_failure)?;
     let session = state
         .connect
@@ -655,7 +653,8 @@ async fn create_session(
             ConnectSessionId::generate(),
             &NewConnectSession {
                 environment: workspace.environment,
-                app: installed,
+                app: Some(installed),
+                target: None,
                 configuration_version,
                 intent,
                 installation_id,
@@ -674,6 +673,35 @@ async fn create_session(
         StatusCode::CREATED,
         session_view(&state, session, false, Some(url)).await?,
     ))
+}
+
+/// A session's return URL must be on its environment's allowlist.
+pub(crate) async fn allowed_return_url(
+    state: &AppState,
+    access: &WorkspaceAccess,
+    return_url: Option<&str>,
+) -> Result<(), Failure> {
+    let Some(url) = return_url else {
+        return Ok(());
+    };
+    let environment = access.workspace.environment;
+    let settings = state
+        .connect
+        .find_settings(access.access.organization_id, environment)
+        .await
+        .map_err(connect_failure)?;
+    if settings.return_urls.iter().any(|allowed| allowed == url) {
+        return Ok(());
+    }
+    let mut error = ApiError::new(422, "return_url_not_allowed", "That return URL isn't on the allowlist.");
+    error.fields = Some(
+        [(
+            "return_url".to_owned(),
+            format!("Add it to the {} return URLs first.", environment.as_str()),
+        )]
+        .into(),
+    );
+    Err(error.into())
 }
 
 // --- Hosted Connect ---------------------------------------------------------
@@ -747,7 +775,10 @@ pub(crate) async fn still_eligible(
     session: &ConnectSession,
 ) -> Result<(App, Configuration), Failure> {
     let (organization_id, workspace_id) = (session.organization_id, session.workspace_id);
-    let (app, configuration) = match session.app {
+    let Some(installed) = session.app else {
+        return Err(ApiError::new(422, "app_not_eligible", "This session doesn't connect an app.").into());
+    };
+    let (app, configuration) = match installed {
         InstalledApp::Catalog(id) => {
             let app = state
                 .apps
@@ -953,6 +984,9 @@ async fn submit_credentials(
     let status = session.status_at(Timestamp::now());
     if status != ConnectSessionStatus::Pending {
         return Err(not_pending(status));
+    }
+    if session.target.is_some() {
+        return crate::channels::submit_channel_credentials(&state, &session, body).await;
     }
     let (app, configuration) = still_eligible(&state, &session).await?;
     let AuthTemplate::Token {

@@ -23,7 +23,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::apps::ClientRegistrationId;
 use crate::environment::Environment;
 use crate::ids::{
-    AppId, ConnectSessionId, InstallationId, ModelConnectionId, OrganizationId, WebhookEndpointId, WorkspaceId,
+    AppId, ChannelAppId, ChannelAppManagerId, ChannelConnectionId, ConnectSessionId, InstallationId, ModelConnectionId,
+    OrganizationId, WebhookEndpointId, WorkspaceId,
 };
 
 /// What a secret is for, implied by the constructor that built its context.
@@ -34,6 +35,9 @@ enum Purpose {
     ConnectAuthorization,
     WebhookSigningSecret,
     ModelProviderKey,
+    ChannelAppManagerCredential,
+    ChannelAppSecret,
+    ChannelConnectionCredential,
 }
 
 impl Purpose {
@@ -44,6 +48,9 @@ impl Purpose {
             Self::ConnectAuthorization => "connect_authorization",
             Self::WebhookSigningSecret => "webhook_signing_secret",
             Self::ModelProviderKey => "model_provider_key",
+            Self::ChannelAppManagerCredential => "channel_app_manager_credential",
+            Self::ChannelAppSecret => "channel_app_secret",
+            Self::ChannelConnectionCredential => "channel_connection_credential",
         }
     }
 }
@@ -161,6 +168,29 @@ impl EncryptionContext {
         }
     }
 
+    /// What a channel Connect session keeps while the person is on the
+    /// provider's page allowing an agent's app: the link's reference, sealed
+    /// once per authorization attempt. A channel session installs no catalog
+    /// or workspace app, so the context names no app (an app's session always
+    /// does): the session is its owner, and the attempt its version.
+    pub fn channel_connect_authorization(
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        environment: Environment,
+        session_id: ConnectSessionId,
+        attempt: u32,
+    ) -> Self {
+        Self {
+            organization_id,
+            workspace_id: Some(workspace_id),
+            environment,
+            purpose: Purpose::ConnectAuthorization,
+            app_id: None,
+            object: session_id.to_string(),
+            version: attempt,
+        }
+    }
+
     /// A webhook endpoint's signing secret. An endpoint belongs to one
     /// organization and one environment.
     pub fn webhook_signing_secret(
@@ -194,6 +224,68 @@ impl EncryptionContext {
             workspace_id: None,
             environment,
             purpose: Purpose::ModelProviderKey,
+            app_id: None,
+            object: connection_id.to_string(),
+            version,
+        }
+    }
+
+    /// A linked team's app configuration token and its refresh token, sealed
+    /// together as one value per version: a rotation seals the next version,
+    /// so a pair can't be split, nor an older one opened as the current one.
+    pub fn channel_app_manager_credential(
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        environment: Environment,
+        manager_id: ChannelAppManagerId,
+        version: u32,
+    ) -> Self {
+        Self {
+            organization_id,
+            workspace_id: Some(workspace_id),
+            environment,
+            purpose: Purpose::ChannelAppManagerCredential,
+            app_id: None,
+            object: manager_id.to_string(),
+            version,
+        }
+    }
+
+    /// A generated channel app's client secret and signing secret, sealed
+    /// together as one value per version.
+    pub fn channel_app_secret(
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        environment: Environment,
+        app_id: ChannelAppId,
+        version: u32,
+    ) -> Self {
+        Self {
+            organization_id,
+            workspace_id: Some(workspace_id),
+            environment,
+            purpose: Purpose::ChannelAppSecret,
+            app_id: None,
+            object: app_id.to_string(),
+            version,
+        }
+    }
+
+    /// A channel connection's tokens (in Slack, the bot token, and its
+    /// refresh token when rotation is on), sealed together as one value per
+    /// version.
+    pub fn channel_connection_credential(
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        environment: Environment,
+        connection_id: ChannelConnectionId,
+        version: u32,
+    ) -> Self {
+        Self {
+            organization_id,
+            workspace_id: Some(workspace_id),
+            environment,
+            purpose: Purpose::ChannelConnectionCredential,
             app_id: None,
             object: connection_id.to_string(),
             version,
@@ -442,6 +534,33 @@ mod tests {
             EncryptionContext::connect_authorization(org, ws, Environment::Sandbox, app, cs, 4).canonical(),
             format!(
                 "zupflow.v1;org={org};ws={ws};env=sandbox;purpose=connect_authorization;app={app};object={cs};version=4"
+            )
+        );
+        assert_eq!(
+            EncryptionContext::channel_connect_authorization(org, ws, Environment::Sandbox, cs, 4).canonical(),
+            format!(
+                "zupflow.v1;org={org};ws={ws};env=sandbox;purpose=connect_authorization;app=-;object={cs};version=4"
+            )
+        );
+        let manager = ChannelAppManagerId::generate();
+        assert_eq!(
+            EncryptionContext::channel_app_manager_credential(org, ws, Environment::Sandbox, manager, 2).canonical(),
+            format!(
+                "zupflow.v1;org={org};ws={ws};env=sandbox;purpose=channel_app_manager_credential;app=-;object={manager};version=2"
+            )
+        );
+        let chapp = ChannelAppId::generate();
+        assert_eq!(
+            EncryptionContext::channel_app_secret(org, ws, Environment::Production, chapp, 1).canonical(),
+            format!(
+                "zupflow.v1;org={org};ws={ws};env=production;purpose=channel_app_secret;app=-;object={chapp};version=1"
+            )
+        );
+        let chcon = ChannelConnectionId::generate();
+        assert_eq!(
+            EncryptionContext::channel_connection_credential(org, ws, Environment::Sandbox, chcon, 3).canonical(),
+            format!(
+                "zupflow.v1;org={org};ws={ws};env=sandbox;purpose=channel_connection_credential;app=-;object={chcon};version=3"
             )
         );
     }

@@ -25,6 +25,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { AgentAccess } from "@/features/agents/access";
 import { AgentFields, agentInput, useAgentForm } from "@/features/agents/agent-form";
 import { StartRunSheet } from "@/features/agents/start-run-sheet";
+import { AgentChannels } from "@/features/channels/agent-channels";
 import { canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
 import { AgentModelName } from "@/features/models/agent-model";
 import { useAgent, useDeleteAgent, useRuns, useUpdateAgent } from "@/features/queries";
@@ -33,7 +34,7 @@ import { useDetailCrumb } from "@/lib/crumbs";
 import { applyFieldErrors, toastError } from "@/lib/errors";
 import { idParam } from "@/lib/route-ids";
 
-const TABS = ["overview", "access", "configuration"] as const;
+const TABS = ["overview", "access", "channels", "configuration"] as const;
 
 export const Route = createFileRoute("/_authed/$org/w/$ws/agents/$agentId")({
   params: idParam("agentId", "agent"),
@@ -166,12 +167,14 @@ function AgentPage() {
               </span>
             ) : null}
           </LineTabsTrigger>
+          <LineTabsTrigger value="channels">Channels</LineTabsTrigger>
           <LineTabsTrigger value="configuration">Configuration</LineTabsTrigger>
         </LineTabsList>
         <TabsContent value="overview">
           {a ? <OverviewTab org={org} workspace={ws} agent={a} /> : <RowsSkeleton />}
         </TabsContent>
         <TabsContent value="access">{a ? <AgentAccess org={org} workspace={ws} agent={a} /> : null}</TabsContent>
+        <TabsContent value="channels">{a ? <AgentChannels org={org} workspace={ws} agent={a} /> : null}</TabsContent>
         <TabsContent value="configuration">
           {a ? <ConfigurationTab workspace={ws} agent={a} readOnly={!mayChange} /> : null}
         </TabsContent>

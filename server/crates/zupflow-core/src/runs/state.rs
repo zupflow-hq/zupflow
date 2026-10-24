@@ -17,12 +17,13 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::ids::{
-    ApiKeyId, InstallationId, ModelConnectionId, ModelId, OrganizationId, RunId, ToolCallId, WorkspaceId,
+    ApiKeyId, ChannelConnectionId, ChannelConversationId, InstallationId, ModelConnectionId, ModelId, OrganizationId,
+    RunId, ToolCallId, WorkspaceId,
 };
-use crate::models::TokenUsage;
+use crate::models::{Message, TokenUsage};
 use crate::policy::{Decision, Verdict};
 use crate::runs::digest::Sha256Digest;
-use crate::runs::names::Offer;
+use crate::runs::names::{Offer, ToolHost};
 use crate::runs::{ApprovalDecision, CallOutcome, CallState, Failure, RunStatus};
 use crate::time::Timestamp;
 
@@ -188,18 +189,31 @@ internal_id! {
     ClaimantId
 }
 
-/// Tokens one model answer took.
+/// Tokens one model answer took ([`TokenUsage`] says what each counts).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cache_write_input_tokens: u64,
 }
 
 impl From<TokenUsage> for Usage {
     fn from(usage: TokenUsage) -> Self {
+        // Kept within the input, as `TokenUsage::new` builds it.
+        let usage = TokenUsage::new(
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_input_tokens,
+            usage.cache_write_input_tokens,
+        );
         Self {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_write_input_tokens: usage.cache_write_input_tokens,
         }
     }
 }
@@ -241,9 +255,14 @@ impl From<&Decision> for CallDecision {
 
 /// The installation and tool a call goes to, recorded with it when the
 /// model's name was looked up in the turn's frozen offer (decision 0047).
+/// A channel tool's call names its connection instead, whose short ID,
+/// label and provider stand where an installation's would; never both.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundTarget {
-    pub installation_id: InstallationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_id: Option<InstallationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_connection_id: Option<ChannelConnectionId>,
     pub installation_short_id: String,
     pub installation_label: String,
     pub app_key: String,
@@ -252,6 +271,25 @@ pub struct BoundTarget {
     pub tool: String,
     /// The pinned definition the call was decided against.
     pub definition_sha256: Sha256Digest,
+}
+
+impl BoundTarget {
+    /// Where the call goes.
+    pub fn host(&self) -> ToolHost {
+        match (self.installation_id, self.channel_connection_id) {
+            (Some(installation_id), _) => ToolHost::Installation(installation_id),
+            (None, Some(connection_id)) => ToolHost::Channel(connection_id),
+            (None, None) => ToolHost::Run,
+        }
+    }
+
+    /// The channel connection a channel tool's call goes through.
+    pub fn channel(&self) -> Option<ChannelConnectionId> {
+        match self.host() {
+            ToolHost::Channel(connection_id) => Some(connection_id),
+            ToolHost::Installation(_) | ToolHost::Run => None,
+        }
+    }
 }
 
 /// One authorization to send a call: its send claim.
@@ -347,6 +385,40 @@ pub struct CommittedTurn {
     pub text: Option<String>,
 }
 
+/// Thread messages that joined a run at a turn boundary: one user turn,
+/// before the turn it names, as it was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteeredTurn {
+    pub turn: u32,
+    pub text: String,
+}
+
+/// Where a channel run was started: its connection, conversation and
+/// thread. A channel tool's call is bound to it (its digest covers it), so
+/// an approval never stands for a post somewhere else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelOrigin {
+    pub connection_id: ChannelConnectionId,
+    pub conversation_id: ChannelConversationId,
+    pub thread_key: String,
+}
+
+/// What a channel run continues and keeps: its session's conversation so
+/// far, the tools fixed for the session, and the thread messages that
+/// joined it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionContext {
+    /// Where the run was started.
+    pub origin: ChannelOrigin,
+    /// The turns of the session's earlier runs from its history start,
+    /// exactly as they were sent ([`super::history::transcript`]).
+    pub history: Vec<Message>,
+    /// The tools every run in the session offers, in its order.
+    pub offer: Offer,
+    /// In order of turn.
+    pub steers: Vec<SteeredTurn>,
+}
+
 /// A run as committed: everything [`super::reducer::advance`] reads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
@@ -369,6 +441,11 @@ pub struct Snapshot {
     pub calls: Vec<CallRecord>,
     /// Every model attempt, by turn and attempt.
     pub model_attempts: Vec<ModelAttempt>,
+    /// A channel run's session; `None` for any other run.
+    pub session: Option<SessionContext>,
+    /// The reason a channel run gave `stay_silent`, once it did: it ends
+    /// as soon as its calls are settled, and nothing is posted for it.
+    pub silent_reason: Option<String>,
 }
 
 impl Snapshot {

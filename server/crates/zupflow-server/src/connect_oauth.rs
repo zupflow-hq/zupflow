@@ -101,12 +101,18 @@ fn challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-fn authorization_context(session: &ConnectSession, attempt: u32) -> EncryptionContext {
+/// An app session's app. A channel session never reaches the app's OAuth
+/// code: its own routes answer for it.
+fn installed(session: &ConnectSession) -> Result<InstalledApp, Failed> {
+    session.app.ok_or(Failed("app_not_eligible"))
+}
+
+fn authorization_context(session: &ConnectSession, installed: InstalledApp, attempt: u32) -> EncryptionContext {
     EncryptionContext::connect_authorization(
         session.organization_id,
         session.workspace_id,
         session.environment,
-        session.app.id(),
+        installed.id(),
         session.id,
         attempt,
     )
@@ -135,7 +141,13 @@ pub async fn authorize(State(state): State<AppState>, Path(reference): Path<Stri
     if status != ConnectSessionStatus::Pending {
         return Err(not_pending(status));
     }
+    if session.target.is_some() {
+        return crate::channel_install::authorize(&state, &session, &reference).await;
+    }
     let (app, configuration) = still_eligible(&state, &session).await?;
+    let Some(installed) = session.app else {
+        return Err(ApiError::internal().into());
+    };
     let consent = match &app.auth {
         AuthTemplate::OAuth2 {
             authorize_url,
@@ -183,7 +195,7 @@ pub async fn authorize(State(state): State<AppState>, Path(reference): Path<Stri
     let plaintext = Zeroizing::new(serde_json::to_vec(&sealing).map_err(|_| Failure(ApiError::internal()))?);
     let sealed = keys::seal(
         state.keys.as_ref(),
-        &authorization_context(&session, attempt),
+        &authorization_context(&session, installed, attempt),
         &plaintext,
     )
     .await
@@ -271,13 +283,17 @@ struct Issued {
     registration_access_token: Option<String>,
 }
 
-fn registration_context(session: &ConnectSession, registration: ClientRegistrationId) -> EncryptionContext {
-    let workspace_id = matches!(session.app, InstalledApp::Workspace(_)).then_some(session.workspace_id);
+fn registration_context(
+    session: &ConnectSession,
+    installed: InstalledApp,
+    registration: ClientRegistrationId,
+) -> EncryptionContext {
+    let workspace_id = matches!(installed, InstalledApp::Workspace(_)).then_some(session.workspace_id);
     EncryptionContext::oauth_client_registration(
         session.organization_id,
         workspace_id,
         session.environment,
-        session.app.id(),
+        installed.id(),
         registration,
     )
 }
@@ -289,7 +305,10 @@ async fn find_registration(
     session: &ConnectSession,
     issuer: &str,
 ) -> Result<Option<ClientRegistration>, AppError> {
-    match session.app {
+    let Some(installed) = session.app else {
+        return Ok(None);
+    };
+    match installed {
         InstalledApp::Catalog(id) => {
             state
                 .apps
@@ -383,6 +402,7 @@ async fn register(
     server: &AuthorizationServer,
     deadline: tokio::time::Instant,
 ) -> Result<ClientRegistration, Failed> {
+    let installed = installed(session)?;
     let registered = sign_in::register(
         state.outbound.as_ref(),
         server,
@@ -400,12 +420,16 @@ async fn register(
                 registration_access_token: registration_access_token.as_deref().map(String::as_str),
             };
             let plaintext = Zeroizing::new(serde_json::to_vec(&issuing).map_err(|_| Failed("unavailable"))?);
-            let sealed = keys::seal(state.keys.as_ref(), &registration_context(session, id), &plaintext)
-                .await
-                .map_err(|error| {
-                    tracing::error!(event = "connect.seal_failed", %error);
-                    Failed("unavailable")
-                })?;
+            let sealed = keys::seal(
+                state.keys.as_ref(),
+                &registration_context(session, installed, id),
+                &plaintext,
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(event = "connect.seal_failed", %error);
+                Failed("unavailable")
+            })?;
             Some(sealed)
         }
     };
@@ -416,7 +440,7 @@ async fn register(
         authentication: registered.authentication,
         sealed,
     };
-    let saved = match session.app {
+    let saved = match installed {
         InstalledApp::Catalog(app_id) => {
             state
                 .apps
@@ -473,7 +497,7 @@ async fn registered_secret(
     };
     let opened = keys::open(
         state.keys.as_ref(),
-        &registration_context(session, registration.id),
+        &registration_context(session, installed(session)?, registration.id),
         sealed,
     )
     .await
@@ -599,7 +623,7 @@ fn unknown_state() -> Response {
 /// Back to the hosted page, which reads the session's outcome. Neither the
 /// callback's URL (it carries the code) nor the page's (it carries the
 /// reference) is sent on as a referrer.
-fn back_to(state: &AppState, reference: &str) -> Response {
+pub(crate) fn back_to(state: &AppState, reference: &str) -> Response {
     let mut response = Redirect::to(&format!("{}/connect/{reference}", state.public_url)).into_response();
     let headers = response.headers_mut();
     headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
@@ -634,9 +658,17 @@ pub async fn callback(State(state): State<AppState>, RawQuery(query): RawQuery) 
         Ok(None) => return unknown_state(),
         Err(error) => return connect_failure(error).into_response(),
     };
+    // A channel app's install comes back here too.
+    if session.target.is_some() {
+        return crate::channel_install::callback(&state, session, authorization, &params).await;
+    }
+    // Only an app's session begins an authorization.
+    let Some(installed) = session.app else {
+        return unknown_state();
+    };
     let opened = keys::open(
         state.keys.as_ref(),
-        &authorization_context(&session, authorization.attempt),
+        &authorization_context(&session, installed, authorization.attempt),
         &authorization.sealed,
     )
     .await;
@@ -801,7 +833,7 @@ async fn complete(
                         session.organization_id,
                         session.workspace_id,
                         session.environment,
-                        session.app,
+                        installed(session)?,
                         discovered,
                     )
                     .await
@@ -1020,7 +1052,8 @@ async fn configured_client(
     let (Some(client_id), Some(secret)) = (&configuration.oauth_client_id, &configuration.client_secret) else {
         return Err(Failed("configuration_not_ready"));
     };
-    let stored = match session.app {
+    let installed = installed(session)?;
+    let stored = match installed {
         InstalledApp::Catalog(id) => {
             state
                 .apps
@@ -1037,7 +1070,7 @@ async fn configured_client(
     .map_err(|_| Failed("unavailable"))?
     .filter(|stored| stored.version == secret.version)
     .ok_or(Failed("configuration_not_ready"))?;
-    let workspace_id = matches!(session.app, InstalledApp::Workspace(_)).then_some(session.workspace_id);
+    let workspace_id = matches!(installed, InstalledApp::Workspace(_)).then_some(session.workspace_id);
     let context = EncryptionContext::oauth_client_secret(
         session.organization_id,
         workspace_id,

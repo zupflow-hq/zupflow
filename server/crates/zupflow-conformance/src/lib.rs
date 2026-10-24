@@ -14,6 +14,7 @@ pub mod app_store;
 pub mod approval_policy;
 pub mod audit_store;
 pub mod cache;
+pub mod channel_store;
 pub mod connect_store;
 pub mod event_bus;
 pub mod idempotency_store;

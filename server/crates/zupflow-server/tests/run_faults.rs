@@ -871,10 +871,7 @@ impl ModelProvider for Busy {
             .iter()
             .filter(|message| matches!(message, Message::Assistant { .. }))
             .count();
-        let usage = TokenUsage {
-            input_tokens: 1,
-            output_tokens: 1,
-        };
+        let usage = TokenUsage::new(1, 1, 0, 0);
         if asked >= self.turns {
             return Ok(Completion {
                 reply: Reply::Text("Done.".to_owned()),

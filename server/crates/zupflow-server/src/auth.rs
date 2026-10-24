@@ -30,6 +30,7 @@ use zupflow_core::organizations::{Member, MemberRole, Organization, Organization
 use zupflow_core::outbound::OutboundHttp;
 use zupflow_core::workspaces::{Workspace, WorkspaceError, WorkspaceStore};
 
+use crate::guard::PublicHost;
 use crate::http::Failure;
 
 /// What every route reaches its adapters through.
@@ -51,6 +52,12 @@ pub struct AppState {
     /// provider adapters, or the scripted providers for local work.
     pub model_catalog: Arc<dyn zupflow_core::model_providers::ModelProviderCatalog>,
     pub connect: Arc<dyn ConnectStore>,
+    /// Linked teams, agents' generated apps, channel connections and what they've seen.
+    pub channels: Arc<dyn zupflow_core::channels::store::ChannelStore>,
+    /// Makes, changes and deletes agents' apps in linked teams.
+    pub channel_provisioner: Arc<dyn zupflow_core::channels::provision::AppProvisioner>,
+    /// Checks and reads what a provider delivers to an app's inbound endpoint.
+    pub channel_provider: Arc<dyn zupflow_core::channels::provider::ChannelProvider>,
     /// Seals the secrets Zupflow holds (decision 0033).
     pub keys: Arc<dyn KeyService>,
     /// Background work: tool discovery and runs.
@@ -112,11 +119,9 @@ impl FromRequestParts<AppState> for Caller {
     type Rejection = Failure;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
-        let bearer = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "));
+        // Before any credential is read: the public host carries no caller.
+        refuse_public_host(parts)?;
+        let bearer = bearer(parts);
         if let Some(secret) = bearer.filter(|bearer| bearer.starts_with(SECRET_PREFIX)) {
             // The one cross-tenant lookup: the key names its organization.
             let hash = state.api_key_hasher.hash(secret);
@@ -131,7 +136,7 @@ impl FromRequestParts<AppState> for Caller {
                 .into()),
             };
         }
-        console_session(bearer, state)
+        console_session(parts, state)
             .await
             .map(|session| Self::Console(session.user))
     }
@@ -162,21 +167,51 @@ impl FromRequestParts<AppState> for ConsoleSession {
     /// Like [`ConsoleUser`]: `401` without a valid credential, `403
     /// console_only` for a valid API key.
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
-        let bearer = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "));
-        if bearer.is_some_and(|bearer| bearer.starts_with(SECRET_PREFIX)) {
+        refuse_public_host(parts)?;
+        if bearer(parts).is_some_and(|bearer| bearer.starts_with(SECRET_PREFIX)) {
             // A key is never a Console session: an unknown one is `401`, a valid one refused.
             Caller::from_request_parts(parts, state).await?;
             return Err(console_only());
         }
-        console_session(bearer, state).await
+        console_session(parts, state).await
     }
 }
 
-async fn console_session(bearer: Option<&str>, state: &AppState) -> Result<ConsoleSession, Failure> {
+/// The request's bearer token, if it sends one.
+fn bearer(parts: &Parts) -> Option<&str> {
+    parts
+        .headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+/// Refuses to resolve any caller for a request the guard admitted on the
+/// server's public host under `local` sign-in ([`PublicHost`]). There, a
+/// request with no credential is the local owner; the public host reaches
+/// only routes authorized by what the request itself carries (a Connect
+/// link's reference or `state`, a provider's signature), so none of them
+/// ever needs a caller, and a route that asks for one is refused here
+/// rather than handed the owner.
+fn refuse_public_host(parts: &Parts) -> Result<(), Failure> {
+    if parts.extensions.get::<PublicHost>().is_none() {
+        return Ok(());
+    }
+    tracing::warn!(event = "auth.public_host_refused");
+    Err(ApiError::new(
+        403,
+        "host_not_allowed",
+        "This route can't be reached through the server's public address. Use localhost, 127.0.0.1 or [::1].",
+    )
+    .into())
+}
+
+/// Signs the Console user in through the identity adapter. Every route that
+/// resolves a Console user comes through here, so the public host is refused
+/// here too, right before the one call that could answer with the local owner.
+async fn console_session(parts: &Parts, state: &AppState) -> Result<ConsoleSession, Failure> {
+    refuse_public_host(parts)?;
+    let bearer = bearer(parts);
     let identity = state.identity.verify(bearer).await.map_err(|error| match error {
         IdentityError::Unauthenticated => Failure(ApiError::unauthenticated()),
         IdentityError::Unavailable => {

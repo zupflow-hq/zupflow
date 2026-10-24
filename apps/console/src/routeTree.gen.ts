@@ -38,6 +38,7 @@ import { Route as AuthedOrgWebhooksHookIdRouteImport } from "./routes/_authed/$o
 import { Route as AuthedOrgWWsIndexRouteImport } from "./routes/_authed/$org/w/$ws/index"
 import { Route as AuthedOrgWWsAgentsRouteImport } from "./routes/_authed/$org/w/$ws/agents"
 import { Route as AuthedOrgWWsAppsRouteImport } from "./routes/_authed/$org/w/$ws/apps"
+import { Route as AuthedOrgWWsChannelsRouteImport } from "./routes/_authed/$org/w/$ws/channels"
 import { Route as AuthedOrgWWsConnectSessionsRouteImport } from "./routes/_authed/$org/w/$ws/connect-sessions"
 import { Route as AuthedOrgWWsInstallationsRouteImport } from "./routes/_authed/$org/w/$ws/installations"
 import { Route as AuthedOrgWWsRunsRouteImport } from "./routes/_authed/$org/w/$ws/runs"
@@ -46,6 +47,8 @@ import { Route as AuthedOrgWWsAgentsIndexRouteImport } from "./routes/_authed/$o
 import { Route as AuthedOrgWWsAgentsAgentIdRouteImport } from "./routes/_authed/$org/w/$ws/agents/$agentId"
 import { Route as AuthedOrgWWsAppsIndexRouteImport } from "./routes/_authed/$org/w/$ws/apps/index"
 import { Route as AuthedOrgWWsAppsAppIdRouteImport } from "./routes/_authed/$org/w/$ws/apps/$appId"
+import { Route as AuthedOrgWWsChannelsIndexRouteImport } from "./routes/_authed/$org/w/$ws/channels/index"
+import { Route as AuthedOrgWWsChannelsConnectionIdRouteImport } from "./routes/_authed/$org/w/$ws/channels/$connectionId"
 import { Route as AuthedOrgWWsInstallationsIndexRouteImport } from "./routes/_authed/$org/w/$ws/installations/index"
 import { Route as AuthedOrgWWsInstallationsInstallationIdRouteImport } from "./routes/_authed/$org/w/$ws/installations/$installationId"
 import { Route as AuthedOrgWWsRunsIndexRouteImport } from "./routes/_authed/$org/w/$ws/runs/index"
@@ -198,6 +201,11 @@ const AuthedOrgWWsAppsRoute = AuthedOrgWWsAppsRouteImport.update({
   path: "/apps",
   getParentRoute: () => AuthedOrgWWsRoute,
 } as any)
+const AuthedOrgWWsChannelsRoute = AuthedOrgWWsChannelsRouteImport.update({
+  id: "/channels",
+  path: "/channels",
+  getParentRoute: () => AuthedOrgWWsRoute,
+} as any)
 const AuthedOrgWWsConnectSessionsRoute =
   AuthedOrgWWsConnectSessionsRouteImport.update({
     id: "/connect-sessions",
@@ -241,6 +249,18 @@ const AuthedOrgWWsAppsAppIdRoute = AuthedOrgWWsAppsAppIdRouteImport.update({
   path: "/$appId",
   getParentRoute: () => AuthedOrgWWsAppsRoute,
 } as any)
+const AuthedOrgWWsChannelsIndexRoute =
+  AuthedOrgWWsChannelsIndexRouteImport.update({
+    id: "/",
+    path: "/",
+    getParentRoute: () => AuthedOrgWWsChannelsRoute,
+  } as any)
+const AuthedOrgWWsChannelsConnectionIdRoute =
+  AuthedOrgWWsChannelsConnectionIdRouteImport.update({
+    id: "/$connectionId",
+    path: "/$connectionId",
+    getParentRoute: () => AuthedOrgWWsChannelsRoute,
+  } as any)
 const AuthedOrgWWsInstallationsIndexRoute =
   AuthedOrgWWsInstallationsIndexRouteImport.update({
     id: "/",
@@ -292,6 +312,7 @@ export interface FileRoutesByFullPath {
   "/$org/webhooks/": typeof AuthedOrgWebhooksIndexRoute
   "/$org/w/$ws/agents": typeof AuthedOrgWWsAgentsRouteWithChildren
   "/$org/w/$ws/apps": typeof AuthedOrgWWsAppsRouteWithChildren
+  "/$org/w/$ws/channels": typeof AuthedOrgWWsChannelsRouteWithChildren
   "/$org/w/$ws/connect-sessions": typeof AuthedOrgWWsConnectSessionsRoute
   "/$org/w/$ws/installations": typeof AuthedOrgWWsInstallationsRouteWithChildren
   "/$org/w/$ws/runs": typeof AuthedOrgWWsRunsRouteWithChildren
@@ -299,10 +320,12 @@ export interface FileRoutesByFullPath {
   "/$org/w/$ws/": typeof AuthedOrgWWsIndexRoute
   "/$org/w/$ws/agents/$agentId": typeof AuthedOrgWWsAgentsAgentIdRoute
   "/$org/w/$ws/apps/$appId": typeof AuthedOrgWWsAppsAppIdRoute
+  "/$org/w/$ws/channels/$connectionId": typeof AuthedOrgWWsChannelsConnectionIdRoute
   "/$org/w/$ws/installations/$installationId": typeof AuthedOrgWWsInstallationsInstallationIdRoute
   "/$org/w/$ws/runs/$runId": typeof AuthedOrgWWsRunsRunIdRoute
   "/$org/w/$ws/agents/": typeof AuthedOrgWWsAgentsIndexRoute
   "/$org/w/$ws/apps/": typeof AuthedOrgWWsAppsIndexRoute
+  "/$org/w/$ws/channels/": typeof AuthedOrgWWsChannelsIndexRoute
   "/$org/w/$ws/installations/": typeof AuthedOrgWWsInstallationsIndexRoute
   "/$org/w/$ws/runs/": typeof AuthedOrgWWsRunsIndexRoute
 }
@@ -332,10 +355,12 @@ export interface FileRoutesByTo {
   "/$org/w/$ws": typeof AuthedOrgWWsIndexRoute
   "/$org/w/$ws/agents/$agentId": typeof AuthedOrgWWsAgentsAgentIdRoute
   "/$org/w/$ws/apps/$appId": typeof AuthedOrgWWsAppsAppIdRoute
+  "/$org/w/$ws/channels/$connectionId": typeof AuthedOrgWWsChannelsConnectionIdRoute
   "/$org/w/$ws/installations/$installationId": typeof AuthedOrgWWsInstallationsInstallationIdRoute
   "/$org/w/$ws/runs/$runId": typeof AuthedOrgWWsRunsRunIdRoute
   "/$org/w/$ws/agents": typeof AuthedOrgWWsAgentsIndexRoute
   "/$org/w/$ws/apps": typeof AuthedOrgWWsAppsIndexRoute
+  "/$org/w/$ws/channels": typeof AuthedOrgWWsChannelsIndexRoute
   "/$org/w/$ws/installations": typeof AuthedOrgWWsInstallationsIndexRoute
   "/$org/w/$ws/runs": typeof AuthedOrgWWsRunsIndexRoute
 }
@@ -369,6 +394,7 @@ export interface FileRoutesById {
   "/_authed/$org/webhooks/": typeof AuthedOrgWebhooksIndexRoute
   "/_authed/$org/w/$ws/agents": typeof AuthedOrgWWsAgentsRouteWithChildren
   "/_authed/$org/w/$ws/apps": typeof AuthedOrgWWsAppsRouteWithChildren
+  "/_authed/$org/w/$ws/channels": typeof AuthedOrgWWsChannelsRouteWithChildren
   "/_authed/$org/w/$ws/connect-sessions": typeof AuthedOrgWWsConnectSessionsRoute
   "/_authed/$org/w/$ws/installations": typeof AuthedOrgWWsInstallationsRouteWithChildren
   "/_authed/$org/w/$ws/runs": typeof AuthedOrgWWsRunsRouteWithChildren
@@ -376,10 +402,12 @@ export interface FileRoutesById {
   "/_authed/$org/w/$ws/": typeof AuthedOrgWWsIndexRoute
   "/_authed/$org/w/$ws/agents/$agentId": typeof AuthedOrgWWsAgentsAgentIdRoute
   "/_authed/$org/w/$ws/apps/$appId": typeof AuthedOrgWWsAppsAppIdRoute
+  "/_authed/$org/w/$ws/channels/$connectionId": typeof AuthedOrgWWsChannelsConnectionIdRoute
   "/_authed/$org/w/$ws/installations/$installationId": typeof AuthedOrgWWsInstallationsInstallationIdRoute
   "/_authed/$org/w/$ws/runs/$runId": typeof AuthedOrgWWsRunsRunIdRoute
   "/_authed/$org/w/$ws/agents/": typeof AuthedOrgWWsAgentsIndexRoute
   "/_authed/$org/w/$ws/apps/": typeof AuthedOrgWWsAppsIndexRoute
+  "/_authed/$org/w/$ws/channels/": typeof AuthedOrgWWsChannelsIndexRoute
   "/_authed/$org/w/$ws/installations/": typeof AuthedOrgWWsInstallationsIndexRoute
   "/_authed/$org/w/$ws/runs/": typeof AuthedOrgWWsRunsIndexRoute
 }
@@ -413,6 +441,7 @@ export interface FileRouteTypes {
     | "/$org/webhooks/"
     | "/$org/w/$ws/agents"
     | "/$org/w/$ws/apps"
+    | "/$org/w/$ws/channels"
     | "/$org/w/$ws/connect-sessions"
     | "/$org/w/$ws/installations"
     | "/$org/w/$ws/runs"
@@ -420,10 +449,12 @@ export interface FileRouteTypes {
     | "/$org/w/$ws/"
     | "/$org/w/$ws/agents/$agentId"
     | "/$org/w/$ws/apps/$appId"
+    | "/$org/w/$ws/channels/$connectionId"
     | "/$org/w/$ws/installations/$installationId"
     | "/$org/w/$ws/runs/$runId"
     | "/$org/w/$ws/agents/"
     | "/$org/w/$ws/apps/"
+    | "/$org/w/$ws/channels/"
     | "/$org/w/$ws/installations/"
     | "/$org/w/$ws/runs/"
   fileRoutesByTo: FileRoutesByTo
@@ -453,10 +484,12 @@ export interface FileRouteTypes {
     | "/$org/w/$ws"
     | "/$org/w/$ws/agents/$agentId"
     | "/$org/w/$ws/apps/$appId"
+    | "/$org/w/$ws/channels/$connectionId"
     | "/$org/w/$ws/installations/$installationId"
     | "/$org/w/$ws/runs/$runId"
     | "/$org/w/$ws/agents"
     | "/$org/w/$ws/apps"
+    | "/$org/w/$ws/channels"
     | "/$org/w/$ws/installations"
     | "/$org/w/$ws/runs"
   id:
@@ -489,6 +522,7 @@ export interface FileRouteTypes {
     | "/_authed/$org/webhooks/"
     | "/_authed/$org/w/$ws/agents"
     | "/_authed/$org/w/$ws/apps"
+    | "/_authed/$org/w/$ws/channels"
     | "/_authed/$org/w/$ws/connect-sessions"
     | "/_authed/$org/w/$ws/installations"
     | "/_authed/$org/w/$ws/runs"
@@ -496,10 +530,12 @@ export interface FileRouteTypes {
     | "/_authed/$org/w/$ws/"
     | "/_authed/$org/w/$ws/agents/$agentId"
     | "/_authed/$org/w/$ws/apps/$appId"
+    | "/_authed/$org/w/$ws/channels/$connectionId"
     | "/_authed/$org/w/$ws/installations/$installationId"
     | "/_authed/$org/w/$ws/runs/$runId"
     | "/_authed/$org/w/$ws/agents/"
     | "/_authed/$org/w/$ws/apps/"
+    | "/_authed/$org/w/$ws/channels/"
     | "/_authed/$org/w/$ws/installations/"
     | "/_authed/$org/w/$ws/runs/"
   fileRoutesById: FileRoutesById
@@ -718,6 +754,13 @@ declare module "@tanstack/react-router" {
       preLoaderRoute: typeof AuthedOrgWWsAppsRouteImport
       parentRoute: typeof AuthedOrgWWsRoute
     }
+    "/_authed/$org/w/$ws/channels": {
+      id: "/_authed/$org/w/$ws/channels"
+      path: "/channels"
+      fullPath: "/$org/w/$ws/channels"
+      preLoaderRoute: typeof AuthedOrgWWsChannelsRouteImport
+      parentRoute: typeof AuthedOrgWWsRoute
+    }
     "/_authed/$org/w/$ws/connect-sessions": {
       id: "/_authed/$org/w/$ws/connect-sessions"
       path: "/connect-sessions"
@@ -773,6 +816,20 @@ declare module "@tanstack/react-router" {
       fullPath: "/$org/w/$ws/apps/$appId"
       preLoaderRoute: typeof AuthedOrgWWsAppsAppIdRouteImport
       parentRoute: typeof AuthedOrgWWsAppsRoute
+    }
+    "/_authed/$org/w/$ws/channels/": {
+      id: "/_authed/$org/w/$ws/channels/"
+      path: "/"
+      fullPath: "/$org/w/$ws/channels/"
+      preLoaderRoute: typeof AuthedOrgWWsChannelsIndexRouteImport
+      parentRoute: typeof AuthedOrgWWsChannelsRoute
+    }
+    "/_authed/$org/w/$ws/channels/$connectionId": {
+      id: "/_authed/$org/w/$ws/channels/$connectionId"
+      path: "/$connectionId"
+      fullPath: "/$org/w/$ws/channels/$connectionId"
+      preLoaderRoute: typeof AuthedOrgWWsChannelsConnectionIdRouteImport
+      parentRoute: typeof AuthedOrgWWsChannelsRoute
     }
     "/_authed/$org/w/$ws/installations/": {
       id: "/_authed/$org/w/$ws/installations/"
@@ -875,6 +932,19 @@ const AuthedOrgWWsAppsRouteChildren: AuthedOrgWWsAppsRouteChildren = {
 const AuthedOrgWWsAppsRouteWithChildren =
   AuthedOrgWWsAppsRoute._addFileChildren(AuthedOrgWWsAppsRouteChildren)
 
+interface AuthedOrgWWsChannelsRouteChildren {
+  AuthedOrgWWsChannelsConnectionIdRoute: typeof AuthedOrgWWsChannelsConnectionIdRoute
+  AuthedOrgWWsChannelsIndexRoute: typeof AuthedOrgWWsChannelsIndexRoute
+}
+
+const AuthedOrgWWsChannelsRouteChildren: AuthedOrgWWsChannelsRouteChildren = {
+  AuthedOrgWWsChannelsConnectionIdRoute: AuthedOrgWWsChannelsConnectionIdRoute,
+  AuthedOrgWWsChannelsIndexRoute: AuthedOrgWWsChannelsIndexRoute,
+}
+
+const AuthedOrgWWsChannelsRouteWithChildren =
+  AuthedOrgWWsChannelsRoute._addFileChildren(AuthedOrgWWsChannelsRouteChildren)
+
 interface AuthedOrgWWsInstallationsRouteChildren {
   AuthedOrgWWsInstallationsInstallationIdRoute: typeof AuthedOrgWWsInstallationsInstallationIdRoute
   AuthedOrgWWsInstallationsIndexRoute: typeof AuthedOrgWWsInstallationsIndexRoute
@@ -908,6 +978,7 @@ const AuthedOrgWWsRunsRouteWithChildren =
 interface AuthedOrgWWsRouteChildren {
   AuthedOrgWWsAgentsRoute: typeof AuthedOrgWWsAgentsRouteWithChildren
   AuthedOrgWWsAppsRoute: typeof AuthedOrgWWsAppsRouteWithChildren
+  AuthedOrgWWsChannelsRoute: typeof AuthedOrgWWsChannelsRouteWithChildren
   AuthedOrgWWsConnectSessionsRoute: typeof AuthedOrgWWsConnectSessionsRoute
   AuthedOrgWWsInstallationsRoute: typeof AuthedOrgWWsInstallationsRouteWithChildren
   AuthedOrgWWsRunsRoute: typeof AuthedOrgWWsRunsRouteWithChildren
@@ -918,6 +989,7 @@ interface AuthedOrgWWsRouteChildren {
 const AuthedOrgWWsRouteChildren: AuthedOrgWWsRouteChildren = {
   AuthedOrgWWsAgentsRoute: AuthedOrgWWsAgentsRouteWithChildren,
   AuthedOrgWWsAppsRoute: AuthedOrgWWsAppsRouteWithChildren,
+  AuthedOrgWWsChannelsRoute: AuthedOrgWWsChannelsRouteWithChildren,
   AuthedOrgWWsConnectSessionsRoute: AuthedOrgWWsConnectSessionsRoute,
   AuthedOrgWWsInstallationsRoute: AuthedOrgWWsInstallationsRouteWithChildren,
   AuthedOrgWWsRunsRoute: AuthedOrgWWsRunsRouteWithChildren,

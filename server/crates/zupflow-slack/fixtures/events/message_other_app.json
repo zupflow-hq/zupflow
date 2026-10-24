@@ -1,0 +1,18 @@
+{
+  "team_id": "T0FAKE001",
+  "api_app_id": "A0FAKE00001",
+  "event": {
+    "type": "message",
+    "subtype": "bot_message",
+    "bot_id": "B0WEBHOOK",
+    "username": "Deploys",
+    "text": "Deploy finished",
+    "ts": "1760000500.000100",
+    "channel": "C0GENERAL",
+    "event_ts": "1760000500.000100",
+    "channel_type": "channel"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0WEBHOOK01",
+  "event_time": 1760000500
+}

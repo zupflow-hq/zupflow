@@ -1,0 +1,16 @@
+{
+  "team_id": "T0FAKE001",
+  "api_app_id": "A0FAKE00001",
+  "event": {
+    "type": "message",
+    "user": "U0ALICE01",
+    "text": "Ship it",
+    "ts": "1760000300.000100",
+    "channel": "C0PRIVATE",
+    "event_ts": "1760000300.000100",
+    "channel_type": "group"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0PRIVATE01",
+  "event_time": 1760000300
+}

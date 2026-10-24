@@ -10,6 +10,8 @@ import { Form, FormControl, FormDescription, FormField, FormItem, FormLabel, For
 import { Input } from "@/components/ui/input";
 import { InputGroup, InputGroupAddon, InputGroupInput, InputGroupText } from "@/components/ui/input-group";
 import { Spinner } from "@/components/ui/spinner";
+import { ChannelSettingsSection } from "@/features/channels/channel-settings";
+import { ChannelToolLevels } from "@/features/channels/channel-tool-levels";
 import { canAdminister, useDocumentTitle, useOrg } from "@/features/context";
 import { useUpdateOrganization } from "@/features/queries";
 import { ToolPolicySettings } from "@/features/tool-policy/policy-settings";
@@ -110,6 +112,8 @@ function OrgSettingsPage() {
           </Panel>
         </section>
         <ToolPolicySettings org={org} />
+        <ChannelToolLevels org={org} />
+        <ChannelSettingsSection org={org} />
         <section>
           <SectionHeader title="Identifiers" />
           <Panel>
