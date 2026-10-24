@@ -9,7 +9,7 @@
 //! its self-signed certificate to `--certificate` (PEM) for the backend to
 //! trust, and prints `listening <port>`. A browser reaches it at
 //! `https://taskboard.example:<port>` once that name points at `127.0.0.1`
-//! (see the README).
+//! (see DEVELOPMENT.md).
 
 use std::process::ExitCode;
 use std::time::Duration;
