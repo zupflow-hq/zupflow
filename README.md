@@ -1,6 +1,6 @@
 # Zupflow
 
-Zupflow is a standalone, open-source backend for adding personal agents to your
+Zupflow is a standalone, open-source backend for adding AI agents to your
 product. Create an isolated workspace for each of your customers, connect their
 accounts, give an agent access to selected tools, and run it inside your own
 experience.
