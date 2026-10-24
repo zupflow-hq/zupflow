@@ -1,0 +1,148 @@
+---
+// How the three layers decide each tool of one installation: what the app
+// offers, the organization's level, and the agent's grant. Illustrative data.
+import { siLinear } from "simple-icons";
+
+type Result = "ok" | "wait" | "no";
+const rows: { tool: string; level: string; grant: string; result: Result; says: string }[] = [
+  { tool: "list_issues", level: "allow", grant: "granted", result: "ok", says: "Runs" },
+  {
+    tool: "update_issue",
+    level: "allow",
+    grant: "granted, approval_required",
+    result: "wait",
+    says: "Waits for approval",
+  },
+  { tool: "create_issue", level: "approve", grant: "granted", result: "wait", says: "Waits for approval" },
+  { tool: "archive_project", level: "allow", grant: "not granted", result: "no", says: "Never offered" },
+  { tool: "delete_issue", level: "deny", grant: "—", result: "no", says: "Never offered" },
+];
+---
+
+<figure class="zf-fig zf-decisions not-content">
+  <div class="zf-fig-body">
+    <div class="install">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d={siLinear.path} /></svg>
+      <span><strong>Linear</strong> <span class="zf-mono">k7m2qd</span></span>
+      <span class="zf-badge ok">connected</span>
+      <span class="agent">granted to <strong>Planner</strong></span>
+    </div>
+    <div class="table" role="table">
+      <div class="row head" role="row">
+        <span role="columnheader">Tool</span>
+        <span role="columnheader">Org level</span>
+        <span role="columnheader">Agent's grant</span>
+        <span role="columnheader">Result</span>
+      </div>
+      {
+        rows.map((row) => (
+          <div class="row" role="row">
+            <code role="cell">{row.tool}</code>
+            <span role="cell">
+              <span class:list={["level", row.level]}>{row.level}</span>
+            </span>
+            <span role="cell" class="grant">
+              {row.grant}
+            </span>
+            <span role="cell">
+              <span class:list={["zf-badge", row.result]}>{row.says}</span>
+            </span>
+          </div>
+        ))
+      }
+    </div>
+  </div>
+  <figcaption>The strictest layer wins. A tool the agent may never call is never shown to the model at all.</figcaption>
+</figure>
+
+<style>
+  .install {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    padding-bottom: 0.8rem;
+    border-bottom: 1px solid var(--sl-color-gray-5);
+    color: var(--sl-color-gray-2);
+    font-size: var(--sl-text-sm);
+  }
+  .install svg {
+    width: 1.9rem;
+    height: 1.9rem;
+    padding: 0.4rem;
+    border-radius: 0.45rem;
+    fill: var(--sl-color-gray-2);
+    background: var(--sl-color-gray-6);
+    border: 1px solid var(--sl-color-gray-5);
+  }
+  .install strong {
+    color: var(--sl-color-white);
+  }
+  .agent {
+    margin-left: auto;
+    font-size: var(--sl-text-xs);
+    color: var(--sl-color-gray-3);
+  }
+  .row {
+    display: grid;
+    grid-template-columns: 1.1fr 0.9fr 1.3fr 1fr;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.5rem 0.2rem;
+    border-bottom: 1px solid color-mix(in srgb, var(--sl-color-gray-5) 60%, transparent);
+    font-size: var(--sl-text-sm);
+  }
+  .row:last-child {
+    border-bottom: 0;
+  }
+  .row.head {
+    font-size: var(--sl-text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--sl-color-gray-3);
+  }
+  code {
+    font-size: 0.8rem;
+    color: var(--sl-color-white);
+    background: none;
+    padding: 0;
+  }
+  .grant {
+    color: var(--sl-color-gray-2);
+  }
+  .level {
+    font-family: var(--sl-font-mono);
+    font-size: 0.75rem;
+    padding: 0.08rem 0.4rem;
+    border-radius: 0.3rem;
+    border: 1px solid var(--sl-color-gray-5);
+    color: var(--sl-color-gray-2);
+  }
+  .level.deny {
+    border-color: color-mix(in srgb, #ef4444 50%, transparent);
+  }
+  .level.approve {
+    border-color: color-mix(in srgb, var(--zf-amber) 60%, transparent);
+  }
+  @media (max-width: 45rem) {
+    .row.head {
+      display: none;
+    }
+    .row {
+      grid-template-columns: 1fr auto;
+      row-gap: 0.3rem;
+    }
+    .row > :nth-child(2),
+    .row > :nth-child(4) {
+      justify-self: end;
+    }
+    .row > :nth-child(2),
+    .row > :nth-child(3) {
+      font-size: var(--sl-text-xs);
+    }
+    .agent {
+      margin-left: 0;
+    }
+  }
+</style>

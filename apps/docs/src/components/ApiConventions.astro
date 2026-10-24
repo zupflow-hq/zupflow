@@ -1,0 +1,72 @@
+---
+// The API's conventions, each with an example request or response beside it.
+import "./ApiReference.css";
+---
+
+<div class="zf-api-intro not-content">
+  <div class="zf-api-op">
+    <div class="zf-api-doc">
+      <h3>Authentication</h3>
+      <p>Send a bearer token on every request. An API key (<code>zf_test_…</code> in Sandbox, <code>zf_live_…</code> in Production) acts in its organization and environment, and sees nothing of the other environment. Keep keys on your backend, never in a browser.</p>
+      <p>A Console session also sends <code>Zupflow-Organization</code> to say which organization it acts in.</p>
+    </div>
+    <div class="zf-api-code">
+      <div class="zf-api-panel">
+        <div class="zf-api-panel-head"><span>Authenticated request</span></div>
+        <pre><span class="t-flag">curl</span> https://zupflow.example.com/v1/workspaces/ws_034a8swzUzvsQ2inuZzZfA \
+  <span class="t-flag">-H</span> <span class="t-str">"Authorization: Bearer $ZUPFLOW_API_KEY"</span></pre>
+      </div>
+    </div>
+  </div>
+  <div class="zf-api-op">
+    <div class="zf-api-doc">
+      <h3>Responses and errors</h3>
+      <p>Every response is an envelope: <code>data</code> on success, <code>error</code> on failure, and <code>meta</code> for paging. Branch on <code>error.code</code>, never on <code>error.message</code>. A validation error names the fields that failed in <code>error.fields</code>.</p>
+      <p>IDs are prefixed and opaque (<code>ws_…</code>, <code>run_…</code>). A malformed ID, an ID of another type, or one in another organization answers <code>404</code>, exactly like a missing one.</p>
+    </div>
+    <div class="zf-api-code">
+      <div class="zf-api-panel">
+        <div class="zf-api-panel-head"><span>Error</span><span class="zf-api-status" style="color:#f04438">400</span></div>
+        <pre>&#123;
+  <span class="t-key">"data"</span>: <span class="t-lit">null</span>,
+  <span class="t-key">"meta"</span>: <span class="t-lit">null</span>,
+  <span class="t-key">"error"</span>: &#123;
+    <span class="t-key">"code"</span>: <span class="t-str">"validation_failed"</span>,
+    <span class="t-key">"message"</span>: <span class="t-str">"The request body is invalid."</span>,
+    <span class="t-key">"fields"</span>: &#123; <span class="t-key">"slug"</span>: <span class="t-str">"Use lowercase letters, digits and dashes."</span> &#125;
+  &#125;
+&#125;</pre>
+      </div>
+    </div>
+  </div>
+  <div class="zf-api-op">
+    <div class="zf-api-doc">
+      <h3>Pagination</h3>
+      <p>Lists are paged on the server. Pass <code>limit</code> (1 to 100, default 25) and, for the next page, the <code>cursor</code> from <code>meta.pagination.next_cursor</code>. When <code>next_cursor</code> is <code>null</code>, you have every item. The SDK's list methods page for you.</p>
+    </div>
+    <div class="zf-api-code">
+      <div class="zf-api-panel">
+        <div class="zf-api-panel-head"><span>Next page</span></div>
+        <pre><span class="t-flag">curl</span> <span class="t-str">"https://zupflow.example.com/v1/organizations/org_034WrceamQGAwHgTod2dHN/workspaces?limit=25&amp;cursor=eyJpZCI6IjAzNEgifQ"</span> \
+  <span class="t-flag">-H</span> <span class="t-str">"Authorization: Bearer $ZUPFLOW_API_KEY"</span></pre>
+      </div>
+    </div>
+  </div>
+  <div class="zf-api-op">
+    <div class="zf-api-doc">
+      <h3>Idempotency</h3>
+      <p>Every <code>POST</code> accepts an <code>Idempotency-Key</code>. Sending the same key and request again replays the first response, so a retry after a timeout never creates two runs. The same key with a different request answers <code>422</code>; one still in flight answers <code>409</code>. Keys are kept for 24 hours. The SDK sets one for you.</p>
+      <p>Secrets (API keys, webhook signing secrets) appear once, in the response that creates them. A replay of that request answers <code>409</code> rather than showing the secret again.</p>
+    </div>
+    <div class="zf-api-code">
+      <div class="zf-api-panel">
+        <div class="zf-api-panel-head"><span>Safe retry</span></div>
+        <pre><span class="t-flag">curl</span> <span class="t-flag">-X</span> POST https://zupflow.example.com/v1/workspaces/ws_034a8swzUzvsQ2inuZzZfA/agents/agt_034HXHH2LZFzvoaSAhfGVC/runs \
+  <span class="t-flag">-H</span> <span class="t-str">"Authorization: Bearer $ZUPFLOW_API_KEY"</span> \
+  <span class="t-flag">-H</span> <span class="t-str">"Idempotency-Key: 6f1c0f2e-run-acct_1042-42"</span> \
+  <span class="t-flag">-H</span> <span class="t-str">"Content-Type: application/json"</span> \
+  <span class="t-flag">-d</span> '&#123; <span class="t-key">"input"</span>: <span class="t-str">"What is due this week?"</span> &#125;'</pre>
+      </div>
+    </div>
+  </div>
+</div>

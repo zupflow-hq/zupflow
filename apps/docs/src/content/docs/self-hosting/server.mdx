@@ -1,0 +1,73 @@
+---
+title: Running the server
+description: Build and run the Zupflow server, and choose how the Console signs in.
+sidebar:
+  order: 2
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+The server is one Rust binary, `zupflow`, serving the API, the hosted Connect page and the background workers, with its data in one SQLite file.
+
+## Build
+
+```bash
+cd server
+cargo build --release --locked -p zupflow-server
+./target/release/zupflow
+```
+
+A plain build leaves out the development-only crates (the contract fixture server and Taskboard).
+
+## Sign-in: `local` or `oidc`
+
+`ZUPFLOW_IDENTITY` is required, with no default.
+
+### `local`: one person, one machine
+
+No sign-in: every Console request is one built-in owner. Because that trusts anyone who can reach the port, the server refuses to start with it on anything but a loopback address, and answers only requests addressed to `localhost`, `127.0.0.1` or `[::1]`.
+
+<Aside type="danger">
+  Never expose a `local` server through a tunnel or proxy that rewrites the `Host` header. Every request would arrive
+  as the owner.
+</Aside>
+
+`local` exists only in builds with the `local-identity` feature, on by default. Build with `--no-default-features` for a deployment, so it can't be turned on.
+
+### `oidc`: a team
+
+The Console signs in through any OpenID Connect provider with the authorization code flow and PKCE, and the server verifies the provider's ID token.
+
+```bash
+ZUPFLOW_IDENTITY=oidc
+ZUPFLOW_OIDC_ISSUER=https://auth.example.com
+ZUPFLOW_OIDC_AUDIENCE=<the Console's client ID>
+ZUPFLOW_SECRET_KEY=$(openssl rand -base64 32)
+```
+
+The provider's client for the Console must be public (no secret), allow the redirect URI `{Console origin}/sign-in/callback`, and answer its token endpoint cross-origin.
+
+## The secret key
+
+`ZUPFLOW_SECRET_KEY` (32 bytes, base64) keys what must not be guessable from the database: API keys and idempotency fingerprints are stored as an HMAC under it, and the key that seals credentials is derived from it. With `oidc` it's required and lives outside the database.
+
+<Aside type="caution">
+  Changing the secret key invalidates every API key and every stored credential. Keep it in your secret manager and
+  never regenerate it.
+</Aside>
+
+## The Console
+
+The Console is a static build. Build it with the API's URL and the sign-in provider's origins, and serve it from any static host:
+
+```bash
+VITE_ZUPFLOW_API_URL=https://api.example.com \
+VITE_ZUPFLOW_OIDC_ORIGINS=https://auth.example.com \
+pnpm --filter @zupflow/console build
+```
+
+Set `ZUPFLOW_CONSOLE_ORIGIN` on the server to the origin it's served from. Whatever serves it must also send `Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options: DENY`.
+
+## Health
+
+`GET /health` answers when the process is up, `GET /ready` when it can serve. Logs are JSON lines; runs and tool calls log their transitions and latencies, never inputs, outputs, arguments or credentials.

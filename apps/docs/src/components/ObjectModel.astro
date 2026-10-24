@@ -1,0 +1,286 @@
+---
+// The core objects in the scopes that hold them: an organization, its two
+// environments, and a workspace with how its objects relate. Static: nothing
+// in the figure is a link.
+import { siGithub, siHubspot, siJira, siLinear, siNotion, siStripe } from "simple-icons";
+
+interface Props {
+  /** Show the Sandbox and Production scopes between the organization and its workspaces. */
+  environments?: boolean;
+}
+const { environments = true } = Astro.props;
+
+const apps = [siNotion, siLinear, siStripe, siGithub, siHubspot, siJira];
+---
+
+<figure class:list={["zf-objects not-content", { flat: !environments }]} aria-labelledby="zf-objects-caption">
+  <div class="scope org">
+    <div class="head">
+      <span class="name">Organization</span><code>org_</code>
+      <span class="note">your company</span>
+    </div>
+    <div class="pills">
+      <span>Apps <code>app_</code></span>
+      <span>Tool policy</span>
+      <span>Model connections <code>mcn_</code></span>
+      <span>Members</span>
+    </div>
+
+    <div class="envs">
+      <div class="scope env sandbox">
+        <div class="head env-head">
+          <span class="env-chip sandbox">Sandbox</span>
+          <span class="note">environment</span>
+        </div>
+        <div class="pills">
+          <span>API keys <code>key_</code></span>
+          <span>Webhook endpoints <code>we_</code></span>
+        </div>
+
+        <div class="scope ws">
+          <div class="head">
+            <span class="name">Workspace</span><code>ws_</code>
+            <span class="note">one per customer of yours</span>
+          </div>
+          <div class="flow">
+            <div class="node">
+              <span class="name">Installation</span><code>inst_</code>
+              <span class="note">a connected account</span>
+              <span class="apps" aria-label={`For example ${apps.map((app) => app.title).join(", ")}`}>
+                {
+                  apps.map((app) => (
+                    <svg viewBox="0 0 24 24" role="img" aria-hidden="true">
+                      <title>{app.title}</title>
+                      <path d={app.path} />
+                    </svg>
+                  ))
+                }
+              </span>
+            </div>
+            <div class="edge"><span>granted to</span></div>
+            <div class="node">
+              <span class="name">Agent</span><code>agt_</code>
+              <span class="note">instructions + model</span>
+            </div>
+            <div class="edge"><span>starts</span></div>
+            <div class="node accent">
+              <span class="name">Run</span><code>run_</code>
+              <span class="note">events and tool calls</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {
+        environments && (
+          <div class="scope env production">
+        <div class="head">
+          <span class="env-chip production">Production</span>
+          <span class="note">environment</span>
+        </div>
+            <p class="same">The same objects, kept apart. Nothing falls back from one environment to the other.</p>
+          </div>
+        )
+      }
+    </div>
+  </div>
+  <figcaption id="zf-objects-caption">
+    Each object lives in exactly one scope. One customer's workspace never reaches another's.
+  </figcaption>
+</figure>
+
+<style>
+  .zf-objects {
+    margin-block: 2rem;
+  }
+  .scope {
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.75rem;
+    padding: 1rem 1.1rem 1.1rem;
+  }
+  .org {
+    background: var(--sl-color-black);
+  }
+  .env {
+    background: var(--sl-color-gray-6);
+  }
+  .ws {
+    margin-top: 0.9rem;
+    background: var(--sl-color-black);
+    border-color: color-mix(in srgb, var(--sl-color-accent) 45%, var(--sl-color-gray-5));
+  }
+  .head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.45rem;
+  }
+  .name {
+    font-weight: 700;
+    color: var(--sl-color-white);
+  }
+  .note {
+    font-size: var(--sl-text-xs);
+    color: var(--sl-color-gray-3);
+  }
+  code {
+    font-family: var(--sl-font-mono);
+    font-size: 0.72rem;
+    color: var(--sl-color-gray-3);
+  }
+  .pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-top: 0.7rem;
+  }
+  .pills span {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.35rem;
+    padding: 0.2rem 0.6rem;
+    font-size: var(--sl-text-xs);
+    font-weight: 500;
+    color: var(--sl-color-gray-2);
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 999px;
+  }
+  .envs {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.75rem;
+    margin-top: 1rem;
+  }
+  .scope.env.production {
+    border-style: dashed;
+  }
+  .scope.env.production {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.5rem 1rem;
+    padding-block: 0.8rem;
+  }
+  .same {
+    flex: 1 1 18rem;
+    margin: 0;
+    font-size: var(--sl-text-sm);
+    line-height: 1.5;
+    color: var(--sl-color-gray-3);
+  }
+  .flow {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr);
+    align-items: stretch;
+    margin-top: 0.85rem;
+  }
+  .node {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    align-content: flex-start;
+    gap: 0.1rem 0.4rem;
+    padding: 0.6rem 0.7rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.5rem;
+    background: var(--sl-color-gray-6);
+  }
+  .node .name {
+    font-size: var(--sl-text-sm);
+  }
+  .node .note {
+    flex-basis: 100%;
+  }
+  .apps {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    flex-basis: 100%;
+    margin-top: 0.45rem;
+  }
+  .apps svg {
+    width: 1.5rem;
+    height: 1.5rem;
+    padding: 0.3rem;
+    border-radius: 0.35rem;
+    background: var(--sl-color-black);
+    border: 1px solid var(--sl-color-gray-5);
+    fill: var(--sl-color-gray-2);
+  }
+  .node.accent {
+    border-color: var(--sl-color-accent);
+  }
+  .edge {
+    position: relative;
+    align-self: center;
+    min-width: 4.75rem;
+    height: 1px;
+    margin: 0 0.25rem;
+    background: var(--sl-color-gray-4);
+  }
+  .edge::after {
+    content: "";
+    position: absolute;
+    right: -1px;
+    top: -4px;
+    border: 4.5px solid transparent;
+    border-left: 6px solid var(--sl-color-gray-4);
+    border-right: 0;
+  }
+  .edge span {
+    position: absolute;
+    left: 50%;
+    bottom: 0.3rem;
+    transform: translateX(-50%);
+    font-size: 0.68rem;
+    white-space: nowrap;
+    color: var(--sl-color-gray-3);
+  }
+  figcaption {
+    margin-top: 0.75rem;
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-3);
+  }
+  /* Without environments, the workspace sits right inside the organization. */
+  .flat .envs,
+  .flat .env {
+    display: contents;
+  }
+  .flat .env-head {
+    display: none;
+  }
+  .flat .env > .pills {
+    margin-top: 0.4rem;
+  }
+  .flat .ws {
+    margin-top: 1rem;
+  }
+  @media (max-width: 50rem) {
+    .envs {
+      grid-template-columns: 1fr;
+    }
+    .flow {
+      grid-template-columns: 1fr;
+      gap: 0;
+    }
+    .edge {
+      width: 1px;
+      height: 1.6rem;
+      min-width: 0;
+      margin: 0 auto;
+    }
+    .edge::after {
+      right: -4px;
+      top: auto;
+      bottom: -1px;
+      border: 4.5px solid transparent;
+      border-top: 6px solid var(--sl-color-gray-4);
+      border-bottom: 0;
+    }
+    .edge span {
+      left: 0.6rem;
+      bottom: 50%;
+      transform: translateY(50%);
+    }
+  }
+</style>

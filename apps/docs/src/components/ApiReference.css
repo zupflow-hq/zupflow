@@ -1,0 +1,390 @@
+/* The reference gets the room a two-column layout needs. */
+:root:has(.zf-api) {
+  --sl-content-width: 78rem;
+}
+
+.zf-api {
+  margin-top: 1.5rem;
+}
+
+.zf-api-toolbar {
+  position: sticky;
+  top: calc(var(--sl-nav-height) + 0.5rem);
+  z-index: 3;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.5rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.6rem;
+  background: var(--sl-color-black);
+}
+.zf-api-toolbar input,
+.zf-api-toolbar select {
+  font: inherit;
+  font-size: var(--sl-text-sm);
+  color: var(--sl-color-white);
+  background: var(--sl-color-gray-6);
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.4rem;
+  padding: 0.4rem 0.6rem;
+}
+.zf-api-toolbar input {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+.zf-api-toolbar input:focus,
+.zf-api-toolbar select:focus {
+  outline: 2px solid var(--sl-color-accent);
+  outline-offset: 1px;
+}
+.zf-api-count {
+  font-size: var(--sl-text-xs);
+  color: var(--sl-color-gray-3);
+  margin-inline-start: auto;
+}
+
+.zf-api-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 1rem 0 0.5rem;
+}
+.zf-api-groups a {
+  font-size: var(--sl-text-xs);
+  font-weight: 500;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 999px;
+  color: var(--sl-color-gray-2);
+  text-decoration: none;
+}
+.zf-api-groups a:hover {
+  border-color: var(--sl-color-accent);
+  color: var(--sl-color-white);
+}
+.zf-api-groups span {
+  color: var(--sl-color-gray-4);
+  margin-inline-start: 0.15rem;
+}
+
+.zf-api section {
+  scroll-margin-top: calc(var(--sl-nav-height) + 4.5rem);
+}
+.zf-api-group {
+  margin: 3.5rem 0 0;
+  padding-bottom: 0.6rem;
+  font-size: var(--sl-text-h3);
+  letter-spacing: -0.015em;
+  color: var(--sl-color-white);
+  border-bottom: 1px solid var(--sl-color-gray-5);
+}
+
+/* One operation: the docs, and beside them a request and its response. */
+.zf-api-op {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 2.5rem;
+  padding: 2.25rem 0;
+  border-bottom: 1px solid var(--sl-color-hairline);
+  scroll-margin-top: calc(var(--sl-nav-height) + 4.5rem);
+}
+@media (max-width: 64rem) {
+  .zf-api-op {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1.25rem;
+  }
+}
+
+.zf-api-doc h3 {
+  margin: 0;
+  font-size: var(--sl-text-h4);
+  line-height: 1.3;
+  color: var(--sl-color-white);
+}
+.zf-api-doc h3 a {
+  color: inherit;
+  text-decoration: none;
+}
+.zf-api-doc h3 a:hover {
+  text-decoration: underline;
+  text-decoration-color: var(--sl-color-gray-4);
+}
+.zf-api-doc h3 code {
+  font-size: 0.85em;
+}
+.zf-api-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.65rem 0 0;
+}
+.zf-api-path {
+  font-family: var(--sl-font-mono);
+  font-size: 0.82rem;
+  color: var(--sl-color-gray-2);
+  overflow-wrap: anywhere;
+}
+.zf-api-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  margin: 0.6rem 0 0;
+}
+.zf-api-opid {
+  font-family: var(--sl-font-mono);
+  font-size: 0.72rem;
+  color: var(--sl-color-gray-3);
+}
+
+.zf-api-method {
+  display: inline-block;
+  font-family: var(--sl-font-mono);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  padding: 0.1rem 0.45rem;
+  border-radius: 0.3rem;
+}
+.m-get {
+  color: #2fbf71;
+  background: color-mix(in srgb, #2fbf71 14%, transparent);
+}
+.m-post {
+  color: #35c8f5;
+  background: color-mix(in srgb, #35c8f5 14%, transparent);
+}
+.m-patch,
+.m-put {
+  color: #f5a524;
+  background: color-mix(in srgb, #f5a524 14%, transparent);
+}
+.m-delete {
+  color: #f04438;
+  background: color-mix(in srgb, #f04438 14%, transparent);
+}
+:root[data-theme="light"] .m-get {
+  color: #157a45;
+}
+:root[data-theme="light"] .m-post {
+  color: #0a6f92;
+}
+:root[data-theme="light"] .m-patch,
+:root[data-theme="light"] .m-put {
+  color: #8a5a00;
+}
+:root[data-theme="light"] .m-delete {
+  color: #b42318;
+}
+
+.zf-api-caller {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--sl-color-gray-5);
+  color: var(--sl-color-gray-2);
+}
+.zf-api-caller.c-secret {
+  border-color: color-mix(in srgb, var(--zf-amber) 50%, transparent);
+}
+
+.zf-api-fields {
+  margin-top: 1.5rem;
+}
+.zf-api-fields h4 {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin: 0 0 0.25rem;
+  padding-bottom: 0.4rem;
+  font-size: var(--sl-text-xs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--sl-color-gray-3);
+  border-bottom: 1px solid var(--sl-color-gray-5);
+}
+.zf-api-fields h4 .zf-api-type {
+  text-transform: none;
+  letter-spacing: 0;
+}
+.zf-api-fields dl {
+  margin: 0;
+}
+.zf-api-fields dl > div {
+  padding: 0.6rem 0;
+  border-bottom: 1px solid var(--sl-color-hairline);
+}
+.zf-api-fields dt {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.2rem 0.5rem;
+}
+.zf-api-name {
+  font-family: var(--sl-font-mono);
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--sl-color-white);
+}
+.zf-api-type {
+  font-family: var(--sl-font-mono);
+  font-size: 0.74rem;
+  color: var(--sl-color-gray-3);
+  overflow-wrap: anywhere;
+}
+.zf-api-req {
+  font-size: 0.66rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #d8781e;
+}
+.zf-api-fields dd {
+  margin: 0.3rem 0 0;
+  font-size: var(--sl-text-sm);
+  color: var(--sl-color-gray-2);
+  line-height: 1.5;
+}
+.zf-api-fields dd code,
+.zf-api-doc h3 code {
+  font-family: var(--sl-font-mono);
+  font-size: 0.8em;
+  padding: 0.05rem 0.3rem;
+  border-radius: 0.25rem;
+  background: var(--sl-color-gray-6);
+}
+.zf-api-returns {
+  margin: 0.5rem 0 0;
+  font-size: var(--sl-text-sm);
+  color: var(--sl-color-gray-2);
+}
+.zf-api-returns > code:first-child {
+  font-family: var(--sl-font-mono);
+  font-weight: 600;
+  color: var(--sl-color-white);
+}
+
+/* The code column: always dark, as in the console. */
+.zf-api-code {
+  display: grid;
+  gap: 0.9rem;
+  align-content: start;
+  position: sticky;
+  top: calc(var(--sl-nav-height) + 4.5rem);
+  max-height: calc(100vh - var(--sl-nav-height) - 6rem);
+}
+@media (max-width: 64rem) {
+  .zf-api-code {
+    position: static;
+    max-height: none;
+  }
+}
+.zf-api-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-radius: 0.6rem;
+  overflow: hidden;
+  background: #0d1417;
+  border: 1px solid #1f2b30;
+}
+.zf-api-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.5rem 0.8rem;
+  font-size: var(--sl-text-xs);
+  font-weight: 600;
+  color: #8a9aa1;
+  background: #141e22;
+  border-bottom: 1px solid #1f2b30;
+}
+.zf-api-panel-head code {
+  font-family: var(--sl-font-mono);
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: #c1ccd1;
+  overflow-wrap: anywhere;
+}
+.zf-api-status {
+  margin-inline-start: auto;
+  font-family: var(--sl-font-mono);
+  color: #2fbf71;
+}
+.zf-api-panel pre {
+  margin: 0;
+  padding: 0.85rem 1rem;
+  overflow: auto;
+  font-family: var(--sl-font-mono);
+  font-size: 0.76rem;
+  line-height: 1.6;
+  color: #c1ccd1;
+  font-variant-ligatures: none;
+  tab-size: 2;
+}
+.zf-api-response {
+  max-height: 26rem;
+}
+.t-key {
+  color: #79c0ff;
+}
+.t-str {
+  color: #a5d6ff;
+}
+.t-num {
+  color: #ffa657;
+}
+.t-lit {
+  color: #ff7b72;
+}
+.t-flag {
+  color: #d2a8ff;
+}
+.t-url {
+  color: #e6edf3;
+}
+
+.zf-api-empty {
+  color: var(--sl-color-gray-3);
+  margin-top: 1.5rem;
+}
+/* The code column is dark in both themes, so its methods keep the dark colors. */
+:root[data-theme="light"] .zf-api-panel .m-get {
+  color: #2fbf71;
+}
+:root[data-theme="light"] .zf-api-panel .m-post {
+  color: #35c8f5;
+}
+:root[data-theme="light"] .zf-api-panel :is(.m-patch, .m-put) {
+  color: #f5a524;
+}
+:root[data-theme="light"] .zf-api-panel .m-delete {
+  color: #f04438;
+}
+
+/* The conventions above the endpoints reuse the operation layout. */
+.zf-api-intro .zf-api-op:first-child {
+  padding-top: 1rem;
+}
+.zf-api-intro .zf-api-code {
+  position: static;
+  max-height: none;
+}
+.zf-api-doc p {
+  margin: 0.7rem 0 0;
+  font-size: var(--sl-text-sm);
+  line-height: 1.6;
+  color: var(--sl-color-gray-2);
+}
+.zf-api-doc p code {
+  font-family: var(--sl-font-mono);
+  font-size: 0.8em;
+  padding: 0.05rem 0.3rem;
+  border-radius: 0.25rem;
+  background: var(--sl-color-gray-6);
+}

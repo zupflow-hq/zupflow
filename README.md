@@ -13,6 +13,7 @@ against an in-browser mock of it.
 ```
 apps/
   console/        Developer Console — Vite, React 19, TanStack Router + Query, shadcn/ui
+  docs/           Documentation site — Astro Starlight, Markdown/MDX with React components
 packages/
   contract/       @zupflow/contract — zod schemas, route table, generated openapi.json
   contract-tests/ @zupflow/contract-tests — the black-box suite every server must pass
@@ -886,6 +887,17 @@ stay in an owner-only temporary directory that the runner removes on completion,
 failure or a handled interrupt. CI uploads no browser artifacts. Investigate a
 failure using fixed, source-controlled diagnostic labels rather than logging
 URLs, errors, request data or the DOM.
+
+## Documentation
+
+The documentation site is `apps/docs` ([Starlight](https://starlight.astro.build)):
+pages are Markdown or MDX in `src/content/docs`, and anything interactive is a
+React component in `src/components`. Its API reference is built from
+`packages/contract/openapi.json`, so it follows the contract.
+
+```bash
+pnpm --filter @zupflow/docs dev   # http://localhost:5190
+```
 
 ## Checks
 

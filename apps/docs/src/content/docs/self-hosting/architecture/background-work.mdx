@@ -1,0 +1,106 @@
+---
+title: Background work
+description: The job queue, the outbox, webhook delivery, tool discovery and channels.
+sidebar:
+  order: 4
+---
+
+Anything that must happen even if the process stops runs as a **job**. The server's workers run in the same process as the API, each on loops of its own, all claiming from one [`JobQueue`](/self-hosting/architecture/traits/#jobqueue).
+
+```mermaid
+flowchart LR
+    API["API handlers<br/>and stores"] -->|enqueue, in the<br/>change's transaction| Q[("Job queue")]
+    Q --> D["Discovery worker<br/>list an app's tools"]
+    Q --> R["Run worker<br/>advance runs"]
+    Q --> WA["Webhook announcer<br/>events → deliveries"]
+    Q --> WD["Webhook deliverers<br/>sign and send"]
+    Q --> CP["Channel worker<br/>apps, tokens, upkeep"]
+    Q --> CI["Inbound worker<br/>who answers a message"]
+    Q --> CR["Reply worker<br/>post a run's answer"]
+    R -->|run events| Q
+```
+
+## The job queue
+
+A job belongs to the scope it was enqueued in, and a worker gets that scope back with it. Claiming is the one operation that starts without a scope (a worker takes the next job of any organization); everything after it (complete, retry, postpone, bury, extend) names the job's scope again, so a job ID and lease used from another scope reach nothing.
+
+- **Leases.** A claim holds the job for a lease. A worker that crashes or stalls loses it when the lease runs out, and the job is claimed again as its next attempt. A lapsed lease reaches nothing, so a stalled worker can't finish or retry a job it no longer holds.
+- **At least once.** Every handler is idempotent, or records what it did before acting.
+- **Small payloads.** A job carries references (an event's ID, an installation's ID), never secrets or bulk data. Workers read everything again in the job's own scope.
+- **Dead jobs.** A job whose last attempt fails or lapses is dead, never claimed again.
+
+The basic queue lives in the same SQLite database as the stores, which is what lets a change and its jobs commit together.
+
+## The outbox
+
+A change that causes an event never sends it directly. It queues an **announcement** job in its own transaction: the run store when it appends a run event a webhook names, the tool registry when a listing changes a tool. A rolled-back change announces nothing, and a committed one is never lost.
+
+```mermaid
+sequenceDiagram
+    participant S as Store
+    participant Q as Job queue
+    participant A as Announcer
+    participant WS as WebhookStore
+    participant D as Deliverer
+    participant E as Your endpoint
+    S->>Q: change + announcement job (one transaction)
+    A->>Q: claim announcement
+    A->>WS: record_event (idempotent by event ID)
+    WS->>Q: one delivery job per subscribed endpoint
+    D->>Q: claim delivery
+    D->>D: open the endpoint's secret, sign
+    D->>E: POST signed event
+    alt 2xx within 10s
+        D->>Q: complete
+    else anything else
+        D->>Q: retry later, with jitter
+    end
+```
+
+## Webhook delivery
+
+Announcements and deliveries run on separate loops, so a slow endpoint never holds up an announcement.
+
+- The announcer reads what the event names, builds the event body once, and records it with one delivery per enabled endpoint of the organization and environment that subscribes to its type.
+- Deliverers sign the body with the endpoint's secret (opened at the moment of sending and nowhere else) and send it through [`OutboundHttp`](/self-hosting/architecture/traits/#outboundhttp). Any `2xx` within 10 seconds is success. Anything else is retried after 1 minute, 5 minutes, 30 minutes, then 2, 6, 12 and 24 hours (eight attempts in all, with jitter). The response body is never read or stored.
+- An endpoint has one delivery in flight at a time, across every worker.
+- Only the endpoint's own failures count as attempts. When Zupflow itself can't send (a store or the key service is down), the job backs off without touching the endpoint.
+
+Delivery is at least once and unordered: a delivery cut off by a restart is sent again with the same event ID. See [Webhooks](/concepts/webhooks/) for verifying signatures.
+
+## Tool discovery
+
+When an installation connects, a job lists its app's tools through the installation's credential and records them in the [`ToolRegistry`](/self-hosting/architecture/traits/#the-stores) as that installation's own. A connect never waits for, or fails because of, discovery.
+
+The registry **pins** each tool's definition. A tool whose definition later changes is marked as changed and can't be called until someone reviews it, so an MCP server can't quietly widen what an agent does.
+
+## Channels
+
+Agents can also be reached in a team's chat. The pieces are the same: jobs, the outbox, and one trait per seam.
+
+```mermaid
+sequenceDiagram
+    participant P as Chat provider
+    participant IN as Inbound endpoint
+    participant CS as ChannelStore
+    participant J as Inbound job
+    participant H as MessageHandler
+    participant R as Run engine
+    participant RJ as Reply job
+    P->>IN: signed event (no credential)
+    IN->>IN: ChannelProvider.verify + read
+    IN->>CS: record delivery, queue inbound job (one transaction)
+    J->>CS: candidates: active agents the author may reach
+    J->>H: decide(message, thread, candidates)
+    H-->>J: dispatches
+    J->>CS: record each dispatch, check the loop breaker
+    CS->>R: start or continue the session's run
+    R->>CS: final answer queues the reply job
+    RJ->>P: post the answer with the app's token
+```
+
+- The provider's inbound endpoint holds no credential. The delivery's signature, by the app's own signing secret, authorizes it, and only a verified body is read.
+- The [`MessageHandler`](/self-hosting/architecture/traits/#messagehandler) only decides **which** agents answer. The inbound job enforces every rule before and after it: sender lists, automated accounts, other agents, the hop limit and the conversation's loop breaker.
+- One run per message. A message in a thread continues the session's run, with its earlier runs as a cached prefix (see [the run engine](/self-hosting/architecture/run-engine/#keeping-the-prompt-cache-warm)).
+- The reply job posts a channel run's answer. A retried reply looks for a post whose answer was lost before posting again, so nothing is posted twice.
+- The channel worker makes each agent's app at the provider through the [`AppProvisioner`](/self-hosting/architecture/traits/#appprovisioner), rotates tokens, and keeps apps in step with their agents.

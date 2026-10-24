@@ -1,0 +1,19 @@
+---
+title: API reference
+description: Every endpoint of the Zupflow API, generated from the contract.
+tableOfContents: false
+sidebar:
+  order: 1
+---
+
+import ApiConventions from "../../../components/ApiConventions.astro";
+import ApiReference from "../../../components/ApiReference.tsx";
+import { apiVersion, endpoints } from "../../../lib/openapi";
+
+This page is generated from `@zupflow/contract` (API version {apiVersion}), the same source the server, the SDK and the Console are checked against. Download the full [OpenAPI document](/openapi.json).
+
+<ApiConventions />
+
+## Endpoints
+
+<ApiReference client:load endpoints={endpoints} />

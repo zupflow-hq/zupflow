@@ -1,0 +1,50 @@
+---
+title: Apps, Connect and installations
+description: How your customers connect their accounts, and how Zupflow keeps the credentials.
+sidebar:
+  order: 2
+---
+
+import ConnectFlow from "../../../components/ConnectFlow.astro";
+
+## Apps
+
+An **app** is a service an agent can use through its MCP server. Apps live in your organization's **catalog**, or in a single workspace for one-off ones.
+
+An app's authentication is one of:
+
+- **`mcp_oauth`**: the MCP server's own OAuth, discovered from its metadata, with dynamic client registration and PKCE. Nothing to configure.
+- **`oauth2`**: a configured OAuth client (authorize URL, token URL, client ID and secret, scopes), per environment.
+- **Token**: the person pastes an API key or token, checked against the app's inputs and verified at its `verify_url`.
+
+Each environment has its own configuration for an app. An app that isn't configured in an environment can't be connected there.
+
+## Connect
+
+**Connect** is how a person connects their account. Your backend creates a session; Zupflow hosts the page that runs the flow.
+
+<ConnectFlow />
+
+```ts
+const session = await zupflow.connectSessions.create(workspaceId, {
+  app_id: appId,
+  intent: "create",          // or "reconnect", with installation_id
+  label: "Work Linear",
+  installation_id: null,
+  return_url: "https://app.example.com/settings/integrations",
+});
+// Send the person to session.url, in a redirect or a popup.
+```
+
+The hosted page lives at `/connect/{reference}` on your Zupflow URL. The reference is a bearer secret: possession authorizes the page, so never log it. When the session finishes, the page returns the person to `return_url`, which must be on your environment's exact allowlist, or tells the opener window and closes. See [Connect an account](/guides/connect/).
+
+## Installations
+
+A successful Connect creates an **installation**: one connected account of one app, in one workspace. Its credentials are encrypted at rest and opened only to call that installation's MCP server.
+
+- `short_id` is six characters naming it within the workspace, for people and models. It never changes.
+- `status` is `connected`, `reconnect_required` or `disconnected`. OAuth tokens are refreshed before they expire; when refreshing fails, the installation needs a reconnect and Zupflow sends `installation.reconnect_required`.
+
+## The tool registry
+
+Once an installation connects, Zupflow lists its app's tools into the installation's **tool registry**. The first definition of each tool is pinned. A later listing that changes a tool keeps the new definition beside the old one, **for review**, and sends `app.tools_changed`; calls keep using the reviewed definition until someone accepts the change.

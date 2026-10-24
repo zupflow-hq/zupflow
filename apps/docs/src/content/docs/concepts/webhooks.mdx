@@ -1,0 +1,73 @@
+---
+title: Webhooks
+description: Signed deliveries for runs, approvals and connected accounts.
+sidebar:
+  order: 5
+---
+
+import { Aside } from "@astrojs/starlight/components";
+import RetrySchedule from "../../../components/RetrySchedule.astro";
+import WebhookPlayground from "../../../components/WebhookPlayground.tsx";
+
+Webhooks tell your backend when something happens that it should act on. Endpoints belong to the organization and one environment, and subscribe to event types.
+
+## Event types
+
+| Type | When |
+| --- | --- |
+| `run.completed`, `run.failed`, `run.cancelled` | A run ended. |
+| `run.waiting_for_approval` | A run needs your product to ask the person. |
+| `installation.connected` | An account was connected or reconnected. |
+| `installation.reconnect_required` | An account's credentials stopped working. |
+| `installation.disconnected` | An account was disconnected or deleted. |
+| `connect_session.completed`, `connect_session.failed` | A Connect session finished. |
+| `app.tools_changed` | A connected app changed a tool's definition: review it. |
+| `webhook.test` | The Console's test button. Needs no subscription. |
+
+Events are **lean**: type, IDs, environment, the workspace's `external_id` and the object's status. Read the object through the API for the rest.
+
+```json
+{
+  "id": "evt_034HXHH2LZFzvoaSAhfGVC",
+  "type": "run.completed",
+  "created_at": "2026-10-04T21:04:11Z",
+  "environment": "production",
+  "organization_id": "org_034CmCMi0M7gup3a0htwn5",
+  "workspace": { "id": "ws_034FpGDIRLk8Of6gikx8DG", "external_id": "cus_1042" },
+  "data": { "object": "run", "id": "run_034HXHH2LZFzvoaSAhfGVD", "agent_id": "agt_034HXHH2LZFzvoaSAhfGVC", "status": "completed" }
+}
+```
+
+## Verifying a delivery
+
+Every delivery carries `Zupflow-Signature: t=<unix seconds>,v1=<hex>`, an HMAC-SHA256 of `"<t>.<raw body>"` under the endpoint's signing secret, plus `Zupflow-Event-Id`, `Zupflow-Event-Type` and `Zupflow-Delivery-Attempt`. The SDK checks the signature, the timestamp (5 minutes by default) and the body:
+
+```ts
+import { verifyWebhook } from "@zupflow/sdk";
+
+const raw = await request.text(); // the body exactly as received
+const verified = await verifyWebhook(raw, request.headers.get("Zupflow-Signature"), process.env.ZUPFLOW_WEBHOOK_SECRET!);
+if (!verified.known) return new Response(null, { status: 204 }); // a newer event type
+switch (verified.event.type) {
+  case "run.waiting_for_approval":
+    // ask the person
+}
+```
+
+<Aside>Verify the raw body. Parsing and re-serializing the JSON first changes the bytes and breaks the signature.</Aside>
+
+Try it here: sign the sample, then change a character of the body or the secret and verify again. It runs in your browser with the SDK's own functions.
+
+<WebhookPlayground client:visible />
+
+## Delivery
+
+<RetrySchedule />
+
+- Any `2xx` within 10 seconds is success. Anything else is retried about 1 minute, 5 minutes, 30 minutes, 2, 6, 12 and 24 hours later: eight attempts.
+- Delivery is **at least once and unordered**, with the same event ID every time. Deduplicate on `id`.
+- An endpoint that fails every attempt for three days is disabled. Enabling it again doesn't replay what it missed; resend deliveries from the history instead.
+
+## Rotating the secret
+
+`POST /v1/organizations/{org}/webhooks/{hook}/roll-secret` returns the new secret once. For 24 hours, deliveries carry two `v1` signatures, one per secret, and `verifyWebhook` accepts either, so you can switch without dropping deliveries.

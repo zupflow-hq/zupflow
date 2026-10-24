@@ -1,0 +1,141 @@
+---
+// What your product might show a person when a run waits for approval, with the
+// fields it comes from. Illustrative: the prompt is yours to design.
+import { siLinear } from "simple-icons";
+---
+
+<figure class="zf-fig zf-approval not-content">
+  <div class="zf-fig-body">
+    <div class="layout">
+      <div class="prompt">
+        <div class="head">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d={siLinear.path} /></svg>
+          <span><strong>Planner</strong> wants to update an issue in Linear</span>
+        </div>
+        <dl>
+          <dt>Issue</dt>
+          <dd>ENG-212 · Billing export times out</dd>
+          <dt>Change</dt>
+          <dd>Cycle: <s>This sprint</s> → Next sprint</dd>
+        </dl>
+        <div class="actions">
+          <span class="btn ghost">Deny</span>
+          <span class="btn">Allow</span>
+        </div>
+      </div>
+      <ul class="fields">
+        <li><code>approval.requested</code> event</li>
+        <li><code>call_id</code> to answer with</li>
+        <li><code>app_name</code>, <code>tool</code> and <code>arguments</code> to show</li>
+        <li><code>resolveApproval</code> with <code>approved</code> or <code>denied</code></li>
+      </ul>
+    </div>
+  </div>
+  <figcaption>The prompt lives in your product, in your design. Zupflow supplies the call; your backend sends the answer.</figcaption>
+</figure>
+
+<style>
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr);
+    align-items: center;
+    gap: 1.5rem;
+  }
+  .prompt {
+    padding: 1rem 1.1rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.7rem;
+    background: var(--sl-color-gray-6);
+    box-shadow: 0 10px 30px -18px rgb(0 0 0 / 0.45);
+  }
+  .head {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-2);
+  }
+  .head svg {
+    flex: none;
+    width: 1.8rem;
+    height: 1.8rem;
+    padding: 0.38rem;
+    border-radius: 0.45rem;
+    fill: var(--sl-color-gray-2);
+    background: var(--sl-color-black);
+    border: 1px solid var(--sl-color-gray-5);
+  }
+  .head strong {
+    color: var(--sl-color-white);
+  }
+  dl {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.35rem 0.9rem;
+    margin: 0.9rem 0;
+    padding: 0.7rem 0.8rem;
+    border-radius: 0.45rem;
+    background: var(--sl-color-black);
+    font-size: var(--sl-text-sm);
+  }
+  dt {
+    color: var(--sl-color-gray-3);
+  }
+  dd {
+    margin: 0;
+    color: var(--sl-color-white);
+  }
+  s {
+    color: var(--sl-color-gray-3);
+  }
+  .actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+  }
+  .btn {
+    padding: 0.3rem 0.9rem;
+    border-radius: 0.4rem;
+    font-size: var(--sl-text-sm);
+    font-weight: 600;
+    color: var(--sl-color-black);
+    background: var(--sl-color-accent);
+  }
+  .btn.ghost {
+    color: var(--sl-color-gray-2);
+    background: none;
+    border: 1px solid var(--sl-color-gray-5);
+  }
+  .fields {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.6rem;
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-2);
+  }
+  .fields li {
+    position: relative;
+    margin: 0;
+    padding-left: 1.1rem;
+  }
+  .fields li::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0.55rem;
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 50%;
+    background: var(--zf-amber);
+  }
+  .fields code {
+    font-size: 0.78rem;
+  }
+  @media (max-width: 45rem) {
+    .layout {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

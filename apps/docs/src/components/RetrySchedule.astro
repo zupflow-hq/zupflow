@@ -1,0 +1,91 @@
+---
+// When a webhook delivery is tried again. The gaps widen with each attempt.
+const attempts = ["now", "+1m", "+5m", "+30m", "+2h", "+6h", "+12h", "+24h"];
+---
+
+<figure class="zf-fig zf-retries not-content">
+  <div class="zf-fig-body">
+    <div class="track">
+      {
+        attempts.map((label, i) => (
+          <>
+            {i > 0 && <span class="gap" style={`flex-grow: ${i}`} />}
+            <div class="attempt">
+              <span class="n">{i + 1}</span>
+              <span class="label zf-mono">{label}</span>
+            </div>
+          </>
+        ))
+      }
+    </div>
+    <div class="outcomes">
+      <span><span class="zf-badge ok">2xx within 10s</span> Delivered.</span>
+      <span><span class="zf-badge no">8 attempts failed</span> Marked failed. Resend it from the history.</span>
+    </div>
+  </div>
+  <figcaption>Eight attempts over about two days, at least once and in no set order. Deduplicate on the event <code>id</code>.</figcaption>
+</figure>
+
+<style>
+  .track {
+    position: relative;
+    display: flex;
+    align-items: flex-start;
+    padding: 0.4rem 0 0.2rem;
+  }
+  .track::before {
+    content: "";
+    position: absolute;
+    left: 0.9rem;
+    right: 0.9rem;
+    top: 1.3rem;
+    height: 2px;
+    background: linear-gradient(90deg, var(--sl-color-accent), var(--sl-color-gray-5));
+  }
+  .attempt {
+    position: relative;
+    display: grid;
+    justify-items: center;
+    gap: 0.35rem;
+    flex: 0 0 auto;
+  }
+  .gap {
+    flex-basis: 0.4rem;
+  }
+  .n {
+    display: grid;
+    place-items: center;
+    width: 1.8rem;
+    height: 1.8rem;
+    border-radius: 50%;
+    font-family: var(--sl-font-mono);
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: var(--sl-color-accent);
+    background: var(--sl-color-black);
+    border: 1px solid color-mix(in srgb, var(--sl-color-accent) 55%, transparent);
+  }
+  .attempt:first-of-type .n {
+    color: var(--sl-color-black);
+    background: var(--sl-color-accent);
+  }
+  .label {
+    color: var(--sl-color-gray-3);
+  }
+  .outcomes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem 1.75rem;
+    margin-top: 1rem;
+    padding-top: 0.85rem;
+    border-top: 1px solid var(--sl-color-gray-5);
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-2);
+  }
+  .outcomes > span {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+  }
+</style>

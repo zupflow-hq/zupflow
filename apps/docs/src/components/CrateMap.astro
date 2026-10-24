@@ -1,0 +1,117 @@
+---
+// The server's crates in layers: the binary on top, the adapters it wires in,
+// and the core every crate depends on.
+const adapters = [
+  ["zupflow-sqlite", "stores + job queue"],
+  ["zupflow-basic", "keys, cache, events, policy"],
+  ["zupflow-outbound", "safe HTTPS client"],
+  ["zupflow-mcp", "MCP client"],
+  ["zupflow-providers", "OpenAI, Anthropic, OpenRouter"],
+  ["zupflow-oidc", "OpenID Connect sign-in"],
+  ["zupflow-slack", "Slack channels"],
+  ["zupflow-channels", "fake channel provider"],
+];
+---
+
+<figure class="zf-crates not-content">
+  <div class="band">
+    <span class="label">Binary</span>
+    <div class="crate main"><code>zupflow-server</code><span>HTTP API, workers, the <code>zupflow</code> binary</span></div>
+  </div>
+  <div class="arrow" aria-hidden="true">wires in ↓</div>
+  <div class="band">
+    <span class="label">Adapters</span>
+    <div class="grid">
+      {
+        adapters.map(([name, note]) => (
+          <div class="crate">
+            <code>{name}</code>
+            <span>{note}</span>
+          </div>
+        ))
+      }
+    </div>
+  </div>
+  <div class="arrow" aria-hidden="true">implement ↓</div>
+  <div class="band core">
+    <span class="label">Core</span>
+    <div class="crate main"><code>zupflow-core</code><span>types, rules and every trait</span></div>
+    <div class="crate side"><code>zupflow-conformance</code><span>one suite per trait</span></div>
+  </div>
+  <figcaption>Everything depends on <code>zupflow-core</code>; nothing in the core depends on an adapter.</figcaption>
+</figure>
+
+<style>
+  .zf-crates {
+    margin-block: 1.75rem;
+    display: grid;
+    gap: 0.4rem;
+  }
+  .band {
+    display: grid;
+    grid-template-columns: 6rem 1fr;
+    gap: 0.75rem;
+    align-items: center;
+    padding: 0.85rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.75rem;
+    background: var(--sl-color-black);
+  }
+  .band.core {
+    grid-template-columns: 6rem 1fr 1fr;
+    border-color: color-mix(in srgb, var(--sl-color-accent) 50%, var(--sl-color-gray-5));
+    background: color-mix(in srgb, var(--sl-color-accent-low) 40%, var(--sl-color-black));
+  }
+  .label {
+    font-size: var(--sl-text-xs);
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--sl-color-gray-3);
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr));
+    gap: 0.5rem;
+  }
+  .crate {
+    display: grid;
+    gap: 0.15rem;
+    padding: 0.55rem 0.7rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.5rem;
+    background: var(--sl-color-gray-6);
+  }
+  .crate > code {
+    font-family: var(--sl-font-mono);
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--sl-color-white);
+    background: none;
+    padding: 0;
+  }
+  .crate > span {
+    font-size: var(--sl-text-xs);
+    color: var(--sl-color-gray-3);
+    line-height: 1.35;
+  }
+  .crate span code {
+    font-size: 0.72rem;
+  }
+  .arrow {
+    text-align: center;
+    font-size: var(--sl-text-xs);
+    color: var(--sl-color-gray-3);
+  }
+  figcaption {
+    margin-top: 0.4rem;
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-3);
+  }
+  @media (max-width: 40rem) {
+    .band,
+    .band.core {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

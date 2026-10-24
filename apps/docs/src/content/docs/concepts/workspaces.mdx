@@ -1,0 +1,52 @@
+---
+title: Organizations and workspaces
+description: Organizations, members, environments and workspaces, and how they isolate data.
+sidebar:
+  order: 1
+---
+
+import ObjectModel from "../../../components/ObjectModel.astro";
+
+Everything in Zupflow belongs to your organization, and everything an agent touches belongs to one workspace: one per customer of yours.
+
+<ObjectModel environments={false} />
+
+## Organizations
+
+An **organization** is your company's account on Zupflow. It owns the app catalog, the tool policy, model providers, API keys and webhooks. People join it as **members** with a role:
+
+| Role | Can |
+| --- | --- |
+| `owner` | Everything, including managing other owners. |
+| `admin` | Manage members, keys, webhooks, policy and providers. |
+| `developer` | Build: apps, agents, grants, workspaces, runs in Sandbox. |
+| `viewer` | Read only. |
+
+Nobody joins an organization without accepting an invitation, sent to their email address.
+
+## Environments
+
+Every organization has two environments, <span class="env-chip sandbox">Sandbox</span> and <span class="env-chip production">Production</span>. API keys, app configuration, Connect settings, model providers, default models and webhooks are all per environment, and **configuration never falls back** from one environment to the other.
+
+The Console doesn't act in Production: it never starts runs or connects accounts there. Your product does that through the API.
+
+## Workspaces
+
+A **workspace** is one of your customers. Everything an agent touches lives inside exactly one workspace: installations, agents, grants and runs.
+
+```ts
+const workspace = await zupflow.workspaces.create(organizationId, {
+  name: "Acme Corp",
+  slug: "acme",
+  environment: "sandbox",
+  external_id: "cus_1042", // your own ID for this customer
+});
+```
+
+- A workspace's **environment is fixed** when it's created.
+- `external_id` is your own reference. It comes back in every webhook event, so you can route events without storing Zupflow's IDs.
+- Organizations can have thousands of workspaces. Lists are paged and searched on the server.
+
+## Two layers of isolation
+
+No organization reaches another, and no workspace reaches another within its organization. Every request is checked against both, and an ID alone never grants access. That's why workspace-scoped endpoints carry the workspace in the path (`/v1/workspaces/{ws}/…`), and an ID from another workspace answers `404` like a missing one.

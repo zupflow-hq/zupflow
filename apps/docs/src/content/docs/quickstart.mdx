@@ -1,0 +1,138 @@
+---
+title: Quickstart
+description: Get an API key, create a workspace and an agent, and start your first run.
+---
+
+import { Aside, Steps, Tabs, TabItem } from "@astrojs/starlight/components";
+import StepStrip from "../../components/StepStrip.astro";
+
+In ten minutes you'll create a workspace for a customer, give it an agent, and start a run, all from your backend with an API key.
+
+<StepStrip
+  steps={[
+    { title: "API key", text: "A Sandbox key from the Console" },
+    { title: "Model", text: "Connect a provider, pick a default" },
+    { title: "Workspace", text: "One per customer of yours" },
+    { title: "Agent", text: "Instructions and a model" },
+    { title: "Run", text: "Start it, read its events" },
+  ]}
+/>
+
+You need your Zupflow API URL and access to the Console. Every example uses `$ZUPFLOW_URL` for the API URL.
+
+<Steps>
+
+1. **Create a Sandbox API key.** In the Console, open **Developers → API keys** and create a key for **Sandbox**. Copy the secret now: it's shown once. Sandbox keys start with `zf_test_`.
+
+2. **Give Sandbox a model.** Under **Developers → Model providers**, connect a provider with your own key (OpenAI, Anthropic or OpenRouter), add one of its models and make it Sandbox's default. Agents without a model of their own use it.
+
+3. **Create a workspace** for a customer, with your own ID for them as `external_id`.
+
+   <Tabs syncKey="lang">
+     <TabItem label="TypeScript">
+
+     ```ts
+     import { createClient, createHttpTransport } from "@zupflow/sdk";
+
+     const zupflow = createClient(
+       createHttpTransport({
+         baseUrl: process.env.ZUPFLOW_URL!,
+         getToken: async () => process.env.ZUPFLOW_API_KEY!,
+       }),
+     );
+
+     const workspace = await zupflow.workspaces.create(organizationId, {
+       name: "Acme Corp",
+       slug: "acme",
+       environment: "sandbox",
+       external_id: "cus_1042",
+     });
+     ```
+
+     </TabItem>
+     <TabItem label="curl">
+
+     ```bash
+     curl -X POST $ZUPFLOW_URL/v1/organizations/$ORG/workspaces \
+       -H "Authorization: Bearer $ZUPFLOW_API_KEY" \
+       -H "Content-Type: application/json" \
+       -H "Idempotency-Key: $(uuidgen)" \
+       -d '{"name":"Acme Corp","slug":"acme","environment":"sandbox","external_id":"cus_1042"}'
+     ```
+
+     </TabItem>
+   </Tabs>
+
+4. **Create an agent** in that workspace.
+
+   <Tabs syncKey="lang">
+     <TabItem label="TypeScript">
+
+     ```ts
+     const agent = await zupflow.agents.create(workspace.id, {
+       name: "Planner",
+       description: "Plans the team's week.",
+       instructions: "You help the team plan their week. Be brief.",
+       model_id: null, // Sandbox's default model
+     });
+     ```
+
+     </TabItem>
+     <TabItem label="curl">
+
+     ```bash
+     curl -X POST $ZUPFLOW_URL/v1/workspaces/$WS/agents \
+       -H "Authorization: Bearer $ZUPFLOW_API_KEY" \
+       -H "Content-Type: application/json" \
+       -H "Idempotency-Key: $(uuidgen)" \
+       -d '{"name":"Planner","description":"Plans the team'"'"'s week.","instructions":"You help the team plan their week. Be brief.","model_id":null}'
+     ```
+
+     </TabItem>
+   </Tabs>
+
+5. **Start a run** and read what happened.
+
+   <Tabs syncKey="lang">
+     <TabItem label="TypeScript">
+
+     ```ts
+     const run = await zupflow.runs.create(workspace.id, agent.id, { input: "Hello" });
+
+     // Later, or when the run.completed webhook arrives:
+     const events = await zupflow.runs.events(workspace.id, run.id);
+     const done = await zupflow.runs.get(workspace.id, run.id);
+     console.log(done.status, done.output);
+     ```
+
+     </TabItem>
+     <TabItem label="curl">
+
+     ```bash
+     curl -X POST $ZUPFLOW_URL/v1/workspaces/$WS/agents/$AGENT/runs \
+       -H "Authorization: Bearer $ZUPFLOW_API_KEY" \
+       -H "Content-Type: application/json" \
+       -H "Idempotency-Key: $(uuidgen)" \
+       -d '{"input":"Hello"}'
+
+     curl $ZUPFLOW_URL/v1/workspaces/$WS/runs/$RUN/events \
+       -H "Authorization: Bearer $ZUPFLOW_API_KEY"
+     ```
+
+     </TabItem>
+   </Tabs>
+
+   You can also watch it in the Console under **Runs**.
+
+</Steps>
+
+<Aside type="tip" title="Keys stay on your backend">
+  An API key acts with every permission in its organization and environment. Never send it to a browser or a mobile
+  app; your frontend talks to your backend, and your backend talks to Zupflow.
+</Aside>
+
+## Next steps
+
+- Give the agent real tools: [Build your first agent](/guides/first-agent/) connects an account, grants tools and handles webhooks.
+- Ask a person before sensitive calls: [Ask before acting](/guides/approvals/).
+- Every endpoint, with examples: [API reference](/reference/api/).
