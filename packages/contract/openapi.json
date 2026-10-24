@@ -15872,7 +15872,7 @@
       },
       "delete": {
         "operationId": "deleteChannelConnection",
-        "summary": "Disconnect: the token is revoked, and the connection, its conversations, messages and agent channel removed. Its app waits for a new install",
+        "summary": "Disconnect: the token is revoked, and the connection, its conversations, messages and agent channel removed. Its app waits for a new install. A provider this deployment doesn't reach can't revoke the token: `501 channel_providers_not_configured`, and nothing is removed",
         "security": [
           {
             "consoleSession": [],

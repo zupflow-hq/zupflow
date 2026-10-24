@@ -334,9 +334,10 @@ async fn install(state: &AppState, session: &ConnectSession, code: &str) -> Resu
             ProvisionError::Refused(_) | ProvisionError::TokensRefused | ProvisionError::AppNotFound => {
                 Failed("token_exchange_failed")
             }
-            ProvisionError::Unavailable | ProvisionError::RateLimited { .. } | ProvisionError::NotConfigured => {
-                Failed("provider_unavailable")
-            }
+            ProvisionError::Unavailable
+            | ProvisionError::RateLimited { .. }
+            | ProvisionError::NotConfigured
+            | ProvisionError::Unreached => Failed("provider_unavailable"),
         })?;
     let ConsentedInstall {
         external_app_id,

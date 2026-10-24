@@ -10,7 +10,9 @@
 //! event names only its app's inbound reference) and
 //! [`ChannelStore::reap_stranded_apps_cross_tenant`] and
 //! [`ChannelStore::queue_due_rotations_cross_tenant`] (sweeps, like a
-//! worker's claim, that then work on each row in its own scope).
+//! worker's claim, that then work on each row in its own scope), and
+//! [`ChannelStore::count_teams_by_provider_cross_tenant`] (a count, naming
+//! no tenant).
 //!
 //! **Concurrency.** Every change takes the acting [`ChannelEditor`] and
 //! checks, inside its own transaction, that they still may: an active member
@@ -922,6 +924,12 @@ pub trait ChannelStore: Send + Sync {
         limit: u32,
         now: Timestamp,
     ) -> Result<RotationSweep, ChannelError>;
+
+    /// **Cross-tenant, by design:** how many linked teams every workspace
+    /// holds together, by provider, so a server that doesn't reach one of
+    /// them can say so at startup. A count only: it names no organization,
+    /// workspace or team.
+    async fn count_teams_by_provider_cross_tenant(&self) -> Result<Vec<(ChannelProviderKind, u64)>, ChannelError>;
 
     /// A deleted app is removed at its provider: it no longer holds its
     /// manager back from being unlinked. Whether it changed.

@@ -2821,6 +2821,10 @@ impl ChannelStore for SqliteChannelStore {
         lifecycle::queue_due_rotations_cross_tenant(self, rotate, due_by, limit, now).await
     }
 
+    async fn count_teams_by_provider_cross_tenant(&self) -> Result<Vec<(ChannelProviderKind, u64)>, ChannelError> {
+        lifecycle::count_teams_by_provider_cross_tenant(self).await
+    }
+
     async fn record_app_released(
         &self,
         organization_id: OrganizationId,
@@ -4057,6 +4061,8 @@ mod tests {
         // A sweep over every workspace's channel data for what's past
         // retention, each then swept in its own scope.
         "retention_due_cross_tenant",
+        // A count of every workspace's linked teams by provider, naming none.
+        "count_teams_by_provider_cross_tenant",
     ];
 
     /// Statements on a workspace's tables that hold to the organization

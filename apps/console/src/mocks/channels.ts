@@ -568,12 +568,8 @@ export function deleteWorkspaceChannels(d: Db, workspace: { id: WorkspaceId; org
 
 /** The fake provider makes the app at once: the job's work, after the `202` was written. */
 function provisionApp(app: ChannelAppRow, at: string) {
-  // A provider this deployment doesn't reach makes nothing: the job fails it.
-  if (!db().channel_providers.includes(app.provider)) {
-    app.last_error = "provisioner_unavailable";
-    setAppStatus(app, "failed", at);
-    return;
-  }
+  // A provider this deployment doesn't reach makes nothing yet: the job waits for a deployment that does.
+  if (!db().channel_providers.includes(app.provider)) return;
   app.external_app_id = `A0${upper(app.id, 9)}`;
   setAppStatus(app, "awaiting_install", at);
 }
@@ -1312,6 +1308,15 @@ export function createChannelHandlers(
         const access = workspaceAccess(request, param(params, "ws"));
         requireRole(access, DEVELOPERS, "disconnect channels");
         const row = findConnection(access, params);
+        // Nothing here could revoke its token: kept, still working, for a deployment that can.
+        if (!db().channel_providers.includes(row.provider)) {
+          const name = CHANNEL_PROVIDER_NAMES[row.provider];
+          throw new ApiFailure(
+            501,
+            "channel_providers_not_configured",
+            `This deployment can't reach ${name}, so it can't revoke this connection's token there; nothing was removed. ${SETUP_HINT[row.provider]}`,
+          );
+        }
         const d = db();
         const at = now();
         setConnectionStatus(row, "disconnected", at);

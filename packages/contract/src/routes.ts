@@ -1194,7 +1194,7 @@ export const routes: readonly Route[] = [
     method: "delete",
     path: "/v1/workspaces/{ws}/channel-connections/{channel_connection}",
     summary:
-      "Disconnect: the token is revoked, and the connection, its conversations, messages and agent channel removed. Its app waits for a new install",
+      "Disconnect: the token is revoked, and the connection, its conversations, messages and agent channel removed. Its app waits for a new install. A provider this deployment doesn't reach can't revoke the token: `501 channel_providers_not_configured`, and nothing is removed",
     callers: both,
     params: { ...ws, channel_connection: idSchema("channel_connection") },
     response: noContent,

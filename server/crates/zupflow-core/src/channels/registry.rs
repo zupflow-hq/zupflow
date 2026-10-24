@@ -9,9 +9,12 @@
 //! stored with, never a global one.
 //!
 //! A kind the server doesn't reach answers through stand-ins, so callers
-//! need no special case: its provisioner says `NotConfigured` to every call,
-//! and its provider refuses every delivery and answers every call
-//! `Unavailable`, which the jobs try again later.
+//! need no special case. Its provisioner says `NotConfigured` to what a
+//! person asks at once (linking a team, allowing an app), and `Unreached`
+//! to what a job does for a team, app or connection already stored, which
+//! waits, using no attempt, for a server that reaches it: a restart with
+//! the provider's settings picks it up. Its provider refuses every delivery
+//! and answers every call `Unavailable`.
 
 use std::sync::Arc;
 
@@ -89,8 +92,9 @@ impl ChannelProviders {
         self.entry(kind).is_some()
     }
 
-    /// What makes apps in `kind`'s teams: `NotConfigured` to every call
-    /// when the server doesn't reach it.
+    /// What makes apps in `kind`'s teams: when the server doesn't reach it,
+    /// one that answers `NotConfigured` to what a person asks and
+    /// `Unreached` to what a job does.
     pub fn provisioner(&self, kind: ChannelProviderKind) -> Arc<dyn AppProvisioner> {
         match self.entry(kind) {
             Some(entry) => entry.provisioner.clone(),
@@ -114,7 +118,8 @@ impl ChannelProviders {
     }
 }
 
-/// The provisioner of a kind the server doesn't reach.
+/// The provisioner of a kind the server doesn't reach: `NotConfigured` to
+/// checking tokens and consent, `Unreached` to the rest.
 struct Unreached;
 
 #[async_trait]
@@ -133,7 +138,7 @@ impl AppProvisioner for Unreached {
     }
 
     async fn rotate_tokens(&self, _: &dyn OutboundHttp, _: &ManagerTokens) -> Result<RotatedTokens, ProvisionError> {
-        Err(ProvisionError::NotConfigured)
+        Err(ProvisionError::Unreached)
     }
 
     async fn create(
@@ -142,11 +147,11 @@ impl AppProvisioner for Unreached {
         _: &ManagerTokens,
         _: &AppManifest,
     ) -> Result<CreatedApp, ProvisionError> {
-        Err(ProvisionError::NotConfigured)
+        Err(ProvisionError::Unreached)
     }
 
     async fn find(&self, _: &dyn OutboundHttp, _: &ManagerTokens, _: &str) -> Result<Option<String>, ProvisionError> {
-        Err(ProvisionError::NotConfigured)
+        Err(ProvisionError::Unreached)
     }
 
     async fn update(
@@ -156,11 +161,11 @@ impl AppProvisioner for Unreached {
         _: &str,
         _: &AppManifest,
     ) -> Result<(), ProvisionError> {
-        Err(ProvisionError::NotConfigured)
+        Err(ProvisionError::Unreached)
     }
 
     async fn delete(&self, _: &dyn OutboundHttp, _: &ManagerTokens, _: &str) -> Result<(), ProvisionError> {
-        Err(ProvisionError::NotConfigured)
+        Err(ProvisionError::Unreached)
     }
 
     fn consent_url(&self, _: &ConsentRequest<'_>) -> Result<String, ProvisionError> {
@@ -176,7 +181,7 @@ impl AppProvisioner for Unreached {
     }
 
     async fn revoke_install(&self, _: &dyn OutboundHttp, _: &str) -> Result<(), ProvisionError> {
-        Err(ProvisionError::NotConfigured)
+        Err(ProvisionError::Unreached)
     }
 }
 
@@ -360,7 +365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_a_provider_every_call_is_not_configured_or_unavailable() {
+    async fn without_a_provider_every_call_is_refused_or_waits() {
         let none = ChannelProviders::none();
         assert!(none.available().is_empty());
         assert!(none.providers().is_empty());
@@ -372,9 +377,18 @@ mod tests {
             Some(ProvisionError::NotConfigured)
         );
         assert_eq!(provisioner.consent_url(&consent()), Err(ProvisionError::NotConfigured));
+        // What a job does for what's stored waits for a server that reaches it.
+        assert_eq!(
+            provisioner.rotate_tokens(&NoRequests, &tokens()).await.err(),
+            Some(ProvisionError::Unreached)
+        );
+        assert_eq!(
+            provisioner.delete(&NoRequests, &tokens(), "A1").await,
+            Err(ProvisionError::Unreached)
+        );
         assert_eq!(
             provisioner.revoke_install(&NoRequests, "xoxb-1").await,
-            Err(ProvisionError::NotConfigured)
+            Err(ProvisionError::Unreached)
         );
         let provider = none.provider(slack);
         assert_eq!(provider.kind(), slack);

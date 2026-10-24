@@ -220,6 +220,11 @@ pub enum ProvisionError {
     /// This server has no provisioner for the provider.
     #[error("no provisioner is configured")]
     NotConfigured,
+    /// This server doesn't reach the provider, so nothing was asked: what's
+    /// stored for it (a team's tokens, an app, a connection's token) waits,
+    /// using no attempt, for a server that does.
+    #[error("the provider isn't reached from this server")]
+    Unreached,
     /// The provider asked to wait this long before calling again (Slack's
     /// `Retry-After`): try again then, as a job, never by sleeping in a
     /// request. Nothing was done.

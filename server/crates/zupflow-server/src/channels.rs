@@ -586,7 +586,7 @@ pub(crate) fn provision_failure(error: ProvisionError, provider: ChannelProvider
                  with its refresh token."
             ),
         ),
-        ProvisionError::NotConfigured => ApiError::new(
+        ProvisionError::NotConfigured | ProvisionError::Unreached => ApiError::new(
             501,
             "channel_providers_not_configured",
             format!(
@@ -606,6 +606,22 @@ pub(crate) fn provision_failure(error: ProvisionError, provider: ChannelProvider
         )
         .into(),
     }
+}
+
+/// A connection whose token this server can't revoke, because it doesn't
+/// reach its provider: nothing is removed.
+fn not_revocable(provider: ChannelProviderKind) -> Failure {
+    let name = provider.name();
+    ApiError::new(
+        501,
+        "channel_providers_not_configured",
+        format!(
+            "This deployment can't reach {name}, so it can't revoke this connection's token there; nothing was \
+             removed. {}",
+            setup_hint(provider)
+        ),
+    )
+    .into()
 }
 
 /// What a deployment's operator does so the server reaches a provider.
@@ -1385,6 +1401,10 @@ async fn delete_connection(
     let (organization_id, workspace_id) = (access.access.organization_id, access.workspace.id);
     // Its token, opened before the store forgets it, to revoke at the provider after.
     let token = connection_token(&state, &access, &connection).await;
+    // Nothing here could revoke it: kept, still working, for a server that can.
+    if token.is_some() && !state.channel_providers.is_available(connection.provider) {
+        return Err(not_revocable(connection.provider));
+    }
     state
         .channels
         .delete_connection(
@@ -2390,8 +2410,9 @@ enum Outcome {
     Done,
     /// Worth another attempt later, with why.
     Retry(&'static str),
-    /// The provider asked to wait this long (its rate limit): tried again
-    /// then, without using up an attempt. Nothing was done.
+    /// Tried again after this long, without using up an attempt: the
+    /// provider asked to wait (its rate limit), or this server doesn't
+    /// reach it. Nothing was done.
     Wait(Duration),
 }
 
@@ -2493,6 +2514,7 @@ async fn clean_up(
             Ok(found) => found,
             Err(ProvisionError::Unavailable) => return Err(Outcome::Retry("provider_unavailable")),
             Err(ProvisionError::RateLimited { retry_after_secs }) => return Err(wait(retry_after_secs)),
+            Err(ProvisionError::Unreached) => return Err(Outcome::Wait(crate::channel_upkeep::UNREACHED_WAIT)),
             Err(error) => {
                 tracing::warn!(event = "channels.orphan_not_found", %organization_id, %workspace_id, %app_id, %error);
                 None
@@ -2506,6 +2528,7 @@ async fn clean_up(
             }
             Err(ProvisionError::Unavailable) => return Err(Outcome::Retry("provider_unavailable")),
             Err(ProvisionError::RateLimited { retry_after_secs }) => return Err(wait(retry_after_secs)),
+            Err(ProvisionError::Unreached) => return Err(Outcome::Wait(crate::channel_upkeep::UNREACHED_WAIT)),
             Err(error) => {
                 tracing::warn!(event = "channels.orphan_kept", %organization_id, %workspace_id, %app_id, %error);
             }
@@ -2565,6 +2588,8 @@ async fn discard(
 /// provider first; then the app is marked in flight, made, its provider ID
 /// recorded at once, its secrets sealed, and it's recorded as made. An app
 /// deleted or failed while in flight only has what was made for it deleted.
+/// One of a provider this server doesn't reach waits, using no attempt,
+/// for a server that does.
 async fn provision(
     state: &AppState,
     organization_id: OrganizationId,
@@ -2704,6 +2729,8 @@ async fn provision(
         Err(ProvisionError::NotConfigured) => return fail("provisioner_unavailable").await,
         // Nothing was made: asked again once Slack's wait is over.
         Err(ProvisionError::RateLimited { retry_after_secs }) => return wait(retry_after_secs),
+        // Nothing was asked: made by a server that reaches the provider.
+        Err(ProvisionError::Unreached) => return Outcome::Wait(crate::channel_upkeep::UNREACHED_WAIT),
         // Perhaps made all the same: the next attempt finds it by its events URL.
         Err(ProvisionError::Unavailable | ProvisionError::AppNotFound) => {
             return retry("provider_unavailable", "provider_unavailable").await;
@@ -2954,6 +2981,12 @@ pub async fn reap_once(state: &AppState) -> u32 {
 /// those that lapsed unrotated.
 pub async fn rotate_due(state: &AppState) {
     crate::channel_upkeep::sweep(state).await;
+}
+
+/// Logs, as an error, how many linked teams name each provider this server
+/// doesn't reach (a count per provider, naming no tenant): which it logged.
+pub async fn report_unreached(state: &AppState) -> Vec<(ChannelProviderKind, u64)> {
+    crate::channel_upkeep::report_unreached(state).await
 }
 
 /// Queues the retention sweeps that are due, one per workspace: how many.

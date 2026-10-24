@@ -696,9 +696,19 @@ waited out for a day after the run at most.
 
 `ZUPFLOW_SLACK_API_URL` points the calls somewhere other than
 `https://slack.com/api` (a stand-in, say); it must be `https://`, and consent
-pages are sent to `/oauth/v2/authorize` at the same origin. Without Slack, a
-delivery to a Slack app answers as one with a bad signature, and the jobs that
-would call Slack (replies, catch-up, token rotation) wait and try again.
+pages are sent to `/oauth/v2/authorize` at the same origin.
+
+Without Slack (a server whose `ZUPFLOW_PUBLIC_URL` isn't `https://`), linking
+a Slack team answers `501 channel_providers_not_configured`, a delivery to a
+Slack app answers as one with a bad signature, and disconnecting a Slack
+connection answers the same `501` with nothing removed, since its bot token
+can't be revoked. What's stored for Slack stays: rotating a team's tokens,
+making, syncing and removing apps (revoking their bot tokens first) wait,
+using no attempt, and carry on once the server is started again reaching
+Slack. At startup it logs `channels.provider_unreached`, as an error, with how
+many linked teams are waiting. Tokens that lapse meanwhile expire as ever (a
+configuration token lasts twelve hours), so their team needs new ones pasted.
+Replies and catch-up are tried and given up as when Slack doesn't answer.
 
 ### The contract suite against the backend
 

@@ -4106,7 +4106,7 @@ describe("channels", () => {
       .webhook_events.slice(since)
       .map((e) => [e.body.type, e.body.data]);
 
-  it("offers only the providers the deployment reaches, and links teams and makes apps nowhere else", async () => {
+  it("offers only the providers the deployment reaches, links teams nowhere else, and keeps what is stored", async () => {
     const workspace = sandbox();
     const agent = applessAgent(workspace);
     const manager = managerIn(workspace);
@@ -4129,13 +4129,21 @@ describe("channels", () => {
     );
     expect([invalid.status, invalid.code]).toEqual([501, "channel_providers_not_configured"]);
     expect(db().channel_app_managers).toHaveLength(managers);
-    // An app asked for meanwhile fails, as the job that would make it does.
+    // An app asked for meanwhile waits for a deployment that reaches the provider, as the job that makes it does.
     const app = await owner.channelApps.create(workspace.id, { agent_id: agent.id, manager_id: manager.id });
     expect(await owner.channelApps.get(workspace.id, app.id)).toMatchObject({
-      status: "failed",
-      last_error: "provisioner_unavailable",
+      status: "creating",
+      last_error: null,
       external_app_id: null,
     });
+    // A connection keeps its token, nothing here can revoke it.
+    const connection = must(
+      db().channel_connections.find((c) => inWorkspace(c, workspace)),
+      "connection",
+    );
+    const kept = await failure(owner.channelConnections.delete(workspace.id, connection.id));
+    expect([kept.status, kept.code]).toEqual([501, "channel_providers_not_configured"]);
+    expect(await owner.channelConnections.get(workspace.id, connection.id)).toMatchObject({ id: connection.id });
   });
 
   it("installs an agent's app on consent: a connection, its short ID, the agent's channel and the events", async () => {

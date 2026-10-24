@@ -152,8 +152,8 @@ pub fn model_catalog(config: &Config, outbound: &Arc<dyn OutboundHttp>) -> Arc<d
 ///   each linked team's configuration token, deliveries read in Slack's
 ///   format, people read with `users.info` and answers posted with
 ///   `chat.postMessage`, at `ZUPFLOW_SLACK_API_URL`. Otherwise Slack isn't
-///   available: linking a Slack team answers `501`, and the server starts
-///   all the same.
+///   available: linking a Slack team answers `501`, what's stored for Slack
+///   waits for a server that reaches it, and the server starts all the same.
 ///
 /// None holds a credential: each delivery is checked with its own app's
 /// signing secret, and each call made with its own team's or connection's
@@ -207,6 +207,7 @@ pub async fn serve(
             source,
         })?;
     tracing::info!(event = "server.listening", address = %config.listen);
+    crate::channels::report_unreached(&state).await;
     let worker = tokio::spawn(crate::discovery::run_worker(state.clone()));
     let runner = tokio::spawn(crate::run_engine::run_worker(state.clone()));
     let deliverer = tokio::spawn(crate::webhook_delivery::run_workers(state.clone()));
