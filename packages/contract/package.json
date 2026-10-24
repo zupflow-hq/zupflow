@@ -1,8 +1,26 @@
 {
   "name": "@zupflow/contract",
-  "version": "0.0.0",
+  "description": "The Zupflow API contract: zod schemas, routes, IDs and the OpenAPI document.",
+  "version": "0.1.0",
   "license": "Apache-2.0",
-  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zupflow-hq/zupflow.git",
+    "directory": "packages/contract"
+  },
+  "author": "Zupflow",
+  "homepage": "https://docs.zupflow.com",
+  "bugs": "https://github.com/zupflow-hq/zupflow/issues",
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "zupflow",
+    "ai-agents",
+    "mcp",
+    "openapi",
+    "zod"
+  ],
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
@@ -13,16 +31,49 @@
     "./openapi.json": "./openapi.json"
   },
   "scripts": {
+    "build": "tsdown",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "generate": "GENERATE_OPENAPI=1 vitest run src/openapi.test.ts"
+    "generate": "GENERATE_OPENAPI=1 vitest run src/openapi.test.ts",
+    "prepublishOnly": "pnpm build"
   },
   "dependencies": {
     "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/node": "^26.6.4",
+    "tsdown": "0.23.1",
     "typescript": "~6.0.2",
     "vitest": "^5.0.3"
+  },
+  "files": [
+    "dist",
+    "openapi.json"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "./idempotency": {
+        "types": "./dist/idempotency.d.ts",
+        "default": "./dist/idempotency.js"
+      },
+      "./ids": {
+        "types": "./dist/ids.d.ts",
+        "default": "./dist/ids.js"
+      },
+      "./schemas": {
+        "types": "./dist/schemas.d.ts",
+        "default": "./dist/schemas.js"
+      },
+      "./webhooks": {
+        "types": "./dist/webhooks.d.ts",
+        "default": "./dist/webhooks.js"
+      },
+      "./openapi.json": "./openapi.json"
+    }
   }
 }
