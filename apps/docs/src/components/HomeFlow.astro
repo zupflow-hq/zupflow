@@ -1,0 +1,634 @@
+---
+// The home page's picture of Zupflow: your product on the left, the
+// ready-made agent backend in the middle, your customers' apps and your
+// models on the right. Plain HTML and CSS, so it stacks on a phone and
+// follows the theme's tokens in light and dark. The moving pulses stop for
+// people who ask for reduced motion.
+import { siAnthropic, siGithub, siLinear, siNotion, siOpenrouter, siStripe } from "simple-icons";
+
+const apps = [siLinear, siNotion, siGithub, siStripe];
+const layers = [
+  {
+    name: "Connected accounts",
+    text: "Hosted Connect, OAuth and MCP sign-in. Tokens sealed and refreshed.",
+    kind: "accounts",
+  },
+  {
+    name: "Tool policy",
+    text: "Every call checked against your floor and the agent's grant.",
+    kind: "policy",
+  },
+  {
+    name: "Durable runs",
+    text: "The agent loop, saved step by step. Survives restarts.",
+    kind: "runs",
+  },
+  {
+    name: "Webhooks and audit",
+    text: "Signed events to your backend. Every change on record.",
+    kind: "events",
+  },
+];
+const steps = ["queued", "model", "tool", "approval", "done"];
+---
+
+<figure class="zf-flow not-content" aria-labelledby="zf-flow-caption">
+  <div class="zf-flow-grid">
+    <!-- Your product -->
+    <div class="zf-flow-col">
+      <p class="zf-flow-eyebrow">Your product</p>
+      <div class="zf-flow-card zf-flow-app">
+        <div class="zf-flow-bar" aria-hidden="true"><i></i><i></i><i></i><span>app.yourproduct.com</span></div>
+        <p class="zf-flow-msg zf-flow-user">Move anything overdue to next sprint.</p>
+        <p class="zf-flow-msg zf-flow-agent">3 issues are overdue. I'll move them.</p>
+        <div class="zf-flow-approval">
+          <p><strong>Planner</strong> wants to run <code>update_issue</code> ×3</p>
+          <div><span class="zf-flow-btn zf-flow-yes">Approve</span><span class="zf-flow-btn">Deny</span></div>
+        </div>
+      </div>
+      <div class="zf-flow-card zf-flow-backend">
+        <strong>Your backend</strong>
+        <span>holds the API key, starts runs, sends decisions</span>
+      </div>
+    </div>
+
+    <!-- Product ⇄ Zupflow -->
+    <div class="zf-flow-link" aria-hidden="true">
+      <div class="zf-flow-wire"><span>REST API</span><i class="zf-flow-pulse"></i></div>
+      <div class="zf-flow-wire zf-flow-back"><span>webhooks</span><i class="zf-flow-pulse"></i></div>
+    </div>
+
+    <!-- Zupflow -->
+    <div class="zf-flow-core">
+      <div class="zf-flow-core-head">
+        <img src="/favicon.svg" alt="" width="20" height="20" />
+        <strong>Zupflow</strong>
+        <span>the agent backend, ready to run</span>
+      </div>
+      <div class="zf-flow-tabs" aria-label="One isolated workspace per customer">
+        <span class="zf-flow-tab is-active">Acme</span>
+        <span class="zf-flow-tab">Globex</span>
+        <span class="zf-flow-tab">Initech</span>
+        <span class="zf-flow-tab zf-flow-more">+ 2,481 workspaces</span>
+      </div>
+      <ul class="zf-flow-layers">
+        {
+          layers.map((layer) => (
+            <li class={`zf-flow-layer zf-flow-${layer.kind}`}>
+              <div>
+                <strong>{layer.name}</strong>
+                <span>{layer.text}</span>
+              </div>
+              {layer.kind === "policy" && (
+                <p class="zf-flow-chips" aria-hidden="true">
+                  <span class="zf-flow-allow">allow</span>
+                  <span class="zf-flow-approve">approve</span>
+                  <span class="zf-flow-deny">deny</span>
+                </p>
+              )}
+              {layer.kind === "runs" && (
+                <ol class="zf-flow-steps" aria-hidden="true">
+                  {steps.map((step, i) => (
+                    <li style={`--i: ${i}`}>
+                      <i />
+                      <span>{step}</span>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </li>
+          ))
+        }
+      </ul>
+      <p class="zf-flow-envs" aria-hidden="true">
+        <span class="env-chip sandbox">Sandbox</span>
+        <span class="env-chip production">Production</span>
+      </p>
+    </div>
+
+    <!-- Zupflow ⇄ services -->
+    <div class="zf-flow-link" aria-hidden="true">
+      <div class="zf-flow-wire"><span>tool calls</span><i class="zf-flow-pulse"></i></div>
+      <div class="zf-flow-wire"><span>model turns</span><i class="zf-flow-pulse"></i></div>
+    </div>
+
+    <!-- Their apps and your models -->
+    <div class="zf-flow-col">
+      <p class="zf-flow-eyebrow">Their apps, through MCP</p>
+      <ul class="zf-flow-card zf-flow-list">
+        {
+          apps.map((app) => (
+            <li>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d={app.path} />
+              </svg>
+              {app.title}
+            </li>
+          ))
+        }
+        <li class="zf-flow-any">any MCP server</li>
+      </ul>
+      <p class="zf-flow-eyebrow">Your models, your keys</p>
+      <ul class="zf-flow-card zf-flow-list">
+        <li>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d={siAnthropic.path} /></svg>
+          Anthropic
+        </li>
+        <li><span class="zf-flow-mono" aria-hidden="true">AI</span>OpenAI</li>
+        <li>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d={siOpenrouter.path} /></svg>
+          OpenRouter
+        </li>
+      </ul>
+    </div>
+  </div>
+  <figcaption id="zf-flow-caption">
+    Your customers stay in your product. Your backend calls Zupflow, and Zupflow does the rest: their accounts, the
+    tools you allow, the model loop, approvals and every event back to you.
+  </figcaption>
+</figure>
+
+<style>
+  .zf-flow {
+    margin: 0.5rem 0 1rem;
+    --zf-flow-line: color-mix(in srgb, var(--sl-color-accent) 45%, var(--sl-color-gray-5));
+  }
+  .zf-flow-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 4.5rem minmax(0, 1.25fr) 4.5rem minmax(0, 0.85fr);
+    align-items: center;
+    padding: 1.5rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 1rem;
+    background:
+      radial-gradient(circle at 1px 1px, var(--sl-color-gray-5) 1px, transparent 0) 0 0 / 22px 22px,
+      var(--sl-color-black);
+  }
+  :where(.zf-flow) :where(p, ul, ol) {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .zf-flow-col {
+    display: grid;
+    gap: 0.6rem;
+  }
+  .zf-flow-eyebrow {
+    font-family: var(--sl-font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--sl-color-gray-3);
+  }
+  .zf-flow-col .zf-flow-eyebrow:not(:first-child) {
+    margin-top: 0.6rem;
+  }
+  .zf-flow-card {
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.7rem;
+    background: var(--sl-color-gray-6);
+    font-size: var(--sl-text-xs);
+    color: var(--sl-color-gray-2);
+  }
+
+  /* The product mock-up */
+  .zf-flow-app {
+    padding: 0 0.75rem 0.75rem;
+    display: grid;
+    gap: 0.45rem;
+  }
+  .zf-flow-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    margin: 0 -0.75rem 0.2rem;
+    padding: 0.45rem 0.75rem;
+    border-bottom: 1px solid var(--sl-color-gray-5);
+  }
+  .zf-flow-bar i {
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 50%;
+    background: var(--sl-color-gray-4);
+  }
+  .zf-flow-bar span {
+    margin-inline-start: 0.4rem;
+    font-family: var(--sl-font-mono);
+    font-size: 0.62rem;
+    color: var(--sl-color-gray-3);
+  }
+  .zf-flow-msg {
+    max-width: 88%;
+    padding: 0.4rem 0.6rem;
+    border-radius: 0.6rem;
+    line-height: 1.35;
+  }
+  .zf-flow-user {
+    justify-self: end;
+    background: var(--sl-color-accent-low);
+    color: var(--sl-color-accent-high);
+  }
+  .zf-flow-agent {
+    background: var(--sl-color-gray-5);
+    color: var(--sl-color-white);
+  }
+  .zf-flow-approval {
+    padding: 0.5rem 0.6rem;
+    border: 1px solid color-mix(in srgb, var(--zf-amber) 55%, transparent);
+    border-radius: 0.6rem;
+    background: color-mix(in srgb, var(--zf-amber) 10%, transparent);
+    display: grid;
+    gap: 0.4rem;
+  }
+  .zf-flow-approval strong {
+    color: var(--sl-color-white);
+  }
+  .zf-flow-approval code {
+    font-size: 0.68rem;
+    padding: 0.05rem 0.25rem;
+  }
+  .zf-flow-approval div {
+    display: flex;
+    gap: 0.35rem;
+  }
+  .zf-flow-btn {
+    padding: 0.15rem 0.55rem;
+    border-radius: 0.35rem;
+    border: 1px solid var(--sl-color-gray-4);
+    font-weight: 600;
+    font-size: 0.68rem;
+  }
+  .zf-flow-yes {
+    background: var(--sl-color-white);
+    border-color: var(--sl-color-white);
+    color: var(--sl-color-black);
+  }
+  .zf-flow-backend {
+    padding: 0.6rem 0.75rem;
+    display: grid;
+    gap: 0.1rem;
+  }
+  .zf-flow-backend strong {
+    color: var(--sl-color-white);
+    font-size: var(--sl-text-sm);
+  }
+
+  /* The wires between columns, with a pulse running along each */
+  .zf-flow-link {
+    display: grid;
+    gap: 2.2rem;
+    padding-inline: 0.35rem;
+  }
+  .zf-flow-wire {
+    position: relative;
+    height: 2px;
+    background: var(--zf-flow-line);
+    overflow: visible;
+  }
+  .zf-flow-wire::after {
+    content: "";
+    position: absolute;
+    right: -2px;
+    top: -4px;
+    border: 5px solid transparent;
+    border-left-color: var(--zf-flow-line);
+    border-right: 0;
+  }
+  .zf-flow-back::after {
+    right: auto;
+    left: -2px;
+    border-left: 0;
+    border-right: 5px solid var(--zf-flow-line);
+  }
+  .zf-flow-back {
+    background: repeating-linear-gradient(90deg, var(--zf-flow-line) 0 6px, transparent 6px 10px);
+  }
+  .zf-flow-wire span {
+    position: absolute;
+    bottom: 0.45rem;
+    left: 50%;
+    transform: translateX(-50%);
+    white-space: nowrap;
+    font-family: var(--sl-font-mono);
+    font-size: 0.6rem;
+    color: var(--sl-color-gray-3);
+  }
+  .zf-flow-pulse {
+    position: absolute;
+    top: -3px;
+    left: 0;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--sl-color-accent);
+    box-shadow: 0 0 10px var(--sl-color-accent);
+    animation: zf-flow-run 2.4s linear infinite;
+  }
+  .zf-flow-back .zf-flow-pulse {
+    animation-direction: reverse;
+    animation-delay: 1.2s;
+    background: var(--zf-amber);
+    box-shadow: 0 0 10px var(--zf-amber);
+  }
+  .zf-flow-link + .zf-flow-core + .zf-flow-link .zf-flow-wire:last-child .zf-flow-pulse {
+    animation-delay: 0.8s;
+  }
+  @keyframes zf-flow-run {
+    from {
+      left: 0;
+      opacity: 0;
+    }
+    15% {
+      opacity: 1;
+    }
+    85% {
+      opacity: 1;
+    }
+    to {
+      left: calc(100% - 8px);
+      opacity: 0;
+    }
+  }
+
+  /* Zupflow in the middle */
+  .zf-flow-core {
+    position: relative;
+    padding: 0.9rem;
+    border: 1px solid color-mix(in srgb, var(--sl-color-accent) 60%, transparent);
+    border-radius: 0.9rem;
+    background: color-mix(in srgb, var(--sl-color-accent) 5%, var(--sl-color-black));
+    box-shadow:
+      0 0 0 4px color-mix(in srgb, var(--sl-color-accent) 8%, transparent),
+      0 18px 50px -20px color-mix(in srgb, var(--sl-color-accent) 45%, transparent);
+    display: grid;
+    gap: 0.6rem;
+  }
+  .zf-flow-core-head {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    flex-wrap: wrap;
+  }
+  .zf-flow-core-head strong {
+    font-size: var(--sl-text-base);
+    color: var(--sl-color-white);
+  }
+  .zf-flow-core-head span {
+    font-size: var(--sl-text-xs);
+    color: var(--sl-color-gray-3);
+  }
+  .zf-flow-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+  }
+  .zf-flow-tab {
+    padding: 0.15rem 0.55rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 999px;
+    font-size: 0.68rem;
+    color: var(--sl-color-gray-3);
+  }
+  .zf-flow-tab.is-active {
+    border-color: var(--sl-color-accent);
+    color: var(--sl-color-accent-high);
+    background: var(--sl-color-accent-low);
+  }
+  .zf-flow-more {
+    border-style: dashed;
+  }
+  .zf-flow-layers {
+    display: grid;
+    gap: 0.4rem;
+  }
+  .zf-flow-layer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+    padding: 0.5rem 0.65rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.55rem;
+    background: var(--sl-color-gray-6);
+    font-size: var(--sl-text-xs);
+  }
+  .zf-flow-layer > div {
+    display: grid;
+    gap: 0.05rem;
+  }
+  .zf-flow-layer strong {
+    color: var(--sl-color-white);
+    font-size: var(--sl-text-sm);
+  }
+  .zf-flow-layer span {
+    color: var(--sl-color-gray-3);
+    line-height: 1.35;
+  }
+  .zf-flow-runs {
+    flex-wrap: wrap;
+  }
+  .zf-flow-chips {
+    display: flex;
+    gap: 0.25rem;
+    flex-shrink: 0;
+  }
+  .zf-flow-chips span {
+    padding: 0.05rem 0.4rem;
+    border-radius: 999px;
+    font-family: var(--sl-font-mono);
+    font-size: 0.6rem;
+    font-weight: 600;
+  }
+  .zf-flow-allow {
+    color: #0f7a46;
+    background: color-mix(in srgb, #22c55e 22%, transparent);
+  }
+  .zf-flow-approve {
+    color: #8a5300;
+    background: color-mix(in srgb, var(--zf-amber) 28%, transparent);
+  }
+  .zf-flow-deny {
+    color: #b42318;
+    background: color-mix(in srgb, #ef4444 20%, transparent);
+  }
+  :root:not([data-theme="light"]) .zf-flow-allow {
+    color: #86efac;
+  }
+  :root:not([data-theme="light"]) .zf-flow-approve {
+    color: #ffd38a;
+  }
+  :root:not([data-theme="light"]) .zf-flow-deny {
+    color: #fca5a5;
+  }
+  .zf-flow-steps {
+    display: flex;
+    flex-shrink: 0;
+    gap: 0.2rem;
+  }
+  .zf-flow-steps li {
+    display: grid;
+    justify-items: center;
+    gap: 0.15rem;
+  }
+  .zf-flow-steps i {
+    width: 0.55rem;
+    height: 0.55rem;
+    border-radius: 50%;
+    background: var(--sl-color-gray-4);
+    animation: zf-flow-step 5s calc(var(--i) * 0.8s) infinite;
+  }
+  .zf-flow-steps li:nth-child(4) i {
+    --zf-step: var(--zf-amber);
+  }
+  .zf-flow-steps span {
+    font-family: var(--sl-font-mono);
+    font-size: 0.55rem;
+  }
+  @keyframes zf-flow-step {
+    0%,
+    10% {
+      background: var(--sl-color-gray-4);
+      box-shadow: none;
+    }
+    16%,
+    80% {
+      background: var(--zf-step, var(--sl-color-accent));
+      box-shadow: 0 0 8px var(--zf-step, var(--sl-color-accent));
+    }
+    100% {
+      background: var(--sl-color-gray-4);
+      box-shadow: none;
+    }
+  }
+  .zf-flow-envs {
+    display: flex;
+    gap: 0.35rem;
+  }
+  .zf-flow-envs .env-chip {
+    font-size: 0.6rem;
+  }
+
+  /* Services on the right */
+  .zf-flow-list {
+    padding: 0.35rem;
+    display: grid;
+    gap: 0.15rem;
+  }
+  .zf-flow-list li {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.3rem 0.45rem;
+    border-radius: 0.4rem;
+    color: var(--sl-color-white);
+    font-size: var(--sl-text-xs);
+    font-weight: 500;
+  }
+  .zf-flow-list svg {
+    width: 0.9rem;
+    height: 0.9rem;
+    fill: currentColor;
+    flex-shrink: 0;
+  }
+  .zf-flow-mono {
+    display: inline-grid;
+    place-items: center;
+    width: 0.9rem;
+    height: 0.9rem;
+    border-radius: 0.2rem;
+    background: var(--sl-color-white);
+    color: var(--sl-color-black);
+    font-size: 0.45rem;
+    font-weight: 700;
+  }
+  .zf-flow-any {
+    color: var(--sl-color-gray-3) !important;
+    font-family: var(--sl-font-mono);
+    font-size: 0.62rem !important;
+    border: 1px dashed var(--sl-color-gray-5);
+    justify-content: center;
+  }
+
+  .zf-flow figcaption {
+    margin-top: 0.8rem;
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-3);
+    max-width: 46rem;
+  }
+
+  /* A phone stacks the columns and turns the wires downward. */
+  @media (max-width: 52rem) {
+    .zf-flow-grid {
+      grid-template-columns: 1fr;
+      gap: 0;
+      padding: 1rem;
+    }
+    .zf-flow-link {
+      grid-auto-flow: column;
+      justify-content: center;
+      gap: 6rem;
+      height: 3.25rem;
+      padding: 0.3rem 0;
+    }
+    .zf-flow-wire {
+      width: 2px;
+      height: 100%;
+    }
+    .zf-flow-back {
+      background: repeating-linear-gradient(180deg, var(--zf-flow-line) 0 6px, transparent 6px 10px);
+    }
+    .zf-flow-wire::after {
+      right: -4px;
+      top: auto;
+      bottom: -2px;
+      border: 5px solid transparent;
+      border-top-color: var(--zf-flow-line);
+      border-bottom: 0;
+    }
+    .zf-flow-back::after {
+      left: -4px;
+      right: auto;
+      top: -2px;
+      bottom: auto;
+      border: 5px solid transparent;
+      border-bottom: 5px solid var(--zf-flow-line);
+      border-top: 0;
+    }
+    .zf-flow-wire span {
+      bottom: auto;
+      top: 50%;
+      left: 0.6rem;
+      transform: translateY(-50%);
+    }
+    .zf-flow-pulse {
+      left: -3px;
+      animation-name: zf-flow-down;
+    }
+    .zf-flow-layer {
+      flex-wrap: wrap;
+    }
+  }
+  @keyframes zf-flow-down {
+    from {
+      top: 0;
+      opacity: 0;
+    }
+    15%,
+    85% {
+      opacity: 1;
+    }
+    to {
+      top: calc(100% - 8px);
+      opacity: 0;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .zf-flow-pulse {
+      display: none;
+    }
+    .zf-flow-steps i {
+      animation: none;
+      background: var(--sl-color-accent);
+    }
+  }
+</style>
