@@ -1,22 +1,55 @@
 {
   "name": "@zupflow/sdk",
-  "version": "0.0.0",
+  "description": "The TypeScript SDK for Zupflow: a typed API client and webhook verification.",
+  "version": "0.1.0",
   "license": "Apache-2.0",
-  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zupflow-hq/zupflow.git",
+    "directory": "packages/sdk"
+  },
+  "author": "Zupflow",
+  "homepage": "https://docs.zupflow.com",
+  "bugs": "https://github.com/zupflow-hq/zupflow/issues",
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "zupflow",
+    "ai-agents",
+    "agents",
+    "mcp",
+    "sdk"
+  ],
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
+    "build": "tsdown",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepublishOnly": "pnpm build"
   },
   "devDependencies": {
+    "@types/node": "^26.6.4",
+    "tsdown": "0.23.1",
     "typescript": "~6.0.2",
-    "vitest": "^5.0.3",
-    "@types/node": "^26.6.4"
+    "vitest": "^5.0.3"
   },
   "dependencies": {
     "@zupflow/contract": "workspace:*"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
   }
 }
