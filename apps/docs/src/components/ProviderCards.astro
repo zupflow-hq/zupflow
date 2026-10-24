@@ -1,0 +1,168 @@
+---
+// One environment's model setup: a connection per provider account, the models
+// added from each, and the environment's default. Illustrative data.
+import { siAnthropic, siOpenrouter } from "simple-icons";
+
+const providers: { name: string; key: string; icon?: string; last4: string; models: string[] }[] = [
+  {
+    name: "Anthropic",
+    key: "anthropic",
+    icon: siAnthropic.path,
+    last4: "x7Qa",
+    models: ["claude-sonnet-4-5", "claude-haiku-4-5"],
+  },
+  { name: "OpenAI", key: "openai", last4: "9fK2", models: ["gpt-5", "gpt-5-mini"] },
+  {
+    name: "OpenRouter",
+    key: "openrouter",
+    icon: siOpenrouter.path,
+    last4: "mR41",
+    models: ["openai/gpt-5", "deepseek/deepseek-chat-v3.1"],
+  },
+];
+const defaultModel = "claude-sonnet-4-5";
+---
+
+<figure class="zf-fig zf-providers not-content">
+  <div class="zf-fig-body">
+    <div class="env">
+      <span class="env-chip production">Production</span>
+      <span>Default model <code>{defaultModel}</code></span>
+    </div>
+    <div class="cards">
+      {
+        providers.map((provider) => (
+          <div class="card">
+            <div class="head">
+              {provider.icon ? (
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d={provider.icon} />
+                </svg>
+              ) : (
+                <span class="mono" aria-hidden="true">
+                  AI
+                </span>
+              )}
+              <strong>{provider.name}</strong>
+              <code class="key">{provider.key}</code>
+            </div>
+            <div class="secret">
+              <span class="zf-badge ok">key checked</span>
+              <span class="zf-mono">••••{provider.last4}</span>
+            </div>
+            <ul>
+              {provider.models.map((model) => (
+                <li class:list={{ default: model === defaultModel }}>
+                  <code>{model}</code>
+                  {model === defaultModel && <span class="zf-badge info">default</span>}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))
+      }
+    </div>
+  </div>
+  <figcaption>
+    Each environment has its own connections and default. An agent names one of these models, or uses the default.
+  </figcaption>
+</figure>
+
+<style>
+  .env {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 0.9rem;
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-2);
+  }
+  code {
+    font-size: 0.78rem;
+    background: none;
+    padding: 0;
+    color: var(--sl-color-white);
+  }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.75rem;
+  }
+  .card {
+    display: grid;
+    align-content: start;
+    gap: 0.7rem;
+    padding: 0.85rem 0.9rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.6rem;
+    background: var(--sl-color-gray-6);
+  }
+  .head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .head svg,
+  .head .mono {
+    width: 1.7rem;
+    height: 1.7rem;
+    padding: 0.35rem;
+    border-radius: 0.4rem;
+    fill: var(--sl-color-gray-2);
+    background: var(--sl-color-black);
+    border: 1px solid var(--sl-color-gray-5);
+  }
+  .head .mono {
+    display: grid;
+    place-items: center;
+    padding: 0;
+    font-size: 0.62rem;
+    font-weight: 800;
+    color: var(--sl-color-gray-2);
+  }
+  .head strong {
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-white);
+  }
+  .key {
+    margin-left: auto;
+    color: var(--sl-color-gray-3);
+  }
+  .secret {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    color: var(--sl-color-gray-3);
+  }
+  ul {
+    list-style: none;
+    margin: 0;
+    padding: 0.6rem 0 0;
+    border-top: 1px solid var(--sl-color-gray-5);
+    display: grid;
+    gap: 0.35rem;
+  }
+  li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.4rem;
+    margin: 0;
+  }
+  li code {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--sl-color-gray-2);
+  }
+  li.default code {
+    color: var(--sl-color-white);
+  }
+  @media (max-width: 50rem) {
+    .cards {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

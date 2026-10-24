@@ -1,0 +1,36 @@
+---
+title: Model providers
+description: Bring your own OpenAI, Anthropic or OpenRouter accounts.
+sidebar:
+  order: 6
+---
+
+import ProviderCards from "../../../components/ProviderCards.astro";
+
+Agents run on your own model accounts. An organization connects providers **per environment**, adds models from them and chooses a default model for each environment.
+
+<ProviderCards />
+
+## Connections
+
+A **connection** is one provider account in one environment: `openai`, `anthropic` or `openrouter`. Its key is checked with the provider before it's saved, then sealed. Responses only ever show whether it's set and its last four characters.
+
+A key is checked by listing models, so it must be allowed to: an OpenAI restricted key needs read access to Models.
+
+## Models and the default
+
+From a connection you **add models** from the provider's list; only models that can call tools are offered. Each environment has a **default model**. An agent either names one of its environment's models or uses the default.
+
+Removing a model or connection that the default or an agent uses is refused (`409 model_in_use`).
+
+## What runs see
+
+Every model call names exactly one model, the run's, and every turn caps its output at 16,000 tokens. When a provider answers with an error, the run reacts to its status:
+
+| Provider answers | The run |
+| --- | --- |
+| `401` | Fails `model_key_invalid`, and the connection is marked `invalid_key`. |
+| `402`, `403` | Fails `model_failed` (out of credits, or refused). |
+| `404` | Fails `model_unavailable`, and the model is marked unavailable. |
+| `408`, `409`, `425`, `429`, `5xx` | Retried, honoring `Retry-After`, then `model_unavailable`. |
+| A timeout | Retried once, then `model_failed`. |

@@ -1,0 +1,172 @@
+---
+// Connect from the person's side: your product's button, Zupflow's hosted page,
+// the service's own sign-in, and the installation that results.
+import { siLinear } from "simple-icons";
+---
+
+<figure class="zf-fig zf-connect not-content">
+  <div class="zf-fig-body">
+    <div class="panes">
+      <div class="pane">
+        <span class="where">Your product</span>
+        <div class="screen">
+          <span class="row-title">Integrations</span>
+          <span class="app">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d={siLinear.path} /></svg>
+            Linear
+          </span>
+          <span class="btn">Connect</span>
+        </div>
+        <span class="say">Your backend creates a session and sends the person to its URL.</span>
+      </div>
+      <span class="arrow" aria-hidden="true"></span>
+      <div class="pane">
+        <span class="where">Hosted by Zupflow</span>
+        <div class="screen">
+          <span class="url zf-mono">/connect/cs_ref…</span>
+          <span class="row-title">Connect Linear</span>
+          <span class="btn">Continue</span>
+        </div>
+        <span class="say">Runs the sign-in: OAuth, or a token the person pastes.</span>
+      </div>
+      <span class="arrow" aria-hidden="true"></span>
+      <div class="pane">
+        <span class="where">The service</span>
+        <div class="screen">
+          <span class="app big">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d={siLinear.path} /></svg>
+          </span>
+          <span class="row-title">Authorize access?</span>
+          <span class="btn">Authorize</span>
+        </div>
+        <span class="say">The person signs in with the service itself.</span>
+      </div>
+      <span class="arrow" aria-hidden="true"></span>
+      <div class="pane result">
+        <span class="where">Installation</span>
+        <div class="screen">
+          <span class="app">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d={siLinear.path} /></svg>
+            Linear <span class="zf-mono dim">k7m2qd</span>
+          </span>
+          <span class="zf-badge ok">connected</span>
+          <span class="zf-mono dim">23 tools listed</span>
+        </div>
+        <span class="say">Credentials sealed, tools listed, and the person is back at your <code>return_url</code>.</span>
+      </div>
+    </div>
+  </div>
+  <figcaption>The person never gives your product their credentials, and you never store them.</figcaption>
+</figure>
+
+<style>
+  .panes {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 1.2rem minmax(0, 1fr) 1.2rem minmax(0, 1fr) 1.2rem minmax(0, 1fr);
+    align-items: start;
+    gap: 0.35rem;
+  }
+  .pane {
+    display: grid;
+    gap: 0.5rem;
+  }
+  .where {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--sl-color-gray-3);
+  }
+  .screen {
+    display: grid;
+    justify-items: start;
+    align-content: start;
+    gap: 0.5rem;
+    min-height: 7.6rem;
+    padding: 0.75rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.55rem;
+    background: var(--sl-color-gray-6);
+    box-shadow: 0 1px 0 color-mix(in srgb, var(--sl-color-white) 4%, transparent) inset;
+  }
+  .result .screen {
+    border-color: var(--sl-color-accent);
+  }
+  .row-title {
+    font-size: var(--sl-text-sm);
+    font-weight: 600;
+    color: var(--sl-color-white);
+  }
+  .app {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-2);
+  }
+  .app svg {
+    width: 1rem;
+    height: 1rem;
+    fill: currentColor;
+  }
+  .app.big svg {
+    width: 1.5rem;
+    height: 1.5rem;
+  }
+  .btn {
+    padding: 0.2rem 0.65rem;
+    border-radius: 0.35rem;
+    font-size: var(--sl-text-xs);
+    font-weight: 600;
+    color: var(--sl-color-black);
+    background: var(--sl-color-accent);
+  }
+  .url {
+    width: 100%;
+    padding: 0.15rem 0.4rem;
+    border-radius: 0.3rem;
+    background: var(--sl-color-black);
+    color: var(--sl-color-gray-3);
+    font-size: 0.68rem;
+  }
+  .dim {
+    color: var(--sl-color-gray-3);
+    font-size: 0.72rem;
+  }
+  .say {
+    font-size: var(--sl-text-xs);
+    line-height: 1.45;
+    color: var(--sl-color-gray-3);
+  }
+  .say code {
+    font-size: 0.7rem;
+  }
+  .arrow {
+    position: relative;
+    align-self: start;
+    margin-top: 5.4rem;
+    height: 1px;
+    background: var(--sl-color-gray-4);
+  }
+  .arrow::after {
+    content: "";
+    position: absolute;
+    right: -1px;
+    top: -4px;
+    border: 4.5px solid transparent;
+    border-left: 6px solid var(--sl-color-gray-4);
+    border-right: 0;
+  }
+  @media (max-width: 50rem) {
+    .panes {
+      grid-template-columns: 1fr;
+      gap: 1.25rem;
+    }
+    .arrow {
+      display: none;
+    }
+    .screen {
+      min-height: 0;
+    }
+  }
+</style>

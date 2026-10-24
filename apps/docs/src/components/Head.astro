@@ -1,0 +1,99 @@
+---
+import Default from "@astrojs/starlight/components/Head.astro";
+---
+
+<Default><slot /></Default>
+
+<script>
+  // ```mermaid fences render as code first; each is swapped for a diagram here.
+  // Mermaid loads only on pages with one, and redraws when the theme changes.
+  const diagrams = [...document.querySelectorAll<HTMLElement>('.expressive-code pre[data-language="mermaid"]')].map(
+    (pre) => {
+      const lines = [...pre.querySelectorAll(".ec-line")].map((line) => line.textContent ?? "");
+      const el = document.createElement("pre");
+      el.className = "mermaid not-content";
+      el.dataset.source = lines.join("\n");
+      // Expressive Code puts its stylesheet in the page's first code block, so
+      // keep that wrapper (hidden) and drop only the diagram's source.
+      const block = pre.closest<HTMLElement>(".expressive-code");
+      block?.before(el);
+      block?.querySelector("figure")?.remove();
+      if (block) block.hidden = true;
+      return el;
+    },
+  );
+  if (diagrams.length > 0) {
+    const { default: mermaid } = await import("mermaid");
+    const css = (name: string) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    const draw = async () => {
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: "base",
+        fontFamily: css("--sl-font"),
+        themeVariables: {
+          fontFamily: css("--sl-font"),
+          fontSize: "14px",
+          background: css("--sl-color-black"),
+          primaryColor: css("--sl-color-gray-6"),
+          primaryBorderColor: css("--sl-color-gray-4"),
+          primaryTextColor: css("--sl-color-white"),
+          secondaryColor: css("--sl-color-gray-6"),
+          tertiaryColor: css("--sl-color-black"),
+          lineColor: css("--sl-color-gray-3"),
+          textColor: css("--sl-color-gray-2"),
+          actorBkg: css("--sl-color-gray-6"),
+          actorBorder: css("--sl-color-gray-4"),
+          actorTextColor: css("--sl-color-white"),
+          signalColor: css("--sl-color-gray-2"),
+          signalTextColor: css("--sl-color-gray-2"),
+          labelBoxBkgColor: css("--sl-color-gray-6"),
+          labelBoxBorderColor: css("--sl-color-gray-4"),
+          labelTextColor: css("--sl-color-white"),
+          noteBkgColor: css("--sl-color-accent-low"),
+          noteBorderColor: css("--sl-color-accent"),
+          noteTextColor: css("--sl-color-white"),
+          activationBkgColor: css("--sl-color-accent-low"),
+          activationBorderColor: css("--sl-color-accent"),
+          sequenceNumberColor: css("--sl-color-black"),
+          clusterBkg: css("--sl-color-black"),
+          clusterBorder: css("--sl-color-gray-5"),
+          edgeLabelBackground: css("--sl-color-black"),
+          stateLabelColor: css("--sl-color-white"),
+          altBackground: css("--sl-color-gray-6"),
+        },
+      });
+      for (const el of diagrams) {
+        el.removeAttribute("data-processed");
+        el.textContent = el.dataset.source ?? "";
+      }
+      await mermaid.run({ nodes: diagrams });
+    };
+    await draw();
+    new MutationObserver(() => void draw()).observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-theme"],
+    });
+  }
+</script>
+
+<style is:global>
+  pre.mermaid {
+    margin-block: 1.5rem;
+    padding: 1.25rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.5rem;
+    background: var(--sl-color-black);
+    display: flex;
+    justify-content: center;
+    overflow-x: auto;
+    font-family: var(--sl-font);
+  }
+  pre.mermaid:not([data-processed]) {
+    color: transparent;
+    min-height: 8rem;
+  }
+  .expressive-code:has(pre[data-language="mermaid"]) {
+    visibility: hidden;
+    min-height: 8rem;
+  }
+</style>

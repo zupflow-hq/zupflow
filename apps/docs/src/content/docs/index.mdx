@@ -1,0 +1,107 @@
+---
+title: AI agents, inside your product
+description: The backend for adding AI agents to your product.
+template: splash
+hero:
+  tagline: Give each of your customers an isolated workspace, connect their accounts, grant an agent the tools it may use, and run it from your own backend.
+  actions:
+    - text: How it works
+      link: /how-it-works/
+    - text: Quickstart
+      link: /quickstart/
+      variant: minimal
+    - text: API reference
+      link: /reference/api/
+      variant: minimal
+---
+
+<ol class="zf-home-steps">
+  <li>
+    <span>01</span>
+    <h3>A workspace per customer</h3>
+    <p>Each of your customers gets an isolated workspace, tied to your own ID for them. Nothing crosses between workspaces or organizations.</p>
+  </li>
+  <li>
+    <span>02</span>
+    <h3>Their accounts, connected</h3>
+    <p>A hosted Connect page signs them in to Linear, Notion or any MCP app. Zupflow seals the credentials and keeps tokens fresh.</p>
+  </li>
+  <li>
+    <span>03</span>
+    <h3>Tools you choose</h3>
+    <p>Grant an agent specific tools. Your policy decides which calls run, which wait for a person's approval, and which are refused.</p>
+  </li>
+  <li>
+    <span>04</span>
+    <h3>Runs you can trust</h3>
+    <p>Start a run from your product. Every step is recorded, approvals pause it, and webhooks tell you when it's done.</p>
+  </li>
+</ol>
+
+## In your backend
+
+A few calls take a customer from nothing to an agent running with their own accounts.
+
+```ts title="server.ts"
+import { createClient, createHttpTransport } from "@zupflow/sdk";
+
+const zupflow = createClient(
+  createHttpTransport({ baseUrl, getToken: async () => apiKey }),
+);
+
+// One workspace per customer, with your own ID for them.
+const ws = await zupflow.workspaces.create(orgId, {
+  name: "Acme",
+  slug: "acme",
+  environment: "production",
+  external_id: "cus_1042",
+});
+
+// Link their Linear account through hosted Connect.
+const connect = await zupflow.connectSessions.create(
+  ws.id,
+  { app_id: linearId, intent: "create", label: "Linear",
+    installation_id: null, return_url: returnUrl },
+);
+
+// Run an agent with the tools you granted it.
+await zupflow.runs.create(ws.id, agentId, {
+  input: "Move overdue issues to next sprint.",
+});
+```
+
+## Built for production
+
+<dl class="zf-home-list">
+  <div>
+    <dt>Isolation by design</dt>
+    <dd>Organization and workspace scopes are explicit in every query, key and test.</dd>
+  </div>
+  <div>
+    <dt>Sandbox and Production</dt>
+    <dd>Two environments with separate keys, apps and models. Configuration never leaks across.</dd>
+  </div>
+  <div>
+    <dt>Durable runs</dt>
+    <dd>Each step is saved before it's taken. An interrupted run resumes, and a tool call is never sent twice.</dd>
+  </div>
+  <div>
+    <dt>Your models</dt>
+    <dd>Connect OpenAI, Anthropic or OpenRouter per environment and pick a model per agent.</dd>
+  </div>
+  <div>
+    <dt>Signed webhooks</dt>
+    <dd>Runs, approvals and connected accounts, delivered at least once and retried for a day.</dd>
+  </div>
+  <div>
+    <dt>A full audit log</dt>
+    <dd>Every change, with who made it and where, kept even after a workspace is gone.</dd>
+  </div>
+</dl>
+
+<nav class="zf-home-next" aria-label="Next steps">
+  <a href="/how-it-works/"><span>How it works</span>The flow from workspace to finished run</a>
+  <a href="/concepts/workspaces/"><span>Concepts</span>Workspaces, apps, agents, runs</a>
+  <a href="/quickstart/"><span>Quickstart</span>From an API key to your first run</a>
+  <a href="/reference/api/"><span>API reference</span>Every endpoint, with examples</a>
+</nav>

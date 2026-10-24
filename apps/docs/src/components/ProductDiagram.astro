@@ -1,0 +1,246 @@
+---
+// Where Zupflow sits: your product on the left, Zupflow in the middle, the
+// services it reaches on the right. Drawn with the theme's tokens, so it
+// follows light and dark.
+import { siGithub, siHubspot, siLinear, siNotion } from "simple-icons";
+
+const core = [
+  ["Workspaces", "one per customer"],
+  ["Connect", "hosted account sign-in"],
+  ["Agents", "instructions + tools"],
+  ["Runs", "durable, step by step"],
+  ["Approvals", "a person decides"],
+  ["Webhooks", "signed and retried"],
+];
+const apps = [siLinear, siNotion, siGithub, siHubspot];
+const models = ["OpenAI", "Anthropic", "OpenRouter"];
+---
+
+<figure class="zf-diagram not-content" aria-labelledby="zf-product-caption">
+  <div class="zf-diagram-scroll">
+    <svg viewBox="0 0 1000 440" role="img" aria-labelledby="zf-product-title">
+      <title id="zf-product-title">
+        Your product talks to Zupflow with an API key and receives webhooks. Your customers connect their accounts on
+        Zupflow's hosted page. Zupflow calls their apps' MCP servers and your organization's model providers.
+      </title>
+      <defs>
+        <marker id="zf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" class="zf-d-head"></path>
+        </marker>
+      </defs>
+
+      <!-- Your product -->
+      <text x="20" y="28" class="zf-d-eyebrow">YOUR PRODUCT</text>
+      <g class="zf-d-person" transform="translate(135 70)">
+        <circle cx="0" cy="-12" r="9"></circle>
+        <path d="M-17 16 a17 15 0 0 1 34 0 z"></path>
+      </g>
+      <text x="135" y="108" text-anchor="middle" class="zf-d-sub">Your customer</text>
+
+      <rect x="20" y="128" width="230" height="78" rx="10" class="zf-d-box"></rect>
+      <text x="40" y="160" class="zf-d-title">Your app</text>
+      <text x="40" y="184" class="zf-d-sub">where people use agents</text>
+
+      <rect x="20" y="262" width="230" height="78" rx="10" class="zf-d-box"></rect>
+      <text x="40" y="294" class="zf-d-title">Your backend</text>
+      <text x="40" y="318" class="zf-d-sub">holds the API key</text>
+
+      <line x1="135" y1="114" x2="135" y2="126" class="zf-d-line" marker-end="url(#zf-arrow)"></line>
+      <line x1="135" y1="208" x2="135" y2="260" class="zf-d-line" marker-start="url(#zf-arrow)" marker-end="url(#zf-arrow)"></line>
+
+      <!-- Zupflow -->
+      <rect x="330" y="40" width="340" height="380" rx="14" class="zf-d-core"></rect>
+      <text x="352" y="74" class="zf-d-brand">Zupflow</text>
+      {
+        core.map(([name, sub], i) => {
+          const x = 350 + (i % 2) * 155;
+          const y = 92 + Math.floor(i / 2) * 72;
+          return (
+            <g>
+              <rect x={x} y={y} width="145" height="60" rx="8" class="zf-d-chip" />
+              <text x={x + 14} y={y + 26} class="zf-d-title zf-d-small">
+                {name}
+              </text>
+              <text x={x + 14} y={y + 45} class="zf-d-sub zf-d-tiny">
+                {sub}
+              </text>
+            </g>
+          );
+        })
+      }
+      <line x1="350" y1="324" x2="650" y2="324" class="zf-d-rule"></line>
+      {
+        ["Tool policy", "Sealed credentials", "Audit log"].map((name, i) => (
+          <text x={[350, 450, 590][i]} y="352" class="zf-d-sub zf-d-tiny">
+            {name}
+          </text>
+        ))
+      }
+      {
+        ["Sandbox", "Production"].map((name, i) => (
+          <g>
+            <rect x={[350, 440][i]} y="372" width={[80, 96][i]} height="26" rx="13" class={`zf-d-env zf-d-env-${i}`} />
+            <text x={[350, 440][i] + [40, 48][i]} y="390" text-anchor="middle" class="zf-d-envtext">
+              {name}
+            </text>
+          </g>
+        ))
+      }
+
+      <!-- Arrows between product and Zupflow -->
+      <path d="M152 62 C 230 40, 280 70, 328 92" class="zf-d-line" marker-end="url(#zf-arrow)"></path>
+      <text x="196" y="42" class="zf-d-label">connects accounts, once</text>
+
+      <line x1="252" y1="284" x2="328" y2="284" class="zf-d-line" marker-end="url(#zf-arrow)"></line>
+      <text x="290" y="276" text-anchor="middle" class="zf-d-label">REST API</text>
+      <line x1="328" y1="318" x2="252" y2="318" class="zf-d-line zf-d-dashed" marker-end="url(#zf-arrow)"></line>
+      <text x="290" y="336" text-anchor="middle" class="zf-d-label">webhooks</text>
+
+      <!-- Their services -->
+      <text x="750" y="28" class="zf-d-eyebrow">THEIR APPS · MCP</text>
+      <rect x="750" y="40" width="230" height="190" rx="10" class="zf-d-box"></rect>
+      {
+        apps.map((app, i) => (
+          <g>
+            <rect x="766" y={56 + i * 42} width="198" height="32" rx="6" class="zf-d-chip" />
+            <g transform={`translate(778 ${63 + i * 42}) scale(0.75)`}>
+              <path d={app.path} class="zf-d-icon" />
+            </g>
+            <text x="806" y={77 + i * 42} class="zf-d-title zf-d-small">
+              {app.title}
+            </text>
+          </g>
+        ))
+      }
+      <text x="750" y="268" class="zf-d-eyebrow">MODEL PROVIDERS · YOUR KEYS</text>
+      <rect x="750" y="280" width="230" height="140" rx="10" class="zf-d-box"></rect>
+      {
+        models.map((name, i) => (
+          <g>
+            <rect x="766" y={294 + i * 40} width="198" height="30" rx="6" class="zf-d-chip" />
+            <text x="780" y={314 + i * 40} class="zf-d-title zf-d-small">
+              {name}
+            </text>
+          </g>
+        ))
+      }
+
+      <line x1="672" y1="135" x2="748" y2="135" class="zf-d-line" marker-end="url(#zf-arrow)"></line>
+      <text x="710" y="126" text-anchor="middle" class="zf-d-label">tool calls</text>
+      <line x1="672" y1="350" x2="748" y2="350" class="zf-d-line" marker-end="url(#zf-arrow)"></line>
+      <text x="710" y="341" text-anchor="middle" class="zf-d-label">model turns</text>
+    </svg>
+  </div>
+  <figcaption id="zf-product-caption">
+    Your backend drives Zupflow over its API and hears back through webhooks. Your customers only see your product, and
+    Zupflow's hosted Connect page once per account.
+  </figcaption>
+</figure>
+
+<style>
+  .zf-diagram {
+    margin-block: 2rem;
+  }
+  .zf-diagram-scroll {
+    overflow-x: auto;
+    padding: 1.25rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.75rem;
+    background:
+      radial-gradient(circle at 1px 1px, var(--sl-color-gray-5) 1px, transparent 0) 0 0 / 22px 22px,
+      var(--sl-color-black);
+  }
+  svg {
+    display: block;
+    width: 100%;
+    min-width: 680px;
+    height: auto;
+    font-family: var(--sl-font);
+  }
+  figcaption {
+    margin-top: 0.75rem;
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-3);
+  }
+  .zf-d-box {
+    fill: var(--sl-color-gray-6);
+    stroke: var(--sl-color-gray-5);
+  }
+  .zf-d-chip {
+    fill: var(--sl-color-black);
+    stroke: var(--sl-color-gray-5);
+  }
+  .zf-d-core {
+    fill: color-mix(in srgb, var(--sl-color-accent-low) 55%, var(--sl-color-black));
+    stroke: var(--sl-color-accent);
+    stroke-width: 1.5;
+  }
+  .zf-d-core ~ g .zf-d-chip {
+    stroke: color-mix(in srgb, var(--sl-color-accent) 35%, var(--sl-color-gray-5));
+  }
+  .zf-d-rule {
+    stroke: color-mix(in srgb, var(--sl-color-accent) 30%, transparent);
+  }
+  .zf-d-person circle,
+  .zf-d-person path {
+    fill: var(--sl-color-gray-4);
+  }
+  .zf-d-eyebrow {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    fill: var(--sl-color-gray-3);
+  }
+  .zf-d-brand {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    fill: var(--sl-color-white);
+  }
+  .zf-d-title {
+    font-size: 16px;
+    font-weight: 600;
+    fill: var(--sl-color-white);
+  }
+  .zf-d-small {
+    font-size: 14px;
+  }
+  .zf-d-sub {
+    font-size: 13px;
+    fill: var(--sl-color-gray-3);
+  }
+  .zf-d-tiny {
+    font-size: 12px;
+  }
+  .zf-d-label {
+    font-size: 12px;
+    font-weight: 500;
+    fill: var(--sl-color-gray-2);
+  }
+  .zf-d-line {
+    fill: none;
+    stroke: var(--sl-color-gray-3);
+    stroke-width: 1.5;
+  }
+  .zf-d-dashed {
+    stroke-dasharray: 5 4;
+  }
+  .zf-d-icon {
+    fill: var(--sl-color-gray-2);
+  }
+  .zf-d-head {
+    fill: var(--sl-color-gray-3);
+  }
+  .zf-d-env-0 {
+    fill: color-mix(in srgb, var(--zf-amber) 22%, transparent);
+  }
+  .zf-d-env-1 {
+    fill: color-mix(in srgb, var(--zf-cyan) 22%, transparent);
+  }
+  .zf-d-envtext {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    fill: var(--sl-color-white);
+  }
+</style>

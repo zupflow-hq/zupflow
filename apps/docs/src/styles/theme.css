@@ -1,0 +1,350 @@
+/* Zupflow brand on Starlight: ink #10191D, cyan #35C8F5, Instrument Sans and JetBrains Mono, as in the Console. */
+
+:root {
+  --sl-font: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --sl-font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+
+  --zf-cyan: #35c8f5;
+  --zf-ink: #10191d;
+  --zf-amber: #f5a524;
+
+  /* Dark (Starlight's default theme). */
+  --sl-color-accent-low: #0b3442;
+  --sl-color-accent: #35c8f5;
+  --sl-color-accent-high: #b8ecfc;
+  --sl-color-white: #ffffff;
+  --sl-color-gray-1: #e6edf0;
+  --sl-color-gray-2: #c1ccd1;
+  --sl-color-gray-3: #8a9aa1;
+  --sl-color-gray-4: #56666d;
+  --sl-color-gray-5: #2a373d;
+  --sl-color-gray-6: #172227;
+  --sl-color-black: #0c1316;
+
+  --sl-content-width: 48rem;
+}
+
+:root[data-theme="light"] {
+  --sl-color-accent-low: #d4f3fd;
+  --sl-color-accent: #0a7fa6;
+  --sl-color-accent-high: #0a3a4b;
+  --sl-color-white: #10191d;
+  --sl-color-gray-1: #1d292e;
+  --sl-color-gray-2: #34444b;
+  --sl-color-gray-3: #56666d;
+  --sl-color-gray-4: #8a9aa1;
+  --sl-color-gray-5: #c9d3d8;
+  --sl-color-gray-6: #eef3f6;
+  --sl-color-gray-7: #f5f8fa;
+  --sl-color-black: #ffffff;
+}
+
+/* No ligatures in code: `=>` stays two characters. */
+code,
+pre,
+.expressive-code {
+  font-variant-ligatures: none;
+}
+
+/* Headings a touch tighter, as in the Console. */
+.sl-markdown-content :is(h1, h2, h3) {
+  letter-spacing: -0.015em;
+}
+
+/* Home: a restrained hero, then code beside a plain list, as in the Console. */
+[data-has-hero] .hero {
+  padding-block: 3rem 2rem;
+  grid-template-columns: 1fr;
+}
+[data-has-hero] .hero h1 {
+  font-size: clamp(2rem, 1.2rem + 3vw, 3rem);
+  letter-spacing: -0.03em;
+  line-height: 1.1;
+}
+[data-has-hero] .hero .tagline {
+  max-width: 38rem;
+  font-size: var(--sl-text-lg);
+  color: var(--sl-color-gray-2);
+}
+.sl-link-button {
+  border-radius: 0.4rem;
+  font-size: var(--sl-text-sm);
+  font-weight: 500;
+  padding: 0.5rem 1rem;
+}
+.sl-link-button.primary {
+  background: var(--sl-color-white);
+  border-color: var(--sl-color-white);
+  color: var(--sl-color-black);
+}
+.sl-link-button.minimal {
+  padding-inline: 0.6rem;
+}
+
+.sl-markdown-content .zf-home-steps {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 0;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  border-top: 1px solid var(--sl-color-hairline);
+}
+.sl-markdown-content .zf-home-steps li {
+  margin: 0;
+  padding: 1.25rem 1.25rem 1.5rem 0;
+}
+.sl-markdown-content .zf-home-steps span {
+  font-family: var(--sl-font-mono);
+  font-size: var(--sl-text-xs);
+  color: var(--sl-color-gray-3);
+}
+.sl-markdown-content .zf-home-steps h3 {
+  margin: 0.6rem 0 0.4rem;
+  font-size: var(--sl-text-base);
+  color: var(--sl-color-white);
+}
+.sl-markdown-content .zf-home-steps p {
+  margin: 0;
+  font-size: var(--sl-text-sm);
+  color: var(--sl-color-gray-3);
+  line-height: 1.55;
+}
+.sl-markdown-content .zf-home-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+  column-gap: 2.5rem;
+}
+.sl-markdown-content .zf-home-list {
+  margin: 0;
+}
+.zf-home-list > div {
+  padding: 0.85rem 0;
+  border-bottom: 1px solid var(--sl-color-hairline);
+  margin: 0 !important;
+}
+.sl-markdown-content .zf-home-list dt {
+  font-weight: 600;
+  color: var(--sl-color-white);
+  font-size: var(--sl-text-sm);
+}
+.sl-markdown-content .zf-home-list dd {
+  margin: 0.15rem 0 0;
+  margin-inline-start: 0 !important;
+  padding-inline-start: 0;
+  color: var(--sl-color-gray-3);
+  font-size: var(--sl-text-sm);
+  line-height: 1.5;
+}
+
+.zf-home-next {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: 0;
+  margin-top: 3rem !important;
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 0.5rem;
+  overflow: hidden;
+}
+.zf-home-next a {
+  display: block;
+  padding: 1rem 1.1rem;
+  text-decoration: none;
+  color: var(--sl-color-gray-3);
+  font-size: var(--sl-text-sm);
+  box-shadow: inset -1px -1px 0 var(--sl-color-hairline);
+}
+.zf-home-next a span {
+  display: block;
+  color: var(--sl-color-white);
+  font-weight: 600;
+  margin-bottom: 0.15rem;
+}
+.zf-home-next a:hover {
+  background: var(--sl-color-gray-6);
+}
+.zf-home-next a:hover span::after {
+  content: " →";
+}
+
+/* Environment chips: Sandbox is amber, Production is cyan, everywhere. */
+.env-chip {
+  display: inline-block;
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  font-size: var(--sl-text-xs);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+.env-chip.sandbox {
+  color: #7a4a00;
+  background: color-mix(in srgb, var(--zf-amber) 28%, transparent);
+}
+.env-chip.production {
+  color: #0a5873;
+  background: color-mix(in srgb, var(--zf-cyan) 28%, transparent);
+}
+:root:not([data-theme="light"]) .env-chip.sandbox {
+  color: #ffd38a;
+}
+:root:not([data-theme="light"]) .env-chip.production {
+  color: #b8ecfc;
+}
+
+[data-has-hero] .sl-markdown-content h2 {
+  font-size: var(--sl-text-h3);
+  margin-top: 3.5rem;
+}
+
+/* "You build / Zupflow handles". */
+.zf-split {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 0;
+  margin-block: 1.5rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.75rem;
+  overflow: hidden;
+}
+.zf-split section {
+  padding: 1.1rem 1.25rem 1.25rem;
+}
+.zf-split section + section {
+  background: color-mix(in srgb, var(--sl-color-accent-low) 45%, transparent);
+  box-shadow: inset 1px 0 0 var(--sl-color-gray-5);
+}
+.zf-split h3 {
+  margin: 0 0 0.6rem;
+  font-size: var(--sl-text-xs);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--sl-color-gray-3);
+}
+.zf-split section + section h3 {
+  color: var(--sl-color-accent);
+}
+.zf-split ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.5rem;
+}
+.zf-split li {
+  position: relative;
+  padding-inline-start: 1.25rem;
+  font-size: var(--sl-text-sm);
+  color: var(--sl-color-gray-2);
+  line-height: 1.45;
+}
+.zf-split li::before {
+  content: "";
+  position: absolute;
+  inset-inline-start: 0;
+  top: 0.5em;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  border: 1.5px solid var(--sl-color-gray-4);
+}
+.zf-split section + section li::before {
+  border-color: var(--sl-color-accent);
+  background: var(--sl-color-accent);
+}
+
+/* A guide's summary: what you'll build, how long, what you need. */
+.zf-guide-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  margin-block: 1.5rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.75rem;
+  overflow: hidden;
+}
+.zf-guide-meta > div {
+  padding: 0.85rem 1rem;
+  font-size: var(--sl-text-sm);
+  color: var(--sl-color-gray-2);
+  line-height: 1.5;
+  box-shadow: inset -1px -1px 0 var(--sl-color-gray-5);
+}
+.zf-guide-meta span {
+  display: block;
+  margin-bottom: 0.2rem;
+  font-size: var(--sl-text-xs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--sl-color-gray-3);
+}
+.zf-guide-meta a {
+  color: var(--sl-color-accent);
+}
+
+/* A figure panel shared by the concept diagrams. */
+.zf-fig {
+  margin: 1.75rem 0;
+}
+.zf-fig > .zf-fig-body {
+  padding: 1.1rem 1.2rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.75rem;
+  background:
+    radial-gradient(circle at 1px 1px, var(--sl-color-gray-5) 1px, transparent 0) 0 0 / 22px 22px,
+    var(--sl-color-black);
+}
+.zf-fig > figcaption {
+  margin-top: 0.7rem;
+  font-size: var(--sl-text-sm);
+  color: var(--sl-color-gray-3);
+}
+.zf-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+.zf-badge::before {
+  content: "";
+  width: 0.4rem;
+  height: 0.4rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+.zf-badge.ok {
+  color: #1f9d55;
+  background: color-mix(in srgb, #22c55e 14%, transparent);
+}
+.zf-badge.wait {
+  color: #b7791f;
+  background: color-mix(in srgb, var(--zf-amber) 18%, transparent);
+}
+.zf-badge.no {
+  color: #d64545;
+  background: color-mix(in srgb, #ef4444 13%, transparent);
+}
+.zf-badge.info {
+  color: var(--sl-color-accent);
+  background: var(--sl-color-accent-low);
+}
+:root:not([data-theme="light"]) .zf-badge.ok {
+  color: #4ade80;
+}
+:root:not([data-theme="light"]) .zf-badge.wait {
+  color: #fbbf24;
+}
+:root:not([data-theme="light"]) .zf-badge.no {
+  color: #f87171;
+}
+.zf-mono {
+  font-family: var(--sl-font-mono);
+  font-size: 0.78rem;
+}

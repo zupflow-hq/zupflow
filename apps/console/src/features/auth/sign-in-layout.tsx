@@ -18,7 +18,7 @@ export function SignInLayout({ children, footer }: { children: ReactNode; footer
           loop="#35C8F5"
         />
         <p className="font-mono text-[11px] tracking-[0.14em] text-white/50 uppercase">
-          Personal agents, inside your product
+          AI agents, inside your product
         </p>
         <div className="relative max-w-md space-y-6">
           <p className="text-[28px] leading-[1.15] font-semibold tracking-[-0.02em] text-balance">

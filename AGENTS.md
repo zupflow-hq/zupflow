@@ -1,6 +1,6 @@
 # Zupflow monorepo
 
-Read `README.md` first.
+Read `README.md` first, then `DEVELOPMENT.md`.
 
 ## Ground rules
 
