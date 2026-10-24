@@ -226,6 +226,7 @@ function channelAttempts(
     ...input
   } = settings;
   return [
+    ["[victim workspace] list channel providers", () => r.channelProviders.list(w)],
     ["[victim workspace] list channel app managers", () => r.channelAppManagers.list(w)],
     [
       "[victim workspace] link a team",

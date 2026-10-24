@@ -156,7 +156,7 @@ describe("linking a Slack team", () => {
         <button type="button" onClick={() => setOpen(true)}>
           Reopen
         </button>
-        <LinkTeamDialog workspaceId={workspace.id} open={open} onOpenChange={setOpen} />
+        <LinkTeamDialog workspaceId={workspace.id} provider="slack" open={open} onOpenChange={setOpen} />
       </>
     );
   }
@@ -219,6 +219,22 @@ describe("linking a Slack team", () => {
       await within(dialog).findByText("Slack refused this token. Generate a new one and paste it again."),
     ).toBeVisible();
     expect(within(dialog).getByLabelText("Configuration token")).toHaveAttribute("aria-invalid", "true");
+  });
+
+  it("says so when this server can't reach the provider", async () => {
+    const message =
+      "This deployment can't reach Slack, so it can't link teams there. Ask its operator to set ZUPFLOW_PUBLIC_URL to the https:// address Slack reaches it at.";
+    api.channelAppManagers.create.mockRejectedValue(
+      new ZupflowApiError(501, { code: "channel_providers_not_configured", message, fields: null }),
+    );
+    render(
+      <QueryClientProvider client={client()}>
+        <Harness />
+      </QueryClientProvider>,
+    );
+    const dialog = await screen.findByRole("dialog", { name: "Link a Slack team" });
+    await paste(dialog);
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(message);
   });
 });
 

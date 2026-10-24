@@ -1048,6 +1048,16 @@ export function useResendWebhookDelivery(orgId: OrganizationId, endpointId: Webh
 /** A page at a time, newest first. */
 const nextCursor = (last: { pagination: { next_cursor: string | null } }) => last.pagination.next_cursor;
 
+/** The channel providers this deployment reaches: the only ones the Console offers to link. */
+export function useChannelProviders(wsId: WorkspaceId) {
+  return useQuery({
+    queryKey: qk.channelProviders(wsId),
+    queryFn: () => api.channelProviders.list(wsId),
+    // The server's, not the workspace's: it changes only when the deployment does.
+    staleTime: 5 * 60_000,
+  });
+}
+
 /** The workspace's linked teams, a page at a time. */
 export function useChannelAppManagers(wsId: WorkspaceId) {
   return useInfiniteQuery({

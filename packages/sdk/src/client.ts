@@ -14,6 +14,7 @@ import type {
   AuditListQuery,
   AuthorizeConnectResult,
   AvailableApp,
+  AvailableChannelProvider,
   ChannelApp,
   ChannelAppId,
   ChannelAppListQuery,
@@ -491,6 +492,11 @@ export function createClient(transport: Transport) {
     audit: {
       list: (organizationId: OrganizationId, query: AuditListQuery = {}) =>
         getPage<AuditEvent>(`${org(organizationId)}/audit-events`, { ...query }),
+    },
+
+    /** The channel providers this deployment reaches: the workspace links teams only there. */
+    channelProviders: {
+      list: (workspaceId: WorkspaceId) => get<AvailableChannelProvider[]>(`${ws(workspaceId)}/channel-providers`),
     },
 
     /**

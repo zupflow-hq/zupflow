@@ -1,4 +1,4 @@
-import type { ChannelAppManager, WorkspaceId } from "@zupflow/sdk";
+import { CHANNEL_PROVIDER_NAMES, type ChannelAppManager, type ChannelProvider, type WorkspaceId } from "@zupflow/sdk";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -23,17 +23,21 @@ import {
 } from "./configuration-token";
 
 /**
- * Links a Slack workspace to this Zupflow workspace by pasting a
- * configuration token, or, given `manager`, replaces a linked one's tokens.
- * Sandbox only: in Production the customer's product links teams.
+ * Links a team of `provider` (in Slack, a workspace) to this Zupflow
+ * workspace by pasting a configuration token, or, given `manager`, replaces
+ * a linked one's tokens. Sandbox only: in Production the customer's product
+ * links teams. Offered only for a provider the server reaches.
  */
 export function LinkTeamDialog({
   workspaceId,
+  provider,
   manager,
   open,
   onOpenChange,
 }: {
   workspaceId: WorkspaceId;
+  /** The provider of the team to link, or of `manager`. */
+  provider: ChannelProvider;
   /** The linked team whose tokens are replaced; none to link a new one. */
   manager?: ChannelAppManager;
   open: boolean;
@@ -59,7 +63,8 @@ export function LinkTeamDialog({
 
   const serverErrors = tokenFieldErrors(mutation.error);
   const errors = { ...serverErrors, ...missing };
-  const teamName = manager?.team.name ?? "this Slack team";
+  const name = CHANNEL_PROVIDER_NAMES[provider];
+  const teamName = manager?.team.name ?? `this ${name} team`;
 
   const submit = () => {
     const absent = missingTokens(values);
@@ -69,19 +74,19 @@ export function LinkTeamDialog({
     const done = {
       onSuccess: (linked: ChannelAppManager) => {
         setValues(EMPTY_TOKENS);
-        toast.success(manager ? `Replaced the tokens for ${teamName}` : `Linked ${linked.team.name ?? "Slack"}`);
+        toast.success(manager ? `Replaced the tokens for ${teamName}` : `Linked ${linked.team.name ?? name}`);
         onOpenChange(false);
       },
     };
     if (manager) replace.mutate({ managerId: manager.id, ...tokens }, done);
-    else create.mutate({ provider: "slack", method: "configuration_token", ...tokens }, done);
+    else create.mutate({ provider, method: "configuration_token", ...tokens }, done);
   };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>{manager ? `Replace the tokens for ${teamName}` : "Link a Slack team"}</DialogTitle>
+          <DialogTitle>{manager ? `Replace the tokens for ${teamName}` : `Link a ${name} team`}</DialogTitle>
           <DialogDescription>
             {manager
               ? "Paste a new configuration token and its refresh token. Installed apps keep answering meanwhile."

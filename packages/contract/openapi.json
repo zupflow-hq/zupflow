@@ -808,6 +808,28 @@
           "configuration"
         ]
       },
+      "AvailableChannelProvider": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "$ref": "#/components/schemas/ChannelProvider"
+          },
+          "methods": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "configuration_token"
+              ]
+            }
+          }
+        },
+        "required": [
+          "provider",
+          "methods"
+        ]
+      },
       "ChannelApp": {
         "type": "object",
         "properties": {
@@ -14785,6 +14807,77 @@
         }
       }
     },
+    "/v1/workspaces/{ws}/channel-providers": {
+      "get": {
+        "operationId": "listChannelProviders",
+        "summary": "The channel providers this deployment reaches, so the workspace can link teams there. Linking a team of a provider that isn't listed answers `501 channel_providers_not_configured`",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/AvailableChannelProvider"
+                      }
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/v1/workspaces/{ws}/channel-app-managers": {
       "get": {
         "operationId": "listChannelAppManagers",
@@ -14869,7 +14962,7 @@
       },
       "post": {
         "operationId": "createChannelAppManager",
-        "summary": "Link a team with a configuration token, so Zupflow can create apps for the workspace's agents there. Developers and API keys; the Console can't in Production (`403 console_read_only_in_production`). A token the provider refuses is `422 invalid_configuration_token`",
+        "summary": "Link a team with a configuration token, so Zupflow can create apps for the workspace's agents there. Developers and API keys; the Console can't in Production (`403 console_read_only_in_production`). A token the provider refuses is `422 invalid_configuration_token`; a provider this deployment doesn't reach (see `listChannelProviders`) is `501 channel_providers_not_configured`",
         "security": [
           {
             "consoleSession": [],

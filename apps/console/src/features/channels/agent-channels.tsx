@@ -53,6 +53,7 @@ import {
   useChannelAppManagersById,
   useChannelApps,
   useChannelConnections,
+  useChannelProviders,
   useCreateChannelApp,
   useDeleteAgentChannel,
   useDeleteChannelApp,
@@ -60,7 +61,7 @@ import {
 } from "@/features/queries";
 import { toastError } from "@/lib/errors";
 import { AgentChannelSettings } from "./agent-channel-settings";
-import { appFailure, CHANNEL_PROVIDER_ICON, PRODUCTION_CHANNELS } from "./labels";
+import { appFailure, CHANNEL_PROVIDER_ICON, NO_CHANNEL_PROVIDERS, PRODUCTION_CHANNELS } from "./labels";
 import { ChannelAppStatusPill, ConnectionStatusPill } from "./status";
 
 /**
@@ -186,6 +187,9 @@ function AddToSlack({
   onLoadMore: () => void;
 }) {
   const create = useCreateChannelApp(workspace.id);
+  const providers = useChannelProviders(workspace.id);
+  // Whether a team could be linked here at all: only of a provider this server reaches.
+  const slackReached = providers.data?.some((p) => p.provider === "slack") ?? false;
   const active = teams.filter((t) => t.status === "active");
   const [team, setTeam] = useState<ChannelAppManagerId | undefined>(undefined);
   const chosen = active.find((t) => t.id === team)?.id ?? active[0]?.id;
@@ -199,7 +203,9 @@ function AddToSlack({
     : !mayChange
       ? "Developers, admins and owners can add agents to Slack."
       : !anyLinked
-        ? "Link a Slack team on this workspace's Channels page first. Then add the agent here: Zupflow creates its own Slack app, and someone in the team allows it."
+        ? providers.isSuccess && !slackReached
+          ? NO_CHANNEL_PROVIDERS
+          : "Link a Slack team on this workspace's Channels page first. Then add the agent here: Zupflow creates its own Slack app, and someone in the team allows it."
         : active.length === 0
           ? "Every linked team's configuration token has expired. Paste a new one on the Channels page, then add the agent."
           : `Zupflow creates ${agent.name}'s own Slack app in the team, named after it, so people can mention it and send it messages. Then someone in the team allows it.`;
@@ -257,13 +263,17 @@ function AddToSlack({
               </Button>
             ) : null}
           </EmptyContent>
-        ) : !production && mayChange && !anyLinked ? (
+        ) : !production && mayChange && !anyLinked && slackReached ? (
           <EmptyContent>
             <Button asChild variant="outline">
-              <Link to="/$org/w/$ws/channels" params={{ org: org.slug, ws: workspace.id }} search={{ link: true }}>
+              <Link to="/$org/w/$ws/channels" params={{ org: org.slug, ws: workspace.id }} search={{ link: "slack" }}>
                 Link a Slack team
               </Link>
             </Button>
+          </EmptyContent>
+        ) : !production && mayChange && !anyLinked && providers.isError ? (
+          <EmptyContent>
+            <QueryError error={providers.error} onRetry={() => providers.refetch()} what="channel providers" />
           </EmptyContent>
         ) : null}
       </Empty>

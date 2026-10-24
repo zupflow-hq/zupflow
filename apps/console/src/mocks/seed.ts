@@ -4,22 +4,23 @@
  * publishing app; Beta Labs connects its own Google account; each has Sandbox
  * counterparts. Everything is relative to the moment the seed runs.
  */
-import type {
-  AccountConnection,
-  ApiKeyId,
-  AuditEvent,
-  Environment,
-  IdKind,
-  ModelId,
-  ModelProviderKind,
-  OrganizationId,
-  ToolLevel,
-  User,
-  UserId,
-  WebhookDeliveryState,
-  WebhookEndpoint,
-  WebhookEvent,
-  WorkspaceId,
+import {
+  type AccountConnection,
+  type ApiKeyId,
+  type AuditEvent,
+  CHANNEL_PROVIDERS,
+  type Environment,
+  type IdKind,
+  type ModelId,
+  type ModelProviderKind,
+  type OrganizationId,
+  type ToolLevel,
+  type User,
+  type UserId,
+  type WebhookDeliveryState,
+  type WebhookEndpoint,
+  type WebhookEvent,
+  type WorkspaceId,
 } from "@zupflow/sdk";
 import { CATALOG, type CatalogEntry } from "./catalog";
 import { seedChannels } from "./channel-seed";
@@ -47,7 +48,7 @@ import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 import { appIn, issueShortId, timelineOf } from "./scope";
 import { listedFrom, recordListing } from "./tools";
 
-export const DB_SCHEMA = 27;
+export const DB_SCHEMA = 28;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -555,6 +556,7 @@ export function seed(nowMs: number = Date.now()): Db {
     webhook_events: [],
     webhook_deliveries: [],
     webhook_delivery_attempts: [],
+    channel_providers: [...CHANNEL_PROVIDERS],
     channel_app_managers: [],
     channel_apps: [],
     channel_connections: [],

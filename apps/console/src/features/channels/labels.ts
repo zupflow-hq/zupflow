@@ -21,6 +21,10 @@ import type {
 export const PRODUCTION_CHANNELS =
   "In Production, your product links Slack teams and adds agents through the API or hosted Connect, so the customer's own admin does it from your product. The Console shows what they set up.";
 
+/** Why no team can be linked: this server reaches no channel provider. */
+export const NO_CHANNEL_PROVIDERS =
+  "This Zupflow server can't reach Slack yet, so no team can be linked here. Whoever runs it turns Slack on by giving the server a public HTTPS address.";
+
 /** A provider's mark in the Console: a glyph on its color, like an app's icon. */
 export const CHANNEL_PROVIDER_ICON: Record<ChannelProvider, AppIcon> = {
   slack: { glyph: "#", color: "#4A154B" },

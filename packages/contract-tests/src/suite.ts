@@ -505,6 +505,7 @@ export function contractSuite(target: Target) {
 
         // Channels: a team linked and an agent's app made in the Sandbox, then the fixture's install read and
         // changed, then removals.
+        await owner.channelProviders.list(sandbox.id);
         await owner.channelAppManagers.list(sandbox.id);
         const manager = await owner.channelAppManagers.create(sandbox.id, {
           provider: "slack",
@@ -3762,6 +3763,19 @@ export function contractSuite(target: Target) {
         const body = (await response.json()) as { error?: { code: string } };
         return response.ok ? body : `${response.status} ${body.error?.code}`;
       };
+
+      it("lists the channel providers the deployment reaches, to anyone who can read the workspace", async () => {
+        const available = await owner.channelProviders.list(sandbox());
+        expect(available).toEqual([{ provider: "slack", methods: ["configuration_token"] }]);
+        expect(await as("viewer").channelProviders.list(sandbox())).toEqual(available);
+        // An API key reads its own environment's workspaces, and no other's.
+        const key = withKey(
+          (await owner.apiKeys.create(fx.organization, { name: "Channel providers", environment: "sandbox" })).secret,
+        );
+        expect(await key.channelProviders.list(sandbox())).toEqual(available);
+        expect(await answer(key.channelProviders.list(fx.workspaces.acme.id))).toBe("404 not_found");
+        expect(await answer(as("outsider").channelProviders.list(sandbox()))).toBe("404 not_found");
+      });
 
       it("links a team through hosted Connect, checking its tokens with the provider first", async () => {
         // Channel sessions need a server that serves channels; one that serves only app sessions skips this.

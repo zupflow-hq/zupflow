@@ -4106,6 +4106,38 @@ describe("channels", () => {
       .webhook_events.slice(since)
       .map((e) => [e.body.type, e.body.data]);
 
+  it("offers only the providers the deployment reaches, and links teams and makes apps nowhere else", async () => {
+    const workspace = sandbox();
+    const agent = applessAgent(workspace);
+    const manager = managerIn(workspace);
+    const tokens = { configuration_token: "xoxe.xoxp-1-unreached-0000", refresh_token: "xoxe-1-unreached-0000" };
+    expect(await owner.channelProviders.list(workspace.id)).toEqual([
+      { provider: "slack", methods: ["configuration_token"] },
+    ]);
+
+    db().channel_providers = [];
+    expect(await owner.channelProviders.list(workspace.id)).toEqual([]);
+    const managers = db().channel_app_managers.length;
+    const refused = await failure(
+      owner.channelAppManagers.create(workspace.id, { provider: "slack", method: "configuration_token", ...tokens }),
+    );
+    expect([refused.status, refused.code]).toEqual([501, "channel_providers_not_configured"]);
+    expect(refused.message).toContain("ZUPFLOW_PUBLIC_URL");
+    // Even a token the provider would refuse: nothing reaches it to ask.
+    const invalid = await failure(
+      owner.channelAppManagers.update(workspace.id, manager.id, { ...tokens, configuration_token: "invalid" }),
+    );
+    expect([invalid.status, invalid.code]).toEqual([501, "channel_providers_not_configured"]);
+    expect(db().channel_app_managers).toHaveLength(managers);
+    // An app asked for meanwhile fails, as the job that would make it does.
+    const app = await owner.channelApps.create(workspace.id, { agent_id: agent.id, manager_id: manager.id });
+    expect(await owner.channelApps.get(workspace.id, app.id)).toMatchObject({
+      status: "failed",
+      last_error: "provisioner_unavailable",
+      external_app_id: null,
+    });
+  });
+
   it("installs an agent's app on consent: a connection, its short ID, the agent's channel and the events", async () => {
     const workspace = sandbox();
     const agent = applessAgent(workspace);
