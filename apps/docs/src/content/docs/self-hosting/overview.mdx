@@ -31,7 +31,7 @@ Every external resource (the database, the job queue, keys, the cache, model pro
 
 ## Try it locally
 
-This runs the Console in your browser and the server on port `8080`, with a scripted model so you need no provider account.
+This runs the server on port `8080` and the Console in your browser, with a scripted model, so you need no provider account or API key. It takes a few minutes, most of them compiling the server the first time.
 
 ### Requirements
 
@@ -56,13 +56,21 @@ This runs the Console in your browser and the server on port `8080`, with a scri
    ZUPFLOW_CONSOLE_ORIGIN=http://localhost:5180 pnpm --filter @zupflow/server dev
    ```
 
-3. In another terminal, start the Console against it.
+3. In another terminal, start your first run.
+
+   ```bash
+   pnpm try
+   ```
+
+   It sets up an organization, a scripted model as Sandbox's default and a Sandbox API key, then, with that key as your backend would, a workspace, an agent and a run. It prints the run's answer, the API key and a `curl` for the next run. Running it again reuses what's there and prints a fresh API key.
+
+4. Start the Console against the server to watch it.
 
    ```bash
    VITE_ZUPFLOW_API_URL=http://localhost:8080 pnpm dev
    ```
 
-4. Open [http://localhost:5180](http://localhost:5180), create an organization and a Sandbox workspace.
+5. Open [http://localhost:5180](http://localhost:5180). The **Acme (local)** organization holds the workspace, agent and run `pnpm try` made.
 
 </Steps>
 
