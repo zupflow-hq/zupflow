@@ -20,6 +20,18 @@ In ten minutes you'll create a workspace for a customer, give it an agent, and s
 
 You need your Zupflow API URL and access to the Console. Every example uses `$ZUPFLOW_URL` for the API URL.
 
+<Aside type="tip" title="No server yet? Run one locally">
+  Clone the repository and start the server with a scripted model, so you need no provider account. Then `pnpm try` does steps 1 to 5 for you and prints an API key:
+
+  ```bash
+  git clone https://github.com/zupflow-hq/zupflow.git && cd zupflow && pnpm install
+  ZUPFLOW_CONSOLE_ORIGIN=http://localhost:5180 pnpm --filter @zupflow/server dev
+  pnpm try   # in another terminal
+  ```
+
+  You need Node 22+, pnpm 10 and Rust. [Self-hosting](/self-hosting/overview/#try-it-locally) has the details.
+</Aside>
+
 <Steps>
 
 1. **Create a Sandbox API key.** In the Console, open **Developers → API keys** and create a key for **Sandbox**. Copy the secret now: it's shown once. Sandbox keys start with `zf_test_`.

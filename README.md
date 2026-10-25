@@ -11,6 +11,13 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/zupflow-hq/zupflow/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/zupflow-hq/zupflow/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://www.npmjs.com/package/@zupflow/sdk"><img alt="@zupflow/sdk on npm" src="https://img.shields.io/npm/v/@zupflow/sdk?label=%40zupflow%2Fsdk"></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
+  <img alt="Status: alpha" src="https://img.shields.io/badge/status-alpha-orange">
+</p>
+
+<p align="center">
   <a href="https://docs.zupflow.com/introduction/">Documentation</a> ·
   <a href="https://docs.zupflow.com/quickstart/">Quickstart</a> ·
   <a href="https://docs.zupflow.com/reference/api/">API reference</a> ·
@@ -19,6 +26,9 @@
 </p>
 
 ---
+
+> [!NOTE]
+> Zupflow is in **alpha**. It runs end to end, but the API can still change between versions and it hasn't been run at scale. Try it, and tell us what breaks in [Issues](https://github.com/zupflow-hq/zupflow/issues).
 
 ## What is Zupflow?
 
@@ -131,7 +141,7 @@ Zupflow is open source under Apache-2.0. This repository holds the whole platfor
 
 The server is written in Rust and runs as one binary, with its data in one SQLite file. Every external resource (the database, job queue, keys, cache and model providers) sits behind a trait with a working implementation, so you can swap in Postgres, a managed key service or a shared cache without forking.
 
-Try it locally with Node 22+, pnpm 10 and Rust:
+Try it locally with Node 22+, pnpm 10 and Rust. No provider account or API key needed:
 
 ```bash
 git clone https://github.com/zupflow-hq/zupflow.git
@@ -141,9 +151,14 @@ pnpm install
 # The server, on :8080, with no sign-in and a scripted model
 ZUPFLOW_CONSOLE_ORIGIN=http://localhost:5180 pnpm --filter @zupflow/server dev
 
-# The Console, on :5180, in another terminal
+# In another terminal: a workspace, an agent and a first run, plus an API key
+pnpm try
+
+# The Console, on :5180, to watch it
 VITE_ZUPFLOW_API_URL=http://localhost:8080 pnpm dev
 ```
+
+Install the SDK in your backend with `npm install @zupflow/sdk`.
 
 Or run only the Console, against an in-browser mock of the API, with `pnpm dev`.
 
