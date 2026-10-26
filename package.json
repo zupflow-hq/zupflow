@@ -8,6 +8,7 @@
   },
   "scripts": {
     "dev": "pnpm --filter @zupflow/console dev",
+    "try": "node scripts/try-local.mjs",
     "build": "turbo run build",
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",

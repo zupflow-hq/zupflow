@@ -1,0 +1,47 @@
+name: Publish packages
+
+# Publishes @zupflow/contract and @zupflow/sdk to npm, with provenance, at the
+# versions in their package.json. npm authenticates this workflow through
+# trusted publishing (OIDC), so no token is stored: each package names this
+# repository and workflow as its trusted publisher on npmjs.com.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @zupflow/contract --filter @zupflow/sdk test
+      # pnpm packs each package with its publishConfig and the workspace
+      # version of @zupflow/contract; npm publishes the tarballs. The contract
+      # goes first, since the SDK depends on it.
+      - name: Pack
+        run: |
+          mkdir -p out
+          pnpm --filter @zupflow/contract --filter @zupflow/sdk build
+          (cd packages/contract && pnpm pack --pack-destination ../../out)
+          (cd packages/sdk && pnpm pack --pack-destination ../../out)
+      - name: Publish
+        run: |
+          for package in contract sdk; do
+            tarball=$(ls out/zupflow-$package-*.tgz)
+            version=$(tar -xOzf "$tarball" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0)).version")
+            if npm view "@zupflow/$package@$version" version >/dev/null 2>&1; then
+              echo "@zupflow/$package@$version is already published"
+            else
+              npm publish "$tarball" --provenance --access public
+            fi
+          done
