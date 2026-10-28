@@ -177,7 +177,7 @@ One chat provider's side of a connection: which headers carry its signature, che
 
 ### AppProvisioner
 
-Creates, changes and deletes one agent's app in one linked team, with the team's current tokens, and installs it with the consent a person gives on the provider's page. `SlackProvisioner` generates one Slack app per agent from a manifest. Selected with `ZUPFLOW_CHANNEL_PROVISIONER`: `slack`, `scripted` (local work), or unset, where teams can't be linked.
+Creates, changes and deletes one agent's app in one linked team, with the team's current tokens, and installs it with the consent a person gives on the provider's page. `SlackProvisioner` generates one Slack app per agent from a manifest. There is no setting to pick one: a server serves every provider it reaches at once (`ChannelProviders`, keyed by provider), and each linked team, app and connection uses the one it was made with. Slack is reached whenever `ZUPFLOW_PUBLIC_URL` is an `https://` origin.
 
 ### MessageHandler
 

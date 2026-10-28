@@ -1060,6 +1060,16 @@ export const routes: readonly Route[] = [
   // organization's). An API key reads and changes only its own environment's
   // workspaces (another's is `404`).
   {
+    operationId: "listChannelProviders",
+    method: "get",
+    path: "/v1/workspaces/{ws}/channel-providers",
+    summary:
+      "The channel providers this deployment reaches, so the workspace can link teams there. Linking a team of a provider that isn't listed answers `501 channel_providers_not_configured`",
+    callers: both,
+    params: ws,
+    response: ok(s.AvailableChannelProvider, { list: true }),
+  },
+  {
     operationId: "listChannelAppManagers",
     method: "get",
     path: "/v1/workspaces/{ws}/channel-app-managers",
@@ -1074,7 +1084,7 @@ export const routes: readonly Route[] = [
     method: "post",
     path: "/v1/workspaces/{ws}/channel-app-managers",
     summary:
-      "Link a team with a configuration token, so Zupflow can create apps for the workspace's agents there. Developers and API keys; the Console can't in Production (`403 console_read_only_in_production`). A token the provider refuses is `422 invalid_configuration_token`",
+      "Link a team with a configuration token, so Zupflow can create apps for the workspace's agents there. Developers and API keys; the Console can't in Production (`403 console_read_only_in_production`). A token the provider refuses is `422 invalid_configuration_token`; a provider this deployment doesn't reach (see `listChannelProviders`) is `501 channel_providers_not_configured`",
     callers: both,
     params: ws,
     body: s.CreateChannelAppManagerInput,
@@ -1184,7 +1194,7 @@ export const routes: readonly Route[] = [
     method: "delete",
     path: "/v1/workspaces/{ws}/channel-connections/{channel_connection}",
     summary:
-      "Disconnect: the token is revoked, and the connection, its conversations, messages and agent channel removed. Its app waits for a new install",
+      "Disconnect: the token is revoked, and the connection, its conversations, messages and agent channel removed. Its app waits for a new install. A provider this deployment doesn't reach can't revoke the token: `501 channel_providers_not_configured`, and nothing is removed",
     callers: both,
     params: { ...ws, channel_connection: idSchema("channel_connection") },
     response: noContent,

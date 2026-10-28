@@ -14,7 +14,7 @@ use uuid::Uuid;
 use zupflow_core::channels::TOKEN_LIFETIME_MS;
 use zupflow_core::channels::provision::{RELEASE_CHANNEL_APP, SYNC_CHANNEL_APP};
 use zupflow_core::channels::store::{ChannelError, NewInstall, RotationSweep, SealedVersion};
-use zupflow_core::channels::{AgentChannel, ChannelConnection, ConnectTarget, ManagerStatus};
+use zupflow_core::channels::{AgentChannel, ChannelConnection, ChannelProviderKind, ConnectTarget, ManagerStatus};
 use zupflow_core::connect::{ConnectSession, ConnectSessionStatus};
 use zupflow_core::ids::{
     AgentId, ChannelAppId, ChannelAppManagerId, ChannelConnectionId, ConnectSessionId, OrganizationId, WorkspaceId,
@@ -499,4 +499,22 @@ pub(super) async fn queue_due_rotations_cross_tenant(
     }
     transaction.commit().await.map_err(failed("queue_due_rotations"))?;
     Ok(sweep)
+}
+
+/// Cross-tenant by design, and a count only: how many linked teams every
+/// workspace holds together, by provider.
+pub(super) async fn count_teams_by_provider_cross_tenant(
+    store: &SqliteChannelStore,
+) -> Result<Vec<(ChannelProviderKind, u64)>, ChannelError> {
+    let rows = sqlx::query("SELECT provider, count(*) AS teams FROM channel_app_managers GROUP BY provider")
+        .fetch_all(store.database.pool())
+        .await
+        .map_err(failed("count_teams_by_provider"))?;
+    rows.iter()
+        .map(|row| {
+            let provider = super::parsed(row, "provider", ChannelProviderKind::parse)?;
+            let teams: i64 = row.try_get("teams").map_err(read)?;
+            Ok((provider, u64::try_from(teams).unwrap_or(0)))
+        })
+        .collect()
 }

@@ -132,6 +132,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     removes_a_made_app_at_its_provider_too(&stores, &prepare).await;
     syncs_an_agents_apps_with_its_changes(&stores, &prepare).await;
     rotates_a_teams_tokens_once_per_version(&stores, &prepare).await;
+    counts_teams_by_provider_naming_no_tenant(&stores, &prepare).await;
     reads_people_once_and_replies_only_to_answers(&stores, &prepare).await;
     replies_to_an_answer_until_it_is_sent(&stores, &prepare).await;
     acts_only_within_its_connection_and_sweeps_past_retention(&stores, &prepare).await;
@@ -528,6 +529,11 @@ async fn makes_one_live_app_per_agent_per_manager(stores: &Stores<'_>, prepare: 
     assert!(
         secrets.secrets.is_none(),
         "no secrets before the provider makes the app"
+    );
+    assert_eq!(
+        secrets.provider,
+        ChannelProviderKind::Slack,
+        "an app's secrets name the provider that reads its deliveries"
     );
     assert_eq!(
         stores
@@ -2813,6 +2819,34 @@ async fn syncs_an_agents_apps_with_its_changes(stores: &Stores<'_>, prepare: &Pr
     );
 }
 
+/// Every workspace's linked teams, counted together by provider: one more
+/// when a team is linked, one fewer when it's unlinked.
+async fn counts_teams_by_provider_naming_no_tenant(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let slack = || async {
+        stores
+            .channels
+            .count_teams_by_provider_cross_tenant()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(provider, _)| *provider == ChannelProviderKind::Slack)
+            .map_or(0, |(_, teams)| teams)
+    };
+    let before = slack().await;
+    let manager = link(stores, &t, t.sandbox).await;
+    link(stores, &t, t.sibling).await;
+    assert_eq!(slack().await, before + 2);
+    stores
+        .channels
+        .delete_manager(t.organization_id, t.sandbox, manager, developer(&t), &|_| {
+            by_suite_in(t.sandbox)
+        })
+        .await
+        .unwrap();
+    assert_eq!(slack().await, before + 1);
+}
+
 async fn rotates_a_teams_tokens_once_per_version(stores: &Stores<'_>, prepare: &Prepare) {
     let t = tenant(prepare).await;
     let (org, ws) = (t.organization_id, t.sandbox);
@@ -3199,6 +3233,7 @@ async fn replies_to_an_answer_until_it_is_sent(stores: &Stores<'_>, prepare: &Pr
     assert_eq!(
         reply,
         ChannelReply {
+            provider: ChannelProviderKind::Slack,
             connection_id: connection,
             connection_status: ConnectionStatus::Connected,
             conversation_external_id: "C0SUPPORT".to_owned(),

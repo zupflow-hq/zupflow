@@ -1233,6 +1233,22 @@ export type UpdateAppToolLevelsInput = z.infer<typeof UpdateAppToolLevelsInput>;
  */
 export const ChannelAppManagerMethod = z.enum(["configuration_token"]);
 export type ChannelAppManagerMethod = z.infer<typeof ChannelAppManagerMethod>;
+/**
+ * A channel provider this deployment reaches, so the workspace can link
+ * teams there: every one the server ships is available at once (Slack
+ * whenever the server has a public HTTPS address). Linking a team of a
+ * provider that isn't listed answers `501 channel_providers_not_configured`.
+ */
+export const AvailableChannelProvider = named(
+  "AvailableChannelProvider",
+  z.object({
+    provider: ChannelProvider,
+    /** How a team is linked there. */
+    methods: z.array(ChannelAppManagerMethod).min(1),
+  }),
+);
+export type AvailableChannelProvider = z.infer<typeof AvailableChannelProvider>;
+
 /** `token_expired`: the token can't be rotated any more; paste a new one. */
 export const ChannelAppManagerStatus = z.enum(["active", "token_expired", "disconnected"]);
 export type ChannelAppManagerStatus = z.infer<typeof ChannelAppManagerStatus>;

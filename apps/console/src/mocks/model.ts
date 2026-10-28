@@ -661,6 +661,13 @@ export interface Db {
   webhook_events: WebhookEventRow[];
   webhook_deliveries: WebhookDeliveryRow[];
   webhook_delivery_attempts: WebhookDeliveryAttemptRow[];
+  /**
+   * The channel providers this deployment reaches: the server's, not a
+   * tenant's, so every workspace lists the same ones. Every provider by
+   * default; a test takes one away to see the server answer as one that
+   * can't reach it.
+   */
+  channel_providers: ChannelProvider[];
   channel_app_managers: ChannelAppManagerRow[];
   channel_apps: ChannelAppRow[];
   channel_connections: ChannelConnectionRow[];

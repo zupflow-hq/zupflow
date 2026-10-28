@@ -31,7 +31,7 @@ use zupflow_core::channels::provision::{
     ConsentExchange, ConsentRequest, ConsentedInstall, ProvisionError, SLACK_SCOPES,
 };
 use zupflow_core::channels::store::{ChannelError, NewInstall, SealedVersion};
-use zupflow_core::channels::{ChannelApp, ConnectTarget, FIRST_VERSION, MAX_LABEL, ManagerStatus};
+use zupflow_core::channels::{ChannelApp, ChannelProviderKind, ConnectTarget, FIRST_VERSION, MAX_LABEL, ManagerStatus};
 use zupflow_core::connect::{Authorization, ConnectError, ConnectSession, ConnectSessionStatus, OAuthState};
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::ChannelConnectionId;
@@ -174,7 +174,8 @@ pub(crate) async fn authorize(
     }
     let redirect_url = crate::app_configurations::redirect_uri(&state.public_url);
     let url = state
-        .channel_provisioner
+        .channel_providers
+        .provisioner(provider)
         .consent_url(&ConsentRequest {
             client_id: &client_id,
             scopes: SLACK_SCOPES,
@@ -293,9 +294,10 @@ pub(crate) struct SealingConnection<'a> {
 }
 
 /// Revokes a token Zupflow won't keep, so it doesn't keep working at the provider.
-async fn discard(state: &AppState, session: &ConnectSession, token: &str) {
+async fn discard(state: &AppState, session: &ConnectSession, provider: ChannelProviderKind, token: &str) {
     if let Err(error) = state
-        .channel_provisioner
+        .channel_providers
+        .provisioner(provider)
         .revoke_install(state.outbound.as_ref(), token)
         .await
     {
@@ -312,10 +314,12 @@ async fn install(state: &AppState, session: &ConnectSession, code: &str) -> Resu
     }
     let (organization_id, workspace_id) = (session.organization_id, session.workspace_id);
     let (app, client_id) = installable(state, session).await?;
+    let provider = app.provider;
     let client_secret = client_secret(state, session, &app).await?;
     let redirect_url = crate::app_configurations::redirect_uri(&state.public_url);
     let consented = state
-        .channel_provisioner
+        .channel_providers
+        .provisioner(provider)
         .complete_consent(
             state.outbound.as_ref(),
             &ConsentExchange {
@@ -330,9 +334,10 @@ async fn install(state: &AppState, session: &ConnectSession, code: &str) -> Resu
             ProvisionError::Refused(_) | ProvisionError::TokensRefused | ProvisionError::AppNotFound => {
                 Failed("token_exchange_failed")
             }
-            ProvisionError::Unavailable | ProvisionError::RateLimited { .. } | ProvisionError::NotConfigured => {
-                Failed("provider_unavailable")
-            }
+            ProvisionError::Unavailable
+            | ProvisionError::RateLimited { .. }
+            | ProvisionError::NotConfigured
+            | ProvisionError::Unreached => Failed("provider_unavailable"),
         })?;
     let ConsentedInstall {
         external_app_id,
@@ -343,7 +348,7 @@ async fn install(state: &AppState, session: &ConnectSession, code: &str) -> Resu
     // The app the provider says it installed is the one the session is for.
     if external_app_id.is_some() && external_app_id != app.external_app_id {
         tracing::warn!(event = "channels.install_of_another_app", %organization_id, %workspace_id, app_id = %app.id);
-        discard(state, session, &install.token).await;
+        discard(state, session, provider, &install.token).await;
         return Err(Failed("token_exchange_failed"));
     }
     let manager = state
@@ -355,7 +360,7 @@ async fn install(state: &AppState, session: &ConnectSession, code: &str) -> Resu
     // Checked here so a token for another team is revoked at once; the store checks it again.
     if manager.team.id.as_deref().is_some_and(|team| team != install.team.id) {
         tracing::warn!(event = "channels.install_team_mismatch", %organization_id, %workspace_id, app_id = %app.id);
-        discard(state, session, &install.token).await;
+        discard(state, session, provider, &install.token).await;
         return Err(Failed("team_mismatch"));
     }
     // A reinstall writes the live connection's next version; the provider
@@ -382,7 +387,7 @@ async fn install(state: &AppState, session: &ConnectSession, code: &str) -> Resu
     let token: &str = &install.token;
     let unkept = |why: &'static str| async move {
         if first || why == "team_mismatch" {
-            discard(state, session, token).await;
+            discard(state, session, provider, token).await;
         }
         Failed(why)
     };

@@ -27,6 +27,13 @@
 //! Nothing here sleeps on a rate limit: the job is postponed for as long as
 //! the provider asked, without using an attempt.
 //!
+//! **A provider this server doesn't reach.** What's stored for it stays: a
+//! job for its team, app or connection is postponed every
+//! [`UNREACHED_WAIT`] without using an attempt (the provisioner answers
+//! `Unreached`), so a server that reaches it again, after a restart with
+//! its settings, carries on where this one left off. Tokens that lapse
+//! meanwhile are expired as ever, announced.
+//!
 //! [`ChannelStore::sweep_retention`]: zupflow_core::channels::store::ChannelStore::sweep_retention
 
 use std::time::Duration;
@@ -35,7 +42,9 @@ use serde_json::{Value, json};
 use zupflow_core::audit::{AuditAction, AuditActor, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::channels::provision::{ProvisionError, RELEASE_CHANNEL_APP, RotatedTokens, SYNC_CHANNEL_APP};
 use zupflow_core::channels::store::{ChannelError, TokenReplacement};
-use zupflow_core::channels::{AppStatus, ChannelAppManager, ManagerStatus, RETENTION_JOB, TOKEN_LIFETIME_MS};
+use zupflow_core::channels::{
+    AppStatus, ChannelAppManager, ChannelProviderKind, ManagerStatus, RETENTION_JOB, TOKEN_LIFETIME_MS,
+};
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{ChannelAppId, ChannelAppManagerId, ChannelConnectionId, OrganizationId, WorkspaceId};
 use zupflow_core::jobs::{Job, JobOptions};
@@ -55,6 +64,8 @@ pub(crate) const ROTATE_CHANNEL_MANAGER: &str = "rotate_channel_manager_tokens";
 const ROTATE_AHEAD_MS: i64 = 60 * 60 * 1000;
 /// How many tries a rotation gets within its hour.
 const ROTATION_ATTEMPTS: u32 = 10;
+/// How often a job of a provider this server doesn't reach looks again.
+pub(crate) const UNREACHED_WAIT: Duration = Duration::from_secs(5 * 60);
 /// How long a removal waits for its team's tokens to be active again
 /// before it looks again; pasted tokens queue it at once.
 const RELEASE_WAIT: Duration = Duration::from_secs(6 * 60 * 60);
@@ -70,7 +81,8 @@ pub(crate) enum Next {
     Done,
     /// Later, after the queue's backoff, using an attempt.
     Retry(&'static str),
-    /// After the provider's wait, using no attempt.
+    /// After this long, using no attempt: the provider's wait, or
+    /// [`UNREACHED_WAIT`].
     Wait(Duration),
 }
 
@@ -126,6 +138,33 @@ pub(crate) async fn sweep(state: &AppState) {
         Ok(_) => {}
         Err(error) => tracing::warn!(event = "channels.rotation_sweep_failed", %error),
     }
+}
+
+/// Says, at startup, how many linked teams name each provider this server
+/// doesn't reach: their jobs wait for a server that does. Cross-tenant, a
+/// count only, naming no organization, workspace or team. What it said.
+pub(crate) async fn report_unreached(state: &AppState) -> Vec<(ChannelProviderKind, u64)> {
+    let teams = match state.channels.count_teams_by_provider_cross_tenant().await {
+        Ok(teams) => teams,
+        Err(error) => {
+            tracing::warn!(event = "channels.teams_not_counted", %error);
+            return Vec::new();
+        }
+    };
+    let unreached: Vec<_> = teams
+        .into_iter()
+        .filter(|(provider, teams)| *teams > 0 && !state.channel_providers.is_available(*provider))
+        .collect();
+    for (provider, teams) in &unreached {
+        tracing::error!(
+            event = "channels.provider_unreached",
+            provider = provider.as_str(),
+            teams,
+            "Linked teams use a provider this server doesn't reach: their tokens aren't rotated and their apps \
+             aren't kept in step until a server that reaches it runs"
+        );
+    }
+    unreached
 }
 
 /// Queues a retention sweep for each workspace with channel data past its
@@ -331,7 +370,7 @@ async fn rotate(
             if manager.status == ManagerStatus::Active && manager.credential_version == version
                 && credential.version == version
     );
-    let (Some(credential), true) = (credential, current) else {
+    let (Some(manager), Some(credential), true) = (manager, credential, current) else {
         return Next::Done;
     };
     let Some(tokens) = open_tokens(
@@ -347,7 +386,8 @@ async fn rotate(
         return later("keys_unavailable").await;
     };
     let rotated = match state
-        .channel_provisioner
+        .channel_providers
+        .provisioner(manager.provider)
         .rotate_tokens(state.outbound.as_ref(), &tokens)
         .await
     {
@@ -372,6 +412,8 @@ async fn rotate(
         Err(ProvisionError::RateLimited { retry_after_secs }) => return wait(retry_after_secs),
         // Perhaps spent all the same: the next attempt finds out.
         Err(ProvisionError::Unavailable) => return later("provider_unavailable").await,
+        // Nothing was spent: rotated by a server that reaches it, if it's in time.
+        Err(ProvisionError::Unreached) => return Next::Wait(UNREACHED_WAIT),
         Err(ProvisionError::NotConfigured | ProvisionError::AppNotFound) => {
             tracing::warn!(event = "channels.rotation_unsupported", %organization_id, %workspace_id, %manager_id);
             return Next::Done;
@@ -532,7 +574,8 @@ pub(crate) async fn sync(
         return Next::Done;
     }
     match state
-        .channel_provisioner
+        .channel_providers
+        .provisioner(app.provider)
         .update(state.outbound.as_ref(), &tokens, external_app_id, &manifest)
         .await
     {
@@ -552,6 +595,7 @@ pub(crate) async fn sync(
         // Refused tokens may be a rotation's moment: tried again after it.
         Err(ProvisionError::Unavailable) => Next::Retry("provider_unavailable"),
         Err(ProvisionError::TokensRefused) => Next::Retry("tokens_refused"),
+        Err(ProvisionError::Unreached) => Next::Wait(UNREACHED_WAIT),
         Err(error) => {
             tracing::warn!(event = "channels.app_not_synced", %organization_id, %workspace_id, %app_id, %error);
             Next::Done
@@ -567,6 +611,7 @@ async fn revoke_connection(
     organization_id: OrganizationId,
     workspace_id: WorkspaceId,
     environment: Environment,
+    provider: ChannelProviderKind,
     connection_id: ChannelConnectionId,
 ) -> Result<(), Next> {
     let sealed = match state
@@ -594,13 +639,16 @@ async fn revoke_connection(
     };
     let token = Zeroizing::new(std::mem::take(&mut connection.token));
     match state
-        .channel_provisioner
+        .channel_providers
+        .provisioner(provider)
         .revoke_install(state.outbound.as_ref(), &token)
         .await
     {
         Ok(()) => Ok(()),
         Err(ProvisionError::RateLimited { retry_after_secs }) => Err(wait(retry_after_secs)),
         Err(ProvisionError::Unavailable) => Err(Next::Retry("provider_unavailable")),
+        // Kept, still working, until a server that reaches the provider revokes it.
+        Err(ProvisionError::Unreached) => Err(Next::Wait(UNREACHED_WAIT)),
         Err(error) => {
             // Refused for another reason: the app's deletion revokes it too.
             tracing::warn!(event = "channels.token_not_revoked", %organization_id, %workspace_id, %connection_id, %error);
@@ -637,7 +685,15 @@ async fn release(
         Err(()) => return Next::Retry("store_unavailable"),
     };
     if let Some(connection_id) = connection_id
-        && let Err(next) = revoke_connection(state, organization_id, workspace_id, environment, connection_id).await
+        && let Err(next) = revoke_connection(
+            state,
+            organization_id,
+            workspace_id,
+            environment,
+            app.provider,
+            connection_id,
+        )
+        .await
     {
         return next;
     }
@@ -664,7 +720,8 @@ async fn release(
         Err(why) => return Next::Retry(why),
     };
     match state
-        .channel_provisioner
+        .channel_providers
+        .provisioner(app.provider)
         .delete(state.outbound.as_ref(), &tokens, external_app_id)
         .await
     {
@@ -675,6 +732,7 @@ async fn release(
         Err(ProvisionError::RateLimited { retry_after_secs }) => wait(retry_after_secs),
         Err(ProvisionError::Unavailable) => Next::Retry("provider_unavailable"),
         Err(ProvisionError::TokensRefused) => Next::Retry("tokens_refused"),
+        Err(ProvisionError::Unreached) => Next::Wait(UNREACHED_WAIT),
         Err(error) => {
             // Kept unreleased: its team stays linked, and pasting its tokens tries again.
             tracing::warn!(event = "channels.app_not_released", %organization_id, %workspace_id, %app_id, %error);

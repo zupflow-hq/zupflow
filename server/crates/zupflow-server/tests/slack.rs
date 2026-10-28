@@ -20,7 +20,9 @@ use std::time::Duration;
 use axum::http::{Method, StatusCode};
 use common::{Server, call, code};
 use serde_json::{Value, json};
+use zupflow_core::channels::ChannelProviderKind;
 use zupflow_core::channels::provision::SLACK_SCOPES;
+use zupflow_core::channels::registry::ChannelProviders;
 use zupflow_core::ids::ChannelAppManagerId;
 use zupflow_server::RequestGuard;
 use zupflow_slack::fake::{Delivery, FakeSlack, Fault};
@@ -36,11 +38,23 @@ async fn slack_server() -> (Server, Arc<FakeSlack>) {
     let mut server = Server::new().await;
     let slack = Arc::new(FakeSlack::new());
     server.state.outbound = slack.clone();
-    server.state.channel_provisioner = Arc::new(SlackProvisioner::new(FakeSlack::api()));
-    server.state.channel_provider = Arc::new(SlackChannelProvider::new(FakeSlack::api()));
     server.state.public_url = PUBLIC.to_owned();
-    server.app = zupflow_server::app(server.state.clone(), RequestGuard::default());
+    restart(&mut server, true);
     (server, slack)
+}
+
+/// The same server started again, with the same database and keys, reaching
+/// Slack or not (as when its public URL is `https://` or isn't).
+fn restart(server: &mut Server, reaches_slack: bool) {
+    server.state.channel_providers = if reaches_slack {
+        ChannelProviders::none().with(
+            Arc::new(SlackProvisioner::new(FakeSlack::api())),
+            Arc::new(SlackChannelProvider::new(FakeSlack::api())),
+        )
+    } else {
+        ChannelProviders::none()
+    };
+    server.app = zupflow_server::app(server.state.clone(), RequestGuard::default());
 }
 
 struct Tenant {
@@ -903,6 +917,210 @@ async fn links_a_team_from_the_hosted_page() {
     assert!(!linked.to_string().contains(CONFIGURATION_TOKEN));
     assert_eq!(session(&server, &reference).await["status"], "completed");
     assert!(page(&server, &reference).await.contains("Slack team linked"));
+}
+
+/// The queued jobs, each with the attempts it has used.
+async fn queued(server: &Server) -> Vec<(String, i64)> {
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", server.directory.join("zupflow.sqlite").display()))
+        .await
+        .unwrap();
+    let mut rows: Vec<(String, i64)> = sqlx::query_as("SELECT kind, attempts FROM jobs WHERE state = 'queued'")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    rows.sort();
+    rows
+}
+
+/// Every queued job due now, as though the time it waits had passed.
+async fn time_passes(server: &Server) {
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", server.directory.join("zupflow.sqlite").display()))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE jobs SET run_at = 0 WHERE state = 'queued'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+/// A server that doesn't reach Slack (restarted without an https public
+/// URL) says so at startup, by a count, and keeps a linked team's rotation
+/// waiting however often it comes up, spending neither an attempt nor the
+/// refresh token; started again reaching Slack, it rotates them.
+#[tokio::test]
+async fn rotates_a_teams_tokens_once_a_server_reaches_slack_again() {
+    let (mut server, slack) = slack_server().await;
+    let t = tenant(&server, "alice", "acme").await;
+    slack.issue_configuration_token(CONFIGURATION_TOKEN, REFRESH_TOKEN, TEAM);
+    let (_, linked) = link(&server, &t, "alice", CONFIGURATION_TOKEN, REFRESH_TOKEN).await;
+    let manager = linked["data"]["id"].as_str().unwrap().to_owned();
+    assert!(
+        zupflow_server::channels::report_unreached(&server.state)
+            .await
+            .is_empty()
+    );
+
+    restart(&mut server, false);
+    assert_eq!(
+        zupflow_server::channels::report_unreached(&server.state).await,
+        vec![(ChannelProviderKind::Slack, 1)]
+    );
+    for _ in 0..3 {
+        rotate(&server).await;
+        time_passes(&server).await;
+    }
+    assert!(slack.calls_to("tooling.tokens.rotate").is_empty());
+    assert_eq!(
+        queued(&server).await,
+        vec![("rotate_channel_manager_tokens".to_owned(), 0)],
+        "waiting, with no attempt used"
+    );
+    assert_eq!(self::manager(&server, &t, "alice", &manager).await["status"], "active");
+
+    restart(&mut server, true);
+    assert!(
+        zupflow_server::channels::report_unreached(&server.state)
+            .await
+            .is_empty()
+    );
+    rotate(&server).await;
+    assert_eq!(slack.rotations(), 1);
+    let rotated = self::manager(&server, &t, "alice", &manager).await;
+    assert_eq!(rotated["status"], "active", "{rotated}");
+    assert!(rotated["token_expires_at"].is_string(), "{rotated}");
+    assert!(queued(&server).await.is_empty());
+}
+
+/// While the server doesn't reach Slack, an app asked for, an agent renamed
+/// and an app removed each wait for one that does, using no attempt, and a
+/// connection isn't removed with a token nothing here can revoke; started
+/// again reaching Slack, each is done.
+#[tokio::test]
+async fn carries_on_with_apps_once_a_server_reaches_slack_again() {
+    let (mut server, slack) = slack_server().await;
+    let t = tenant(&server, "alice", "acme").await;
+    slack.issue_configuration_token(CONFIGURATION_TOKEN, REFRESH_TOKEN, TEAM);
+    let (_, linked) = link(&server, &t, "alice", CONFIGURATION_TOKEN, REFRESH_TOKEN).await;
+    let manager = linked["data"]["id"].as_str().unwrap().to_owned();
+    // The team's tokens rotated now, so no rotation comes up below.
+    rotate(&server).await;
+    let scribe = agent(&server, &t, "alice", "Scribe").await;
+    let (app, external) = made_app(&server, &t, "alice", &scribe, &manager).await;
+    let reference = install_session(&server, &t, "alice", &app).await;
+    let (_, query) = authorize(&server, &reference).await;
+    let consent = slack.allow(&external, TEAM, "Acme");
+    server
+        .visit(&callback(&format!("code={consent}&state={}", query["state"])))
+        .await;
+    let connection = session(&server, &reference).await["target"]["connection"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let other = agent(&server, &t, "alice", "Herald").await;
+    let calls = slack.calls().len();
+
+    restart(&mut server, false);
+    let (status, accepted) = server
+        .send(
+            call("alice", Method::POST, format!("/v1/workspaces/{}/channel-apps", t.ws))
+                .naming(&t.org)
+                .body(json!({ "agent_id": other, "manager_id": manager })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let asked = accepted["data"]["id"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .send(
+            call(
+                "alice",
+                Method::PATCH,
+                format!("/v1/workspaces/{}/agents/{scribe}", t.ws),
+            )
+            .naming(&t.org)
+            .body(json!({ "name": "Quill" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let disconnect = || {
+        call(
+            "alice",
+            Method::DELETE,
+            format!("/v1/workspaces/{}/channel-connections/{connection}", t.ws),
+        )
+        .naming(&t.org)
+    };
+    let (status, refused) = server.send(disconnect()).await;
+    assert_eq!(
+        (status, code(&refused)),
+        (StatusCode::NOT_IMPLEMENTED, "channel_providers_not_configured"),
+        "{refused}"
+    );
+    for _ in 0..3 {
+        drain(&server).await;
+        time_passes(&server).await;
+    }
+    assert_eq!(slack.calls().len(), calls, "nothing reached Slack");
+    assert_eq!(
+        queued(&server).await,
+        vec![
+            ("provision_channel_app".to_owned(), 0),
+            ("sync_channel_app".to_owned(), 0),
+        ],
+        "waiting, with no attempt used"
+    );
+    assert_eq!(read_app(&server, &t, "alice", &asked).await["status"], "creating");
+    let (status, _) = server
+        .send(
+            call(
+                "alice",
+                Method::GET,
+                format!("/v1/workspaces/{}/channel-connections/{connection}", t.ws),
+            )
+            .naming(&t.org),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "the connection and its token are kept");
+
+    restart(&mut server, true);
+    drain(&server).await;
+    assert_eq!(
+        read_app(&server, &t, "alice", &asked).await["status"],
+        "awaiting_install"
+    );
+    let at_slack = slack.apps().into_iter().find(|made| made.id == external).unwrap();
+    assert_eq!(at_slack.manifest["display_information"]["name"], "Quill");
+    assert!(queued(&server).await.is_empty());
+
+    // Removed while Slack isn't reached: its token is revoked, and it's deleted there, once it is.
+    restart(&mut server, false);
+    let (status, _) = server
+        .send(
+            call(
+                "alice",
+                Method::DELETE,
+                format!("/v1/workspaces/{}/channel-apps/{app}", t.ws),
+            )
+            .naming(&t.org),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    for _ in 0..3 {
+        drain(&server).await;
+        time_passes(&server).await;
+    }
+    assert!(!slack.installs().pop().unwrap().revoked);
+    assert!(slack.calls_to("apps.manifest.delete").is_empty());
+    assert_eq!(queued(&server).await, vec![("release_channel_app".to_owned(), 0)]);
+
+    restart(&mut server, true);
+    drain(&server).await;
+    assert!(slack.installs().pop().unwrap().revoked, "its bot token revoked");
+    let deletes = slack.calls_to("apps.manifest.delete");
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0].form["app_id"], external);
+    assert!(queued(&server).await.is_empty());
 }
 
 /// Slack refusing a rotation for a reason other than an invalid refresh

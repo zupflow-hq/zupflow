@@ -97,8 +97,7 @@ async fn main() {
         identity: bootstrap::identity(&config).expect("identity"),
         provider: bootstrap::model_provider(&config, &outbound),
         model_catalog: bootstrap::model_catalog(&config, &outbound),
-        channel_provider: bootstrap::channel_provider(&config),
-        channel_provisioner: bootstrap::channel_provisioner(&config),
+        channel_providers: bootstrap::channel_providers(&config),
         sign_in: bootstrap::sign_in(&config),
         outbound,
         // ...your stores, or the SQLite ones, for every other field

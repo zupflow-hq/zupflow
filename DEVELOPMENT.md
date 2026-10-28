@@ -621,15 +621,28 @@ prefix turn by turn on the Anthropic and OpenAI paths.
 
 ### Agents in Slack
 
-With `ZUPFLOW_CHANNEL_PROVISIONER=slack`, each agent gets its own Slack app,
-made and kept in step through Slack's manifest API (`zupflow-slack`). Unset,
-nothing is made; `scripted` is a stand-in for local work and tests only.
+A server reaches every channel provider it ships at once, and an agent can
+be in several: each linked team, app and connection is served by the provider
+it was made with (`ChannelProviders`, keyed by provider), never by one picked
+for the whole server. No setting chooses a provider:
+`ZUPFLOW_CHANNEL_PROVISIONER`, which picked one in earlier builds, is no
+longer read, and set, it stops startup. `GET
+/v1/workspaces/{ws}/channel-providers` lists the ones this server reaches, and
+the Console offers only those; linking a team of any other answers `501
+channel_providers_not_configured`. Slack is the only provider so far.
+
+Each agent gets its own Slack app, made and kept in step through Slack's
+manifest API (`zupflow-slack`). The scripted provisioner and the fake
+provider, which make apps by fixed rules and call no one, exist only in tests
+and the development-only contract server (`zupflow-basic`'s
+`scripted-channels` feature): no deployment's build contains them.
 
 1. **Give the server a public HTTPS address.** Slack sends each app's events
    to `{ZUPFLOW_PUBLIC_URL}/channels/inbound/{reference}` and the browser back
    from its consent page to `{ZUPFLOW_PUBLIC_URL}/connect/oauth/callback`, so
-   with `slack` the server refuses to start unless `ZUPFLOW_PUBLIC_URL` is an
-   `https://` origin, and Slack must be able to reach it. For local work,
+   Slack is available only while `ZUPFLOW_PUBLIC_URL` is an `https://` origin,
+   and Slack must be able to reach it. Without one the server starts all the
+   same, without Slack. For local work,
    point any HTTPS tunnel at `127.0.0.1:8080` without rewriting the `Host`
    header, and set `ZUPFLOW_PUBLIC_URL` to the tunnel's origin; it must stay
    the same for as long as its apps live, since their manifests name it. With
@@ -686,9 +699,19 @@ waited out for a day after the run at most.
 
 `ZUPFLOW_SLACK_API_URL` points the calls somewhere other than
 `https://slack.com/api` (a stand-in, say); it must be `https://`, and consent
-pages are sent to `/oauth/v2/authorize` at the same origin. Without `slack`,
-deliveries are read by the fake provider, which calls no one, so nothing is
-posted back.
+pages are sent to `/oauth/v2/authorize` at the same origin.
+
+Without Slack (a server whose `ZUPFLOW_PUBLIC_URL` isn't `https://`), linking
+a Slack team answers `501 channel_providers_not_configured`, a delivery to a
+Slack app answers as one with a bad signature, and disconnecting a Slack
+connection answers the same `501` with nothing removed, since its bot token
+can't be revoked. What's stored for Slack stays: rotating a team's tokens,
+making, syncing and removing apps (revoking their bot tokens first) wait,
+using no attempt, and carry on once the server is started again reaching
+Slack. At startup it logs `channels.provider_unreached`, as an error, with how
+many linked teams are waiting. Tokens that lapse meanwhile expire as ever (a
+configuration token lasts twelve hours), so their team needs new ones pasted.
+Replies and catch-up are tried and given up as when Slack doesn't answer.
 
 ### The contract suite against the backend
 

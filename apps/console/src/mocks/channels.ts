@@ -118,8 +118,32 @@ function fakeTeam(manager: ChannelAppManagerRow, workspaceName: string) {
 
 const tokenInput = z.string().trim().min(1, "Required.").max(4096, "Use 4,096 characters or fewer.");
 
-/** Checks both tokens with the fake provider: one containing `invalid` is refused. */
+/** What a deployment's operator does so the server reaches a provider. */
+const SETUP_HINT: Record<ChannelProvider, string> = {
+  slack: "Ask its operator to set ZUPFLOW_PUBLIC_URL to the https:// address Slack reaches it at.",
+};
+
+/** The providers this deployment reaches, each with how a team is linked there. */
+function availableProviders() {
+  return CHANNEL_PROVIDERS.filter((provider) => db().channel_providers.includes(provider)).map((provider) => ({
+    provider,
+    methods: ["configuration_token" as const],
+  }));
+}
+
+/**
+ * Checks both tokens with the fake provider: one containing `invalid` is
+ * refused. A provider this deployment doesn't reach checks nothing.
+ */
 function checkTokens(provider: ChannelProvider, input: { configuration_token: string; refresh_token: string }) {
+  if (!db().channel_providers.includes(provider)) {
+    const name = CHANNEL_PROVIDER_NAMES[provider];
+    throw new ApiFailure(
+      501,
+      "channel_providers_not_configured",
+      `This deployment can't reach ${name}, so it can't link teams there. ${SETUP_HINT[provider]}`,
+    );
+  }
   if (/invalid/i.test(input.configuration_token) || /invalid/i.test(input.refresh_token)) {
     const name = CHANNEL_PROVIDER_NAMES[provider];
     throw new ApiFailure(
@@ -544,6 +568,8 @@ export function deleteWorkspaceChannels(d: Db, workspace: { id: WorkspaceId; org
 
 /** The fake provider makes the app at once: the job's work, after the `202` was written. */
 function provisionApp(app: ChannelAppRow, at: string) {
+  // A provider this deployment doesn't reach makes nothing yet: the job waits for a deployment that does.
+  if (!db().channel_providers.includes(app.provider)) return;
   app.external_app_id = `A0${upper(app.id, 9)}`;
   setAppStatus(app, "awaiting_install", at);
 }
@@ -1009,6 +1035,15 @@ export function createChannelHandlers(
   const where = (access: WorkspaceAccess) => ({ workspace: access.workspace });
 
   return [
+    // --- Providers -------------------------------------------------------------
+    http.get(
+      u("/v1/workspaces/:ws/channel-providers"),
+      route(({ request, params }) => {
+        workspaceAccess(request, param(params, "ws"));
+        return ok(availableProviders());
+      }),
+    ),
+
     // --- App managers ---------------------------------------------------------
     http.get(
       u("/v1/workspaces/:ws/channel-app-managers"),
@@ -1273,6 +1308,15 @@ export function createChannelHandlers(
         const access = workspaceAccess(request, param(params, "ws"));
         requireRole(access, DEVELOPERS, "disconnect channels");
         const row = findConnection(access, params);
+        // Nothing here could revoke its token: kept, still working, for a deployment that can.
+        if (!db().channel_providers.includes(row.provider)) {
+          const name = CHANNEL_PROVIDER_NAMES[row.provider];
+          throw new ApiFailure(
+            501,
+            "channel_providers_not_configured",
+            `This deployment can't reach ${name}, so it can't revoke this connection's token there; nothing was removed. ${SETUP_HINT[row.provider]}`,
+          );
+        }
         const d = db();
         const at = now();
         setConnectionStatus(row, "disconnected", at);

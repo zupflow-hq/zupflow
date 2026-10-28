@@ -289,9 +289,11 @@ async fn serve(path: &str, serving: Serving) -> Result<(), String> {
         model_catalog: Arc::new(ScriptedProviders),
         connect: Arc::new(SqliteConnectStore::new(database.clone())),
         channels: Arc::new(zupflow_sqlite::SqliteChannelStore::new(database.clone())),
-        channel_provider: std::sync::Arc::new(zupflow_channels::fake::FakeChannelProvider::default()),
-        channel_provisioner: Arc::new(
-            zupflow_basic::scripted_channel_provisioner::ScriptedChannelProvisioner::default(),
+        // Slack, by fixed rules: the scripted provisioner makes its apps and
+        // the fake provider reads their deliveries, calling no one.
+        channel_providers: zupflow_core::channels::registry::ChannelProviders::none().with(
+            Arc::new(zupflow_basic::scripted_channel_provisioner::ScriptedChannelProvisioner::default()),
+            Arc::new(zupflow_channels::fake::FakeChannelProvider::default()),
         ),
         jobs: Arc::new(zupflow_sqlite::SqliteJobQueue::new(database.clone())),
         tools: Arc::new(zupflow_sqlite::SqliteToolRegistry::new(database.clone())),

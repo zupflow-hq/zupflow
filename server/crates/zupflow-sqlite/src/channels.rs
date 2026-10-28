@@ -2708,7 +2708,7 @@ impl ChannelStore for SqliteChannelStore {
         app_id: ChannelAppId,
     ) -> Result<Option<AppSecretsRecord>, ChannelError> {
         let row = sqlx::query(
-            "SELECT a.inbound_ref, a.client_id, a.manifest_digest, s.version, s.key_id, s.wrapped_key, s.nonce, \
+            "SELECT a.provider, a.inbound_ref, a.client_id, a.manifest_digest, s.version, s.key_id, s.wrapped_key, s.nonce, \
              s.ciphertext \
              FROM channel_apps a LEFT JOIN channel_app_secrets s \
              ON s.organization_id = a.organization_id AND s.workspace_id = a.workspace_id AND s.app_id = a.id \
@@ -2724,6 +2724,7 @@ impl ChannelStore for SqliteChannelStore {
         let Some(row) = row else { return Ok(None) };
         let version: Option<i64> = row.try_get("version").map_err(read)?;
         Ok(Some(AppSecretsRecord {
+            provider: parsed(&row, "provider", ChannelProviderKind::parse)?,
             inbound_ref: InboundRef::parse(&text(&row, "inbound_ref")?)
                 .ok_or_else(|| read("an invalid inbound reference"))?,
             client_id: row.try_get("client_id").map_err(read)?,
@@ -2818,6 +2819,10 @@ impl ChannelStore for SqliteChannelStore {
         now: Timestamp,
     ) -> Result<RotationSweep, ChannelError> {
         lifecycle::queue_due_rotations_cross_tenant(self, rotate, due_by, limit, now).await
+    }
+
+    async fn count_teams_by_provider_cross_tenant(&self) -> Result<Vec<(ChannelProviderKind, u64)>, ChannelError> {
+        lifecycle::count_teams_by_provider_cross_tenant(self).await
     }
 
     async fn record_app_released(
@@ -4056,6 +4061,8 @@ mod tests {
         // A sweep over every workspace's channel data for what's past
         // retention, each then swept in its own scope.
         "retention_due_cross_tenant",
+        // A count of every workspace's linked teams by provider, naming none.
+        "count_teams_by_provider_cross_tenant",
     ];
 
     /// Statements on a workspace's tables that hold to the organization

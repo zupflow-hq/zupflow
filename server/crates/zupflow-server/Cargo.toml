@@ -42,7 +42,6 @@ regex = "1"
 url = "2"
 zeroize.workspace = true
 zupflow-basic.workspace = true
-zupflow-channels.workspace = true
 zupflow-core.workspace = true
 zupflow-mcp.workspace = true
 zupflow-oidc.workspace = true
@@ -51,8 +50,11 @@ zupflow-providers.workspace = true
 zupflow-slack.workspace = true
 zupflow-sqlite = { workspace = true, optional = true }
 
+# The scripted provisioner and the fake provider are for tests: never a
+# dependency of the server itself, so no configuration can select them.
 [dev-dependencies]
-zupflow-basic = { workspace = true, features = ["local-identity"] }
+zupflow-basic = { workspace = true, features = ["local-identity", "scripted-channels"] }
+zupflow-channels.workspace = true
 zupflow-providers = { workspace = true, features = ["fake"] }
 zupflow-slack = { workspace = true, features = ["fake"] }
 zupflow-sqlite.workspace = true

@@ -71,6 +71,7 @@ export const qk = {
   runEvents: (wsId: string, id: string) => ["ws", wsId, "runs", id, "events"] as const,
   /** Every channel key starts here, so a change to one refreshes linked teams, apps and connections together. */
   channels: (wsId: string) => ["ws", wsId, "channels"] as const,
+  channelProviders: (wsId: string) => ["ws", wsId, "channels", "providers"] as const,
   channelAppManagers: (wsId: string) => ["ws", wsId, "channels", "managers"] as const,
   channelAppManager: (wsId: string, id: string) => ["ws", wsId, "channels", "manager", id] as const,
   channelApps: (wsId: string, query: ChannelAppListQuery = {}) => ["ws", wsId, "channels", "apps", query] as const,

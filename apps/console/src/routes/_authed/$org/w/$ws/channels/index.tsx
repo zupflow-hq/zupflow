@@ -1,5 +1,13 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import type { Agent, ChannelAppManager, Organization, Workspace } from "@zupflow/sdk";
+import {
+  type Agent,
+  CHANNEL_PROVIDER_NAMES,
+  CHANNEL_PROVIDERS,
+  type ChannelAppManager,
+  type ChannelProvider,
+  type Organization,
+  type Workspace,
+} from "@zupflow/sdk";
 import {
   AlertTriangleIcon,
   EllipsisIcon,
@@ -27,15 +35,22 @@ import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTi
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { CHANNEL_PROVIDER_ICON, PRODUCTION_CHANNELS } from "@/features/channels/labels";
+import { CHANNEL_PROVIDER_ICON, NO_CHANNEL_PROVIDERS, PRODUCTION_CHANNELS } from "@/features/channels/labels";
 import { LinkTeamDialog } from "@/features/channels/link-team-dialog";
 import { ChannelAppStatusPill, ManagerStatusPill } from "@/features/channels/status";
 import { canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
-import { useAgents, useChannelAppManagers, useChannelApps, useDeleteChannelAppManager } from "@/features/queries";
+import {
+  useAgents,
+  useChannelAppManagers,
+  useChannelApps,
+  useChannelProviders,
+  useDeleteChannelAppManager,
+} from "@/features/queries";
 import { toastError } from "@/lib/errors";
 
 export const Route = createFileRoute("/_authed/$org/w/$ws/channels/")({
-  validateSearch: z.object({ link: z.boolean().optional() }),
+  /** `link`: the provider whose link dialog is open. */
+  validateSearch: z.object({ link: z.enum(CHANNEL_PROVIDERS).optional().catch(undefined) }),
   component: ChannelsPage,
 });
 
@@ -46,30 +61,46 @@ function ChannelsPage() {
   const navigate = useNavigate({ from: Route.fullPath });
   const { link } = Route.useSearch();
   const managers = useChannelAppManagers(ws.id);
+  const providers = useChannelProviders(ws.id);
   const agents = useAgents(ws.id);
   const production = ws.environment === "production";
   const mayLink = !production && canChange(org);
-  const setLink = (open: boolean) => navigate({ search: open ? { link: true } : {}, replace: true });
+  // Only the providers this server reaches are offered.
+  const offered = mayLink ? (providers.data ?? []).map((p) => p.provider) : [];
+  const unreached = mayLink && providers.isSuccess && offered.length === 0;
+  const setLink = (provider: ChannelProvider | null) =>
+    navigate({ search: provider ? { link: provider } : {}, replace: true });
   const items = managers.data?.pages.flatMap((page) => page.items) ?? [];
+  const linkButtons = () =>
+    offered.map((provider) => (
+      <Button key={provider} onClick={() => setLink(provider)}>
+        <PlusIcon />
+        Link {CHANNEL_PROVIDER_NAMES[provider]} team
+      </Button>
+    ));
 
   return (
     <PageContainer>
       <PageHeader
         title="Channels"
         description="Agents people can talk to in Slack. Link a Slack team once; then each agent gets its own app there, added from the agent's Channels tab."
-        actions={
-          mayLink ? (
-            <Button onClick={() => setLink(true)}>
-              <PlusIcon />
-              Link Slack team
-            </Button>
-          ) : null
-        }
+        actions={offered.length > 0 ? <div className="flex flex-wrap gap-2">{linkButtons()}</div> : null}
       />
       {production ? <p className="mb-5 rounded-xl border bg-muted/40 p-3 text-sm">{PRODUCTION_CHANNELS}</p> : null}
+      {unreached && items.length > 0 ? (
+        <p className="mb-5 rounded-xl border bg-muted/40 p-3 text-sm">{NO_CHANNEL_PROVIDERS}</p>
+      ) : null}
+      {mayLink && providers.isError ? (
+        <QueryError
+          error={providers.error}
+          onRetry={() => providers.refetch()}
+          what="channel providers"
+          className="mb-5"
+        />
+      ) : null}
       {managers.isError ? (
         <QueryError error={managers.error} onRetry={() => managers.refetch()} what="linked teams" />
-      ) : managers.isPending ? (
+      ) : managers.isPending || (mayLink && providers.isPending) ? (
         <TeamSkeleton />
       ) : items.length === 0 ? (
         <Panel>
@@ -78,21 +109,28 @@ function ChannelsPage() {
               <EmptyMedia variant="icon">
                 <MessagesSquareIcon />
               </EmptyMedia>
-              <EmptyTitle>{mayLink ? "Link a Slack team" : "No Slack team linked yet"}</EmptyTitle>
+              <EmptyTitle>
+                {offered.length > 1
+                  ? "Link a team"
+                  : offered[0]
+                    ? `Link a ${CHANNEL_PROVIDER_NAMES[offered[0]]} team`
+                    : unreached
+                      ? "Slack isn't available here"
+                      : "No Slack team linked yet"}
+              </EmptyTitle>
               <EmptyDescription>
                 {production
                   ? "This customer links their Slack team from your product."
-                  : mayLink
+                  : offered.length > 0
                     ? "Paste a configuration token from Slack. Zupflow then creates an app for each agent you add, so people can mention it and send it messages."
-                    : "Teams appear here once a developer links one."}
+                    : unreached
+                      ? NO_CHANNEL_PROVIDERS
+                      : "Teams appear here once a developer links one."}
               </EmptyDescription>
             </EmptyHeader>
-            {mayLink ? (
+            {offered.length > 0 ? (
               <EmptyContent>
-                <Button onClick={() => setLink(true)}>
-                  <PlusIcon />
-                  Link Slack team
-                </Button>
+                <div className="flex flex-wrap justify-center gap-2">{linkButtons()}</div>
               </EmptyContent>
             ) : null}
           </Empty>
@@ -112,7 +150,15 @@ function ChannelsPage() {
           ) : null}
         </div>
       )}
-      {mayLink ? <LinkTeamDialog workspaceId={ws.id} open={Boolean(link)} onOpenChange={setLink} /> : null}
+      {offered.map((provider) => (
+        <LinkTeamDialog
+          key={provider}
+          workspaceId={ws.id}
+          provider={provider}
+          open={link === provider}
+          onOpenChange={(open) => setLink(open ? provider : null)}
+        />
+      ))}
     </PageContainer>
   );
 }
@@ -312,6 +358,7 @@ function TeamCard({
       {sandbox && mayChange ? (
         <LinkTeamDialog
           workspaceId={workspace.id}
+          provider={manager.provider}
           manager={manager}
           open={dialog === "replace"}
           onOpenChange={(open) => setDialog(open ? "replace" : null)}

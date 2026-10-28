@@ -159,7 +159,7 @@ pub async fn learn_people(
             return unread;
         }
     };
-    let provider = state.channel_provider.as_ref();
+    let provider = state.channel_providers.provider(connection.provider);
     let mut people = Vec::new();
     let mut failed = false;
     for id in wanted {
@@ -330,7 +330,7 @@ async fn post_once(
         text: &reply.text,
         send_id: &send_id,
     };
-    let provider = state.channel_provider.as_ref();
+    let provider = state.channel_providers.provider(reply.provider);
     let http = state.outbound.as_ref();
     if retried {
         // An earlier try may have posted it and lost the answer: posted
