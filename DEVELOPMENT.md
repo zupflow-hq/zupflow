@@ -631,6 +631,38 @@ longer read, and set, it stops startup. `GET
 the Console offers only those; linking a team of any other answers `501
 channel_providers_not_configured`. Slack is the only provider so far.
 
+Each organization also chooses which providers its workspaces may use
+(`GET`/`PUT /v1/organizations/{org}/channel-provider-settings`, owners and
+admins from the Console, under **Chat providers** in organization settings;
+`channel_provider_settings.updated` in the audit log). Until an admin saves a
+list, every provider is allowed, including ones a later release adds;
+`allowed_providers: null` restores that. A saved list allows only the
+providers on it, so a provider added later stays off for that organization
+until an admin turns it on, and an empty list allows none. The read lists
+every provider the server ships with `reachable` and `allowed`, so the Console
+can say why one isn't offered; `listChannelProviders` lists only those that
+are both. Linking a team of a provider the organization doesn't allow, through
+the API or hosted Connect, answers `403 channel_provider_not_allowed`, checked
+before the provider is asked anything and again in the transaction that links
+the team (a Connect session started before the change links nothing). Turning a
+provider off deletes nothing: teams already linked, their apps and connections
+keep working, their tokens are rotated and replaced, agents' apps are made and
+installed and messages answered, until someone unlinks them; the Console marks
+them *Not allowed by your organization*.
+
+The hosted page is for the customer's team admin, who can't change the
+organization's choice, so it's told before it asks for tokens: its read
+(`GET /v1/connect/sessions/{reference}`) names `unavailable_reason`
+(`channel_provider_not_allowed`, or `channel_providers_not_configured` when the
+server doesn't reach the provider) and the page says the link can't be used
+right now, to ask for a new one; pasting anyway answers the same codes in those
+words, while the Console and API keys keep the admin's. The link check and the
+save are serialized per organization (SQLite's immediate transactions; another
+store locks the organization's row, as the `ChannelStore` trait says). A saved
+list keeps the provider names this build doesn't ship, so an older build
+saving during a rolling deploy or after a rollback doesn't take away one a
+newer build allowed; saving null clears them.
+
 Each agent gets its own Slack app, made and kept in step through Slack's
 manifest API (`zupflow-slack`). The scripted provisioner and the fake
 provider, which make apps by fixed rules and call no one, exist only in tests
