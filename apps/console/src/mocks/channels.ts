@@ -1,10 +1,11 @@
 /**
  * The mock's channels: linked teams (app managers), each agent's generated
  * app, connections with their conversations and messages, agent channels,
- * the organization's channel tool levels and settings, the provider's inbound
- * endpoint, and channel Connect sessions. A fake provider stands in for
- * Slack: it accepts any token of the right shape, refuses one containing
- * `invalid`, makes apps at once and installs them on consent.
+ * the organization's channel tool levels, settings and allowed providers,
+ * the provider's inbound endpoint, and channel Connect sessions. A fake
+ * provider stands in for Slack: it accepts any token of the right shape,
+ * refuses one containing `invalid`, makes apps at once and installs them on
+ * consent.
  *
  * Every lookup carries the organization and the workspace; the one
  * exception is finding an app by its inbound reference, which is how a
@@ -30,10 +31,12 @@ import {
   ChannelConversationKind,
   type ChannelMessage,
   type ChannelProvider,
+  type ChannelProviderSettings,
   type ChannelSettings,
   type ChannelToolLevel,
   type ChannelToolName,
   type ConnectTarget,
+  type ConnectUnavailableReason,
   type ChannelConversationKind as ConversationKind,
   type Id,
   type IdKind,
@@ -123,25 +126,116 @@ const SETUP_HINT: Record<ChannelProvider, string> = {
   slack: "Ask its operator to set ZUPFLOW_PUBLIC_URL to the https:// address Slack reaches it at.",
 };
 
-/** The providers this deployment reaches, each with how a team is linked there. */
-function availableProviders() {
-  return CHANNEL_PROVIDERS.filter((provider) => db().channel_providers.includes(provider)).map((provider) => ({
+/**
+ * Whether the organization allows linking teams of `provider`: every
+ * provider until an admin saves a list, then only the listed ones.
+ */
+function providerAllowed(organizationId: OrganizationId, provider: ChannelProvider) {
+  const row = db().channel_provider_settings.find((s) => s.organization_id === organizationId);
+  return !row?.allowed_providers || row.allowed_providers.includes(provider);
+}
+
+/**
+ * Why the hosted page's team can't be linked, for the person there: the
+ * customer's team admin, who can't change why, only ask for a new link.
+ */
+function hostedRefusal(provider: ChannelProvider) {
+  return `This link can't be used to link a ${CHANNEL_PROVIDER_NAMES[provider]} team right now, so nothing was linked. Ask the app that sent you here for a new one.`;
+}
+
+/**
+ * Refuses linking a team of a provider the organization doesn't allow, in
+ * words for whoever is linking: the organization's members, or (`hosted`)
+ * the person on the hosted page. Teams already linked keep working.
+ */
+function assertProviderAllowed(organizationId: OrganizationId, provider: ChannelProvider, hosted = false) {
+  if (providerAllowed(organizationId, provider)) return;
+  const name = CHANNEL_PROVIDER_NAMES[provider];
+  throw new ApiFailure(
+    403,
+    "channel_provider_not_allowed",
+    hosted
+      ? hostedRefusal(provider)
+      : `Your organization doesn't allow ${name}, so no ${name} team can be linked. An owner or admin can allow it in the organization's settings.`,
+  );
+}
+
+/**
+ * Why a pending team-linking session can't be finished right now, for the
+ * hosted read: the code pasting its tokens would answer, the organization's
+ * refusal first. Null for any other session.
+ */
+export function hostedUnavailableReason(session: ConnectSessionRow): ConnectUnavailableReason | null {
+  if (session.target?.kind !== "channel_app_manager" || session.status !== "pending") return null;
+  const provider = session.target.provider;
+  if (!providerAllowed(session.organization_id, provider)) return "channel_provider_not_allowed";
+  if (!db().channel_providers.includes(provider)) return "channel_providers_not_configured";
+  return null;
+}
+
+/** The providers this deployment reaches and the organization allows, each with how a team is linked there. */
+function availableProviders(organizationId: OrganizationId) {
+  return CHANNEL_PROVIDERS.filter(
+    (provider) => db().channel_providers.includes(provider) && providerAllowed(organizationId, provider),
+  ).map((provider) => ({
     provider,
     methods: ["configuration_token" as const],
   }));
 }
 
+function toChannelProviderSettings(organizationId: OrganizationId): ChannelProviderSettings {
+  const row = db().channel_provider_settings.find((s) => s.organization_id === organizationId);
+  return {
+    organization_id: organizationId,
+    allowed_providers: row?.allowed_providers ?? null,
+    providers: CHANNEL_PROVIDERS.map((provider) => ({
+      provider,
+      reachable: db().channel_providers.includes(provider),
+      allowed: providerAllowed(organizationId, provider),
+    })),
+    updated_at: row?.updated_at ?? null,
+    updated_by: row?.updated_by_user_id ? toUser(row.updated_by_user_id) : null,
+  };
+}
+
+const providerSettingsInput = z.object({
+  allowed_providers: z.array(z.unknown(), "Required: a list of providers, or null for every one.").nullable(),
+});
+
+/** Each provider once, by name, read as the server reads them: the first name it can't take is refused. */
+function allowedInput(names: readonly unknown[]): ChannelProvider[] {
+  const allowed: ChannelProvider[] = [];
+  for (const name of names) {
+    const provider = CHANNEL_PROVIDERS.find((p) => p === name);
+    if (!provider || allowed.includes(provider)) {
+      throw new ApiFailure(400, "validation_failed", "Some fields are invalid.", {
+        allowed_providers: provider ? "List each provider once." : "Choose providers this server ships.",
+      });
+    }
+    allowed.push(provider);
+  }
+  return allowed;
+}
+
 /**
  * Checks both tokens with the fake provider: one containing `invalid` is
- * refused. A provider this deployment doesn't reach checks nothing.
+ * refused. A provider this deployment doesn't reach checks nothing, and is
+ * explained to the person on the hosted page (`hosted`) as a link that
+ * can't be used.
  */
-function checkTokens(provider: ChannelProvider, input: { configuration_token: string; refresh_token: string }) {
+function checkTokens(
+  provider: ChannelProvider,
+  input: { configuration_token: string; refresh_token: string },
+  hosted = false,
+) {
   if (!db().channel_providers.includes(provider)) {
     const name = CHANNEL_PROVIDER_NAMES[provider];
     throw new ApiFailure(
       501,
       "channel_providers_not_configured",
-      `This deployment can't reach ${name}, so it can't link teams there. ${SETUP_HINT[provider]}`,
+      hosted
+        ? hostedRefusal(provider)
+        : `This deployment can't reach ${name}, so it can't link teams there. ${SETUP_HINT[provider]}`,
     );
   }
   if (/invalid/i.test(input.configuration_token) || /invalid/i.test(input.refresh_token)) {
@@ -670,6 +764,7 @@ const targetInput = z.object({
 export function channelSessionTarget(access: WorkspaceAccess, json: unknown) {
   const input = validated(json, targetInput);
   if (input.target.kind === "channel_app_manager") {
+    assertProviderAllowed(access.org.id, input.target.provider);
     const target: ConnectTarget = { kind: "channel_app_manager", provider: input.target.provider, manager: null };
     return { target, label: CHANNEL_PROVIDER_NAMES[input.target.provider], return_url: input.return_url };
   }
@@ -758,7 +853,9 @@ export async function submitChannelCredentials(
     );
   }
   const input = await body(request, z.object({ values: tokensInput }));
-  checkTokens(session.target.provider, input.values);
+  // Asked again: the organization may have stopped allowing the provider since the session started.
+  assertProviderAllowed(session.organization_id, session.target.provider, true);
+  checkTokens(session.target.provider, input.values, true);
   const at = new Date().toISOString();
   const manager = newManager(
     { organization_id: session.organization_id, workspace_id: session.workspace_id },
@@ -1039,8 +1136,8 @@ export function createChannelHandlers(
     http.get(
       u("/v1/workspaces/:ws/channel-providers"),
       route(({ request, params }) => {
-        workspaceAccess(request, param(params, "ws"));
-        return ok(availableProviders());
+        const access = workspaceAccess(request, param(params, "ws"));
+        return ok(availableProviders(access.org.id));
       }),
     ),
 
@@ -1066,6 +1163,7 @@ export function createChannelHandlers(
         requireRole(access, DEVELOPERS, "link teams");
         assertConsoleMayAct(access, "link teams");
         const input = await body(request, managerInput);
+        assertProviderAllowed(access.org.id, input.provider);
         checkTokens(input.provider, input);
         const row = newManager(
           { organization_id: access.org.id, workspace_id: access.workspace.id },
@@ -1555,6 +1653,43 @@ export function createChannelHandlers(
           });
         audit(access, "channel_settings.updated", { type: "channel_settings", id: null, name: "Channel settings" });
         return ok(toChannelSettings(access.org.id));
+      }),
+    ),
+
+    http.get(
+      u("/v1/organizations/:org/channel-provider-settings"),
+      route(({ request, params }) => {
+        const access: OrgAccess = orgAccess(request, param(params, "org"));
+        return ok(toChannelProviderSettings(access.org.id));
+      }),
+    ),
+
+    http.put(
+      u("/v1/organizations/:org/channel-provider-settings"),
+      route(async ({ request, params }) => {
+        const access = consoleOrgAccess(request, param(params, "org"));
+        requireRole(access, ADMINS, "choose channel providers");
+        const input = await body(request, providerSettingsInput);
+        const listed = input.allowed_providers && allowedInput(input.allowed_providers);
+        const d = db();
+        const at = now();
+        // Kept in the server's order, whatever order they were sent in.
+        const allowed = listed ? CHANNEL_PROVIDERS.filter((provider) => listed.includes(provider)) : null;
+        const row = d.channel_provider_settings.find((s) => s.organization_id === access.org.id);
+        if (row) Object.assign(row, { allowed_providers: allowed, updated_at: at, updated_by_user_id: access.user.id });
+        else
+          d.channel_provider_settings.push({
+            organization_id: access.org.id,
+            allowed_providers: allowed,
+            updated_at: at,
+            updated_by_user_id: access.user.id,
+          });
+        audit(access, "channel_provider_settings.updated", {
+          type: "channel_provider_settings",
+          id: null,
+          name: "Channel providers",
+        });
+        return ok(toChannelProviderSettings(access.org.id));
       }),
     ),
 

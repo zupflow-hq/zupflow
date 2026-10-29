@@ -1,16 +1,19 @@
 //! Channels: a workspace's agents reached in a team's chat (Slack first), at
 //! `/v1/workspaces/{ws}/channel-…`, `/v1/workspaces/{ws}/agents/{agent}/channels…`
-//! and the organization's `/v1/organizations/{org}/channel-tool-levels` and
-//! `/channel-settings`; and channel Connect sessions, which link a team or
-//! install an agent's app on the hosted page.
+//! and the organization's `/v1/organizations/{org}/channel-tool-levels`,
+//! `/channel-settings` and `/channel-provider-settings`; and channel Connect
+//! sessions, which link a team or install an agent's app on the hosted page.
 //!
 //! Every workspace route resolves with [`WorkspaceAccess::resolve`], so a key
 //! reaches its own organization and environment only, and every lookup names
 //! the organization and the workspace. Changes need a developer or stricter
 //! (the organization's levels and settings an admin, from the Console), and
 //! the Console can't link teams or make apps in Production: the customer's
-//! product does that with a key. Each change is checked again by the store
-//! inside its transaction, with the editor's role read again.
+//! product does that with a key. A team is linked only of a provider the
+//! server reaches and the organization allows; one the organization stops
+//! allowing keeps the teams already linked working. Each change is checked
+//! again by the store inside its transaction, with the editor's role read
+//! again.
 //!
 //! An app is made by a job (`provision_channel_app`) after `202`: the worker
 //! here opens the team's tokens, asks the [`AppProvisioner`] to make it, and
@@ -47,11 +50,12 @@ use zupflow_core::channels::store::{
 use zupflow_core::channels::{
     AgentChannel, AgentChannelSettings, AgentMessages, AppStatus, Audience, BreakerSettings, CHANNEL_TOOLS, ChannelApp,
     ChannelAppManager, ChannelConnection, ChannelConversation, ChannelMessage, ChannelPerson, ChannelProviderKind,
-    ChannelSettings, ChannelToolLevel, ConnectTarget, ConnectionStatus, ConnectionTeam, ConversationKind, Direction,
-    FIRST_VERSION, HandlerKind, Identity, InboundRef, MAX_AGENT_HOPS, MAX_LABEL, MIN_AGENT_HOPS, ManagerMethod,
-    ManagerStatus, MidRun, Persona, Senders, Team, ThreadFollowUp, TokenState, channel_tool,
+    ChannelProviderSettings, ChannelSettings, ChannelToolLevel, ConnectTarget, ConnectionStatus, ConnectionTeam,
+    ConversationKind, Direction, FIRST_VERSION, HandlerKind, Identity, InboundRef, MAX_AGENT_HOPS, MAX_LABEL,
+    MIN_AGENT_HOPS, ManagerMethod, ManagerStatus, MidRun, Persona, Senders, Team, ThreadFollowUp, TokenState,
+    channel_tool,
 };
-use zupflow_core::connect::{ConnectIntent, ConnectSession, NewConnectSession, Reference};
+use zupflow_core::connect::{ConnectIntent, ConnectSession, ConnectSessionStatus, NewConnectSession, Reference};
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{
@@ -112,6 +116,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/v1/organizations/{org}/channel-settings",
             get(get_settings).put(update_settings),
+        )
+        .route(
+            "/v1/organizations/{org}/channel-provider-settings",
+            get(get_provider_settings).put(update_provider_settings),
         )
 }
 
@@ -540,9 +548,8 @@ fn channel_failure(error: ChannelError) -> Failure {
         ChannelError::ToolDenied(tool) => tool_denied(&tool),
         ChannelError::ApprovalRequiredByPolicy(tool) => approval_required_by_policy(&tool),
         ChannelError::UnknownConversation => unknown_conversation(),
-        ChannelError::SessionNotPending => {
-            crate::connect::not_pending(zupflow_core::connect::ConnectSessionStatus::Completed)
-        }
+        ChannelError::ProviderNotAllowed(provider) => provider_not_allowed(provider),
+        ChannelError::SessionNotPending => crate::connect::not_pending(ConnectSessionStatus::Completed),
     }
 }
 
@@ -606,6 +613,88 @@ pub(crate) fn provision_failure(error: ProvisionError, provider: ChannelProvider
         )
         .into(),
     }
+}
+
+/// A team of a provider the organization doesn't allow: none is linked.
+/// Teams already linked keep working.
+fn provider_not_allowed(provider: ChannelProviderKind) -> Failure {
+    let name = provider.name();
+    ApiError::new(
+        403,
+        "channel_provider_not_allowed",
+        format!(
+            "Your organization doesn't allow {name}, so no {name} team can be linked. An owner or admin can allow \
+             it in the organization's settings."
+        ),
+    )
+    .into()
+}
+
+/// Refuses linking a team of `provider` when the organization doesn't
+/// allow it, before the provider is asked anything. The store asks again
+/// in the transaction that links it.
+async fn require_provider_allowed(
+    state: &AppState,
+    organization_id: OrganizationId,
+    provider: ChannelProviderKind,
+) -> Result<(), Failure> {
+    let settings = state
+        .channels
+        .channel_provider_settings(organization_id)
+        .await
+        .map_err(channel_failure)?;
+    if settings.allows(provider) {
+        Ok(())
+    } else {
+        Err(provider_not_allowed(provider))
+    }
+}
+
+/// A refusal of the hosted page's tokens, in words for the person there:
+/// the customer's team admin, who can't change why a team can't be linked
+/// (the organization's choice, or what this deployment reaches) and only
+/// needs to know to ask for a new link. The status and code stay the API's;
+/// any other refusal is written for them already.
+fn for_the_hosted_page(Failure(mut error): Failure, provider: ChannelProviderKind) -> Failure {
+    if matches!(
+        error.code,
+        "channel_provider_not_allowed" | "channel_providers_not_configured"
+    ) {
+        error.message = format!(
+            "This link can't be used to link a {} team right now, so nothing was linked. Ask the app that sent you \
+             here for a new one.",
+            provider.name()
+        );
+    }
+    Failure(error)
+}
+
+/// Why a pending team-linking session can't be finished right now, for the
+/// hosted page's read, so it doesn't ask for tokens: the code pasting them
+/// would answer, the organization's refusal first. `None` for any other
+/// session, and while it can be finished.
+pub(crate) async fn unavailable_reason(
+    state: &AppState,
+    session: &ConnectSession,
+) -> Result<Option<&'static str>, Failure> {
+    let Some(ConnectTarget::ChannelAppManager { provider, .. }) = session.target else {
+        return Ok(None);
+    };
+    if session.status_at(Timestamp::now()) != ConnectSessionStatus::Pending {
+        return Ok(None);
+    }
+    let settings = state
+        .channels
+        .channel_provider_settings(session.organization_id)
+        .await
+        .map_err(channel_failure)?;
+    Ok(if !settings.allows(provider) {
+        Some("channel_provider_not_allowed")
+    } else if !state.channel_providers.is_available(provider) {
+        Some("channel_providers_not_configured")
+    } else {
+        None
+    })
 }
 
 /// A connection whose token this server can't revoke, because it doesn't
@@ -769,19 +858,25 @@ fn filter_id<T>(query: &BTreeMap<String, String>, name: &str, parse: impl Fn(&st
 
 // --- Linked teams -------------------------------------------------------------
 
-/// The providers this server reaches, so the workspace links teams only
-/// there: the same for every workspace, read by anyone who can read one.
+/// The providers this server reaches and the organization allows, so the
+/// workspace links teams only there: read by anyone who can read it.
 async fn list_providers(
     State(state): State<AppState>,
     caller: Caller,
     headers: HeaderMap,
     Path(ws): Path<String>,
 ) -> Result<Response, Failure> {
-    WorkspaceAccess::resolve(&state, caller, &headers, &ws).await?;
+    let access = WorkspaceAccess::resolve(&state, caller, &headers, &ws).await?;
+    let settings = state
+        .channels
+        .channel_provider_settings(access.access.organization_id)
+        .await
+        .map_err(channel_failure)?;
     let providers = &state.channel_providers;
     let available = providers
         .available()
         .into_iter()
+        .filter(|kind| settings.allows(*kind))
         .map(|kind| {
             json!({
                 "provider": kind.as_str(),
@@ -972,6 +1067,7 @@ async fn create_manager(
         return Err(ApiError::internal().into());
     };
     let (organization_id, workspace_id) = (access.access.organization_id, access.workspace.id);
+    require_provider_allowed(&state, organization_id, provider).await?;
     let manager_id = ChannelAppManagerId::generate();
     let created_by = match &access.access.actor {
         Actor::Member(member) => Some(member.user.id),
@@ -2185,6 +2281,125 @@ async fn update_settings(
     Ok(envelope(StatusCode::OK, settings_view(saved)))
 }
 
+#[derive(Serialize)]
+struct ProviderView {
+    provider: ChannelProviderKind,
+    reachable: bool,
+    allowed: bool,
+}
+
+#[derive(Serialize)]
+struct ProviderSettingsView {
+    organization_id: OrganizationId,
+    allowed_providers: Option<Vec<ChannelProviderKind>>,
+    providers: Vec<ProviderView>,
+    updated_at: Option<Timestamp>,
+    updated_by: Option<User>,
+}
+
+/// The organization's choice, with every provider the server ships: whether
+/// it reaches it and whether the organization allows it.
+fn provider_settings_view(state: &AppState, settings: ChannelProviderSettings) -> ProviderSettingsView {
+    ProviderSettingsView {
+        organization_id: settings.organization_id,
+        providers: ChannelProviderKind::ALL
+            .iter()
+            .map(|&provider| ProviderView {
+                provider,
+                reachable: state.channel_providers.is_available(provider),
+                allowed: settings.allows(provider),
+            })
+            .collect(),
+        allowed_providers: settings.allowed,
+        updated_at: settings.updated_at,
+        updated_by: settings.updated_by,
+    }
+}
+
+async fn get_provider_settings(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(org): Path<String>,
+) -> Result<Response, Failure> {
+    let access = Access::organization(&state, caller, &org).await?;
+    let settings = state
+        .channels
+        .channel_provider_settings(access.organization_id)
+        .await
+        .map_err(channel_failure)?;
+    Ok(envelope(StatusCode::OK, provider_settings_view(&state, settings)))
+}
+
+/// `allowed_providers`: null, or each provider once.
+fn allowed_input(body: &Object, fields: &mut Fields) -> Option<Option<Vec<ChannelProviderKind>>> {
+    const KEY: &str = "allowed_providers";
+    match body.0.get(KEY) {
+        Some(Value::Null) => Some(None),
+        Some(Value::Array(names)) => {
+            let mut allowed = Vec::new();
+            for name in names {
+                let Some(provider) = name.as_str().and_then(ChannelProviderKind::parse) else {
+                    fields.invalid(KEY, "Choose providers this server ships.");
+                    return None;
+                };
+                if allowed.contains(&provider) {
+                    fields.invalid(KEY, "List each provider once.");
+                    return None;
+                }
+                allowed.push(provider);
+            }
+            Some(Some(allowed))
+        }
+        _ => {
+            fields.invalid(KEY, "Required: a list of providers, or null for every one.");
+            None
+        }
+    }
+}
+
+async fn update_provider_settings(
+    State(state): State<AppState>,
+    ConsoleUser(user): ConsoleUser,
+    Path(org): Path<String>,
+    body: Body,
+) -> Result<Response, Failure> {
+    let access = OrganizationAccess::resolve(&state, user, &org).await?;
+    access.require(MemberRole::is_admin, "choose channel providers")?;
+    let body = body.object()?;
+    let mut fields = Fields::default();
+    let allowed = allowed_input(&body, &mut fields);
+    fields.finish()?;
+    let Some(allowed) = allowed else {
+        return Err(ApiError::internal().into());
+    };
+    let saved = state
+        .channels
+        .save_channel_provider_settings(
+            access.organization.id,
+            access.member.id,
+            allowed.as_deref(),
+            access.user.id,
+            Timestamp::now(),
+            &|_: &ChannelProviderSettings| {
+                AuditEntry::new(
+                    access.audit_actor(),
+                    AuditAction::ChannelProviderSettingsUpdated,
+                    AuditTarget::new(AuditObject::ChannelProviderSettings, "Channel providers"),
+                    AuditPlace::Organization,
+                )
+            },
+        )
+        .await
+        .map_err(channel_failure)?;
+    tracing::info!(
+        event = "channels.providers_chosen",
+        organization_id = %access.organization.id,
+        user_id = %access.user.id,
+        allowed = ?saved.allowed.as_ref().map(|allowed| allowed.iter().map(|kind| kind.as_str()).collect::<Vec<_>>()),
+    );
+    Ok(envelope(StatusCode::OK, provider_settings_view(&state, saved)))
+}
+
 // --- Channel Connect sessions ------------------------------------------------------------
 
 /// A channel session's target, as a body names it.
@@ -2244,13 +2459,16 @@ pub(crate) async fn create_channel_session(
         return Err(ApiError::internal().into());
     };
     let (target, label) = match target {
-        TargetInput::Manager(provider) => (
-            ConnectTarget::ChannelAppManager {
-                provider,
-                manager: None,
-            },
-            provider.name().to_owned(),
-        ),
+        TargetInput::Manager(provider) => {
+            require_provider_allowed(state, access.access.organization_id, provider).await?;
+            (
+                ConnectTarget::ChannelAppManager {
+                    provider,
+                    manager: None,
+                },
+                provider.name().to_owned(),
+            )
+        }
         TargetInput::App(app) => {
             let app = find_app(state, access, &app).await?;
             if !app.status.is_installable() {
@@ -2355,6 +2573,11 @@ pub(crate) async fn submit_channel_credentials(
         return Err(ApiError::internal().into());
     };
     let (organization_id, workspace_id) = (session.organization_id, session.workspace_id);
+    let hosted = |failure| for_the_hosted_page(failure, provider);
+    // Asked again: the organization may have stopped allowing the provider since the session started.
+    require_provider_allowed(state, organization_id, provider)
+        .await
+        .map_err(hosted)?;
     let manager_id = ChannelAppManagerId::generate();
     let manager = new_manager(
         state,
@@ -2368,7 +2591,8 @@ pub(crate) async fn submit_channel_credentials(
         &tokens,
         None,
     )
-    .await?;
+    .await
+    .map_err(hosted)?;
     let (completed, linked) = state
         .channels
         .link_team_through_session(
@@ -2390,7 +2614,7 @@ pub(crate) async fn submit_channel_credentials(
             },
         )
         .await
-        .map_err(channel_failure)?;
+        .map_err(|error| hosted(channel_failure(error)))?;
     tracing::info!(event = "channels.team_linked", %organization_id, %workspace_id, manager_id = %linked.id, session_id = %session.id);
     Ok(envelope(
         StatusCode::OK,

@@ -23,6 +23,7 @@ import { z } from "zod";
 import { ConfirmDialog } from "@/components/app/confirm-dialog";
 import { AppIcon, QueryError, RelativeTime, RowsSkeleton, rowLinkProps } from "@/components/app/misc";
 import { PageContainer, PageHeader, Panel } from "@/components/app/page";
+import { StatusPill } from "@/components/app/status";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -35,7 +36,14 @@ import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTi
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { CHANNEL_PROVIDER_ICON, NO_CHANNEL_PROVIDERS, PRODUCTION_CHANNELS } from "@/features/channels/labels";
+import { NoProviderReason } from "@/features/channels/channel-providers";
+import {
+  CHANNEL_PROVIDER_ICON,
+  notAllowedNote,
+  onlyProvider,
+  PRODUCTION_CHANNELS,
+  providerNames,
+} from "@/features/channels/labels";
 import { LinkTeamDialog } from "@/features/channels/link-team-dialog";
 import { ChannelAppStatusPill, ManagerStatusPill } from "@/features/channels/status";
 import { canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
@@ -43,6 +51,7 @@ import {
   useAgents,
   useChannelAppManagers,
   useChannelApps,
+  useChannelProviderSettings,
   useChannelProviders,
   useDeleteChannelAppManager,
 } from "@/features/queries";
@@ -62,15 +71,28 @@ function ChannelsPage() {
   const { link } = Route.useSearch();
   const managers = useChannelAppManagers(ws.id);
   const providers = useChannelProviders(ws.id);
+  const choice = useChannelProviderSettings(org.id);
   const agents = useAgents(ws.id);
   const production = ws.environment === "production";
   const mayLink = !production && canChange(org);
-  // Only the providers this server reaches are offered.
-  const offered = mayLink ? (providers.data ?? []).map((p) => p.provider) : [];
-  const unreached = mayLink && providers.isSuccess && offered.length === 0;
+  // Only the providers this server reaches and the organization allows are listed, and offered where people link.
+  const listed = (providers.data ?? []).map((p) => p.provider);
+  const offered = mayLink ? listed : [];
+  // Then no team can be linked here, by anyone in either environment: said instead of how one is linked.
+  const nothingListed = providers.isSuccess && listed.length === 0;
   const setLink = (provider: ChannelProvider | null) =>
     navigate({ search: provider ? { link: provider } : {}, replace: true });
   const items = managers.data?.pages.flatMap((page) => page.items) ?? [];
+  // Linked teams by provider, in the server's order, each under its name.
+  const groups = CHANNEL_PROVIDERS.map((provider) => ({
+    provider,
+    teams: items.filter((m) => m.provider === provider),
+  })).filter((g) => g.teams.length > 0);
+  const allowedNow = (provider: ChannelProvider) =>
+    choice.data?.providers.find((p) => p.provider === provider)?.allowed ?? true;
+  // Copy names a provider only when it's the one listed here.
+  const only = onlyProvider(listed);
+  const onlyName = only ? CHANNEL_PROVIDER_NAMES[only] : null;
   const linkButtons = () =>
     offered.map((provider) => (
       <Button key={provider} onClick={() => setLink(provider)}>
@@ -83,12 +105,18 @@ function ChannelsPage() {
     <PageContainer>
       <PageHeader
         title="Channels"
-        description="Agents people can talk to in Slack. Link a Slack team once; then each agent gets its own app there, added from the agent's Channels tab."
+        description="Agents people can talk to in chat channels. Link a team once; then each agent gets its own app there, added from the agent's Channels tab."
         actions={offered.length > 0 ? <div className="flex flex-wrap gap-2">{linkButtons()}</div> : null}
       />
-      {production ? <p className="mb-5 rounded-xl border bg-muted/40 p-3 text-sm">{PRODUCTION_CHANNELS}</p> : null}
-      {unreached && items.length > 0 ? (
-        <p className="mb-5 rounded-xl border bg-muted/40 p-3 text-sm">{NO_CHANNEL_PROVIDERS}</p>
+      {nothingListed ? (
+        // With no team linked, the empty state says why instead.
+        items.length > 0 ? (
+          <p className="mb-5 rounded-xl border bg-muted/40 p-3 text-sm">
+            <NoProviderReason org={org} settings={choice.data} linked />
+          </p>
+        ) : null
+      ) : production ? (
+        <p className="mb-5 rounded-xl border bg-muted/40 p-3 text-sm">{PRODUCTION_CHANNELS}</p>
       ) : null}
       {mayLink && providers.isError ? (
         <QueryError
@@ -100,7 +128,7 @@ function ChannelsPage() {
       ) : null}
       {managers.isError ? (
         <QueryError error={managers.error} onRetry={() => managers.refetch()} what="linked teams" />
-      ) : managers.isPending || (mayLink && providers.isPending) ? (
+      ) : managers.isPending || providers.isPending ? (
         <TeamSkeleton />
       ) : items.length === 0 ? (
         <Panel>
@@ -114,18 +142,22 @@ function ChannelsPage() {
                   ? "Link a team"
                   : offered[0]
                     ? `Link a ${CHANNEL_PROVIDER_NAMES[offered[0]]} team`
-                    : unreached
-                      ? "Slack isn't available here"
-                      : "No Slack team linked yet"}
+                    : nothingListed
+                      ? "No chat provider available"
+                      : onlyName
+                        ? `No ${onlyName} team linked yet`
+                        : "No team linked yet"}
               </EmptyTitle>
               <EmptyDescription>
-                {production
-                  ? "This customer links their Slack team from your product."
-                  : offered.length > 0
-                    ? "Paste a configuration token from Slack. Zupflow then creates an app for each agent you add, so people can mention it and send it messages."
-                    : unreached
-                      ? NO_CHANNEL_PROVIDERS
-                      : "Teams appear here once a developer links one."}
+                {nothingListed ? (
+                  <NoProviderReason org={org} settings={choice.data} />
+                ) : production ? (
+                  `This customer links their ${onlyName ? `${onlyName} team` : "team"} from your product.`
+                ) : offered.length > 0 ? (
+                  `Paste a configuration token from ${providerNames(offered)}. Zupflow then creates an app for each agent you add, so people can mention it and send it messages.`
+                ) : (
+                  "Teams appear here once a developer links one."
+                )}
               </EmptyDescription>
             </EmptyHeader>
             {offered.length > 0 ? (
@@ -136,9 +168,22 @@ function ChannelsPage() {
           </Empty>
         </Panel>
       ) : (
-        <div className="space-y-4">
-          {items.map((manager) => (
-            <TeamCard key={manager.id} org={org} workspace={ws} manager={manager} agents={agents.data} />
+        <div className="space-y-6">
+          {groups.map(({ provider, teams }) => (
+            <section key={provider} aria-label={`${CHANNEL_PROVIDER_NAMES[provider]} teams`} className="space-y-3">
+              <h2 className="flex flex-wrap items-center gap-2 text-sm font-medium">
+                <AppIcon icon={CHANNEL_PROVIDER_ICON[provider]} size="sm" />
+                {CHANNEL_PROVIDER_NAMES[provider]}
+                {allowedNow(provider) ? null : <StatusPill tone="neutral">Not allowed by your organization</StatusPill>}
+              </h2>
+              {/* Said once above when no provider is left to link. */}
+              {allowedNow(provider) || nothingListed ? null : (
+                <p className="rounded-xl border bg-muted/40 p-3 text-sm">{notAllowedNote(provider)}</p>
+              )}
+              {teams.map((manager) => (
+                <TeamCard key={manager.id} org={org} workspace={ws} manager={manager} agents={agents.data} />
+              ))}
+            </section>
           ))}
           {managers.hasNextPage ? (
             <div className="flex justify-center">
@@ -197,7 +242,7 @@ function TeamCard({
   const [dialog, setDialog] = useState<null | "replace" | "unlink">(null);
   const mayChange = canChange(org);
   const sandbox = workspace.environment === "sandbox";
-  const name = manager.team.name ?? "Slack team";
+  const name = manager.team.name ?? `${CHANNEL_PROVIDER_NAMES[manager.provider]} team`;
   const rows = apps.data?.pages.flatMap((page) => page.items) ?? [];
   const agentName = (id: string) => agents?.find((a) => a.id === id)?.name;
 

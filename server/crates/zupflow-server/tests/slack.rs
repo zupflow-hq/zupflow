@@ -472,6 +472,126 @@ async fn installs_an_agents_app_in_its_team_through_hosted_connect() {
 }
 
 /// The app's signing secret as the server stored it, opened as the inbound endpoint opens it.
+/// A team-linking link whose provider the organization stopped allowing, or
+/// the server stopped reaching, says so on the hosted page instead of asking
+/// for tokens; pasting them anyway is refused in words for the person there,
+/// the customer's team admin, while the Console is told why. The session
+/// stays pending, and the link works again once the provider is back.
+#[tokio::test]
+async fn tells_the_hosted_page_a_team_link_cant_be_used_before_it_asks_for_tokens() {
+    let (mut server, _slack) = slack_server().await;
+    let t = tenant(&server, "alice", "acme").await;
+    let (status, created) = server
+        .send(
+            call(
+                "alice",
+                Method::POST,
+                format!("/v1/workspaces/{}/connect-sessions", t.ws),
+            )
+            .naming(&t.org)
+            .body(json!({ "target": { "kind": "channel_app_manager", "provider": "slack" }, "return_url": null })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let reference = created["data"]["url"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let read_by_api = format!(
+        "/v1/workspaces/{}/connect-sessions/{}",
+        t.ws,
+        created["data"]["id"].as_str().unwrap()
+    );
+    let choose = |allowed: Value| {
+        call(
+            "alice",
+            Method::PUT,
+            format!("/v1/organizations/{}/channel-provider-settings", t.org),
+        )
+        .naming(&t.org)
+        .body(json!({ "allowed_providers": allowed }))
+    };
+    let paste = || {
+        call(
+            "nobody",
+            Method::POST,
+            format!("/v1/connect/sessions/{reference}/credentials"),
+        )
+        .body(json!({ "values": { "configuration_token": CONFIGURATION_TOKEN, "refresh_token": REFRESH_TOKEN } }))
+    };
+    const FORM: &str = "data-form=\"credentials\"";
+    const UNUSABLE: &str = "This link can&#39;t be used right now";
+    assert_eq!(session(&server, &reference).await["unavailable_reason"], Value::Null);
+    assert!(page(&server, &reference).await.contains(FORM));
+
+    let (status, body) = server.send(choose(json!([]))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let read = session(&server, &reference).await;
+    assert_eq!(
+        (&read["status"], &read["unavailable_reason"]),
+        (&json!("pending"), &json!("channel_provider_not_allowed"))
+    );
+    let (_, by_api) = server
+        .send(call("alice", Method::GET, read_by_api.clone()).naming(&t.org))
+        .await;
+    assert_eq!(
+        by_api["data"]["unavailable_reason"],
+        Value::Null,
+        "only the hosted read says it"
+    );
+    let shown = page(&server, &reference).await;
+    assert!(
+        shown.contains(UNUSABLE)
+            && shown.contains("data-reason=\"channel_provider_not_allowed\"")
+            && !shown.contains(FORM),
+        "{shown}"
+    );
+    let (status, refused) = server.send(paste()).await;
+    assert_eq!(
+        (status, code(&refused)),
+        (StatusCode::FORBIDDEN, "channel_provider_not_allowed")
+    );
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("Ask the app that sent you here for a new one.") && !message.contains("organization"),
+        "{message}"
+    );
+    let (_, refused) = link(&server, &t, "alice", CONFIGURATION_TOKEN, REFRESH_TOKEN).await;
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("organization's settings"),
+        "{refused}"
+    );
+
+    // Allowed again, but no longer reached: the same, with the deployment's code.
+    server.send(choose(Value::Null)).await;
+    restart(&mut server, false);
+    assert_eq!(
+        session(&server, &reference).await["unavailable_reason"],
+        "channel_providers_not_configured"
+    );
+    assert!(page(&server, &reference).await.contains(UNUSABLE));
+    let (status, refused) = server.send(paste()).await;
+    assert_eq!(
+        (status, code(&refused)),
+        (StatusCode::NOT_IMPLEMENTED, "channel_providers_not_configured")
+    );
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("Ask the app that sent you here") && !message.contains("ZUPFLOW_PUBLIC_URL"),
+        "{message}"
+    );
+
+    restart(&mut server, true);
+    assert_eq!(session(&server, &reference).await["unavailable_reason"], Value::Null);
+    assert!(page(&server, &reference).await.contains(FORM));
+}
+
 async fn stored_signing_secret(server: &Server, t: &Tenant, app: &str) -> String {
     use zupflow_core::ids::{ChannelAppId, OrganizationId, WorkspaceId};
     let (org, ws) = (

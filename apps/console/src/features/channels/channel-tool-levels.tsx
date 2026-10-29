@@ -21,7 +21,7 @@ const LEVELS: ToolLevel[] = ["allow", "approve", "deny"];
 
 /**
  * The organization's level for each channel tool, beside each app's: what any
- * agent may do in Slack, in every workspace. Unlike an app's suggested
+ * agent may do in each chat provider, in every workspace. Unlike an app's suggested
  * levels, a channel tool's default is Zupflow's and in force until changed.
  */
 export function ChannelToolLevels({ org }: { org: Organization }) {
@@ -33,7 +33,7 @@ export function ChannelToolLevels({ org }: { org: Organization }) {
     <section>
       <SectionHeader
         title="Channel tool permissions"
-        description="What agents may do in Slack, in every workspace. Each agent's channel settings can be stricter, never looser. Sending anywhere but the thread that woke an agent asks first by default, and deleting is blocked."
+        description="What agents may do in chat channels, in every workspace. Each agent's channel settings can be stricter, never looser. Sending anywhere but the thread that woke an agent asks first by default, and deleting is blocked."
       />
       {levels.isError ? (
         <QueryError error={levels.error} onRetry={() => levels.refetch()} what="channel tool permissions" />

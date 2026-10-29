@@ -3,6 +3,7 @@ import {
   type Agent,
   type AgentChannel,
   agentChannelDefaults,
+  CHANNEL_PROVIDER_NAMES,
   type ChannelApp,
   type ChannelAppManager,
   type ChannelAppManagerId,
@@ -25,6 +26,7 @@ import { toast } from "sonner";
 import { ConfirmDialog } from "@/components/app/confirm-dialog";
 import { AppIcon, QueryError } from "@/components/app/misc";
 import { Panel } from "@/components/app/page";
+import { StatusPill } from "@/components/app/status";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -53,6 +55,7 @@ import {
   useChannelAppManagersById,
   useChannelApps,
   useChannelConnections,
+  useChannelProviderSettings,
   useChannelProviders,
   useCreateChannelApp,
   useDeleteAgentChannel,
@@ -61,13 +64,14 @@ import {
 } from "@/features/queries";
 import { toastError } from "@/lib/errors";
 import { AgentChannelSettings } from "./agent-channel-settings";
-import { appFailure, CHANNEL_PROVIDER_ICON, NO_CHANNEL_PROVIDERS, PRODUCTION_CHANNELS } from "./labels";
+import { NoProviderReason } from "./channel-providers";
+import { appFailure, CHANNEL_PROVIDER_ICON, notAllowedNote, onlyProvider, PRODUCTION_CHANNELS } from "./labels";
 import { ChannelAppStatusPill, ConnectionStatusPill } from "./status";
 
 /**
- * An agent in Slack: its own app in each linked team, how it gets there
- * (created by Zupflow, then allowed by someone in the team) and, once
- * installed, what it does there.
+ * An agent in chat channels: its own app in each linked team, of whichever
+ * provider, how it gets there (created by Zupflow, then allowed by someone
+ * in the team) and, once installed, what it does there.
  */
 export function AgentChannels({ org, workspace, agent }: { org: Organization; workspace: Workspace; agent: Agent }) {
   const apps = useChannelApps(workspace.id, { agent_id: agent.id });
@@ -147,7 +151,7 @@ export function AgentChannels({ org, workspace, agent }: { org: Organization; wo
           channel={channels.data.find((c) => c.connection_id === app.connection_id)}
         />
       ))}
-      <AddToSlack
+      <AddToTeam
         org={org}
         workspace={workspace}
         agent={agent}
@@ -163,7 +167,7 @@ export function AgentChannels({ org, workspace, agent }: { org: Organization; wo
 }
 
 /** Adds the agent to a linked team: Zupflow creates its app, then someone in the team allows it. */
-function AddToSlack({
+function AddToTeam({
   org,
   workspace,
   agent,
@@ -188,27 +192,39 @@ function AddToSlack({
 }) {
   const create = useCreateChannelApp(workspace.id);
   const providers = useChannelProviders(workspace.id);
-  // Whether a team could be linked here at all: only of a provider this server reaches.
-  const slackReached = providers.data?.some((p) => p.provider === "slack") ?? false;
+  const choice = useChannelProviderSettings(org.id);
+  // The providers a team could be linked of here: ones this server reaches and the organization allows.
+  const listed = (providers.data ?? []).map((p) => p.provider);
   const active = teams.filter((t) => t.status === "active");
   const [team, setTeam] = useState<ChannelAppManagerId | undefined>(undefined);
-  const chosen = active.find((t) => t.id === team)?.id ?? active[0]?.id;
+  const chosenTeam = active.find((t) => t.id === team) ?? active[0];
+  const chosen = chosenTeam?.id;
   const production = workspace.environment === "production";
   const mayChange = canChange(org);
   // Nothing to offer once the agent is in every linked team.
   if (hasApps && teams.length === 0 && !more) return null;
 
-  const body = production
-    ? PRODUCTION_CHANNELS
-    : !mayChange
-      ? "Developers, admins and owners can add agents to Slack."
-      : !anyLinked
-        ? providers.isSuccess && !slackReached
-          ? NO_CHANNEL_PROVIDERS
-          : "Link a Slack team on this workspace's Channels page first. Then add the agent here: Zupflow creates its own Slack app, and someone in the team allows it."
-        : active.length === 0
-          ? "Every linked team's configuration token has expired. Paste a new one on the Channels page, then add the agent."
-          : `Zupflow creates ${agent.name}'s own Slack app in the team, named after it, so people can mention it and send it messages. Then someone in the team allows it.`;
+  // Copy names a provider only when it's the only one in play: the linked teams', or else the one offered.
+  const only = onlyProvider(anyLinked ? teams.map((t) => t.provider) : listed);
+  const where = only ? CHANNEL_PROVIDER_NAMES[only] : "chat channels";
+  const teamOf = only ? `${CHANNEL_PROVIDER_NAMES[only]} team` : "team";
+  const chosenName = chosenTeam ? CHANNEL_PROVIDER_NAMES[chosenTeam.provider] : "the provider";
+  const mixed = new Set(active.map((t) => t.provider)).size > 1;
+  const body = production ? (
+    PRODUCTION_CHANNELS
+  ) : !mayChange ? (
+    `Developers, admins and owners can add agents to ${where}.`
+  ) : !anyLinked ? (
+    providers.isSuccess && listed.length === 0 ? (
+      <NoProviderReason org={org} settings={choice.data} />
+    ) : (
+      `Link a ${teamOf} on this workspace's Channels page first. Then add the agent here: Zupflow creates its own app there, and someone in the team allows it.`
+    )
+  ) : active.length === 0 ? (
+    "Every linked team's configuration token has expired. Paste a new one on the Channels page, then add the agent."
+  ) : (
+    `Zupflow creates ${agent.name}'s own ${chosenName} app in the team, named after it, so people can mention it and send it messages. Then someone in the team allows it.`
+  );
   const canAdd = !production && mayChange && active.length > 0;
 
   return (
@@ -218,7 +234,7 @@ function AddToSlack({
           <EmptyMedia variant="icon">
             <MessagesSquareIcon />
           </EmptyMedia>
-          <EmptyTitle>{hasApps ? "Add to another Slack team" : `Add ${agent.name} to Slack`}</EmptyTitle>
+          <EmptyTitle>{hasApps ? `Add to another ${teamOf}` : `Add ${agent.name} to ${where}`}</EmptyTitle>
           <EmptyDescription>{body}</EmptyDescription>
         </EmptyHeader>
         {canAdd ? (
@@ -226,13 +242,15 @@ function AddToSlack({
             <div className="flex w-full max-w-sm flex-col gap-2 sm:flex-row sm:justify-center">
               {active.length > 1 || more ? (
                 <Select value={chosen} onValueChange={(v) => setTeam(v as ChannelAppManagerId)}>
-                  <SelectTrigger aria-label="Slack team" className="w-full bg-card sm:flex-1">
+                  <SelectTrigger aria-label="Team" className="w-full bg-card sm:flex-1">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
                     {active.map((t) => (
                       <SelectItem key={t.id} value={t.id}>
-                        {t.team.name ?? `Slack team ending ${t.configuration_token.last4}`}
+                        {t.team.name ??
+                          `${CHANNEL_PROVIDER_NAMES[t.provider]} team ending ${t.configuration_token.last4}`}
+                        {mixed && t.team.name ? ` · ${CHANNEL_PROVIDER_NAMES[t.provider]}` : null}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -245,16 +263,18 @@ function AddToSlack({
                   chosen &&
                   create.mutate(
                     { agentId: agent.id, managerId: chosen },
-                    { onError: (e) => toastError(e, "Couldn't add the agent to Slack") },
+                    { onError: (e) => toastError(e, `Couldn't add the agent to ${chosenName}`) },
                   )
                 }
               >
                 {create.isPending ? <Spinner /> : <PlusIcon />}
-                Add to Slack
+                Add to {chosenName}
               </Button>
             </div>
             {active.length === 1 && !more ? (
-              <p className="text-xs text-muted-foreground">In {active[0]?.team.name ?? "the linked Slack team"}.</p>
+              <p className="text-xs text-muted-foreground">
+                In {active[0]?.team.name ?? `the linked ${chosenName} team`}.
+              </p>
             ) : null}
             {more ? (
               <Button variant="ghost" size="sm" disabled={loadingMore} onClick={onLoadMore}>
@@ -263,11 +283,15 @@ function AddToSlack({
               </Button>
             ) : null}
           </EmptyContent>
-        ) : !production && mayChange && !anyLinked && slackReached ? (
+        ) : !production && mayChange && !anyLinked && listed.length > 0 ? (
           <EmptyContent>
             <Button asChild variant="outline">
-              <Link to="/$org/w/$ws/channels" params={{ org: org.slug, ws: workspace.id }} search={{ link: "slack" }}>
-                Link a Slack team
+              <Link
+                to="/$org/w/$ws/channels"
+                params={{ org: org.slug, ws: workspace.id }}
+                search={only ? { link: only } : {}}
+              >
+                Link a {teamOf}
               </Link>
             </Button>
           </EmptyContent>
@@ -301,10 +325,13 @@ function AppCard({
   const remove = useDeleteChannelApp(workspace.id);
   const put = usePutAgentChannel(workspace.id, agent.id);
   const stop = useDeleteAgentChannel(workspace.id, agent.id);
+  const choice = useChannelProviderSettings(org.id);
   const [dialog, setDialog] = useState<null | "install" | "remove" | "stop">(null);
   const mayChange = canChange(org);
   const production = workspace.environment === "production";
-  const team = manager?.team.name ?? connection?.team.name ?? "Slack";
+  const provider = CHANNEL_PROVIDER_NAMES[app.provider];
+  const notAllowed = choice.data?.providers.some((p) => p.provider === app.provider && !p.allowed) ?? false;
+  const team = manager?.team.name ?? connection?.team.name ?? provider;
   const managerActive = manager?.status === "active";
   const needsInstall =
     app.status === "awaiting_install" || (app.status === "installed" && connection?.status === "reconnect_required");
@@ -321,6 +348,7 @@ function AppCard({
             {connection && connection.status !== "connected" ? (
               <ConnectionStatusPill status={connection.status} />
             ) : null}
+            {notAllowed ? <StatusPill tone="neutral">Not allowed by your organization</StatusPill> : null}
           </p>
           <p className="truncate text-sm text-muted-foreground">
             {connection ? (
@@ -336,7 +364,7 @@ function AppCard({
                 </Link>
               </>
             ) : (
-              <span className="font-mono text-xs">{app.external_app_id ?? "Its own Slack app"}</span>
+              <span className="font-mono text-xs">{app.external_app_id ?? `Its own ${provider} app`}</span>
             )}
           </p>
         </div>
@@ -380,12 +408,16 @@ function AppCard({
               <DropdownMenuSeparator />
               <DropdownMenuItem variant="destructive" onSelect={() => setDialog("remove")}>
                 <Trash2Icon />
-                Remove from Slack
+                Remove from {provider}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
         ) : null}
       </div>
+
+      {notAllowed ? (
+        <p className="border-t bg-muted/40 px-4 py-2.5 text-sm text-muted-foreground">{notAllowedNote(app.provider)}</p>
+      ) : null}
 
       <AppBody
         org={org}
@@ -439,7 +471,7 @@ function AppCard({
         description={
           <>
             <p>
-              Zupflow deletes {agent.name}'s app in Slack, so people there can't mention it or message it. Runs in
+              Zupflow deletes {agent.name}'s app in {provider}, so people there can't mention it or message it. Runs in
               progress can't send there again.
             </p>
             <p>
@@ -447,7 +479,7 @@ function AppCard({
             </p>
           </>
         }
-        actionLabel="Remove from Slack"
+        actionLabel={`Remove from ${provider}`}
         pending={remove.isPending}
         onConfirm={() =>
           remove.mutate(app.id, {
@@ -488,6 +520,7 @@ function AppBody({
 }) {
   const production = workspace.environment === "production";
   const mayChange = canChange(org);
+  const provider = CHANNEL_PROVIDER_NAMES[app.provider];
   const tokenNote =
     manager && manager.status !== "active"
       ? " The team's configuration token has expired, so nothing can change here until someone pastes a new one on the Channels page."
@@ -499,10 +532,10 @@ function AppBody({
         <Spinner className="mt-0.5 size-4 text-brand-ink" />
         <p className="text-muted-foreground">
           {app.status === "creating"
-            ? `Creating ${agent.name}'s app in ${team}. Slack makes about one new app a minute per team, so this can take a moment.`
+            ? `Creating ${agent.name}'s app in ${team}. ${provider} makes about one new app a minute per team, so this can take a moment.`
             : app.status === "updating"
-              ? `Sending ${agent.name}'s new name and description to Slack.`
-              : `Removing ${agent.name}'s app from Slack.`}
+              ? `Sending ${agent.name}'s new name and description to ${provider}.`
+              : `Removing ${agent.name}'s app from ${provider}.`}
         </p>
       </div>
     );
@@ -511,7 +544,7 @@ function AppBody({
     return (
       <p className="flex items-start gap-2 border-t bg-danger-soft/50 px-4 py-3 text-sm">
         <AlertTriangleIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
-        <span>{appFailure(app.last_error)}</span>
+        <span>{appFailure(app.last_error, app.provider)}</span>
       </p>
     );
   }
@@ -534,22 +567,22 @@ function AppBody({
             <span className="min-w-0 space-y-0.5">
               <span className="block font-medium">
                 {reinstall
-                  ? "Install it again: Slack removed it or revoked its token"
-                  : "Someone in the team allows it in Slack"}
+                  ? `Install it again: ${provider} removed it or revoked its token`
+                  : `Someone in the team allows it in ${provider}`}
               </span>
               <span className="block text-xs text-muted-foreground">
                 {production
-                  ? "Your product sends a team admin to hosted Connect with a channel_app session; they click Allow in Slack."
+                  ? `Your product sends a team admin to hosted Connect with a channel_app session; they click Allow in ${provider}.`
                   : !mayChange
                     ? "A developer, admin or owner installs it."
-                    : `Opens Slack's Allow page for ${agent.name}'s app. Sign in as someone who may install apps in ${team}.${tokenNote}`}
+                    : `Opens ${provider}'s Allow page for ${agent.name}'s app. Sign in as someone who may install apps in ${team}.${tokenNote}`}
               </span>
             </span>
           </li>
         </ol>
         {installable && !reinstall ? (
           <Button onClick={onInstall} className="shrink-0">
-            Install in Slack
+            Install in {provider}
           </Button>
         ) : null}
       </div>
@@ -588,8 +621,8 @@ function AppBody({
 
 /**
  * The install step: hosted Connect, in its own window, sends the person to
- * Slack's Allow page for this agent's app and back; the Console follows the
- * session until the API says it finished.
+ * the provider's Allow page for this agent's app and back; the Console
+ * follows the session until the API says it finished.
  */
 function InstallDialog({
   workspace,
@@ -607,6 +640,7 @@ function InstallDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const flow = useConnectFlow(workspace.id);
+  const provider = CHANNEL_PROVIDER_NAMES[app.provider];
   const { reset } = flow;
   useEffect(() => {
     if (!open) reset();
@@ -615,10 +649,12 @@ function InstallDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Install {agent.name} in Slack</DialogTitle>
+          <DialogTitle>
+            Install {agent.name} in {provider}
+          </DialogTitle>
           <DialogDescription>
-            Slack asks someone in {team} to allow {agent.name}'s app. Once they do, people can mention it and send it
-            messages, and it answers with the settings on this tab.
+            {provider} asks someone in {team} to allow {agent.name}'s app. Once they do, people can mention it and send
+            it messages, and it answers with the settings on this tab.
           </DialogDescription>
         </DialogHeader>
         {flow.sessionId ? (
@@ -635,7 +671,7 @@ function InstallDialog({
                 onClick={() => flow.start({ target: { kind: "channel_app", app: app.id }, return_url: null })}
               >
                 {flow.starting ? <Spinner /> : null}
-                Continue to Slack
+                Continue to {provider}
               </Button>
             </DialogFooter>
           </>

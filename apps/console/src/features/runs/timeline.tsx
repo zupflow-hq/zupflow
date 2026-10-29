@@ -384,7 +384,8 @@ function OriginRow({
   orgSlug?: string;
 }) {
   const origin = run.channel.origin_message_id ? context?.messages.get(run.channel.origin_message_id) : undefined;
-  const provider = context?.connection ? CHANNEL_PROVIDER_NAMES[context.connection.provider] : "Slack";
+  // Before the connection is read, or once it's gone, no provider is named.
+  const provider = context?.connection ? CHANNEL_PROVIDER_NAMES[context.connection.provider] : "Chat channel";
   return (
     <Row at={run.created_at} start={run.created_at} icon={<MessageSquareTextIcon />} tone="neutral">
       <p className="mb-1.5 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">

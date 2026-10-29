@@ -1056,15 +1056,15 @@ export const routes: readonly Route[] = [
     params: { ...org, hook: idSchema("webhook_endpoint") },
     response: ok(s.WebhookDelivery),
   },
-  // Channels. Workspace-scoped, except tool levels and settings (the
-  // organization's). An API key reads and changes only its own environment's
-  // workspaces (another's is `404`).
+  // Channels. Workspace-scoped, except tool levels, settings and allowed
+  // providers (the organization's). An API key reads and changes only its own
+  // environment's workspaces (another's is `404`).
   {
     operationId: "listChannelProviders",
     method: "get",
     path: "/v1/workspaces/{ws}/channel-providers",
     summary:
-      "The channel providers this deployment reaches, so the workspace can link teams there. Linking a team of a provider that isn't listed answers `501 channel_providers_not_configured`",
+      "The channel providers this deployment reaches and the organization allows, so the workspace can link teams there. Linking a team of a provider the deployment doesn't reach answers `501 channel_providers_not_configured`; of one the organization doesn't allow (see `getChannelProviderSettings`), `403 channel_provider_not_allowed`",
     callers: both,
     params: ws,
     response: ok(s.AvailableChannelProvider, { list: true }),
@@ -1084,7 +1084,7 @@ export const routes: readonly Route[] = [
     method: "post",
     path: "/v1/workspaces/{ws}/channel-app-managers",
     summary:
-      "Link a team with a configuration token, so Zupflow can create apps for the workspace's agents there. Developers and API keys; the Console can't in Production (`403 console_read_only_in_production`). A token the provider refuses is `422 invalid_configuration_token`; a provider this deployment doesn't reach (see `listChannelProviders`) is `501 channel_providers_not_configured`",
+      "Link a team with a configuration token, so Zupflow can create apps for the workspace's agents there. Developers and API keys; the Console can't in Production (`403 console_read_only_in_production`). A token the provider refuses is `422 invalid_configuration_token`; a provider the organization doesn't allow is `403 channel_provider_not_allowed`, and one this deployment doesn't reach (see `listChannelProviders`) is `501 channel_providers_not_configured`",
     callers: both,
     params: ws,
     body: s.CreateChannelAppManagerInput,
@@ -1288,6 +1288,27 @@ export const routes: readonly Route[] = [
     params: org,
     body: s.UpdateChannelSettingsInput,
     response: ok(s.ChannelSettings),
+  },
+  {
+    operationId: "getChannelProviderSettings",
+    method: "get",
+    path: "/v1/organizations/{org}/channel-provider-settings",
+    summary:
+      "Which channel providers the organization's workspaces may link teams of, with every provider the server ships, whether this deployment reaches it and whether it's allowed",
+    callers: both,
+    params: org,
+    response: ok(s.ChannelProviderSettings),
+  },
+  {
+    operationId: "updateChannelProviderSettings",
+    method: "put",
+    path: "/v1/organizations/{org}/channel-provider-settings",
+    summary:
+      "Choose the channel providers the organization's workspaces may link teams of: owners and admins, from the Console. Teams already linked keep working",
+    callers: consoleOnly,
+    params: org,
+    body: s.UpdateChannelProviderSettingsInput,
+    response: ok(s.ChannelProviderSettings),
   },
   {
     operationId: "receiveChannelEvent",

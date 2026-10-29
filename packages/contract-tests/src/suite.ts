@@ -28,6 +28,7 @@ import {
   type OrganizationId,
   type PutAgentChannelInput,
   type UpdateAppInput,
+  type UpdateChannelProviderSettingsInput,
   type UpdateChannelToolLevelsInput,
   type UpdateInstallationInput,
   type WebhookDeliveryId,
@@ -545,6 +546,8 @@ export function contractSuite(target: Target) {
         });
         await owner.channelSettings.get(org);
         await owner.channelSettings.update(org, CHANNEL_SETTINGS_DEFAULTS);
+        await owner.channelSettings.providers(org);
+        await owner.channelSettings.setProviders(org, { allowed_providers: null });
         await owner.agentChannels.delete(sandbox.id, installed.agentId, installed.connection.id);
         await owner.channelConnections.delete(sandbox.id, installed.connection.id);
         await owner.channelApps.delete(sandbox.id, channelApp.id);
@@ -4019,8 +4022,12 @@ export function contractSuite(target: Target) {
         expect(await sandboxKey.channelSettings.toolLevels(fx.organization)).toEqual(
           await owner.channelSettings.toolLevels(fx.organization),
         );
+        expect(await production.channelSettings.providers(fx.organization)).toEqual(
+          await owner.channelSettings.providers(fx.organization),
+        );
         for (const attempt of [
           () => production.channelSettings.update(fx.organization, CHANNEL_SETTINGS_DEFAULTS),
+          () => production.channelSettings.setProviders(fx.organization, { allowed_providers: [] }),
           () =>
             production.channelSettings.setToolLevels(fx.organization, {
               provider: "slack",
@@ -4283,6 +4290,127 @@ export function contractSuite(target: Target) {
           updated_at: null,
         });
         expect((await outsider.channelSettings.toolLevels(fx.otherOrganization)).some((l) => l.confirmed)).toBe(false);
+      });
+
+      it("links teams only of providers the organization allows, and keeps teams already linked working", async () => {
+        const org = fx.organization;
+        const ws = sandbox();
+        const offered = [{ provider: "slack", methods: ["configuration_token"] }];
+        // Until an admin chooses, every provider is allowed: every one the deployment reaches is offered.
+        const settings = await owner.channelSettings.providers(org);
+        expect(settings).toEqual({
+          organization_id: org,
+          allowed_providers: null,
+          providers: [{ provider: "slack", reachable: true, allowed: true }],
+          updated_at: null,
+          updated_by: null,
+        });
+        expect(await owner.channelProviders.list(ws)).toEqual(offered);
+
+        // Anyone who can read the organization reads it, keys included; only the Console's admins change it.
+        const key = withKey(
+          (await owner.apiKeys.create(org, { name: "Channel providers", environment: "sandbox" })).secret,
+        );
+        expect(await as("viewer").channelSettings.providers(org)).toEqual(settings);
+        expect(await key.channelSettings.providers(org)).toEqual(settings);
+        expect(await answer(as("developer").channelSettings.setProviders(org, { allowed_providers: [] }))).toBe(
+          "403 forbidden",
+        );
+        expect(await answer(key.channelSettings.setProviders(org, { allowed_providers: [] }))).toBe("403 console_only");
+        for (const input of [{ allowed_providers: ["slack", "slack"] }, { allowed_providers: ["pager"] }, {}]) {
+          expect(
+            await answer(owner.channelSettings.setProviders(org, input as UpdateChannelProviderSettingsInput)),
+            JSON.stringify(input),
+          ).toBe("400 validation_failed");
+        }
+        expect(await owner.channelSettings.providers(org)).toEqual(settings);
+
+        const { manager, connection, agentId, agentChannel } = await installedIn(ws);
+        const started = await owner.connectSessions.create(ws, {
+          target: { kind: "channel_app_manager", provider: "slack" },
+          return_url: null,
+        });
+        const managers = (await owner.channelAppManagers.list(ws, { limit: 100 })).items;
+        expect((await owner.connect.get(referenceOf(started))).unavailable_reason).toBeNull();
+
+        // An empty list allows none: nothing is offered, and no team is linked, through the API or hosted Connect.
+        const me = (await owner.me.get()).user;
+        const none = await owner.channelSettings.setProviders(org, { allowed_providers: [] });
+        expect(none).toMatchObject({
+          organization_id: org,
+          allowed_providers: [],
+          providers: [{ provider: "slack", reachable: true, allowed: false }],
+          updated_by: { id: me.id },
+        });
+        expect(none.updated_at).not.toBeNull();
+        expect(await owner.channelSettings.providers(org)).toEqual(none);
+        expect(await owner.channelProviders.list(ws)).toEqual([]);
+        expect(await key.channelProviders.list(ws)).toEqual([]);
+        for (const [what, attempt] of [
+          ["link from the Console", () => link(ws)],
+          ["link with a key", () => link(ws, key)],
+          [
+            "start a hosted Connect session",
+            () =>
+              key.connectSessions.create(ws, {
+                target: { kind: "channel_app_manager", provider: "slack" },
+                return_url: null,
+              }),
+          ],
+          // A session started while the provider was allowed links nothing once it isn't.
+          [
+            "finish a session started before",
+            () => owner.connect.submitCredentials(referenceOf(started), { values: { ...TOKENS } }),
+          ],
+        ] as const) {
+          expect(await answer(attempt()), what).toBe("403 channel_provider_not_allowed");
+        }
+        expect((await owner.channelAppManagers.list(ws, { limit: 100 })).items).toEqual(managers);
+        // The hosted page reads why before it asks for tokens, and is answered in words for the person there:
+        // the customer's team admin, who can't change the organization's choice. The Console and keys are told why.
+        const hosted = await owner.connect.get(referenceOf(started));
+        expect([hosted.status, hosted.unavailable_reason]).toEqual(["pending", "channel_provider_not_allowed"]);
+        expect((await owner.connectSessions.get(ws, hosted.id)).unavailable_reason).toBeNull();
+        const pasted = await failure(owner.connect.submitCredentials(referenceOf(started), { values: { ...TOKENS } }));
+        expect(pasted.message).toContain("Ask the app that sent you here for a new one.");
+        expect(pasted.message).not.toMatch(/organization|owner|admin/i);
+        expect((await failure(link(ws))).message).toContain("organization's settings");
+
+        // Nothing is deleted, and teams already linked keep working: tokens replaced, apps made, channels set.
+        expect((await owner.channelAppManagers.update(ws, manager.id, TOKENS)).status).toBe("active");
+        const agent = await applessAgent(ws);
+        expect((await owner.channelApps.create(ws, { agent_id: agent.id, manager_id: manager.id })).status).toBe(
+          "creating",
+        );
+        expect((await owner.channelConnections.get(ws, connection.id)).status).toBe("connected");
+        expect(await answer(owner.agentChannels.put(ws, agentId, connection.id, settingsOf(agentChannel)))).toBe(
+          "succeeded",
+        );
+
+        // Another organization's choice is its own: it never leaks, and never applies there.
+        const harbor = await larkspur();
+        const outsider = as("outsider");
+        expect(await answer(outsider.channelSettings.providers(org))).toBe("404 not_found");
+        expect(await outsider.channelSettings.providers(fx.otherOrganization)).toMatchObject({
+          organization_id: fx.otherOrganization,
+          allowed_providers: null,
+          providers: [{ provider: "slack", reachable: true, allowed: true }],
+          updated_at: null,
+        });
+        expect(await outsider.channelProviders.list(harbor.sandbox.id)).toEqual(offered);
+        expect(await answer(link(harbor.sandbox.id, outsider))).toBe("succeeded");
+
+        // Allowed by name, it's offered and linked again; null allows every provider again, later ones included.
+        const listed = await owner.channelSettings.setProviders(org, { allowed_providers: ["slack"] });
+        expect([listed.allowed_providers, listed.providers]).toEqual([
+          ["slack"],
+          [{ provider: "slack", reachable: true, allowed: true }],
+        ]);
+        expect(await owner.channelProviders.list(ws)).toEqual(offered);
+        expect(await answer(link(ws))).toBe("succeeded");
+        expect((await owner.channelSettings.setProviders(org, { allowed_providers: null })).allowed_providers).toBe(
+          null,
+        );
       });
 
       it("lists a connection's conversations and messages, searched and paged on the server", async () => {
@@ -4619,6 +4747,7 @@ export function contractSuite(target: Target) {
             "updateChannelSettings",
             () => c.channelSettings.update(t.org, { ...CHANNEL_SETTINGS_DEFAULTS, breaker_runs: 5 }),
           ],
+          ["updateChannelProviderSettings", () => c.channelSettings.setProviders(t.org, { allowed_providers: [] })],
           ["deleteGrant", () => c.grants.delete(w, t.agent.id, t.grant.id)],
           ["deleteAgent", () => c.agents.delete(w, t.agent.id)],
           [
@@ -4745,6 +4874,7 @@ export function contractSuite(target: Target) {
           "resendWebhookDelivery",
           "updateChannelToolLevels",
           "updateChannelSettings",
+          "updateChannelProviderSettings",
         ]);
         const t = await northwind();
         const changes = changesBy(as("developer"), t, await sandboxKey());

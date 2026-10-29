@@ -48,6 +48,7 @@ import {
   createChannelHandlers,
   deleteAgentChannels,
   deleteWorkspaceChannels,
+  hostedUnavailableReason,
   submitChannelCredentials,
 } from "./channels";
 import { keyedDigest, newApiKeySecret } from "./credentials";
@@ -2181,7 +2182,7 @@ export function createHandlers(apiBase: string) {
       route(async ({ params }) => {
         const session = await findSessionByReferenceCrossTenant(param(params, "reference"));
         assertLinkShows(session);
-        return ok(toConnectSession(session, true));
+        return ok({ ...toConnectSession(session, true), unavailable_reason: hostedUnavailableReason(session) });
       }),
     ),
 

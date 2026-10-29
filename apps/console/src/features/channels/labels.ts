@@ -4,26 +4,93 @@
  * connection acts as its identity, and apps posting on their own are
  * automated accounts.
  */
-import type {
-  AppIcon,
-  ChannelAppManagerStatus,
-  ChannelAppStatus,
-  ChannelConnection,
-  ChannelConnectionStatus,
-  ChannelConversation,
-  ChannelConversationKind,
-  ChannelProvider,
-  ChannelToolName,
-  ChannelWakeReason,
+import {
+  type AppIcon,
+  CHANNEL_PROVIDER_NAMES,
+  type ChannelAppManagerStatus,
+  type ChannelAppStatus,
+  type ChannelConnection,
+  type ChannelConnectionStatus,
+  type ChannelConversation,
+  type ChannelConversationKind,
+  type ChannelProvider,
+  type ChannelProviderSettings,
+  type ChannelToolName,
+  type ChannelWakeReason,
 } from "@zupflow/sdk";
 
 /** Why the Console doesn't link teams or add agents in Production: the customer's product does, through the API. */
 export const PRODUCTION_CHANNELS =
-  "In Production, your product links Slack teams and adds agents through the API or hosted Connect, so the customer's own admin does it from your product. The Console shows what they set up.";
+  "In Production, your product links teams and adds agents through the API or hosted Connect, so the customer's own admin does it from your product. The Console shows what they set up.";
 
-/** Why no team can be linked: this server reaches no channel provider. */
-export const NO_CHANNEL_PROVIDERS =
-  "This Zupflow server can't reach Slack yet, so no team can be linked here. Whoever runs it turns Slack on by giving the server a public HTTPS address.";
+/** What whoever runs the server does so it reaches each provider. */
+export const CHANNEL_PROVIDER_SETUP: Record<ChannelProvider, string> = {
+  slack: "Whoever runs it turns Slack on by giving the server a public HTTPS address.",
+};
+
+/** Providers by name, for a sentence: "Slack", "Slack or Teams", "Slack, Teams or Chat". */
+export function providerNames(providers: readonly ChannelProvider[], conjunction = "or"): string {
+  const names = providers.map((p) => CHANNEL_PROVIDER_NAMES[p]);
+  return names.length <= 1
+    ? (names[0] ?? "")
+    : `${names.slice(0, -1).join(", ")} ${conjunction} ${names[names.length - 1]}`;
+}
+
+/** The one provider copy can name, when there is exactly one; null otherwise. */
+export function onlyProvider(providers: readonly ChannelProvider[]): ChannelProvider | null {
+  const distinct = [...new Set(providers)];
+  return distinct.length === 1 ? (distinct[0] ?? null) : null;
+}
+
+/**
+ * Why no team can be linked in this workspace, from the organization's
+ * choice and what this server reaches: none allowed, or none of the allowed
+ * reached. Without the organization's choice, both are possible. `linked`:
+ * teams are linked here already. `choice` says whether the organization's
+ * choice is part of why, so the page can say who changes it.
+ */
+export function noProviderReason(
+  settings: ChannelProviderSettings | undefined,
+  linked = false,
+): { text: string; choice: boolean } {
+  const team = linked ? "no new team" : "no team";
+  if (!settings) {
+    return {
+      text: "No chat provider is available here: this Zupflow server reaches none that your organization allows.",
+      choice: true,
+    };
+  }
+  const allowed = settings.providers.filter((p) => p.allowed).map((p) => p.provider);
+  if (allowed.length === 0) {
+    return {
+      text: `Your organization doesn't allow any chat provider, so ${team} can be linked here.${linked ? " Teams already linked keep working." : ""}`,
+      choice: true,
+    };
+  }
+  const refused = settings.providers.filter((p) => p.reachable && !p.allowed).map((p) => p.provider);
+  return {
+    text: [
+      `This Zupflow server can't reach ${providerNames(allowed)} yet, so ${team} can be linked here.`,
+      ...allowed.map((p) => CHANNEL_PROVIDER_SETUP[p]),
+      refused.length > 0 ? `Your organization doesn't allow ${providerNames(refused)}.` : "",
+    ]
+      .filter(Boolean)
+      .join(" "),
+    choice: refused.length > 0,
+  };
+}
+
+/** What a team of a provider the organization stopped allowing still does. */
+export function notAllowedNote(provider: ChannelProvider): string {
+  const name = CHANNEL_PROVIDER_NAMES[provider];
+  return `Your organization doesn't allow ${name} any more. Agents already here keep working, but no new ${name} team can be linked.`;
+}
+
+/** What each provider calls a team, when it isn't "team": said once where a team is linked. */
+export const CHANNEL_TEAM_TERM: Record<ChannelProvider, string | null> = { slack: "what Slack calls a workspace" };
+
+/** What each provider calls a conversation shared with another organization. */
+export const SHARED_CONVERSATION: Record<ChannelProvider, string> = { slack: "Slack Connect" };
 
 /** A provider's mark in the Console: a glyph on its color, like an app's icon. */
 export const CHANNEL_PROVIDER_ICON: Record<ChannelProvider, AppIcon> = {
@@ -78,21 +145,22 @@ export const WAKE_REASON: Record<ChannelWakeReason, string> = {
 };
 
 /** Why an app couldn't be made or changed, by its stable code, with what to do. */
-export function appFailure(code: string | null): string {
+export function appFailure(code: string | null, provider: ChannelProvider): string {
+  const name = CHANNEL_PROVIDER_NAMES[provider];
   // A failed app doesn't hold its team: the agent is offered there again below the card.
   const again = "then add the agent to the team again below.";
   switch (code) {
     case "app_limit_reached":
-      return `The team has as many apps as its plan allows. Remove an app in Slack or upgrade the team's plan, ${again}`;
+      return `The team has as many apps as its plan allows. Remove an app in ${name} or upgrade the team's plan, ${again}`;
     case "invalid_configuration_token":
     case "token_expired":
       return `The team's configuration token stopped working. Paste a new one on the Channels page, ${again}`;
     case "rate_limited":
-      return `Slack asked Zupflow to slow down. Wait a minute, ${again}`;
+      return `${name} asked Zupflow to slow down. Wait a minute, ${again}`;
     case null:
-      return "Slack refused to create the app. Add the agent to the team again below.";
+      return `${name} refused to create the app. Add the agent to the team again below.`;
     default:
-      return `Slack refused to create the app (${code}). Add the agent to the team again below.`;
+      return `${name} refused to create the app (${code}). Add the agent to the team again below.`;
   }
 }
 

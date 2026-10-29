@@ -1,6 +1,7 @@
 import {
   type AgentChannel,
   type AgentMessages,
+  CHANNEL_PROVIDER_NAMES,
   CHANNEL_TOOL_NAMES,
   CHANNEL_TOOLS,
   type ChannelAudience,
@@ -36,7 +37,7 @@ import { errorMessage } from "@/lib/errors";
 import { shortId } from "@/lib/format";
 import { useDebounced } from "@/lib/use-debounced";
 import { cn } from "@/lib/utils";
-import { CHANNEL_TOOL_COPY, conversationName } from "./labels";
+import { CHANNEL_TOOL_COPY, conversationName, SHARED_CONVERSATION } from "./labels";
 
 /** The settings as edited: the sender list as typed, one address per line. */
 type Draft = Omit<PutAgentChannelInput, "sender_list" | "persona"> & {
@@ -187,7 +188,10 @@ export function AgentChannelSettings({
       }}
     >
       <fieldset disabled={readOnly} className="contents">
-        <Group title="Tools" description={`What ${handle} may do in Slack, within your organization's levels.`}>
+        <Group
+          title="Tools"
+          description={`What ${handle} may do in ${CHANNEL_PROVIDER_NAMES[connection.provider]}, within your organization's levels.`}
+        >
           {levels.isError ? (
             <QueryError
               error={levels.error}
@@ -368,8 +372,18 @@ export function AgentChannelSettings({
               onValueChange={(v) => set("senders", v)}
               className="sm:grid-cols-2"
               options={[
-                choice("anyone", "Anyone in the team", "Every person in the Slack team who can reach it.", readOnly),
-                choice("listed", "Only people you list", "By the email address on their Slack profile.", readOnly),
+                choice(
+                  "anyone",
+                  "Anyone in the team",
+                  `Every person in the ${CHANNEL_PROVIDER_NAMES[connection.provider]} team who can reach it.`,
+                  readOnly,
+                ),
+                choice(
+                  "listed",
+                  "Only people you list",
+                  `By the email address on their ${CHANNEL_PROVIDER_NAMES[connection.provider]} profile.`,
+                  readOnly,
+                ),
               ]}
             />
             {draft.senders === "listed" ? (
@@ -401,7 +415,7 @@ export function AgentChannelSettings({
           />
           <SwitchRow
             id={fid("allow-external")}
-            label="Slack Connect channels"
+            label={`${SHARED_CONVERSATION[connection.provider]} channels`}
             description="Let people from other organizations in shared channels wake it."
             checked={draft.allow_external}
             onChange={(v) => set("allow_external", v)}

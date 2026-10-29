@@ -22,7 +22,7 @@ import { useChannelConversationLookup, useChannelConversations, useChannelMessag
 import { dateTime, fullDateTime, shortId } from "@/lib/format";
 import { useDebounced } from "@/lib/use-debounced";
 import { cn } from "@/lib/utils";
-import { CONVERSATION_KIND, conversationName, renderMentions } from "./labels";
+import { CONVERSATION_KIND, conversationName, renderMentions, SHARED_CONVERSATION } from "./labels";
 
 const ALL = "all";
 const KINDS: ChannelConversationKind[] = ["channel", "private_channel", "dm", "group_dm"];
@@ -135,7 +135,7 @@ export function ConversationBrowser({
                       <span className="block truncate text-sm font-medium">{conversationName(c)}</span>
                       <span className="block truncate text-xs text-muted-foreground">
                         {CONVERSATION_KIND[c.kind]}
-                        {c.is_external ? " · Slack Connect" : ""}
+                        {c.is_external ? ` · ${SHARED_CONVERSATION[connection.provider]}` : ""}
                       </span>
                     </span>
                     <span className="flex shrink-0 flex-col items-end gap-1">
@@ -234,7 +234,9 @@ function Messages({
             {conversation?.external_id ?? shortId(conversationId)}
           </p>
         </div>
-        {conversation?.is_external ? <StatusPill tone="info">Slack Connect</StatusPill> : null}
+        {conversation?.is_external ? (
+          <StatusPill tone="info">{SHARED_CONVERSATION[connection.provider]}</StatusPill>
+        ) : null}
         {conversation && !conversation.identity_is_member ? (
           <StatusPill tone="neutral">Agent not a member</StatusPill>
         ) : null}

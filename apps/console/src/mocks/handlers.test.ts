@@ -30,6 +30,7 @@ import {
   type InstallationId,
   type InstallationTool,
   type OrganizationId,
+  type UpdateChannelProviderSettingsInput,
   type WorkspaceId,
   ZupflowApiError,
 } from "@zupflow/sdk";
@@ -4144,6 +4145,87 @@ describe("channels", () => {
     const kept = await failure(owner.channelConnections.delete(workspace.id, connection.id));
     expect([kept.status, kept.code]).toEqual([501, "channel_providers_not_configured"]);
     expect(await owner.channelConnections.get(workspace.id, connection.id)).toMatchObject({ id: connection.id });
+  });
+
+  it("tells a provider the deployment doesn't reach from one the organization doesn't allow", async () => {
+    const workspace = sandbox();
+    const org = workspace.organization_id;
+    const tokens = { configuration_token: "xoxe.xoxp-1-allowed-0000", refresh_token: "xoxe-1-allowed-0000" };
+    db().channel_providers = [];
+    // Allowed but not reached: listed as such, offered nowhere, and linking says why.
+    expect((await owner.channelSettings.setProviders(org, { allowed_providers: ["slack"] })).providers).toEqual([
+      { provider: "slack", reachable: false, allowed: true },
+    ]);
+    expect(await owner.channelProviders.list(workspace.id)).toEqual([]);
+    const unreached = await failure(
+      owner.channelAppManagers.create(workspace.id, { provider: "slack", method: "configuration_token", ...tokens }),
+    );
+    expect([unreached.status, unreached.code]).toEqual([501, "channel_providers_not_configured"]);
+    // Neither: the organization's refusal comes first, before anything asks the provider.
+    expect((await owner.channelSettings.setProviders(org, { allowed_providers: [] })).providers).toEqual([
+      { provider: "slack", reachable: false, allowed: false },
+    ]);
+    const refused = await failure(
+      owner.channelAppManagers.create(workspace.id, { provider: "slack", method: "configuration_token", ...tokens }),
+    );
+    expect([refused.status, refused.code]).toEqual([403, "channel_provider_not_allowed"]);
+    expect(refused.message).toContain("organization's settings");
+    // Saved once, in the server's order, and recorded in the audit log.
+    expect(db().channel_provider_settings.filter((s) => s.organization_id === org)).toHaveLength(1);
+    expect(
+      db().audit.filter((e) => e.organization_id === org && e.action === "channel_provider_settings.updated"),
+    ).toHaveLength(2);
+  });
+
+  it("refuses a repeated provider first, in the server's words", async () => {
+    const org = sandbox().organization_id;
+    for (const [allowed, message] of [
+      [["slack", "slack"], "List each provider once."],
+      [["slack", "pager"], "Choose providers this server ships."],
+    ] as const) {
+      const refused = await failure(
+        owner.channelSettings.setProviders(org, {
+          allowed_providers: allowed,
+        } as unknown as UpdateChannelProviderSettingsInput),
+      );
+      expect([refused.code, refused.fields], allowed.join()).toEqual([
+        "validation_failed",
+        { allowed_providers: message },
+      ]);
+    }
+  });
+
+  it("tells the hosted page a team can't be linked before it asks for tokens, in words for the person there", async () => {
+    const workspace = sandbox();
+    const org = workspace.organization_id;
+    const reference = referenceOf(
+      await owner.connectSessions.create(workspace.id, {
+        target: { kind: "channel_app_manager", provider: "slack" },
+        return_url: null,
+      }),
+    );
+    const tokens = { configuration_token: "xoxe.xoxp-1-hosted-0000", refresh_token: "xoxe-1-hosted-0000" };
+    expect((await owner.connect.get(reference)).unavailable_reason).toBeNull();
+
+    // Disallowed after the link was made: the read says so, and pasting is refused without blaming the person.
+    await owner.channelSettings.setProviders(org, { allowed_providers: [] });
+    expect((await owner.connect.get(reference)).unavailable_reason).toBe("channel_provider_not_allowed");
+    const refused = await failure(owner.connect.submitCredentials(reference, { values: tokens }));
+    expect([refused.status, refused.code]).toEqual([403, "channel_provider_not_allowed"]);
+    expect(refused.message).toContain("Ask the app that sent you here for a new one.");
+    expect(refused.message).not.toMatch(/organization|owner|admin/i);
+    // Only the hosted page's read says it; the API's reads of the same session never do.
+    const read = await owner.connectSessions.get(workspace.id, (await owner.connect.get(reference)).id);
+    expect(read.unavailable_reason).toBeNull();
+
+    // Allowed again but not reached: the same, with the deployment's code.
+    await owner.channelSettings.setProviders(org, { allowed_providers: null });
+    db().channel_providers = [];
+    expect((await owner.connect.get(reference)).unavailable_reason).toBe("channel_providers_not_configured");
+    const unreached = await failure(owner.connect.submitCredentials(reference, { values: tokens }));
+    expect([unreached.status, unreached.code]).toEqual([501, "channel_providers_not_configured"]);
+    expect(unreached.message).not.toContain("ZUPFLOW_PUBLIC_URL");
+    expect((await owner.connect.get(reference)).status).toBe("pending");
   });
 
   it("installs an agent's app on consent: a connection, its short ID, the agent's channel and the events", async () => {

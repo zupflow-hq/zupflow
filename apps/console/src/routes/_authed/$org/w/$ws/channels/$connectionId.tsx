@@ -87,8 +87,8 @@ function ConnectionPage() {
 
       {c?.status === "reconnect_required" ? (
         <p className="mb-6 rounded-xl border border-destructive/30 bg-danger-soft/60 p-3 text-sm">
-          Slack uninstalled the app or revoked its token, so the agent doesn't hear or answer messages here. Install it
-          again from the agent's Channels tab.
+          {CHANNEL_PROVIDER_NAMES[c.provider]} uninstalled the app or revoked its token, so the agent doesn't hear or
+          answer messages here. Install it again from the agent's Channels tab.
         </p>
       ) : c?.status === "disconnected" ? (
         <p className="mb-6 rounded-xl border bg-muted/50 p-3 text-sm text-muted-foreground">
