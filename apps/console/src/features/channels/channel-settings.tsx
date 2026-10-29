@@ -46,7 +46,7 @@ export function ChannelSettingsSection({ org }: { org: Organization }) {
     <section>
       <SectionHeader
         title="Channels"
-        description="Applies to every workspace's Slack conversations, in Sandbox and Production."
+        description="Applies to every workspace's chat conversations, in Sandbox and Production."
       />
       <Panel>
         {settings.isPending ? (
@@ -142,7 +142,7 @@ function SettingsForm({ org, settings }: { org: Organization; settings: ChannelS
                   </InputGroup>
                 </FormControl>
                 <FormDescription>
-                  Messages older than this are deleted from Zupflow. Slack keeps its own copy.
+                  Messages older than this are deleted from Zupflow. The chat provider keeps its own copy.
                 </FormDescription>
                 <FormMessage />
               </FormItem>

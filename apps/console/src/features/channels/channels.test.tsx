@@ -7,6 +7,7 @@ import {
   CHANNEL_TOOLS,
   type ChannelAppManager,
   type ChannelConnection,
+  type ChannelProviderSettings,
   type ChannelToolLevel,
   type Organization,
   type Workspace,
@@ -16,13 +17,15 @@ import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { newId } from "@/mocks/ids";
 import { AgentChannelSettings } from "./agent-channel-settings";
+import { ChannelProvidersSection, NoProviderReason } from "./channel-providers";
+import { noProviderReason } from "./labels";
 import { LinkTeamDialog } from "./link-team-dialog";
 
 const { api } = vi.hoisted(() => ({
   api: {
     channelAppManagers: { create: vi.fn(), update: vi.fn() },
     agentChannels: { put: vi.fn() },
-    channelSettings: { toolLevels: vi.fn() },
+    channelSettings: { toolLevels: vi.fn(), providers: vi.fn(), setProviders: vi.fn() },
     channelConnections: { conversations: vi.fn() },
   },
 }));
@@ -336,5 +339,115 @@ describe("an agent's channel settings", () => {
     expect(first.getByRole("checkbox", { name: /^Read messages/ })).not.toBeChecked();
     const ids = [...document.querySelectorAll("[id]")].map((el) => el.id);
     expect(new Set(ids).size).toBe(ids.length);
+  });
+});
+
+describe("the organization's chat providers", () => {
+  const admin: Organization = { ...org, role: "admin" };
+  const settings = (change: Partial<ChannelProviderSettings> = {}): ChannelProviderSettings => ({
+    organization_id: org.id,
+    allowed_providers: null,
+    providers: [{ provider: "slack", reachable: true, allowed: true }],
+    updated_at: null,
+    updated_by: null,
+    ...change,
+  });
+  const renderSection = (organization: Organization) =>
+    render(
+      <QueryClientProvider client={client()}>
+        <ChannelProvidersSection org={organization} />
+      </QueryClientProvider>,
+    );
+
+  it("allows every provider until an admin chooses, and saves the ones chosen", async () => {
+    api.channelSettings.providers.mockResolvedValue(settings());
+    api.channelSettings.setProviders.mockImplementation(async (_org, input) =>
+      settings({
+        allowed_providers: input.allowed_providers,
+        providers: [{ provider: "slack", reachable: true, allowed: false }],
+        updated_at: at,
+      }),
+    );
+    renderSection(admin);
+    const slack = await screen.findByRole("checkbox", { name: /^Slack/ });
+    expect(screen.getByRole("radio", { name: /Every provider/ })).toBeChecked();
+    expect(slack).toBeChecked();
+    expect(slack).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+
+    await userEvent.click(screen.getByRole("radio", { name: /Only the ones you choose/ }));
+    await userEvent.click(screen.getByRole("checkbox", { name: /^Slack/ }));
+    expect(screen.getByText("With none chosen, no workspace can link a new team.")).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(api.channelSettings.setProviders).toHaveBeenCalledTimes(1));
+    expect(api.channelSettings.setProviders.mock.calls[0]).toEqual([admin.id, { allowed_providers: [] }]);
+    expect(await screen.findByRole("radio", { name: /Only the ones you choose/ })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: /^Slack/ })).not.toBeChecked();
+  });
+
+  it("says which providers this server can't reach, and changes nothing for someone who can't", async () => {
+    api.channelSettings.providers.mockResolvedValue(
+      settings({
+        allowed_providers: ["slack"],
+        providers: [{ provider: "slack", reachable: false, allowed: true }],
+        updated_at: at,
+      }),
+    );
+    renderSection(org);
+    expect(await screen.findByText("This server can't reach it")).toBeVisible();
+    expect(screen.getByText(/^Allowed\. It's offered once the server reaches it\./)).toBeVisible();
+    expect(screen.getByRole("checkbox", { name: /^Slack/ })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
+    expect(screen.getByText("Only owners and admins can change these.")).toBeVisible();
+  });
+
+  it("says an unchecked provider the server can't reach isn't allowed", async () => {
+    api.channelSettings.providers.mockResolvedValue(
+      settings({
+        allowed_providers: [],
+        providers: [{ provider: "slack", reachable: false, allowed: false }],
+        updated_at: at,
+      }),
+    );
+    renderSection(admin);
+    expect(await screen.findByText(/^Not allowed, and the server can't reach it yet either\./)).toBeVisible();
+    expect(screen.queryByText(/^Allowed\./)).not.toBeInTheDocument();
+    // Checked again, it's allowed in the draft, and said so before it's saved.
+    await userEvent.click(screen.getByRole("checkbox", { name: /^Slack/ }));
+    expect(screen.getByText(/^Allowed\. It's offered once the server reaches it\./)).toBeVisible();
+  });
+});
+
+describe("why no team can be linked", () => {
+  const none: ChannelProviderSettings = {
+    organization_id: org.id,
+    allowed_providers: [],
+    providers: [{ provider: "slack", reachable: true, allowed: false }],
+    updated_at: at,
+    updated_by: null,
+  };
+
+  it("says the organization allows none, and who can change that, to anyone who reads it", () => {
+    for (const role of ["viewer", "developer"] as const) {
+      const { container, unmount } = render(<NoProviderReason org={{ ...org, role }} settings={none} linked />);
+      expect(container.textContent, role).toBe(
+        "Your organization doesn't allow any chat provider, so no new team can be linked here. Teams already linked keep working. An owner or admin can change this in the organization's settings.",
+      );
+      unmount();
+    }
+    expect(noProviderReason(none)).toEqual({
+      text: "Your organization doesn't allow any chat provider, so no team can be linked here.",
+      choice: true,
+    });
+  });
+
+  it("says the server can't reach the ones allowed, and names the organization only when it refuses one too", () => {
+    const unreached = noProviderReason({
+      ...none,
+      allowed_providers: null,
+      providers: [{ provider: "slack", reachable: false, allowed: true }],
+    });
+    expect(unreached.text).toMatch(/^This Zupflow server can't reach Slack yet, so no team can be linked here\./);
+    expect(unreached.choice).toBe(false);
   });
 });

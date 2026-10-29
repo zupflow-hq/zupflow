@@ -36,6 +36,7 @@ const session = (target: ConnectTarget, label: string): ChannelConnectSession =>
   completed_at: null,
   failure_code: null,
   auth: null,
+  unavailable_reason: null,
   requested_scopes: [],
   expected_account: null,
 });
@@ -99,6 +100,18 @@ describe("hosted Connect for a channel", () => {
     // The developer's words aren't the team admin's: they get what they can do.
     expect(await screen.findByRole("alert")).toHaveTextContent("Contact support for the app that sent you here.");
     expect(screen.getByRole("button", { name: "Continue to Slack" })).toBeDisabled();
+  });
+
+  it("says a link that can't link its team right now can't be used, before it asks for tokens", () => {
+    for (const reason of ["channel_provider_not_allowed", "channel_providers_not_configured"] as const) {
+      renderBody({ ...session(linkTeam, "Slack"), unavailable_reason: reason });
+      expect(screen.getByRole("heading", { name: "This link can't be used right now" }), reason).toBeVisible();
+      expect(screen.getByText("Nothing was linked. Ask the app that sent you here for a new one.")).toBeVisible();
+      expect(screen.queryByLabelText("Configuration token")).toBeNull();
+      expect(screen.queryByText(/api\.slack\.com/)).toBeNull();
+      expect(screen.queryByText(/organization|owner|admin/i)).toBeNull();
+      cleanup();
+    }
   });
 
   it("says what a refusal on Slack's page changed", () => {

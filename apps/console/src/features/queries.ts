@@ -52,6 +52,7 @@ import {
   type UpdateAppInput,
   type UpdateAppToolLevelsInput,
   type UpdateChannelAppManagerInput,
+  type UpdateChannelProviderSettingsInput,
   type UpdateChannelSettingsInput,
   type UpdateChannelToolLevelsInput,
   type UpdateConfigurationInput,
@@ -1053,7 +1054,7 @@ export function useChannelProviders(wsId: WorkspaceId) {
   return useQuery({
     queryKey: qk.channelProviders(wsId),
     queryFn: () => api.channelProviders.list(wsId),
-    // The server's, not the workspace's: it changes only when the deployment does.
+    // The deployment's and the organization's, not the workspace's: saving the organization's choice refreshes it.
     staleTime: 5 * 60_000,
   });
 }
@@ -1298,6 +1299,28 @@ export function useUpdateChannelSettings(orgId: OrganizationId) {
   return useMutation({
     mutationFn: (input: UpdateChannelSettingsInput) => api.channelSettings.update(orgId, input),
     onSuccess: (settings) => qc.setQueryData(qk.channelSettings(orgId), settings),
+  });
+}
+
+/** Every provider the server ships, whether it reaches it, and whether the organization allows it. */
+export function useChannelProviderSettings(orgId: OrganizationId) {
+  return useQuery({
+    queryKey: qk.channelProviderSettings(orgId),
+    queryFn: () => api.channelSettings.providers(orgId),
+  });
+}
+
+export function useUpdateChannelProviderSettings(orgId: OrganizationId) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: UpdateChannelProviderSettingsInput) => api.channelSettings.setProviders(orgId, input),
+    onSuccess: (settings) => {
+      qc.setQueryData(qk.channelProviderSettings(orgId), settings);
+      // Every workspace offers what the organization allows: their lists refresh.
+      void qc.invalidateQueries({
+        predicate: (q) => q.queryKey[0] === "ws" && q.queryKey[2] === "channels" && q.queryKey[3] === "providers",
+      });
+    },
   });
 }
 

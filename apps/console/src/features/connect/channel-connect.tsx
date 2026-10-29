@@ -6,7 +6,7 @@ import {
   type ConnectTarget,
   ZupflowApiError,
 } from "@zupflow/sdk";
-import { CheckCircle2Icon, ExternalLinkIcon, RotateCwIcon } from "lucide-react";
+import { AlertCircleIcon, ArrowLeftIcon, CheckCircle2Icon, ExternalLinkIcon, RotateCwIcon } from "lucide-react";
 import { useState } from "react";
 import { EnvBadge } from "@/components/app/environment";
 import { AppIcon } from "@/components/app/misc";
@@ -27,7 +27,7 @@ import { qk } from "@/lib/query-keys";
 import { hostedFailure } from "./failure";
 import { useAfterSession } from "./finish";
 import { ConnectOutcome } from "./frame";
-import { SessionEnded } from "./session-ended";
+import { returnUrlFor, SessionEnded } from "./session-ended";
 
 /** A channel session: it has a target instead of an app. */
 export type ChannelConnectSession = ConnectSession & { target: ConnectTarget };
@@ -64,6 +64,9 @@ export function ChannelConnectBody({ session, reference }: { session: ChannelCon
   if (session.status !== "pending") {
     return <SessionEnded session={session} canClose={Boolean(window.opener)} />;
   }
+  if (session.unavailable_reason) {
+    return <LinkUnavailable session={session} />;
+  }
 
   return (
     <div>
@@ -97,6 +100,36 @@ export function ChannelConnectBody({ session, reference }: { session: ChannelCon
         Cancel
       </Button>
     </div>
+  );
+}
+
+/**
+ * A link that can't link its team right now (its provider isn't allowed, or
+ * isn't reached), shown instead of asking for tokens the person would make
+ * for nothing. They're the customer's team admin and can change neither, so
+ * they're told only what to do. The session stays pending.
+ */
+function LinkUnavailable({ session }: { session: ChannelConnectSession }) {
+  const back = returnUrlFor(session);
+  return (
+    <ConnectOutcome
+      icon={<AlertCircleIcon className="size-9 text-muted-foreground" />}
+      title="This link can't be used right now"
+      body="Nothing was linked. Ask the app that sent you here for a new one."
+    >
+      {back ? (
+        <Button asChild variant="outline" className="mt-2 w-full">
+          <a href={back}>
+            <ArrowLeftIcon />
+            Go back
+          </a>
+        </Button>
+      ) : window.opener ? (
+        <Button variant="outline" className="mt-2 w-full" onClick={() => window.close()}>
+          Close window
+        </Button>
+      ) : null}
+    </ConnectOutcome>
   );
 }
 
@@ -136,7 +169,7 @@ function LinkTeamForm({
         if (Object.keys(absent).length === 0) submit.mutate(values);
       }}
     >
-      <SlackTokenSteps />
+      {session.target.provider === "slack" ? <SlackTokenSteps /> : null}
       <TokenFields
         idPrefix="connect"
         values={values}

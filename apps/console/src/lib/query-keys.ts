@@ -49,9 +49,10 @@ export const qk = {
     ["org", orgId, "model-providers", "models", query] as const,
   defaultModel: (orgId: string, env: Environment) => ["org", orgId, "model-providers", "default", env] as const,
   audit: (orgId: string, workspaceId?: string) => ["org", orgId, "audit", workspaceId ?? "all"] as const,
-  /** The organization's channel tool levels and settings. */
+  /** The organization's channel tool levels, settings and allowed providers. */
   channelToolLevels: (orgId: string) => ["org", orgId, "channels", "tool-levels"] as const,
   channelSettings: (orgId: string) => ["org", orgId, "channels", "settings"] as const,
+  channelProviderSettings: (orgId: string) => ["org", orgId, "channels", "providers"] as const,
 
   workspace: (wsId: string) => ["ws", wsId] as const,
   workspaceApps: (wsId: string) => ["ws", wsId, "apps"] as const,

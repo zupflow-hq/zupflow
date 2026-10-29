@@ -21,6 +21,7 @@ import {
   type TokenValues,
   tokenFieldErrors,
 } from "./configuration-token";
+import { CHANNEL_TEAM_TERM } from "./labels";
 
 /**
  * Links a team of `provider` (in Slack, a workspace) to this Zupflow
@@ -90,7 +91,7 @@ export function LinkTeamDialog({
           <DialogDescription>
             {manager
               ? "Paste a new configuration token and its refresh token. Installed apps keep answering meanwhile."
-              : "Zupflow uses a configuration token to create each agent's own Slack app in the team (what Slack calls a workspace). You link a team once; adding an agent then takes one Allow in Slack."}
+              : `Zupflow uses a configuration token to create each agent's own ${name} app in the team${CHANNEL_TEAM_TERM[provider] ? ` (${CHANNEL_TEAM_TERM[provider]})` : ""}. You link a team once; adding an agent then takes one Allow in ${name}.`}
           </DialogDescription>
         </DialogHeader>
         <form
@@ -102,7 +103,7 @@ export function LinkTeamDialog({
             submit();
           }}
         >
-          <SlackTokenSteps className="rounded-lg border bg-muted/30 p-3" />
+          {provider === "slack" ? <SlackTokenSteps className="rounded-lg border bg-muted/30 p-3" /> : null}
           <TokenFields
             idPrefix="link-team"
             values={values}
