@@ -326,6 +326,9 @@ pub(crate) struct SessionView {
     failure_code: Option<String>,
     /// Only on the hosted page's read, so it can render its form.
     auth: Option<AuthTemplate>,
+    /// Only on the hosted page's read: why a team-linking session can't be
+    /// finished right now, so the page doesn't ask for tokens.
+    unavailable_reason: Option<&'static str>,
     requested_scopes: Vec<String>,
     expected_account: Option<ConnectedAccount>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -383,6 +386,11 @@ pub(crate) async fn session_view(
 ) -> Result<SessionView, Failure> {
     let app = app_of(state, &session).await?;
     let expected_account = expected_account(state, &session).await?;
+    let unavailable_reason = if hosted {
+        crate::channels::unavailable_reason(state, &session).await?
+    } else {
+        None
+    };
     Ok(SessionView {
         id: session.id,
         workspace_id: session.workspace_id,
@@ -402,6 +410,7 @@ pub(crate) async fn session_view(
         completed_at: session.completed_at,
         failure_code: session.failure_code.clone(),
         auth: app.filter(|_| hosted).map(|app| app.auth),
+        unavailable_reason,
         requested_scopes: session.requested_scopes.clone(),
         expected_account,
         url,

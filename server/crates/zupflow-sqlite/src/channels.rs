@@ -1,6 +1,6 @@
 //! [`SqliteChannelStore`]: linked teams, generated apps, connections with
 //! what they've seen, agent channels, sessions in threads, and the
-//! organization's channel tool levels and settings.
+//! organization's channel tool levels, settings and allowed providers.
 //!
 //! Every statement repeats the organization and, for anything but the
 //! levels and settings, the workspace, joins and subqueries included, next
@@ -35,9 +35,9 @@ use zupflow_core::channels::thread::origin_keys;
 use zupflow_core::channels::{
     AgentChannel, AgentChannelSettings, AgentMessages, AppStatus, Audience, BreakerSettings, CHANNEL_TOOLS, ChannelApp,
     ChannelAppManager, ChannelConnection, ChannelConversation, ChannelMessage, ChannelPerson, ChannelProviderKind,
-    ChannelSettings, ChannelToolLevel, ConnectTarget, ConnectionStatus, ConnectionTeam, ConversationKind, Direction,
-    FIRST_VERSION, HandlerKind, Identity, InboundRef, ManagerMethod, ManagerStatus, MidRun, Persona, Senders, Team,
-    ThreadFollowUp, TokenState,
+    ChannelProviderSettings, ChannelSettings, ChannelToolLevel, ConnectTarget, ConnectionStatus, ConnectionTeam,
+    ConversationKind, Direction, FIRST_VERSION, HandlerKind, Identity, InboundRef, ManagerMethod, ManagerStatus,
+    MidRun, Persona, Senders, Team, ThreadFollowUp, TokenState,
 };
 use zupflow_core::connect::{ConnectSession, ConnectSessionStatus};
 use zupflow_core::ids::{
@@ -761,6 +761,13 @@ async fn insert_manager(
     manager: &NewManager,
     now: Timestamp,
 ) -> Result<ChannelAppManager, ChannelError> {
+    // Read here, so a team is never linked after its provider stopped being allowed.
+    if !provider_settings_in(transaction, organization_id)
+        .await?
+        .allows(manager.provider)
+    {
+        return Err(ChannelError::ProviderNotAllowed(manager.provider));
+    }
     sqlx::query(
         "INSERT INTO channel_app_managers (id, organization_id, workspace_id, provider, method, status, token_last4, \
          token_updated_at, credential_version, token_expires_at, created_by_user_id, created_at, updated_at) \
@@ -1204,6 +1211,68 @@ async fn settings_in(
         updated_at: Some(at(&row, "updated_at")?),
         updated_by: user_of(&row)?,
     })
+}
+
+/// The providers the organization allows: every one until saved.
+async fn provider_settings_in(
+    connection: &mut SqliteConnection,
+    organization_id: OrganizationId,
+) -> Result<ChannelProviderSettings, ChannelError> {
+    let row = sqlx::query(
+        "SELECT s.allowed_providers, s.updated_at, u.id AS user_id, u.name AS user_name, u.email AS user_email, \
+         u.avatar_url AS user_avatar_url \
+         FROM channel_provider_settings s LEFT JOIN users u ON u.id = s.updated_by_user_id \
+         WHERE s.organization_id = ?",
+    )
+    .bind(organization_id.uuid())
+    .fetch_optional(connection)
+    .await
+    .map_err(failed("channel_provider_settings"))?;
+    let Some(row) = row else {
+        return Ok(ChannelProviderSettings::defaults(organization_id));
+    };
+    let allowed: Option<String> = row.try_get("allowed_providers").map_err(read)?;
+    Ok(ChannelProviderSettings {
+        organization_id,
+        allowed: allowed.as_deref().map(allowed_from).transpose()?,
+        updated_at: Some(at(&row, "updated_at")?),
+        updated_by: user_of(&row)?,
+    })
+}
+
+/// A saved list of providers, in [`ChannelProviderKind::ALL`]'s order. A
+/// name this build doesn't ship is passed over: no team of it can be linked
+/// here anyway. Saving keeps it ([`unknown_allowed_in`]).
+fn allowed_from(json: &str) -> Result<Vec<ChannelProviderKind>, ChannelError> {
+    let names: Vec<String> = serde_json::from_str(json).map_err(read)?;
+    Ok(ChannelProviderKind::ALL
+        .iter()
+        .copied()
+        .filter(|kind| names.iter().any(|name| name == kind.as_str()))
+        .collect())
+}
+
+/// The stored list's names this build doesn't ship, in their order: a newer
+/// build allowed them, during a rolling deploy or before a rollback, and a
+/// list saved here keeps them so that build still allows them.
+async fn unknown_allowed_in(
+    connection: &mut SqliteConnection,
+    organization_id: OrganizationId,
+) -> Result<Vec<String>, ChannelError> {
+    let stored: Option<Option<String>> =
+        sqlx::query_scalar("SELECT allowed_providers FROM channel_provider_settings WHERE organization_id = ?")
+            .bind(organization_id.uuid())
+            .fetch_optional(connection)
+            .await
+            .map_err(failed("channel_provider_settings"))?;
+    let Some(json) = stored.flatten() else {
+        return Ok(Vec::new());
+    };
+    let names: Vec<String> = serde_json::from_str(&json).map_err(read)?;
+    Ok(names
+        .into_iter()
+        .filter(|name| ChannelProviderKind::parse(name).is_none())
+        .collect())
 }
 
 async fn levels_in(
@@ -3753,6 +3822,68 @@ impl ChannelStore for SqliteChannelStore {
         transaction.commit().await.map_err(failed("save_channel_settings"))?;
         Ok(settings)
     }
+
+    async fn channel_provider_settings(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<ChannelProviderSettings, ChannelError> {
+        let mut connection = self
+            .database
+            .pool()
+            .acquire()
+            .await
+            .map_err(failed("channel_provider_settings"))?;
+        provider_settings_in(&mut connection, organization_id).await
+    }
+
+    async fn save_channel_provider_settings(
+        &self,
+        organization_id: OrganizationId,
+        editor: MemberId,
+        allowed: Option<&[ChannelProviderKind]>,
+        updated_by: UserId,
+        now: Timestamp,
+        audit: &Audit<'_, ChannelProviderSettings>,
+    ) -> Result<ChannelProviderSettings, ChannelError> {
+        let mut transaction = self.immediate("save_channel_provider_settings").await?;
+        admin_allowed(&mut transaction, organization_id, editor).await?;
+        let allowed = match allowed {
+            Some(allowed) => {
+                // The ones this build ships in its order, then any a newer build allowed, kept.
+                let mut names: Vec<String> = ChannelProviderKind::ALL
+                    .iter()
+                    .filter(|kind| allowed.contains(kind))
+                    .map(|kind| kind.as_str().to_owned())
+                    .collect();
+                names.extend(unknown_allowed_in(&mut transaction, organization_id).await?);
+                Some(serde_json::to_string(&names).map_err(read)?)
+            }
+            None => None,
+        };
+        sqlx::query(
+            "INSERT INTO channel_provider_settings (id, organization_id, allowed_providers, updated_at, \
+             updated_by_user_id) VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT (organization_id) DO UPDATE SET allowed_providers = excluded.allowed_providers, \
+             updated_at = excluded.updated_at, updated_by_user_id = excluded.updated_by_user_id",
+        )
+        .bind(Uuid::now_v7())
+        .bind(organization_id.uuid())
+        .bind(allowed)
+        .bind(now.millis())
+        .bind(updated_by.uuid())
+        .execute(&mut *transaction)
+        .await
+        .map_err(failed("save_channel_provider_settings"))?;
+        let settings = provider_settings_in(&mut transaction, organization_id).await?;
+        crate::audit::record(&mut transaction, organization_id, &audit(&settings))
+            .await
+            .map_err(failed("audit"))?;
+        transaction
+            .commit()
+            .await
+            .map_err(failed("save_channel_provider_settings"))?;
+        Ok(settings)
+    }
 }
 
 #[cfg(test)]
@@ -3887,6 +4018,86 @@ mod tests {
             prepare(database),
         )
         .await;
+    }
+
+    /// A provider a newer build allowed, during a rolling deploy or before a
+    /// rollback, stays allowed for it when this build saves a list: kept in
+    /// the stored list, still unread here. Saving null clears it with the rest.
+    #[tokio::test]
+    async fn keeps_providers_a_newer_build_allowed() {
+        let Temporary {
+            database,
+            directory: _directory,
+        } = temporary().await;
+        let tenant = Tenant {
+            organization_id: OrganizationId::generate(),
+            sandbox: WorkspaceId::generate(),
+            sibling: WorkspaceId::generate(),
+            production: WorkspaceId::generate(),
+            admin: MemberId::generate(),
+            admin_user: UserId::generate(),
+            developer: MemberId::generate(),
+            developer_user: UserId::generate(),
+            viewer: MemberId::generate(),
+            viewer_user: UserId::generate(),
+            sandbox_key: zupflow_core::ids::ApiKeyId::generate(),
+            production_key: zupflow_core::ids::ApiKeyId::generate(),
+            agent: AgentId::generate(),
+            other_agent: AgentId::generate(),
+            sibling_agent: AgentId::generate(),
+            production_agent: AgentId::generate(),
+            runs: [RunId::generate(), RunId::generate(), RunId::generate()],
+        };
+        prepare(database.clone())(tenant).await;
+        let org = tenant.organization_id;
+        let store = &SqliteChannelStore::new(database.clone());
+        let pool = database.pool();
+        let stored = move || async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT allowed_providers FROM channel_provider_settings WHERE organization_id = ?",
+            )
+            .bind(org.uuid())
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        };
+        let save = move |allowed: Option<&'static [ChannelProviderKind]>| async move {
+            store
+                .save_channel_provider_settings(
+                    org,
+                    tenant.admin,
+                    allowed,
+                    tenant.admin_user,
+                    Timestamp::from_millis(1),
+                    &zupflow_conformance::audit_store::by_suite,
+                )
+                .await
+                .unwrap()
+        };
+        let slack = ChannelProviderKind::Slack;
+
+        save(Some(&[])).await;
+        sqlx::query("UPDATE channel_provider_settings SET allowed_providers = ? WHERE organization_id = ?")
+            .bind(r#"["pager","slack","teams"]"#)
+            .bind(org.uuid())
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.channel_provider_settings(org).await.unwrap().allowed,
+            Some(vec![slack]),
+            "read here, only the providers this build ships"
+        );
+
+        let none = save(Some(&[])).await;
+        assert_eq!(none.allowed, Some(Vec::new()));
+        assert_eq!(stored().await.as_deref(), Some(r#"["pager","teams"]"#));
+        let listed = save(Some(&[ChannelProviderKind::Slack])).await;
+        assert_eq!(listed.allowed, Some(vec![slack]));
+        assert_eq!(stored().await.as_deref(), Some(r#"["slack","pager","teams"]"#));
+        let every = save(None).await;
+        assert_eq!(every.allowed, None);
+        assert_eq!(stored().await, None, "null allows every provider: nothing is kept");
     }
 
     /// One token of Rust source: enough of a lexer to find every SQL string.
@@ -4067,9 +4278,9 @@ mod tests {
 
     /// Statements on a workspace's tables that hold to the organization
     /// alone, by the function they're in: none so far. The organization's
-    /// own tables (`channel_tool_levels`, `channel_settings`) and its role
-    /// checks (`members`, `api_keys`) aren't workspace-scoped, so they need
-    /// no entry here.
+    /// own tables (`channel_tool_levels`, `channel_settings`,
+    /// `channel_provider_settings`) and its role checks (`members`,
+    /// `api_keys`) aren't workspace-scoped, so they need no entry here.
     const ORGANIZATION_ONLY: &[&str] = &[];
 
     /// What [`audit`] found in a source: how many statements, which

@@ -144,6 +144,8 @@ pub enum AuditObject {
     ChannelToolLevels,
     /// The organization's channel settings, which have no ID.
     ChannelSettings,
+    /// The channel providers the organization allows, which have no ID.
+    ChannelProviderSettings,
 }
 
 impl AuditObject {
@@ -171,6 +173,7 @@ impl AuditObject {
             Self::AgentChannel(_) => "agent_channel",
             Self::ChannelToolLevels => "channel_tool_levels",
             Self::ChannelSettings => "channel_settings",
+            Self::ChannelProviderSettings => "channel_provider_settings",
         }
     }
 
@@ -194,7 +197,11 @@ impl AuditObject {
             Self::ChannelApp(id) => Some(id.uuid()),
             Self::ChannelConnection(id) => Some(id.uuid()),
             Self::AgentChannel(id) => Some(id.uuid()),
-            Self::ToolPolicy | Self::ConnectSettings | Self::ChannelToolLevels | Self::ChannelSettings => None,
+            Self::ToolPolicy
+            | Self::ConnectSettings
+            | Self::ChannelToolLevels
+            | Self::ChannelSettings
+            | Self::ChannelProviderSettings => None,
         }
     }
 
@@ -222,6 +229,7 @@ impl AuditObject {
             ("agent_channel", Some(uuid)) => Self::AgentChannel(AgentChannelId::from_uuid(uuid)),
             ("channel_tool_levels", None) => Self::ChannelToolLevels,
             ("channel_settings", None) => Self::ChannelSettings,
+            ("channel_provider_settings", None) => Self::ChannelProviderSettings,
             _ => return None,
         })
     }
@@ -285,7 +293,8 @@ impl Serialize for AuditTarget {
             AuditObject::ToolPolicy
             | AuditObject::ConnectSettings
             | AuditObject::ChannelToolLevels
-            | AuditObject::ChannelSettings => target.serialize_field("id", &None::<()>)?,
+            | AuditObject::ChannelSettings
+            | AuditObject::ChannelProviderSettings => target.serialize_field("id", &None::<()>)?,
         }
         target.serialize_field("name", &self.name)?;
         target.end()
@@ -392,6 +401,7 @@ actions! {
     AgentChannelDeleted => "agent_channel.deleted",
     ChannelToolLevelsUpdated => "channel_tool_levels.updated",
     ChannelSettingsUpdated => "channel_settings.updated",
+    ChannelProviderSettingsUpdated => "channel_provider_settings.updated",
 }
 
 impl Serialize for AuditAction {
@@ -561,6 +571,7 @@ mod tests {
             AuditObject::AgentChannel(AgentChannelId::from_uuid(uuid)),
             AuditObject::ChannelToolLevels,
             AuditObject::ChannelSettings,
+            AuditObject::ChannelProviderSettings,
         ] {
             assert_eq!(AuditObject::from_stored(object.kind(), object.uuid()), Some(object));
         }

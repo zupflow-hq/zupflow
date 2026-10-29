@@ -1,8 +1,10 @@
 //! [`ChannelStore`]: linked teams, generated apps, connections with what they
-//! have seen, agent channels, and the organization's tool levels and settings.
+//! have seen, agent channels, and the organization's tool levels, settings
+//! and allowed providers.
 //!
 //! **Scope.** Every method takes the organization first, then (for anything
-//! but tool levels and settings) the workspace, and reaches nothing outside
+//! but tool levels, settings and allowed providers) the workspace, and
+//! reaches nothing outside
 //! them: an ID of another workspace, even of the same organization, is the
 //! same as one that doesn't exist. The statements that start without a
 //! tenant are named and documented as such:
@@ -21,7 +23,8 @@
 //! there too, and by the database: one live app per agent per manager, one
 //! live connection per app, an agent channel only on its own agent's app, a
 //! token replaced only from the version read, one active run per session,
-//! and the conversation breaker's count.
+//! the conversation breaker's count, and no team linked of a provider the
+//! organization stopped allowing (see [`ChannelStore::create_manager`]).
 //!
 //! **Secrets.** Tokens and secrets are stored sealed, one value per version,
 //! under the context their kind's [`crate::keys::EncryptionContext`]
@@ -42,8 +45,8 @@ use super::provider::{InboundEvent, ProviderPerson};
 use super::reply::ChannelReply;
 use super::{
     AgentChannel, AgentChannelSettings, BreakerSettings, ChannelApp, ChannelAppManager, ChannelConnection,
-    ChannelConversation, ChannelMessage, ChannelProviderKind, ChannelSettings, ChannelToolLevel, ConnectionTeam,
-    ConversationKind, Direction, HandlerKind, Identity, InboundRef, ManagerMethod,
+    ChannelConversation, ChannelMessage, ChannelProviderKind, ChannelProviderSettings, ChannelSettings,
+    ChannelToolLevel, ConnectionTeam, ConversationKind, Direction, HandlerKind, Identity, InboundRef, ManagerMethod,
 };
 use crate::audit::Audit;
 use crate::connect::ConnectSession;
@@ -617,6 +620,9 @@ pub enum ChannelError {
     /// The organization denies this tool.
     #[error("the tool is denied")]
     ToolDenied(String),
+    /// The organization doesn't allow linking teams of this provider.
+    #[error("the organization doesn't allow this provider")]
+    ProviderNotAllowed(ChannelProviderKind),
     /// The organization requires approval for this tool, and it isn't in `approval_required`.
     #[error("the tool requires approval")]
     ApprovalRequiredByPolicy(String),
@@ -650,7 +656,20 @@ pub trait ChannelStore: Send + Sync {
     ) -> Result<Option<ChannelAppManager>, ChannelError>;
 
     /// Links a team: an `active` manager with its tokens at version 1,
-    /// announced as `active`.
+    /// announced as `active`. `ProviderNotAllowed` when the organization
+    /// doesn't allow its provider; nothing is written then.
+    ///
+    /// The organization's allowed providers are read in the transaction that
+    /// inserts the manager, and that read and the insert must be serialized
+    /// against [`Self::save_channel_provider_settings`] for the same
+    /// organization: once a save that stops allowing a provider commits, no
+    /// link of that provider may commit after it on what it read before.
+    /// SQLite gets this from its immediate transactions, which take the
+    /// database's write lock before the read. A store with weaker isolation
+    /// (Postgres' default read committed, say) must lock: `SELECT … FOR
+    /// UPDATE` on the organization's settings row, or on the organization's
+    /// own row when it has none yet, here and in the save, before either
+    /// reads.
     #[allow(clippy::too_many_arguments)]
     async fn create_manager(
         &self,
@@ -666,7 +685,8 @@ pub trait ChannelStore: Send + Sync {
     /// Links a team through a pending `channel_app_manager` Connect session,
     /// as one: the manager (announced as `active`), then the session
     /// completed naming it (announced). `SessionNotPending` when the session
-    /// isn't pending at `now`; nothing is written then.
+    /// isn't pending at `now`, `ProviderNotAllowed` as for
+    /// [`Self::create_manager`]; nothing is written then.
     #[allow(clippy::too_many_arguments)]
     async fn link_team_through_session(
         &self,
@@ -1432,4 +1452,34 @@ pub trait ChannelStore: Send + Sync {
         now: Timestamp,
         audit: &Audit<'_, ChannelSettings>,
     ) -> Result<ChannelSettings, ChannelError>;
+
+    /// The providers the organization's workspaces may link teams of:
+    /// every one until saved.
+    async fn channel_provider_settings(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<ChannelProviderSettings, ChannelError>;
+
+    /// Saves them, as written by `updated_by`: an admin or owner, rechecked.
+    /// `None` allows every provider, later ones included; a list (each
+    /// provider once: the caller checks) only those, kept in
+    /// [`ChannelProviderKind::ALL`]'s order. Nothing already linked changes.
+    /// Serialized against links in the same organization as
+    /// [`Self::create_manager`] says.
+    ///
+    /// A stored list may name providers this build doesn't know: a newer
+    /// one saved them, during a rolling deploy or before a rollback. Reads
+    /// pass over them, but saving a list keeps them stored, after the ones
+    /// this build knows, so an older build doesn't take away a provider a
+    /// newer one allowed; saving `None` clears them with the rest.
+    #[allow(clippy::too_many_arguments)]
+    async fn save_channel_provider_settings(
+        &self,
+        organization_id: OrganizationId,
+        editor: MemberId,
+        allowed: Option<&[ChannelProviderKind]>,
+        updated_by: UserId,
+        now: Timestamp,
+        audit: &Audit<'_, ChannelProviderSettings>,
+    ) -> Result<ChannelProviderSettings, ChannelError>;
 }

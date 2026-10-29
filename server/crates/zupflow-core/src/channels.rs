@@ -524,6 +524,39 @@ pub struct ChannelSettings {
     pub updated_by: Option<User>,
 }
 
+/// The contract's `ChannelProviderSettings`, without what the server
+/// reaches: which providers the organization's workspaces may link teams
+/// of. Teams already linked keep working whatever it says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelProviderSettings {
+    pub organization_id: OrganizationId,
+    /// `None`, until an admin saves a list: every provider, including ones
+    /// a later release adds. A list: only those, in
+    /// [`ChannelProviderKind::ALL`]'s order, so a provider added later
+    /// isn't allowed until an admin adds it.
+    pub allowed: Option<Vec<ChannelProviderKind>>,
+    /// `None` until saved.
+    pub updated_at: Option<Timestamp>,
+    pub updated_by: Option<User>,
+}
+
+impl ChannelProviderSettings {
+    /// What an organization that never saved them has: every provider.
+    pub fn defaults(organization_id: OrganizationId) -> Self {
+        Self {
+            organization_id,
+            allowed: None,
+            updated_at: None,
+            updated_by: None,
+        }
+    }
+
+    /// Whether a team of `provider` may be linked.
+    pub fn allows(&self, provider: ChannelProviderKind) -> bool {
+        self.allowed.as_ref().is_none_or(|allowed| allowed.contains(&provider))
+    }
+}
+
 /// What a channel Connect session sets up, instead of an app's installation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

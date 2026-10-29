@@ -196,6 +196,69 @@ async fn lists_the_providers_it_reaches_and_links_teams_of_no_other() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// The organization's choice says, for every provider the server ships,
+/// whether the server reaches it and whether it's allowed; a provider it
+/// doesn't allow is refused before reachability or the tokens are asked.
+#[tokio::test]
+async fn tells_a_provider_it_does_not_reach_from_one_the_organization_does_not_allow() {
+    let mut server = Server::new().await;
+    let org = server.organization("alice", "acme").await;
+    let ws = server.workspace("alice", &org, "acme-sandbox", "sandbox").await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let settings = format!("/v1/organizations/{org}/channel-provider-settings");
+    let choose = |allowed: Value| {
+        call("alice", Method::PUT, settings.clone())
+            .naming(&org)
+            .body(json!({ "allowed_providers": allowed }))
+    };
+    let (status, read) = server
+        .send(call("alice", Method::GET, settings.clone()).naming(&org))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(
+        (
+            read["data"]["allowed_providers"].clone(),
+            read["data"]["providers"].clone()
+        ),
+        (
+            Value::Null,
+            json!([{ "provider": "slack", "reachable": true, "allowed": true }])
+        )
+    );
+    for refused in [json!(["slack", "slack"]), json!(["pager"]), json!("slack")] {
+        let (status, body) = server.send(choose(refused.clone())).await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::BAD_REQUEST, "validation_failed"),
+            "{refused}"
+        );
+    }
+
+    server.state.channel_providers = zupflow_core::channels::registry::ChannelProviders::none();
+    server.app = zupflow_server::app(server.state.clone(), zupflow_server::RequestGuard::default());
+    let (status, chosen) = server.send(choose(json!(["slack"]))).await;
+    assert_eq!(status, StatusCode::OK, "{chosen}");
+    assert_eq!(
+        chosen["data"]["providers"],
+        json!([{ "provider": "slack", "reachable": false, "allowed": true }])
+    );
+    let (_, refused) = server.send(link(&ws, &org, "alice", CONFIGURATION_TOKEN)).await;
+    assert_eq!(code(&refused), "channel_providers_not_configured");
+
+    let (_, chosen) = server.send(choose(json!([]))).await;
+    assert_eq!(
+        chosen["data"]["providers"],
+        json!([{ "provider": "slack", "reachable": false, "allowed": false }])
+    );
+    let (status, refused) = server.send(link(&ws, &org, "alice", "xoxe.xoxp-1-INVALID")).await;
+    assert_eq!(
+        (status, code(&refused)),
+        (StatusCode::FORBIDDEN, "channel_provider_not_allowed")
+    );
+}
+
 #[tokio::test]
 async fn keeps_viewers_out_everywhere_and_the_console_out_of_production() {
     let server = Server::new().await;

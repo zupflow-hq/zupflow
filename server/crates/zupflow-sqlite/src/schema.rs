@@ -81,11 +81,12 @@ const TABLES: &[(&str, Scoping)] = &[
     ("model_connection_credentials", Scoping::Organization),
     ("models", Scoping::Organization),
     ("default_models", Scoping::Organization),
-    // Channels: the organization's tool levels and settings; everything
-    // else is a workspace's. An app names its agent and manager without
-    // referencing them, as history that outlives both.
+    // Channels: the organization's tool levels, settings and allowed
+    // providers; everything else is a workspace's. An app names its agent
+    // and manager without referencing them, as history that outlives both.
     ("channel_tool_levels", Scoping::Organization),
     ("channel_settings", Scoping::Organization),
+    ("channel_provider_settings", Scoping::Organization),
     ("channel_app_managers", Scoping::Workspace),
     ("channel_app_manager_credentials", Scoping::Workspace),
     ("channel_apps", Scoping::Workspace),

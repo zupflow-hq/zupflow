@@ -45,8 +45,9 @@ use zupflow_core::channels::store::{
 };
 use zupflow_core::channels::thread::{STEER_HEADER, origin_keys};
 use zupflow_core::channels::{
-    AgentChannelSettings, AppStatus, BreakerSettings, ChannelMessage, ChannelProviderKind, ConnectTarget,
-    ConnectionStatus, ConnectionTeam, ConversationKind, Direction, HandlerKind, Identity, InboundRef, ManagerMethod,
+    AgentChannelSettings, AppStatus, BreakerSettings, ChannelMessage, ChannelProviderKind, ChannelProviderSettings,
+    ConnectTarget, ConnectionStatus, ConnectionTeam, ConversationKind, Direction, HandlerKind, Identity, InboundRef,
+    ManagerMethod, ManagerStatus,
 };
 use zupflow_core::connect::{ConnectIntent, ConnectSessionStatus, ConnectStore, NewConnectSession, ReferenceHash};
 use zupflow_core::environment::Environment;
@@ -125,6 +126,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     counts_the_breaker_under_concurrency(&stores, &prepare).await;
     counts_runs_and_reads_each_message_once(&stores, &prepare).await;
     links_a_team_through_a_connect_session(&stores, &prepare).await;
+    links_teams_only_of_providers_the_organization_allows(&stores, &prepare).await;
     keeps_workspaces_and_organizations_apart(&stores, &prepare).await;
     makes_an_app_at_least_once(&stores, &prepare).await;
     settles_apps_whose_job_is_gone(&stores, &prepare).await;
@@ -2022,6 +2024,146 @@ async fn links_a_team_through_a_connect_session(stores: &Stores<'_>, prepare: &P
         stores.channels.list_managers(org, ws, None, 100).await.unwrap().total,
         1
     );
+}
+
+/// Only an admin chooses; a provider not allowed links no team, directly or
+/// through a session, and the teams already linked stay.
+///
+/// No case here races a save against links, as the breaker's does with its
+/// dispatches: a link that read the choice before a save and committed after
+/// it leaves exactly what one that committed just before the save leaves (an
+/// active manager, its audit entry), and nothing the trait returns orders the
+/// two, so such a case couldn't fail deterministically. Holding the
+/// serialization [`ChannelStore::create_manager`] documents is the store's.
+async fn links_teams_only_of_providers_the_organization_allows(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let other = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let c = stores.channels;
+    let slack = ChannelProviderKind::Slack;
+    let settings = c.channel_provider_settings(org).await.unwrap();
+    assert_eq!(
+        (settings.allowed.clone(), settings.updated_at, settings.allows(slack)),
+        (None, None, true),
+        "every provider until an admin chooses"
+    );
+    let existing = link(stores, &t, ws).await;
+
+    // Only an admin chooses, and only in their own organization.
+    for (organization_id, member, user) in [
+        (org, t.developer, t.developer_user),
+        (other.organization_id, t.admin, t.admin_user),
+    ] {
+        assert_eq!(
+            c.save_channel_provider_settings(organization_id, member, Some(&[]), user, now(), &by_suite)
+                .await
+                .err(),
+            Some(ChannelError::NotAllowed)
+        );
+    }
+    assert_eq!(c.channel_provider_settings(org).await.unwrap(), settings);
+    let none = c
+        .save_channel_provider_settings(org, t.admin, Some(&[]), t.admin_user, now(), &by_suite)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            none.allowed.clone(),
+            none.allows(slack),
+            none.updated_by.as_ref().map(|user| user.id)
+        ),
+        (Some(Vec::new()), false, Some(t.admin_user))
+    );
+    assert_eq!(c.channel_provider_settings(org).await.unwrap(), none);
+
+    // No team is linked, directly or through a session; nothing is written then.
+    let refused = c
+        .create_manager(
+            org,
+            ws,
+            ChannelAppManagerId::generate(),
+            developer(&t),
+            &new_manager(2),
+            now(),
+            &|_| by_suite_in(ws),
+        )
+        .await;
+    assert_eq!(refused.err(), Some(ChannelError::ProviderNotAllowed(slack)));
+    let session_id = ConnectSessionId::generate();
+    stores
+        .connect
+        .create_session(
+            org,
+            ws,
+            session_id,
+            &NewConnectSession {
+                environment: Environment::Sandbox,
+                app: None,
+                target: Some(ConnectTarget::ChannelAppManager {
+                    provider: slack,
+                    manager: None,
+                }),
+                configuration_version: 0,
+                intent: ConnectIntent::Create,
+                installation_id: None,
+                label: "Slack".to_owned(),
+                return_url: None,
+                requested_scopes: Vec::new(),
+                reference_hash: ReferenceHash([7; 32]),
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+    let through_session = c
+        .link_team_through_session(
+            org,
+            ws,
+            session_id,
+            ChannelAppManagerId::generate(),
+            &new_manager(3),
+            now(),
+            &|_| by_suite_in(ws),
+        )
+        .await;
+    assert_eq!(through_session.err(), Some(ChannelError::ProviderNotAllowed(slack)));
+    assert_eq!(
+        stores
+            .connect
+            .find_session(org, ws, session_id)
+            .await
+            .unwrap()
+            .map(|session| session.status_at(now())),
+        Some(ConnectSessionStatus::Pending),
+        "the session stays pending"
+    );
+    let managers = c.list_managers(org, ws, None, 100).await.unwrap();
+    assert_eq!(
+        managers.items.iter().map(|manager| manager.id).collect::<Vec<_>>(),
+        vec![existing],
+        "the team already linked stays, and no other is linked"
+    );
+    assert_eq!(managers.items[0].status, ManagerStatus::Active);
+
+    // Another organization's choice is its own: it allows every provider still.
+    assert_eq!(
+        c.channel_provider_settings(other.organization_id).await.unwrap(),
+        ChannelProviderSettings::defaults(other.organization_id)
+    );
+    link(stores, &other, other.sandbox).await;
+
+    // Listed again, a team links; null allows every provider again.
+    let listed = c
+        .save_channel_provider_settings(org, t.admin, Some(&[slack]), t.admin_user, now(), &by_suite)
+        .await
+        .unwrap();
+    assert_eq!(listed.allowed, Some(vec![slack]));
+    link(stores, &t, ws).await;
+    let every = c
+        .save_channel_provider_settings(org, t.admin, None, t.admin_user, now(), &by_suite)
+        .await
+        .unwrap();
+    assert_eq!((every.allowed, every.updated_at.is_some()), (None, true));
 }
 
 async fn keeps_workspaces_and_organizations_apart(stores: &Stores<'_>, prepare: &Prepare) {

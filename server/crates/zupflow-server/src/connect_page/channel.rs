@@ -1,7 +1,8 @@
 //! The hosted page for a channel session: linking a team with its app
 //! configuration token, or installing an agent's app in it. The same page
 //! as an app's, in its words: the same card, script, policy and failure
-//! copy's shape, and nothing shown that isn't escaped.
+//! copy's shape, and nothing shown that isn't escaped. A team-linking link
+//! that can't be used right now says so instead of asking for tokens.
 
 use std::fmt::Write as _;
 
@@ -15,8 +16,8 @@ use zupflow_core::connect::ConnectSession;
 use zupflow_core::environment::Environment;
 
 use super::{
-    CHECK_CIRCLE, EXTERNAL, Shown, Unrendered, content_security_policy, document, embedding, ended, escape, finished,
-    icon_color, outcome, secured,
+    ALERT_CIRCLE, ARROW_LEFT, CHECK_CIRCLE, EXTERNAL, Shown, Unrendered, content_security_policy, document, embedding,
+    ended, escape, finished, icon_color, outcome, secured,
 };
 use crate::auth::AppState;
 
@@ -68,11 +69,17 @@ pub(super) async fn render(state: &AppState, session: &ConnectSession, shown: Sh
     let embedding = embedding(state, session).await?;
     let (title, card) = match shown {
         Shown::Pending => {
+            let unavailable = crate::channels::unavailable_reason(state, session)
+                .await
+                .map_err(|_| Unrendered::Unavailable)?;
             let title = match &subject {
                 Subject::Team { provider } => format!("Link a {} team", provider.name()),
                 Subject::App { provider, agent } => format!("Add {agent} to {}", provider.name()),
             };
-            (title.clone(), pending(&subject, session, &title))
+            match unavailable {
+                Some(reason) => unusable(reason, embedding.back.as_deref()),
+                None => (title.clone(), pending(&subject, session, &title)),
+            }
         }
         Shown::Completed => {
             let heading = match &subject {
@@ -111,6 +118,37 @@ pub(super) async fn render(state: &AppState, session: &ConnectSession, shown: Sh
     )
         .into_response();
     Ok(secured(response, &policy, !embedding.origins.is_empty(), "no-store"))
+}
+
+/// A team-linking link that can't be used right now, instead of asking for
+/// tokens the person would make for nothing: the organization doesn't allow
+/// its provider, or this deployment doesn't reach it. The person is the
+/// customer's team admin, who can change neither, so they're told only what
+/// to do: ask for a new link. The session stays pending.
+fn unusable(reason: &str, back: Option<&str>) -> (String, String) {
+    const HEADING: &str = "This link can't be used right now";
+    let back = back
+        .map(|back| {
+            format!(
+                "<a class=\"button outline\" href=\"{}\" data-action=\"back\">{ARROW_LEFT}Go back</a>",
+                escape(back)
+            )
+        })
+        .unwrap_or_default();
+    let content = outcome(
+        "neutral",
+        ALERT_CIRCLE,
+        HEADING,
+        "Nothing was linked. Ask the app that sent you here for a new one.",
+        &back,
+    );
+    (
+        HEADING.to_owned(),
+        format!(
+            "<div class=\"card\" data-state=\"unavailable\" data-reason=\"{}\">{content}</div>",
+            escape(reason)
+        ),
+    )
 }
 
 fn pending(subject: &Subject, session: &ConnectSession, title: &str) -> String {
