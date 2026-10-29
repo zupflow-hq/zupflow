@@ -744,6 +744,10 @@ export const ConnectTarget = named(
 );
 export type ConnectTarget = z.infer<typeof ConnectTarget>;
 
+/** Why a pending session that links a team can't be finished right now: the code pasting its tokens would answer. */
+export const ConnectUnavailableReason = z.enum(["channel_provider_not_allowed", "channel_providers_not_configured"]);
+export type ConnectUnavailableReason = z.infer<typeof ConnectUnavailableReason>;
+
 const connectSessionFields = {
   id: idSchema("connect_session"),
   workspace_id: idSchema("workspace"),
@@ -763,6 +767,15 @@ const connectSessionFields = {
   failure_code: z.string().nullable(),
   /** Present on the hosted Connect read so the page can render its form. */
   auth: AuthTemplate.nullable(),
+  /**
+   * On the hosted Connect read of a pending session that links a team: why
+   * it can't be finished right now, so the page says so instead of asking
+   * for tokens. `channel_provider_not_allowed` when the organization doesn't
+   * allow the session's provider, `channel_providers_not_configured` when
+   * this deployment doesn't reach it: pasting the tokens would answer the
+   * same code. Null otherwise, and on every other read.
+   */
+  unavailable_reason: ConnectUnavailableReason.nullable(),
   requested_scopes: z.array(z.string()),
   /** For a reconnect: the account that must be used again. */
   expected_account: ConnectedAccount.nullable(),
@@ -804,7 +817,11 @@ export type CreateAppConnectSessionInput = z.infer<typeof CreateAppConnectSessio
  * installs that generated app, which must be `awaiting_install` or
  * `installed` (a reinstall), else `409 channel_app_not_ready`. Developers
  * and API keys only; the Console can't start one in Production
- * (`403 console_read_only_in_production`).
+ * (`403 console_read_only_in_production`). A `channel_app_manager` session
+ * for a provider the organization doesn't allow is `403
+ * channel_provider_not_allowed`, at the start and again when the tokens are
+ * pasted, in words for the person on the hosted page; until then the hosted
+ * read names it in `unavailable_reason`, so the page doesn't ask for tokens.
  */
 export const CreateChannelConnectSessionInput = z.object({
   target: z.discriminatedUnion("kind", [
@@ -1223,8 +1240,8 @@ export type UpdateAppToolLevelsInput = z.infer<typeof UpdateAppToolLevelsInput>;
 
 // ---------------------------------------------------------------------------
 // Channels: agents reached in a team's chat (Slack first). Everything is
-// workspace-scoped except tool levels and channel settings, which are the
-// organization's. Zupflow's own names avoid "bot": a connection acts as its
+// workspace-scoped except tool levels, channel settings and allowed
+// providers, which are the organization's. Zupflow's own names avoid "bot": a connection acts as its
 // identity, and people or apps posting automatically are automated accounts.
 
 /**
@@ -1234,10 +1251,12 @@ export type UpdateAppToolLevelsInput = z.infer<typeof UpdateAppToolLevelsInput>;
 export const ChannelAppManagerMethod = z.enum(["configuration_token"]);
 export type ChannelAppManagerMethod = z.infer<typeof ChannelAppManagerMethod>;
 /**
- * A channel provider this deployment reaches, so the workspace can link
- * teams there: every one the server ships is available at once (Slack
- * whenever the server has a public HTTPS address). Linking a team of a
- * provider that isn't listed answers `501 channel_providers_not_configured`.
+ * A channel provider the workspace can link teams of: one this deployment
+ * reaches (every one the server ships is available at once; Slack whenever
+ * the server has a public HTTPS address) and the organization allows (see
+ * `ChannelProviderSettings`). Linking a team of a provider the deployment
+ * doesn't reach answers `501 channel_providers_not_configured`; of one the
+ * organization doesn't allow, `403 channel_provider_not_allowed`.
  */
 export const AvailableChannelProvider = named(
   "AvailableChannelProvider",
@@ -1288,7 +1307,8 @@ export type ChannelAppManager = z.infer<typeof ChannelAppManager>;
  * Links a team with a configuration token and its refresh token, both
  * checked with the provider first (`422 invalid_configuration_token`,
  * `fields.configuration_token`). Developers and API keys; the Console can't
- * in Production (`403 console_read_only_in_production`).
+ * in Production (`403 console_read_only_in_production`). A provider the
+ * organization doesn't allow is `403 channel_provider_not_allowed`.
  */
 /** A token as pasted: 1 to 4,096 characters, surrounding spaces ignored. */
 const channelToken = z.string().trim().min(1).max(4096);
@@ -1725,6 +1745,47 @@ export const UpdateChannelSettingsInput = z.object({
   message_retention_days: z.number().int().min(1).max(365),
 });
 export type UpdateChannelSettingsInput = z.infer<typeof UpdateChannelSettingsInput>;
+
+/**
+ * Which channel providers the organization's workspaces may link teams of,
+ * both environments. `allowed_providers` null (the default, until an admin
+ * saves a list) allows every provider, including ones a later release adds;
+ * a list allows only those, so a provider added later isn't allowed until
+ * an admin adds it, and an empty list allows none.
+ *
+ * Disallowing a provider deletes nothing: teams already linked, their apps
+ * and connections keep working (tokens rotated and replaced, apps made and
+ * installed, messages answered) until someone unlinks them. Only linking a
+ * new team, through the API or hosted Connect, is refused.
+ */
+export const ChannelProviderSettings = named(
+  "ChannelProviderSettings",
+  z.object({
+    organization_id: idSchema("organization"),
+    allowed_providers: z.array(ChannelProvider).nullable(),
+    /**
+     * Every provider this server ships, in `CHANNEL_PROVIDERS`' order:
+     * whether this deployment reaches it and whether the organization
+     * allows it. `listChannelProviders` lists those that are both.
+     */
+    providers: z.array(z.object({ provider: ChannelProvider, reachable: z.boolean(), allowed: z.boolean() })),
+    updated_at: instant.nullable(),
+    /** The member who last saved it; null before that, or when they're gone. */
+    updated_by: User.nullable(),
+  }),
+);
+export type ChannelProviderSettings = z.infer<typeof ChannelProviderSettings>;
+
+/**
+ * Null allows every provider, including later ones; a list (each provider
+ * once, `400 validation_failed` otherwise) allows only those. A provider
+ * this deployment doesn't reach may be allowed: it's offered once it's
+ * reached.
+ */
+export const UpdateChannelProviderSettingsInput = z.object({
+  allowed_providers: z.array(ChannelProvider).max(CHANNEL_PROVIDERS.length).nullable(),
+});
+export type UpdateChannelProviderSettingsInput = z.infer<typeof UpdateChannelProviderSettingsInput>;
 
 /** A hosted Connect session that finished, with what it made. */
 export const ChannelAppManagerConnectResult = named(

@@ -48,7 +48,7 @@ import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 import { appIn, issueShortId, timelineOf } from "./scope";
 import { listedFrom, recordListing } from "./tools";
 
-export const DB_SCHEMA = 28;
+export const DB_SCHEMA = 29;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -566,6 +566,7 @@ export function seed(nowMs: number = Date.now()): Db {
     agent_channels: [],
     channel_tool_levels: [],
     channel_settings: [],
+    channel_provider_settings: [],
     channel_inbound_events: [],
     audit: [] as Db["audit"],
     idempotency_keys: [],

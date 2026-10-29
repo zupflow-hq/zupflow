@@ -177,6 +177,7 @@ async function channelSnapshot(client: ZupflowClient, t: Tenant, agents: { id: A
     await Promise.all(agents.map((a) => client.agentChannels.list(w, a.id))),
     await client.channelSettings.toolLevels(t.org),
     await client.channelSettings.get(t.org),
+    await client.channelSettings.providers(t.org),
   ];
 }
 
@@ -284,6 +285,8 @@ function channelAttempts(
           message_retention_days: 365,
         }),
     ],
+    ["[victim org] channel providers", () => r.channelSettings.providers(v.org)],
+    ["[victim org] choose channel providers", () => r.channelSettings.setProviders(v.org, { allowed_providers: [] })],
     // The victim's channel IDs, through the attacker's own workspace.
     ["[own workspace] channel app manager via own workspace", () => r.channelAppManagers.get(ow, c.manager.id)],
     [

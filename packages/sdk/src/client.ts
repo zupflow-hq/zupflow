@@ -28,6 +28,7 @@ import type {
   ChannelConversationListQuery,
   ChannelMessage,
   ChannelMessageListQuery,
+  ChannelProviderSettings,
   ChannelSettings,
   ChannelToolLevel,
   ClientConfiguration,
@@ -91,6 +92,7 @@ import type {
   UpdateAppToolLevelsInput,
   UpdateChannelAppManagerInput,
   UpdateChannelConnectionInput,
+  UpdateChannelProviderSettingsInput,
   UpdateChannelSettingsInput,
   UpdateChannelToolLevelsInput,
   UpdateConfigurationInput,
@@ -575,7 +577,10 @@ export function createClient(transport: Transport) {
         send<void>("DELETE", `${ws(workspaceId)}/agents/${enc(agentId)}/channels/${enc(connectionId)}`),
     },
 
-    /** The organization's channel tool levels, conversation breaker and message retention. */
+    /**
+     * The organization's channel tool levels, conversation breaker, message
+     * retention and the providers its workspaces may link teams of.
+     */
     channelSettings: {
       get: (organizationId: OrganizationId) => get<ChannelSettings>(`${org(organizationId)}/channel-settings`),
       update: (organizationId: OrganizationId, input: UpdateChannelSettingsInput) =>
@@ -584,6 +589,12 @@ export function createClient(transport: Transport) {
         get<ChannelToolLevel[]>(`${org(organizationId)}/channel-tool-levels`),
       setToolLevels: (organizationId: OrganizationId, input: UpdateChannelToolLevelsInput) =>
         send<ChannelToolLevel[]>("PUT", `${org(organizationId)}/channel-tool-levels`, input),
+      /** Every provider the server ships, whether this deployment reaches it, and whether the organization allows it. */
+      providers: (organizationId: OrganizationId) =>
+        get<ChannelProviderSettings>(`${org(organizationId)}/channel-provider-settings`),
+      /** `allowed_providers` null allows every provider, including later ones; a list, only those. */
+      setProviders: (organizationId: OrganizationId, input: UpdateChannelProviderSettingsInput) =>
+        send<ChannelProviderSettings>("PUT", `${org(organizationId)}/channel-provider-settings`, input),
     },
   };
 }

@@ -880,6 +880,8 @@ export function toConnectSession(s: ConnectSessionRow, withAuth = false): Connec
     completed_at: s.completed_at,
     failure_code: s.failure_code,
     auth: withAuth && app ? app.auth : null,
+    // Only the hosted read says why a session can't be finished; it fills this in.
+    unavailable_reason: null,
     requested_scopes: s.requested_scopes,
     expected_account:
       s.intent === "reconnect"

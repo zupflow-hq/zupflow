@@ -1809,6 +1809,76 @@
           "slack"
         ]
       },
+      "ChannelProviderSettings": {
+        "type": "object",
+        "properties": {
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "allowed_providers": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ChannelProvider"
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "providers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "provider": {
+                  "$ref": "#/components/schemas/ChannelProvider"
+                },
+                "reachable": {
+                  "type": "boolean"
+                },
+                "allowed": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "provider",
+                "reachable",
+                "allowed"
+              ]
+            }
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updated_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/User"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "organization_id",
+          "allowed_providers",
+          "providers",
+          "updated_at",
+          "updated_by"
+        ]
+      },
       "ChannelSettings": {
         "type": "object",
         "properties": {
@@ -2251,6 +2321,20 @@
               }
             ]
           },
+          "unavailable_reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "channel_provider_not_allowed",
+                  "channel_providers_not_configured"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "requested_scopes": {
             "type": "array",
             "items": {
@@ -2284,6 +2368,7 @@
           "completed_at",
           "failure_code",
           "auth",
+          "unavailable_reason",
           "requested_scopes",
           "expected_account"
         ]
@@ -2683,6 +2768,20 @@
               }
             ]
           },
+          "unavailable_reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "channel_provider_not_allowed",
+                  "channel_providers_not_configured"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "requested_scopes": {
             "type": "array",
             "items": {
@@ -2720,6 +2819,7 @@
           "completed_at",
           "failure_code",
           "auth",
+          "unavailable_reason",
           "requested_scopes",
           "expected_account",
           "url"
@@ -14810,7 +14910,7 @@
     "/v1/workspaces/{ws}/channel-providers": {
       "get": {
         "operationId": "listChannelProviders",
-        "summary": "The channel providers this deployment reaches, so the workspace can link teams there. Linking a team of a provider that isn't listed answers `501 channel_providers_not_configured`",
+        "summary": "The channel providers this deployment reaches and the organization allows, so the workspace can link teams there. Linking a team of a provider the deployment doesn't reach answers `501 channel_providers_not_configured`; of one the organization doesn't allow (see `getChannelProviderSettings`), `403 channel_provider_not_allowed`",
         "security": [
           {
             "consoleSession": [],
@@ -14962,7 +15062,7 @@
       },
       "post": {
         "operationId": "createChannelAppManager",
-        "summary": "Link a team with a configuration token, so Zupflow can create apps for the workspace's agents there. Developers and API keys; the Console can't in Production (`403 console_read_only_in_production`). A token the provider refuses is `422 invalid_configuration_token`; a provider this deployment doesn't reach (see `listChannelProviders`) is `501 channel_providers_not_configured`",
+        "summary": "Link a team with a configuration token, so Zupflow can create apps for the workspace's agents there. Developers and API keys; the Console can't in Production (`403 console_read_only_in_production`). A token the provider refuses is `422 invalid_configuration_token`; a provider the organization doesn't allow is `403 channel_provider_not_allowed`, and one this deployment doesn't reach (see `listChannelProviders`) is `501 channel_providers_not_configured`",
         "security": [
           {
             "consoleSession": [],
@@ -16843,6 +16943,163 @@
                   "breaker_window_minutes",
                   "breaker_pause_minutes",
                   "message_retention_days"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{org}/channel-provider-settings": {
+      "get": {
+        "operationId": "getChannelProviderSettings",
+        "summary": "Which channel providers the organization's workspaces may link teams of, with every provider the server ships, whether this deployment reaches it and whether it's allowed",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ChannelProviderSettings"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "operationId": "updateChannelProviderSettings",
+        "summary": "Choose the channel providers the organization's workspaces may link teams of: owners and admins, from the Console. Teams already linked keep working",
+        "security": [
+          {
+            "consoleSession": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ChannelProviderSettings"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "allowed_providers": {
+                    "anyOf": [
+                      {
+                        "maxItems": 1,
+                        "type": "array",
+                        "items": {
+                          "$ref": "#/components/schemas/ChannelProvider"
+                        }
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "allowed_providers"
                 ]
               }
             }

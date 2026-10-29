@@ -611,6 +611,18 @@ export interface ChannelSettingsRow {
   updated_by_user_id: UserId | null;
 }
 
+/**
+ * The channel providers the organization allows, once an admin saved them:
+ * `allowed_providers` null allows every provider, later ones included. An
+ * organization without a row allows every provider.
+ */
+export interface ChannelProviderSettingsRow {
+  organization_id: OrganizationId;
+  allowed_providers: ChannelProvider[] | null;
+  updated_at: string;
+  updated_by_user_id: UserId | null;
+}
+
 /** A verified delivery to one app, for dedupe. Natural key (organization_id, workspace_id, app_id, provider_event_id). */
 export interface ChannelInboundEventRow {
   organization_id: OrganizationId;
@@ -677,6 +689,7 @@ export interface Db {
   agent_channels: AgentChannelRow[];
   channel_tool_levels: ChannelToolLevelRow[];
   channel_settings: ChannelSettingsRow[];
+  channel_provider_settings: ChannelProviderSettingsRow[];
   channel_inbound_events: ChannelInboundEventRow[];
   audit: Omit<AuditEvent, "workspace">[];
   /** Idempotency keys (decision 0016), each scoped to its organization, workspace and the caller that sent it. */
