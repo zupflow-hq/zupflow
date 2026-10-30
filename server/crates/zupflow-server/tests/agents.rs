@@ -1090,6 +1090,49 @@ async fn keeps_an_agent_on_the_default_unless_it_names_one_of_its_organizations_
         let (status, answer) = server.send(change(path, body.clone())).await;
         assert_eq!(refusal(status, &answer), expected, "{path} {body}");
     }
+
+    // In order: the model, then the memory, then its type, one of no type's
+    // form included.
+    let unknown_model = (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unknown_model".to_owned(),
+        vec!["model_id".to_owned()],
+    );
+    for (memory, expected) in [
+        (
+            json!({ "memory": "type", "memory_type_id": null }),
+            invalid("memory_type_id"),
+        ),
+        (
+            json!({ "memory": "default", "memory_type_id": first }),
+            invalid("memory_type_id"),
+        ),
+        (
+            json!({ "memory": "off", "memory_type_id": "not-a-memory-type" }),
+            invalid("memory_type_id"),
+        ),
+        (
+            json!({ "memory": "type", "memory_type_id": "mtype_0000000000000000000000" }),
+            unknown.clone(),
+        ),
+        (
+            json!({ "memory": "type", "memory_type_id": "not-a-memory-type" }),
+            unknown.clone(),
+        ),
+    ] {
+        let mut with_model = memory.clone();
+        with_model["model_id"] = json!("mdl_0000000000000000000000");
+        let (status, answer) = server.send(create(&ws, "Refused", with_model.clone())).await;
+        assert_eq!(refusal(status, &answer), unknown_model, "made with {with_model}");
+        let (status, answer) = server.send(create(&ws, "Refused", memory.clone())).await;
+        assert_eq!(refusal(status, &answer), expected, "made with {memory}");
+        for path in [&plain_path, &off_path] {
+            let (status, answer) = server.send(change(path, with_model.clone())).await;
+            assert_eq!(refusal(status, &answer), unknown_model, "{path} {with_model}");
+            let (status, answer) = server.send(change(path, memory.clone())).await;
+            assert_eq!(refusal(status, &answer), expected, "{path} {memory}");
+        }
+    }
     let read = |path: &str| server.send(call("alice", Method::GET, path).naming(&org));
     assert_eq!(read(&plain_path).await.1["data"], on_type);
     assert_eq!(read(&off_path).await.1["data"], off);
@@ -1109,4 +1152,73 @@ async fn agent_counts(server: &Server, org: &str, types: &[String]) -> Vec<u64> 
         counts.push(read["data"]["agent_count"].as_u64().unwrap());
     }
     counts
+}
+
+/// Two changes of an agent's memory at once apply one after the other, each
+/// to the agent as the other left it, never to a copy read before the other
+/// wrote. Whichever goes first, an agent on a type turned off at once ends
+/// off: a type sent alone, or `type` with no type, applied to an agent
+/// already off is refused for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn applies_memory_changes_made_at_once_one_after_the_other() {
+    let server = Server::new().await;
+    let org = server.organization("alice", "northwind").await;
+    let ws = id(&server.workspace("alice", &org, "acme-sandbox", "sandbox").await).to_owned();
+    let mut types = Vec::new();
+    for name in ["First", "Second"] {
+        let (status, made) = server
+            .send(
+                call("alice", Method::POST, format!("/v1/organizations/{org}/memory-types"))
+                    .body(json!({ "name": name, "kind": "notes" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{made}");
+        types.push(id(&made["data"]).to_owned());
+    }
+    let (first, second) = (types[0].as_str(), types[1].as_str());
+    let change = |agent: &str, body: Value| {
+        call("alice", Method::PATCH, format!("{}/{agent}", agents_path(&ws)))
+            .naming(&org)
+            .body(body)
+    };
+    let mut ended_on_a_type = Vec::new();
+    for round in 0..25 {
+        for other in [
+            json!({ "memory_type_id": second }),
+            json!({ "name": "Kept", "memory": "type" }),
+        ] {
+            let (status, made) = server
+                .send(call("alice", Method::POST, agents_path(&ws)).naming(&org).body(json!({
+                    "name": "Racer",
+                    "description": "",
+                    "instructions": "",
+                    "memory": "type",
+                    "memory_type_id": first,
+                })))
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{made}");
+            let agent = id(&made["data"]).to_owned();
+            let ((off, turned_off), (status, answer)) = tokio::join!(
+                server.send(change(&agent, json!({ "memory": "off" }))),
+                server.send(change(&agent, other.clone())),
+            );
+            assert_eq!(off, StatusCode::OK, "{turned_off}");
+            assert!(
+                status == StatusCode::OK
+                    || (status == StatusCode::BAD_REQUEST && answer["error"]["fields"]["memory_type_id"].is_string()),
+                "round {round}, {other}: {status} {answer}"
+            );
+            let (_, read) = server
+                .send(call("alice", Method::GET, format!("{}/{agent}", agents_path(&ws))).naming(&org))
+                .await;
+            if (&read["data"]["memory"], &read["data"]["memory_type_id"]) != (&json!("off"), &Value::Null) {
+                ended_on_a_type.push(format!("round {round}, {other}"));
+            }
+        }
+    }
+    assert!(
+        ended_on_a_type.is_empty(),
+        "{} of 50 agents turned off ended on a type: {ended_on_a_type:?}",
+        ended_on_a_type.len()
+    );
 }

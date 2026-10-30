@@ -6,11 +6,12 @@
 //! same scope, the agent, the installation and the installation's registry
 //! (`installation_tools`) and the organization's levels (`tool_policies`,
 //! `app_tool_levels`), so neither a listing recorded meanwhile nor a level
-//! tightened meanwhile can slip into a grant. An agent naming a memory type
-//! is written in a transaction that reads the type in its organization first,
-//! so a type deleted meanwhile can't be named. Deleting an agent or an
-//! installation deletes its grants through the cascading keys, in that one
-//! statement.
+//! tightened meanwhile can slip into a grant. An agent's memory is applied
+//! in the immediate transaction that writes the agent, to the agent as it
+//! reads it there, and a type it names is read in its organization first, so
+//! a change made meanwhile is never written over and a type deleted
+//! meanwhile can't be named. Deleting an agent or an installation deletes
+//! its grants through the cascading keys, in that one statement.
 
 use std::collections::HashMap;
 
@@ -372,7 +373,8 @@ impl AgentStore for SqliteAgentStore {
         let now = Timestamp::now().millis();
         let mut transaction = self.immediate("create_agent").await?;
         check_model(&mut transaction, organization_id, workspace_id, agent.model_id).await?;
-        check_memory(&mut transaction, organization_id, agent.memory).await?;
+        let memory = agent.memory.applied_to(AgentMemory::Default)?;
+        check_memory(&mut transaction, organization_id, memory).await?;
         sqlx::query(
             "INSERT INTO agents (id, organization_id, workspace_id, name, description, model_id, memory, \
              memory_type_id, instructions, status, created_at, updated_at) \
@@ -384,8 +386,8 @@ impl AgentStore for SqliteAgentStore {
         .bind(&agent.name)
         .bind(&agent.description)
         .bind(agent.model_id.map(|id| id.uuid()))
-        .bind(agent.memory.as_str())
-        .bind(agent.memory.memory_type_id().map(|id| id.uuid()))
+        .bind(memory.as_str())
+        .bind(memory.memory_type_id().map(|id| id.uuid()))
         .bind(&agent.instructions)
         .bind(now)
         .bind(now)
@@ -431,9 +433,15 @@ impl AgentStore for SqliteAgentStore {
         if let Some(model_id) = changes.model_id {
             check_model(&mut transaction, organization_id, workspace_id, model_id).await?;
         }
-        if let Some(memory) = changes.memory {
+        // Applied to the agent as this transaction reads it, so a change
+        // made meanwhile is what it applies to.
+        let memory = if changes.memory.is_sent() {
+            let memory = changes.memory.applied_to(before.memory)?;
             check_memory(&mut transaction, organization_id, memory).await?;
-        }
+            Some(memory)
+        } else {
+            None
+        };
         let updated = sqlx::query(
             "UPDATE agents SET name = coalesce(?, name), description = coalesce(?, description), \
              model_id = CASE WHEN ? THEN ? ELSE model_id END, memory = coalesce(?, memory), \
@@ -444,9 +452,9 @@ impl AgentStore for SqliteAgentStore {
         .bind(changes.description.as_deref())
         .bind(changes.model_id.is_some())
         .bind(changes.model_id.flatten().map(|id| id.uuid()))
-        .bind(changes.memory.map(AgentMemory::as_str))
-        .bind(changes.memory.is_some())
-        .bind(changes.memory.and_then(AgentMemory::memory_type_id).map(|id| id.uuid()))
+        .bind(memory.map(AgentMemory::as_str))
+        .bind(memory.is_some())
+        .bind(memory.and_then(AgentMemory::memory_type_id).map(|id| id.uuid()))
         .bind(changes.instructions.as_deref())
         .bind(changes.status.map(AgentStatus::as_str))
         .bind(Timestamp::now().millis())
@@ -718,12 +726,14 @@ mod tests {
     use std::sync::Arc;
 
     use zupflow_conformance::agent_store::{Prepare, Stores, Tenant};
+    use zupflow_core::agents::SentMemory;
 
     use super::*;
     use crate::schema::{Temporary, temporary};
 
     /// Makes the tenant's rows straight in the database: an organization, two
-    /// workspaces, and installations of one catalog app.
+    /// workspaces, installations of one catalog app, and two `notes` memory
+    /// types.
     fn prepare(database: Database) -> Prepare {
         Arc::new(move |tenant: Tenant| {
             let database = database.clone();
@@ -737,6 +747,18 @@ mod tests {
                     .execute(pool)
                     .await
                     .unwrap();
+                for (memory_type, name) in tenant.memory_types.iter().zip(["First", "Second"]) {
+                    sqlx::query(
+                        "INSERT INTO memory_types (id, organization_id, name, kind, settings, writes, created_at, \
+                         updated_at) VALUES (?, ?, ?, 'notes', '{}', 'allow', 0, 0)",
+                    )
+                    .bind(memory_type.uuid())
+                    .bind(org)
+                    .bind(name)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+                }
                 sqlx::query(
                     "INSERT INTO apps (id, organization_id, kind, name, key, description, icon_glyph, icon_color, \
                      auth, tools, version, created_at, updated_at) \
@@ -819,6 +841,7 @@ mod tests {
             second_installation: InstallationId::generate(),
             sibling: WorkspaceId::generate(),
             sibling_installation: InstallationId::generate(),
+            memory_types: [MemoryTypeId::generate(), MemoryTypeId::generate()],
         };
         prepare(database.clone())(tenant).await;
         let store = SqliteAgentStore::new(database.clone());
@@ -827,7 +850,7 @@ mod tests {
             name: "A".to_owned(),
             description: String::new(),
             model_id: None,
-            memory: AgentMemory::Default,
+            memory: SentMemory::default(),
             instructions: String::new(),
         };
         let here = store

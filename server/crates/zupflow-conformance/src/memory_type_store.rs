@@ -19,7 +19,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::{Map, json};
-use zupflow_core::agents::{Agent, AgentChanges, AgentError, AgentStore, NewAgent};
+use zupflow_core::agents::{Agent, AgentChanges, AgentError, AgentStore, NewAgent, SentMemory};
 use zupflow_core::audit::{
     AuditAction, AuditActor, AuditEntry, AuditFilter, AuditObject, AuditPlace, AuditStore, AuditTarget,
 };
@@ -235,7 +235,7 @@ async fn agent(
                 name: name.to_owned(),
                 description: String::new(),
                 model_id: None,
-                memory,
+                memory: SentMemory::of(memory),
                 instructions: String::new(),
             },
             &|_| by_suite_in(workspace),
@@ -256,7 +256,7 @@ async fn change_memory(
             agent.workspace_id,
             agent.id,
             &AgentChanges {
-                memory: Some(memory),
+                memory: SentMemory::of(memory),
                 ..AgentChanges::default()
             },
             &|_| by_suite_in(agent.workspace_id),

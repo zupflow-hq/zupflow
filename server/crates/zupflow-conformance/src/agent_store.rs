@@ -4,21 +4,28 @@
 //! installation's registry holds and doesn't hold as gone, with approvals
 //! inside it, and held inside the organization's levels as they are when
 //! it's written; a grant left as it is when a tool later goes; an agent's
-//! grants deleted with it, and an installation's with the installation.
+//! grants deleted with it, and an installation's with the installation; and
+//! an agent's memory applied as sent to the agent as it is when it's
+//! written, held in order to its model, its memory, then a type of its own
+//! organization, the second of two changes at once applying to what the
+//! first left.
 //!
 //! `prepare` makes a [`Tenant`] exist: its organization, two workspaces, two
-//! installations in the first and one in the second, all of one app. The
-//! suite records registry listings through `registry`, sets levels through
-//! `policies` and deletes an installation through `installations`, the
-//! stores that own them.
+//! installations in the first and one in the second, all of one app, and two
+//! memory types of the organization. The suite records registry listings
+//! through `registry`, sets levels through `policies` and deletes an
+//! installation through `installations`, the stores that own them.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use zupflow_core::agents::{Agent, AgentChanges, AgentError, AgentStatus, AgentStore, GrantTools, NewAgent};
+use zupflow_core::agents::{
+    Agent, AgentChanges, AgentError, AgentStatus, AgentStore, GrantTools, MemoryChoice, NewAgent, SentMemory,
+    SentMemoryType,
+};
 use zupflow_core::apps::ToolEffect;
-use zupflow_core::ids::{AgentId, AppId, GrantId, InstallationId, OrganizationId, WorkspaceId};
+use zupflow_core::ids::{AgentId, AppId, GrantId, InstallationId, MemoryTypeId, ModelId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::InstallationStore;
 use zupflow_core::memory::AgentMemory;
 use zupflow_core::policy::{ApprovalMode, NewToolLevel, PolicySettings, ToolLevel, ToolPolicyStore};
@@ -39,6 +46,8 @@ pub struct Tenant {
     /// Another workspace of the organization, with its own installation.
     pub sibling: WorkspaceId,
     pub sibling_installation: InstallationId,
+    /// Two memory types of the organization.
+    pub memory_types: [MemoryTypeId; 2],
 }
 
 pub type Prepare = Arc<dyn Fn(Tenant) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -60,6 +69,7 @@ async fn tenant(prepare: &Prepare) -> Tenant {
         second_installation: InstallationId::generate(),
         sibling: WorkspaceId::generate(),
         sibling_installation: InstallationId::generate(),
+        memory_types: [MemoryTypeId::generate(), MemoryTypeId::generate()],
     };
     prepare(tenant).await;
     tenant
@@ -70,7 +80,7 @@ fn new_agent(name: &str) -> NewAgent {
         name: name.to_owned(),
         description: format!("{name}, described"),
         model_id: None,
-        memory: AgentMemory::Default,
+        memory: SentMemory::default(),
         instructions: "Be brief.".to_owned(),
     }
 }
@@ -157,6 +167,8 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     changes_and_deletes_only_the_grant_named(&stores, &prepare).await;
     leaves_a_grant_alone_when_its_tool_goes(&stores, &prepare).await;
     deletes_grants_with_their_agent_or_installation(&stores, &prepare).await;
+    applies_an_agents_memory_in_order(&stores, &prepare).await;
+    applies_two_memory_changes_at_once_one_after_the_other(&stores, &prepare).await;
 }
 
 async fn creates_reads_changes_and_deletes_agents(stores: &Stores<'_>, prepare: &Prepare) {
@@ -224,7 +236,7 @@ async fn creates_reads_changes_and_deletes_agents(stores: &Stores<'_>, prepare: 
                 name: Some("Gamma".to_owned()),
                 description: Some(String::new()),
                 model_id: Some(None),
-                memory: Some(AgentMemory::Off),
+                memory: SentMemory::of(AgentMemory::Off),
                 instructions: Some("Be thorough.".to_owned()),
                 status: Some(AgentStatus::Active),
             },
@@ -1131,4 +1143,212 @@ async fn deletes_grants_with_their_agent_or_installation(stores: &Stores<'_>, pr
         1,
         "the sibling workspace's grants stay"
     );
+}
+
+async fn create_remembering(
+    stores: &Stores<'_>,
+    t: &Tenant,
+    model_id: Option<ModelId>,
+    memory: SentMemory,
+) -> Result<Agent, AgentError> {
+    stores
+        .agents
+        .create_agent(
+            t.organization_id,
+            t.workspace,
+            AgentId::generate(),
+            &NewAgent {
+                model_id,
+                memory,
+                ..new_agent("Remembers")
+            },
+            &|_| by_suite_in(t.workspace),
+        )
+        .await
+}
+
+async fn change_memory(
+    stores: &Stores<'_>,
+    t: &Tenant,
+    agent: AgentId,
+    model_id: Option<Option<ModelId>>,
+    memory: SentMemory,
+) -> Result<Agent, AgentError> {
+    stores
+        .agents
+        .update_agent(
+            t.organization_id,
+            t.workspace,
+            agent,
+            &AgentChanges {
+                model_id,
+                memory,
+                ..AgentChanges::default()
+            },
+            &|_| by_suite_in(t.workspace),
+        )
+        .await
+}
+
+fn sent(memory: Option<MemoryChoice>, memory_type_id: Option<SentMemoryType>) -> SentMemory {
+    SentMemory { memory, memory_type_id }
+}
+
+/// What's sent of an agent's memory applies over the default, or over the
+/// agent's memory as the store reads it, held in order to the model, the
+/// memory, then a type of the organization's own. A refused change changes
+/// nothing.
+async fn applies_an_agents_memory_in_order(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let other = tenant(prepare).await;
+    let [first, second] = t.memory_types;
+    let store = stores.agents;
+    let (typed, off, default) = (
+        Some(MemoryChoice::Type),
+        Some(MemoryChoice::Off),
+        Some(MemoryChoice::Default),
+    );
+    let (null, unknown) = (Some(SentMemoryType::Null), Some(SentMemoryType::Unknown));
+    let id = |id: MemoryTypeId| Some(SentMemoryType::Id(id));
+    let memory_of = |agent: Result<Agent, AgentError>| agent.map(|agent| agent.memory);
+
+    assert_eq!(
+        memory_of(create_remembering(stores, &t, None, SentMemory::default()).await),
+        Ok(AgentMemory::Default),
+        "a new agent is on the default"
+    );
+    assert_eq!(
+        memory_of(create_remembering(stores, &t, None, sent(None, null)).await),
+        Ok(AgentMemory::Default)
+    );
+    let refusals = [
+        (sent(typed, None), AgentError::MissingMemoryType),
+        (sent(typed, null), AgentError::MissingMemoryType),
+        (sent(None, id(first)), AgentError::UnusedMemoryType),
+        (sent(off, unknown), AgentError::UnusedMemoryType),
+        (sent(typed, id(other.memory_types[0])), AgentError::UnknownMemoryType),
+        (sent(typed, id(MemoryTypeId::generate())), AgentError::UnknownMemoryType),
+        (sent(typed, unknown), AgentError::UnknownMemoryType),
+    ];
+    for (memory, refusal) in refusals {
+        assert_eq!(
+            memory_of(create_remembering(stores, &t, Some(ModelId::generate()), memory).await),
+            Err(AgentError::UnknownModel),
+            "the model before the memory: {memory:?}"
+        );
+        assert_eq!(
+            memory_of(create_remembering(stores, &t, None, memory).await),
+            Err(refusal),
+            "{memory:?}"
+        );
+    }
+    let agent = create_remembering(stores, &t, None, sent(typed, id(first)))
+        .await
+        .unwrap();
+    assert_eq!(agent.memory, AgentMemory::Type(first));
+
+    // A change applies to the agent's own memory.
+    let tenant = &t;
+    let agent_id = agent.id;
+    let change = move |memory: SentMemory| change_memory(stores, tenant, agent_id, None, memory);
+    assert_eq!(
+        memory_of(change(sent(None, id(second))).await),
+        Ok(AgentMemory::Type(second)),
+        "a type sent alone moves an agent on a type to it"
+    );
+    assert_eq!(
+        memory_of(change(sent(typed, None)).await),
+        Ok(AgentMemory::Type(second)),
+        "`type` alone keeps its type"
+    );
+    assert_eq!(
+        memory_of(change(SentMemory::default()).await),
+        Ok(AgentMemory::Type(second))
+    );
+    for (memory, refusal) in [
+        (sent(typed, null), AgentError::MissingMemoryType),
+        (sent(None, null), AgentError::MissingMemoryType),
+        (sent(default, id(first)), AgentError::UnusedMemoryType),
+        (sent(off, unknown), AgentError::UnusedMemoryType),
+        (sent(typed, id(other.memory_types[0])), AgentError::UnknownMemoryType),
+        (sent(typed, id(MemoryTypeId::generate())), AgentError::UnknownMemoryType),
+        (sent(None, unknown), AgentError::UnknownMemoryType),
+    ] {
+        assert_eq!(
+            memory_of(change_memory(stores, &t, agent.id, Some(Some(ModelId::generate())), memory).await),
+            Err(AgentError::UnknownModel),
+            "the model before the memory: {memory:?}"
+        );
+        assert_eq!(memory_of(change(memory).await), Err(refusal), "{memory:?}");
+    }
+    assert_eq!(
+        store
+            .find_agent(t.organization_id, t.workspace, agent.id)
+            .await
+            .unwrap()
+            .map(|agent| agent.memory),
+        Some(AgentMemory::Type(second)),
+        "a refused change changes nothing"
+    );
+    assert_eq!(memory_of(change(sent(off, null)).await), Ok(AgentMemory::Off));
+    assert_eq!(
+        memory_of(change(sent(None, id(first))).await),
+        Err(AgentError::UnusedMemoryType),
+        "a type sent alone to an agent that's off"
+    );
+    assert_eq!(
+        memory_of(change(sent(typed, None)).await),
+        Err(AgentError::MissingMemoryType),
+        "an agent that's off has no type to keep"
+    );
+    assert_eq!(memory_of(change(sent(default, None)).await), Ok(AgentMemory::Default));
+
+    // Another organization's agent can't be given this one's type.
+    let theirs = create_remembering(stores, &other, None, SentMemory::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        memory_of(change_memory(stores, &other, theirs.id, None, sent(typed, id(first))).await),
+        Err(AgentError::UnknownMemoryType)
+    );
+}
+
+/// Two changes of an agent's memory at once apply one after the other, the
+/// second to what the first left: an agent on a type, turned off while a
+/// type is sent alone or `type` is kept, ends off whichever goes first.
+async fn applies_two_memory_changes_at_once_one_after_the_other(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let [first, second] = t.memory_types;
+    let typed = SentMemory::of(AgentMemory::Type(first));
+    for round in 0..10 {
+        for other in [
+            sent(None, Some(SentMemoryType::Id(second))),
+            sent(Some(MemoryChoice::Type), None),
+        ] {
+            let agent = create_remembering(stores, &t, None, typed).await.unwrap();
+            let (off, applied) = tokio::join!(
+                change_memory(stores, &t, agent.id, None, SentMemory::of(AgentMemory::Off)),
+                change_memory(stores, &t, agent.id, None, other),
+            );
+            assert_eq!(off.map(|agent| agent.memory), Ok(AgentMemory::Off));
+            // Applied first, or refused for applying to an agent already off.
+            assert!(
+                matches!(
+                    applied,
+                    Ok(_) | Err(AgentError::UnusedMemoryType | AgentError::MissingMemoryType)
+                ),
+                "round {round}, {other:?}: {applied:?}"
+            );
+            assert_eq!(
+                stores
+                    .agents
+                    .find_agent(t.organization_id, t.workspace, agent.id)
+                    .await
+                    .unwrap()
+                    .map(|agent| agent.memory),
+                Some(AgentMemory::Off),
+                "round {round}, {other:?}"
+            );
+        }
+    }
 }

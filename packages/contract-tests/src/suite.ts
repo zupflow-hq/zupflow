@@ -34,6 +34,7 @@ import {
   type PutAgentChannelInput,
   type UpdateAppInput,
   type UpdateChannelToolLevelsInput,
+  type UpdateDefaultMemoryTypeInput,
   type UpdateInstallationInput,
   type UpdateMemoryTypeInput,
   type WebhookDeliveryId,
@@ -3948,6 +3949,15 @@ export function contractSuite(target: Target) {
           const invalid = await failure(owner.memoryTypes.create(org(), input));
           expect(refusal(invalid), field).toEqual([400, "validation_failed", [field]]);
         }
+        // Every field a body leaves out or sends in the wrong shape is named at once.
+        for (const [input, fields] of [
+          [{}, ["kind", "name"]],
+          [{ name: `${tag} x` }, ["kind"]],
+          [{ name: `${tag} x`, kind: 5 }, ["kind"]],
+        ] as unknown as [CreateMemoryTypeInput, string[]][]) {
+          const invalid = await failure(owner.memoryTypes.create(org(), input));
+          expect(refusal(invalid), JSON.stringify(input)).toEqual([400, "validation_failed", fields]);
+        }
         expect(await listedWith(tag)).toEqual([]);
       });
 
@@ -4056,6 +4066,11 @@ export function contractSuite(target: Target) {
         for (const memory_type_id of MISSING_TYPES) {
           const refused = await failure(owner.memoryTypes.setDefault(org(), { memory_type_id }));
           expect(refusal(refused), memory_type_id).toEqual([422, "unknown_memory_type", ["memory_type_id"]]);
+        }
+        // `memory_type_id` is required: a type's ID, or null for none.
+        for (const input of [{}, { memory_type_id: 5 }] as unknown as UpdateDefaultMemoryTypeInput[]) {
+          const invalid = await failure(owner.memoryTypes.setDefault(org(), input));
+          expect(refusal(invalid), JSON.stringify(input)).toEqual([400, "validation_failed", ["memory_type_id"]]);
         }
         expect(await owner.memoryTypes.getDefault(org())).toEqual(chosen);
         // None: agents on the default then run without memory.
@@ -4200,6 +4215,25 @@ export function contractSuite(target: Target) {
           owner.agents.create(qa, agentInput(`${tag} refused`, { memory: "sometimes" as AgentMemory })),
         );
         expect(refusal(unknown)).toEqual([400, "validation_failed", ["memory"]]);
+        // The model comes first, then the memory, then its type: a model that names nothing is refused whatever
+        // memory comes with it.
+        const unknownModel = "mdl_0000000000000000000000" as const;
+        const refusedMemory: MemoryInput[] = [
+          ...mismatched,
+          ...MISSING_TYPES.map((memory_type_id): MemoryInput => ({ memory: "type", memory_type_id })),
+          { memory: "off", memory_type_id: MISSING_TYPES[1] },
+        ];
+        for (const memory of refusedMemory) {
+          const refused = await failure(
+            owner.agents.create(qa, { ...agentInput(`${tag} refused`, memory), model_id: unknownModel }),
+          );
+          expect(refusal(refused), JSON.stringify(memory)).toEqual([422, "unknown_model", ["model_id"]]);
+        }
+        // The memory before its type, one of no type's form included.
+        const offWithType = await failure(
+          owner.agents.create(qa, agentInput(`${tag} refused`, { memory: "off", memory_type_id: MISSING_TYPES[1] })),
+        );
+        expect(refusal(offWithType)).toEqual([400, "validation_failed", ["memory_type_id"]]);
         expect((await owner.agents.list(qa)).filter((a) => a.name === `${tag} refused`)).toEqual([]);
 
         // An update keeps what it doesn't send.
@@ -4233,10 +4267,20 @@ export function contractSuite(target: Target) {
             "validation_failed",
             ["memory_type_id"],
           ]);
+          const withModel = await failure(owner.agents.update(qa, agent.id, { ...memory, model_id: unknownModel }));
+          expect(refusal(withModel), `${agent.name} ${JSON.stringify(memory)}`).toEqual([
+            422,
+            "unknown_model",
+            ["model_id"],
+          ]);
         }
         for (const memory_type_id of MISSING_TYPES) {
           const refused = await failure(owner.agents.update(qa, onType.id, { memory_type_id }));
           expect(refusal(refused), memory_type_id).toEqual([422, "unknown_memory_type", ["memory_type_id"]]);
+          const withModel = await failure(
+            owner.agents.update(qa, onType.id, { memory_type_id, model_id: unknownModel }),
+          );
+          expect(refusal(withModel), memory_type_id).toEqual([422, "unknown_model", ["model_id"]]);
         }
         expect(await owner.agents.get(qa, onType.id)).toEqual(onType);
         expect(await owner.agents.get(qa, off.id)).toEqual(off);
@@ -4260,9 +4304,24 @@ export function contractSuite(target: Target) {
             await c.memoryTypes.get(org(), made.id),
             await c.memoryTypes.getDefault(org()),
           ]);
+        // Refused for who asks before anything about what's asked: a type that isn't there, a body that isn't one.
+        const unasked = (c: ZupflowClient): [string, () => Promise<unknown>][] => [
+          ["createMemoryType", () => c.memoryTypes.create(org(), { name: 5 } as unknown as CreateMemoryTypeInput)],
+          ...MISSING_TYPES.flatMap((id): [string, () => Promise<unknown>][] => [
+            [
+              `updateMemoryType ${id}`,
+              () => c.memoryTypes.update(org(), id, { name: 5 } as unknown as UpdateMemoryTypeInput),
+            ],
+            [`deleteMemoryType ${id}`, () => c.memoryTypes.delete(org(), id)],
+          ]),
+          [
+            "updateDefaultMemoryType",
+            () => c.memoryTypes.setDefault(org(), { memory_type_id: 5 } as unknown as UpdateDefaultMemoryTypeInput),
+          ],
+        ];
         const before = await reads(owner);
         for (const persona of ["developer", "viewer"] as const) {
-          for (const [what, change] of changes(as(persona))) {
+          for (const [what, change] of [...changes(as(persona)), ...unasked(as(persona))]) {
             const error = await failure(change());
             expect(`${error.status} ${error.code}`, `${persona}: ${what}`).toBe("403 forbidden");
           }
@@ -4273,7 +4332,7 @@ export function contractSuite(target: Target) {
         for (const environment of ["sandbox", "production"] as const) {
           const { secret } = await owner.apiKeys.create(org(), { name: `Memory ${environment}`, environment });
           const key = withKey(secret);
-          for (const [what, change] of changes(key)) {
+          for (const [what, change] of [...changes(key), ...unasked(key)]) {
             const error = await failure(change());
             expect(`${error.status} ${error.code}`, `${environment} key: ${what}`).toBe("403 console_only");
           }
@@ -4319,6 +4378,7 @@ export function contractSuite(target: Target) {
           ["read the default", () => outsider.memoryTypes.getDefault(org())],
           ["clear the default", () => outsider.memoryTypes.setDefault(org(), { memory_type_id: null })],
           ["get with a key, through its own organization", () => otherKey.memoryTypes.get(other, made.id)],
+          ["read the kinds with a key", () => otherKey.memoryKinds.list(org())],
           ["get with a key", () => otherKey.memoryTypes.get(org(), made.id)],
           ["list with a key", () => otherKey.memoryTypes.list(org())],
           ["read the default with a key", () => otherKey.memoryTypes.getDefault(org())],

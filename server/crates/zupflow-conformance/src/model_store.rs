@@ -18,14 +18,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use zupflow_core::agents::{AgentChanges, AgentError, AgentStore, NewAgent};
+use zupflow_core::agents::{AgentChanges, AgentError, AgentStore, NewAgent, SentMemory};
 use zupflow_core::audit::{
     AuditAction, AuditActor, AuditEntry, AuditFilter, AuditObject, AuditPlace, AuditStore, AuditTarget,
 };
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AgentId, ApiKeyId, MemberId, ModelConnectionId, ModelId, OrganizationId, UserId, WorkspaceId};
 use zupflow_core::keys::{Sealed, WrappedKey};
-use zupflow_core::memory::AgentMemory;
 use zupflow_core::model_providers::ProviderKind;
 use zupflow_core::model_store::{
     ConnectionStatus, KeyReplacement, Model, ModelConnection, ModelFilter, ModelManager, ModelStatus, ModelStore,
@@ -250,7 +249,7 @@ async fn agent(
                 name: name.to_owned(),
                 description: String::new(),
                 model_id,
-                memory: AgentMemory::Default,
+                memory: SentMemory::default(),
                 instructions: String::new(),
             },
             &|_| by_suite_in(workspace),

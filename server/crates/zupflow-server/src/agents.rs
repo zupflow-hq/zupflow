@@ -14,10 +14,11 @@
 //! `off` clear its type, and a type sent alone moves an agent on `type` to
 //! it. The agent ends on `type` with a type, or on another memory with none
 //! (`400 validation_failed`, `fields.memory_type_id`, otherwise). Any type
-//! but one of the organization's, another organization's included, is the
-//! same `422 unknown_memory_type`, checked by the store in the transaction
-//! that writes the agent; the environment doesn't matter, since memory types
-//! are the organization's.
+//! but one of the organization's, another organization's or one of no type's
+//! form included, is the same `422 unknown_memory_type`; the environment
+//! doesn't matter, since memory types are the organization's. The store
+//! applies what's sent to the agent as it reads it in the transaction that
+//! writes the agent, checking the model, then the memory, then its type.
 //!
 //! A grant names tools in its installation's registry: one that isn't there,
 //! or is gone, is refused with a field error, checked by the store in the
@@ -37,12 +38,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
 use serde_json::Value;
-use zupflow_core::agents::{Agent, AgentChanges, AgentError, AgentStatus, Grant, GrantTools, NewAgent};
+use zupflow_core::agents::{
+    Agent, AgentChanges, AgentError, AgentStatus, Grant, GrantTools, MemoryChoice, NewAgent, SentMemory, SentMemoryType,
+};
 use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{AgentId, GrantId, InstallationId, MemoryTypeId, ModelId, WorkspaceId};
-use zupflow_core::memory::AgentMemory;
 use zupflow_core::organizations::MemberRole;
 use zupflow_core::runs::AgentActivity;
 use zupflow_core::time::Timestamp;
@@ -173,6 +175,12 @@ fn field_error(status: u16, code: &'static str, field: &str, message: String) ->
     })
 }
 
+/// A memory and a type that don't go together: `400 validation_failed`,
+/// naming `memory_type_id`, as the shape of a body is refused.
+fn memory_type_refused(message: &str) -> Failure {
+    ApiError::validation(BTreeMap::from([("memory_type_id".to_owned(), message.to_owned())])).into()
+}
+
 /// The store's refusal as the API answers it. `installation` names the
 /// grant's installation in a tool's refusal.
 fn agent_failure(error: AgentError, installation: &str) -> Failure {
@@ -191,6 +199,8 @@ fn agent_failure(error: AgentError, installation: &str) -> Failure {
             "memory_type_id",
             "Choose a memory type of this organization.".to_owned(),
         ),
+        AgentError::UnusedMemoryType => memory_type_refused("Set memory to type to choose a memory type."),
+        AgentError::MissingMemoryType => memory_type_refused("Choose the memory type this agent uses."),
         AgentError::InstallationNotFound => ApiError::not_found("Installation").into(),
         AgentError::GrantExists => ApiError::new(
             409,
@@ -363,100 +373,32 @@ fn checked_model_id(
     }
 }
 
-/// The contract's `AgentMemory` as a body names it: which memory, without
-/// the type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MemoryChoice {
-    Default,
-    Type,
-    Off,
-}
-
-impl MemoryChoice {
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "default" => Some(Self::Default),
-            "type" => Some(Self::Type),
-            "off" => Some(Self::Off),
-            _ => None,
+/// `memory` and `memory_type_id` as a body sends them, each in its shape:
+/// one of the three, and a string or `null`. A string of no memory type's
+/// form is sent as a type that's none of the organization's; the store
+/// applies the rest.
+fn sent_memory(body: &Object, fields: &mut Fields) -> SentMemory {
+    let memory = body.0.get("memory").and_then(|value| {
+        let memory = value.as_str().and_then(MemoryChoice::parse);
+        if memory.is_none() {
+            fields.invalid("memory", "Choose default, type or off.");
         }
-    }
-
-    fn of(memory: AgentMemory) -> Self {
-        match memory {
-            AgentMemory::Default => Self::Default,
-            AgentMemory::Type(_) => Self::Type,
-            AgentMemory::Off => Self::Off,
+        memory
+    });
+    let memory_type_id = match body.0.get("memory_type_id") {
+        None => None,
+        Some(Value::Null) => Some(SentMemoryType::Null),
+        Some(Value::String(id)) => Some(
+            MemoryTypeId::parse(id)
+                .map(SentMemoryType::Id)
+                .unwrap_or(SentMemoryType::Unknown),
+        ),
+        Some(_) => {
+            fields.invalid("memory_type_id", "Must be a string.");
+            None
         }
-    }
-}
-
-/// What a body sends of an agent's memory, each `None` when it's left out:
-/// `memory`, and `memory_type_id` (`Some(None)` for `null`).
-struct MemoryInput {
-    memory: Option<MemoryChoice>,
-    memory_type_id: Option<Option<String>>,
-}
-
-impl MemoryInput {
-    /// `memory` and `memory_type_id` in their shapes: one of the three, and a
-    /// string or `null`.
-    fn read(body: &Object, fields: &mut Fields) -> Self {
-        let memory = body.0.get("memory").and_then(|value| {
-            let memory = value.as_str().and_then(MemoryChoice::parse);
-            if memory.is_none() {
-                fields.invalid("memory", "Choose default, type or off.");
-            }
-            memory
-        });
-        let memory_type_id = match body.0.get("memory_type_id") {
-            None => None,
-            Some(Value::Null) => Some(None),
-            Some(Value::String(id)) => Some(Some(id.clone())),
-            Some(_) => {
-                fields.invalid("memory_type_id", "Must be a string.");
-                None
-            }
-        };
-        Self { memory, memory_type_id }
-    }
-
-    fn is_sent(&self) -> bool {
-        self.memory.is_some() || self.memory_type_id.is_some()
-    }
-
-    /// The agent's memory once this is applied to `current` (a new agent's
-    /// is the default): `default` and `off` name no type, and `type` keeps
-    /// the agent's type unless one is sent. An ID that can't be a memory
-    /// type's is refused as one that isn't; the store holds the rest to the
-    /// organization's types.
-    fn applied_to(&self, current: AgentMemory) -> Result<AgentMemory, Failure> {
-        let memory_type_refused = |message: &str| -> Failure {
-            ApiError::validation(BTreeMap::from([("memory_type_id".to_owned(), message.to_owned())])).into()
-        };
-        match self.memory.unwrap_or(MemoryChoice::of(current)) {
-            choice @ (MemoryChoice::Default | MemoryChoice::Off) => {
-                if matches!(self.memory_type_id, Some(Some(_))) {
-                    return Err(memory_type_refused("Set memory to type to choose a memory type."));
-                }
-                Ok(if choice == MemoryChoice::Off {
-                    AgentMemory::Off
-                } else {
-                    AgentMemory::Default
-                })
-            }
-            MemoryChoice::Type => match &self.memory_type_id {
-                Some(Some(id)) => MemoryTypeId::parse(id)
-                    .map(AgentMemory::Type)
-                    .map_err(|_| agent_failure(AgentError::UnknownMemoryType, "this installation")),
-                Some(None) => Err(memory_type_refused("Choose the memory type this agent uses.")),
-                None => current
-                    .memory_type_id()
-                    .map(AgentMemory::Type)
-                    .ok_or_else(|| memory_type_refused("Choose the memory type this agent uses.")),
-            },
-        }
-    }
+    };
+    SentMemory { memory, memory_type_id }
 }
 
 async fn create_agent(
@@ -481,10 +423,9 @@ async fn create_agent(
         .and_then(|instructions| checked_instructions(instructions, &mut fields));
     let environment = access.workspace.environment;
     let model_id = checked_model_id(&body, environment, &mut fields);
-    let memory = MemoryInput::read(&body, &mut fields);
+    let memory = sent_memory(&body, &mut fields);
     fields.finish()?;
     let model_id = model_id?.flatten();
-    let memory = memory.applied_to(AgentMemory::Default)?;
     let (Some(name), Some(description), Some(instructions)) = (name, description, instructions) else {
         return Err(ApiError::internal().into());
     };
@@ -546,11 +487,9 @@ async fn update_agent(
     });
     let environment = access.workspace.environment;
     let model_id = checked_model_id(&body, environment, &mut fields);
-    let memory = MemoryInput::read(&body, &mut fields);
+    let memory = sent_memory(&body, &mut fields);
     fields.finish()?;
     let model_id = model_id?;
-    // Applied to the agent's own memory, only when the body names it.
-    let memory = memory.is_sent().then(|| memory.applied_to(agent.memory)).transpose()?;
     // As the Console reads it: a status sent pauses or resumes the agent.
     let action = match status {
         Some(AgentStatus::Paused) => AuditAction::AgentPaused,
@@ -837,5 +776,23 @@ mod tests {
                 "Choose a memory type of this organization.".to_owned()
             )]))
         );
+    }
+
+    #[test]
+    fn refuses_a_memory_and_a_type_that_dont_go_together_as_a_field() {
+        for (refusal, message) in [
+            (
+                AgentError::UnusedMemoryType,
+                "Set memory to type to choose a memory type.",
+            ),
+            (AgentError::MissingMemoryType, "Choose the memory type this agent uses."),
+        ] {
+            let Failure(error) = agent_failure(refusal, "");
+            assert_eq!((error.status, error.code), (400, "validation_failed"));
+            assert_eq!(
+                error.fields,
+                Some(BTreeMap::from([("memory_type_id".to_owned(), message.to_owned())]))
+            );
+        }
     }
 }

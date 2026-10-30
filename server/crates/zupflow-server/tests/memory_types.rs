@@ -207,6 +207,19 @@ async fn describes_the_kinds_it_serves_and_makes_types_of_them() {
         .await;
         assert_eq!((&made["settings"], &made["writes"]), (&settings, &json!(writes)));
     }
+    // A whole number however JSON writes it, kept as an integer.
+    let written = make(
+        &server,
+        "alice",
+        &org,
+        json!({ "name": "Written", "kind": "notes", "settings": { "recall_characters": 8000.0, "max_notes": 1e3 } }),
+    )
+    .await;
+    assert_eq!(
+        written["settings"],
+        json!({ "recall_characters": 8000, "max_notes": 1000 })
+    );
+    assert!(written["settings"]["recall_characters"].is_u64());
     let longest = notes(&server, &org, &format!(" {} ", "x".repeat(60))).await;
     assert_eq!(longest["name"].as_str().unwrap().chars().count(), 60);
 
@@ -298,7 +311,7 @@ async fn describes_the_kinds_it_serves_and_makes_types_of_them() {
         .send(call("alice", Method::GET, format!("{}?limit=100", types_path(&org))))
         .await
         .1;
-    assert_eq!(listed["meta"]["pagination"]["total"], 5, "no refusal made one");
+    assert_eq!(listed["meta"]["pagination"]["total"], 6, "no refusal made one");
 }
 
 #[tokio::test]
