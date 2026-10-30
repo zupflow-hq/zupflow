@@ -100,6 +100,11 @@ const TABLES: &[(&str, Scoping)] = &[
     ("agent_channels", Scoping::Workspace),
     ("channel_sessions", Scoping::Workspace),
     ("channel_dispatches", Scoping::Workspace),
+    // Memory: the organization's types and default; each note is one
+    // agent's, in one workspace and type.
+    ("memory_types", Scoping::Organization),
+    ("default_memory_types", Scoping::Organization),
+    ("memory_notes", Scoping::Workspace),
     // A deleted workspace's events stay in the log.
     ("audit_events", Scoping::History),
 ];
@@ -684,13 +689,14 @@ async fn keeps_agents_and_their_grants_through_migration_0031() {
         .await
         .unwrap();
     assert_eq!(violations, 0);
-    let mut indexes: Vec<String> =
-        sqlx::query_scalar("SELECT name FROM pragma_index_list('agents') WHERE origin = 'c'")
-            .fetch_all(pool)
-            .await
-            .unwrap();
-    indexes.sort();
-    assert_eq!(indexes, ["agents_by_model", "agents_by_name"]);
+    let indexes: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_index_list('agents') WHERE origin = 'c'")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    // Made again; a later rebuild may add more.
+    for index in ["agents_by_model", "agents_by_name"] {
+        assert!(indexes.iter().any(|name| name == index), "{index}");
+    }
     let mut held = Vec::new();
     for _ in 0..8 {
         let mut connection = pool.acquire().await.unwrap();
@@ -1019,6 +1025,252 @@ async fn keeps_connect_sessions_and_their_authorizations_through_migration_0035(
         .await
         .unwrap();
     assert_eq!(authorizations, 0, "an authorization goes with its session");
+}
+
+#[tokio::test]
+async fn keeps_agents_and_their_grants_through_migration_0039() {
+    use std::str::FromStr;
+
+    use sqlx::sqlite::SqliteConnectOptions;
+
+    let directory = TemporaryDirectory::new();
+    let earlier = directory.0.join("migrations");
+    std::fs::create_dir(&earlier).unwrap();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.as_str() < "0039" {
+            std::fs::copy(&path, earlier.join(&name)).unwrap();
+        }
+    }
+    let options = SqliteConnectOptions::from_str("sqlite:")
+        .unwrap()
+        .filename(directory.file())
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+    sqlx::migrate::Migrator::new(earlier.as_path())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    let blob = |n: u8| {
+        let mut id = [0u8; 16];
+        id[15] = n;
+        id.to_vec()
+    };
+    for statement in [
+        "INSERT INTO organizations (id, name, slug, created_at) VALUES (?1, 'Org', 'org', 0)",
+        "INSERT INTO workspaces (id, organization_id, environment, name, slug, created_at) \
+         VALUES (?2, ?1, 'sandbox', 'W', 'w', 0)",
+        "INSERT INTO model_connections (id, organization_id, environment, kind, label, key_version, key_last4, \
+         key_updated_at, status, created_at, updated_at) \
+         VALUES (?3, ?1, 'sandbox', 'openai', 'O', 1, 'abcd', 0, 'active', 0, 0)",
+        "INSERT INTO models (id, organization_id, environment, connection_id, provider_model_id, name, author, \
+         context_window, supports_tools, status, created_at, updated_at) \
+         VALUES (?4, ?1, 'sandbox', ?3, 'gpt-5', 'GPT-5', 'openai', NULL, 1, 'available', 0, 0)",
+        "INSERT INTO apps (id, organization_id, kind, name, key, description, icon_glyph, icon_color, auth, tools, \
+         version, created_at, updated_at) \
+         VALUES (?5, ?1, 'mcp', 'T', 'tools', '', 'T', '#0E7490', '{}', '[]', 1, 0, 0)",
+        "INSERT INTO installation_short_ids (id, organization_id, workspace_id, short_id, created_at) \
+         VALUES (?6, ?1, ?2, 'abcdef', 0)",
+        "INSERT INTO installations (id, organization_id, workspace_id, catalog_app_id, short_id, label, status, \
+         configuration_version, granted_scopes, created_at, updated_at) \
+         VALUES (?7, ?1, ?2, ?5, 'abcdef', 'Main', 'disconnected', 1, '[]', 0, 0)",
+        // An agent on a model of its own, and one on the default.
+        "INSERT INTO agents (id, organization_id, workspace_id, name, description, model_id, instructions, status, \
+         created_at, updated_at) \
+         VALUES (?8, ?1, ?2, 'Helper', 'Helps.', ?4, 'Be brief.', 'paused', 1, 2)",
+        "INSERT INTO agents (id, organization_id, workspace_id, name, description, model_id, instructions, status, \
+         created_at, updated_at) \
+         VALUES (?9, ?1, ?2, 'Writer', '', NULL, 'Write.', 'active', 3, 4)",
+        "INSERT INTO agent_grants (id, organization_id, workspace_id, agent_id, installation_id, tools, \
+         approval_required, created_at, updated_at) \
+         VALUES (?10, ?1, ?2, ?8, ?7, '[\"lookup\"]', '[]', 0, 0)",
+        // The first agent's channel, on an app's connection, and a session
+        // of it in one conversation.
+        "INSERT INTO channel_apps (id, organization_id, workspace_id, manager_id, agent_id, provider, \
+         external_app_id, client_id, inbound_ref, status, provision_job_id, created_at, updated_at) \
+         VALUES (?12, ?1, ?2, randomblob(16), ?8, 'slack', 'A1', 'C1', 'abcdefghijklmnopqrstuvwxyz234567', \
+         'installed', randomblob(16), 0, 0)",
+        "INSERT INTO installation_short_ids (id, organization_id, workspace_id, short_id, created_at) \
+         VALUES (?13, ?1, ?2, 'bcdefg', 0)",
+        "INSERT INTO channel_connections (id, organization_id, workspace_id, provider, app_id, short_id, label, \
+         handler, status, team_id, identity_external_id, handle, granted_scopes, created_at, updated_at) \
+         VALUES (?14, ?1, ?2, 'slack', ?12, 'bcdefg', 'Team', 'mention', 'connected', 'T1', 'U1', 'helper', '[]', \
+         0, 0)",
+        "INSERT INTO agent_channels (id, organization_id, workspace_id, agent_id, connection_id, tools, \
+         approval_required, audience, audience_conversations, answers_dms, answers_mentions, thread_follow_up, \
+         agent_messages, max_agent_hops, mid_run, senders, sender_list, allow_automated, allow_external, \
+         reply_with_output, created_at, updated_at) \
+         VALUES (?15, ?1, ?2, ?8, ?14, '[]', '[]', 'origin', '[]', 1, 1, 'off', 'ignore', 1, 'steer', 'anyone', \
+         '[]', 0, 0, 0, 0, 0)",
+        "INSERT INTO channel_conversations (id, organization_id, workspace_id, connection_id, external_id, kind, \
+         is_external, identity_is_member, created_at, updated_at) \
+         VALUES (?16, ?1, ?2, ?14, 'C1', 'channel', 0, 1, 0, 0)",
+        "INSERT INTO channel_sessions (id, organization_id, workspace_id, agent_channel_id, conversation_id, \
+         thread_key, session_id, created_at, updated_at) \
+         VALUES (?17, ?1, ?2, ?15, ?16, '', ?18, 0, 0)",
+    ] {
+        let mut query = sqlx::query(statement);
+        for n in 1..=18 {
+            query = query.bind(blob(n));
+        }
+        query
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    pool.close().await;
+
+    let database = Database::open(&directory.file()).await.unwrap();
+    let pool = database.pool();
+    type AgentRow = (
+        Vec<u8>,
+        String,
+        String,
+        Option<Vec<u8>>,
+        String,
+        Option<Vec<u8>>,
+        String,
+        String,
+        i64,
+        i64,
+    );
+    let agents: Vec<AgentRow> = sqlx::query_as(
+        "SELECT id, name, description, model_id, memory, memory_type_id, instructions, status, created_at, \
+         updated_at FROM agents ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        agents,
+        [
+            (
+                blob(8),
+                "Helper".to_owned(),
+                "Helps.".to_owned(),
+                Some(blob(4)),
+                "default".to_owned(),
+                None,
+                "Be brief.".to_owned(),
+                "paused".to_owned(),
+                1,
+                2
+            ),
+            (
+                blob(9),
+                "Writer".to_owned(),
+                String::new(),
+                None,
+                "default".to_owned(),
+                None,
+                "Write.".to_owned(),
+                "active".to_owned(),
+                3,
+                4
+            ),
+        ],
+        "kept as they were, on the organization's default memory"
+    );
+    let count =
+        |statement: &'static str| async move { sqlx::query_scalar::<_, i64>(statement).fetch_one(pool).await.unwrap() };
+    assert_eq!(
+        count("SELECT count(*) FROM agent_grants").await,
+        1,
+        "the grant survives the rebuilt table"
+    );
+    let channel: (Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as("SELECT id, agent_id, connection_id FROM agent_channels")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(channel, (blob(15), blob(8), blob(14)), "and so does the channel");
+    let session: (Vec<u8>, Vec<u8>, Vec<u8>) =
+        sqlx::query_as("SELECT id, agent_channel_id, session_id FROM channel_sessions")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(session, (blob(17), blob(15), blob(18)), "and its session");
+    let violations: i64 = sqlx::query_scalar("SELECT count(*) FROM pragma_foreign_key_check")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(violations, 0);
+    let mut indexes: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_index_list('agents') WHERE origin = 'c'")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    indexes.sort();
+    assert_eq!(indexes, ["agents_by_memory_type", "agents_by_model", "agents_by_name"]);
+    // Every connection enforces foreign keys again: holding as many as the
+    // pool opens reaches each.
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let mut connection = pool.acquire().await.unwrap();
+        let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        assert_eq!(enabled, 1);
+        held.push(connection);
+    }
+    drop(held);
+    // The rebuilt table still references its model, and now its memory type.
+    let removed = sqlx::query("DELETE FROM models WHERE organization_id = ? AND id = ?")
+        .bind(blob(1))
+        .bind(blob(4))
+        .execute(pool)
+        .await;
+    assert!(removed.is_err(), "an agent still names the model");
+    sqlx::query(
+        "INSERT INTO memory_types (id, organization_id, name, kind, settings, writes, created_at, updated_at) \
+         VALUES (?, ?, 'Notes', 'notes', '{}', 'allow', 0, 0)",
+    )
+    .bind(blob(11))
+    .bind(blob(1))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE agents SET memory = 'type', memory_type_id = ? WHERE organization_id = ? AND id = ?")
+        .bind(blob(11))
+        .bind(blob(1))
+        .bind(blob(9))
+        .execute(pool)
+        .await
+        .unwrap();
+    let removed = sqlx::query("DELETE FROM memory_types WHERE organization_id = ? AND id = ?")
+        .bind(blob(1))
+        .bind(blob(11))
+        .execute(pool)
+        .await;
+    assert!(removed.is_err(), "an agent names the type");
+    // The agent's grants and channels still go with it.
+    sqlx::query("DELETE FROM agents WHERE organization_id = ? AND id = ?")
+        .bind(blob(1))
+        .bind(blob(8))
+        .execute(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count("SELECT count(*) FROM agent_grants").await,
+        0,
+        "a grant goes with its agent"
+    );
+    assert_eq!(count("SELECT count(*) FROM agent_channels").await, 0, "a channel too");
+    assert_eq!(
+        count("SELECT count(*) FROM channel_sessions").await,
+        0,
+        "and its sessions"
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM channel_conversations").await,
+        1,
+        "never the conversation"
+    );
 }
 
 /// Every column a session held before 0035, in order.

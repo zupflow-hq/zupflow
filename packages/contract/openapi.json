@@ -340,7 +340,7 @@
       },
       "AnyId": {
         "type": "string",
-        "pattern": "^(org|ws|usr|mem|app|inst|cs|agt|grt|run|rev|call|ses|key|we|evt|whd|aud|mcn|mdl|chmgr|chapp|chcon|agch|conv|chmsg|person)_[0-9A-Za-z]{22}$"
+        "pattern": "^(org|ws|usr|mem|app|inst|cs|agt|grt|run|rev|call|ses|key|we|evt|whd|aud|mcn|mdl|chmgr|chapp|chcon|agch|conv|chmsg|person|mtype|memo)_[0-9A-Za-z]{22}$"
       },
       "ApiKey": {
         "type": "object",

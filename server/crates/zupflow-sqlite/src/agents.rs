@@ -6,7 +6,9 @@
 //! same scope, the agent, the installation and the installation's registry
 //! (`installation_tools`) and the organization's levels (`tool_policies`,
 //! `app_tool_levels`), so neither a listing recorded meanwhile nor a level
-//! tightened meanwhile can slip into a grant. Deleting an agent or an
+//! tightened meanwhile can slip into a grant. An agent naming a memory type
+//! is written in a transaction that reads the type in its organization first,
+//! so a type deleted meanwhile can't be named. Deleting an agent or an
 //! installation deletes its grants through the cascading keys, in that one
 //! statement.
 
@@ -20,7 +22,8 @@ use zupflow_core::agents::{
     levels_refusal,
 };
 use zupflow_core::audit::Audit;
-use zupflow_core::ids::{AgentId, AppId, GrantId, InstallationId, ModelId, OrganizationId, WorkspaceId};
+use zupflow_core::ids::{AgentId, AppId, GrantId, InstallationId, MemoryTypeId, ModelId, OrganizationId, WorkspaceId};
+use zupflow_core::memory::AgentMemory;
 use zupflow_core::policy::{AppToolLevel, GrantLevels, NewToolLevel, PolicySettings, ToolLevel};
 use zupflow_core::time::Timestamp;
 
@@ -61,8 +64,8 @@ fn read(error: impl std::fmt::Display) -> AgentError {
 /// stay static strings.
 macro_rules! agent_select {
     () => {
-        "SELECT a.id, a.organization_id, a.workspace_id, a.name, a.description, a.model_id, a.instructions, \
-         a.status, a.created_at, a.updated_at, \
+        "SELECT a.id, a.organization_id, a.workspace_id, a.name, a.description, a.model_id, a.memory, \
+         a.memory_type_id, a.instructions, a.status, a.created_at, a.updated_at, \
          (SELECT count(*) FROM agent_grants g \
           WHERE g.organization_id = ?1 AND g.workspace_id = ?2 AND g.agent_id = a.id) AS grant_count \
          FROM agents a WHERE a.organization_id = ?1 AND a.workspace_id = ?2"
@@ -77,6 +80,8 @@ const MODEL_OF_WORKSPACE: &str = "SELECT 1 FROM models m JOIN workspaces w \
                                   ON w.organization_id = m.organization_id AND w.environment = m.environment \
                                   WHERE m.organization_id = ?1 AND w.organization_id = ?1 AND w.id = ?2 AND m.id = ?3";
 const AGENT_EXISTS: &str = "SELECT 1 FROM agents WHERE organization_id = ? AND workspace_id = ? AND id = ?";
+/// A memory type of the organization: the organization, then the type.
+const MEMORY_TYPE_OF_ORGANIZATION: &str = "SELECT 1 FROM memory_types WHERE organization_id = ? AND id = ?";
 const INSTALLATION_EXISTS: &str =
     "SELECT 1 FROM installations WHERE organization_id = ? AND workspace_id = ? AND id = ?";
 /// The installation's registry: each tool's name and whether it's gone.
@@ -125,6 +130,11 @@ const UPDATE_GRANT: &str = concat!(
 fn agent_from(row: &SqliteRow) -> Result<Agent, AgentError> {
     let status: String = row.try_get("status").map_err(read)?;
     let grant_count: i64 = row.try_get("grant_count").map_err(read)?;
+    let memory: String = row.try_get("memory").map_err(read)?;
+    let memory_type_id = row
+        .try_get::<Option<uuid::Uuid>, _>("memory_type_id")
+        .map_err(read)?
+        .map(MemoryTypeId::from_uuid);
     Ok(Agent {
         id: AgentId::from_uuid(row.try_get("id").map_err(read)?),
         organization_id: OrganizationId::from_uuid(row.try_get("organization_id").map_err(read)?),
@@ -135,6 +145,7 @@ fn agent_from(row: &SqliteRow) -> Result<Agent, AgentError> {
             .try_get::<Option<uuid::Uuid>, _>("model_id")
             .map_err(read)?
             .map(ModelId::from_uuid),
+        memory: AgentMemory::from_stored(&memory, memory_type_id).ok_or_else(|| read("an unknown agent memory"))?,
         instructions: row.try_get("instructions").map_err(read)?,
         status: AgentStatus::parse(&status).ok_or_else(|| read("an unknown agent status"))?,
         grant_count: u64::try_from(grant_count).map_err(read)?,
@@ -181,6 +192,29 @@ async fn check_model(
         Ok(())
     } else {
         Err(AgentError::UnknownModel)
+    }
+}
+
+/// Holds an agent's memory type to its organization, inside the caller's
+/// transaction.
+async fn check_memory(
+    transaction: &mut Transaction<'static, Sqlite>,
+    organization_id: OrganizationId,
+    memory: AgentMemory,
+) -> Result<(), AgentError> {
+    let Some(memory_type_id) = memory.memory_type_id() else {
+        return Ok(());
+    };
+    let found: Option<i64> = sqlx::query_scalar(MEMORY_TYPE_OF_ORGANIZATION)
+        .bind(organization_id.uuid())
+        .bind(memory_type_id.uuid())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(failed("check_memory"))?;
+    if found.is_some() {
+        Ok(())
+    } else {
+        Err(AgentError::UnknownMemoryType)
     }
 }
 
@@ -338,9 +372,11 @@ impl AgentStore for SqliteAgentStore {
         let now = Timestamp::now().millis();
         let mut transaction = self.immediate("create_agent").await?;
         check_model(&mut transaction, organization_id, workspace_id, agent.model_id).await?;
+        check_memory(&mut transaction, organization_id, agent.memory).await?;
         sqlx::query(
-            "INSERT INTO agents (id, organization_id, workspace_id, name, description, model_id, instructions, status, \
-             created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+            "INSERT INTO agents (id, organization_id, workspace_id, name, description, model_id, memory, \
+             memory_type_id, instructions, status, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
         )
         .bind(agent_id.uuid())
         .bind(organization_id.uuid())
@@ -348,6 +384,8 @@ impl AgentStore for SqliteAgentStore {
         .bind(&agent.name)
         .bind(&agent.description)
         .bind(agent.model_id.map(|id| id.uuid()))
+        .bind(agent.memory.as_str())
+        .bind(agent.memory.memory_type_id().map(|id| id.uuid()))
         .bind(&agent.instructions)
         .bind(now)
         .bind(now)
@@ -393,15 +431,22 @@ impl AgentStore for SqliteAgentStore {
         if let Some(model_id) = changes.model_id {
             check_model(&mut transaction, organization_id, workspace_id, model_id).await?;
         }
+        if let Some(memory) = changes.memory {
+            check_memory(&mut transaction, organization_id, memory).await?;
+        }
         let updated = sqlx::query(
             "UPDATE agents SET name = coalesce(?, name), description = coalesce(?, description), \
-             model_id = CASE WHEN ? THEN ? ELSE model_id END, instructions = coalesce(?, instructions), \
+             model_id = CASE WHEN ? THEN ? ELSE model_id END, memory = coalesce(?, memory), \
+             memory_type_id = CASE WHEN ? THEN ? ELSE memory_type_id END, instructions = coalesce(?, instructions), \
              status = coalesce(?, status), updated_at = ? WHERE organization_id = ? AND workspace_id = ? AND id = ?",
         )
         .bind(changes.name.as_deref())
         .bind(changes.description.as_deref())
         .bind(changes.model_id.is_some())
         .bind(changes.model_id.flatten().map(|id| id.uuid()))
+        .bind(changes.memory.map(AgentMemory::as_str))
+        .bind(changes.memory.is_some())
+        .bind(changes.memory.and_then(AgentMemory::memory_type_id).map(|id| id.uuid()))
         .bind(changes.instructions.as_deref())
         .bind(changes.status.map(AgentStatus::as_str))
         .bind(Timestamp::now().millis())
@@ -782,6 +827,7 @@ mod tests {
             name: "A".to_owned(),
             description: String::new(),
             model_id: None,
+            memory: AgentMemory::Default,
             instructions: String::new(),
         };
         let here = store

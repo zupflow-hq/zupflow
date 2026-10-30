@@ -10,6 +10,7 @@
 //! - [`error`]: the API's error codes and the envelope's `error` field.
 //! - [`environment`]: Sandbox and Production.
 //! - [`keys`]: envelope encryption and the [`keys::KeyService`] trait.
+//! - [`memory`]: agent memory: the [`memory::MemoryProvider`] trait, the `notes` kind, memory types and their store.
 //! - [`scope`]: the scope stored values belong to, and the names inside it.
 //! - [`storage`]: the [`storage::Cache`] and [`storage::ObjectStore`] traits.
 //! - [`events`]: the [`events::EventBus`] trait.
@@ -45,6 +46,7 @@ pub mod ids;
 pub mod installations;
 pub mod jobs;
 pub mod keys;
+pub mod memory;
 pub mod metrics;
 pub mod model_providers;
 pub mod model_store;

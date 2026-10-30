@@ -25,6 +25,7 @@ use zupflow_core::audit::{
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AgentId, ApiKeyId, MemberId, ModelConnectionId, ModelId, OrganizationId, UserId, WorkspaceId};
 use zupflow_core::keys::{Sealed, WrappedKey};
+use zupflow_core::memory::AgentMemory;
 use zupflow_core::model_providers::ProviderKind;
 use zupflow_core::model_store::{
     ConnectionStatus, KeyReplacement, Model, ModelConnection, ModelFilter, ModelManager, ModelStatus, ModelStore,
@@ -249,6 +250,7 @@ async fn agent(
                 name: name.to_owned(),
                 description: String::new(),
                 model_id,
+                memory: AgentMemory::Default,
                 instructions: String::new(),
             },
             &|_| by_suite_in(workspace),

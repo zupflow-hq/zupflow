@@ -17,6 +17,10 @@
 //! slipped past. A grant isn't rewritten when a level tightens later: the run
 //! engine holds the call to it.
 //!
+//! An agent's memory ([`AgentMemory`]) is the organization's default type, a
+//! type of its own or none; a type it names is one of its organization's,
+//! checked by the store in the transaction that writes the agent.
+//!
 //! Deleting an agent deletes its grants, and deleting an installation
 //! deletes the grants of it, each as one change. Every [`AgentStore`] method
 //! takes the organization, then the workspace.
@@ -25,6 +29,7 @@ use async_trait::async_trait;
 
 use crate::audit::Audit;
 use crate::ids::{AgentId, GrantId, InstallationId, ModelId, OrganizationId, WorkspaceId};
+use crate::memory::AgentMemory;
 use crate::policy::{GrantLevels, LevelRefusal, level_refusal};
 use crate::time::Timestamp;
 
@@ -63,6 +68,9 @@ pub struct Agent {
     /// organization's, added in the workspace's environment. `None` runs on
     /// the default.
     pub model_id: Option<ModelId>,
+    /// The memory its runs start with: the organization's default type
+    /// unless it names a type of its own or has none.
+    pub memory: AgentMemory,
     pub instructions: String,
     pub status: AgentStatus,
     /// How many grants it holds, counted when read.
@@ -78,6 +86,8 @@ pub struct NewAgent {
     pub description: String,
     /// Held to the same rule as [`Agent::model_id`] by the store.
     pub model_id: Option<ModelId>,
+    /// A type it names is one of the organization's, checked by the store.
+    pub memory: AgentMemory,
     pub instructions: String,
 }
 
@@ -88,6 +98,8 @@ pub struct AgentChanges {
     pub description: Option<String>,
     /// `Some(None)` goes back to the environment's default.
     pub model_id: Option<Option<ModelId>>,
+    /// The default or none forgets the type it named.
+    pub memory: Option<AgentMemory>,
     pub instructions: Option<String>,
     pub status: Option<AgentStatus>,
 }
@@ -124,6 +136,9 @@ pub enum AgentError {
     /// The model named isn't one of the organization's in the workspace's environment.
     #[error("not a model of this workspace's environment")]
     UnknownModel,
+    /// The memory type named isn't one of the organization's.
+    #[error("not a memory type of this organization")]
+    UnknownMemoryType,
     /// The grant isn't the agent's, in this scope.
     #[error("grant not found")]
     GrantNotFound,
@@ -170,8 +185,9 @@ pub trait AgentStore: Send + Sync {
 
     /// Creates an active agent in a workspace the caller has resolved in its
     /// organization. Its model, if it names one, must be the organization's,
-    /// added in the workspace's environment (`UnknownModel`), checked in the
-    /// transaction that writes the agent.
+    /// added in the workspace's environment (`UnknownModel`), and its memory
+    /// type, if it names one, the organization's (`UnknownMemoryType`), both
+    /// checked in the transaction that writes the agent.
     async fn create_agent(
         &self,
         organization_id: OrganizationId,
@@ -181,8 +197,9 @@ pub trait AgentStore: Send + Sync {
         audit: &Audit<'_, Agent>,
     ) -> Result<Agent, AgentError>;
 
-    /// Changes what `changes` names; a model is held to the rule
-    /// [`AgentStore::create_agent`] holds it to, in the same transaction.
+    /// Changes what `changes` names; a model and a memory type are held to
+    /// the rules [`AgentStore::create_agent`] holds them to, in the same
+    /// transaction.
     async fn update_agent(
         &self,
         organization_id: OrganizationId,

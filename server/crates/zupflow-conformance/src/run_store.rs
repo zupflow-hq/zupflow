@@ -55,6 +55,7 @@ use zupflow_core::ids::{
     WorkspaceId,
 };
 use zupflow_core::jobs::{Job, JobError, JobQueue};
+use zupflow_core::memory::AgentMemory;
 use zupflow_core::model_store::{RouteState, RunModel};
 use zupflow_core::models::{Completion, ModelToolCall, Reply, TokenUsage};
 use zupflow_core::runs::digest::{Sha256Digest, call_digest};
@@ -194,6 +195,7 @@ async fn agent(stores: &Stores<'_>, organization_id: OrganizationId, workspace: 
                 name: name.to_owned(),
                 description: String::new(),
                 model_id: None,
+                memory: AgentMemory::Default,
                 instructions: "Be brief.".to_owned(),
             },
             &|_| by_suite_in(workspace),

@@ -31,6 +31,7 @@ use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, Audi
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{AgentId, GrantId, InstallationId, ModelId, WorkspaceId};
+use zupflow_core::memory::AgentMemory;
 use zupflow_core::organizations::MemberRole;
 use zupflow_core::runs::AgentActivity;
 use zupflow_core::time::Timestamp;
@@ -167,6 +168,12 @@ fn agent_failure(error: AgentError, installation: &str) -> Failure {
             "Choose a model added in this workspace's environment.",
         )
         .into(),
+        AgentError::UnknownMemoryType => field_error(
+            422,
+            "unknown_memory_type",
+            "memory_type_id",
+            "Choose a memory type of this organization.".to_owned(),
+        ),
         AgentError::InstallationNotFound => ApiError::not_found("Installation").into(),
         AgentError::GrantExists => ApiError::new(
             409,
@@ -376,6 +383,8 @@ async fn create_agent(
                 name,
                 description,
                 model_id,
+                // Set through the API once it reads an agent's memory.
+                memory: AgentMemory::Default,
                 instructions,
             },
             &|agent: &Agent| {
@@ -441,6 +450,7 @@ async fn update_agent(
                 name,
                 description,
                 model_id,
+                memory: None,
                 instructions,
                 status,
             },
@@ -693,4 +703,22 @@ async fn delete_grant(
         .await
         .map_err(|error| agent_failure(error, "this installation"))?;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_the_field_of_an_unknown_memory_type() {
+        let Failure(error) = agent_failure(AgentError::UnknownMemoryType, "");
+        assert_eq!((error.status, error.code), (422, "unknown_memory_type"));
+        assert_eq!(
+            error.fields,
+            Some(BTreeMap::from([(
+                "memory_type_id".to_owned(),
+                "Choose a memory type of this organization.".to_owned()
+            )]))
+        );
+    }
 }
