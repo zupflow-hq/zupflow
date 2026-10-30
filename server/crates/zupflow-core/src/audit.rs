@@ -9,6 +9,10 @@
 //! given and, for an event in a workspace, the workspace's environment as
 //! stored.
 //!
+//! A change no store of the server makes, one a memory kind makes to the
+//! memories it keeps itself, is recorded right after it, with
+//! [`AuditStore::record`].
+//!
 //! The log keeps history: an event of a workspace outlives the workspace,
 //! still naming its ID (the workspace reference is then `null`). Events go
 //! only with their organization.
@@ -24,7 +28,7 @@ use uuid::Uuid;
 use crate::environment::Environment;
 use crate::ids::{
     AgentChannelId, AgentId, ApiKeyId, AppId, AuditEventId, ChannelAppId, ChannelAppManagerId, ChannelConnectionId,
-    InstallationId, MemberId, MemoryTypeId, ModelConnectionId, ModelId, OrganizationId, RunId, UserId,
+    InstallationId, MemberId, MemoryId, MemoryTypeId, ModelConnectionId, ModelId, OrganizationId, RunId, UserId,
     WebhookDeliveryId, WebhookEndpointId, WorkspaceId,
 };
 use crate::time::Timestamp;
@@ -148,6 +152,9 @@ pub enum AuditObject {
     /// The organization's default memory type, named by the type chosen;
     /// `None` when it was cleared.
     DefaultMemoryType(Option<MemoryTypeId>),
+    /// One thing an agent remembers, named by its agent and short ID, never
+    /// by its text.
+    Memory(MemoryId),
 }
 
 impl AuditObject {
@@ -177,6 +184,7 @@ impl AuditObject {
             Self::ChannelSettings => "channel_settings",
             Self::MemoryType(_) => "memory_type",
             Self::DefaultMemoryType(_) => "default_memory_type",
+            Self::Memory(_) => "memory",
         }
     }
 
@@ -202,6 +210,7 @@ impl AuditObject {
             Self::AgentChannel(id) => Some(id.uuid()),
             Self::MemoryType(id) => Some(id.uuid()),
             Self::DefaultMemoryType(id) => id.map(|id| id.uuid()),
+            Self::Memory(id) => Some(id.uuid()),
             Self::ToolPolicy | Self::ConnectSettings | Self::ChannelToolLevels | Self::ChannelSettings => None,
         }
     }
@@ -232,6 +241,7 @@ impl AuditObject {
             ("channel_settings", None) => Self::ChannelSettings,
             ("memory_type", Some(uuid)) => Self::MemoryType(MemoryTypeId::from_uuid(uuid)),
             ("default_memory_type", uuid) => Self::DefaultMemoryType(uuid.map(MemoryTypeId::from_uuid)),
+            ("memory", Some(uuid)) => Self::Memory(MemoryId::from_uuid(uuid)),
             _ => return None,
         })
     }
@@ -294,6 +304,7 @@ impl Serialize for AuditTarget {
             AuditObject::AgentChannel(id) => target.serialize_field("id", id)?,
             AuditObject::MemoryType(id) => target.serialize_field("id", id)?,
             AuditObject::DefaultMemoryType(id) => target.serialize_field("id", id)?,
+            AuditObject::Memory(id) => target.serialize_field("id", id)?,
             AuditObject::ToolPolicy
             | AuditObject::ConnectSettings
             | AuditObject::ChannelToolLevels
@@ -409,6 +420,13 @@ actions! {
     MemoryTypeUpdated => "memory_type.updated",
     MemoryTypeDeleted => "memory_type.deleted",
     DefaultMemoryTypeUpdated => "default_memory_type.updated",
+    MemorySaved => "memory.saved",
+    /// Its text changed.
+    MemoryUpdated => "memory.updated",
+    MemoryForgotten => "memory.forgotten",
+    /// Everything an agent kept in its workspace forgotten at once, named
+    /// with how many.
+    AgentMemoryForgotten => "agent.memory_forgotten",
 }
 
 impl Serialize for AuditAction {
@@ -491,10 +509,19 @@ pub enum AuditError {
     /// A cursor this store didn't issue.
     #[error("not a cursor from this list")]
     InvalidCursor,
+    /// An event placed in a workspace the organization doesn't hold.
+    #[error("no such workspace")]
+    NotFound,
 }
 
 #[async_trait]
 pub trait AuditStore: Send + Sync {
+    /// Records the event of a change no store made in its own transaction,
+    /// once the change is made: in the organization and, placed in a
+    /// workspace, with the workspace's environment as stored. `NotFound`,
+    /// recording nothing, when the organization holds no such workspace.
+    async fn record(&self, organization_id: OrganizationId, entry: &AuditEntry) -> Result<(), AuditError>;
+
     /// A page of the organization's events, newest first, at most `limit`
     /// (clamped to 1–[`MAX_PAGE`]). A cursor names a position only: used in
     /// another organization it starts there among that organization's own.
@@ -581,6 +608,7 @@ mod tests {
             AuditObject::MemoryType(MemoryTypeId::from_uuid(uuid)),
             AuditObject::DefaultMemoryType(Some(MemoryTypeId::from_uuid(uuid))),
             AuditObject::DefaultMemoryType(None),
+            AuditObject::Memory(MemoryId::from_uuid(uuid)),
         ] {
             assert_eq!(AuditObject::from_stored(object.kind(), object.uuid()), Some(object));
         }

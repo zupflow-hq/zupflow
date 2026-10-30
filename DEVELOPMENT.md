@@ -176,7 +176,8 @@ So far it serves `/health`, `/ready`, `/v1/sign-in-settings`, `/v1/me`, the
 signed-in person's invitations (accepted or declined only by the person whose
 verified email was invited), organizations, members,
 workspaces, API keys, the memory kinds it serves with the organization's
-memory types and its default one, catalog and workspace apps with their client
+memory types and its default one, what each agent remembers in its workspace,
+catalog and workspace apps with their client
 configurations, the apps available to a workspace, installations (read,
 renamed, disconnected and deleted), and Connect's settings and sessions with
 the hosted page's read, cancel and a token app's credentials, checked against
@@ -509,6 +510,17 @@ minute, 5 minutes, 30 minutes, 2, 6, 12 and 24 hours later (with jitter):
 eight attempts, at least once, unordered, the same event ID every time. An
 endpoint that has failed every attempt for three days is disabled; enabling
 it again doesn't replay what it missed.
+
+A memory kind keeps an agent's memories itself, outside the server's
+database, so a memory saved, changed or forgotten through the API or the
+Console is recorded right after the kind makes the change, before the
+answer: its `memory.saved`, `memory.updated` or `memory.forgotten` event
+(the memory, its agent and type, and who wrote its text, never the text)
+with its deliveries, then its audit event. Text a memory already holds
+changes nothing and records nothing. Forgetting all of an agent's memories
+sends one event per memory and records one audit event with the count;
+deleting an agent, a workspace or a memory type forgets its memories without
+an event for each.
 
 Each endpoint has paginated delivery history at
 `GET /v1/organizations/{org}/webhooks/{hook}/deliveries`, filtered by

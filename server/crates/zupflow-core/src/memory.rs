@@ -506,6 +506,15 @@ pub enum MemoryChange {
     Forgotten(Memory),
 }
 
+impl MemoryChange {
+    /// The memory changed: as it is now, or as it was when forgotten.
+    pub fn memory(&self) -> &Memory {
+        match self {
+            Self::Saved(memory) | Self::Updated(memory) | Self::Forgotten(memory) => memory,
+        }
+    }
+}
+
 /// What the model reads back from a call to a memory tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallResult {
@@ -667,9 +676,24 @@ pub trait MemoryProvider: Send + Sync {
         arguments: &Map<String, Value>,
     ) -> Result<CallResult, MemoryError>;
 
+    /// What a person is told the kind keeps when it refuses text
+    /// ([`MemoryError::InvalidText`]): `notes` says `Write a note of 1 to 500
+    /// characters on one line.`
+    fn text_rule(&self) -> String;
+
+    /// The most memories one agent keeps in one workspace in a type with
+    /// these settings: what a person is told when a save finds no room
+    /// ([`MemoryError::Full`]).
+    fn limit(&self, settings: &Settings) -> u32;
+
     /// A page of the scope's memories, newest first: every one, whatever its
     /// audience, for the people who manage them.
     async fn list(&self, scope: &MemoryScope, filter: &MemoryFilter) -> Result<Page<Memory>, MemoryError>;
+
+    /// One of the scope's memories by its ID, as it is now, whatever its
+    /// audience: how the server finds a memory the API names, before it
+    /// checks what [`Manage`] allows. `NotFound` unless the scope keeps it.
+    async fn get(&self, scope: &MemoryScope, id: MemoryId) -> Result<Memory, MemoryError>;
 
     /// Adds a memory from outside a run, the API or the Console, as `origin`
     /// says: one for the whole workspace.

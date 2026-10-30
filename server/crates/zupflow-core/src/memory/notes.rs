@@ -62,6 +62,9 @@ pub const MAX_NOTES: u32 = 1_000;
 /// The longest note, in characters, once it's one line.
 pub const MAX_TEXT: usize = 500;
 
+/// What a person is told a note is, when text isn't one.
+pub const TEXT_RULE: &str = "Write a note of 1 to 500 characters on one line.";
+
 /// The longest search query, in characters.
 pub const MAX_QUERY: usize = 500;
 
@@ -432,6 +435,10 @@ pub trait NoteStore: Send + Sync {
     /// reaches it: the note as it was.
     async fn delete(&self, scope: &MemoryScope, note: NoteRef<'_>, reach: Reach<'_>) -> Result<Memory, MemoryError>;
 
+    /// One of the scope's notes by its ID, as it is now, whatever its
+    /// audience: `NotFound` unless the scope keeps it.
+    async fn get(&self, scope: &MemoryScope, id: MemoryId) -> Result<Memory, MemoryError>;
+
     /// The `limit` notes the audience is shown that changed last, newest
     /// first (by last change, then ID), and how many it's shown in all, both
     /// of one moment.
@@ -671,6 +678,15 @@ impl MemoryProvider for Notes {
         tools(writes)
     }
 
+    fn text_rule(&self) -> String {
+        TEXT_RULE.to_owned()
+    }
+
+    /// The type's `max_notes`.
+    fn limit(&self, settings: &Settings) -> u32 {
+        NotesSettings::of(settings).max_notes
+    }
+
     async fn recall(
         &self,
         scope: &MemoryScope,
@@ -724,6 +740,10 @@ impl MemoryProvider for Notes {
                 filter.limit.clamp(1, super::MAX_PAGE),
             )
             .await
+    }
+
+    async fn get(&self, scope: &MemoryScope, id: MemoryId) -> Result<Memory, MemoryError> {
+        self.store.get(scope, id).await
     }
 
     async fn add(

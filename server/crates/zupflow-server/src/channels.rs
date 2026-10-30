@@ -633,9 +633,10 @@ fn setup_hint(provider: ChannelProviderKind) -> &'static str {
     }
 }
 
-/// In Production the Console only observes: the customer's product links
-/// teams and makes apps there, with a key.
-fn console_may_act(access: &WorkspaceAccess, action: &str) -> Result<(), Failure> {
+/// In Production the Console only observes: what changes there (a team
+/// linked, an app made, a memory saved) is changed through the API, with a
+/// key.
+pub(crate) fn console_may_act(access: &WorkspaceAccess, action: &str) -> Result<(), Failure> {
     if matches!(access.access.actor, Actor::Member(_)) && access.workspace.environment == Environment::Production {
         return Err(ApiError::new(
             403,

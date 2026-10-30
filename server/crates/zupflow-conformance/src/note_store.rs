@@ -2,6 +2,7 @@
 //! their full scope (organization, workspace, agent and type), each of its
 //! four keys changed alone; saved only in a scope that's there, up to its
 //! limit, with a short ID held once in it, saves made at once included;
+//! found there by ID, as they are now, whatever their audience;
 //! changed and deleted only where their reach goes (a run in a direct
 //! conversation changes that conversation's notes only, a run elsewhere the
 //! workspace's, and the people who manage them every one), an update keeping
@@ -120,6 +121,7 @@ pub type Prepare = Arc<dyn Fn(Tenant) -> Pin<Box<dyn Future<Output = ()> + Send>
 
 pub async fn run(store: &dyn NoteStore, prepare: Prepare) {
     saves_only_in_a_scope_that_is_there(store, &prepare).await;
+    finds_a_note_by_its_id_in_its_scope_only(store, &prepare).await;
     gives_each_note_a_short_id_once_in_its_scope(store, &prepare).await;
     keeps_a_scope_to_its_limit(store, &prepare).await;
     keeps_the_limit_and_short_ids_when_saved_at_once(store, &prepare).await;
@@ -232,6 +234,87 @@ async fn found(store: &dyn NoteStore, scope: &MemoryScope, audience: &Audience, 
         .into_iter()
         .map(|note| note.text)
         .collect()
+}
+
+async fn finds_a_note_by_its_id_in_its_scope_only(store: &dyn NoteStore, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let other = tenant(prepare).await;
+    let scope = t.scope();
+    let note = save(store, &scope, 1, "Prefers short answers.", 1).await;
+    let direct = save_in(
+        store,
+        &scope,
+        Some(ChannelConversationId::generate()),
+        2,
+        "Said in a direct conversation.",
+        2,
+    )
+    .await;
+    for kept in [&note, &direct] {
+        assert_eq!(
+            store.get(&scope, kept.id).await.as_ref(),
+            Ok(kept),
+            "whatever its audience"
+        );
+        for (key, elsewhere) in t.changed_alone(&other) {
+            assert_eq!(
+                store.get(&elsewhere, kept.id).await,
+                Err(MemoryError::NotFound),
+                "{key}"
+            );
+        }
+    }
+    // A neighbor's note is found in its own scope, never through this one.
+    for (neighbor, n) in t.neighbors().iter().zip(3..) {
+        let theirs = save(store, neighbor, n, "A neighbor's note.", 3).await;
+        assert_eq!(store.get(neighbor, theirs.id).await.as_ref(), Ok(&theirs));
+        assert_eq!(
+            store.get(&scope, theirs.id).await,
+            Err(MemoryError::NotFound),
+            "{neighbor:?}"
+        );
+    }
+    assert_eq!(
+        store.get(&scope, MemoryId::generate()).await,
+        Err(MemoryError::NotFound),
+        "an ID no note holds"
+    );
+
+    // As it is now: changed, then gone.
+    let changed = store
+        .update(
+            &scope,
+            NoteRef::Id(note.id),
+            Reach::Everything,
+            &member(),
+            "Prefers shorter answers.",
+            at(4),
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.get(&scope, note.id).await, Ok(changed.memory));
+    store
+        .delete(&scope, NoteRef::Id(note.id), Reach::Everything)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get(&scope, note.id).await,
+        Err(MemoryError::NotFound),
+        "once deleted"
+    );
+    store
+        .delete_all(&Forget::Agent {
+            organization_id: t.organization_id,
+            workspace_id: t.workspace,
+            agent_id: t.agent,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get(&scope, direct.id).await,
+        Err(MemoryError::NotFound),
+        "nor once its agent's notes are"
+    );
 }
 
 async fn saves_only_in_a_scope_that_is_there(store: &dyn NoteStore, prepare: &Prepare) {

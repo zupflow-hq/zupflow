@@ -8,6 +8,10 @@
 //! A change made in a workspace records its event in that workspace, never
 //! elsewhere: any other place fails the change.
 //!
+//! A change made outside the database (a memory a memory kind keeps) is
+//! recorded on its own, as it says, and only in a workspace of its own
+//! organization.
+//!
 //! `prepare` makes an organization exist. Every other suite's changes record
 //! [`by_suite`], or [`by_suite_in`] their workspace.
 
@@ -21,7 +25,7 @@ use zupflow_core::audit::{
     AuditTarget,
 };
 use zupflow_core::environment::Environment;
-use zupflow_core::ids::{OrganizationId, UserId, WorkspaceId};
+use zupflow_core::ids::{MemoryId, OrganizationId, UserId, WorkspaceId};
 use zupflow_core::workspaces::{NewWorkspace, Workspace, WorkspaceError, WorkspaceStore};
 
 pub type Prepare = Arc<dyn Fn(OrganizationId) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -59,6 +63,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     refuses_a_cursor_it_did_not_issue(&stores, &prepare).await;
     keeps_a_deleted_workspaces_history(&stores, &prepare).await;
     records_with_the_change_only(&stores, &prepare).await;
+    records_a_change_made_elsewhere(&stores, &prepare).await;
 }
 
 async fn organization(prepare: &Prepare) -> OrganizationId {
@@ -523,4 +528,77 @@ async fn records_with_the_change_only(stores: &Stores<'_>, prepare: &Prepare) {
     assert_eq!(latest.len(), before + 1);
     assert_eq!(latest[0].action, AuditAction::WorkspaceUpdated);
     assert_eq!(latest[0].target.name, renamed.name, "named as changed");
+}
+
+async fn records_a_change_made_elsewhere(stores: &Stores<'_>, prepare: &Prepare) {
+    let (org, other) = (organization(prepare).await, organization(prepare).await);
+    let sandbox = workspace(stores, org, "sandbox", Environment::Sandbox).await;
+    let doomed = workspace(stores, org, "doomed", Environment::Sandbox).await;
+    let theirs = workspace(stores, other, "theirs", Environment::Production).await;
+    let saved = entry(
+        AuditAction::MemorySaved,
+        AuditTarget::new(AuditObject::Memory(MemoryId::generate()), "Helper · k7m2qd"),
+        AuditPlace::Workspace(sandbox.id),
+    );
+    stores.audit.record(org, &saved).await.unwrap();
+    let recorded = all(stores, org, &everything()).await.remove(0);
+    assert_eq!(
+        (
+            recorded.organization_id,
+            recorded.workspace_id,
+            recorded.environment,
+            &recorded.actor,
+            recorded.action,
+            &recorded.target,
+        ),
+        (
+            org,
+            Some(sandbox.id),
+            Some(Environment::Sandbox),
+            &saved.actor,
+            saved.action,
+            &saved.target,
+        ),
+        "as it says, with its workspace's environment"
+    );
+    let policy = entry(
+        AuditAction::ToolPolicyUpdated,
+        AuditTarget::tool_policy(),
+        AuditPlace::Environment(Environment::Production),
+    );
+    stores.audit.record(org, &policy).await.unwrap();
+    let recorded = all(stores, org, &everything()).await.remove(0);
+    assert_eq!(
+        (recorded.action, recorded.workspace_id, recorded.environment),
+        (AuditAction::ToolPolicyUpdated, None, Some(Environment::Production)),
+        "or in an environment"
+    );
+
+    // Never in another organization's workspace, nor in one that's gone.
+    stores
+        .workspaces
+        .delete_workspace(org, doomed.id, &|_: &Workspace| by_suite_in(doomed.id))
+        .await
+        .unwrap();
+    let (mine, theirs_before) = (
+        all(stores, org, &everything()).await.len(),
+        all(stores, other, &everything()).await.len(),
+    );
+    for place in [
+        AuditPlace::Workspace(theirs.id),
+        AuditPlace::Workspace(doomed.id),
+        AuditPlace::Workspace(WorkspaceId::generate()),
+    ] {
+        assert_eq!(
+            stores.audit.record(org, &AuditEntry { place, ..saved.clone() }).await,
+            Err(AuditError::NotFound),
+            "{place:?}"
+        );
+    }
+    assert_eq!(all(stores, org, &everything()).await.len(), mine, "nothing written");
+    assert_eq!(
+        all(stores, other, &everything()).await.len(),
+        theirs_before,
+        "nothing written there either"
+    );
 }

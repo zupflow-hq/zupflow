@@ -157,6 +157,14 @@ const WRITTEN: &str = concat!(
     written!(),
     " AND (id = ?7 OR short_id = ?8)"
 );
+/// A note by its ID (`?5`), whatever its audience.
+const FIND: &str = concat!(
+    "SELECT ",
+    columns!(),
+    " FROM memory_notes WHERE ",
+    in_scope!(),
+    " AND id = ?5"
+);
 const DELETE: &str = concat!(
     "DELETE FROM memory_notes WHERE ",
     in_scope!(),
@@ -438,6 +446,15 @@ impl NoteStore for SqliteNoteStore {
         let deleted = row.as_ref().map(note_from).transpose()?.ok_or(MemoryError::NotFound)?;
         transaction.commit().await.map_err(failed("delete"))?;
         Ok(deleted)
+    }
+
+    async fn get(&self, scope: &MemoryScope, id: MemoryId) -> Result<Memory, MemoryError> {
+        let row = bind_scope(sqlx::query(FIND), scope)
+            .bind(id.uuid())
+            .fetch_optional(self.database.pool())
+            .await
+            .map_err(failed("get"))?;
+        row.as_ref().map(note_from).transpose()?.ok_or(MemoryError::NotFound)
     }
 
     async fn recent(&self, scope: &MemoryScope, audience: &Audience, limit: u32) -> Result<Recent, MemoryError> {

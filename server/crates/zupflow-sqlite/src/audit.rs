@@ -1,7 +1,8 @@
 //! [`SqliteAuditStore`]: the audit log, and [`record`], which every store
-//! calls inside the transaction of the change it records. Every statement
-//! names the organization; an event placed in a workspace is written only
-//! from that workspace's row in the organization.
+//! calls inside the transaction of the change it records, as the log's own
+//! [`AuditStore::record`] does for a change made outside the database.
+//! Every statement names the organization; an event placed in a workspace
+//! is written only from that workspace's row in the organization.
 //!
 //! The log keeps history: `audit_events.workspace_id` doesn't reference
 //! `workspaces`, so a deleted workspace's events stay, and a list joins the
@@ -228,6 +229,22 @@ fn push_filter(query: &mut QueryBuilder<Sqlite>, organization_id: OrganizationId
 
 #[async_trait]
 impl AuditStore for SqliteAuditStore {
+    async fn record(&self, organization_id: OrganizationId, entry: &AuditEntry) -> Result<(), AuditError> {
+        let mut transaction = self
+            .database
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(failed("record"))?;
+        match record(&mut transaction, organization_id, entry).await {
+            Ok(_) => {}
+            // No such workspace in the organization: nothing written.
+            Err(sqlx::Error::RowNotFound) => return Err(AuditError::NotFound),
+            Err(error) => return Err(failed("record")(error)),
+        }
+        transaction.commit().await.map_err(failed("record"))
+    }
+
     async fn list_audit_events(
         &self,
         organization_id: OrganizationId,

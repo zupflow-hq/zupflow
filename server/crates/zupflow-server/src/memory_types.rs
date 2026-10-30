@@ -14,7 +14,9 @@
 //! holds it): the store checks each, and that the member may still change
 //! memory types, in the transaction that makes the change. A type of a kind
 //! this server doesn't serve still reads, as not `served`: its agents run
-//! without memory.
+//! without memory. A deleted type's memories go with it, in every
+//! workspace, without a `memory.forgotten` for each: its kind is asked to
+//! forget them once the type is gone.
 
 use std::collections::BTreeMap;
 
@@ -33,7 +35,7 @@ use zupflow_core::memory::type_store::{
     DEFAULT_PAGE, DefaultMemoryType, MAX_NAME, MAX_PAGE, MemoryType, MemoryTypeChanges, MemoryTypeError,
     MemoryTypeHolders, NewMemoryType,
 };
-use zupflow_core::memory::{MemoryKind, MemoryWrites, Settings};
+use zupflow_core::memory::{Forget, MemoryKind, MemoryWrites, Settings};
 use zupflow_core::organizations::{MemberRole, User};
 use zupflow_core::time::Timestamp;
 
@@ -482,7 +484,36 @@ async fn delete_type(
             MemoryTypeError::InUse(holders) => in_use(&memory_type.name, &holders),
             error => store_failure(error),
         })?;
+    forget_memories(&state, access.organization.id, &memory_type).await;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Asks a deleted type's kind to forget the type's memories, in every
+/// workspace. What the database keeps went with the type; a kind may keep
+/// its memories elsewhere. Best effort: the type is deleted either way,
+/// and nothing reaches its memories again, so a failure is logged.
+async fn forget_memories(state: &AppState, organization_id: OrganizationId, memory_type: &MemoryType) {
+    if !state.memory_providers.serves(&memory_type.kind) {
+        return;
+    }
+    let forget = Forget::Type {
+        organization_id,
+        memory_type_id: memory_type.id,
+    };
+    if let Err(error) = state
+        .memory_providers
+        .provider(&memory_type.kind)
+        .forget_all(&forget)
+        .await
+    {
+        tracing::error!(
+            event = "memory_types.memories_not_forgotten",
+            %organization_id,
+            memory_type_id = %memory_type.id,
+            kind = memory_type.kind.as_str(),
+            %error,
+        );
+    }
 }
 
 async fn get_default(

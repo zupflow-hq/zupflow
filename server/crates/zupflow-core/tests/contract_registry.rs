@@ -1,10 +1,12 @@
 //! The backend's ID registry is the contract's: the same prefixes, from the
-//! generated `openapi.json` that `@zupflow/contract` commits.
+//! generated `openapi.json` that `@zupflow/contract` commits. So are the
+//! webhook event types an endpoint subscribes to.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
 use zupflow_core::ids::REGISTRY;
+use zupflow_core::webhooks::WebhookEventType;
 
 fn openapi() -> serde_json::Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packages/contract/openapi.json");
@@ -56,4 +58,15 @@ fn names_each_kind_as_the_contract_does() {
         checked += 1;
     }
     assert!(checked >= 17, "only {checked} kinds had a component to compare with");
+}
+
+#[test]
+fn subscribes_to_exactly_the_contract_event_types() {
+    let doc = openapi();
+    let listed = doc["components"]["schemas"]["WebhookEndpoint"]["properties"]["events"]["items"]["enum"]
+        .as_array()
+        .expect("an endpoint's events list the contract's types");
+    let contract: Vec<&str> = listed.iter().filter_map(serde_json::Value::as_str).collect();
+    let ours: Vec<&str> = WebhookEventType::ALL.iter().map(|kind| kind.as_str()).collect();
+    assert_eq!(ours, contract, "the same types, in the contract's order");
 }

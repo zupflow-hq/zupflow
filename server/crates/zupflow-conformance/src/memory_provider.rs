@@ -15,6 +15,8 @@
 //! conversation recalled only there, and a run there changing none of the
 //! workspace's; and forgetting everything of an agent, a workspace, a type
 //! or an organization forgets exactly that.
+//! A memory is found by its ID in its own scope only, as it is now, whatever
+//! its audience and whatever the kind lets people do with it.
 //!
 //! `notes` adds: its tools' answers and refusals, writes refused before
 //! their arguments are read once denied, who wrote each note, search over
@@ -31,7 +33,7 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 use zupflow_core::apps::ToolEffect;
-use zupflow_core::ids::{ApiKeyId, ChannelConversationId, RunId, ToolCallId, UserId};
+use zupflow_core::ids::{ApiKeyId, ChannelConversationId, MemoryId, RunId, ToolCallId, UserId};
 use zupflow_core::memory::notes::{self, NoteStore, Notes};
 use zupflow_core::memory::{
     Audience, CallContext, CallResult, Forget, Memory, MemoryChange, MemoryError, MemoryFilter, MemoryKind,
@@ -71,6 +73,7 @@ pub async fn run(subject: Subject<'_>, prepare: Prepare) {
     recalls_a_direct_memory_only_there(&subject, &prepare).await;
     changes_none_of_the_workspaces_memories_from_a_direct_conversation(&subject, &prepare).await;
     keeps_each_memory_to_its_scope(&subject, &prepare).await;
+    finds_each_memory_by_its_id_in_its_scope(&subject, &prepare).await;
     forgets_exactly_what_it_names(&subject, &prepare).await;
 }
 
@@ -202,6 +205,11 @@ fn describes_itself(subject: &Subject<'_>) {
         "checked settings check the same"
     );
     assert_eq!(read_back(provider, &settings), settings, "and read back the same");
+    assert!(
+        !provider.text_rule().trim().is_empty(),
+        "what text it keeps, as a person reads it"
+    );
+    assert!(provider.limit(&settings) >= 1, "room for a memory");
 }
 
 fn offers_the_same_tools_for_the_same_settings(subject: &Subject<'_>) {
@@ -579,6 +587,70 @@ async fn keeps_each_memory_to_its_scope(subject: &Subject<'_>, prepare: &Prepare
     }
 }
 
+/// How the server finds a memory the API names: by its ID, in its scope,
+/// whatever its audience and whatever the kind lets people do with it.
+async fn finds_each_memory_by_its_id_in_its_scope(subject: &Subject<'_>, prepare: &Prepare) {
+    let provider = subject.provider;
+    let manage = provider.describe().manage;
+    let t = tenant(prepare).await;
+    let other = tenant(prepare).await;
+    let scope = t.scope();
+    let here = Audience::Direct(ChannelConversationId::generate());
+    let memory = (subject.remember)(scope, Audience::Workspace, "Found by its ID.".to_owned(), at(1)).await;
+    let direct = (subject.remember)(scope, here, "Found by its ID, though said directly.".to_owned(), at(2)).await;
+    for kept in [&memory, &direct] {
+        assert_eq!(
+            provider.get(&scope, kept.id).await.as_ref(),
+            Ok(kept),
+            "as remembered, whatever its audience"
+        );
+        for (key, elsewhere) in t.changed_alone(&other) {
+            assert_eq!(
+                provider.get(&elsewhere, kept.id).await,
+                Err(MemoryError::NotFound),
+                "{key}"
+            );
+        }
+    }
+    for neighbor in t.neighbors() {
+        let theirs = (subject.remember)(neighbor, Audience::Workspace, "A neighbor's.".to_owned(), at(3)).await;
+        assert_eq!(
+            provider.get(&scope, theirs.id).await,
+            Err(MemoryError::NotFound),
+            "{neighbor:?}"
+        );
+    }
+    assert_eq!(
+        provider.get(&scope, MemoryId::generate()).await,
+        Err(MemoryError::NotFound),
+        "an ID it never gave"
+    );
+    let person = Origin::Member {
+        user_id: UserId::generate(),
+    };
+    if manage.change {
+        let changed = provider
+            .change(&scope, &person, memory.id, "Found by its ID, and changed.", at(4))
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.get(&scope, memory.id).await,
+            Ok(changed.memory),
+            "as it is now"
+        );
+    }
+    if manage.forget {
+        for kept in [&memory, &direct] {
+            provider.forget(&scope, kept.id).await.unwrap();
+            assert_eq!(
+                provider.get(&scope, kept.id).await,
+                Err(MemoryError::NotFound),
+                "once forgotten"
+            );
+        }
+    }
+}
+
 async fn forgets_exactly_what_it_names(subject: &Subject<'_>, prepare: &Prepare) {
     let provider = subject.provider;
     let remember = &subject.remember;
@@ -814,6 +886,9 @@ fn describes_notes(provider: &dyn MemoryProvider) {
         ["max_notes", "ranking", "recall_characters"],
         "each refused, by name"
     );
+
+    assert_eq!(provider.text_rule(), "Write a note of 1 to 500 characters on one line.");
+    assert_eq!(provider.limit(&settings), 200, "max_notes");
 
     let names = |writes: MemoryWrites| -> Vec<(String, ToolLevel)> {
         provider
@@ -1257,6 +1332,7 @@ async fn keeps_a_scope_to_its_limit(provider: &dyn MemoryProvider, prepare: &Pre
             .await
         }
     };
+    assert_eq!(provider.limit(&settings), 2, "as many as max_notes");
     let first = save(scope, "First.", 1).await;
     assert!(!save(scope, "Second.", 2).await.is_error);
     let full = save(scope, "Third.", 3).await;

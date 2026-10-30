@@ -12,6 +12,11 @@
 //! of the event's organization and environment that subscribes to its type
 //! ([`WebhookStore::record_event`], idempotent by the event's ID).
 //!
+//! A memory kind keeps its memories itself, outside the server's database,
+//! so a change to a memory from the API or the Console is recorded right
+//! after the kind makes it, with [`WebhookStore::record_event`], and before
+//! the answer.
+//!
 //! **Delivery** is at least once, unordered, through `OutboundHttp`, signed
 //! with the endpoint's secret: [`signature`] over `"<t>.<raw body>"`.
 //! [`DELIVERY_ATTEMPTS`] attempts, [`RETRY_AFTER`] apart.
@@ -34,6 +39,7 @@ use crate::ids::{
 };
 use crate::jobs::{JobOptions, LeaseToken};
 use crate::keys::Sealed;
+use crate::memory::{Memory, MemoryChange};
 use crate::runs::{QueuedJob, RunEventType};
 use crate::scope::Name;
 use crate::time::Timestamp;
@@ -59,10 +65,13 @@ pub enum WebhookEventType {
     ChannelAppStatusChanged,
     ChannelConnectionStatusChanged,
     ChannelConversationPaused,
+    MemorySaved,
+    MemoryUpdated,
+    MemoryForgotten,
 }
 
 impl WebhookEventType {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 19] = [
         Self::InstallationConnected,
         Self::InstallationReconnectRequired,
         Self::InstallationDisconnected,
@@ -79,6 +88,9 @@ impl WebhookEventType {
         Self::ChannelAppStatusChanged,
         Self::ChannelConnectionStatusChanged,
         Self::ChannelConversationPaused,
+        Self::MemorySaved,
+        Self::MemoryUpdated,
+        Self::MemoryForgotten,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -99,6 +111,9 @@ impl WebhookEventType {
             Self::ChannelAppStatusChanged => "channel_app.status_changed",
             Self::ChannelConnectionStatusChanged => "channel_connection.status_changed",
             Self::ChannelConversationPaused => "channel_conversation.paused",
+            Self::MemorySaved => "memory.saved",
+            Self::MemoryUpdated => "memory.updated",
+            Self::MemoryForgotten => "memory.forgotten",
         }
     }
 
@@ -114,6 +129,15 @@ impl WebhookEventType {
             RunEventType::RunCancelled => Some(Self::RunCancelled),
             RunEventType::ApprovalRequested => Some(Self::RunWaitingForApproval),
             _ => None,
+        }
+    }
+
+    /// The webhook a change to a memory is announced as.
+    pub fn of_memory_change(change: &MemoryChange) -> Self {
+        match change {
+            MemoryChange::Saved(_) => Self::MemorySaved,
+            MemoryChange::Updated(_) => Self::MemoryUpdated,
+            MemoryChange::Forgotten(_) => Self::MemoryForgotten,
         }
     }
 
@@ -838,6 +862,20 @@ pub fn new_signing_secret(environment: Environment) -> Option<zeroize::Zeroizing
     Some(zeroize::Zeroizing::new(format!("whsec_{label}_{random}")))
 }
 
+/// A memory event's `data`: the memory, the agent and the type that keep
+/// it, and who wrote its text (the change's writer; for a memory forgotten,
+/// whoever wrote it last), never the text. The consumer reads the memory
+/// itself with `getMemory`.
+pub fn memory_event_data(memory: &Memory) -> Value {
+    json!({
+        "object": "memory",
+        "id": memory.id,
+        "agent_id": memory.agent_id,
+        "memory_type_id": memory.memory_type_id,
+        "origin": memory.origin,
+    })
+}
+
 /// The delivery body every attempt sends: the contract's `WebhookEvent`.
 pub fn event_body(
     event_id: WebhookEventId,
@@ -892,6 +930,49 @@ mod tests {
             assert_eq!(WebhookEventType::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(WebhookEventType::parse(TEST_EVENT), None);
+    }
+
+    #[test]
+    fn names_a_changed_memory_and_never_its_text() {
+        use crate::ids::{AgentId, MemoryId, MemoryTypeId};
+        use crate::installations::ShortId;
+        use crate::memory::Origin;
+
+        let api_key_id = ApiKeyId::generate();
+        let memory = Memory {
+            id: MemoryId::generate(),
+            organization_id: OrganizationId::generate(),
+            workspace_id: WorkspaceId::generate(),
+            agent_id: AgentId::generate(),
+            memory_type_id: MemoryTypeId::generate(),
+            short_id: ShortId::from_bits(7),
+            text: "Prefers email.".to_owned(),
+            channel_conversation_id: None,
+            origin: Origin::ApiKey { api_key_id },
+            created_at: Timestamp::from_millis(1),
+            updated_at: Timestamp::from_millis(2),
+        };
+        for (change, kind) in [
+            (MemoryChange::Saved(memory.clone()), "memory.saved"),
+            (MemoryChange::Updated(memory.clone()), "memory.updated"),
+            (MemoryChange::Forgotten(memory.clone()), "memory.forgotten"),
+        ] {
+            let announced = WebhookEventType::of_memory_change(&change);
+            assert_eq!((announced.as_str(), announced.run_status()), (kind, None));
+        }
+        let data = memory_event_data(&memory);
+        assert_eq!(
+            data,
+            json!({
+                "object": "memory",
+                "id": memory.id.to_string(),
+                "agent_id": memory.agent_id.to_string(),
+                "memory_type_id": memory.memory_type_id.to_string(),
+                "origin": { "type": "api_key", "api_key_id": api_key_id.to_string() },
+            }),
+            "where it is and who wrote it, nothing of what it says"
+        );
+        assert!(!data.to_string().contains("Prefers"));
     }
 
     #[test]

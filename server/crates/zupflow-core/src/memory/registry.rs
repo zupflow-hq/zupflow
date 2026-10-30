@@ -114,6 +114,15 @@ impl MemoryProvider for Unserved {
         Vec::new()
     }
 
+    fn text_rule(&self) -> String {
+        format!("This server doesn't serve {}, so it keeps no text.", self.kind)
+    }
+
+    /// It keeps none.
+    fn limit(&self, _: &Settings) -> u32 {
+        0
+    }
+
     async fn recall(&self, _: &MemoryScope, _: &Audience, _: &Settings) -> Result<Recall, MemoryError> {
         Ok(Recall::none())
     }
@@ -129,6 +138,10 @@ impl MemoryProvider for Unserved {
     }
 
     async fn list(&self, _: &MemoryScope, _: &MemoryFilter) -> Result<Page<Memory>, MemoryError> {
+        Err(MemoryError::NotServed)
+    }
+
+    async fn get(&self, _: &MemoryScope, _: MemoryId) -> Result<Memory, MemoryError> {
         Err(MemoryError::NotServed)
     }
 
@@ -196,6 +209,12 @@ mod tests {
         fn tools(&self, _: &Settings, _: MemoryWrites) -> Vec<MemoryTool> {
             Vec::new()
         }
+        fn text_rule(&self) -> String {
+            self.name.to_owned()
+        }
+        fn limit(&self, _: &Settings) -> u32 {
+            0
+        }
         async fn recall(&self, _: &MemoryScope, _: &Audience, _: &Settings) -> Result<Recall, MemoryError> {
             Ok(Recall::of_lines([self.name.to_owned()]))
         }
@@ -210,6 +229,9 @@ mod tests {
         }
         async fn list(&self, _: &MemoryScope, _: &MemoryFilter) -> Result<Page<Memory>, MemoryError> {
             Err(MemoryError::Unsupported)
+        }
+        async fn get(&self, _: &MemoryScope, _: MemoryId) -> Result<Memory, MemoryError> {
+            Err(MemoryError::NotFound)
         }
         async fn add(
             &self,
@@ -296,6 +318,12 @@ mod tests {
                 .await,
             Err(MemoryError::NotServed)
         );
+        assert_eq!(
+            stand_in.get(&scope(), MemoryId::from_uuid(Uuid::from_u128(6))).await,
+            Err(MemoryError::NotServed),
+            "nothing found by its ID"
+        );
+        assert_eq!(stand_in.limit(&settings), 0, "nothing kept");
         assert_eq!(
             stand_in
                 .forget_all(&Forget::Organization {
