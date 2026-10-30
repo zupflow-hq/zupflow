@@ -10,7 +10,9 @@
 //! - [`SqliteIdempotencyStore`]: idempotency keys for `POST`.
 //! - [`SqliteInstallationStore`]: installations and their sealed credentials.
 //! - [`SqliteJobQueue`]: the job queue, in the same database.
+//! - [`SqliteMemoryTypeStore`]: memory types and the organization's default.
 //! - [`SqliteModelStore`]: model provider connections and their sealed keys, models and default models.
+//! - [`SqliteNoteStore`]: the `notes` memory kind's notes, searched with FTS5.
 //! - [`SqliteOrganizationStore`]: organizations, members and users.
 //! - [`SqliteRunStore`]: runs, their timelines and their tool calls, one
 //!   transition at a time.
@@ -34,7 +36,9 @@ mod database;
 mod idempotency;
 mod installations;
 mod job_queue;
+mod memory_types;
 mod models;
+mod notes;
 mod organizations;
 mod runs;
 #[cfg(test)]
@@ -54,7 +58,9 @@ pub use database::{Database, DatabaseError};
 pub use idempotency::SqliteIdempotencyStore;
 pub use installations::SqliteInstallationStore;
 pub use job_queue::SqliteJobQueue;
+pub use memory_types::SqliteMemoryTypeStore;
 pub use models::SqliteModelStore;
+pub use notes::SqliteNoteStore;
 pub use organizations::SqliteOrganizationStore;
 pub use runs::SqliteRunStore;
 pub use tool_policy::SqliteToolPolicyStore;

@@ -20,6 +20,7 @@ use zupflow_core::agents::{Agent, AgentChanges, AgentError, AgentStatus, AgentSt
 use zupflow_core::apps::ToolEffect;
 use zupflow_core::ids::{AgentId, AppId, GrantId, InstallationId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::InstallationStore;
+use zupflow_core::memory::AgentMemory;
 use zupflow_core::policy::{ApprovalMode, NewToolLevel, PolicySettings, ToolLevel, ToolPolicyStore};
 use zupflow_core::time::Timestamp;
 use zupflow_core::tools::{ListedTool, ToolRegistry, ToolRevision};
@@ -69,6 +70,7 @@ fn new_agent(name: &str) -> NewAgent {
         name: name.to_owned(),
         description: format!("{name}, described"),
         model_id: None,
+        memory: AgentMemory::Default,
         instructions: "Be brief.".to_owned(),
     }
 }
@@ -173,6 +175,11 @@ async fn creates_reads_changes_and_deletes_agents(stores: &Stores<'_>, prepare: 
     );
     assert_eq!(beta.model_id, None, "on the environment's default");
     assert_eq!(
+        beta.memory,
+        AgentMemory::Default,
+        "on the organization's default memory"
+    );
+    assert_eq!(
         (beta.status, beta.grant_count),
         (AgentStatus::Active, 0),
         "starts active, with no grants"
@@ -202,8 +209,8 @@ async fn creates_reads_changes_and_deletes_agents(stores: &Stores<'_>, prepare: 
         .await
         .unwrap();
     assert_eq!(
-        (paused.status, paused.name.as_str(), paused.model_id),
-        (AgentStatus::Paused, "Beta", None),
+        (paused.status, paused.name.as_str(), paused.model_id, paused.memory),
+        (AgentStatus::Paused, "Beta", None, AgentMemory::Default),
         "an update changes only what it names"
     );
     assert!(paused.updated_at >= beta.updated_at);
@@ -217,6 +224,7 @@ async fn creates_reads_changes_and_deletes_agents(stores: &Stores<'_>, prepare: 
                 name: Some("Gamma".to_owned()),
                 description: Some(String::new()),
                 model_id: Some(None),
+                memory: Some(AgentMemory::Off),
                 instructions: Some("Be thorough.".to_owned()),
                 status: Some(AgentStatus::Active),
             },
@@ -232,7 +240,10 @@ async fn creates_reads_changes_and_deletes_agents(stores: &Stores<'_>, prepare: 
         ],
         ["Gamma", "", "Be thorough."]
     );
-    assert_eq!(renamed.status, AgentStatus::Active);
+    assert_eq!(
+        (renamed.status, renamed.memory),
+        (AgentStatus::Active, AgentMemory::Off)
+    );
     assert_eq!(store.find_agent(org, ws, beta.id).await.unwrap(), Some(renamed));
 
     store

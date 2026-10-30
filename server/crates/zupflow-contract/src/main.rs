@@ -70,6 +70,7 @@ use zupflow_core::ids::{
 };
 use zupflow_core::installations::{InstallationStore, InstalledApp, TemplateSnapshot};
 use zupflow_core::keys::{EncryptionContext, seal};
+use zupflow_core::memory::AgentMemory;
 use zupflow_core::model_store::ModelStore;
 use zupflow_core::organizations::{INVITATION_TTL_MS, Member, MemberRole, Organization, OrganizationStore, User};
 use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse, Refusal};
@@ -993,6 +994,7 @@ async fn reset(path: &str) -> Result<(), String> {
                     name: name.to_owned(),
                     description: format!("{name}, for the contract suite."),
                     model_id: override_of(label)?,
+                    memory: AgentMemory::Default,
                     instructions: "Be brief.".to_owned(),
                 },
                 &|created: &Agent| {
@@ -1067,6 +1069,7 @@ async fn reset(path: &str) -> Result<(), String> {
                 name: "Support concierge".to_owned(),
                 description: "Not granted any installations yet.".to_owned(),
                 model_id: Some(northwind_models.model(Environment::Production, "OpenAI", "gpt-5")?),
+                memory: AgentMemory::Default,
                 instructions: "Answer support questions briefly.".to_owned(),
             },
             &|created: &Agent| {
@@ -1113,6 +1116,7 @@ async fn reset(path: &str) -> Result<(), String> {
                     name: "Release notes writer".to_owned(),
                     description: "Not on any channel yet.".to_owned(),
                     model_id: None,
+                    memory: AgentMemory::Default,
                     instructions: "Summarize what changed, briefly.".to_owned(),
                 },
                 &|created: &Agent| {

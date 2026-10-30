@@ -37,6 +37,8 @@ export const ID_PREFIXES = {
   channel_conversation: "conv",
   channel_message: "chmsg",
   channel_person: "person",
+  memory_type: "mtype",
+  memory: "memo",
 } as const;
 
 export type IdKind = keyof typeof ID_PREFIXES;
@@ -75,6 +77,8 @@ export type AgentChannelId = Id<"agent_channel">;
 export type ChannelConversationId = Id<"channel_conversation">;
 export type ChannelMessageId = Id<"channel_message">;
 export type ChannelPersonId = Id<"channel_person">;
+export type MemoryTypeId = Id<"memory_type">;
+export type MemoryId = Id<"memory">;
 
 /** The 22-character base62 body every ID shares. */
 const BODY = /^[0-9A-Za-z]{22}$/;

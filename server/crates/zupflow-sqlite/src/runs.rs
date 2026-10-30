@@ -3051,6 +3051,7 @@ mod tests {
                     name: "A".to_owned(),
                     description: String::new(),
                     model_id: None,
+                    memory: zupflow_core::memory::AgentMemory::Default,
                     instructions: String::new(),
                 },
                 &|_| zupflow_conformance::audit_store::by_suite_in(tenant.workspace),

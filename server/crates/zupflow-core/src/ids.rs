@@ -102,6 +102,10 @@ kinds! {
     ChannelMessage, ChannelMessageId => "channel_message", "chmsg";
     /// Someone a channel connection has seen write.
     ChannelPerson, ChannelPersonId => "channel_person", "person";
+    /// An organization's named setup of a memory kind: its settings, and how its agents may write.
+    MemoryType, MemoryTypeId => "memory_type", "mtype";
+    /// One thing an agent remembers in one workspace, in one memory type.
+    Memory, MemoryId => "memory", "memo";
 }
 
 /// An object's identifier, typed by its kind.

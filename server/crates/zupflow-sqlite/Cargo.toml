@@ -24,4 +24,5 @@ uuid.workspace = true
 zupflow-core.workspace = true
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 zupflow-conformance.workspace = true
