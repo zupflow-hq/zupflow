@@ -107,10 +107,12 @@ function Harness({
   currentOrg = org,
   currentEndpoint = endpoint,
   filters = {},
+  onFiltersChange = vi.fn(),
 }: {
   currentOrg?: Organization;
   currentEndpoint?: WebhookEndpoint;
   filters?: Omit<WebhookDeliveryListQuery, "cursor" | "limit">;
+  onFiltersChange?: (filters: Omit<WebhookDeliveryListQuery, "cursor" | "limit">) => void;
 }) {
   const [selected, onSelect] = useState<WebhookDeliveryId>();
   return (
@@ -119,7 +121,7 @@ function Harness({
         org={currentOrg}
         endpoint={currentEndpoint}
         filters={filters}
-        onFiltersChange={vi.fn()}
+        onFiltersChange={onFiltersChange}
         selected={selected}
         onSelect={onSelect}
       />
@@ -240,6 +242,40 @@ describe("webhook history", () => {
       });
     });
     expect(await screen.findByText("17 ms")).toBeInTheDocument();
+  });
+
+  it("groups the event types it filters by what each is about, memory's together", async () => {
+    // Radix measures the list it opens; jsdom has no layout.
+    Element.prototype.scrollIntoView ??= () => {};
+    globalThis.ResizeObserver ??= class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+    const onFiltersChange = vi.fn();
+    setup({ onFiltersChange });
+    (await screen.findByRole("combobox", { name: "Event type" })).focus();
+    await userEvent.keyboard("{Enter}");
+    const list = await screen.findByRole("listbox");
+    const named = (group: HTMLElement) =>
+      document.getElementById(group.getAttribute("aria-labelledby") ?? "")?.textContent;
+    expect(within(list).getAllByRole("group").map(named)).toEqual([
+      "Installations",
+      "Connect sessions",
+      "Runs",
+      "Apps",
+      "Channels",
+      "Memory",
+      "Test events",
+    ]);
+    const memory = within(list).getByRole("group", { name: "Memory" });
+    expect(
+      within(memory)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["memory.saved", "memory.updated", "memory.forgotten"]);
+    await userEvent.click(within(memory).getByRole("option", { name: "memory.forgotten" }));
+    expect(onFiltersChange).toHaveBeenCalledWith({ event_type: "memory.forgotten" });
   });
 
   it("explains legacy gaps without inventing individual results", async () => {

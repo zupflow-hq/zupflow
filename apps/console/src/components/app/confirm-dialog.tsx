@@ -39,15 +39,15 @@ export function ConfirmDialog({
   destructive?: boolean;
 }) {
   const [typed, setTyped] = useState("");
+  // Each opening starts empty, however the last one ended: Cancel, or the caller closing it once the action is done.
+  const [shownOpen, setShownOpen] = useState(open);
+  if (open !== shownOpen) {
+    setShownOpen(open);
+    setTyped("");
+  }
   const locked = confirmText !== undefined && typed.trim() !== confirmText;
   return (
-    <AlertDialog
-      open={open}
-      onOpenChange={(next) => {
-        if (!next) setTyped("");
-        onOpenChange(next);
-      }}
-    >
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>{title}</AlertDialogTitle>
@@ -57,8 +57,13 @@ export function ConfirmDialog({
         </AlertDialogHeader>
         {confirmText !== undefined ? (
           <div className="space-y-2">
-            <Label htmlFor="confirm-text" className="font-normal text-muted-foreground">
-              Type <code className="rounded bg-muted px-1 py-0.5 text-foreground">{confirmText}</code> to confirm
+            {/* A sentence, so a long name wraps in its line instead of squeezing the words beside it. */}
+            <Label htmlFor="confirm-text" className="block leading-relaxed font-normal text-muted-foreground">
+              Type{" "}
+              <code className="rounded bg-muted box-decoration-clone px-1 py-0.5 text-foreground [overflow-wrap:anywhere]">
+                {confirmText}
+              </code>{" "}
+              to confirm
             </Label>
             <Input id="confirm-text" value={typed} autoComplete="off" onChange={(e) => setTyped(e.target.value)} />
           </div>

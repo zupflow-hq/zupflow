@@ -326,3 +326,47 @@ describe("webhook signing-secret rotation", () => {
     expect(remove).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("the endpoint dialog", () => {
+  // Radix checkboxes measure themselves; jsdom has no ResizeObserver.
+  globalThis.ResizeObserver ??= class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  };
+  beforeEach(() => {
+    vi.resetAllMocks();
+    api.webhooks.list.mockResolvedValue([endpoint]);
+  });
+  afterEach(() => {
+    cleanup();
+    for (const client of clients.splice(0)) client.clear();
+  });
+
+  it("groups the events an endpoint takes by what each is about, memory's together", async () => {
+    setup({}, true);
+    await userEvent.click(await screen.findByRole("button", { name: "Add endpoint" }));
+    const dialog = await screen.findByRole("dialog", { name: "Add Sandbox endpoint" });
+    const named = (group: HTMLElement) =>
+      document.getElementById(group.getAttribute("aria-labelledby") ?? "")?.textContent;
+    expect(within(dialog).getAllByRole("group").map(named)).toEqual([
+      "Installations",
+      "Connect sessions",
+      "Runs",
+      "Apps",
+      "Channels",
+      "Memory",
+    ]);
+    const memory = within(dialog).getByRole("group", { name: "Memory" });
+    const events = within(memory).getAllByRole("checkbox");
+    expect(events.map((box) => box.getAttribute("id"))).toEqual([
+      "event-memory.saved",
+      "event-memory.updated",
+      "event-memory.forgotten",
+    ]);
+    const saved = within(memory).getByRole("checkbox", { name: "memory.saved" });
+    expect(saved).not.toBeChecked();
+    await userEvent.click(saved);
+    expect(saved).toBeChecked();
+  });
+});

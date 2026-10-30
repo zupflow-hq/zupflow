@@ -21,6 +21,7 @@ import { Route as AuthedOrgAppsRouteImport } from "./routes/_authed/$org/apps"
 import { Route as AuthedOrgAuditLogRouteImport } from "./routes/_authed/$org/audit-log"
 import { Route as AuthedOrgConnectRouteImport } from "./routes/_authed/$org/connect"
 import { Route as AuthedOrgMembersRouteImport } from "./routes/_authed/$org/members"
+import { Route as AuthedOrgMemoryRouteImport } from "./routes/_authed/$org/memory"
 import { Route as AuthedOrgModelProvidersRouteImport } from "./routes/_authed/$org/model-providers"
 import { Route as AuthedOrgRunsRouteImport } from "./routes/_authed/$org/runs"
 import { Route as AuthedOrgSettingsRouteImport } from "./routes/_authed/$org/settings"
@@ -111,6 +112,11 @@ const AuthedOrgConnectRoute = AuthedOrgConnectRouteImport.update({
 const AuthedOrgMembersRoute = AuthedOrgMembersRouteImport.update({
   id: "/members",
   path: "/members",
+  getParentRoute: () => AuthedOrgRoute,
+} as any)
+const AuthedOrgMemoryRoute = AuthedOrgMemoryRouteImport.update({
+  id: "/memory",
+  path: "/memory",
   getParentRoute: () => AuthedOrgRoute,
 } as any)
 const AuthedOrgModelProvidersRoute = AuthedOrgModelProvidersRouteImport.update({
@@ -295,6 +301,7 @@ export interface FileRoutesByFullPath {
   "/$org/audit-log": typeof AuthedOrgAuditLogRoute
   "/$org/connect": typeof AuthedOrgConnectRoute
   "/$org/members": typeof AuthedOrgMembersRoute
+  "/$org/memory": typeof AuthedOrgMemoryRoute
   "/$org/model-providers": typeof AuthedOrgModelProvidersRouteWithChildren
   "/$org/runs": typeof AuthedOrgRunsRoute
   "/$org/settings": typeof AuthedOrgSettingsRoute
@@ -338,6 +345,7 @@ export interface FileRoutesByTo {
   "/$org/audit-log": typeof AuthedOrgAuditLogRoute
   "/$org/connect": typeof AuthedOrgConnectRoute
   "/$org/members": typeof AuthedOrgMembersRoute
+  "/$org/memory": typeof AuthedOrgMemoryRoute
   "/$org/runs": typeof AuthedOrgRunsRoute
   "/$org/settings": typeof AuthedOrgSettingsRoute
   "/$org/workspaces": typeof AuthedOrgWorkspacesRoute
@@ -377,6 +385,7 @@ export interface FileRoutesById {
   "/_authed/$org/audit-log": typeof AuthedOrgAuditLogRoute
   "/_authed/$org/connect": typeof AuthedOrgConnectRoute
   "/_authed/$org/members": typeof AuthedOrgMembersRoute
+  "/_authed/$org/memory": typeof AuthedOrgMemoryRoute
   "/_authed/$org/model-providers": typeof AuthedOrgModelProvidersRouteWithChildren
   "/_authed/$org/runs": typeof AuthedOrgRunsRoute
   "/_authed/$org/settings": typeof AuthedOrgSettingsRoute
@@ -424,6 +433,7 @@ export interface FileRouteTypes {
     | "/$org/audit-log"
     | "/$org/connect"
     | "/$org/members"
+    | "/$org/memory"
     | "/$org/model-providers"
     | "/$org/runs"
     | "/$org/settings"
@@ -467,6 +477,7 @@ export interface FileRouteTypes {
     | "/$org/audit-log"
     | "/$org/connect"
     | "/$org/members"
+    | "/$org/memory"
     | "/$org/runs"
     | "/$org/settings"
     | "/$org/workspaces"
@@ -505,6 +516,7 @@ export interface FileRouteTypes {
     | "/_authed/$org/audit-log"
     | "/_authed/$org/connect"
     | "/_authed/$org/members"
+    | "/_authed/$org/memory"
     | "/_authed/$org/model-providers"
     | "/_authed/$org/runs"
     | "/_authed/$org/settings"
@@ -633,6 +645,13 @@ declare module "@tanstack/react-router" {
       path: "/members"
       fullPath: "/$org/members"
       preLoaderRoute: typeof AuthedOrgMembersRouteImport
+      parentRoute: typeof AuthedOrgRoute
+    }
+    "/_authed/$org/memory": {
+      id: "/_authed/$org/memory"
+      path: "/memory"
+      fullPath: "/$org/memory"
+      preLoaderRoute: typeof AuthedOrgMemoryRouteImport
       parentRoute: typeof AuthedOrgRoute
     }
     "/_authed/$org/model-providers": {
@@ -1007,6 +1026,7 @@ interface AuthedOrgRouteChildren {
   AuthedOrgAuditLogRoute: typeof AuthedOrgAuditLogRoute
   AuthedOrgConnectRoute: typeof AuthedOrgConnectRoute
   AuthedOrgMembersRoute: typeof AuthedOrgMembersRoute
+  AuthedOrgMemoryRoute: typeof AuthedOrgMemoryRoute
   AuthedOrgModelProvidersRoute: typeof AuthedOrgModelProvidersRouteWithChildren
   AuthedOrgRunsRoute: typeof AuthedOrgRunsRoute
   AuthedOrgSettingsRoute: typeof AuthedOrgSettingsRoute
@@ -1022,6 +1042,7 @@ const AuthedOrgRouteChildren: AuthedOrgRouteChildren = {
   AuthedOrgAuditLogRoute: AuthedOrgAuditLogRoute,
   AuthedOrgConnectRoute: AuthedOrgConnectRoute,
   AuthedOrgMembersRoute: AuthedOrgMembersRoute,
+  AuthedOrgMemoryRoute: AuthedOrgMemoryRoute,
   AuthedOrgModelProvidersRoute: AuthedOrgModelProvidersRouteWithChildren,
   AuthedOrgRunsRoute: AuthedOrgRunsRoute,
   AuthedOrgSettingsRoute: AuthedOrgSettingsRoute,
