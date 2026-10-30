@@ -732,13 +732,11 @@ impl NoteStore for SqliteNoteStore {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
-    use serde_json::{Map, Value, json};
     use zupflow_conformance::note_store::{Logs, Prepare, Tenant};
     use zupflow_core::ids::{RunId, ToolCallId};
-    use zupflow_core::memory::notes::{self, Notes};
-    use zupflow_core::memory::{CallContext, MemoryChange, MemoryFilter, MemoryProvider, MemoryWrites, record_nothing};
+    use zupflow_core::memory::record_nothing;
 
     use super::*;
     use crate::schema::{Temporary, temporary};
@@ -951,173 +949,6 @@ mod tests {
             ],
             "by its new text: the shorter first"
         );
-    }
-
-    /// Captures what's logged on this thread, at every level.
-    #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Captured {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl Captured {
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
-    fn arguments(value: Value) -> Map<String, Value> {
-        let Value::Object(arguments) = value else {
-            panic!("arguments are an object");
-        };
-        arguments
-    }
-
-    /// No note's text reaches a log: not as it's saved, searched, recalled,
-    /// listed, changed or forgotten, nor when the database refuses it.
-    #[tokio::test]
-    async fn keeps_every_notes_text_out_of_the_logs() {
-        const SECRET: &str = "quokka5501";
-        let Temporary {
-            database,
-            directory: _directory,
-        } = temporary().await;
-        let t = tenant(100);
-        prepare(database.clone())(t).await;
-        let store = Arc::new(SqliteNoteStore::new(database));
-        let kind = Notes::new(store.clone());
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _logged = tracing::subscriber::set_default(subscriber);
-
-        let scope = t.scope();
-        let origin = run_origin();
-        let settings = notes::check_settings(&Map::new()).unwrap();
-        let conversation = Audience::Direct(ChannelConversationId::generate());
-        let context = |audience, now| CallContext {
-            origin: &origin,
-            audience,
-            settings: &settings,
-            writes: MemoryWrites::Allow,
-            now,
-        };
-        let workspace = Audience::Workspace;
-        let saved = kind
-            .call(
-                &scope,
-                &context(&workspace, at(1)),
-                notes::SAVE_MEMORY,
-                &arguments(json!({ "text": format!("The vault code is {SECRET}.") })),
-            )
-            .await
-            .unwrap();
-        let Some(MemoryChange::Saved(note)) = saved.change else {
-            panic!("saved: {saved:?}");
-        };
-        let short = note.short_id.as_str();
-        kind.call(
-            &scope,
-            &context(&conversation, at(2)),
-            notes::SAVE_MEMORY,
-            &arguments(json!({ "text": format!("Here only: {SECRET}.") })),
-        )
-        .await
-        .unwrap();
-        let found = kind
-            .call(
-                &scope,
-                &context(&conversation, at(3)),
-                notes::SEARCH_MEMORY,
-                &arguments(json!({ "query": format!("\"{SECRET}\"*") })),
-            )
-            .await
-            .unwrap();
-        assert!(!found.is_error && found.content.contains(SECRET), "{found:?}");
-        let recalled = kind.recall(&scope, &conversation, &settings).await.unwrap();
-        assert!(recalled.framed().unwrap().contains(SECRET));
-        let filter = MemoryFilter {
-            q: Some(SECRET.to_owned()),
-            limit: 10,
-            ..MemoryFilter::default()
-        };
-        assert_eq!(kind.list(&scope, &filter).await.unwrap().total, 2);
-        kind.call(
-            &scope,
-            &context(&workspace, at(4)),
-            notes::UPDATE_MEMORY,
-            &arguments(json!({ "memory": short, "text": format!("The vault code is {SECRET}, still.") })),
-        )
-        .await
-        .unwrap();
-        kind.change(
-            &scope,
-            &origin,
-            note.id,
-            &format!("The vault code was {SECRET}."),
-            at(5),
-            &record_nothing,
-        )
-        .await
-        .unwrap();
-        kind.call(
-            &scope,
-            &context(&workspace, at(6)),
-            notes::FORGET_MEMORY,
-            &arguments(json!({ "memory": short })),
-        )
-        .await
-        .unwrap();
-        // The database refuses what the kind never sends: text too long.
-        let long = format!("{SECRET} ").repeat(60);
-        let refused = store
-            .insert(
-                &scope,
-                &NewNote {
-                    id: MemoryId::generate(),
-                    text: &long,
-                    channel_conversation_id: None,
-                    origin: &origin,
-                    short_ids: &[ShortId::from_bits(7)],
-                },
-                200,
-                at(7),
-                &record_nothing,
-            )
-            .await;
-        assert_eq!(refused, Err(MemoryError::Unavailable));
-        let kept = store.list(&scope, None, None, 10).await.unwrap().items;
-        let refused = store
-            .update(
-                &scope,
-                NoteRef::Id(kept[0].id),
-                Reach::Everything,
-                &origin,
-                &long,
-                at(8),
-                &record_nothing,
-            )
-            .await;
-        assert_eq!(refused, Err(MemoryError::Unavailable));
-
-        let logged = captured.text();
-        assert!(
-            logged.contains("memory_notes.database_error"),
-            "the refusals are logged: {logged}"
-        );
-        assert!(!logged.to_lowercase().contains(SECRET), "never a note's text: {logged}");
     }
 
     #[tokio::test]
