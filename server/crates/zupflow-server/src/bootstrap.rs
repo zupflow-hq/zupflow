@@ -12,6 +12,8 @@ use tokio::net::TcpListener;
 use zupflow_core::channels::ChannelProviderKind;
 use zupflow_core::channels::registry::ChannelProviders;
 use zupflow_core::identity::Identity;
+use zupflow_core::memory::notes::{NoteStore, Notes};
+use zupflow_core::memory::registry::MemoryProviders;
 use zupflow_core::model_providers::ModelProviderCatalog;
 use zupflow_core::models::ModelProvider;
 use zupflow_core::outbound::OutboundHttp;
@@ -181,6 +183,13 @@ pub fn channel_providers(config: &Config) -> ChannelProviders {
         );
     }
     providers
+}
+
+/// The memory kinds this repository ships, each over the store that keeps
+/// its memories: `notes`, over the note store. A deployment may serve more
+/// kinds behind the same trait, adding each to what this returns.
+pub fn memory_providers(notes: Arc<dyn NoteStore>) -> MemoryProviders {
+    MemoryProviders::none().with(Arc::new(Notes::new(notes)))
 }
 
 /// The outbound HTTP client every call to a provider, an MCP server or a

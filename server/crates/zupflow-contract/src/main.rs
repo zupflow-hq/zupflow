@@ -86,8 +86,8 @@ use zupflow_server::sign_in::SignInSettings;
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{
     Database, SqliteAgentStore, SqliteApiKeyStore, SqliteAppStore, SqliteConnectStore, SqliteIdempotencyStore,
-    SqliteInstallationStore, SqliteModelStore, SqliteOrganizationStore, SqliteRunStore, SqliteToolPolicyStore,
-    SqliteToolRegistry, SqliteWebhookStore, SqliteWorkspaceStore,
+    SqliteInstallationStore, SqliteMemoryTypeStore, SqliteModelStore, SqliteNoteStore, SqliteOrganizationStore,
+    SqliteRunStore, SqliteToolPolicyStore, SqliteToolRegistry, SqliteWebhookStore, SqliteWorkspaceStore,
 };
 
 /// The personas, with the address each signs in with: people's names, as in
@@ -288,6 +288,10 @@ async fn serve(path: &str, serving: Serving) -> Result<(), String> {
         metrics: Arc::new(zupflow_basic::in_process_metrics::InProcessMetrics::default()),
         model_store: Arc::new(SqliteModelStore::new(database.clone())),
         model_catalog: Arc::new(ScriptedProviders),
+        // The `notes` kind, over this database. The suite makes the memory
+        // types it needs: the fixture has none.
+        memory_types: Arc::new(SqliteMemoryTypeStore::new(database.clone())),
+        memory_providers: zupflow_server::bootstrap::memory_providers(Arc::new(SqliteNoteStore::new(database.clone()))),
         connect: Arc::new(SqliteConnectStore::new(database.clone())),
         channels: Arc::new(zupflow_sqlite::SqliteChannelStore::new(database.clone())),
         // Slack, by fixed rules: the scripted provisioner makes its apps and

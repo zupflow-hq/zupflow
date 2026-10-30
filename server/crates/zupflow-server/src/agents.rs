@@ -8,6 +8,17 @@
 //! the other environment's included, is the same `422 unknown_model`,
 //! checked by the store in the transaction that writes the agent.
 //!
+//! An agent's memory is `memory`: the organization's default memory type
+//! (`default`), one of its types (`type`, named by `memory_type_id`), or none
+//! (`off`). A change applies what it sends to the agent's own: `default` and
+//! `off` clear its type, and a type sent alone moves an agent on `type` to
+//! it. The agent ends on `type` with a type, or on another memory with none
+//! (`400 validation_failed`, `fields.memory_type_id`, otherwise). Any type
+//! but one of the organization's, another organization's included, is the
+//! same `422 unknown_memory_type`, checked by the store in the transaction
+//! that writes the agent; the environment doesn't matter, since memory types
+//! are the organization's.
+//!
 //! A grant names tools in its installation's registry: one that isn't there,
 //! or is gone, is refused with a field error, checked by the store in the
 //! transaction that writes the grant. A grant of a catalog app's
@@ -30,7 +41,7 @@ use zupflow_core::agents::{Agent, AgentChanges, AgentError, AgentStatus, Grant, 
 use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
-use zupflow_core::ids::{AgentId, GrantId, InstallationId, ModelId, WorkspaceId};
+use zupflow_core::ids::{AgentId, GrantId, InstallationId, MemoryTypeId, ModelId, WorkspaceId};
 use zupflow_core::memory::AgentMemory;
 use zupflow_core::organizations::MemberRole;
 use zupflow_core::runs::AgentActivity;
@@ -70,6 +81,10 @@ struct AgentView {
     description: String,
     /// `null`: the environment's default.
     model_id: Option<ModelId>,
+    /// `default`, `type` or `off`.
+    memory: &'static str,
+    /// Set when `memory` is `type`.
+    memory_type_id: Option<MemoryTypeId>,
     instructions: String,
     status: AgentStatus,
     grant_count: u64,
@@ -103,6 +118,8 @@ fn agent_view(agent: Agent, activity: &HashMap<AgentId, AgentActivity>) -> Agent
         name: agent.name,
         description: agent.description,
         model_id: agent.model_id,
+        memory: agent.memory.as_str(),
+        memory_type_id: agent.memory.memory_type_id(),
         instructions: agent.instructions,
         status: agent.status,
         grant_count: agent.grant_count,
@@ -346,6 +363,102 @@ fn checked_model_id(
     }
 }
 
+/// The contract's `AgentMemory` as a body names it: which memory, without
+/// the type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryChoice {
+    Default,
+    Type,
+    Off,
+}
+
+impl MemoryChoice {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "default" => Some(Self::Default),
+            "type" => Some(Self::Type),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    fn of(memory: AgentMemory) -> Self {
+        match memory {
+            AgentMemory::Default => Self::Default,
+            AgentMemory::Type(_) => Self::Type,
+            AgentMemory::Off => Self::Off,
+        }
+    }
+}
+
+/// What a body sends of an agent's memory, each `None` when it's left out:
+/// `memory`, and `memory_type_id` (`Some(None)` for `null`).
+struct MemoryInput {
+    memory: Option<MemoryChoice>,
+    memory_type_id: Option<Option<String>>,
+}
+
+impl MemoryInput {
+    /// `memory` and `memory_type_id` in their shapes: one of the three, and a
+    /// string or `null`.
+    fn read(body: &Object, fields: &mut Fields) -> Self {
+        let memory = body.0.get("memory").and_then(|value| {
+            let memory = value.as_str().and_then(MemoryChoice::parse);
+            if memory.is_none() {
+                fields.invalid("memory", "Choose default, type or off.");
+            }
+            memory
+        });
+        let memory_type_id = match body.0.get("memory_type_id") {
+            None => None,
+            Some(Value::Null) => Some(None),
+            Some(Value::String(id)) => Some(Some(id.clone())),
+            Some(_) => {
+                fields.invalid("memory_type_id", "Must be a string.");
+                None
+            }
+        };
+        Self { memory, memory_type_id }
+    }
+
+    fn is_sent(&self) -> bool {
+        self.memory.is_some() || self.memory_type_id.is_some()
+    }
+
+    /// The agent's memory once this is applied to `current` (a new agent's
+    /// is the default): `default` and `off` name no type, and `type` keeps
+    /// the agent's type unless one is sent. An ID that can't be a memory
+    /// type's is refused as one that isn't; the store holds the rest to the
+    /// organization's types.
+    fn applied_to(&self, current: AgentMemory) -> Result<AgentMemory, Failure> {
+        let memory_type_refused = |message: &str| -> Failure {
+            ApiError::validation(BTreeMap::from([("memory_type_id".to_owned(), message.to_owned())])).into()
+        };
+        match self.memory.unwrap_or(MemoryChoice::of(current)) {
+            choice @ (MemoryChoice::Default | MemoryChoice::Off) => {
+                if matches!(self.memory_type_id, Some(Some(_))) {
+                    return Err(memory_type_refused("Set memory to type to choose a memory type."));
+                }
+                Ok(if choice == MemoryChoice::Off {
+                    AgentMemory::Off
+                } else {
+                    AgentMemory::Default
+                })
+            }
+            MemoryChoice::Type => match &self.memory_type_id {
+                Some(Some(id)) => MemoryTypeId::parse(id)
+                    .map(AgentMemory::Type)
+                    .map_err(|_| agent_failure(AgentError::UnknownMemoryType, "this installation")),
+                Some(None) => Err(memory_type_refused("Choose the memory type this agent uses.")),
+                None => current
+                    .memory_type_id()
+                    .map(AgentMemory::Type)
+                    .ok_or_else(|| memory_type_refused("Choose the memory type this agent uses.")),
+            },
+        }
+    }
+}
+
 async fn create_agent(
     State(state): State<AppState>,
     caller: Caller,
@@ -368,8 +481,10 @@ async fn create_agent(
         .and_then(|instructions| checked_instructions(instructions, &mut fields));
     let environment = access.workspace.environment;
     let model_id = checked_model_id(&body, environment, &mut fields);
+    let memory = MemoryInput::read(&body, &mut fields);
     fields.finish()?;
     let model_id = model_id?.flatten();
+    let memory = memory.applied_to(AgentMemory::Default)?;
     let (Some(name), Some(description), Some(instructions)) = (name, description, instructions) else {
         return Err(ApiError::internal().into());
     };
@@ -383,8 +498,7 @@ async fn create_agent(
                 name,
                 description,
                 model_id,
-                // Set through the API once it reads an agent's memory.
-                memory: AgentMemory::Default,
+                memory,
                 instructions,
             },
             &|agent: &Agent| {
@@ -432,8 +546,11 @@ async fn update_agent(
     });
     let environment = access.workspace.environment;
     let model_id = checked_model_id(&body, environment, &mut fields);
+    let memory = MemoryInput::read(&body, &mut fields);
     fields.finish()?;
     let model_id = model_id?;
+    // Applied to the agent's own memory, only when the body names it.
+    let memory = memory.is_sent().then(|| memory.applied_to(agent.memory)).transpose()?;
     // As the Console reads it: a status sent pauses or resumes the agent.
     let action = match status {
         Some(AgentStatus::Paused) => AuditAction::AgentPaused,
@@ -450,7 +567,7 @@ async fn update_agent(
                 name,
                 description,
                 model_id,
-                memory: None,
+                memory,
                 instructions,
                 status,
             },
