@@ -175,7 +175,8 @@ once per OAuth client.
 So far it serves `/health`, `/ready`, `/v1/sign-in-settings`, `/v1/me`, the
 signed-in person's invitations (accepted or declined only by the person whose
 verified email was invited), organizations, members,
-workspaces, API keys, catalog and workspace apps with their client
+workspaces, API keys, the memory kinds it serves with the organization's
+memory types and its default one, catalog and workspace apps with their client
 configurations, the apps available to a workspace, installations (read,
 renamed, disconnected and deleted), and Connect's settings and sessions with
 the hosted page's read, cancel and a token app's credentials, checked against

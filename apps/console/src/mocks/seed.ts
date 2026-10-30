@@ -11,6 +11,7 @@ import {
   CHANNEL_PROVIDERS,
   type Environment,
   type IdKind,
+  MEMORY_KIND_NOTES,
   type ModelId,
   type ModelProviderKind,
   type OrganizationId,
@@ -25,6 +26,7 @@ import {
 import { CATALOG, type CatalogEntry } from "./catalog";
 import { seedChannels } from "./channel-seed";
 import { newId } from "./ids";
+import { NOTES_DEFAULT_SETTINGS } from "./memory-kinds";
 import type {
   AgentRow,
   AppRow,
@@ -34,6 +36,7 @@ import type {
   GrantRow,
   InstallationRow,
   InstallationShortIdRow,
+  MemoryTypeRow,
   ModelConnectionRow,
   ModelRow,
   OrganizationRow,
@@ -48,7 +51,7 @@ import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 import { appIn, issueShortId, timelineOf } from "./scope";
 import { listedFrom, recordListing } from "./tools";
 
-export const DB_SCHEMA = 28;
+export const DB_SCHEMA = 29;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -349,6 +352,8 @@ export function seed(nowMs: number = Date.now()): Db {
       description,
       // Overrides are set once the organization's models are seeded; until then, the environment's default.
       model_id: null,
+      memory: "default",
+      memory_type_id: null,
       instructions,
       status,
       created_at: ago(createdAgo),
@@ -475,6 +480,9 @@ export function seed(nowMs: number = Date.now()): Db {
     model_connections: [],
     models: [],
     default_models: [],
+    memory_kinds: [MEMORY_KIND_NOTES],
+    memory_types: [],
+    default_memory_types: [],
     agents,
     grants,
     runs: [],
@@ -739,9 +747,37 @@ export function seed(nowMs: number = Date.now()): Db {
   seedTools(db, nowMs, sandboxTaskboard);
   seedLevels(db, nowMs, { google, taskboard, stripe, github }, jordan.id);
   seedWebhookHistory(db, nowMs);
+  seedMemory(db, nowMs, org.id, DEMO_USER_ID);
   // Seeded runs record their approvals as they're decided: newest first, like the log.
   db.audit.sort((a, b) => b.created_at.localeCompare(a.created_at));
   return db;
+}
+
+/**
+ * The demo organization's memory: one `notes` type with the kind's defaults,
+ * chosen as its default, so every agent (each on the default) remembers.
+ * Other organizations have none, as a new one has.
+ */
+function seedMemory(db: Db, nowMs: number, organizationId: OrganizationId, chosenBy: UserId) {
+  const rng = mulberry32(20261030);
+  const createdAt = new Date(nowMs - 12 * DAY).toISOString();
+  const notes: MemoryTypeRow = {
+    id: newId("memory_type", { rng, at: nowMs - 12 * DAY }),
+    organization_id: organizationId,
+    name: "Notes",
+    kind: MEMORY_KIND_NOTES,
+    settings: { ...NOTES_DEFAULT_SETTINGS },
+    writes: "allow",
+    created_at: createdAt,
+    updated_at: createdAt,
+  };
+  db.memory_types.push(notes);
+  db.default_memory_types.push({
+    organization_id: organizationId,
+    memory_type_id: notes.id,
+    updated_at: createdAt,
+    updated_by_user_id: chosenBy,
+  });
 }
 
 /** Fixed scenarios and times relative to `nowMs`, so resetting repeats every delivery outcome. */
@@ -1146,6 +1182,8 @@ function seedLarkspur(db: Db, nowMs: number) {
     name: "Triage assistant",
     description: "Creates and summarizes board tasks.",
     model_id: null,
+    memory: "default",
+    memory_type_id: null,
     instructions: "Keep task titles short and notes clear.",
     status: "active",
     created_at: ago(16 * DAY),

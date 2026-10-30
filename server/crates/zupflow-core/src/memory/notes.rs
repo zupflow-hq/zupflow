@@ -158,8 +158,21 @@ pub fn settings_schema() -> Value {
     })
 }
 
+/// A JSON number with no fractional part, as the schema's `integer` takes
+/// it: `8000`, `8000.0`, `8e3` and `-0` are the same number. `None` for any
+/// other value, and for one past `u32`.
+fn whole_number(value: &Value) -> Option<u32> {
+    if let Some(value) = value.as_u64() {
+        return u32::try_from(value).ok();
+    }
+    let value = value.as_f64()?;
+    // Exact: a whole number within `u32` converts as it is.
+    (value.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&value)).then_some(value as u32)
+}
+
 /// Checks a type's settings: each a whole number in its bounds, nothing
-/// else, the defaults filled in for what's missing.
+/// else, the defaults filled in for what's missing. Each is kept as an
+/// integer, however it was written.
 pub fn check_settings(values: &Map<String, Value>) -> Result<Settings, SettingsRefusal> {
     let mut fields = BTreeMap::new();
     for key in values.keys() {
@@ -169,7 +182,7 @@ pub fn check_settings(values: &Map<String, Value>) -> Result<Settings, SettingsR
     }
     let mut whole = |key: &str, low: u32, high: u32, default: u32, refusal: &str| match values.get(key) {
         None => default,
-        Some(value) => match value.as_u64().and_then(|value| u32::try_from(value).ok()) {
+        Some(value) => match whole_number(value) {
             Some(value) if (low..=high).contains(&value) => value,
             _ => {
                 fields.insert(key.to_owned(), refusal.to_owned());
@@ -825,7 +838,9 @@ mod tests {
         for value in [
             json!(-1),
             json!(1.5),
-            json!(8000.0),
+            json!(-0.5),
+            json!(32001.0),
+            json!(1e300),
             json!("8000"),
             json!(null),
             json!(u64::MAX),
@@ -833,6 +848,20 @@ mod tests {
             assert!(
                 checked(json!({ "recall_characters": value })).is_err(),
                 "{value} isn't a whole number in bounds"
+            );
+        }
+        // A whole number however JSON writes it, kept as an integer.
+        for (written, kept) in [("8000.0", 8000), ("8e3", 8000), ("-0", 0), ("32000.0", 32000)] {
+            let value: Value = serde_json::from_str(written).expect("JSON");
+            assert!(value.is_f64(), "{written} reads as a float");
+            assert_eq!(
+                checked(json!({ "recall_characters": value, "max_notes": 1e3 }))
+                    .expect("a whole number in bounds")
+                    .values(),
+                json!({ "recall_characters": kept, "max_notes": 1000 })
+                    .as_object()
+                    .expect("object"),
+                "{written}"
             );
         }
     }

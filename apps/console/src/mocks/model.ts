@@ -9,6 +9,7 @@ import type {
   AgentChannelId,
   AgentGrant,
   AgentId,
+  AgentMemory,
   AgentStatus,
   ApiKeyId,
   AppIcon,
@@ -42,6 +43,8 @@ import type {
   MemberId,
   MemberRole,
   MemberStatus,
+  MemoryTypeId,
+  MemoryWrites,
   ModelConnectionId,
   ModelConnectionStatus,
   ModelId,
@@ -257,6 +260,10 @@ export interface AgentRow {
   description: string;
   /** An override: a model of the same organization, in the workspace's environment. Null runs on the default. */
   model_id: ModelId | null;
+  /** The organization's default memory type, a type of its own (`memory_type_id`), or none. */
+  memory: AgentMemory;
+  /** Set exactly when `memory` is `type`: one of the organization's memory types. */
+  memory_type_id: MemoryTypeId | null;
   instructions: string;
   status: AgentStatus;
   created_at: string;
@@ -308,6 +315,30 @@ export interface DefaultModelRow {
   organization_id: OrganizationId;
   environment: Environment;
   model_id: ModelId | null;
+  updated_at: string;
+  updated_by_user_id: UserId | null;
+}
+
+/**
+ * One organization's named setup of a memory kind, the same in both
+ * environments. `settings` are as the kind checked them, its defaults filled
+ * in; the kind never changes.
+ */
+export interface MemoryTypeRow {
+  id: MemoryTypeId;
+  organization_id: OrganizationId;
+  name: string;
+  kind: string;
+  settings: Record<string, unknown>;
+  writes: MemoryWrites;
+  created_at: string;
+  updated_at: string;
+}
+
+/** An organization's default memory type, once someone chose; `memory_type_id` is null once cleared. */
+export interface DefaultMemoryTypeRow {
+  organization_id: OrganizationId;
+  memory_type_id: MemoryTypeId | null;
   updated_at: string;
   updated_by_user_id: UserId | null;
 }
@@ -656,6 +687,16 @@ export interface Db {
   models: ModelRow[];
   /** Each organization's chosen default model per environment. */
   default_models: DefaultModelRow[];
+  /**
+   * The memory kinds this deployment serves: the server's, not a tenant's.
+   * `notes` by default; a test takes it away to see the server answer as one
+   * that doesn't serve it.
+   */
+  memory_kinds: string[];
+  /** Each organization's memory types. */
+  memory_types: MemoryTypeRow[];
+  /** Each organization's default memory type, at most one row each. */
+  default_memory_types: DefaultMemoryTypeRow[];
   api_keys: ApiKeyRow[];
   webhooks: WebhookEndpoint[];
   webhook_events: WebhookEventRow[];

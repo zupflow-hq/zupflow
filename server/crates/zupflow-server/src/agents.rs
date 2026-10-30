@@ -8,6 +8,18 @@
 //! the other environment's included, is the same `422 unknown_model`,
 //! checked by the store in the transaction that writes the agent.
 //!
+//! An agent's memory is `memory`: the organization's default memory type
+//! (`default`), one of its types (`type`, named by `memory_type_id`), or none
+//! (`off`). A change applies what it sends to the agent's own: `default` and
+//! `off` clear its type, and a type sent alone moves an agent on `type` to
+//! it. The agent ends on `type` with a type, or on another memory with none
+//! (`400 validation_failed`, `fields.memory_type_id`, otherwise). Any type
+//! but one of the organization's, another organization's or one of no type's
+//! form included, is the same `422 unknown_memory_type`; the environment
+//! doesn't matter, since memory types are the organization's. The store
+//! applies what's sent to the agent as it reads it in the transaction that
+//! writes the agent, checking the model, then the memory, then its type.
+//!
 //! A grant names tools in its installation's registry: one that isn't there,
 //! or is gone, is refused with a field error, checked by the store in the
 //! transaction that writes the grant. A grant of a catalog app's
@@ -26,12 +38,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
 use serde_json::Value;
-use zupflow_core::agents::{Agent, AgentChanges, AgentError, AgentStatus, Grant, GrantTools, NewAgent};
+use zupflow_core::agents::{
+    Agent, AgentChanges, AgentError, AgentStatus, Grant, GrantTools, MemoryChoice, NewAgent, SentMemory, SentMemoryType,
+};
 use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::environment::Environment;
 use zupflow_core::error::ApiError;
-use zupflow_core::ids::{AgentId, GrantId, InstallationId, ModelId, WorkspaceId};
-use zupflow_core::memory::AgentMemory;
+use zupflow_core::ids::{AgentId, GrantId, InstallationId, MemoryTypeId, ModelId, WorkspaceId};
 use zupflow_core::organizations::MemberRole;
 use zupflow_core::runs::AgentActivity;
 use zupflow_core::time::Timestamp;
@@ -70,6 +83,10 @@ struct AgentView {
     description: String,
     /// `null`: the environment's default.
     model_id: Option<ModelId>,
+    /// `default`, `type` or `off`.
+    memory: &'static str,
+    /// Set when `memory` is `type`.
+    memory_type_id: Option<MemoryTypeId>,
     instructions: String,
     status: AgentStatus,
     grant_count: u64,
@@ -103,6 +120,8 @@ fn agent_view(agent: Agent, activity: &HashMap<AgentId, AgentActivity>) -> Agent
         name: agent.name,
         description: agent.description,
         model_id: agent.model_id,
+        memory: agent.memory.as_str(),
+        memory_type_id: agent.memory.memory_type_id(),
         instructions: agent.instructions,
         status: agent.status,
         grant_count: agent.grant_count,
@@ -156,6 +175,12 @@ fn field_error(status: u16, code: &'static str, field: &str, message: String) ->
     })
 }
 
+/// A memory and a type that don't go together: `400 validation_failed`,
+/// naming `memory_type_id`, as the shape of a body is refused.
+fn memory_type_refused(message: &str) -> Failure {
+    ApiError::validation(BTreeMap::from([("memory_type_id".to_owned(), message.to_owned())])).into()
+}
+
 /// The store's refusal as the API answers it. `installation` names the
 /// grant's installation in a tool's refusal.
 fn agent_failure(error: AgentError, installation: &str) -> Failure {
@@ -174,6 +199,8 @@ fn agent_failure(error: AgentError, installation: &str) -> Failure {
             "memory_type_id",
             "Choose a memory type of this organization.".to_owned(),
         ),
+        AgentError::UnusedMemoryType => memory_type_refused("Set memory to type to choose a memory type."),
+        AgentError::MissingMemoryType => memory_type_refused("Choose the memory type this agent uses."),
         AgentError::InstallationNotFound => ApiError::not_found("Installation").into(),
         AgentError::GrantExists => ApiError::new(
             409,
@@ -346,6 +373,34 @@ fn checked_model_id(
     }
 }
 
+/// `memory` and `memory_type_id` as a body sends them, each in its shape:
+/// one of the three, and a string or `null`. A string of no memory type's
+/// form is sent as a type that's none of the organization's; the store
+/// applies the rest.
+fn sent_memory(body: &Object, fields: &mut Fields) -> SentMemory {
+    let memory = body.0.get("memory").and_then(|value| {
+        let memory = value.as_str().and_then(MemoryChoice::parse);
+        if memory.is_none() {
+            fields.invalid("memory", "Choose default, type or off.");
+        }
+        memory
+    });
+    let memory_type_id = match body.0.get("memory_type_id") {
+        None => None,
+        Some(Value::Null) => Some(SentMemoryType::Null),
+        Some(Value::String(id)) => Some(
+            MemoryTypeId::parse(id)
+                .map(SentMemoryType::Id)
+                .unwrap_or(SentMemoryType::Unknown),
+        ),
+        Some(_) => {
+            fields.invalid("memory_type_id", "Must be a string.");
+            None
+        }
+    };
+    SentMemory { memory, memory_type_id }
+}
+
 async fn create_agent(
     State(state): State<AppState>,
     caller: Caller,
@@ -368,6 +423,7 @@ async fn create_agent(
         .and_then(|instructions| checked_instructions(instructions, &mut fields));
     let environment = access.workspace.environment;
     let model_id = checked_model_id(&body, environment, &mut fields);
+    let memory = sent_memory(&body, &mut fields);
     fields.finish()?;
     let model_id = model_id?.flatten();
     let (Some(name), Some(description), Some(instructions)) = (name, description, instructions) else {
@@ -383,8 +439,7 @@ async fn create_agent(
                 name,
                 description,
                 model_id,
-                // Set through the API once it reads an agent's memory.
-                memory: AgentMemory::Default,
+                memory,
                 instructions,
             },
             &|agent: &Agent| {
@@ -432,6 +487,7 @@ async fn update_agent(
     });
     let environment = access.workspace.environment;
     let model_id = checked_model_id(&body, environment, &mut fields);
+    let memory = sent_memory(&body, &mut fields);
     fields.finish()?;
     let model_id = model_id?;
     // As the Console reads it: a status sent pauses or resumes the agent.
@@ -450,7 +506,7 @@ async fn update_agent(
                 name,
                 description,
                 model_id,
-                memory: None,
+                memory,
                 instructions,
                 status,
             },
@@ -720,5 +776,23 @@ mod tests {
                 "Choose a memory type of this organization.".to_owned()
             )]))
         );
+    }
+
+    #[test]
+    fn refuses_a_memory_and_a_type_that_dont_go_together_as_a_field() {
+        for (refusal, message) in [
+            (
+                AgentError::UnusedMemoryType,
+                "Set memory to type to choose a memory type.",
+            ),
+            (AgentError::MissingMemoryType, "Choose the memory type this agent uses."),
+        ] {
+            let Failure(error) = agent_failure(refusal, "");
+            assert_eq!((error.status, error.code), (400, "validation_failed"));
+            assert_eq!(
+                error.fields,
+                Some(BTreeMap::from([("memory_type_id".to_owned(), message.to_owned())]))
+            );
+        }
     }
 }

@@ -102,6 +102,10 @@ impl Server {
             metrics: Arc::new(zupflow_basic::in_process_metrics::InProcessMetrics::default()),
             model_store: Arc::new(zupflow_sqlite::SqliteModelStore::new(database.clone())),
             model_catalog: Arc::new(zupflow_basic::no_providers::NoProviders),
+            memory_types: Arc::new(zupflow_sqlite::SqliteMemoryTypeStore::new(database.clone())),
+            memory_providers: zupflow_server::bootstrap::memory_providers(Arc::new(
+                zupflow_sqlite::SqliteNoteStore::new(database.clone()),
+            )),
             connect: Arc::new(zupflow_sqlite::SqliteConnectStore::new(database.clone())),
             channels: Arc::new(zupflow_sqlite::SqliteChannelStore::new(database.clone())),
             channel_providers: zupflow_core::channels::registry::ChannelProviders::none(),

@@ -68,13 +68,14 @@ fn unavailable() -> Response {
 /// (`x-zupflow-callers` without `api_key`); a test holds the two equal. A key
 /// on one passes straight through, so the route answers `403 console_only`
 /// whatever key or organization the request names.
-pub const NOT_FOR_API_KEYS: [&str; 10] = [
+pub const NOT_FOR_API_KEYS: [&str; 11] = [
     "/v1/organizations",
     "/v1/me/invitations/{invitation}/accept",
     "/v1/me/invitations/{invitation}/decline",
     "/v1/organizations/{org}/members",
     "/v1/organizations/{org}/api-keys",
     "/v1/organizations/{org}/api-keys/{key}/revoke",
+    "/v1/organizations/{org}/memory-types",
     "/v1/connect/sessions/{reference}/credentials",
     "/v1/connect/sessions/{reference}/authorize",
     "/v1/connect/sessions/{reference}/cancel",

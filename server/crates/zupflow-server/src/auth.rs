@@ -51,6 +51,12 @@ pub struct AppState {
     /// Checks a connection's key and lists its provider's models: the
     /// provider adapters, or the scripted providers for local work.
     pub model_catalog: Arc<dyn zupflow_core::model_providers::ModelProviderCatalog>,
+    /// Organizations' memory types and the default type of each.
+    pub memory_types: Arc<dyn zupflow_core::memory::type_store::MemoryTypeStore>,
+    /// The memory kinds this server serves, by key: each checks the
+    /// settings of the types made of it. A type of a kind it doesn't serve
+    /// still reads, as not served.
+    pub memory_providers: zupflow_core::memory::registry::MemoryProviders,
     pub connect: Arc<dyn ConnectStore>,
     /// Linked teams, agents' generated apps, channel connections and what they've seen.
     pub channels: Arc<dyn zupflow_core::channels::store::ChannelStore>,

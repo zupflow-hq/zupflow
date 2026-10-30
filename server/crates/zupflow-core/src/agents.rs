@@ -18,8 +18,11 @@
 //! engine holds the call to it.
 //!
 //! An agent's memory ([`AgentMemory`]) is the organization's default type, a
-//! type of its own or none; a type it names is one of its organization's,
-//! checked by the store in the transaction that writes the agent.
+//! type of its own or none; a type it names is one of its organization's. A
+//! create or an update sends what it changes of it ([`SentMemory`]), and the
+//! store applies that to the agent as it reads it in the transaction that
+//! writes the agent, checking the type there: of two changes at once, the
+//! second applies to what the first left, never to a copy read before it.
 //!
 //! Deleting an agent deletes its grants, and deleting an installation
 //! deletes the grants of it, each as one change. Every [`AgentStore`] method
@@ -28,7 +31,7 @@
 use async_trait::async_trait;
 
 use crate::audit::Audit;
-use crate::ids::{AgentId, GrantId, InstallationId, ModelId, OrganizationId, WorkspaceId};
+use crate::ids::{AgentId, GrantId, InstallationId, MemoryTypeId, ModelId, OrganizationId, WorkspaceId};
 use crate::memory::AgentMemory;
 use crate::policy::{GrantLevels, LevelRefusal, level_refusal};
 use crate::time::Timestamp;
@@ -86,8 +89,9 @@ pub struct NewAgent {
     pub description: String,
     /// Held to the same rule as [`Agent::model_id`] by the store.
     pub model_id: Option<ModelId>,
-    /// A type it names is one of the organization's, checked by the store.
-    pub memory: AgentMemory,
+    /// Applied over the default by the store, its type one of the
+    /// organization's.
+    pub memory: SentMemory,
     pub instructions: String,
 }
 
@@ -98,10 +102,100 @@ pub struct AgentChanges {
     pub description: Option<String>,
     /// `Some(None)` goes back to the environment's default.
     pub model_id: Option<Option<ModelId>>,
-    /// The default or none forgets the type it named.
-    pub memory: Option<AgentMemory>,
+    /// Applied by the store over the agent's memory as it reads it; nothing
+    /// sent keeps it.
+    pub memory: SentMemory,
     pub instructions: Option<String>,
     pub status: Option<AgentStatus>,
+}
+
+/// Which memory a create or an update names: the contract's `AgentMemory`,
+/// without the type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryChoice {
+    Default,
+    Type,
+    Off,
+}
+
+impl MemoryChoice {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "default" => Some(Self::Default),
+            "type" => Some(Self::Type),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// Which memory `memory` is.
+    pub fn of(memory: AgentMemory) -> Self {
+        match memory {
+            AgentMemory::Default => Self::Default,
+            AgentMemory::Type(_) => Self::Type,
+            AgentMemory::Off => Self::Off,
+        }
+    }
+}
+
+/// A `memory_type_id` as a create or an update sends it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SentMemoryType {
+    /// `null`: no type.
+    Null,
+    /// An ID of a memory type's form, held by the store to the
+    /// organization's types.
+    Id(MemoryTypeId),
+    /// A string of no memory type's form: the same as an ID that names none
+    /// of the organization's types.
+    Unknown,
+}
+
+/// An agent's memory as a create or an update sends it, each part `None`
+/// when it's left out. The store applies it ([`SentMemory::applied_to`]) to
+/// the agent as it reads it in the transaction that writes the agent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SentMemory {
+    pub memory: Option<MemoryChoice>,
+    pub memory_type_id: Option<SentMemoryType>,
+}
+
+impl SentMemory {
+    /// `memory` sent as it is: which memory, and its type if it names one.
+    pub fn of(memory: AgentMemory) -> Self {
+        Self {
+            memory: Some(MemoryChoice::of(memory)),
+            memory_type_id: memory.memory_type_id().map(SentMemoryType::Id),
+        }
+    }
+
+    pub fn is_sent(self) -> bool {
+        self.memory.is_some() || self.memory_type_id.is_some()
+    }
+
+    /// The agent's memory once this is applied to `current`, a new agent's
+    /// being the default. `default` and `off` name no type
+    /// (`UnusedMemoryType` when one is sent), and `type` takes the type
+    /// sent, else the agent's own (`MissingMemoryType` with neither). A
+    /// type of no memory type's form is `UnknownMemoryType`; the store holds
+    /// any other to the organization's types.
+    pub fn applied_to(self, current: AgentMemory) -> Result<AgentMemory, AgentError> {
+        let sent_type = self.memory_type_id.filter(|sent| *sent != SentMemoryType::Null);
+        match self.memory.unwrap_or(MemoryChoice::of(current)) {
+            MemoryChoice::Default | MemoryChoice::Off if sent_type.is_some() => Err(AgentError::UnusedMemoryType),
+            MemoryChoice::Default => Ok(AgentMemory::Default),
+            MemoryChoice::Off => Ok(AgentMemory::Off),
+            MemoryChoice::Type => match self.memory_type_id {
+                Some(SentMemoryType::Id(id)) => Ok(AgentMemory::Type(id)),
+                Some(SentMemoryType::Unknown) => Err(AgentError::UnknownMemoryType),
+                Some(SentMemoryType::Null) => Err(AgentError::MissingMemoryType),
+                None => current
+                    .memory_type_id()
+                    .map(AgentMemory::Type)
+                    .ok_or(AgentError::MissingMemoryType),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +233,12 @@ pub enum AgentError {
     /// The memory type named isn't one of the organization's.
     #[error("not a memory type of this organization")]
     UnknownMemoryType,
+    /// A memory type is sent, but the agent's memory isn't a type.
+    #[error("a memory type is named, but the memory isn't a type")]
+    UnusedMemoryType,
+    /// The agent's memory is a type, but none is sent or kept.
+    #[error("the memory is a type, but names none")]
+    MissingMemoryType,
     /// The grant isn't the agent's, in this scope.
     #[error("grant not found")]
     GrantNotFound,
@@ -184,10 +284,12 @@ pub trait AgentStore: Send + Sync {
     ) -> Result<Option<Agent>, AgentError>;
 
     /// Creates an active agent in a workspace the caller has resolved in its
-    /// organization. Its model, if it names one, must be the organization's,
-    /// added in the workspace's environment (`UnknownModel`), and its memory
-    /// type, if it names one, the organization's (`UnknownMemoryType`), both
-    /// checked in the transaction that writes the agent.
+    /// organization. In the transaction that writes the agent, and in this
+    /// order: its model, if it names one, must be the organization's, added
+    /// in the workspace's environment (`UnknownModel`); its memory is
+    /// applied over the default ([`SentMemory::applied_to`]:
+    /// `UnusedMemoryType`, `MissingMemoryType`); and the memory type it
+    /// ends on, if any, must be the organization's (`UnknownMemoryType`).
     async fn create_agent(
         &self,
         organization_id: OrganizationId,
@@ -197,9 +299,10 @@ pub trait AgentStore: Send + Sync {
         audit: &Audit<'_, Agent>,
     ) -> Result<Agent, AgentError>;
 
-    /// Changes what `changes` names; a model and a memory type are held to
-    /// the rules [`AgentStore::create_agent`] holds them to, in the same
-    /// transaction.
+    /// Changes what `changes` names, held to the rules and the order
+    /// [`AgentStore::create_agent`] holds a new agent to, in the same
+    /// transaction; the memory sent applies to the agent's as that
+    /// transaction reads it.
     async fn update_agent(
         &self,
         organization_id: OrganizationId,
@@ -296,4 +399,63 @@ pub fn levels_refusal(tools: &GrantTools, levels: &GrantLevels) -> Option<AgentE
         LevelRefusal::Denied(tool) => AgentError::ToolDenied(tool),
         LevelRefusal::ApprovalRequired(tool) => AgentError::ApprovalRequiredByPolicy(tool),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sent(memory: Option<MemoryChoice>, memory_type_id: Option<SentMemoryType>) -> SentMemory {
+        SentMemory { memory, memory_type_id }
+    }
+
+    #[test]
+    fn applies_what_is_sent_to_the_agents_memory() {
+        let (first, second) = (MemoryTypeId::generate(), MemoryTypeId::generate());
+        let all = [AgentMemory::Default, AgentMemory::Type(first), AgentMemory::Off];
+        for current in all {
+            assert!(!SentMemory::default().is_sent());
+            assert_eq!(
+                SentMemory::default().applied_to(current),
+                Ok(current),
+                "nothing sent keeps it"
+            );
+            for memory in all {
+                assert_eq!(SentMemory::of(memory).applied_to(current), Ok(memory), "sent as it is");
+            }
+        }
+        let (default, typed, off) = (
+            Some(MemoryChoice::Default),
+            Some(MemoryChoice::Type),
+            Some(MemoryChoice::Off),
+        );
+        let (null, id, unknown) = (
+            Some(SentMemoryType::Null),
+            Some(SentMemoryType::Id(second)),
+            Some(SentMemoryType::Unknown),
+        );
+        let on_first = AgentMemory::Type(first);
+        for (sent, current, expected) in [
+            // `default` and `off` let go of the type, and name none.
+            (sent(default, None), on_first, Ok(AgentMemory::Default)),
+            (sent(off, null), on_first, Ok(AgentMemory::Off)),
+            (sent(default, id), on_first, Err(AgentError::UnusedMemoryType)),
+            (sent(off, unknown), AgentMemory::Off, Err(AgentError::UnusedMemoryType)),
+            // A type sent alone applies to the agent's own memory.
+            (sent(None, id), on_first, Ok(AgentMemory::Type(second))),
+            (sent(None, id), AgentMemory::Off, Err(AgentError::UnusedMemoryType)),
+            (sent(None, null), AgentMemory::Default, Ok(AgentMemory::Default)),
+            (sent(None, null), on_first, Err(AgentError::MissingMemoryType)),
+            // `type` takes the type sent, else keeps the agent's own.
+            (sent(typed, id), AgentMemory::Default, Ok(AgentMemory::Type(second))),
+            (sent(typed, None), on_first, Ok(on_first)),
+            (sent(typed, None), AgentMemory::Off, Err(AgentError::MissingMemoryType)),
+            (sent(typed, null), on_first, Err(AgentError::MissingMemoryType)),
+            // A type of no type's form names none of the organization's.
+            (sent(typed, unknown), on_first, Err(AgentError::UnknownMemoryType)),
+            (sent(None, unknown), on_first, Err(AgentError::UnknownMemoryType)),
+        ] {
+            assert_eq!(sent.applied_to(current), expected, "{sent:?} over {current:?}");
+        }
+    }
 }

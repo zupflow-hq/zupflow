@@ -56,7 +56,7 @@ use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use zupflow_basic::local_keys::LocalKeyService;
 use zupflow_basic::scripted_providers::ScriptedProviders;
-use zupflow_core::agents::{Agent, AgentStore, Grant, GrantTools, NewAgent};
+use zupflow_core::agents::{Agent, AgentStore, Grant, GrantTools, NewAgent, SentMemory};
 use zupflow_core::api_keys::{ApiKey, ApiKeyHasher, ApiKeyStore, NewApiKey, NewSecret};
 use zupflow_core::apps::{App, AppStore, Configuration, ToolEffect};
 use zupflow_core::audit::{AuditAction, AuditActor, AuditEntry, AuditObject, AuditPlace, AuditTarget};
@@ -70,7 +70,6 @@ use zupflow_core::ids::{
 };
 use zupflow_core::installations::{InstallationStore, InstalledApp, TemplateSnapshot};
 use zupflow_core::keys::{EncryptionContext, seal};
-use zupflow_core::memory::AgentMemory;
 use zupflow_core::model_store::ModelStore;
 use zupflow_core::organizations::{INVITATION_TTL_MS, Member, MemberRole, Organization, OrganizationStore, User};
 use zupflow_core::outbound::{Limits, OutboundError, OutboundHttp, OutboundRequest, OutboundResponse, Refusal};
@@ -86,8 +85,8 @@ use zupflow_server::sign_in::SignInSettings;
 use zupflow_server::{AppState, RequestGuard};
 use zupflow_sqlite::{
     Database, SqliteAgentStore, SqliteApiKeyStore, SqliteAppStore, SqliteConnectStore, SqliteIdempotencyStore,
-    SqliteInstallationStore, SqliteModelStore, SqliteOrganizationStore, SqliteRunStore, SqliteToolPolicyStore,
-    SqliteToolRegistry, SqliteWebhookStore, SqliteWorkspaceStore,
+    SqliteInstallationStore, SqliteMemoryTypeStore, SqliteModelStore, SqliteNoteStore, SqliteOrganizationStore,
+    SqliteRunStore, SqliteToolPolicyStore, SqliteToolRegistry, SqliteWebhookStore, SqliteWorkspaceStore,
 };
 
 /// The personas, with the address each signs in with: people's names, as in
@@ -288,6 +287,10 @@ async fn serve(path: &str, serving: Serving) -> Result<(), String> {
         metrics: Arc::new(zupflow_basic::in_process_metrics::InProcessMetrics::default()),
         model_store: Arc::new(SqliteModelStore::new(database.clone())),
         model_catalog: Arc::new(ScriptedProviders),
+        // The `notes` kind, over this database. The suite makes the memory
+        // types it needs: the fixture has none.
+        memory_types: Arc::new(SqliteMemoryTypeStore::new(database.clone())),
+        memory_providers: zupflow_server::bootstrap::memory_providers(Arc::new(SqliteNoteStore::new(database.clone()))),
         connect: Arc::new(SqliteConnectStore::new(database.clone())),
         channels: Arc::new(zupflow_sqlite::SqliteChannelStore::new(database.clone())),
         // Slack, by fixed rules: the scripted provisioner makes its apps and
@@ -994,7 +997,7 @@ async fn reset(path: &str) -> Result<(), String> {
                     name: name.to_owned(),
                     description: format!("{name}, for the contract suite."),
                     model_id: override_of(label)?,
-                    memory: AgentMemory::Default,
+                    memory: SentMemory::default(),
                     instructions: "Be brief.".to_owned(),
                 },
                 &|created: &Agent| {
@@ -1069,7 +1072,7 @@ async fn reset(path: &str) -> Result<(), String> {
                 name: "Support concierge".to_owned(),
                 description: "Not granted any installations yet.".to_owned(),
                 model_id: Some(northwind_models.model(Environment::Production, "OpenAI", "gpt-5")?),
-                memory: AgentMemory::Default,
+                memory: SentMemory::default(),
                 instructions: "Answer support questions briefly.".to_owned(),
             },
             &|created: &Agent| {
@@ -1116,7 +1119,7 @@ async fn reset(path: &str) -> Result<(), String> {
                     name: "Release notes writer".to_owned(),
                     description: "Not on any channel yet.".to_owned(),
                     model_id: None,
-                    memory: AgentMemory::Default,
+                    memory: SentMemory::default(),
                     instructions: "Summarize what changed, briefly.".to_owned(),
                 },
                 &|created: &Agent| {

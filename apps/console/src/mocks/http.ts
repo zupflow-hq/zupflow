@@ -903,6 +903,8 @@ export function toAgent(a: AgentRow): Agent {
     name: a.name,
     description: a.description,
     model_id: a.model_id,
+    memory: a.memory,
+    memory_type_id: a.memory_type_id,
     instructions: a.instructions,
     status: a.status,
     grant_count: d.grants.filter((g) => sameWorkspace(g, a) && g.agent_id === a.id).length,

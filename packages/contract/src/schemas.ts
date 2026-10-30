@@ -857,6 +857,14 @@ export const AgentGrant = named(
 );
 export type AgentGrant = z.infer<typeof AgentGrant>;
 
+/**
+ * An agent's memory: `default`, the organization's default memory type (none
+ * while it has no default); `type`, one of the organization's memory types of
+ * its own; `off`, none, whatever the default.
+ */
+export const AgentMemory = z.enum(["default", "type", "off"]);
+export type AgentMemory = z.infer<typeof AgentMemory>;
+
 export const Agent = named(
   "Agent",
   z.object({
@@ -870,6 +878,9 @@ export const Agent = named(
      * on the environment's default model.
      */
     model_id: idSchema("model").nullable(),
+    memory: AgentMemory,
+    /** The memory type it uses when `memory` is `type`; `null` otherwise. */
+    memory_type_id: idSchema("memory_type").nullable(),
     instructions: z.string(),
     status: AgentStatus,
     grant_count: z.number().int(),
@@ -885,11 +896,19 @@ export type Agent = z.infer<typeof Agent>;
  * `model_id` names a model of the same organization, added in the
  * workspace's environment (`422 unknown_model`, `fields.model_id`, for any
  * other); omitted or `null`, the agent runs on the environment's default.
+ *
+ * `memory` is `default` when omitted. `type` needs a `memory_type_id`, and a
+ * `memory_type_id` needs `type` (`400 validation_failed`,
+ * `fields.memory_type_id`, otherwise). It names one of the organization's
+ * memory types (`422 unknown_memory_type`, `fields.memory_type_id`, for any
+ * other).
  */
 export const CreateAgentInput = z.object({
   name: z.string(),
   description: z.string(),
   model_id: idSchema("model").nullable().optional(),
+  memory: AgentMemory.optional(),
+  memory_type_id: idSchema("memory_type").nullable().optional(),
   instructions: z.string(),
 });
 export type CreateAgentInput = z.infer<typeof CreateAgentInput>;
@@ -898,6 +917,15 @@ export const UpdateAgentInput = z.object({
   description: z.string().optional(),
   /** As for creating; `null` goes back to the environment's default. Omitted keeps the agent's. */
   model_id: idSchema("model").nullable().optional(),
+  /**
+   * Omitted keeps the agent's; `default` and `off` clear its
+   * `memory_type_id`. As for creating, the agent ends on `type` with a
+   * `memory_type_id`, or on another with none (`400 validation_failed`,
+   * `fields.memory_type_id`, otherwise).
+   */
+  memory: AgentMemory.optional(),
+  /** Omitted keeps the agent's; a new one moves an agent on `type` to that type. */
+  memory_type_id: idSchema("memory_type").nullable().optional(),
   instructions: z.string().optional(),
   status: AgentStatus.optional(),
 });
@@ -1142,6 +1170,125 @@ export type DefaultModel = z.infer<typeof DefaultModel>;
  */
 export const UpdateDefaultModelInput = z.object({ model_id: idSchema("model").nullable() });
 export type UpdateDefaultModelInput = z.infer<typeof UpdateDefaultModelInput>;
+
+// ---------------------------------------------------------------------------
+// Memory: what an agent keeps from one conversation for the next. A memory
+// kind is an implementation a server serves by its key; a memory type is an
+// organization's named setup of a kind; an agent uses the organization's
+// default type, a type of its own, or none (`AgentMemory`). Types and the
+// default are the organization's, the same in both environments.
+
+/** The kind this repository ships: short notes, recalled at the start of each run. */
+export const MEMORY_KIND_NOTES = "notes";
+
+/**
+ * A kind's key: 1 to 32 characters of `a-z`, `0-9` and `_`. An open string:
+ * a deployment may serve kinds this repository doesn't ship.
+ */
+const memoryKindKey = z.string().regex(/^[a-z0-9_]{1,32}$/);
+
+/**
+ * Whether a type's agents may write their memory with their tools: without
+ * asking (`allow`), once a person approves each call (`approve`, like any
+ * approve-level tool call), or not at all (`deny`: they search only).
+ */
+export const MemoryWrites = z.enum(["allow", "approve", "deny"]);
+export type MemoryWrites = z.infer<typeof MemoryWrites>;
+
+/** A kind this server serves, as it describes it. */
+export const MemoryKind = named(
+  "MemoryKind",
+  z.object({
+    /** Its key: `notes`. */
+    kind: memoryKindKey,
+    /** As people know it: `Notes`. */
+    name: z.string(),
+    description: z.string(),
+    /** The JSON Schema of its settings, with their defaults. */
+    settings_schema: z.record(z.string(), z.unknown()),
+    /** What people can do with its memories, from the API and the Console. */
+    manage: z.object({ list: z.boolean(), add: z.boolean(), change: z.boolean(), forget: z.boolean() }),
+  }),
+);
+export type MemoryKind = z.infer<typeof MemoryKind>;
+
+/**
+ * An organization's named setup of a kind: its settings, and whether its
+ * agents may write. Both environments use the same types.
+ */
+export const MemoryType = named(
+  "MemoryType",
+  z.object({
+    id: idSchema("memory_type"),
+    /** 1 to 60 characters, unique in the organization. */
+    name: z.string(),
+    /** Fixed once the type is created. */
+    kind: memoryKindKey,
+    /** As its kind checked them, with the kind's defaults filled in. */
+    settings: z.record(z.string(), z.unknown()),
+    writes: MemoryWrites,
+    /** False when this server doesn't serve the kind: its agents run without memory. */
+    served: z.boolean(),
+    /** Agents that name it, across the organization's workspaces; agents on the default aren't counted. */
+    agent_count: z.number().int(),
+    /** The organization's default memory type. */
+    is_default: z.boolean(),
+    created_at: instant,
+    updated_at: instant,
+  }),
+);
+export type MemoryType = z.infer<typeof MemoryType>;
+
+/**
+ * A kind this server serves (`422 unknown_memory_kind`, `fields.kind`,
+ * otherwise), with settings it accepts: each setting it refuses is named in
+ * `fields` as `settings.<key>` (`422 invalid_memory_settings`). A name
+ * another of the organization's types has is `409 memory_type_name_taken`.
+ */
+export const CreateMemoryTypeInput = z.object({
+  /** 1 to 60 characters, trimmed. */
+  name: z.string(),
+  kind: z.string(),
+  /** The kind's settings; one left out takes its default. */
+  settings: z.record(z.string(), z.unknown()).optional(),
+  /** Defaults to `allow`. */
+  writes: MemoryWrites.optional(),
+});
+export type CreateMemoryTypeInput = z.infer<typeof CreateMemoryTypeInput>;
+
+/**
+ * As for creating; the kind never changes. `settings` replaces the type's
+ * settings, checked by its kind: one left out takes the kind's default.
+ */
+export const UpdateMemoryTypeInput = z.object({
+  name: z.string().optional(),
+  settings: z.record(z.string(), z.unknown()).optional(),
+  writes: MemoryWrites.optional(),
+});
+export type UpdateMemoryTypeInput = z.infer<typeof UpdateMemoryTypeInput>;
+
+/**
+ * The type every agent on `default` uses. Memory is off until an owner or
+ * admin chooses one: while `memory_type` is `null`, agents on the default run
+ * without memory.
+ */
+export const DefaultMemoryType = named(
+  "DefaultMemoryType",
+  z.object({
+    memory_type: MemoryType.nullable(),
+    updated_at: instant.nullable(),
+    /** Who last changed it: null before anyone did; "Former member" once they are gone. */
+    updated_by: User.nullable(),
+  }),
+);
+export type DefaultMemoryType = z.infer<typeof DefaultMemoryType>;
+
+/**
+ * A memory type of this organization (`422 unknown_memory_type`,
+ * `fields.memory_type_id`, otherwise), or `null` to have none.
+ */
+export const UpdateDefaultMemoryTypeInput = z.object({ memory_type_id: idSchema("memory_type").nullable() });
+export type UpdateDefaultMemoryTypeInput = z.infer<typeof UpdateDefaultMemoryTypeInput>;
 
 // ---------------------------------------------------------------------------
 // Tool permissions (decision 0040)

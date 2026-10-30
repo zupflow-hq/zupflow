@@ -906,6 +906,90 @@ export const routes: readonly Route[] = [
     response: ok(s.DefaultModel),
   },
 
+  // Memory: the kinds a server serves, the organization's memory types and
+  // its default type. Organization-wide, one set for both environments. Every
+  // member and API key reads them; owners and admins change them, from the
+  // Console only.
+  {
+    operationId: "listMemoryKinds",
+    method: "get",
+    path: "/v1/organizations/{org}/memory-kinds",
+    summary: "The memory kinds this server serves, by key",
+    callers: both,
+    params: org,
+    response: ok(s.MemoryKind, { list: true }),
+  },
+  {
+    operationId: "listMemoryTypes",
+    method: "get",
+    path: "/v1/organizations/{org}/memory-types",
+    summary: "The organization's memory types, by name, paged on the server",
+    callers: both,
+    params: org,
+    query: s.PageQuery,
+    response: ok(s.MemoryType, { list: true, paginated: true }),
+  },
+  {
+    operationId: "createMemoryType",
+    method: "post",
+    path: "/v1/organizations/{org}/memory-types",
+    summary:
+      "Create a memory type, a kind set up for the organization: owners and admins, from the Console. `422 unknown_memory_kind` (`fields.kind`) for a kind this server doesn't serve, `422 invalid_memory_settings` (`fields.settings.<key>`) for settings it refuses, `409 memory_type_name_taken`",
+    callers: consoleOnly,
+    params: org,
+    body: s.CreateMemoryTypeInput,
+    response: created(s.MemoryType),
+  },
+  {
+    operationId: "getMemoryType",
+    method: "get",
+    path: "/v1/organizations/{org}/memory-types/{memory_type}",
+    summary: "A memory type",
+    callers: both,
+    params: { ...org, memory_type: idSchema("memory_type") },
+    response: ok(s.MemoryType),
+  },
+  {
+    operationId: "updateMemoryType",
+    method: "patch",
+    path: "/v1/organizations/{org}/memory-types/{memory_type}",
+    summary:
+      "Rename a memory type, or change its settings or writes: owners and admins, from the Console. Refused as for creating",
+    callers: consoleOnly,
+    params: { ...org, memory_type: idSchema("memory_type") },
+    body: s.UpdateMemoryTypeInput,
+    response: ok(s.MemoryType),
+  },
+  {
+    operationId: "deleteMemoryType",
+    method: "delete",
+    path: "/v1/organizations/{org}/memory-types/{memory_type}",
+    summary:
+      "Delete a memory type: owners and admins, from the Console. Refused while it is the organization's default or an agent's (`409 memory_type_in_use`, naming them)",
+    callers: consoleOnly,
+    params: { ...org, memory_type: idSchema("memory_type") },
+    response: noContent,
+  },
+  {
+    operationId: "getDefaultMemoryType",
+    method: "get",
+    path: "/v1/organizations/{org}/default-memory-type",
+    summary: "The memory type agents on the default use",
+    callers: both,
+    params: org,
+    response: ok(s.DefaultMemoryType),
+  },
+  {
+    operationId: "updateDefaultMemoryType",
+    method: "put",
+    path: "/v1/organizations/{org}/default-memory-type",
+    summary: "Choose the organization's default memory type, or none: owners and admins, from the Console",
+    callers: consoleOnly,
+    params: org,
+    body: s.UpdateDefaultMemoryTypeInput,
+    response: ok(s.DefaultMemoryType),
+  },
+
   // Developer settings
   {
     operationId: "getConnectSettings",

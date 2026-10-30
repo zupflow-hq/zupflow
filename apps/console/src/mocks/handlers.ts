@@ -111,6 +111,7 @@ import {
   workspaceAccess,
 } from "./http";
 import { hashReference, isId, newId, newReference } from "./ids";
+import { agentMemory, agentMemoryInput, createMemoryHandlers } from "./memory";
 import type {
   AgentRow,
   AppRow,
@@ -2330,9 +2331,12 @@ export function createHandlers(apiBase: string) {
             name: name(),
             description: z.string().trim().max(280),
             model_id: idOf("model").nullable().optional(),
+            ...agentMemoryInput,
             instructions: z.string().max(20_000),
           }),
         );
+        const modelId = agentModel(access, input.model_id ?? null);
+        const memory = agentMemory(access.org.id, { memory: "default", memory_type_id: null }, input);
         const now = new Date().toISOString();
         const row: AgentRow = {
           id: newId("agent"),
@@ -2340,7 +2344,8 @@ export function createHandlers(apiBase: string) {
           workspace_id: access.workspace.id,
           name: input.name,
           description: input.description,
-          model_id: agentModel(access, input.model_id ?? null),
+          model_id: modelId,
+          ...memory,
           instructions: input.instructions,
           status: "active",
           created_at: now,
@@ -2372,12 +2377,17 @@ export function createHandlers(apiBase: string) {
             name: name().optional(),
             description: z.string().trim().max(280).optional(),
             model_id: idOf("model").nullable().optional(),
+            ...agentMemoryInput,
             instructions: z.string().max(20_000).optional(),
             status: z.enum(["active", "paused"]).optional(),
           }),
         );
-        const { model_id: modelId, ...rest } = input;
-        if (modelId !== undefined) row.model_id = agentModel(access, modelId);
+        const { model_id: modelId, memory: _memory, memory_type_id: _memoryType, ...rest } = input;
+        // Everything is checked before anything changes.
+        const model = modelId === undefined ? row.model_id : agentModel(access, modelId);
+        const memory = agentMemory(access.org.id, row, input);
+        row.model_id = model;
+        Object.assign(row, memory);
         Object.assign(row, Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== undefined)));
         row.updated_at = new Date().toISOString();
         audit(
@@ -3659,6 +3669,7 @@ export function createHandlers(apiBase: string) {
     ),
 
     ...createChannelHandlers(u, (session) => toConnectSession(session)),
+    ...createMemoryHandlers(u),
   ];
 }
 
