@@ -43,7 +43,7 @@ Every `POST` accepts an `Idempotency-Key`, handled by one middleware so no handl
 1. The caller is resolved first, exactly as the handler will, so a `401` or `404` is never replayed past its checks.
 2. The key belongs to that caller: the organization, the workspace on workspace routes, the environment and the credential.
 3. The same key and the same request replays the saved status and body. A different request with that key answers `422`; one still in flight answers `409`.
-4. A `5xx` saves nothing, so a retry runs again. A route that shows a secret once saves only that it completed, never the secret.
+4. A `5xx` saves nothing, so a retry runs again. A route that shows a secret once, or whose answer holds a memory's text, saves only that it completed, never the answer.
 
 ## 4. The trust context
 

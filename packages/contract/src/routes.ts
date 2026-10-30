@@ -47,6 +47,13 @@ export interface Route {
    * `409 idempotency_key_completed` instead of showing the secret again.
    */
   showsSecretOnce?: true;
+  /**
+   * The response holds what people wrote (a memory's text), which is never
+   * kept anywhere but where it's saved. Idempotency records that its key
+   * completed but never saves the body, so a retry answers
+   * `409 idempotency_key_completed`.
+   */
+  answerNeverKept?: true;
 }
 
 const org = { org: idSchema("organization") };
@@ -1015,11 +1022,12 @@ export const routes: readonly Route[] = [
     method: "post",
     path: "/v1/workspaces/{ws}/agents/{agent}/memories",
     summary:
-      "Save a memory for the agent: owners, admins and developers, from the Console in Sandbox only, and API keys. Its origin is the caller. `422 memory_off` when the body names no type and the agent has none; `422 unknown_memory_type` (`fields.memory_type_id`), `422 invalid_memory_text` (`fields.text`), `422 memory_full` at the type's `max_notes`. Sends `memory.saved`; audited as `memory.saved`",
+      "Save a memory for the agent: owners, admins and developers, from the Console in Sandbox only, and API keys. Its origin is the caller. `422 memory_off` when the body names no type and the agent has none; `422 unknown_memory_type` (`fields.memory_type_id`), also for a type deleted while it saves, `422 invalid_memory_text` (`fields.text`), `422 memory_full` at the type's `max_notes`. Sends `memory.saved`; audited as `memory.saved`. Its answer holds the memory's text, so an idempotency key's retry answers `409 idempotency_key_completed`, never the answer again",
     callers: both,
     params: { ...ws, agent: idSchema("agent") },
     body: s.CreateMemoryInput,
     response: created(s.Memory),
+    answerNeverKept: true,
   },
   {
     operationId: "getMemory",
@@ -1057,7 +1065,7 @@ export const routes: readonly Route[] = [
     method: "delete",
     path: "/v1/workspaces/{ws}/agents/{agent}/memories",
     summary:
-      "Forget everything the agent keeps in the workspace, in every memory type of a kind this server serves: owners, admins and developers, from the Console in Sandbox only, and API keys. Sends a `memory.forgotten` for each memory; audited once, as `agent.memory_forgotten` with how many, when there was at least one",
+      "Forget everything the agent keeps in the workspace, in every memory type of a kind this server serves, whatever the kind's `manage` says: an erasure, for owners, admins and developers, from the Console in Sandbox only, and API keys. Sends a `memory.forgotten` for each memory; audited once for each type that held any, as `agent.memory_forgotten` naming the type and how many",
     callers: both,
     params: { ...ws, agent: idSchema("agent") },
     response: noContent,

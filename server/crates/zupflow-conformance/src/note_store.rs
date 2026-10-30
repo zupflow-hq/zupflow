@@ -9,37 +9,57 @@
 //! who wrote the text, and the text a note holds already changing nothing;
 //! recalled by last change, and listed by when they were saved, with counts
 //! of one moment; searched by every word, in any case, in an order no other
-//! scope's notes move; and every note of an agent, a workspace, a type or an
+//! scope's notes move; every note of one scope deleted at once, whatever its
+//! audience; and every note of an agent, a workspace, a type or an
 //! organization deleted, and nothing else.
+//!
+//! Each change people make writes what it records with it (its audit event,
+//! and its webhook events with their deliveries) in its own transaction: a
+//! change refused or changing nothing records nothing, and a record placed
+//! outside the note's workspace fails the change, which then changes
+//! nothing. The suite reads them back through the [`Logs`].
 //!
 //! Which note ranks first is the store's own: a suite can't hold another
 //! database to SQLite's BM25, so its order is tested where it's kept.
 //!
-//! `prepare` makes a [`Tenant`] exist: its organization, a workspace with
-//! two agents, another workspace with one, and two memory types of the
-//! `notes` kind.
+//! `prepare` makes a [`Tenant`] exist: its organization, a Sandbox workspace
+//! with two agents, a Production workspace with one, and two memory types of
+//! the `notes` kind.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use serde_json::Value;
+use zupflow_core::audit::{
+    AuditAction, AuditActor, AuditEntry, AuditFilter, AuditObject, AuditPlace, AuditStore, AuditTarget,
+};
+use zupflow_core::environment::Environment;
 use zupflow_core::ids::{
     AgentId, ApiKeyId, ChannelConversationId, MemoryId, MemoryTypeId, OrganizationId, RunId, ToolCallId, UserId,
-    WorkspaceId,
+    WebhookEndpointId, WebhookEventId, WorkspaceId,
 };
 use zupflow_core::installations::ShortId;
+use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::memory::notes::{NewNote, NoteRef, NoteStore, Reach};
-use zupflow_core::memory::{Audience, Forget, Memory, MemoryError, MemoryScope, Origin, Rewritten};
+use zupflow_core::memory::{
+    Audience, Forget, Memory, MemoryChange, MemoryError, MemoryScope, Origin, Record, Recorded, Rewritten,
+    record_nothing,
+};
 use zupflow_core::time::Timestamp;
+use zupflow_core::webhooks::{
+    DeliveryFilter, NewEndpoint, NewWebhookEvent, WebhookEventType, WebhookStore, event_body, memory_event_data,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Tenant {
     pub organization_id: OrganizationId,
-    /// Where [`Tenant::agent`] and [`Tenant::other_agent`] work.
+    /// Where [`Tenant::agent`] and [`Tenant::other_agent`] work: a Sandbox
+    /// workspace.
     pub workspace: WorkspaceId,
     pub agent: AgentId,
     pub other_agent: AgentId,
-    /// Another workspace, with an agent of its own.
+    /// Another workspace, in Production, with an agent of its own.
     pub sibling: WorkspaceId,
     pub sibling_agent: AgentId,
     /// Two of the organization's memory types, of the `notes` kind.
@@ -119,7 +139,18 @@ impl Tenant {
 
 pub type Prepare = Arc<dyn Fn(Tenant) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-pub async fn run(store: &dyn NoteStore, prepare: Prepare) {
+/// Where the suites read what a store records with its changes: the
+/// organization's audit log, and the deliveries of its webhook endpoints.
+#[derive(Clone, Copy)]
+pub struct Logs<'a> {
+    pub audit: &'a dyn AuditStore,
+    pub webhooks: &'a dyn WebhookStore,
+}
+
+pub async fn run(store: &dyn NoteStore, logs: Logs<'_>, prepare: Prepare) {
+    records_each_change_with_it(store, logs, &prepare).await;
+    records_nothing_with_a_refusal(store, logs, &prepare).await;
+    deletes_a_scope_at_once_with_its_records(store, logs, &prepare).await;
     saves_only_in_a_scope_that_is_there(store, &prepare).await;
     finds_a_note_by_its_id_in_its_scope_only(store, &prepare).await;
     gives_each_note_a_short_id_once_in_its_scope(store, &prepare).await;
@@ -205,6 +236,7 @@ async fn save_in(
             },
             200,
             at(millis),
+            &record_nothing,
         )
         .await
         .unwrap_or_else(|error| panic!("saving {text:?}: {error}"))
@@ -289,12 +321,13 @@ async fn finds_a_note_by_its_id_in_its_scope_only(store: &dyn NoteStore, prepare
             &member(),
             "Prefers shorter answers.",
             at(4),
+            &record_nothing,
         )
         .await
         .unwrap();
     assert_eq!(store.get(&scope, note.id).await, Ok(changed.memory));
     store
-        .delete(&scope, NoteRef::Id(note.id), Reach::Everything)
+        .delete(&scope, NoteRef::Id(note.id), Reach::Everything, &record_nothing)
         .await
         .unwrap();
     assert_eq!(
@@ -337,6 +370,7 @@ async fn saves_only_in_a_scope_that_is_there(store: &dyn NoteStore, prepare: &Pr
             },
             200,
             at(1),
+            &record_nothing,
         )
         .await
         .unwrap();
@@ -430,6 +464,7 @@ async fn saves_only_in_a_scope_that_is_there(store: &dyn NoteStore, prepare: &Pr
                 },
                 200,
                 at(3),
+                &record_nothing,
             )
             .await;
         assert_eq!(refused, Err(MemoryError::NotFound), "{place}");
@@ -455,6 +490,7 @@ async fn gives_each_note_a_short_id_once_in_its_scope(store: &dyn NoteStore, pre
                 },
                 200,
                 at(1),
+                &record_nothing,
             )
             .await
             .map(|note| note.short_id)
@@ -499,6 +535,7 @@ async fn keeps_a_scope_to_its_limit(store: &dyn NoteStore, prepare: &Prepare) {
                 },
                 max_notes,
                 at(i64::from(n)),
+                &record_nothing,
             )
             .await
             .map(|_| ())
@@ -547,6 +584,7 @@ async fn keeps_the_limit_and_short_ids_when_saved_at_once(store: &dyn NoteStore,
                     },
                     MAX_NOTES,
                     at(i64::from(n)),
+                    &record_nothing,
                 )
                 .await
                 .map(|note| note.short_id)
@@ -612,13 +650,23 @@ async fn changes_only_what_its_reach_goes_to(store: &dyn NoteStore, prepare: &Pr
         for reference in [NoteRef::ShortId(&direct.short_id), NoteRef::Id(direct.id)] {
             assert_eq!(
                 store
-                    .update(&scope, reference, Reach::Run(&audience), &writer, "Changed.", at(3))
+                    .update(
+                        &scope,
+                        reference,
+                        Reach::Run(&audience),
+                        &writer,
+                        "Changed.",
+                        at(3),
+                        &record_nothing
+                    )
                     .await,
                 Err(MemoryError::NotFound),
                 "{audience:?}"
             );
             assert_eq!(
-                store.delete(&scope, reference, Reach::Run(&audience)).await,
+                store
+                    .delete(&scope, reference, Reach::Run(&audience), &record_nothing)
+                    .await,
                 Err(MemoryError::NotFound),
                 "{audience:?}"
             );
@@ -630,13 +678,23 @@ async fn changes_only_what_its_reach_goes_to(store: &dyn NoteStore, prepare: &Pr
         for reference in [NoteRef::ShortId(&note.short_id), NoteRef::Id(note.id)] {
             assert_eq!(
                 store
-                    .update(&scope, reference, Reach::Run(&audience), &writer, "Changed.", at(3))
+                    .update(
+                        &scope,
+                        reference,
+                        Reach::Run(&audience),
+                        &writer,
+                        "Changed.",
+                        at(3),
+                        &record_nothing
+                    )
                     .await,
                 Err(MemoryError::NotFound),
                 "{audience:?}"
             );
             assert_eq!(
-                store.delete(&scope, reference, Reach::Run(&audience)).await,
+                store
+                    .delete(&scope, reference, Reach::Run(&audience), &record_nothing)
+                    .await,
                 Err(MemoryError::NotFound),
                 "{audience:?}"
             );
@@ -663,6 +721,7 @@ async fn changes_only_what_its_reach_goes_to(store: &dyn NoteStore, prepare: &Pr
             &writer,
             "Their project is due in May, not April.",
             at(4),
+            &record_nothing,
         )
         .await
         .unwrap();
@@ -687,6 +746,7 @@ async fn changes_only_what_its_reach_goes_to(store: &dyn NoteStore, prepare: &Pr
             &writer,
             "Ships on Thursdays and Fridays.",
             at(5),
+            &record_nothing,
         )
         .await
         .unwrap();
@@ -705,6 +765,7 @@ async fn changes_only_what_its_reach_goes_to(store: &dyn NoteStore, prepare: &Pr
             &person,
             "Their project is due in June.",
             at(6),
+            &record_nothing,
         )
         .await
         .unwrap();
@@ -723,13 +784,23 @@ async fn changes_only_what_its_reach_goes_to(store: &dyn NoteStore, prepare: &Pr
         for reference in [NoteRef::Id(note.id), NoteRef::ShortId(&note.short_id)] {
             assert_eq!(
                 store
-                    .update(&elsewhere, reference, Reach::Everything, &person, "Changed.", at(7))
+                    .update(
+                        &elsewhere,
+                        reference,
+                        Reach::Everything,
+                        &person,
+                        "Changed.",
+                        at(7),
+                        &record_nothing
+                    )
                     .await,
                 Err(MemoryError::NotFound),
                 "{key}"
             );
             assert_eq!(
-                store.delete(&elsewhere, reference, Reach::Everything).await,
+                store
+                    .delete(&elsewhere, reference, Reach::Everything, &record_nothing)
+                    .await,
                 Err(MemoryError::NotFound),
                 "{key}"
             );
@@ -744,7 +815,12 @@ async fn changes_only_what_its_reach_goes_to(store: &dyn NoteStore, prepare: &Pr
     for audience in [here, elsewhere] {
         assert_eq!(
             store
-                .delete(&scope, NoteRef::ShortId(&note.short_id), Reach::Run(&audience))
+                .delete(
+                    &scope,
+                    NoteRef::ShortId(&note.short_id),
+                    Reach::Run(&audience),
+                    &record_nothing
+                )
                 .await,
             Err(MemoryError::NotFound),
             "{audience:?}: never forgets the workspace's"
@@ -755,6 +831,7 @@ async fn changes_only_what_its_reach_goes_to(store: &dyn NoteStore, prepare: &Pr
             &scope,
             NoteRef::ShortId(&note.short_id),
             Reach::Run(&Audience::Workspace),
+            &record_nothing,
         )
         .await
         .unwrap();
@@ -764,13 +841,23 @@ async fn changes_only_what_its_reach_goes_to(store: &dyn NoteStore, prepare: &Pr
         "the note as it was"
     );
     assert_eq!(
-        store.delete(&scope, NoteRef::Id(note.id), Reach::Everything).await,
+        store
+            .delete(&scope, NoteRef::Id(note.id), Reach::Everything, &record_nothing)
+            .await,
         Err(MemoryError::NotFound),
         "once"
     );
     assert_eq!(
         store
-            .update(&scope, NoteRef::Id(note.id), Reach::Everything, &person, "Back.", at(8))
+            .update(
+                &scope,
+                NoteRef::Id(note.id),
+                Reach::Everything,
+                &person,
+                "Back.",
+                at(8),
+                &record_nothing
+            )
             .await,
         Err(MemoryError::NotFound)
     );
@@ -779,7 +866,12 @@ async fn changes_only_what_its_reach_goes_to(store: &dyn NoteStore, prepare: &Pr
         "nor found"
     );
     store
-        .delete(&scope, NoteRef::ShortId(&direct.short_id), Reach::Run(&here))
+        .delete(
+            &scope,
+            NoteRef::ShortId(&direct.short_id),
+            Reach::Run(&here),
+            &record_nothing,
+        )
         .await
         .unwrap();
     assert_eq!(texts(store, &scope).await, Vec::<String>::new());
@@ -801,6 +893,7 @@ async fn keeps_who_wrote_the_text(store: &dyn NoteStore, prepare: &Prepare) {
             &after_app,
             "Ships on Fridays.",
             at(2),
+            &record_nothing,
         )
         .await
         .unwrap();
@@ -819,6 +912,7 @@ async fn keeps_who_wrote_the_text(store: &dyn NoteStore, prepare: &Prepare) {
             &person,
             "Ships on Fridays, from May.",
             at(3),
+            &record_nothing,
         )
         .await
         .unwrap();
@@ -836,6 +930,7 @@ async fn keeps_who_wrote_the_text(store: &dyn NoteStore, prepare: &Prepare) {
             &api_key,
             "Ships on Fridays, from June.",
             at(4),
+            &record_nothing,
         )
         .await
         .unwrap();
@@ -868,7 +963,15 @@ async fn changes_nothing_with_the_text_a_note_holds(store: &dyn NoteStore, prepa
         (NoteRef::ShortId(&first.short_id), Reach::Run(&Audience::Workspace)),
     ] {
         let unchanged = store
-            .update(&scope, reference, reach, &member(), "Ships on Thursdays.", at(5))
+            .update(
+                &scope,
+                reference,
+                reach,
+                &member(),
+                "Ships on Thursdays.",
+                at(5),
+                &record_nothing,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -888,6 +991,7 @@ async fn changes_nothing_with_the_text_a_note_holds(store: &dyn NoteStore, prepa
             &run_origin(true),
             "Due in April.",
             at(6),
+            &record_nothing,
         )
         .await
         .unwrap();
@@ -913,7 +1017,15 @@ async fn changes_nothing_with_the_text_a_note_holds(store: &dyn NoteStore, prepa
     ] {
         assert_eq!(
             store
-                .update(&scope, reference, Reach::Run(&audience), &origin(), text, at(7))
+                .update(
+                    &scope,
+                    reference,
+                    Reach::Run(&audience),
+                    &origin(),
+                    text,
+                    at(7),
+                    &record_nothing
+                )
                 .await,
             Err(MemoryError::NotFound),
             "{audience:?}"
@@ -975,6 +1087,7 @@ async fn recalls_the_notes_last_changed(store: &dyn NoteStore, prepare: &Prepare
             &origin(),
             "First, changed.",
             at(6),
+            &record_nothing,
         )
         .await
         .unwrap();
@@ -987,7 +1100,15 @@ async fn recalls_the_notes_last_changed(store: &dyn NoteStore, prepare: &Prepare
     for note in [&second, &third] {
         let text = note.text.replace('.', ", changed.");
         store
-            .update(&scope, NoteRef::Id(note.id), Reach::Everything, &origin(), &text, at(7))
+            .update(
+                &scope,
+                NoteRef::Id(note.id),
+                Reach::Everything,
+                &origin(),
+                &text,
+                at(7),
+                &record_nothing,
+            )
             .await
             .unwrap();
     }
@@ -1168,6 +1289,7 @@ async fn lists_every_note_newest_first(store: &dyn NoteStore, prepare: &Prepare)
             &origin(),
             "The finance team meets on Mondays at ten.",
             at(9),
+            &record_nothing,
         )
         .await
         .unwrap();
@@ -1331,4 +1453,535 @@ async fn deletes_all_of_exactly_what_it_names(store: &dyn NoteStore, prepare: &P
                 .is_empty()
         );
     }
+}
+
+fn suite_actor() -> AuditActor {
+    AuditActor::System {
+        name: "Conformance".to_owned(),
+    }
+}
+
+/// What the suites record of a change: its audit event, naming the memory by
+/// its short ID, and its webhook event, each in the memory's own workspace,
+/// whose environment is `environment`.
+pub(crate) fn recorder(environment: Environment) -> impl Fn(&MemoryChange) -> Recorded + Send + Sync {
+    move |change| {
+        let memory = change.memory();
+        let kind = WebhookEventType::of_memory_change(change);
+        let action = match change {
+            MemoryChange::Saved(_) => AuditAction::MemorySaved,
+            MemoryChange::Updated(_) => AuditAction::MemoryUpdated,
+            MemoryChange::Forgotten(_) => AuditAction::MemoryForgotten,
+        };
+        let id = WebhookEventId::generate();
+        let now = Timestamp::now();
+        Recorded {
+            audit: Some(AuditEntry::new(
+                suite_actor(),
+                action,
+                AuditTarget::new(AuditObject::Memory(memory.id), memory.short_id.as_str()),
+                AuditPlace::Workspace(memory.workspace_id),
+            )),
+            events: vec![NewWebhookEvent {
+                id,
+                environment,
+                workspace_id: Some(memory.workspace_id),
+                kind: kind.as_str().to_owned(),
+                body: event_body(
+                    id,
+                    kind.as_str(),
+                    now,
+                    environment,
+                    memory.organization_id,
+                    Some((memory.workspace_id, None)),
+                    memory_event_data(memory),
+                ),
+                created_at: now,
+            }],
+        }
+    }
+}
+
+/// What the suites record of forgetting a scope: an audit event of its
+/// agent, named with how many went.
+pub(crate) fn counter(scope: MemoryScope) -> impl Fn(&u64) -> AuditEntry + Send + Sync {
+    move |count| {
+        AuditEntry::new(
+            suite_actor(),
+            AuditAction::AgentMemoryForgotten,
+            AuditTarget::new(AuditObject::Agent(scope.agent_id), count.to_string()),
+            AuditPlace::Workspace(scope.workspace_id),
+        )
+    }
+}
+
+/// [`recorder`], with its audit event placed in `workspace_id` instead.
+pub(crate) fn misplaced(
+    environment: Environment,
+    workspace_id: WorkspaceId,
+) -> impl Fn(&MemoryChange) -> Recorded + Send + Sync {
+    let record = recorder(environment);
+    move |change| {
+        let mut recorded = record(change);
+        if let Some(audit) = recorded.audit.as_mut() {
+            audit.place = AuditPlace::Workspace(workspace_id);
+        }
+        recorded
+    }
+}
+
+/// [`recorder`], with its webhook event naming `workspace_id`, a workspace
+/// of the same organization in `environment`, instead.
+pub(crate) fn sent_elsewhere(
+    environment: Environment,
+    workspace_id: WorkspaceId,
+) -> impl Fn(&MemoryChange) -> Recorded + Send + Sync {
+    move |change| {
+        let mut recorded = recorder(environment)(change);
+        for event in &mut recorded.events {
+            event.workspace_id = Some(workspace_id);
+        }
+        recorded
+    }
+}
+
+/// An endpoint of the organization's Sandbox, subscribed to every memory
+/// event.
+pub(crate) async fn watch(logs: Logs<'_>, organization_id: OrganizationId) -> WebhookEndpointId {
+    let endpoint_id = WebhookEndpointId::generate();
+    logs.webhooks
+        .create_endpoint(
+            organization_id,
+            endpoint_id,
+            &NewEndpoint {
+                environment: Environment::Sandbox,
+                url: "https://hooks.example/memories".to_owned(),
+                description: String::new(),
+                events: vec![
+                    WebhookEventType::MemorySaved,
+                    WebhookEventType::MemoryUpdated,
+                    WebhookEventType::MemoryForgotten,
+                ],
+                secret: Sealed {
+                    wrapped_key: WrappedKey {
+                        key_id: "key-1".to_owned(),
+                        bytes: vec![1; 40],
+                    },
+                    nonce: [1; 12],
+                    ciphertext: vec![1; 32],
+                },
+                secret_last4: "last".to_owned(),
+            },
+            Timestamp::now(),
+            &crate::audit_store::by_suite,
+        )
+        .await
+        .unwrap();
+    endpoint_id
+}
+
+/// What a workspace recorded: its audit events, as action and target name,
+/// and the events delivered to `endpoint`, as type and data, each sorted.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct Seen {
+    pub audit: Vec<(String, String)>,
+    pub events: Vec<(String, Value)>,
+}
+
+impl Seen {
+    /// What a change's [`recorder`] adds.
+    pub(crate) fn add(&mut self, change: &MemoryChange) {
+        let memory = change.memory();
+        let kind = WebhookEventType::of_memory_change(change).as_str().to_owned();
+        self.audit.push((kind.clone(), memory.short_id.as_str().to_owned()));
+        self.events.push((kind, memory_event_data(memory)));
+        self.sort();
+    }
+
+    pub(crate) fn add_counted(&mut self, count: u64) {
+        self.audit
+            .push(("agent.memory_forgotten".to_owned(), count.to_string()));
+        self.sort();
+    }
+
+    fn sort(&mut self) {
+        self.audit.sort();
+        self.events
+            .sort_by(|a, b| (a.0.as_str(), a.1.to_string()).cmp(&(b.0.as_str(), b.1.to_string())));
+    }
+}
+
+/// A workspace's audit events, as action and target name, newest first.
+pub(crate) async fn audit_in(
+    logs: Logs<'_>,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+) -> Vec<(String, String)> {
+    let events = logs
+        .audit
+        .list_audit_events(
+            organization_id,
+            &AuditFilter {
+                workspace_id: Some(workspace_id),
+            },
+            None,
+            100,
+        )
+        .await
+        .unwrap();
+    events
+        .items
+        .into_iter()
+        .map(|event| (event.action.as_str().to_owned(), event.target.name))
+        .collect()
+}
+
+pub(crate) async fn seen(
+    logs: Logs<'_>,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    endpoint: WebhookEndpointId,
+) -> Seen {
+    let mut seen = Seen {
+        audit: audit_in(logs, organization_id, workspace_id).await,
+        events: Vec::new(),
+    };
+    let deliveries = logs
+        .webhooks
+        .list_deliveries(
+            organization_id,
+            endpoint,
+            Environment::Sandbox,
+            &DeliveryFilter::default(),
+            None,
+            100,
+        )
+        .await
+        .unwrap();
+    for delivery in deliveries.items {
+        let detail = logs
+            .webhooks
+            .find_delivery_detail(organization_id, endpoint, Environment::Sandbox, delivery.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            detail.event["workspace"]["id"],
+            serde_json::json!(workspace_id),
+            "in its workspace"
+        );
+        seen.events.push((delivery.event_type, detail.event["data"].clone()));
+    }
+    seen.sort();
+    seen
+}
+
+/// A note of the workspace's, as a person saves one.
+fn note_of<'a>(text: &'a str, origin: &'a Origin, short_ids: &'a [ShortId]) -> NewNote<'a> {
+    NewNote {
+        id: MemoryId::generate(),
+        text,
+        channel_conversation_id: None,
+        origin,
+        short_ids,
+    }
+}
+
+async fn records_each_change_with_it(store: &dyn NoteStore, logs: Logs<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let scope = t.scope();
+    let endpoint = watch(logs, t.organization_id).await;
+    let record = recorder(Environment::Sandbox);
+    let seen_now = || seen(logs, t.organization_id, t.workspace, endpoint);
+    let mut expected = Seen::default();
+    assert_eq!(seen_now().await, expected, "nothing yet");
+
+    let writer = member();
+    let saved = store
+        .insert(
+            &scope,
+            &note_of("Prefers short answers.", &writer, &[short(1)]),
+            200,
+            at(1),
+            &record,
+        )
+        .await
+        .unwrap();
+    expected.add(&MemoryChange::Saved(saved.clone()));
+    assert_eq!(seen_now().await, expected, "saved, with its records");
+
+    let changer = member();
+    let changed = store
+        .update(
+            &scope,
+            NoteRef::Id(saved.id),
+            Reach::Everything,
+            &changer,
+            "Prefers shorter answers.",
+            at(2),
+            &record,
+        )
+        .await
+        .unwrap();
+    assert!(changed.changed);
+    assert_eq!(changed.memory.origin, changer);
+    expected.add(&MemoryChange::Updated(changed.memory.clone()));
+    assert_eq!(seen_now().await, expected, "changed, with the memory as changed");
+
+    let forgotten = store
+        .delete(&scope, NoteRef::Id(saved.id), Reach::Everything, &record)
+        .await
+        .unwrap();
+    assert_eq!(forgotten, changed.memory);
+    expected.add(&MemoryChange::Forgotten(forgotten));
+    assert_eq!(seen_now().await, expected, "forgotten, with the memory as it was");
+
+    // A record placed anywhere but the note's workspace fails the change,
+    // which then changes nothing.
+    let kept = store
+        .insert(
+            &scope,
+            &note_of("Ships on Thursdays.", &writer, &[short(2)]),
+            200,
+            at(3),
+            &record,
+        )
+        .await
+        .unwrap();
+    expected.add(&MemoryChange::Saved(kept.clone()));
+    let before = texts(store, &scope).await;
+    let elsewhere = misplaced(Environment::Sandbox, t.sibling);
+    let sent = sent_elsewhere(Environment::Production, t.sibling);
+    let records: [(&str, &Record<'_>); 2] = [
+        ("an audit event elsewhere", &elsewhere),
+        ("a webhook event elsewhere", &sent),
+    ];
+    for (what, record) in records {
+        assert_eq!(
+            store
+                .insert(
+                    &scope,
+                    &note_of("Never kept.", &writer, &[short(3)]),
+                    200,
+                    at(4),
+                    record
+                )
+                .await,
+            Err(MemoryError::Unavailable),
+            "{what}: saved"
+        );
+        assert_eq!(
+            store
+                .update(
+                    &scope,
+                    NoteRef::Id(kept.id),
+                    Reach::Everything,
+                    &writer,
+                    "Never changed.",
+                    at(5),
+                    record
+                )
+                .await,
+            Err(MemoryError::Unavailable),
+            "{what}: changed"
+        );
+        assert_eq!(
+            store
+                .delete(&scope, NoteRef::Id(kept.id), Reach::Everything, record)
+                .await,
+            Err(MemoryError::Unavailable),
+            "{what}: forgotten"
+        );
+        assert_eq!(
+            store.delete_scope(&scope, record, &counter(scope)).await,
+            Err(MemoryError::Unavailable),
+            "{what}: every one forgotten"
+        );
+    }
+    let misplaced_count = |count: &u64| AuditEntry {
+        place: AuditPlace::Workspace(t.sibling),
+        ..counter(scope)(count)
+    };
+    assert_eq!(
+        store.delete_scope(&scope, &record, &misplaced_count).await,
+        Err(MemoryError::Unavailable),
+        "the count elsewhere"
+    );
+    assert_eq!(texts(store, &scope).await, before, "nothing changed");
+    assert_eq!(store.get(&scope, kept.id).await, Ok(kept));
+    assert_eq!(seen_now().await, expected, "nothing recorded");
+    assert!(
+        audit_in(logs, t.organization_id, t.sibling).await.is_empty(),
+        "nor where it was placed"
+    );
+}
+
+async fn records_nothing_with_a_refusal(store: &dyn NoteStore, logs: Logs<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let scope = t.scope();
+    let endpoint = watch(logs, t.organization_id).await;
+    let record = recorder(Environment::Sandbox);
+    let writer = member();
+    let saved = store
+        .insert(&scope, &note_of("Kept.", &writer, &[short(1)]), 200, at(1), &record)
+        .await
+        .unwrap();
+    let mut expected = Seen::default();
+    expected.add(&MemoryChange::Saved(saved.clone()));
+
+    assert_eq!(
+        store
+            .insert(&scope, &note_of("No room.", &writer, &[short(2)]), 1, at(2), &record)
+            .await,
+        Err(MemoryError::Full)
+    );
+    assert_eq!(
+        store
+            .insert(
+                &scope,
+                &note_of("No short ID.", &writer, &[short(1)]),
+                200,
+                at(2),
+                &record
+            )
+            .await,
+        Err(MemoryError::Unavailable),
+        "every short ID drawn held"
+    );
+    let nowhere = MemoryScope {
+        agent_id: AgentId::generate(),
+        ..scope
+    };
+    assert_eq!(
+        store
+            .insert(
+                &nowhere,
+                &note_of("Nowhere.", &writer, &[short(2)]),
+                200,
+                at(2),
+                &record
+            )
+            .await,
+        Err(MemoryError::NotFound)
+    );
+    let unchanged = store
+        .update(
+            &scope,
+            NoteRef::Id(saved.id),
+            Reach::Everything,
+            &member(),
+            "Kept.",
+            at(3),
+            &record,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        unchanged,
+        Rewritten {
+            memory: saved.clone(),
+            changed: false
+        },
+        "its own text"
+    );
+    let missing = MemoryId::generate();
+    assert_eq!(
+        store
+            .update(
+                &scope,
+                NoteRef::Id(missing),
+                Reach::Everything,
+                &writer,
+                "Gone.",
+                at(3),
+                &record
+            )
+            .await,
+        Err(MemoryError::NotFound)
+    );
+    assert_eq!(
+        store
+            .delete(&scope, NoteRef::Id(missing), Reach::Everything, &record)
+            .await,
+        Err(MemoryError::NotFound)
+    );
+    // A run's reach is a refusal too: a direct conversation never changes
+    // the workspace's note.
+    let direct = Audience::Direct(ChannelConversationId::generate());
+    assert_eq!(
+        store
+            .delete(&scope, NoteRef::Id(saved.id), Reach::Run(&direct), &record)
+            .await,
+        Err(MemoryError::NotFound)
+    );
+    let empty = MemoryScope {
+        memory_type_id: t.other_type,
+        ..scope
+    };
+    assert_eq!(
+        store.delete_scope(&empty, &record, &counter(empty)).await,
+        Ok(0),
+        "nothing to forget"
+    );
+    assert_eq!(
+        seen(logs, t.organization_id, t.workspace, endpoint).await,
+        expected,
+        "only the save recorded"
+    );
+}
+
+async fn deletes_a_scope_at_once_with_its_records(store: &dyn NoteStore, logs: Logs<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let other = tenant(prepare).await;
+    let scope = t.scope();
+    let endpoint = watch(logs, t.organization_id).await;
+    let record = recorder(Environment::Sandbox);
+    let first = save(store, &scope, 1, "Prefers short answers.", 1).await;
+    let direct = save_in(
+        store,
+        &scope,
+        Some(ChannelConversationId::generate()),
+        2,
+        "Said in a direct conversation.",
+        2,
+    )
+    .await;
+    let neighbors = t.neighbors();
+    for (neighbor, n) in neighbors.iter().zip(3..) {
+        save(store, neighbor, n, "A neighbor's note.", 3).await;
+    }
+    save(store, &other.scope(), 9, "Another organization's note.", 4).await;
+
+    assert_eq!(store.delete_scope(&scope, &record, &counter(scope)).await, Ok(2));
+    assert!(
+        texts(store, &scope).await.is_empty(),
+        "every one, whatever its audience"
+    );
+    for neighbor in &neighbors {
+        assert_eq!(texts(store, neighbor).await, ["A neighbor's note."], "{neighbor:?}");
+    }
+    assert_eq!(texts(store, &other.scope()).await, ["Another organization's note."]);
+    for gone in [&first, &direct] {
+        assert_eq!(store.get(&scope, gone.id).await, Err(MemoryError::NotFound));
+    }
+    let mut expected = Seen::default();
+    for gone in [first, direct] {
+        expected.add(&MemoryChange::Forgotten(gone));
+    }
+    expected.add_counted(2);
+    assert_eq!(
+        seen(logs, t.organization_id, t.workspace, endpoint).await,
+        expected,
+        "each one, and how many"
+    );
+    assert_eq!(
+        store.delete_scope(&scope, &record, &counter(scope)).await,
+        Ok(0),
+        "nothing left"
+    );
+    assert_eq!(
+        seen(logs, t.organization_id, t.workspace, endpoint).await,
+        expected,
+        "and nothing recorded"
+    );
 }

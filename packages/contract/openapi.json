@@ -44,7 +44,7 @@
           "maxLength": 255,
           "pattern": "^[\\x20-\\x7E]+$"
         },
-        "description": "Makes a retry safe: 1–255 printable ASCII characters, scoped to the caller that sent it, kept for 24 hours. The same key and request replays the saved response; the same key with a different request answers `422 idempotency_key_reused`; a key still in flight answers `409 idempotency_request_in_progress`; a malformed key answers `400 invalid_idempotency_key`. Routes marked `x-zupflow-shows-secret-once` never save their body: a retry answers `409 idempotency_key_completed`."
+        "description": "Makes a retry safe: 1–255 printable ASCII characters, scoped to the caller that sent it, kept for 24 hours. The same key and request replays the saved response; the same key with a different request answers `422 idempotency_key_reused`; a key still in flight answers `409 idempotency_request_in_progress`; a malformed key answers `400 invalid_idempotency_key`. Routes marked `x-zupflow-shows-secret-once` or `x-zupflow-answer-never-kept` never save their body: a retry answers `409 idempotency_key_completed`."
       }
     },
     "responses": {
@@ -14739,7 +14739,7 @@
       },
       "post": {
         "operationId": "createMemory",
-        "summary": "Save a memory for the agent: owners, admins and developers, from the Console in Sandbox only, and API keys. Its origin is the caller. `422 memory_off` when the body names no type and the agent has none; `422 unknown_memory_type` (`fields.memory_type_id`), `422 invalid_memory_text` (`fields.text`), `422 memory_full` at the type's `max_notes`. Sends `memory.saved`; audited as `memory.saved`",
+        "summary": "Save a memory for the agent: owners, admins and developers, from the Console in Sandbox only, and API keys. Its origin is the caller. `422 memory_off` when the body names no type and the agent has none; `422 unknown_memory_type` (`fields.memory_type_id`), also for a type deleted while it saves, `422 invalid_memory_text` (`fields.text`), `422 memory_full` at the type's `max_notes`. Sends `memory.saved`; audited as `memory.saved`. Its answer holds the memory's text, so an idempotency key's retry answers `409 idempotency_key_completed`, never the answer again",
         "security": [
           {
             "consoleSession": [],
@@ -14814,6 +14814,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
+        "x-zupflow-answer-never-kept": true,
         "requestBody": {
           "required": true,
           "content": {
@@ -14838,7 +14839,7 @@
       },
       "delete": {
         "operationId": "deleteMemories",
-        "summary": "Forget everything the agent keeps in the workspace, in every memory type of a kind this server serves: owners, admins and developers, from the Console in Sandbox only, and API keys. Sends a `memory.forgotten` for each memory; audited once, as `agent.memory_forgotten` with how many, when there was at least one",
+        "summary": "Forget everything the agent keeps in the workspace, in every memory type of a kind this server serves, whatever the kind's `manage` says: an erasure, for owners, admins and developers, from the Console in Sandbox only, and API keys. Sends a `memory.forgotten` for each memory; audited once for each type that held any, as `agent.memory_forgotten` naming the type and how many",
         "security": [
           {
             "consoleSession": [],

@@ -9,7 +9,9 @@
 //! the default or an agent names isn't deleted, a default is one of the
 //! organization's types), then writes the change and its audit event. A
 //! type's notes reference it with a cascading key: they go with it, in the
-//! statement that deletes it.
+//! statement that deletes it, and the transaction queues the job that has
+//! its kind forget them wherever it keeps them ([`queue_forgetting`], which
+//! deleting an agent or a workspace queues too).
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -24,13 +26,71 @@ use zupflow_core::memory::type_store::{
     DefaultMemoryType, MemoryType, MemoryTypeChanges, MemoryTypeError, MemoryTypeHolders, MemoryTypeStore,
     NAMED_HOLDERS, NewMemoryType, RunMemory,
 };
-use zupflow_core::memory::{MemoryKind, MemoryWrites};
+use zupflow_core::memory::{Forget, MemoryKind, MemoryWrites};
 use zupflow_core::model_store::HoldingAgent;
 use zupflow_core::organizations::User;
+use zupflow_core::scope::Scope;
 use zupflow_core::time::Timestamp;
 use zupflow_core::workspaces::Page;
 
 use crate::Database;
+use crate::job_queue::insert_job;
+
+/// The forget jobs of a deletion couldn't be queued; the cause is logged,
+/// and the deletion fails with it.
+#[derive(Debug)]
+pub(crate) struct ForgettingNotQueued;
+
+/// Queues, in a deletion's own transaction, the job that has a memory kind
+/// forget what went ([`Forget::job`]): one for each kind of the
+/// organization's types as they are now, or for `kind` alone, a deleted
+/// type's own. In the organization's scope, so a workspace deleted later
+/// doesn't take it along.
+pub(crate) async fn queue_forgetting(
+    connection: &mut SqliteConnection,
+    what: &Forget,
+    kind: Option<&MemoryKind>,
+) -> Result<(), ForgettingNotQueued> {
+    let organization_id = what.organization_id();
+    let kinds = match kind {
+        Some(kind) => vec![kind.clone()],
+        None => {
+            let stored: Vec<String> =
+                sqlx::query_scalar("SELECT DISTINCT kind FROM memory_types WHERE organization_id = ? ORDER BY kind")
+                    .bind(organization_id.uuid())
+                    .fetch_all(&mut *connection)
+                    .await
+                    .map_err(|error| {
+                        tracing::error!(event = "memory.forgetting_not_queued", %error);
+                        ForgettingNotQueued
+                    })?;
+            stored
+                .iter()
+                .map(|kind| MemoryKind::parse(kind))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    tracing::error!(event = "memory.forgetting_not_queued", error = "a malformed kind");
+                    ForgettingNotQueued
+                })?
+        }
+    };
+    for kind in &kinds {
+        let job = what.job(kind).ok_or(ForgettingNotQueued)?;
+        insert_job(
+            &mut *connection,
+            &Scope::Organization(organization_id),
+            &job.kind,
+            job.payload,
+            job.options,
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(event = "memory.forgetting_not_queued", %error);
+            ForgettingNotQueued
+        })?;
+    }
+    Ok(())
+}
 
 pub struct SqliteMemoryTypeStore {
     database: Database,
@@ -458,13 +518,21 @@ impl MemoryTypeStore for SqliteMemoryTypeStore {
             return Err(MemoryTypeError::InUse(held));
         }
         // Its notes reference it with a cascading key: they go in this one
-        // statement, and their search entries with them.
+        // statement, and their search entries with them. Its kind is told
+        // to forget them too, wherever it keeps them.
         sqlx::query("DELETE FROM memory_types WHERE organization_id = ? AND id = ?")
             .bind(organization_id.uuid())
             .bind(memory_type_id.uuid())
             .execute(&mut *transaction)
             .await
             .map_err(failed("delete_type"))?;
+        let forget = Forget::Type {
+            organization_id,
+            memory_type_id,
+        };
+        queue_forgetting(&mut transaction, &forget, Some(&memory_type.kind))
+            .await
+            .map_err(|_| MemoryTypeError::Unavailable)?;
         crate::audit::record(&mut transaction, organization_id, &audit(&memory_type))
             .await
             .map_err(failed("audit"))?;
@@ -625,6 +693,8 @@ mod tests {
                 agents: &crate::SqliteAgentStore::new(database.clone()),
                 notes: &crate::SqliteNoteStore::new(database.clone()),
                 audit: &crate::SqliteAuditStore::new(database.clone()),
+                workspaces: &crate::SqliteWorkspaceStore::new(database.clone()),
+                jobs: &crate::SqliteJobQueue::new(database.clone()),
             },
             prepare(database),
         )

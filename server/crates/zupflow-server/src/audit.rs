@@ -25,9 +25,8 @@ pub fn routes() -> Router<AppState> {
 fn audit_failure(error: AuditError) -> Failure {
     match error {
         AuditError::InvalidCursor => invalid_cursor(),
-        // The store has logged the cause. A list records nothing, so it
-        // never misses a workspace to record in.
-        AuditError::Unavailable | AuditError::NotFound => ApiError::new(
+        // The store has logged the cause.
+        AuditError::Unavailable => ApiError::new(
             503,
             "unavailable",
             "The service is unavailable right now. Try again shortly.",

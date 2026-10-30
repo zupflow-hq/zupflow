@@ -13,14 +13,19 @@
 //! memory_kind_not_served`. A change or a forget finds the memory first,
 //! then checks what its kind lets people do ([`Manage`]), then the text.
 //!
-//! A kind keeps its memories itself, outside the server's database, so each
-//! change is recorded right after the kind makes it, before the answer: its
-//! webhook (`memory.saved`, `memory.updated` or `memory.forgotten`, naming
-//! the memory and never its text) for the endpoints of the workspace's
-//! environment, and its audit event, which names a memory by its agent and
-//! short ID. The text a memory holds already changes nothing, so nothing is
-//! sent or recorded for it. What can't be recorded is logged, and the
-//! answer is still the change's, since the kind made it.
+//! Each change is recorded with it, in the transaction the kind makes it in
+//! ([`zupflow_core::memory::Record`]): its webhook event (`memory.saved`,
+//! `memory.updated` or `memory.forgotten`, naming the memory and never its
+//! text), with a delivery for each endpoint of the workspace's environment
+//! that subscribes to it, and its audit event, which names a memory by its
+//! agent and short ID. A request cut off leaves the change and its records,
+//! or neither. The text a memory holds already changes nothing, so nothing
+//! is sent or recorded for it.
+//!
+//! Forgetting everything is an erasure: in each type of a kind this server
+//! serves, whatever the kind lets people do, the agent's memories go at
+//! once, each with its `memory.forgotten`, audited once for the type, as
+//! `agent.memory_forgotten` with how many.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -33,18 +38,18 @@ use axum::routing::get;
 use serde::Serialize;
 use serde_json::{Value, json};
 use zupflow_core::agents::Agent;
-use zupflow_core::audit::{AuditAction, AuditEntry, AuditError, AuditObject, AuditPlace, AuditTarget};
+use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::error::ApiError;
 use zupflow_core::ids::{AgentId, ChannelConversationId, MemoryId, MemoryTypeId, WebhookEventId, WorkspaceId};
 use zupflow_core::installations::ShortId;
 use zupflow_core::memory::type_store::{self, MemoryType};
 use zupflow_core::memory::{
     AgentMemory, DEFAULT_PAGE, MAX_PAGE, Manage, Memory, MemoryChange, MemoryError, MemoryFilter, MemoryProvider,
-    MemoryScope, Origin, Settings,
+    MemoryScope, Origin, Recorded, Settings,
 };
 use zupflow_core::organizations::MemberRole;
 use zupflow_core::time::Timestamp;
-use zupflow_core::webhooks::{NewWebhookEvent, WebhookError, WebhookEventType, event_body, memory_event_data};
+use zupflow_core::webhooks::{NewWebhookEvent, WebhookEventType, event_body, memory_event_data};
 
 use crate::auth::{Access, Actor, AppState, Caller, WorkspaceAccess};
 use crate::channels::console_may_act;
@@ -376,16 +381,14 @@ fn workspace_audit(access: &WorkspaceAccess, action: AuditAction, target: AuditT
     )
 }
 
-/// Records a change's webhook event, before the answer, for the endpoints
-/// of the workspace's environment that subscribe to it. A workspace deleted
-/// meanwhile has no endpoints to tell.
-async fn record_webhook(state: &AppState, access: &WorkspaceAccess, change: &MemoryChange) {
+/// A change's webhook event, for the endpoints of the workspace's
+/// environment that subscribe to it: it names the memory, never its text.
+fn memory_event(access: &WorkspaceAccess, change: &MemoryChange) -> NewWebhookEvent {
     let kind = WebhookEventType::of_memory_change(change);
-    let memory = change.memory();
     let id = WebhookEventId::generate();
     let now = Timestamp::now();
     let workspace = &access.workspace;
-    let event = NewWebhookEvent {
+    NewWebhookEvent {
         id,
         environment: workspace.environment,
         workspace_id: Some(workspace.id),
@@ -397,35 +400,23 @@ async fn record_webhook(state: &AppState, access: &WorkspaceAccess, change: &Mem
             workspace.environment,
             access.access.organization_id,
             Some((workspace.id, workspace.external_id.as_deref())),
-            memory_event_data(memory),
+            memory_event_data(change.memory()),
         ),
         created_at: now,
-    };
-    match state.webhooks.record_event(access.access.organization_id, &event).await {
-        Ok(_) | Err(WebhookError::NotFound) => {}
-        Err(error) => tracing::error!(
-            event = "memories.webhook_lost",
-            organization_id = %access.access.organization_id,
-            workspace_id = %workspace.id,
-            memory_id = %memory.id,
-            kind = kind.as_str(),
-            %error,
-        ),
     }
 }
 
-/// Records a change's audit event, before the answer. A workspace deleted
-/// meanwhile took the memories with it.
-async fn record_audit(state: &AppState, access: &WorkspaceAccess, entry: &AuditEntry) {
-    match state.audit.record(access.access.organization_id, entry).await {
-        Ok(()) | Err(AuditError::NotFound) => {}
-        Err(error) => tracing::error!(
-            event = "memories.audit_lost",
-            organization_id = %access.access.organization_id,
-            workspace_id = %access.workspace.id,
-            action = entry.action.as_str(),
-            %error,
-        ),
+/// What one change records with it ([`zupflow_core::memory::Record`]): its
+/// webhook event, and its audit event, by the caller.
+fn recorded(access: &WorkspaceAccess, agent: &Agent, change: &MemoryChange) -> Recorded {
+    let action = match change {
+        MemoryChange::Saved(_) => AuditAction::MemorySaved,
+        MemoryChange::Updated(_) => AuditAction::MemoryUpdated,
+        MemoryChange::Forgotten(_) => AuditAction::MemoryForgotten,
+    };
+    Recorded {
+        audit: Some(workspace_audit(access, action, memory_target(agent, change.memory()))),
+        events: vec![memory_event(access, change)],
     }
 }
 
@@ -554,41 +545,49 @@ async fn create_memory(
     };
     let provider = provider_for(&state, &memory_type, Use::Add)?;
     let settings = stored_settings(&*provider, &access, &memory_type)?;
+    let record = |change: &MemoryChange| recorded(&access, &agent, change);
     let saved = provider
         .add(
             &scope_of(&access, &agent, &memory_type),
+            MemoryId::generate(),
             &origin_of(&access.access),
             &settings,
             text,
             Timestamp::now(),
+            &record,
         )
+        .await;
+    match saved {
+        Ok(saved) => Ok(envelope(StatusCode::CREATED, memory_view(&saved))),
+        Err(MemoryError::Full) => Err(ApiError::new(
+            422,
+            "memory_full",
+            format!(
+                "{} keeps {} memories at most in {}. Forget one, or change one instead.",
+                agent.name,
+                provider.limit(&settings),
+                memory_type.name
+            ),
+        )
+        .into()),
+        Err(MemoryError::NotFound) => Err(gone_meanwhile(&state, &access, &agent).await),
+        Err(error) => Err(kind_failure(error, &memory_type, &*provider, Use::Add)),
+    }
+}
+
+/// What a save answers when its kind found nowhere to keep the memory: its
+/// agent went meanwhile (`404`), or else its type, which is then no type of
+/// the organization's.
+async fn gone_meanwhile(state: &AppState, access: &WorkspaceAccess, agent: &Agent) -> Failure {
+    match state
+        .agents
+        .find_agent(access.access.organization_id, access.workspace.id, agent.id)
         .await
-        .map_err(|error| match error {
-            MemoryError::Full => ApiError::new(
-                422,
-                "memory_full",
-                format!(
-                    "{} keeps {} memories at most in {}. Forget one, or change one instead.",
-                    agent.name,
-                    provider.limit(&settings),
-                    memory_type.name
-                ),
-            )
-            .into(),
-            // The agent went meanwhile, or the type.
-            MemoryError::NotFound => agent_not_found(),
-            error => kind_failure(error, &memory_type, &*provider, Use::Add),
-        })?;
-    let change = MemoryChange::Saved(saved);
-    record_webhook(&state, &access, &change).await;
-    let saved = change.memory();
-    record_audit(
-        &state,
-        &access,
-        &workspace_audit(&access, AuditAction::MemorySaved, memory_target(&agent, saved)),
-    )
-    .await;
-    Ok(envelope(StatusCode::CREATED, memory_view(saved)))
+    {
+        Ok(Some(_)) => unknown_type("memory_type_id"),
+        Ok(None) => agent_not_found(),
+        Err(_) => unavailable(),
+    }
 }
 
 /// The type's settings as stored, checked again by its kind, which kept
@@ -646,6 +645,7 @@ async fn update_memory(
     let Some(Value::String(text)) = body.0.get("text") else {
         return Err(text_required());
     };
+    let record = |change: &MemoryChange| recorded(&access, &agent, change);
     let rewritten = found
         .provider
         .change(
@@ -654,22 +654,11 @@ async fn update_memory(
             found.memory.id,
             text,
             Timestamp::now(),
+            &record,
         )
         .await
         .map_err(|error| kind_failure(error, &found.memory_type, &*found.provider, Use::Change))?;
-    if !rewritten.changed {
-        return Ok(envelope(StatusCode::OK, memory_view(&rewritten.memory)));
-    }
-    let change = MemoryChange::Updated(rewritten.memory);
-    record_webhook(&state, &access, &change).await;
-    let updated = change.memory();
-    record_audit(
-        &state,
-        &access,
-        &workspace_audit(&access, AuditAction::MemoryUpdated, memory_target(&agent, updated)),
-    )
-    .await;
-    Ok(envelope(StatusCode::OK, memory_view(updated)))
+    Ok(envelope(StatusCode::OK, memory_view(&rewritten.memory)))
 }
 
 async fn delete_memory(
@@ -684,31 +673,21 @@ async fn delete_memory(
     let agent = find_agent(&state, &access, &agent).await?;
     let found = find_memory(&state, &access, &agent, &memory).await?;
     allows(&*found.provider, &found.memory_type, Use::Forget)?;
-    let forgotten = found
+    let record = |change: &MemoryChange| recorded(&access, &agent, change);
+    found
         .provider
-        .forget(&found.scope, found.memory.id)
+        .forget(&found.scope, found.memory.id, &record)
         .await
         .map_err(|error| kind_failure(error, &found.memory_type, &*found.provider, Use::Forget))?;
-    let change = MemoryChange::Forgotten(forgotten);
-    record_webhook(&state, &access, &change).await;
-    record_audit(
-        &state,
-        &access,
-        &workspace_audit(
-            &access,
-            AuditAction::MemoryForgotten,
-            memory_target(&agent, change.memory()),
-        ),
-    )
-    .await;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Forgets everything the agent keeps in the workspace, in every type of a
-/// kind this server serves that lets people list and forget memories, one
-/// memory at a time, so each has its `memory.forgotten`; one audit event
-/// counts them, when there was at least one. A memory saved meanwhile may
-/// stay, and one forgotten meanwhile by another call is skipped.
+/// kind this server serves, whatever the kind lets people do: an erasure.
+/// Each type at once, in one call to its kind, which commits with it a
+/// `memory.forgotten` for each memory and, when there was one, an
+/// `agent.memory_forgotten` naming the type and how many. A type that fails
+/// stops the rest; the types before stay forgotten, with their records.
 async fn delete_memories(
     State(state): State<AppState>,
     caller: Caller,
@@ -719,76 +698,29 @@ async fn delete_memories(
     access.access.require(MemberRole::is_developer, "forget memories")?;
     console_may_act(&access, "forget memories")?;
     let agent = find_agent(&state, &access, &agent).await?;
-    let mut forgotten: u64 = 0;
-    let mut outcome = Ok(());
+    // Each memory's event; the type's audit event counts them.
+    let record = |change: &MemoryChange| Recorded {
+        audit: None,
+        events: vec![memory_event(&access, change)],
+    };
     for memory_type in served_types(&state, &access).await? {
         let provider = state.memory_providers.provider(&memory_type.kind);
-        let manage = provider.describe().manage;
-        if !(manage.list && manage.forget) {
-            // People can't reach this kind's memories one by one: it keeps them.
-            continue;
-        }
-        outcome = forget_every_one(&state, &access, &agent, &memory_type, &*provider, &mut forgotten).await;
-        if outcome.is_err() {
-            break;
-        }
-    }
-    // What it forgot is recorded, even when it couldn't go on.
-    if forgotten > 0 {
-        let count = if forgotten == 1 {
-            "1 memory".to_owned()
-        } else {
-            format!("{forgotten} memories")
+        let counted = |count: &u64| {
+            let count = if *count == 1 {
+                "1 memory".to_owned()
+            } else {
+                format!("{count} memories")
+            };
+            let target = AuditTarget::new(
+                AuditObject::Agent(agent.id),
+                format!("{} · {} · {count}", agent.name, memory_type.name),
+            );
+            workspace_audit(&access, AuditAction::AgentMemoryForgotten, target)
         };
-        let target = AuditTarget::new(AuditObject::Agent(agent.id), format!("{} · {count}", agent.name));
-        record_audit(
-            &state,
-            &access,
-            &workspace_audit(&access, AuditAction::AgentMemoryForgotten, target),
-        )
-        .await;
-    }
-    outcome?;
-    Ok(StatusCode::NO_CONTENT.into_response())
-}
-
-/// Forgets each memory the agent keeps in `memory_type`, page by page, and
-/// counts each in `forgotten`: a cursor is a position, so forgetting the
-/// page before doesn't move it.
-async fn forget_every_one(
-    state: &AppState,
-    access: &WorkspaceAccess,
-    agent: &Agent,
-    memory_type: &MemoryType,
-    provider: &dyn MemoryProvider,
-    forgotten: &mut u64,
-) -> Result<(), Failure> {
-    let scope = scope_of(access, agent, memory_type);
-    let mut cursor: Option<String> = None;
-    loop {
-        let filter = MemoryFilter {
-            q: None,
-            cursor: cursor.take(),
-            limit: MAX_PAGE,
-        };
-        let page = provider
-            .list(&scope, &filter)
+        provider
+            .forget_scope(&scope_of(&access, &agent, &memory_type), &record, &counted)
             .await
-            .map_err(|error| kind_failure(error, memory_type, provider, Use::List))?;
-        for memory in page.items {
-            match provider.forget(&scope, memory.id).await {
-                Ok(memory) => {
-                    record_webhook(state, access, &MemoryChange::Forgotten(memory)).await;
-                    *forgotten += 1;
-                }
-                // Another call forgot it meanwhile, and told of it.
-                Err(MemoryError::NotFound) => {}
-                Err(error) => return Err(kind_failure(error, memory_type, provider, Use::Forget)),
-            }
-        }
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => return Ok(()),
-        }
+            .map_err(|error| kind_failure(error, &memory_type, &*provider, Use::Forget))?;
     }
+    Ok(StatusCode::NO_CONTENT.into_response())
 }

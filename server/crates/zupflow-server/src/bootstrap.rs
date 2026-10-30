@@ -223,6 +223,7 @@ pub async fn serve(
     let provisioner = tokio::spawn(crate::channels::run_worker(state.clone()));
     let inbound = tokio::spawn(crate::channel_inbound::run_worker(state.clone()));
     let replies = tokio::spawn(crate::channel_reply::run_worker(state.clone()));
+    let forgetting = tokio::spawn(crate::memory_forgetting::run_worker(state.clone()));
     let served = axum::serve(listener, crate::app(state, guard))
         .with_graceful_shutdown(shutdown)
         .await;
@@ -232,6 +233,7 @@ pub async fn serve(
     provisioner.abort();
     inbound.abort();
     replies.abort();
+    forgetting.abort();
     served.map_err(BootstrapError::Serve)
 }
 

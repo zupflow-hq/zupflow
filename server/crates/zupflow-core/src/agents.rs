@@ -313,7 +313,9 @@ pub trait AgentStore: Send + Sync {
     ) -> Result<Agent, AgentError>;
 
     /// Deletes the agent and its grants, as one, recording `audit` of the
-    /// agent as it was.
+    /// agent as it was, and queueing with it, in the organization's scope,
+    /// for each memory kind of the organization's types, the job that has the
+    /// kind forget what the agent kept ([`crate::memory::Forget::job`]).
     async fn delete_agent(
         &self,
         organization_id: OrganizationId,

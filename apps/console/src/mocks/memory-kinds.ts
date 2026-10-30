@@ -64,6 +64,7 @@ const NOTES: MemoryKind = {
         minimum: RECALL_CHARACTERS.min,
         maximum: RECALL_CHARACTERS.max,
         default: RECALL_CHARACTERS.default,
+        title: "Recall length",
         description:
           "How many characters of notes a run starts with, counting each note's line. The oldest are left out first. 0 starts runs with none: the agent searches for them.",
       },
@@ -72,6 +73,7 @@ const NOTES: MemoryKind = {
         minimum: MAX_NOTES.min,
         maximum: MAX_NOTES.max,
         default: MAX_NOTES.default,
+        title: "Note limit",
         description: "The most notes one agent keeps in one workspace.",
       },
     },

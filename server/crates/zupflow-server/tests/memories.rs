@@ -5,28 +5,37 @@
 //! and forget them, the Console in Sandbox only. Each organization's,
 //! workspace's and agent's are its own, and a kind this server doesn't serve
 //! keeps its memories out of reach. Each change is sent to the endpoints of
-//! its workspace's environment and audited, never with its text.
+//! its workspace's environment and audited, never with its text, each
+//! recorded with the change: a request cut off leaves the three, or none.
+//! Forgetting everything is an erasure, whatever the kind lets people do,
+//! and a deletion has each kind forget what went with it.
 
 #![allow(clippy::unwrap_used)]
 
 mod common;
 
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use async_trait::async_trait;
 use axum::http::{Method, StatusCode};
 use common::{Server, call, code};
 use serde_json::{Map, Value, json};
-use zupflow_core::ids::{MemoryId, MemoryTypeId, OrganizationId};
+use zupflow_core::audit::Audit;
+use zupflow_core::ids::{AgentId, MemoryId, MemoryTypeId, OrganizationId, WorkspaceId};
 use zupflow_core::memory::notes::Notes;
 use zupflow_core::memory::registry::MemoryProviders;
 use zupflow_core::memory::{
-    Audience, CallContext, CallResult, Forget, KindDescription, Manage, Memory, MemoryError, MemoryFilter, MemoryKind,
-    MemoryProvider, MemoryScope, MemoryTool, MemoryWrites, Origin, Recall, Rewritten, Settings, SettingsRefusal,
+    Audience, CallContext, CallResult, FORGET_JOB, Forget, KindDescription, Manage, Memory, MemoryError, MemoryFilter,
+    MemoryKind, MemoryProvider, MemoryScope, MemoryTool, MemoryWrites, Origin, Recall, Record, Rewritten, Settings,
+    SettingsRefusal,
 };
 use zupflow_core::time::Timestamp;
 use zupflow_core::workspaces::Page;
-use zupflow_server::webhook_delivery;
+use zupflow_server::{memory_forgetting, webhook_delivery};
 use zupflow_sqlite::SqliteNoteStore;
 
 /// IDs that name no memory: one of a memory's form that doesn't exist, and
@@ -1123,36 +1132,59 @@ async fn keeps_memories_to_their_organization_workspace_agent_and_environment() 
     );
 }
 
+/// A save's answer holds the memory's text, which is kept nowhere but the
+/// memory: its key records that it completed, so a retry saves nothing
+/// again and answers `409`, and a refusal, which holds no text, replays.
 #[tokio::test]
-async fn replays_a_save_with_the_same_key_and_refuses_the_key_for_another() {
+async fn never_keeps_a_saves_answer_for_a_retry() {
     let server = Server::new().await;
     let t = tenant(&server).await;
     let (org, ws, agent) = (t.org.as_str(), t.sandbox.as_str(), t.agent.as_str());
-    let attempt = |text: &str| {
+    let attempt = |key: &'static str, text: &str| {
         server.send(
             call("owner", Method::POST, memories_path(ws, agent))
                 .naming(org)
-                .idempotent("memory-once")
+                .idempotent(key)
                 .body(json!({ "text": text })),
         )
     };
-    let (status, first) = attempt("Once.").await;
+    let (status, first) = attempt("memory-once", "Kept once, in the memory.").await;
     assert_eq!(status, StatusCode::CREATED, "{first}");
-    let (status, again) = attempt("Once.").await;
+    let (status, again) = attempt("memory-once", "Kept once, in the memory.").await;
     assert_eq!(
-        (status, &again),
-        (StatusCode::CREATED, &first),
-        "the first answer, again"
+        refusal(status, &again),
+        refused(StatusCode::CONFLICT, "idempotency_key_completed", &[])
     );
-    let (status, other) = attempt("Twice.").await;
+    assert_eq!(
+        again["error"]["message"],
+        "This request already completed, and its response held a memory's text, which is never kept. Find the \
+         memory in the agent's list, or start again with a new key."
+    );
+    let (status, other) = attempt("memory-once", "Twice.").await;
     assert_eq!(
         refusal(status, &other),
         refused(StatusCode::UNPROCESSABLE_ENTITY, "idempotency_key_reused", &[])
     );
     assert_eq!(
         listed(&server, "owner", org, ws, agent, "").await["data"],
-        json!([first["data"]])
+        json!([first["data"]]),
+        "saved once"
     );
+    let kept: Vec<(String, Option<i64>, Option<Vec<u8>>)> =
+        sqlx::query_as("SELECT state, status, body FROM idempotency_keys WHERE key = 'memory-once'")
+            .fetch_all(&pool(&server).await)
+            .await
+            .unwrap();
+    assert_eq!(
+        kept,
+        [("completed".to_owned(), Some(201), None)],
+        "its key completed, no answer kept"
+    );
+
+    // A refusal holds no one's words: it replays.
+    let (status, refused_once) = attempt("memory-refused", "").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused_once}");
+    assert_eq!(attempt("memory-refused", "").await, (status, refused_once));
 }
 
 /// Delivers what's queued, until nothing is left.
@@ -1406,6 +1438,7 @@ async fn audits_each_change_naming_the_memory_by_its_agent_and_short_id() {
     .await;
     forget(&server, "owner", org, ws, agent, id(&first)).await;
     let two = saved(&server, "owner", org, ws, agent, "Audited two.").await;
+    let two_more = saved(&server, "owner", org, ws, agent, "Audited two more.").await;
     let three = save(
         &server,
         "owner",
@@ -1427,14 +1460,14 @@ async fn audits_each_change_naming_the_memory_by_its_agent_and_short_id() {
         .send(call(
             "owner",
             Method::GET,
-            format!("/v1/organizations/{org}/audit-events?limit=7"),
+            format!("/v1/organizations/{org}/audit-events?limit=9"),
         ))
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let events = body["data"].as_array().unwrap();
     let mut recorded: Vec<Value> = events
         .iter()
-        .take(6)
+        .take(8)
         .map(|event| {
             json!([
                 event["action"],
@@ -1459,38 +1492,332 @@ async fn audits_each_change_naming_the_memory_by_its_agent_and_short_id() {
         entry("memory.updated", named(&first)),
         entry("memory.forgotten", named(&first)),
         entry("memory.saved", named(&two)),
+        entry("memory.saved", named(&two_more)),
         entry("memory.saved", named(&three)),
         entry(
             "agent.memory_forgotten",
-            json!({ "type": "agent", "id": agent, "name": "Keeper · 2 memories" }),
+            json!({ "type": "agent", "id": agent, "name": "Keeper · Notes · 2 memories" }),
+        ),
+        entry(
+            "agent.memory_forgotten",
+            json!({ "type": "agent", "id": agent, "name": "Keeper · Second · 1 memory" }),
         ),
     ];
     let order = |values: &mut Vec<Value>| values.sort_by_key(Value::to_string);
     order(&mut recorded);
     order(&mut expected);
-    assert_eq!(recorded, expected, "these six, and nothing for what changed nothing");
-    assert_eq!(events[6]["action"], "memory_type.created", "and before them, the type");
+    assert_eq!(
+        recorded, expected,
+        "these eight, one for each type forgotten at once, and nothing for what changed nothing"
+    );
+    assert_eq!(events[8]["action"], "memory_type.created", "and before them, the type");
     assert!(!body.to_string().contains("Audited"), "never the text");
 
-    // One memory forgotten at once is counted as one.
+    // One memory forgotten at once is counted as one, and a type that held
+    // none records nothing.
     saved(&server, "owner", org, ws, agent, "Alone.").await;
     forget_all(&server, "owner", org, ws, agent).await;
     let (_, body) = server
         .send(call(
             "owner",
             Method::GET,
-            format!("/v1/organizations/{org}/audit-events?limit=1"),
+            format!("/v1/organizations/{org}/audit-events?limit=2"),
         ))
         .await;
-    assert_eq!(body["data"][0]["target"]["name"], "Keeper · 1 memory");
+    assert_eq!(body["data"][0]["target"]["name"], "Keeper · Notes · 1 memory");
+    assert_eq!(body["data"][1]["action"], "memory.saved");
 }
 
+/// Runs `request` until it's been polled `polls` times, then drops it, as
+/// the server drops a request whose caller went away: its answer, if it
+/// finished first.
+async fn cut_off<F: Future>(polls: usize, request: F) -> Option<F::Output> {
+    let mut request = std::pin::pin!(request);
+    let mut polled = 0;
+    std::future::poll_fn(move |context| {
+        if polled == polls {
+            return Poll::Ready(None);
+        }
+        polled += 1;
+        request.as_mut().poll(context).map(Some)
+    })
+    .await
+}
+
+/// Waits for every transaction a dropped request left open to commit or
+/// roll back: a write of its own takes the database only after them.
+async fn settled(pool: &sqlx::SqlitePool) {
+    let transaction = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    transaction.commit().await.unwrap();
+}
+
+/// How many memories the agent keeps in a type.
+async fn held(server: &Server, org: &str, ws: &str, agent: &str, memory_type: &str) -> u64 {
+    listed(
+        server,
+        "owner",
+        org,
+        ws,
+        agent,
+        &format!("?memory_type={memory_type}&limit=1"),
+    )
+    .await["meta"]["pagination"]["total"]
+        .as_u64()
+        .unwrap()
+}
+
+/// Every item of a paged list, as the owner reads it.
+async fn every_item(server: &Server, path: &str) -> Vec<Value> {
+    let mut items = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let (status, body) = server
+            .send(call("owner", Method::GET, format!("{path}?limit=100{cursor}")))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        items.extend(body["data"].as_array().unwrap().iter().cloned());
+        match body["meta"]["pagination"]["next_cursor"].as_str() {
+            Some(next) => cursor = format!("&cursor={next}"),
+            None => return items,
+        }
+    }
+}
+
+/// How many of each there are, of those there are any of.
+fn tallied<'a>(names: impl IntoIterator<Item = (&'a str, usize)>) -> BTreeMap<String, usize> {
+    let mut tally = BTreeMap::new();
+    for (name, count) in names {
+        if count > 0 {
+            *tally.entry(name.to_owned()).or_insert(0) += count;
+        }
+    }
+    tally
+}
+
+/// What the changes made so far record: an audit event and a webhook event
+/// for each memory saved, changed or forgotten alone; a webhook event for
+/// each memory erased, and an audit event for each type erased.
+#[derive(Debug, Default)]
+struct Made {
+    saved: usize,
+    updated: usize,
+    forgotten: usize,
+    erased: usize,
+    types_erased: usize,
+}
+
+impl Made {
+    /// Holds what the organization's audit log and `endpoint`'s deliveries
+    /// have of memories to what was made: no more, and no less.
+    async fn recorded(&self, server: &Server, org: &str, endpoint: &str, what: &str) {
+        let events = every_item(server, &format!("/v1/organizations/{org}/audit-events")).await;
+        let audit = tallied(
+            events
+                .iter()
+                .map(|event| event["action"].as_str().unwrap())
+                .filter(|action| action.starts_with("memory.") || *action == "agent.memory_forgotten")
+                .map(|action| (action, 1)),
+        );
+        let deliveries = every_item(
+            server,
+            &format!("/v1/organizations/{org}/webhooks/{endpoint}/deliveries"),
+        )
+        .await;
+        let sent = tallied(
+            deliveries
+                .iter()
+                .map(|delivery| (delivery["event_type"].as_str().unwrap(), 1)),
+        );
+        assert_eq!(
+            audit,
+            tallied([
+                ("memory.saved", self.saved),
+                ("memory.updated", self.updated),
+                ("memory.forgotten", self.forgotten),
+                ("agent.memory_forgotten", self.types_erased),
+            ]),
+            "{what}: audited"
+        );
+        assert_eq!(
+            sent,
+            tallied([
+                ("memory.saved", self.saved),
+                ("memory.updated", self.updated),
+                ("memory.forgotten", self.forgotten + self.erased),
+            ]),
+            "{what}: sent"
+        );
+    }
+}
+
+/// The most polls a request is let run before the test gives up on it.
+const MOST_POLLS: usize = 2_000;
+
+/// A request cut off at any point leaves its change with its records, or
+/// neither: each save, change, forget and erasure is cut off after one poll,
+/// then two, and so on until one answers, and after each, what's kept and
+/// what's recorded agree. Some are made and cut off before their answer.
+#[tokio::test]
+async fn keeps_each_change_with_its_records_when_its_request_is_cut_off() {
+    let server = Server::new().await;
+    let t = tenant(&server).await;
+    let (org, ws) = (t.org.as_str(), t.sandbox.as_str());
+    // Room for every memory a cut-off request leaves.
+    let roomy = json!({ "max_notes": 1000 });
+    let types = [
+        notes_type(&server, org, "Roomy", roomy.clone()).await,
+        notes_type(&server, org, "Roomy too", roomy).await,
+    ];
+    let keeper = |name: &'static str| self::agent(&server, org, ws, name, &types[0]);
+    let events = json!(["memory.saved", "memory.updated", "memory.forgotten"]);
+    let endpoint = hook(&server, org, "sandbox", HOOK, events).await;
+    let pool = pool(&server).await;
+    let mut made = Made::default();
+    // Changes made, then cut off before their answer.
+    let mut unanswered = 0;
+
+    let saver = keeper("Saver").await;
+    let agent = saver.as_str();
+    for polls in 1..=MOST_POLLS {
+        let before = held(&server, org, ws, agent, &types[0]).await;
+        let text = format!("Saved within {polls} polls.");
+        let answer = cut_off(polls, save(&server, "owner", org, ws, agent, json!({ "text": text }))).await;
+        settled(&pool).await;
+        let after = held(&server, org, ws, agent, &types[0]).await;
+        assert!(after == before || after == before + 1, "{after} after {before}");
+        if after > before {
+            made.saved += 1;
+            unanswered += usize::from(answer.is_none());
+        }
+        made.recorded(&server, org, &endpoint, &format!("a save cut off after {polls} polls"))
+            .await;
+        if let Some((status, body)) = answer {
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            break;
+        }
+        assert!(polls < MOST_POLLS, "a save answers");
+    }
+
+    let changer = keeper("Changer").await;
+    let agent = changer.as_str();
+    let target = saved(&server, "owner", org, ws, agent, "To be changed.").await;
+    made.saved += 1;
+    for polls in 1..=MOST_POLLS {
+        let text = format!("Changed within {polls} polls.");
+        let answer = cut_off(
+            polls,
+            update(&server, "owner", org, ws, agent, id(&target), json!({ "text": text })),
+        )
+        .await;
+        settled(&pool).await;
+        let (_, now) = get(&server, "owner", org, ws, agent, id(&target)).await;
+        if now["data"]["text"] == text.as_str() {
+            made.updated += 1;
+            unanswered += usize::from(answer.is_none());
+        }
+        made.recorded(
+            &server,
+            org,
+            &endpoint,
+            &format!("a change cut off after {polls} polls"),
+        )
+        .await;
+        if let Some((status, body)) = answer {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            break;
+        }
+        assert!(polls < MOST_POLLS, "a change answers");
+    }
+
+    let forgetter = keeper("Forgetter").await;
+    let agent = forgetter.as_str();
+    for polls in 1..=MOST_POLLS {
+        let target = saved(
+            &server,
+            "owner",
+            org,
+            ws,
+            agent,
+            &format!("Forgotten within {polls} polls."),
+        )
+        .await;
+        made.saved += 1;
+        let answer = cut_off(polls, forget(&server, "owner", org, ws, agent, id(&target))).await;
+        settled(&pool).await;
+        let (status, _) = get(&server, "owner", org, ws, agent, id(&target)).await;
+        if status == StatusCode::NOT_FOUND {
+            made.forgotten += 1;
+            unanswered += usize::from(answer.is_none());
+        }
+        made.recorded(
+            &server,
+            org,
+            &endpoint,
+            &format!("a forget cut off after {polls} polls"),
+        )
+        .await;
+        if let Some((status, body)) = answer {
+            assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+            break;
+        }
+        assert!(polls < MOST_POLLS, "a forget answers");
+    }
+
+    let eraser = keeper("Eraser").await;
+    let agent = eraser.as_str();
+    for polls in 1..=MOST_POLLS {
+        // A memory in each type: as many as an erasure cut off left, or one.
+        let mut before = Vec::new();
+        for memory_type in &types {
+            if held(&server, org, ws, agent, memory_type).await == 0 {
+                let body = json!({ "text": format!("Erased within {polls} polls."), "memory_type_id": memory_type });
+                let (status, body) = save(&server, "owner", org, ws, agent, body).await;
+                assert_eq!(status, StatusCode::CREATED, "{body}");
+                made.saved += 1;
+            }
+            before.push(held(&server, org, ws, agent, memory_type).await);
+        }
+        let answer = cut_off(polls, forget_all(&server, "owner", org, ws, agent)).await;
+        settled(&pool).await;
+        for (memory_type, before) in types.iter().zip(before) {
+            let after = held(&server, org, ws, agent, memory_type).await;
+            if after == 0 {
+                made.erased += usize::try_from(before).unwrap();
+                made.types_erased += 1;
+                unanswered += usize::from(answer.is_none());
+            } else {
+                assert_eq!(after, before, "a type's memories go at once, or none of them");
+            }
+        }
+        made.recorded(
+            &server,
+            org,
+            &endpoint,
+            &format!("an erasure cut off after {polls} polls"),
+        )
+        .await;
+        if let Some((status, body)) = answer {
+            assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+            break;
+        }
+        assert!(polls < MOST_POLLS, "an erasure answers");
+    }
+    assert!(unanswered > 0, "some changes were made and cut off before their answer");
+}
+
+/// What happens while a save is under way, before the kind keeps it.
+type Meanwhile = Pin<Box<dyn Future<Output = ()> + Send>>;
+
 /// The `notes` kind over the server's database, letting people do only what
-/// [`Limited::manage`] says, and keeping what it's asked to forget all of.
+/// [`Limited::manage`] says, keeping what it's asked to forget all of, and
+/// letting a test act while a save is under way.
 struct Limited {
     notes: Notes,
     manage: Mutex<Manage>,
     forgotten: Mutex<Vec<Forget>>,
+    /// How many of the next requests to forget fail.
+    failures: Mutex<u32>,
+    meanwhile: Mutex<Option<Meanwhile>>,
 }
 
 impl Limited {
@@ -1504,11 +1831,24 @@ impl Limited {
                 forget: true,
             }),
             forgotten: Mutex::new(Vec::new()),
+            failures: Mutex::new(0),
+            meanwhile: Mutex::new(None),
         })
     }
 
     fn allow(&self, change: impl FnOnce(&mut Manage)) {
         change(&mut self.manage.lock().unwrap());
+    }
+
+    /// Fails the next `times` requests to forget, as a kind out of reach
+    /// would.
+    fn fail_to_forget(&self, times: u32) {
+        *self.failures.lock().unwrap() = times;
+    }
+
+    /// Runs `meanwhile` while the next save is under way.
+    fn during_next_save(&self, meanwhile: impl Future<Output = ()> + Send + 'static) {
+        *self.meanwhile.lock().unwrap() = Some(Box::pin(meanwhile));
     }
 }
 
@@ -1571,12 +1911,18 @@ impl MemoryProvider for Limited {
     async fn add(
         &self,
         scope: &MemoryScope,
+        id: MemoryId,
         origin: &Origin,
         settings: &Settings,
         text: &str,
         now: Timestamp,
+        record: &Record<'_>,
     ) -> Result<Memory, MemoryError> {
-        self.notes.add(scope, origin, settings, text, now).await
+        let meanwhile = self.meanwhile.lock().unwrap().take();
+        if let Some(meanwhile) = meanwhile {
+            meanwhile.await;
+        }
+        self.notes.add(scope, id, origin, settings, text, now, record).await
     }
 
     async fn change(
@@ -1586,16 +1932,35 @@ impl MemoryProvider for Limited {
         id: MemoryId,
         text: &str,
         now: Timestamp,
+        record: &Record<'_>,
     ) -> Result<Rewritten, MemoryError> {
-        self.notes.change(scope, origin, id, text, now).await
+        self.notes.change(scope, origin, id, text, now, record).await
     }
 
-    async fn forget(&self, scope: &MemoryScope, id: MemoryId) -> Result<Memory, MemoryError> {
-        self.notes.forget(scope, id).await
+    async fn forget(&self, scope: &MemoryScope, id: MemoryId, record: &Record<'_>) -> Result<Memory, MemoryError> {
+        self.notes.forget(scope, id, record).await
+    }
+
+    async fn forget_scope(
+        &self,
+        scope: &MemoryScope,
+        record: &Record<'_>,
+        counted: &Audit<'_, u64>,
+    ) -> Result<u64, MemoryError> {
+        self.notes.forget_scope(scope, record, counted).await
     }
 
     async fn forget_all(&self, what: &Forget) -> Result<(), MemoryError> {
         self.forgotten.lock().unwrap().push(*what);
+        let failing = {
+            let mut failures = self.failures.lock().unwrap();
+            let failing = *failures > 0;
+            *failures = failures.saturating_sub(1);
+            failing
+        };
+        if failing {
+            return Err(MemoryError::Unavailable);
+        }
         self.notes.forget_all(what).await
     }
 }
@@ -1691,69 +2056,251 @@ async fn refuses_what_a_kind_does_not_let_people_do() {
     assert_eq!(refusal(status, &body), unsupported);
     let (status, body) = forget(&server, "owner", org, ws, agent, missing).await;
     assert_eq!(refusal(status, &body), not_found());
-    // Forgetting everything leaves what people can't forget.
-    assert_eq!(
-        forget_all(&server, "owner", org, ws, agent).await.0,
-        StatusCode::NO_CONTENT
-    );
     limited.allow(|manage| manage.forget = true);
-    limited.allow(|manage| manage.list = false);
+    assert_eq!(
+        listed(&server, "owner", org, ws, agent, "").await["data"],
+        json!([kept]),
+        "each refusal changed nothing"
+    );
+
+    // Forgetting everything is an erasure: whatever the kind lets people
+    // do, nothing of the agent's is left.
+    limited.allow(|manage| {
+        *manage = Manage {
+            list: false,
+            add: false,
+            change: false,
+            forget: false,
+        }
+    });
     assert_eq!(
         forget_all(&server, "owner", org, ws, agent).await.0,
         StatusCode::NO_CONTENT
     );
     limited.allow(|manage| manage.list = true);
-
     assert_eq!(
         listed(&server, "owner", org, ws, agent, "").await["data"],
-        json!([kept])
+        json!([]),
+        "erased"
     );
-    assert!(limited.forgotten.lock().unwrap().is_empty());
+    assert!(limited.forgotten.lock().unwrap().is_empty(), "nothing was deleted");
 }
 
+/// A save whose type goes while it's under way is refused as a save naming
+/// a type that isn't the organization's; one whose agent goes, as one for
+/// an agent that isn't there. Nothing is kept, and nothing recorded.
 #[tokio::test]
-async fn forgets_a_deleted_types_memories_through_its_kind() {
+async fn refuses_a_save_whose_type_or_agent_goes_meanwhile() {
     let mut server = Server::new().await;
     let t = tenant(&server).await;
-    let (org, ws, agent) = (t.org.as_str(), t.sandbox.as_str(), t.agent.as_str());
+    let (org, ws) = (t.org.as_str(), t.sandbox.as_str());
     let limited = Limited::over(&server);
     serve(&mut server, MemoryProviders::none().with(limited.clone()));
-    let going = notes_type(&server, org, "Going", json!({})).await;
-    let kept = saved(&server, "owner", org, ws, agent, "Stays with its type.").await;
+    let pool = pool(&server).await;
+    let going_type = notes_type(&server, org, "Going", json!({})).await;
+    let going_agent = agent(&server, org, ws, "Going", &t.memory_type).await;
+    let gone = |statement: &'static str, id: uuid::Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(statement).bind(id).execute(&pool).await.unwrap();
+        }
+    };
+
+    limited.during_next_save(gone(
+        "DELETE FROM memory_types WHERE id = ?",
+        MemoryTypeId::parse(&going_type).unwrap().uuid(),
+    ));
+    let body = json!({ "text": "Never kept.", "memory_type_id": going_type });
+    let (status, answer) = save(&server, "owner", org, ws, &t.agent, body).await;
+    assert_eq!(
+        refusal(status, &answer),
+        refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown_memory_type",
+            &["memory_type_id"]
+        )
+    );
+
+    limited.during_next_save(gone(
+        "DELETE FROM agents WHERE id = ?",
+        AgentId::parse(&going_agent).unwrap().uuid(),
+    ));
+    let (status, answer) = save(
+        &server,
+        "owner",
+        org,
+        ws,
+        &going_agent,
+        json!({ "text": "Never kept." }),
+    )
+    .await;
+    assert_eq!(refusal(status, &answer), not_found());
+    assert_eq!(answer["error"]["message"], "Agent was not found.");
+
+    assert!(texts(&server, org, ws, &t.agent, "").await.is_empty(), "nothing kept");
+    let (_, events) = server
+        .send(call(
+            "owner",
+            Method::GET,
+            format!("/v1/organizations/{org}/audit-events?limit=100"),
+        ))
+        .await;
+    assert!(
+        events["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["action"] != "memory.saved"),
+        "nothing recorded"
+    );
+}
+
+/// The server's database, for what the API doesn't show: the queue's jobs.
+async fn pool(server: &Server) -> sqlx::SqlitePool {
+    sqlx::SqlitePool::connect(&format!("sqlite:{}", server.directory.join("zupflow.sqlite").display()))
+        .await
+        .unwrap()
+}
+
+/// Each forget job's state and attempts so far, oldest first.
+async fn forget_jobs(pool: &sqlx::SqlitePool) -> Vec<(String, i64)> {
+    sqlx::query_as("SELECT state, attempts FROM jobs WHERE kind = ? ORDER BY created_at")
+        .bind(FORGET_JOB)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// Deletes what `path` names, as the owner.
+async fn deleted(server: &Server, org: &str, path: String) {
+    let (status, body) = server.send(call("owner", Method::DELETE, path).naming(org)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// Works the forget jobs that are due, until none is.
+async fn forget_what_is_due(server: &Server) {
+    while memory_forgetting::work_once(&server.state).await {}
+}
+
+/// A kind that fails to forget is asked again after a wait, an attempt used
+/// each time, until it has forgotten.
+#[tokio::test]
+async fn asks_a_kind_that_fails_to_forget_again_until_it_has() {
+    let mut server = Server::new().await;
+    let t = tenant(&server).await;
+    let (org, ws) = (t.org.as_str(), t.sandbox.as_str());
+    let limited = Limited::over(&server);
+    serve(&mut server, MemoryProviders::none().with(limited.clone()));
+    let pool = pool(&server).await;
+
+    let going = agent(&server, org, ws, "Going", &t.memory_type).await;
+    saved(&server, "owner", org, ws, &going, "Goes with its agent.").await;
+    limited.fail_to_forget(2);
+    deleted(&server, org, format!("/v1/workspaces/{ws}/agents/{going}")).await;
+    for attempts in 1..=2 {
+        assert!(memory_forgetting::work_once(&server.state).await, "claimed");
+        assert_eq!(
+            forget_jobs(&pool).await,
+            [("queued".to_owned(), attempts)],
+            "failed, an attempt used"
+        );
+        assert!(
+            !memory_forgetting::work_once(&server.state).await,
+            "asked again only after a wait"
+        );
+        sqlx::query("UPDATE jobs SET run_at = 0 WHERE state = 'queued'")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    forget_what_is_due(&server).await;
+    assert!(forget_jobs(&pool).await.is_empty(), "forgotten at last");
+    let gone = Forget::Agent {
+        organization_id: OrganizationId::parse(org).unwrap(),
+        workspace_id: WorkspaceId::parse(ws).unwrap(),
+        agent_id: AgentId::parse(&going).unwrap(),
+    };
+    assert_eq!(*limited.forgotten.lock().unwrap(), [gone; 3], "asked until it had");
+}
+
+/// Deleting an agent, a workspace or a type has each memory kind forget
+/// what went with it, by a job queued with the deletion: the worker asks
+/// the kind once, naming what went by its IDs, and a refused deletion asks
+/// nothing. A kind this server doesn't serve waits for one that does,
+/// without using an attempt.
+#[tokio::test]
+async fn has_each_kind_forget_what_a_deletion_leaves_it() {
+    let mut server = Server::new().await;
+    let t = tenant(&server).await;
+    let (org, ws) = (t.org.as_str(), t.sandbox.as_str());
+    let limited = Limited::over(&server);
+    serve(&mut server, MemoryProviders::none().with(limited.clone()));
+    let pool = pool(&server).await;
+    let organization_id = OrganizationId::parse(org).unwrap();
+    let asked = || limited.forgotten.lock().unwrap().clone();
+
+    let going = agent(&server, org, ws, "Going", &t.memory_type).await;
+    saved(&server, "owner", org, ws, &going, "Goes with its agent.").await;
+    deleted(&server, org, format!("/v1/workspaces/{ws}/agents/{going}")).await;
+    assert_eq!(forget_jobs(&pool).await, [("queued".to_owned(), 0)], "queued with it");
+    assert!(asked().is_empty(), "asked by the worker, not by the request");
+    forget_what_is_due(&server).await;
+    let agent_gone = Forget::Agent {
+        organization_id,
+        workspace_id: WorkspaceId::parse(ws).unwrap(),
+        agent_id: AgentId::parse(&going).unwrap(),
+    };
+    assert_eq!(asked(), [agent_gone], "an agent's, in every type");
+    assert!(forget_jobs(&pool).await.is_empty(), "and done");
+
+    let third = id(&server.workspace("owner", org, "acme-third", "sandbox").await).to_owned();
+    let there = agent(&server, org, &third, "There", &t.memory_type).await;
+    saved(&server, "owner", org, &third, &there, "Goes with its workspace.").await;
+    deleted(&server, org, format!("/v1/workspaces/{third}")).await;
+    forget_what_is_due(&server).await;
+    let workspace_gone = Forget::Workspace {
+        organization_id,
+        workspace_id: WorkspaceId::parse(&third).unwrap(),
+    };
+    assert_eq!(asked(), [agent_gone, workspace_gone], "a workspace's");
+
+    let going_type = notes_type(&server, org, "Going", json!({})).await;
+    let kept = saved(&server, "owner", org, ws, &t.agent, "Stays with its type.").await;
     let gone = save(
         &server,
         "owner",
         org,
         ws,
-        agent,
-        json!({ "text": "Goes with its type.", "memory_type_id": going }),
+        &t.agent,
+        json!({ "text": "Goes with its type.", "memory_type_id": going_type }),
     )
     .await
     .1["data"]
         .clone();
-    let (status, body) = server
-        .send(call(
-            "owner",
-            Method::DELETE,
-            format!("/v1/organizations/{org}/memory-types/{going}"),
-        ))
-        .await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    deleted(
+        &server,
+        org,
+        format!("/v1/organizations/{org}/memory-types/{going_type}"),
+    )
+    .await;
+    forget_what_is_due(&server).await;
+    let type_gone = Forget::Type {
+        organization_id,
+        memory_type_id: MemoryTypeId::parse(&going_type).unwrap(),
+    };
     assert_eq!(
-        *limited.forgotten.lock().unwrap(),
-        [Forget::Type {
-            organization_id: OrganizationId::parse(org).unwrap(),
-            memory_type_id: MemoryTypeId::parse(&going).unwrap(),
-        }],
-        "asked once, for that type in every workspace"
+        asked(),
+        [agent_gone, workspace_gone, type_gone],
+        "a type's, in every workspace"
     );
-    let (status, body) = get(&server, "owner", org, ws, agent, id(&gone)).await;
+    let (status, body) = get(&server, "owner", org, ws, &t.agent, id(&gone)).await;
     assert_eq!(refusal(status, &body), not_found());
     assert_eq!(
-        listed(&server, "owner", org, ws, agent, "").await["data"],
+        listed(&server, "owner", org, ws, &t.agent, "").await["data"],
         json!([kept])
     );
-    // A type that isn't deleted asks nothing.
+
+    // A deletion refused asks nothing.
     let (status, _) = server
         .send(call(
             "owner",
@@ -1762,5 +2309,41 @@ async fn forgets_a_deleted_types_memories_through_its_kind() {
         ))
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "in use");
-    assert_eq!(limited.forgotten.lock().unwrap().len(), 1);
+    let (status, _) = server
+        .send(call("owner", Method::DELETE, format!("/v1/workspaces/{ws}/agents/{going}")).naming(org))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "gone already");
+    assert!(forget_jobs(&pool).await.is_empty());
+
+    // A kind this server doesn't serve: the job waits, using no attempt.
+    let waiting = agent(&server, org, ws, "Waiting", &t.memory_type).await;
+    serve(&mut server, MemoryProviders::none());
+    deleted(&server, org, format!("/v1/workspaces/{ws}/agents/{waiting}")).await;
+    assert!(memory_forgetting::work_once(&server.state).await, "claimed");
+    assert_eq!(
+        forget_jobs(&pool).await,
+        [("queued".to_owned(), 0)],
+        "put back, no attempt used"
+    );
+    assert!(
+        !memory_forgetting::work_once(&server.state).await,
+        "and not due again at once"
+    );
+    serve(&mut server, MemoryProviders::none().with(limited.clone()));
+    sqlx::query("UPDATE jobs SET run_at = 0 WHERE state = 'queued'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    forget_what_is_due(&server).await;
+    assert_eq!(
+        asked().last(),
+        Some(&Forget::Agent {
+            organization_id,
+            workspace_id: WorkspaceId::parse(ws).unwrap(),
+            agent_id: AgentId::parse(&waiting).unwrap(),
+        }),
+        "asked once a server serves it"
+    );
+    assert_eq!(asked().len(), 4);
+    assert!(forget_jobs(&pool).await.is_empty());
 }

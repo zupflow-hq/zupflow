@@ -14,8 +14,9 @@
 //!   credential: its key belongs to the session its link names.
 //! - The same key and request replays the saved status and body; another
 //!   request answers `422`, one still in flight `409`.
-//! - `5xx` saves nothing. A route that shows a secret once saves that it
-//!   completed, never its body: a retry answers `409 idempotency_key_completed`.
+//! - `5xx` saves nothing. A route that shows a secret once, or whose answer
+//!   holds what people wrote, saves that it completed, never its body: a
+//!   retry answers `409 idempotency_key_completed`.
 
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{FromRequestParts, MatchedPath, RawPathParams, Request, State};
@@ -40,6 +41,28 @@ pub const SHOWS_SECRET_ONCE: [&str; 5] = [
     "/v1/workspaces/{ws}/connect-sessions",
     "/v1/connect/sessions/{reference}/authorize",
 ];
+
+/// Routes whose answer holds what people wrote, a memory's text, which is
+/// never kept, as the contract marks them (`x-zupflow-answer-never-kept`);
+/// a test holds the two lists equal.
+pub const ANSWER_NEVER_KEPT: [&str; 1] = ["/v1/workspaces/{ws}/agents/{agent}/memories"];
+
+/// Whether a route's successful answer is kept for a retry to replay.
+fn keeps_answer(template: &str) -> bool {
+    !SHOWS_SECRET_ONCE.contains(&template) && !ANSWER_NEVER_KEPT.contains(&template)
+}
+
+/// What a retry is told of a request that completed without its answer kept.
+fn completed_unkept(template: &str) -> Failure {
+    let message = if ANSWER_NEVER_KEPT.contains(&template) {
+        "This request already completed, and its response held a memory's text, which is never kept. Find the \
+         memory in the agent's list, or start again with a new key."
+    } else {
+        "This request already completed, and its response showed a secret that is never shown twice. Find the \
+         resource in its list, or start again with a new key."
+    };
+    Failure(ApiError::new(409, "idempotency_key_completed", message))
+}
 
 /// The same limit the routes read bodies with.
 const MAX_BODY_BYTES: usize = 64 << 10;
@@ -251,13 +274,7 @@ pub async fn idempotency(State(state): State<AppState>, request: Request, next: 
             .into_response();
         }
         Ok(Begun::Replay { status, body: None }) if status != 204 => {
-            return Failure(ApiError::new(
-                409,
-                "idempotency_key_completed",
-                "This request already completed, and its response showed a secret that is never shown twice. \
-                 Find the resource in its list, or start again with a new key.",
-            ))
-            .into_response();
+            return completed_unkept(&template).into_response();
         }
         Ok(Begun::Replay { status, body }) => return replay(status, body),
         Ok(Begun::Run(lock)) => lock,
@@ -294,9 +311,9 @@ async fn run_and_save(
         // Nothing is saved for a server error, so a retry runs again.
         state.idempotency.abandon(&scope, &key, &lock).await
     } else {
-        // An error carries no secret; a success from a secret-once route is never kept.
-        let body =
-            (!(status.is_success() && SHOWS_SECRET_ONCE.contains(&template.as_str()))).then(|| response_bytes.to_vec());
+        // An error carries no secret and no one's words; a success is kept
+        // unless its route says never to.
+        let body = (!status.is_success() || keeps_answer(&template)).then(|| response_bytes.to_vec());
         state
             .idempotency
             .complete(&scope, &key, &lock, status.as_u16(), body)

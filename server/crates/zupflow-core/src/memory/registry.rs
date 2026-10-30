@@ -15,8 +15,10 @@ use serde_json::{Map, Value, json};
 
 use super::{
     Audience, CallContext, CallResult, Forget, KindDescription, Manage, Memory, MemoryError, MemoryFilter, MemoryKind,
-    MemoryProvider, MemoryScope, MemoryTool, MemoryWrites, Origin, Recall, Rewritten, Settings, SettingsRefusal,
+    MemoryProvider, MemoryScope, MemoryTool, MemoryWrites, Origin, Recall, Record, Rewritten, Settings,
+    SettingsRefusal,
 };
+use crate::audit::Audit;
 use crate::ids::MemoryId;
 use crate::time::Timestamp;
 use crate::workspaces::Page;
@@ -148,10 +150,12 @@ impl MemoryProvider for Unserved {
     async fn add(
         &self,
         _: &MemoryScope,
+        _: MemoryId,
         _: &Origin,
         _: &Settings,
         _: &str,
         _: Timestamp,
+        _: &Record<'_>,
     ) -> Result<Memory, MemoryError> {
         Err(MemoryError::NotServed)
     }
@@ -163,11 +167,16 @@ impl MemoryProvider for Unserved {
         _: MemoryId,
         _: &str,
         _: Timestamp,
+        _: &Record<'_>,
     ) -> Result<Rewritten, MemoryError> {
         Err(MemoryError::NotServed)
     }
 
-    async fn forget(&self, _: &MemoryScope, _: MemoryId) -> Result<Memory, MemoryError> {
+    async fn forget(&self, _: &MemoryScope, _: MemoryId, _: &Record<'_>) -> Result<Memory, MemoryError> {
+        Err(MemoryError::NotServed)
+    }
+
+    async fn forget_scope(&self, _: &MemoryScope, _: &Record<'_>, _: &Audit<'_, u64>) -> Result<u64, MemoryError> {
         Err(MemoryError::NotServed)
     }
 
@@ -181,7 +190,14 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::audit::AuditEntry;
     use crate::ids::{AgentId, MemoryTypeId, OrganizationId, UserId, WorkspaceId};
+    use crate::memory::record_nothing;
+
+    /// A count's audit event, for a kind that forgets nothing.
+    fn never_counted(_: &u64) -> AuditEntry {
+        unreachable!("nothing is forgotten, so nothing is counted")
+    }
 
     /// A kind that names itself in its description, and keeps nothing.
     struct Named {
@@ -236,10 +252,12 @@ mod tests {
         async fn add(
             &self,
             _: &MemoryScope,
+            _: MemoryId,
             _: &Origin,
             _: &Settings,
             _: &str,
             _: Timestamp,
+            _: &Record<'_>,
         ) -> Result<Memory, MemoryError> {
             Err(MemoryError::Unsupported)
         }
@@ -250,10 +268,14 @@ mod tests {
             _: MemoryId,
             _: &str,
             _: Timestamp,
+            _: &Record<'_>,
         ) -> Result<Rewritten, MemoryError> {
             Err(MemoryError::Unsupported)
         }
-        async fn forget(&self, _: &MemoryScope, _: MemoryId) -> Result<Memory, MemoryError> {
+        async fn forget(&self, _: &MemoryScope, _: MemoryId, _: &Record<'_>) -> Result<Memory, MemoryError> {
+            Err(MemoryError::Unsupported)
+        }
+        async fn forget_scope(&self, _: &MemoryScope, _: &Record<'_>, _: &Audit<'_, u64>) -> Result<u64, MemoryError> {
             Err(MemoryError::Unsupported)
         }
         async fn forget_all(&self, _: &Forget) -> Result<(), MemoryError> {
@@ -314,9 +336,22 @@ mod tests {
         );
         assert_eq!(
             stand_in
-                .add(&scope(), &origin, &settings, "x", Timestamp::from_millis(0))
+                .add(
+                    &scope(),
+                    MemoryId::from_uuid(Uuid::from_u128(6)),
+                    &origin,
+                    &settings,
+                    "x",
+                    Timestamp::from_millis(0),
+                    &record_nothing,
+                )
                 .await,
             Err(MemoryError::NotServed)
+        );
+        assert_eq!(
+            stand_in.forget_scope(&scope(), &record_nothing, &never_counted).await,
+            Err(MemoryError::NotServed),
+            "nothing to forget"
         );
         assert_eq!(
             stand_in.get(&scope(), MemoryId::from_uuid(Uuid::from_u128(6))).await,

@@ -9,10 +9,6 @@
 //! given and, for an event in a workspace, the workspace's environment as
 //! stored.
 //!
-//! A change no store of the server makes, one a memory kind makes to the
-//! memories it keeps itself, is recorded right after it, with
-//! [`AuditStore::record`].
-//!
 //! The log keeps history: an event of a workspace outlives the workspace,
 //! still naming its ID (the workspace reference is then `null`). Events go
 //! only with their organization.
@@ -424,8 +420,8 @@ actions! {
     /// Its text changed.
     MemoryUpdated => "memory.updated",
     MemoryForgotten => "memory.forgotten",
-    /// Everything an agent kept in its workspace forgotten at once, named
-    /// with how many.
+    /// Everything an agent kept in one memory type in its workspace
+    /// forgotten at once, named with the type and how many.
     AgentMemoryForgotten => "agent.memory_forgotten",
 }
 
@@ -509,19 +505,10 @@ pub enum AuditError {
     /// A cursor this store didn't issue.
     #[error("not a cursor from this list")]
     InvalidCursor,
-    /// An event placed in a workspace the organization doesn't hold.
-    #[error("no such workspace")]
-    NotFound,
 }
 
 #[async_trait]
 pub trait AuditStore: Send + Sync {
-    /// Records the event of a change no store made in its own transaction,
-    /// once the change is made: in the organization and, placed in a
-    /// workspace, with the workspace's environment as stored. `NotFound`,
-    /// recording nothing, when the organization holds no such workspace.
-    async fn record(&self, organization_id: OrganizationId, entry: &AuditEntry) -> Result<(), AuditError>;
-
     /// A page of the organization's events, newest first, at most `limit`
     /// (clamped to 1–[`MAX_PAGE`]). A cursor names a position only: used in
     /// another organization it starts there among that organization's own.

@@ -511,16 +511,23 @@ eight attempts, at least once, unordered, the same event ID every time. An
 endpoint that has failed every attempt for three days is disabled; enabling
 it again doesn't replay what it missed.
 
-A memory kind keeps an agent's memories itself, outside the server's
-database, so a memory saved, changed or forgotten through the API or the
-Console is recorded right after the kind makes the change, before the
-answer: its `memory.saved`, `memory.updated` or `memory.forgotten` event
-(the memory, its agent and type, and who wrote its text, never the text)
-with its deliveries, then its audit event. Text a memory already holds
-changes nothing and records nothing. Forgetting all of an agent's memories
-sends one event per memory and records one audit event with the count;
-deleting an agent, a workspace or a memory type forgets its memories without
-an event for each.
+A memory saved, changed or forgotten through the API or the Console is
+recorded with the change, in the transaction the memory kind makes it in:
+its `memory.saved`, `memory.updated` or `memory.forgotten` event (the
+memory, its agent and type, and who wrote its text, never the text) with its
+deliveries, and its audit event. A request cut off leaves the change with
+its records, or neither, and a kind that keeps its memories outside the
+server's database commits them with its change all the same. Text a memory
+already holds changes nothing and records nothing. Forgetting all of an
+agent's memories is an erasure, whatever its kinds let people do: each
+memory type at once, with one event per memory and one audit event naming
+the type and the count. Deleting an agent, a workspace or a memory type
+queues, in the same transaction, a job for each memory kind of the
+organization's types (the type's own kind, for a type) that has the kind
+forget what went, by its IDs, without an event for each. A worker asks the
+kind until it has, backing off up to sixty minutes apart and giving up,
+loudly, only after more than three days; a kind the server doesn't serve
+waits, without using an attempt, for a server that does.
 
 Each endpoint has paginated delivery history at
 `GET /v1/organizations/{org}/webhooks/{hook}/deliveries`, filtered by

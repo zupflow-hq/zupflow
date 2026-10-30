@@ -185,8 +185,9 @@ pub trait MemoryTypeStore: Send + Sync {
 
     /// Deletes the type, recording `audit` of it as it was. `InUse` while
     /// it's the default or an agent names it. Its memories kept in the same
-    /// database go with it, in the same transaction; a kind that keeps them
-    /// elsewhere forgets them when told ([`super::MemoryProvider::forget_all`]).
+    /// database go with it, in the same transaction, which queues the job
+    /// that has its kind forget them wherever it keeps them
+    /// ([`super::Forget::job`]).
     async fn delete_type(
         &self,
         organization_id: OrganizationId,

@@ -7,8 +7,10 @@
 //! memory only a type of its own organization (through the `AgentStore`),
 //! and never one deleted at once;
 //! every change made only by an owner or admin who still may, with one
-//! audit event, and none for a refused change; and a run's memory resolved
-//! from the agent's own type, else the default, else none.
+//! audit event, and none for a refused change; a run's memory resolved
+//! from the agent's own type, else the default, else none; and deleting an
+//! agent, a workspace or a type queuing, with it, the job that has each
+//! memory kind forget what went, and a refused deletion queuing none.
 //!
 //! `prepare` makes a [`Tenant`] exist: its organization, a Sandbox and a
 //! Production workspace (each named), an active owner, admin and developer,
@@ -25,12 +27,17 @@ use zupflow_core::audit::{
 };
 use zupflow_core::ids::{AgentId, MemberId, MemoryId, MemoryTypeId, OrganizationId, UserId, WorkspaceId};
 use zupflow_core::installations::ShortId;
+use zupflow_core::jobs::JobQueue;
 use zupflow_core::memory::notes::{self, NewNote, NoteStore};
 use zupflow_core::memory::type_store::{
     DefaultMemoryType, MemoryType, MemoryTypeChanges, MemoryTypeError, MemoryTypeStore, NewMemoryType, RunMemory,
 };
-use zupflow_core::memory::{AgentMemory, MemoryKind, MemoryScope, MemoryWrites, Origin, Settings};
+use zupflow_core::memory::{
+    AgentMemory, FORGET_JOB, Forget, MemoryKind, MemoryScope, MemoryWrites, Origin, Settings, record_nothing,
+};
+use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
+use zupflow_core::workspaces::{WorkspaceError, WorkspaceStore};
 
 use crate::audit_store::by_suite_in;
 
@@ -54,12 +61,16 @@ pub struct Tenant {
 pub type Prepare = Arc<dyn Fn(Tenant) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// The stores the suite drives: the one under test, agents that name its
-/// types, the notes kept in them, and the log its changes write.
+/// types, the notes kept in them, the log its changes write, the workspaces
+/// agents work in, and the queue deletions queue their forget jobs on, in
+/// the same store.
 pub struct Stores<'a> {
     pub types: &'a dyn MemoryTypeStore,
     pub agents: &'a dyn AgentStore,
     pub notes: &'a dyn NoteStore,
     pub audit: &'a dyn AuditStore,
+    pub workspaces: &'a dyn WorkspaceStore,
+    pub jobs: &'a dyn JobQueue,
 }
 
 pub async fn run(stores: Stores<'_>, prepare: Prepare) {
@@ -72,6 +83,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     resolves_a_runs_memory(&stores, &prepare).await;
     lets_only_owners_and_admins_change(&stores, &prepare).await;
     keeps_organizations_apart(&stores, &prepare).await;
+    queues_forgetting_with_each_deletion(&stores, &prepare).await;
 }
 
 async fn tenant(prepare: &Prepare) -> Tenant {
@@ -595,6 +607,7 @@ async fn keeps_what_is_in_use(stores: &Stores<'_>, prepare: &Prepare) {
                 },
                 200,
                 at(3),
+                &record_nothing,
             )
             .await
             .unwrap();
@@ -917,4 +930,143 @@ async fn keeps_organizations_apart(stores: &Stores<'_>, prepare: &Prepare) {
     delete(stores, &b, theirs.id).await.unwrap();
     assert!(types.find_type(a.organization_id, ours.id).await.unwrap().is_some());
     assert_eq!(events(stores, &b).await.len(), 2, "b's own changes only");
+}
+
+/// The forget jobs queued for the organization, each read back as what it
+/// forgets and the kind that forgets it, sorted, every forget job claimed
+/// finished: the suite's tenants share one queue.
+async fn forget_jobs(stores: &Stores<'_>, organization_id: OrganizationId) -> Vec<(String, Forget)> {
+    let kinds = [Name::new(FORGET_JOB).unwrap()];
+    let mut queued = Vec::new();
+    while let Some(job) = stores
+        .jobs
+        .claim_next(&kinds, std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+    {
+        let (what, kind) = Forget::of_job(&job.payload).expect("a forget job names what it forgets");
+        if what.organization_id() == organization_id {
+            assert_eq!(
+                job.scope,
+                Scope::Organization(organization_id),
+                "in the organization's scope"
+            );
+            queued.push((kind.as_str().to_owned(), what));
+        }
+        stores.jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+    }
+    queued.sort_by_key(|(kind, what)| (kind.clone(), format!("{what:?}")));
+    queued
+}
+
+/// Deleting an agent, a workspace or a type queues with it, in the
+/// organization's scope, the job that has each memory kind forget what went
+/// ([`FORGET_JOB`]), naming it by its IDs: for an agent or a workspace, one
+/// for each kind of the organization's types at that moment; for a type,
+/// one for its own kind. A deletion refused queues none.
+async fn queues_forgetting_with_each_deletion(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let org = t.organization_id;
+    forget_jobs(stores, org).await;
+    let delete_agent = |agent: Agent| async move {
+        stores
+            .agents
+            .delete_agent(org, agent.workspace_id, agent.id, &|_| by_suite_in(agent.workspace_id))
+            .await
+    };
+    let forget_agent = |agent: &Agent| Forget::Agent {
+        organization_id: org,
+        workspace_id: agent.workspace_id,
+        agent_id: agent.id,
+    };
+
+    let first = agent(stores, &t, t.sandbox, "First", AgentMemory::Off).await.unwrap();
+    delete_agent(first.clone()).await.unwrap();
+    assert_eq!(
+        forget_jobs(stores, org).await,
+        [],
+        "no kind to forget it while there's no type"
+    );
+
+    let notes = create(stores, &t, "Notes", MemoryWrites::Allow).await;
+    create(stores, &t, "More notes", MemoryWrites::Allow).await;
+    let other_kind = MemoryKind::parse("other_kind").unwrap();
+    let elsewhere = create_by(
+        stores,
+        &t,
+        t.admin,
+        &NewMemoryType {
+            name: "Kept elsewhere".to_owned(),
+            kind: other_kind.clone(),
+            settings: Settings::default(),
+            writes: MemoryWrites::Allow,
+        },
+        at(2),
+    )
+    .await
+    .unwrap();
+    let second = agent(stores, &t, t.sandbox, "Second", AgentMemory::Type(notes.id))
+        .await
+        .unwrap();
+    delete_agent(second.clone()).await.unwrap();
+    assert_eq!(
+        forget_jobs(stores, org).await,
+        [
+            ("notes".to_owned(), forget_agent(&second)),
+            ("other_kind".to_owned(), forget_agent(&second)),
+        ],
+        "an agent's: one for each kind of the organization's types"
+    );
+
+    // Refused deletions queue nothing.
+    assert_eq!(delete_agent(second).await, Err(AgentError::AgentNotFound));
+    let holder = agent(stores, &t, t.production, "Holder", AgentMemory::Type(notes.id))
+        .await
+        .unwrap();
+    assert!(matches!(
+        delete(stores, &t, notes.id).await,
+        Err(MemoryTypeError::InUse(_))
+    ));
+    assert_eq!(
+        delete(stores, &t, MemoryTypeId::generate()).await,
+        Err(MemoryTypeError::NotFound)
+    );
+    let missing = WorkspaceId::generate();
+    assert_eq!(
+        stores
+            .workspaces
+            .delete_workspace(org, missing, &|_| by_suite_in(missing))
+            .await,
+        Err(WorkspaceError::NotFound)
+    );
+    assert_eq!(forget_jobs(stores, org).await, [], "a refused deletion queues none");
+
+    delete(stores, &t, elsewhere.id).await.unwrap();
+    assert_eq!(
+        forget_jobs(stores, org).await,
+        [(
+            "other_kind".to_owned(),
+            Forget::Type {
+                organization_id: org,
+                memory_type_id: elsewhere.id,
+            }
+        )],
+        "a type's: its own kind's"
+    );
+    stores
+        .workspaces
+        .delete_workspace(org, holder.workspace_id, &|_| by_suite_in(holder.workspace_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        forget_jobs(stores, org).await,
+        [(
+            "notes".to_owned(),
+            Forget::Workspace {
+                organization_id: org,
+                workspace_id: t.production,
+            }
+        )],
+        "a workspace's: one for each kind left"
+    );
 }

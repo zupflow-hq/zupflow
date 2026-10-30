@@ -12,10 +12,11 @@
 //! of the event's organization and environment that subscribes to its type
 //! ([`WebhookStore::record_event`], idempotent by the event's ID).
 //!
-//! A memory kind keeps its memories itself, outside the server's database,
-//! so a change to a memory from the API or the Console is recorded right
-//! after the kind makes it, with [`WebhookStore::record_event`], and before
-//! the answer.
+//! A change people make to a memory records its event, with the event's
+//! deliveries, in the change's own transaction, as
+//! [`WebhookStore::record_event`] records one: the memory kind writes them
+//! with the memory ([`crate::memory::Record`]), so they're there before the
+//! answer, and never without the change.
 //!
 //! **Delivery** is at least once, unordered, through `OutboundHttp`, signed
 //! with the endpoint's secret: [`signature`] over `"<t>.<raw body>"`.

@@ -9,8 +9,8 @@
  *   routes), environment and credential.
  * - The same key and request replays the saved status and body; a different
  *   request answers `422`, one still in flight `409`.
- * - `5xx` saves nothing. A route that shows a secret once saves that its key
- *   completed, never the body.
+ * - `5xx` saves nothing. A route that shows a secret once, or whose answer
+ *   holds what people wrote, saves that its key completed, never the body.
  */
 import {
   IDEMPOTENCY_HEADER,
@@ -142,7 +142,9 @@ export async function idempotently(request: Request, params: Params, handle: () 
         throw new ApiFailure(
           409,
           "idempotency_key_completed",
-          "This request already completed, and its response showed a secret that is never shown twice. Find the resource in its list, or start again with a new key.",
+          route.answerNeverKept
+            ? "This request already completed, and its response held a memory's text, which is never kept. Find the memory in the agent's list, or start again with a new key."
+            : "This request already completed, and its response showed a secret that is never shown twice. Find the resource in its list, or start again with a new key.",
         );
       }
       return replay(row);
@@ -171,8 +173,8 @@ export async function idempotently(request: Request, params: Params, handle: () 
   persist();
 
   const response = await handle();
-  // An error carries no secret; a success from a secret-once route is never kept.
-  const body = route.showsSecretOnce && response.ok ? null : await response.clone().text();
+  // An error carries no secret and no one's words; a success is kept unless its route says never to.
+  const body = (route.showsSecretOnce || route.answerNeverKept) && response.ok ? null : await response.clone().text();
   // Another tab may have written while the handler ran, so find the row again in the current state.
   const store = db();
   if (response.status >= 500) {

@@ -6,7 +6,10 @@
 //! in it, what must hold across concurrent saves: the scope's agent and type
 //! are there, the scope keeps fewer notes than its limit, and a short ID is
 //! held once in it. An update writes the text, who wrote it and when, or,
-//! with the text the note already holds, nothing at all.
+//! with the text the note already holds, nothing at all. What a change
+//! records ([`Record`]) is written in its transaction: each webhook event
+//! with its deliveries and their jobs, as the outbox writes one, and the
+//! audit event, each only in the scope's own workspace.
 //!
 //! A search is FTS5's: the notes holding every word, by word, in any case
 //! and accent, ranked by BM25, then newest first. BM25 weighs a word by how
@@ -21,12 +24,15 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteArguments, SqliteRow};
-use sqlx::{Connection, QueryBuilder, Row, Sqlite, Transaction};
+use sqlx::{Connection, QueryBuilder, Row, Sqlite, SqliteConnection, Transaction};
 use uuid::Uuid;
+use zupflow_core::audit::Audit;
 use zupflow_core::ids::{AgentId, ChannelConversationId, MemoryId, MemoryTypeId, OrganizationId, WorkspaceId};
 use zupflow_core::installations::ShortId;
 use zupflow_core::memory::notes::{NewNote, NoteRef, NoteStore, Reach, Recent};
-use zupflow_core::memory::{Audience, Forget, Memory, MemoryError, MemoryScope, Origin, Rewritten};
+use zupflow_core::memory::{
+    Audience, Forget, Memory, MemoryChange, MemoryError, MemoryScope, Origin, Record, Recorded, Rewritten,
+};
 use zupflow_core::time::Timestamp;
 use zupflow_core::workspaces::Page;
 
@@ -83,6 +89,35 @@ fn failed_quietly(operation: &'static str) -> impl FnOnce(sqlx::Error) -> Memory
 fn read(error: impl std::fmt::Display) -> MemoryError {
     tracing::error!(event = "memory_notes.unreadable_row", %error);
     MemoryError::Unavailable
+}
+
+/// Writes what a change records, in its transaction: each webhook event, with
+/// a delivery and its job for every endpoint subscribed to it, and the audit
+/// event. Either placed anywhere but the scope's workspace fails the change.
+async fn write_records(
+    connection: &mut SqliteConnection,
+    scope: &MemoryScope,
+    recorded: &Recorded,
+    operation: &'static str,
+) -> Result<(), MemoryError> {
+    for event in &recorded.events {
+        if event.workspace_id != Some(scope.workspace_id) {
+            tracing::error!(event = "memory_notes.event_misplaced", operation);
+            return Err(MemoryError::Unavailable);
+        }
+        crate::webhooks::record_event(&mut *connection, scope.organization_id, event)
+            .await
+            .map_err(|error| {
+                tracing::error!(event = "memory_notes.event_not_recorded", operation, %error);
+                MemoryError::Unavailable
+            })?;
+    }
+    if let Some(entry) = &recorded.audit {
+        crate::audit::record_in_workspace(&mut *connection, scope.organization_id, scope.workspace_id, entry)
+            .await
+            .map_err(failed(operation))?;
+    }
+    Ok(())
 }
 
 type Query<'q> = sqlx::query::Query<'q, Sqlite, SqliteArguments>;
@@ -219,6 +254,15 @@ const SEARCH: &str = concat!(
     shown!(),
     " ORDER BY rank, updated_at DESC, id DESC LIMIT ?7"
 );
+/// Every note of the scope, oldest first, and then their removal.
+const SCOPE_NOTES: &str = concat!(
+    "SELECT ",
+    columns!(),
+    " FROM memory_notes WHERE ",
+    in_scope!(),
+    " ORDER BY created_at, id"
+);
+const DELETE_SCOPE: &str = concat!("DELETE FROM memory_notes WHERE ", in_scope!());
 const FORGET_AGENT: &str = "DELETE FROM memory_notes WHERE organization_id = ? AND workspace_id = ? AND agent_id = ?";
 const FORGET_WORKSPACE: &str = "DELETE FROM memory_notes WHERE organization_id = ? AND workspace_id = ?";
 const FORGET_TYPE: &str = "DELETE FROM memory_notes WHERE organization_id = ? AND memory_type_id = ?";
@@ -339,6 +383,7 @@ impl NoteStore for SqliteNoteStore {
         note: &NewNote<'_>,
         max_notes: u32,
         now: Timestamp,
+        record: &Record<'_>,
     ) -> Result<Memory, MemoryError> {
         let origin = serde_json::to_string(note.origin).map_err(read)?;
         let candidates: Vec<&str> = note.short_ids.iter().map(ShortId::as_str).collect();
@@ -393,9 +438,10 @@ impl NoteStore for SqliteNoteStore {
             .fetch_one(&mut *transaction)
             .await
             .map_err(failed("insert"))?;
-        let saved = note_from(&row)?;
+        let saved = MemoryChange::Saved(note_from(&row)?);
+        write_records(&mut transaction, scope, &record(&saved), "insert").await?;
         transaction.commit().await.map_err(failed("insert"))?;
-        Ok(saved)
+        Ok(saved.into_memory())
     }
 
     async fn update(
@@ -406,6 +452,7 @@ impl NoteStore for SqliteNoteStore {
         origin: &Origin,
         text: &str,
         now: Timestamp,
+        record: &Record<'_>,
     ) -> Result<Rewritten, MemoryError> {
         let origin = serde_json::to_string(origin).map_err(read)?;
         let mut transaction = self.immediate("update").await?;
@@ -417,10 +464,14 @@ impl NoteStore for SqliteNoteStore {
             .await
             .map_err(failed("update"))?;
         let rewritten = match row {
-            Some(row) => Rewritten {
-                memory: note_from(&row)?,
-                changed: true,
-            },
+            Some(row) => {
+                let updated = MemoryChange::Updated(note_from(&row)?);
+                write_records(&mut transaction, scope, &record(&updated), "update").await?;
+                Rewritten {
+                    memory: updated.into_memory(),
+                    changed: true,
+                }
+            }
             // It holds that text already, or there's no such note to change.
             None => {
                 let row = bind_note(bind_written(sqlx::query(WRITTEN), scope, reach), note)
@@ -437,15 +488,61 @@ impl NoteStore for SqliteNoteStore {
         Ok(rewritten)
     }
 
-    async fn delete(&self, scope: &MemoryScope, note: NoteRef<'_>, reach: Reach<'_>) -> Result<Memory, MemoryError> {
+    async fn delete(
+        &self,
+        scope: &MemoryScope,
+        note: NoteRef<'_>,
+        reach: Reach<'_>,
+        record: &Record<'_>,
+    ) -> Result<Memory, MemoryError> {
         let mut transaction = self.immediate("delete").await?;
         let row = bind_note(bind_written(sqlx::query(DELETE), scope, reach), note)
             .fetch_optional(&mut *transaction)
             .await
             .map_err(failed("delete"))?;
-        let deleted = row.as_ref().map(note_from).transpose()?.ok_or(MemoryError::NotFound)?;
+        let deleted = MemoryChange::Forgotten(row.as_ref().map(note_from).transpose()?.ok_or(MemoryError::NotFound)?);
+        write_records(&mut transaction, scope, &record(&deleted), "delete").await?;
         transaction.commit().await.map_err(failed("delete"))?;
-        Ok(deleted)
+        Ok(deleted.into_memory())
+    }
+
+    async fn delete_scope(
+        &self,
+        scope: &MemoryScope,
+        record: &Record<'_>,
+        counted: &Audit<'_, u64>,
+    ) -> Result<u64, MemoryError> {
+        let mut transaction = self.immediate("delete_scope").await?;
+        let rows = bind_scope(sqlx::query(SCOPE_NOTES), scope)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(failed("delete_scope"))?;
+        let deleted = bind_scope(sqlx::query(DELETE_SCOPE), scope)
+            .execute(&mut *transaction)
+            .await
+            .map_err(failed("delete_scope"))?;
+        if deleted.rows_affected() != rows.len() as u64 {
+            // The transaction holds the database: nothing can come between.
+            tracing::error!(event = "memory_notes.scope_moved", operation = "delete_scope");
+            return Err(MemoryError::Unavailable);
+        }
+        for row in &rows {
+            let forgotten = MemoryChange::Forgotten(note_from(row)?);
+            write_records(&mut transaction, scope, &record(&forgotten), "delete_scope").await?;
+        }
+        let count = rows.len() as u64;
+        if count > 0 {
+            crate::audit::record_in_workspace(
+                &mut transaction,
+                scope.organization_id,
+                scope.workspace_id,
+                &counted(&count),
+            )
+            .await
+            .map_err(failed("delete_scope"))?;
+        }
+        transaction.commit().await.map_err(failed("delete_scope"))?;
+        Ok(count)
     }
 
     async fn get(&self, scope: &MemoryScope, id: MemoryId) -> Result<Memory, MemoryError> {
@@ -628,13 +725,14 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use serde_json::{Map, Value, json};
-    use zupflow_conformance::note_store::{Prepare, Tenant};
+    use zupflow_conformance::note_store::{Logs, Prepare, Tenant};
     use zupflow_core::ids::{RunId, ToolCallId};
     use zupflow_core::memory::notes::{self, Notes};
-    use zupflow_core::memory::{CallContext, MemoryChange, MemoryFilter, MemoryProvider, MemoryWrites};
+    use zupflow_core::memory::{CallContext, MemoryChange, MemoryFilter, MemoryProvider, MemoryWrites, record_nothing};
 
     use super::*;
     use crate::schema::{Temporary, temporary};
+    use crate::{SqliteAuditStore, SqliteWebhookStore};
 
     /// A tenant whose IDs start at `n`.
     fn tenant(n: u128) -> Tenant {
@@ -682,6 +780,7 @@ mod tests {
                 },
                 200,
                 at(millis),
+                &record_nothing,
             )
             .await
             .unwrap()
@@ -764,7 +863,15 @@ mod tests {
             database,
             directory: _directory,
         } = temporary().await;
-        zupflow_conformance::note_store::run(&SqliteNoteStore::new(database.clone()), prepare(database)).await;
+        zupflow_conformance::note_store::run(
+            &SqliteNoteStore::new(database.clone()),
+            Logs {
+                audit: &SqliteAuditStore::new(database.clone()),
+                webhooks: &SqliteWebhookStore::new(database.clone()),
+            },
+            prepare(database),
+        )
+        .await;
     }
 
     /// BM25 over the notes a search may find: the note holding the word
@@ -822,6 +929,7 @@ mod tests {
                 &run_origin(),
                 "One invoice, then nothing.",
                 at(8),
+                &record_nothing,
             )
             .await
             .unwrap();
@@ -950,6 +1058,7 @@ mod tests {
             note.id,
             &format!("The vault code was {SECRET}."),
             at(5),
+            &record_nothing,
         )
         .await
         .unwrap();
@@ -975,6 +1084,7 @@ mod tests {
                 },
                 200,
                 at(7),
+                &record_nothing,
             )
             .await;
         assert_eq!(refused, Err(MemoryError::Unavailable));
@@ -987,6 +1097,7 @@ mod tests {
                 &origin,
                 &long,
                 at(8),
+                &record_nothing,
             )
             .await;
         assert_eq!(refused, Err(MemoryError::Unavailable));
@@ -1007,6 +1118,10 @@ mod tests {
         } = temporary().await;
         zupflow_conformance::memory_provider::run_notes(
             Arc::new(SqliteNoteStore::new(database.clone())),
+            Logs {
+                audit: &SqliteAuditStore::new(database.clone()),
+                webhooks: &SqliteWebhookStore::new(database.clone()),
+            },
             prepare(database),
         )
         .await;

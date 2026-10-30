@@ -744,19 +744,29 @@ export function createMemoryHandlers(u: (path: string) => string) {
         assertConsoleMayAct(access, "forget memories");
         const agent = agentIn(access, params);
         const d = db();
-        // Every type's, of a kind this server serves: a kind it doesn't serve keeps its memories out of reach.
-        const forgotten = d.memories.filter((m) => keptBy(agent)(m) && reach(d, m) !== undefined);
-        if (forgotten.length === 0) return noContent();
-        d.memories = d.memories.filter((m) => !forgotten.includes(m));
-        const now = new Date().toISOString();
-        for (const row of forgotten) announceMemory("memory.forgotten", row, now);
-        const count = `${forgotten.length} ${forgotten.length === 1 ? "memory" : "memories"}`;
-        audit(
-          access,
-          "agent.memory_forgotten",
-          { type: "agent", id: agent.id, name: `${agent.name} · ${count}` },
-          { workspace: access.workspace },
+        // An erasure: every type's, of a kind this server serves, whatever the kind lets people do. A kind it
+        // doesn't serve keeps its memories out of reach.
+        const reached = d.memories.filter(keptBy(agent)).flatMap((m) => reach(d, m) ?? []);
+        const types = [...new Map(reached.map((r) => [r.type.id, r.type])).values()].sort((a, b) =>
+          comparePlaces(placeOf(a), placeOf(b)),
         );
+        const now = new Date().toISOString();
+        // A type at once, as its kind forgets it: each memory, oldest first, then how many.
+        for (const type of types) {
+          const forgotten = reached
+            .filter((r) => r.type.id === type.id)
+            .map((r) => r.row)
+            .sort((a, b) => compareNames(a.created_at, b.created_at) || compareNames(a.id, b.id));
+          d.memories = d.memories.filter((m) => !forgotten.includes(m));
+          for (const row of forgotten) announceMemory("memory.forgotten", row, now);
+          const count = `${forgotten.length} ${forgotten.length === 1 ? "memory" : "memories"}`;
+          audit(
+            access,
+            "agent.memory_forgotten",
+            { type: "agent", id: agent.id, name: `${agent.name} · ${type.name} · ${count}` },
+            { workspace: access.workspace },
+          );
+        }
         return noContent();
       }),
     ),

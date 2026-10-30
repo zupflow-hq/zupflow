@@ -4423,20 +4423,59 @@ describe("memories", () => {
     expect(db().memories.filter((m) => m.agent_id === p.id)).toEqual([stray]);
   });
 
-  it("keeps a memory's idempotency record in its workspace", async () => {
+  it("keeps a memory's idempotency record in its workspace, and never the answer, which holds its text", async () => {
     const sandbox = ws("acme-sandbox");
     const p = publisher();
     const options = { idempotencyKey: "memory-record" };
-    const saved = await owner.memories.create(sandbox.id, p.id, { text: "Recorded once." }, options);
+    await owner.memories.create(sandbox.id, p.id, { text: "Recorded once." }, options);
     const row = must(db().idempotency_keys.find((r) => r.key === options.idempotencyKey));
-    expect([row.organization_id, row.workspace_id, row.state, row.status]).toEqual([
+    expect([row.organization_id, row.workspace_id, row.state, row.status, row.body]).toEqual([
       northwind(),
       sandbox.id,
       "completed",
       201,
+      null,
     ]);
-    expect(await owner.memories.create(sandbox.id, p.id, { text: "Recorded once." }, options)).toEqual(saved);
+    const again = await failure(owner.memories.create(sandbox.id, p.id, { text: "Recorded once." }, options));
+    expect([again.status, again.code, again.message]).toEqual([
+      409,
+      "idempotency_key_completed",
+      "This request already completed, and its response held a memory's text, which is never kept. Find the memory in the agent's list, or start again with a new key.",
+    ]);
     expect(keptBy(p).filter((m) => m.text === "Recorded once.")).toHaveLength(1);
+  });
+
+  it("forgets everything an agent keeps whatever its kind lets people do, audited once for each type", async () => {
+    const sandbox = ws("acme-sandbox").id;
+    const p = publisher();
+    const second = await owner.memoryTypes.create(northwind(), { name: "Second notes", kind: MEMORY_KIND_NOTES });
+    await owner.memoryTypes.create(northwind(), { name: "Empty notes", kind: MEMORY_KIND_NOTES });
+    await owner.memories.create(sandbox, p.id, { text: "Kept in the second type.", memory_type_id: second.id });
+    const kept = keptBy(p).map((m) => m.id);
+    expect(kept).toHaveLength(5);
+    const [sent, audited] = [db().webhook_events.length, db().audit.length];
+    const manage = must(KNOWN_MEMORY_KINDS.get(MEMORY_KIND_NOTES)).description.manage;
+    const allowed = { ...manage };
+    Object.assign(manage, { list: false, add: false, change: false, forget: false });
+    try {
+      await owner.memories.deleteAll(sandbox, p.id);
+    } finally {
+      Object.assign(manage, allowed);
+    }
+    expect(keptBy(p)).toEqual([]);
+    expect(keptBy(reporter()), "another agent's stay").toHaveLength(3);
+    const forgotten = db()
+      .webhook_events.slice(sent)
+      .map((e) => [e.body.type, (e.body.data as { id: string }).id]);
+    expect(forgotten.sort()).toEqual(kept.map((id) => ["memory.forgotten", id]).sort());
+    const recorded = db()
+      .audit.slice(0, db().audit.length - audited)
+      .map((e) => [e.action, e.target.name])
+      .sort();
+    expect(recorded, "none for a type that held nothing").toEqual([
+      ["agent.memory_forgotten", "Publishing assistant · Notes · 4 memories"],
+      ["agent.memory_forgotten", "Publishing assistant · Second notes · 1 memory"],
+    ]);
   });
 
   it("draws a memory's short ID until one is free in its scope, and gives up after the fourth", () => {
