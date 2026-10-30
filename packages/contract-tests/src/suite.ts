@@ -6,7 +6,7 @@
  * Call `contractSuite(target)` from a test file; see `Target` for what a
  * server provides and the reference fixture it loads.
  */
-import { INVITATION_TTL_DAYS, matchRoute, routes, WEBHOOK_EVENT_TYPES } from "@zupflow/contract";
+import { IDEMPOTENCY_HEADER, INVITATION_TTL_DAYS, matchRoute, routes, WEBHOOK_EVENT_TYPES } from "@zupflow/contract";
 import {
   type AgentChannel,
   type AgentId,
@@ -4940,7 +4940,7 @@ export function contractSuite(target: Target) {
         for (const t of [first, second]) await owner.memoryTypes.delete(org(), t.id);
       });
 
-      it("forgets everything the agent keeps in a type at once, however many pages it fills", async () => {
+      it("forgets everything the agent keeps in a type, a hundred at a time, however many pages it fills", async () => {
         const tag = tagged();
         const sandbox = fx.workspaces.acmeSandbox.id;
         const type = await makeType(`${tag} Notes`);
@@ -4953,15 +4953,29 @@ export function contractSuite(target: Target) {
             events: ["memory.forgotten"],
           })
         ).endpoint;
+        const save = async (many: number) => {
+          for (let n = 1; n <= many; n++) await owner.memories.create(sandbox, agent.id, { text: `Note ${n}.` });
+        };
+        /** The newest audit events, as action and target name. */
+        const audited = async (limit: number) =>
+          (await owner.audit.list(org(), { limit })).items.map((event) => [event.action, event.target.name]);
+        const counted = (count: number) => [
+          "agent.memory_forgotten",
+          `${agent.name} · ${type.name} · ${count} memories`,
+        ];
+        // A hundred exactly: audited once, as nothing is left after them.
+        await save(100);
+        await owner.memories.deleteAll(sandbox, agent.id);
+        expect(await audited(2)).toEqual([counted(100), ["memory.saved", expect.any(String)]]);
         const many = 105;
-        for (let n = 1; n <= many; n++) await owner.memories.create(sandbox, agent.id, { text: `Note ${n}.` });
+        await save(many);
         const full = await owner.memories.list(sandbox, agent.id, { limit: 100 });
         expect([full.items.length, full.pagination.total]).toEqual([100, many]);
         expect(full.pagination.next_cursor, "more than a page").not.toBeNull();
         await owner.memories.deleteAll(sandbox, agent.id);
         const left = await owner.memories.list(sandbox, agent.id, { limit: 100 });
         expect([left.items, left.pagination]).toEqual([[], { next_cursor: null, total: 0 }]);
-        // Each one told of, and the type's audited once, counting them all.
+        // Each one told of, and each hundred audited once, with how many it forgot.
         const told = new Set<string>();
         let cursor: string | undefined;
         do {
@@ -4969,12 +4983,8 @@ export function contractSuite(target: Target) {
           for (const row of page.items) told.add(row.event_id);
           cursor = page.pagination.next_cursor ?? undefined;
         } while (cursor);
-        expect(told.size).toBe(many);
-        const [event] = (await owner.audit.list(org(), { limit: 1 })).items;
-        expect([event?.action, event?.target.name]).toEqual([
-          "agent.memory_forgotten",
-          `${agent.name} · ${type.name} · ${many} memories`,
-        ]);
+        expect(told.size).toBe(100 + many);
+        expect(await audited(3)).toEqual([counted(5), counted(100), ["memory.saved", expect.any(String)]]);
         await owner.webhooks.delete(org(), hook.id);
         await owner.agents.delete(sandbox, agent.id);
         await owner.memoryTypes.delete(org(), type.id);
@@ -5149,21 +5159,60 @@ export function contractSuite(target: Target) {
         await owner.memoryTypes.delete(org(), type.id);
       });
 
-      it("never replays saving a memory, whose answer holds its text, and refuses the key for another", async () => {
+      it("answers a save's retry with the memory as it is now, and refuses the key for another", async () => {
         const tag = tagged();
         const sandbox = fx.workspaces.acmeSandbox.id;
         const type = await makeType(`${tag} Notes`);
         const agent = await makeAgent(`${tag} keeper`, type.id);
         const options = { idempotencyKey: `memory-${tag}` };
         const first = await owner.memories.create(sandbox, agent.id, { text: "Once." }, options);
-        // Its key completed, and its answer was never kept: a retry saves nothing again.
-        const again = await failure(owner.memories.create(sandbox, agent.id, { text: "Once." }, options));
-        expect([again.status, again.code]).toEqual([409, "idempotency_key_completed"]);
-        expect(again.message).not.toContain("Once.");
-        expect((await owner.memories.list(sandbox, agent.id)).items).toEqual([first]);
+        // Its key keeps only the memory's ID: a retry saves nothing again, and answers the memory as it is now.
+        expect(await owner.memories.create(sandbox, agent.id, { text: "Once." }, options)).toEqual(first);
+        const changed = await owner.memories.update(sandbox, agent.id, first.id, { text: "Changed since." });
+        expect(await owner.memories.create(sandbox, agent.id, { text: "Once." }, options)).toEqual(changed);
+        expect((await owner.memories.list(sandbox, agent.id)).items).toEqual([changed]);
         const reused = await failure(owner.memories.create(sandbox, agent.id, { text: "Twice." }, options));
         expect([reused.status, reused.code]).toEqual([422, "idempotency_key_reused"]);
-        expect((await owner.memories.list(sandbox, agent.id)).items).toEqual([first]);
+        expect((await owner.memories.list(sandbox, agent.id)).items).toEqual([changed]);
+        // Forgotten since: the request completed, and its memory is gone.
+        await owner.memories.delete(sandbox, agent.id, first.id);
+        const again = await failure(owner.memories.create(sandbox, agent.id, { text: "Once." }, options));
+        expect([again.status, again.code]).toEqual([409, "idempotency_key_completed"]);
+        expect(again.message).toContain("the memory it saved has since been forgotten");
+        expect(again.message).not.toContain("Once.");
+        expect((await owner.memories.list(sandbox, agent.id)).items).toEqual([]);
+        await owner.agents.delete(sandbox, agent.id);
+        await owner.memoryTypes.delete(org(), type.id);
+      });
+
+      it("lets the SDK retry a save whose answer was lost, with its key, and answer the memory it saved", async () => {
+        const tag = tagged();
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const type = await makeType(`${tag} Notes`);
+        const agent = await makeAgent(`${tag} keeper`, type.id);
+        // The answer to the first save is lost on its way back, after the save.
+        const keys: (string | null)[] = [];
+        const losing = createClient(
+          createHttpTransport({
+            baseUrl: target.baseUrl,
+            getToken: async () => target.token("owner"),
+            getOrganization: () => fx.organization,
+            fetch: async (input, init) => {
+              const answer = await servedFetch(input, init);
+              if (init?.method === "POST") {
+                keys.push(new Headers(init.headers).get(IDEMPOTENCY_HEADER));
+                if (keys.length === 1) throw new TypeError("The answer was lost.");
+              }
+              return answer;
+            },
+            retries: 1,
+          }),
+        );
+        const saved = await losing.memories.create(sandbox, agent.id, { text: "Saved once, answered on a retry." });
+        expect(keys).toHaveLength(2);
+        expect(keys[1], "the same key").toBe(keys[0]);
+        expect(saved.text).toBe("Saved once, answered on a retry.");
+        expect((await owner.memories.list(sandbox, agent.id)).items).toEqual([saved]);
         await owner.agents.delete(sandbox, agent.id);
         await owner.memoryTypes.delete(org(), type.id);
       });
@@ -5280,7 +5329,7 @@ export function contractSuite(target: Target) {
         }));
         const named = (memory: Memory) => ["memory", memory.id, `${agent.name} · ${memory.short_id}`];
         const where = [sandbox, "sandbox"];
-        // Everything forgotten at once: once for each type, with how many.
+        // Fewer than a hundred in each type: forgotten once for each type, with how many.
         const counted = (type: MemoryType, count: string) => ({
           action: "agent.memory_forgotten",
           target: ["agent", agent.id, `${agent.name} · ${type.name} · ${count}`],

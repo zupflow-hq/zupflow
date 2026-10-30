@@ -14,7 +14,7 @@
 
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -1135,8 +1135,12 @@ async fn keeps_memories_to_their_organization_workspace_agent_and_environment() 
 /// A save's answer holds the memory's text, which is kept nowhere but the
 /// memory: its key records that it completed, so a retry saves nothing
 /// again and answers `409`, and a refusal, which holds no text, replays.
+/// A save's answer holds the memory's text, so its idempotency key keeps
+/// only the memory's ID: a retry answers the memory as it is now, and once
+/// it's forgotten, that the request completed. Another request with the key
+/// is refused, and a refusal, which holds no one's words, replays.
 #[tokio::test]
-async fn never_keeps_a_saves_answer_for_a_retry() {
+async fn answers_a_saves_retry_with_the_memory_as_it_is_now() {
     let server = Server::new().await;
     let t = tenant(&server).await;
     let (org, ws, agent) = (t.org.as_str(), t.sandbox.as_str(), t.agent.as_str());
@@ -1150,15 +1154,11 @@ async fn never_keeps_a_saves_answer_for_a_retry() {
     };
     let (status, first) = attempt("memory-once", "Kept once, in the memory.").await;
     assert_eq!(status, StatusCode::CREATED, "{first}");
-    let (status, again) = attempt("memory-once", "Kept once, in the memory.").await;
+    let memory = id(&first["data"]).to_owned();
     assert_eq!(
-        refusal(status, &again),
-        refused(StatusCode::CONFLICT, "idempotency_key_completed", &[])
-    );
-    assert_eq!(
-        again["error"]["message"],
-        "This request already completed, and its response held a memory's text, which is never kept. Find the \
-         memory in the agent's list, or start again with a new key."
+        attempt("memory-once", "Kept once, in the memory.").await,
+        (StatusCode::CREATED, first.clone()),
+        "the memory again"
     );
     let (status, other) = attempt("memory-once", "Twice.").await;
     assert_eq!(
@@ -1170,15 +1170,75 @@ async fn never_keeps_a_saves_answer_for_a_retry() {
         json!([first["data"]]),
         "saved once"
     );
-    let kept: Vec<(String, Option<i64>, Option<Vec<u8>>)> =
-        sqlx::query_as("SELECT state, status, body FROM idempotency_keys WHERE key = 'memory-once'")
-            .fetch_all(&pool(&server).await)
-            .await
-            .unwrap();
+    let pool = pool(&server).await;
+    let kept = || async {
+        sqlx::query_as::<_, (String, Option<i64>, Option<Vec<u8>>)>(
+            "SELECT state, status, body FROM idempotency_keys WHERE key = 'memory-once'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    };
     assert_eq!(
-        kept,
-        [("completed".to_owned(), Some(201), None)],
-        "its key completed, no answer kept"
+        kept().await,
+        [("completed".to_owned(), Some(201), Some(memory.clone().into_bytes()))],
+        "its key completed, keeping the memory's ID and never its text"
+    );
+
+    // Changed since: the memory as it is now.
+    let (status, changed) = update(
+        &server,
+        "owner",
+        org,
+        ws,
+        agent,
+        &memory,
+        json!({ "text": "Changed since." }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{changed}");
+    assert_eq!(
+        attempt("memory-once", "Kept once, in the memory.").await,
+        (StatusCode::CREATED, changed),
+        "as it is now"
+    );
+
+    // Forgotten since: the request completed, and its memory is gone.
+    assert_eq!(
+        forget(&server, "owner", org, ws, agent, &memory).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (status, again) = attempt("memory-once", "Kept once, in the memory.").await;
+    assert_eq!(
+        refusal(status, &again),
+        refused(StatusCode::CONFLICT, "idempotency_key_completed", &[])
+    );
+    assert_eq!(
+        again["error"]["message"],
+        "This request already completed, and the memory it saved has since been forgotten. Start again with a new \
+         key to save it again."
+    );
+    assert!(
+        texts(&server, org, ws, agent, "").await.is_empty(),
+        "nothing saved again"
+    );
+
+    // A key kept without the memory's ID has nothing to answer with.
+    let (status, legacy) = attempt("memory-unkept", "Kept without its ID.").await;
+    assert_eq!(status, StatusCode::CREATED, "{legacy}");
+    sqlx::query("UPDATE idempotency_keys SET body = NULL WHERE key = 'memory-unkept'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, again) = attempt("memory-unkept", "Kept without its ID.").await;
+    assert_eq!(
+        refusal(status, &again),
+        refused(StatusCode::CONFLICT, "idempotency_key_completed", &[])
+    );
+    assert_eq!(
+        again["error"]["message"],
+        "This request already completed, and its response held a memory's text, which is never kept. Find the \
+         memory in the agent's list, or start again with a new key."
     );
 
     // A refusal holds no one's words: it replays.
@@ -1650,6 +1710,61 @@ impl Made {
     }
 }
 
+/// An erasure forgets a type's memories a hundred at a time, each hundred
+/// audited with how many, each memory sent: 250 are counted as 100, 100 and
+/// 50. A hundred exactly are counted once, as nothing is left after them.
+#[tokio::test]
+async fn erases_a_hundred_memories_at_a_time_each_hundred_counted() {
+    let server = Server::new().await;
+    let t = tenant(&server).await;
+    let (org, ws) = (t.org.as_str(), t.sandbox.as_str());
+    let roomy = notes_type(&server, org, "Roomy", json!({ "max_notes": 1000 })).await;
+    let agent = agent(&server, org, ws, "Erased", &roomy).await;
+    let endpoint = hook(&server, org, "sandbox", HOOK, json!(["memory.forgotten"])).await;
+    let counted = || async {
+        every_item(&server, &format!("/v1/organizations/{org}/audit-events"))
+            .await
+            .into_iter()
+            .filter(|event| event["action"] == "agent.memory_forgotten")
+            .map(|event| event["target"]["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    for n in 1..=100 {
+        saved(&server, "owner", org, ws, &agent, &format!("Note {n}.")).await;
+    }
+    assert_eq!(
+        forget_all(&server, "owner", org, ws, &agent).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(counted().await, ["Erased · Roomy · 100 memories"], "a hundred, once");
+
+    for n in 1..=250 {
+        saved(&server, "owner", org, ws, &agent, &format!("Note {n}.")).await;
+    }
+    assert_eq!(
+        forget_all(&server, "owner", org, ws, &agent).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(held(&server, org, ws, &agent, &roomy).await, 0, "every one");
+    assert_eq!(
+        counted().await,
+        [
+            "Erased · Roomy · 50 memories",
+            "Erased · Roomy · 100 memories",
+            "Erased · Roomy · 100 memories",
+            "Erased · Roomy · 100 memories",
+        ],
+        "newest first: a hundred at a time"
+    );
+    let deliveries = every_item(
+        &server,
+        &format!("/v1/organizations/{org}/webhooks/{endpoint}/deliveries"),
+    )
+    .await;
+    assert_eq!(deliveries.len(), 350, "each one sent");
+}
+
 /// The most polls a request is let run before the test gives up on it.
 const MOST_POLLS: usize = 2_000;
 
@@ -1817,7 +1932,7 @@ struct Limited {
     forgotten: Mutex<Vec<Forget>>,
     /// How many of the next requests to forget fail.
     failures: Mutex<u32>,
-    meanwhile: Mutex<Option<Meanwhile>>,
+    meanwhile: Mutex<VecDeque<Meanwhile>>,
 }
 
 impl Limited {
@@ -1832,7 +1947,7 @@ impl Limited {
             }),
             forgotten: Mutex::new(Vec::new()),
             failures: Mutex::new(0),
-            meanwhile: Mutex::new(None),
+            meanwhile: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -1846,9 +1961,10 @@ impl Limited {
         *self.failures.lock().unwrap() = times;
     }
 
-    /// Runs `meanwhile` while the next save is under way.
+    /// Runs `meanwhile` while the next save that runs nothing else is under
+    /// way.
     fn during_next_save(&self, meanwhile: impl Future<Output = ()> + Send + 'static) {
-        *self.meanwhile.lock().unwrap() = Some(Box::pin(meanwhile));
+        self.meanwhile.lock().unwrap().push_back(Box::pin(meanwhile));
     }
 }
 
@@ -1918,7 +2034,7 @@ impl MemoryProvider for Limited {
         now: Timestamp,
         record: &Record<'_>,
     ) -> Result<Memory, MemoryError> {
-        let meanwhile = self.meanwhile.lock().unwrap().take();
+        let meanwhile = self.meanwhile.lock().unwrap().pop_front();
         if let Some(meanwhile) = meanwhile {
             meanwhile.await;
         }
@@ -1944,10 +2060,11 @@ impl MemoryProvider for Limited {
     async fn forget_scope(
         &self,
         scope: &MemoryScope,
+        at_most: u32,
         record: &Record<'_>,
         counted: &Audit<'_, u64>,
     ) -> Result<u64, MemoryError> {
-        self.notes.forget_scope(scope, record, counted).await
+        self.notes.forget_scope(scope, at_most, record, counted).await
     }
 
     async fn forget_all(&self, what: &Forget) -> Result<(), MemoryError> {
@@ -2084,6 +2201,39 @@ async fn refuses_what_a_kind_does_not_let_people_do() {
         "erased"
     );
     assert!(limited.forgotten.lock().unwrap().is_empty(), "nothing was deleted");
+
+    // A save's answer shows its memory; a retry with its key shows it again
+    // only where a read would.
+    limited.allow(|manage| {
+        manage.add = true;
+        manage.list = false;
+    });
+    let attempt = || {
+        server.send(
+            call("owner", Method::POST, memories_path(ws, agent))
+                .naming(org)
+                .idempotent("shown-once")
+                .body(json!({ "text": "Shown once." })),
+        )
+    };
+    let (status, shown) = attempt().await;
+    assert_eq!(status, StatusCode::CREATED, "{shown}");
+    let (status, again) = attempt().await;
+    assert_eq!(
+        refusal(status, &again),
+        refused(StatusCode::CONFLICT, "idempotency_key_completed", &[])
+    );
+    assert_eq!(
+        again["error"]["message"],
+        "This request already completed, and the memory it saved is of a kind that can't list memories from the API \
+         or the Console, so it isn't shown again."
+    );
+    limited.allow(|manage| manage.list = true);
+    assert_eq!(
+        attempt().await,
+        (StatusCode::CREATED, shown),
+        "shown again once a read shows it"
+    );
 }
 
 /// A save whose type goes while it's under way is refused as a save naming
@@ -2155,6 +2305,105 @@ async fn refuses_a_save_whose_type_or_agent_goes_meanwhile() {
     );
 }
 
+/// A save that names no type saves in the agent's own. When that type goes
+/// while it's under way, the agent's type is found once more and the memory
+/// saved there; gone again, the save is refused naming no field, as the body
+/// named none; and an agent whose memory went off meanwhile has none to
+/// save to.
+#[tokio::test]
+async fn saves_in_the_agents_type_found_once_more_when_its_own_goes_meanwhile() {
+    let mut server = Server::new().await;
+    let t = tenant(&server).await;
+    let (org, ws) = (t.org.as_str(), t.sandbox.as_str());
+    let limited = Limited::over(&server);
+    serve(&mut server, MemoryProviders::none().with(limited.clone()));
+    let pool = pool(&server).await;
+    let types = [
+        notes_type(&server, org, "First", json!({})).await,
+        notes_type(&server, org, "Second", json!({})).await,
+        notes_type(&server, org, "Third", json!({})).await,
+        notes_type(&server, org, "Fourth", json!({})).await,
+    ];
+    let mover = agent(&server, org, ws, "Mover", &types[0]).await;
+    let uuid_of = |memory_type: &str| MemoryTypeId::parse(memory_type).unwrap().uuid();
+    // The agent moves to `to`, and the type it left goes.
+    let moved = |from: &str, to: &str| {
+        let (pool, agent) = (pool.clone(), AgentId::parse(&mover).unwrap().uuid());
+        let (from, to) = (uuid_of(from), uuid_of(to));
+        async move {
+            sqlx::query("UPDATE agents SET memory_type_id = ? WHERE id = ?")
+                .bind(to)
+                .bind(agent)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM memory_types WHERE id = ?")
+                .bind(from)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+
+    limited.during_next_save(moved(&types[0], &types[1]));
+    let (status, answer) = save(&server, "owner", org, ws, &mover, json!({ "text": "Moved once." })).await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    assert_eq!(
+        answer["data"]["memory_type_id"],
+        types[1].as_str(),
+        "in the type it has now"
+    );
+
+    limited.during_next_save(moved(&types[1], &types[2]));
+    limited.during_next_save(moved(&types[2], &types[3]));
+    let (status, answer) = save(&server, "owner", org, ws, &mover, json!({ "text": "Moved twice." })).await;
+    assert_eq!(
+        refusal(status, &answer),
+        refused(StatusCode::UNPROCESSABLE_ENTITY, "unknown_memory_type", &[])
+    );
+    assert_eq!(
+        answer["error"]["message"],
+        "Mover's memory type was deleted while the memory was saved. Save it again."
+    );
+
+    let off = {
+        let (pool, agent) = (pool.clone(), AgentId::parse(&mover).unwrap().uuid());
+        async move {
+            sqlx::query("UPDATE agents SET memory = 'off', memory_type_id = NULL WHERE id = ?")
+                .bind(agent)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM memory_types WHERE id = ?")
+                .bind(MemoryTypeId::parse(&types[3]).unwrap().uuid())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    limited.during_next_save(off);
+    let (status, answer) = save(&server, "owner", org, ws, &mover, json!({ "text": "Turned off." })).await;
+    assert_eq!(
+        refusal(status, &answer),
+        refused(StatusCode::UNPROCESSABLE_ENTITY, "memory_off", &[])
+    );
+
+    let (_, events) = server
+        .send(call(
+            "owner",
+            Method::GET,
+            format!("/v1/organizations/{org}/audit-events?limit=100"),
+        ))
+        .await;
+    let saves = events["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["action"] == "memory.saved")
+        .count();
+    assert_eq!(saves, 1, "only what was kept recorded");
+}
+
 /// The server's database, for what the API doesn't show: the queue's jobs.
 async fn pool(server: &Server) -> sqlx::SqlitePool {
     sqlx::SqlitePool::connect(&format!("sqlite:{}", server.directory.join("zupflow.sqlite").display()))
@@ -2221,6 +2470,47 @@ async fn asks_a_kind_that_fails_to_forget_again_until_it_has() {
         agent_id: AgentId::parse(&going).unwrap(),
     };
     assert_eq!(*limited.forgotten.lock().unwrap(), [gone; 3], "asked until it had");
+}
+
+/// A forget job of a kind this server doesn't serve is kept, using no
+/// attempt, and looked at again later each time: five minutes after it was
+/// queued, then twice as long as it has waited, up to six hours.
+#[tokio::test]
+async fn waits_longer_each_time_for_a_kind_it_does_not_serve() {
+    let mut server = Server::new().await;
+    let t = tenant(&server).await;
+    let (org, ws) = (t.org.as_str(), t.sandbox.as_str());
+    let pool = pool(&server).await;
+    let going = agent(&server, org, ws, "Going", &t.memory_type).await;
+    serve(&mut server, MemoryProviders::none());
+    deleted(&server, org, format!("/v1/workspaces/{ws}/agents/{going}")).await;
+    const MINUTE: i64 = 60 * 1000;
+    // Claims the job once it's waited `waited` minutes: how many minutes it
+    // waits then, and the attempts it has used.
+    let looked_at = |waited: i64| {
+        let pool = pool.clone();
+        let state = server.state.clone();
+        async move {
+            sqlx::query("UPDATE jobs SET run_at = 0, created_at = ? WHERE kind = ?")
+                .bind(Timestamp::now().millis() - waited * MINUTE)
+                .bind(FORGET_JOB)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(memory_forgetting::work_once(&state).await, "claimed");
+            let (run_at, attempts): (i64, i64) =
+                sqlx::query_as("SELECT run_at, attempts FROM jobs WHERE kind = ? AND state = 'queued'")
+                    .bind(FORGET_JOB)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            ((run_at - Timestamp::now().millis() + MINUTE / 2) / MINUTE, attempts)
+        }
+    };
+    assert_eq!(looked_at(0).await, (5, 0), "five minutes at first");
+    assert_eq!(looked_at(5).await, (10, 0), "then twice as long");
+    assert_eq!(looked_at(15).await, (20, 0));
+    assert_eq!(looked_at(7 * 60).await, (6 * 60, 0), "six hours at most");
 }
 
 /// Deleting an agent, a workspace or a type has each memory kind forget

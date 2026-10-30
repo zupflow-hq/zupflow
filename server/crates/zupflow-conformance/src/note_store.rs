@@ -9,9 +9,9 @@
 //! who wrote the text, and the text a note holds already changing nothing;
 //! recalled by last change, and listed by when they were saved, with counts
 //! of one moment; searched by every word, in any case, in an order no other
-//! scope's notes move; every note of one scope deleted at once, whatever its
-//! audience; and every note of an agent, a workspace, a type or an
-//! organization deleted, and nothing else.
+//! scope's notes move; one scope's oldest notes deleted as many at a time as
+//! asked, whatever their audience; and every note of an agent, a workspace,
+//! a type or an organization deleted, and nothing else.
 //!
 //! Each change people make writes what it records with it (its audit event,
 //! and its webhook events with their deliveries) in its own transaction: a
@@ -150,7 +150,7 @@ pub struct Logs<'a> {
 pub async fn run(store: &dyn NoteStore, logs: Logs<'_>, prepare: Prepare) {
     records_each_change_with_it(store, logs, &prepare).await;
     records_nothing_with_a_refusal(store, logs, &prepare).await;
-    deletes_a_scope_at_once_with_its_records(store, logs, &prepare).await;
+    deletes_a_scopes_oldest_notes_with_their_records(store, logs, &prepare).await;
     saves_only_in_a_scope_that_is_there(store, &prepare).await;
     finds_a_note_by_its_id_in_its_scope_only(store, &prepare).await;
     gives_each_note_a_short_id_once_in_its_scope(store, &prepare).await;
@@ -1793,7 +1793,7 @@ async fn records_each_change_with_it(store: &dyn NoteStore, logs: Logs<'_>, prep
             "{what}: forgotten"
         );
         assert_eq!(
-            store.delete_scope(&scope, record, &counter(scope)).await,
+            store.delete_scope(&scope, 100, record, &counter(scope)).await,
             Err(MemoryError::Unavailable),
             "{what}: every one forgotten"
         );
@@ -1803,7 +1803,7 @@ async fn records_each_change_with_it(store: &dyn NoteStore, logs: Logs<'_>, prep
         ..counter(scope)(count)
     };
     assert_eq!(
-        store.delete_scope(&scope, &record, &misplaced_count).await,
+        store.delete_scope(&scope, 100, &record, &misplaced_count).await,
         Err(MemoryError::Unavailable),
         "the count elsewhere"
     );
@@ -1919,7 +1919,7 @@ async fn records_nothing_with_a_refusal(store: &dyn NoteStore, logs: Logs<'_>, p
         ..scope
     };
     assert_eq!(
-        store.delete_scope(&empty, &record, &counter(empty)).await,
+        store.delete_scope(&empty, 100, &record, &counter(empty)).await,
         Ok(0),
         "nothing to forget"
     );
@@ -1930,7 +1930,10 @@ async fn records_nothing_with_a_refusal(store: &dyn NoteStore, logs: Logs<'_>, p
     );
 }
 
-async fn deletes_a_scope_at_once_with_its_records(store: &dyn NoteStore, logs: Logs<'_>, prepare: &Prepare) {
+/// A scope's oldest notes go as many at a time as asked, by when each was
+/// saved, then ID, whatever their audience: each recorded as it was, and how
+/// many went each time. Nothing of another scope's goes.
+async fn deletes_a_scopes_oldest_notes_with_their_records(store: &dyn NoteStore, logs: Logs<'_>, prepare: &Prepare) {
     let t = tenant(prepare).await;
     let other = tenant(prepare).await;
     let scope = t.scope();
@@ -1946,26 +1949,26 @@ async fn deletes_a_scope_at_once_with_its_records(store: &dyn NoteStore, logs: L
         2,
     )
     .await;
+    let same_moment = save(store, &scope, 3, "Saved at the same moment.", 2).await;
     let neighbors = t.neighbors();
-    for (neighbor, n) in neighbors.iter().zip(3..) {
-        save(store, neighbor, n, "A neighbor's note.", 3).await;
+    for (neighbor, n) in neighbors.iter().zip(4..) {
+        save(store, neighbor, n, "A neighbor's note.", 1).await;
     }
-    save(store, &other.scope(), 9, "Another organization's note.", 4).await;
+    save(store, &other.scope(), 9, "Another organization's note.", 1).await;
+    // Saved at the same moment, the one with the lower ID goes first.
+    let (second, last) = if direct.id.uuid() < same_moment.id.uuid() {
+        (direct, same_moment)
+    } else {
+        (same_moment, direct)
+    };
 
-    assert_eq!(store.delete_scope(&scope, &record, &counter(scope)).await, Ok(2));
-    assert!(
-        texts(store, &scope).await.is_empty(),
-        "every one, whatever its audience"
-    );
-    for neighbor in &neighbors {
-        assert_eq!(texts(store, neighbor).await, ["A neighbor's note."], "{neighbor:?}");
-    }
-    assert_eq!(texts(store, &other.scope()).await, ["Another organization's note."]);
-    for gone in [&first, &direct] {
+    assert_eq!(store.delete_scope(&scope, 2, &record, &counter(scope)).await, Ok(2));
+    assert_eq!(texts(store, &scope).await, [last.text.as_str()], "the oldest two");
+    for gone in [&first, &second] {
         assert_eq!(store.get(&scope, gone.id).await, Err(MemoryError::NotFound));
     }
     let mut expected = Seen::default();
-    for gone in [first, direct] {
+    for gone in [first, second] {
         expected.add(&MemoryChange::Forgotten(gone));
     }
     expected.add_counted(2);
@@ -1975,7 +1978,27 @@ async fn deletes_a_scope_at_once_with_its_records(store: &dyn NoteStore, logs: L
         "each one, and how many"
     );
     assert_eq!(
-        store.delete_scope(&scope, &record, &counter(scope)).await,
+        store.delete_scope(&scope, 2, &record, &counter(scope)).await,
+        Ok(1),
+        "the rest"
+    );
+    assert!(
+        texts(store, &scope).await.is_empty(),
+        "every one, whatever its audience"
+    );
+    expected.add(&MemoryChange::Forgotten(last));
+    expected.add_counted(1);
+    assert_eq!(
+        seen(logs, t.organization_id, t.workspace, endpoint).await,
+        expected,
+        "each time, how many"
+    );
+    for neighbor in &neighbors {
+        assert_eq!(texts(store, neighbor).await, ["A neighbor's note."], "{neighbor:?}");
+    }
+    assert_eq!(texts(store, &other.scope()).await, ["Another organization's note."]);
+    assert_eq!(
+        store.delete_scope(&scope, 2, &record, &counter(scope)).await,
         Ok(0),
         "nothing left"
     );

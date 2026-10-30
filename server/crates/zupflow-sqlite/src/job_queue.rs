@@ -20,7 +20,7 @@ use zupflow_core::jobs::{
     MIN_LEASE, Retry,
 };
 use zupflow_core::scope::{Name, Scope};
-use zupflow_core::time::{Clock, SystemClock};
+use zupflow_core::time::{Clock, SystemClock, Timestamp};
 
 use crate::database::{Database, duration_millis, millis};
 
@@ -188,7 +188,7 @@ impl JobQueue for SqliteJobQueue {
         query.push_bind(now);
         query.push(
             " AND attempts < max_attempts)) ORDER BY run_at, id LIMIT 1) \
-             RETURNING id, organization_id, workspace_id, environment, kind, payload, attempts",
+             RETURNING id, organization_id, workspace_id, environment, kind, payload, attempts, created_at",
         );
         let Some(row) = query
             .build()
@@ -218,6 +218,7 @@ impl JobQueue for SqliteJobQueue {
             payload: row.try_get("payload").map_err(read)?,
             attempt: u32::try_from(attempts).map_err(|_| unreadable("attempts"))?,
             lease: token,
+            queued_at: Timestamp::from_millis(row.try_get("created_at").map_err(read)?),
         }))
     }
 

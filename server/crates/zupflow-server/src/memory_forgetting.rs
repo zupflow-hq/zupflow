@@ -4,15 +4,20 @@
 //! naming what went by its IDs ([`FORGET_JOB`]). This worker asks the kind to
 //! forget it ([`zupflow_core::memory::MemoryProvider::forget_all`]) until it
 //! has: a kind that fails is asked again, backing off up to sixty minutes
-//! apart, and a kind this server doesn't serve waits for one that does,
-//! without using an attempt. What the server's database keeps goes with the
-//! deletion itself; a kind may keep its memories elsewhere.
+//! apart. The job of a kind this server doesn't serve is kept, without using
+//! an attempt, so the kind forgets once a server serves it again: it's
+//! looked at again after five minutes, then twice as long each time, up to
+//! six hours, with a warning each time. A kind keeps its memories in the
+//! database that holds the server's records, so what the database drops
+//! with the deletion goes in the deletion's own transaction; the job has the
+//! kind forget whatever else it keeps of what went.
 
 use std::time::Duration;
 
 use zupflow_core::jobs::{Job, Retry};
 use zupflow_core::memory::{FORGET_JOB, Forget, MemoryError};
 use zupflow_core::scope::{Name, Scope};
+use zupflow_core::time::Timestamp;
 
 use crate::auth::AppState;
 
@@ -22,9 +27,12 @@ const LEASE: Duration = Duration::from_secs(5 * 60);
 /// How often an idle worker looks for work.
 const IDLE: Duration = Duration::from_secs(1);
 
-/// How long a job of a kind this server doesn't serve waits before it's
-/// looked at again.
-pub const UNSERVED_WAIT: Duration = Duration::from_secs(5 * 60);
+/// How long a job of a kind this server doesn't serve first waits before
+/// it's looked at again.
+const UNSERVED_WAIT: Duration = Duration::from_secs(5 * 60);
+
+/// The longest a job of a kind this server doesn't serve waits.
+const LONGEST_UNSERVED_WAIT: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// The longest a kind that fails waits to be asked again.
 const LONGEST_WAIT: Duration = Duration::from_secs(60 * 60);
@@ -38,6 +46,13 @@ fn kind() -> Option<Name> {
 fn backoff(attempt: u32) -> Duration {
     let doublings = attempt.saturating_sub(1).min(16);
     Duration::from_secs(30 << doublings).min(LONGEST_WAIT)
+}
+
+/// How long a job of a kind this server doesn't serve waits, `waited` since
+/// it was queued: [`UNSERVED_WAIT`] more than that, so five minutes, then
+/// twice as long each time, up to [`LONGEST_UNSERVED_WAIT`].
+fn unserved_wait(waited: Duration) -> Duration {
+    waited.saturating_add(UNSERVED_WAIT).min(LONGEST_UNSERVED_WAIT)
 }
 
 /// Claims and handles one forget job, if one is due. Whether one was.
@@ -63,6 +78,7 @@ async fn handle(state: &AppState, job: Job) {
         payload,
         attempt,
         lease,
+        queued_at,
         ..
     } = job;
     // A job is its organization's: it names nothing of another one.
@@ -114,12 +130,15 @@ async fn handle(state: &AppState, job: Job) {
             }
         }
     } else {
+        let waited = Timestamp::now().millis().saturating_sub(queued_at.millis());
+        let wait = unserved_wait(Duration::from_millis(u64::try_from(waited).unwrap_or(0)));
         tracing::warn!(
             event = "memory_forgetting.kind_not_served",
             %organization_id,
             kind = kind.as_str(),
+            wait_seconds = wait.as_secs(),
         );
-        state.jobs.postpone(&scope, id, &lease, UNSERVED_WAIT).await
+        state.jobs.postpone(&scope, id, &lease, wait).await
     };
     if let Err(error) = finished {
         tracing::warn!(
@@ -154,5 +173,18 @@ mod tests {
             .map(|attempt| backoff(attempt).as_secs())
             .sum();
         assert!((72 * 3600..96 * 3600).contains(&total), "more than three days: {total}");
+    }
+
+    #[test]
+    fn waits_for_a_kind_it_does_not_serve_twice_as_long_each_time_up_to_six_hours() {
+        let mut waited = Duration::ZERO;
+        let mut waits = Vec::new();
+        for _ in 0..9 {
+            let wait = unserved_wait(waited);
+            waits.push(wait.as_secs() / 60);
+            waited += wait;
+        }
+        assert_eq!(waits, [5, 10, 20, 40, 80, 160, 320, 360, 360]);
+        assert_eq!(unserved_wait(Duration::MAX), LONGEST_UNSERVED_WAIT);
     }
 }

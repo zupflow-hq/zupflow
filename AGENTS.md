@@ -32,7 +32,8 @@ Read `README.md` first, then `DEVELOPMENT.md`.
   `Idempotency-Key` in a handler. A route whose response shows a secret once
   is marked `showsSecretOnce` in the contract, and one whose response holds
   what people wrote (a memory's text) `answerNeverKept`, so neither body is
-  ever saved.
+  ever saved: the second keeps only the ID of the memory it saved, and a
+  retry answers that memory as a read shows it now.
 - **Two layers of isolation.** No organization reaches another, and no
   workspace reaches another within its organization. Both scopes are explicit
   in every function, table, query, key and test; a globally unique ID never

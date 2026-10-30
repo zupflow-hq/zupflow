@@ -44,7 +44,7 @@
           "maxLength": 255,
           "pattern": "^[\\x20-\\x7E]+$"
         },
-        "description": "Makes a retry safe: 1–255 printable ASCII characters, scoped to the caller that sent it, kept for 24 hours. The same key and request replays the saved response; the same key with a different request answers `422 idempotency_key_reused`; a key still in flight answers `409 idempotency_request_in_progress`; a malformed key answers `400 invalid_idempotency_key`. Routes marked `x-zupflow-shows-secret-once` or `x-zupflow-answer-never-kept` never save their body: a retry answers `409 idempotency_key_completed`."
+        "description": "Makes a retry safe: 1–255 printable ASCII characters, scoped to the caller that sent it, kept for 24 hours. The same key and request replays the saved response; the same key with a different request answers `422 idempotency_key_reused`; a key still in flight answers `409 idempotency_request_in_progress`; a malformed key answers `400 invalid_idempotency_key`. Routes marked `x-zupflow-shows-secret-once` never save their body: a retry answers `409 idempotency_key_completed`. Routes marked `x-zupflow-answer-never-kept` save only the ID of the memory they saved: a retry answers it as a read shows it now, or `409 idempotency_key_completed` once it's forgotten, or when its kind can't list memories."
       }
     },
     "responses": {
@@ -14739,7 +14739,7 @@
       },
       "post": {
         "operationId": "createMemory",
-        "summary": "Save a memory for the agent: owners, admins and developers, from the Console in Sandbox only, and API keys. Its origin is the caller. `422 memory_off` when the body names no type and the agent has none; `422 unknown_memory_type` (`fields.memory_type_id`), also for a type deleted while it saves, `422 invalid_memory_text` (`fields.text`), `422 memory_full` at the type's `max_notes`. Sends `memory.saved`; audited as `memory.saved`. Its answer holds the memory's text, so an idempotency key's retry answers `409 idempotency_key_completed`, never the answer again",
+        "summary": "Save a memory for the agent: owners, admins and developers, from the Console in Sandbox only, and API keys. Its origin is the caller. `422 memory_off` when the body names no type and the agent has none; `422 unknown_memory_type` (`fields.memory_type_id`), also for a type deleted while it saves, `422 invalid_memory_text` (`fields.text`), `422 memory_full` at the type's `max_notes`. With no type named, the agent's own type deleted while it saves is found once more, and the memory saved in the type the agent has then; deleted again, it's `422 unknown_memory_type` without `fields`. Sends `memory.saved`; audited as `memory.saved`. Its answer holds the memory's text, so an idempotency key keeps only the memory's ID: a retry answers the memory as it is now, and `409 idempotency_key_completed` once it's forgotten, or when its kind's `manage` doesn't let people list memories",
         "security": [
           {
             "consoleSession": [],
@@ -14839,7 +14839,7 @@
       },
       "delete": {
         "operationId": "deleteMemories",
-        "summary": "Forget everything the agent keeps in the workspace, in every memory type of a kind this server serves, whatever the kind's `manage` says: an erasure, for owners, admins and developers, from the Console in Sandbox only, and API keys. Sends a `memory.forgotten` for each memory; audited once for each type that held any, as `agent.memory_forgotten` naming the type and how many",
+        "summary": "Forget everything the agent keeps in the workspace, in every memory type of a kind this server serves, whatever the kind's `manage` says: an erasure, for owners, admins and developers, from the Console in Sandbox only, and API keys. Each type's memories go a hundred at a time, oldest first: each hundred sends a `memory.forgotten` for each memory and is audited once, as `agent.memory_forgotten` naming the type and how many. An erasure that fails partway has still forgotten the hundreds before; asking again forgets the rest",
         "security": [
           {
             "consoleSession": [],

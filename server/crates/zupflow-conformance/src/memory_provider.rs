@@ -20,9 +20,10 @@
 //! change is recorded with it, as the server hands the records over, read
 //! back through the [`Logs`] once the call answers: a refusal, or a change
 //! changing nothing, records nothing, and a record placed outside the
-//! memory's workspace fails the change, which then changes nothing. A scope
-//! is forgotten at once, whatever the kind lets people do, with each
-//! memory's records and its count.
+//! memory's workspace fails the change, which then changes nothing. A
+//! scope's oldest memories are forgotten as many at a time as asked,
+//! whatever the kind lets people do, with each memory's records and their
+//! count.
 //!
 //! `notes` adds: its tools' answers and refusals, writes refused before
 //! their arguments are read once denied, who wrote each note, search over
@@ -975,7 +976,7 @@ async fn records_each_change_with_it(subject: &Subject<'_>, prepare: &Prepare) {
             );
         }
         assert_eq!(
-            provider.forget_scope(&scope, record, &counter(scope)).await,
+            provider.forget_scope(&scope, 100, record, &counter(scope)).await,
             Err(MemoryError::Unavailable),
             "{what}: every one forgotten"
         );
@@ -986,7 +987,7 @@ async fn records_each_change_with_it(subject: &Subject<'_>, prepare: &Prepare) {
         ..counter(scope)(count)
     };
     assert_eq!(
-        provider.forget_scope(&scope, &record, &counted_elsewhere).await,
+        provider.forget_scope(&scope, 100, &record, &counted_elsewhere).await,
         Err(MemoryError::Unavailable),
         "the count elsewhere"
     );
@@ -1002,9 +1003,10 @@ async fn records_each_change_with_it(subject: &Subject<'_>, prepare: &Prepare) {
     );
 }
 
-/// Forgetting a scope forgets every memory it keeps, whatever its audience
-/// and whatever the kind lets people do (an erasure), recording each as it
-/// was and how many, and nothing of any other scope's.
+/// Forgetting a scope forgets its oldest memories, as many at a time as
+/// asked, whatever their audience and whatever the kind lets people do (an
+/// erasure), recording each as it was and how many, and nothing of any other
+/// scope's.
 async fn forgets_a_scope_with_its_records(subject: &Subject<'_>, prepare: &Prepare) {
     let provider = subject.provider;
     let logs = subject.logs;
@@ -1024,6 +1026,7 @@ async fn forgets_a_scope_with_its_records(subject: &Subject<'_>, prepare: &Prepa
         )
         .await,
         remember(scope, here, "Remembered directly.".to_owned(), at(2)).await,
+        remember(scope, Audience::Workspace, "Remembered last.".to_owned(), at(3)).await,
     ];
     let neighbors: Vec<MemoryScope> = t.neighbors().into_iter().chain([other.scope()]).collect();
     for neighbor in &neighbors {
@@ -1036,18 +1039,21 @@ async fn forgets_a_scope_with_its_records(subject: &Subject<'_>, prepare: &Prepa
     }
     let mut expected = seen(logs, t.organization_id, t.workspace, endpoint).await;
 
-    assert_eq!(provider.forget_scope(&scope, &record, &counter(scope)).await, Ok(2));
-    for audience in [Audience::Workspace, here] {
-        assert_eq!(recall(provider, &scope, &audience).await, None, "every one");
-    }
-    for gone in &held {
+    assert_eq!(
+        provider.forget_scope(&scope, 2, &record, &counter(scope)).await,
+        Ok(2),
+        "the oldest two"
+    );
+    for gone in &held[..2] {
         assert_eq!(provider.get(&scope, gone.id).await, Err(MemoryError::NotFound));
     }
-    for (neighbor, recalled) in neighbors.iter().zip(&recalls) {
-        assert_eq!(&recall(provider, neighbor, &here).await, recalled, "{neighbor:?}");
-    }
-    for gone in held {
-        expected.add(&MemoryChange::Forgotten(gone));
+    assert_eq!(
+        provider.get(&scope, held[2].id).await.as_ref(),
+        Ok(&held[2]),
+        "the newest kept"
+    );
+    for gone in &held[..2] {
+        expected.add(&MemoryChange::Forgotten(gone.clone()));
     }
     expected.add_counted(2);
     assert_eq!(
@@ -1056,7 +1062,26 @@ async fn forgets_a_scope_with_its_records(subject: &Subject<'_>, prepare: &Prepa
         "each as it was, and how many"
     );
     assert_eq!(
-        provider.forget_scope(&scope, &record, &counter(scope)).await,
+        provider.forget_scope(&scope, 2, &record, &counter(scope)).await,
+        Ok(1),
+        "the rest"
+    );
+    for audience in [Audience::Workspace, here] {
+        assert_eq!(recall(provider, &scope, &audience).await, None, "every one");
+    }
+    assert_eq!(provider.get(&scope, held[2].id).await, Err(MemoryError::NotFound));
+    for (neighbor, recalled) in neighbors.iter().zip(&recalls) {
+        assert_eq!(&recall(provider, neighbor, &here).await, recalled, "{neighbor:?}");
+    }
+    expected.add(&MemoryChange::Forgotten(held[2].clone()));
+    expected.add_counted(1);
+    assert_eq!(
+        seen(logs, t.organization_id, t.workspace, endpoint).await,
+        expected,
+        "each time, how many"
+    );
+    assert_eq!(
+        provider.forget_scope(&scope, 2, &record, &counter(scope)).await,
         Ok(0),
         "nothing left"
     );

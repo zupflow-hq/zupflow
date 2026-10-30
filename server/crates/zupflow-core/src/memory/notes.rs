@@ -460,12 +460,14 @@ pub trait NoteStore: Send + Sync {
         record: &Record<'_>,
     ) -> Result<Memory, MemoryError>;
 
-    /// Removes every note of the scope, whatever its audience, recording what
-    /// `record` builds from each as it was and, when there was one, `counted`
-    /// of how many: how many it removed.
+    /// Removes the scope's `at_most` oldest notes (by when each was saved,
+    /// then ID), whatever their audience, recording what `record` builds from
+    /// each as it was and, when there was one, `counted` of how many: how many
+    /// it removed.
     async fn delete_scope(
         &self,
         scope: &MemoryScope,
+        at_most: u32,
         record: &Record<'_>,
         counted: &Audit<'_, u64>,
     ) -> Result<u64, MemoryError>;
@@ -838,10 +840,11 @@ impl MemoryProvider for Notes {
     async fn forget_scope(
         &self,
         scope: &MemoryScope,
+        at_most: u32,
         record: &Record<'_>,
         counted: &Audit<'_, u64>,
     ) -> Result<u64, MemoryError> {
-        self.store.delete_scope(scope, record, counted).await
+        self.store.delete_scope(scope, at_most, record, counted).await
     }
 
     async fn forget_all(&self, what: &Forget) -> Result<(), MemoryError> {

@@ -716,7 +716,8 @@ impl Forget {
 /// transaction, for each kind of the organization's memory types at that
 /// moment (the type's own kind, for a type), and a worker asks the kind
 /// ([`MemoryProvider::forget_all`]) until it has forgotten it. A kind the
-/// server doesn't serve waits for one that does, without using an attempt.
+/// server doesn't serve waits for one that does, without using an attempt,
+/// longer each time, up to six hours.
 pub const FORGET_JOB: &str = "forget_memories";
 
 /// How many times a forget job is tried while its kind fails: as many as a
@@ -760,13 +761,16 @@ pub enum MemoryError {
 /// A memory kind. Every method that reads or changes memories takes their
 /// scope first and reaches nothing outside it.
 ///
-/// A change people make ([`MemoryProvider::add`], [`MemoryProvider::change`],
-/// [`MemoryProvider::forget`] and [`MemoryProvider::forget_scope`]) commits
-/// with what the server records of it ([`Record`]): its audit event and its
-/// webhook events, written in the change's own transaction, so a change is
-/// never kept without its records, nor its records without it. A kind that
-/// keeps its memories elsewhere than the server's database commits them
-/// with its change all the same.
+/// A kind keeps its memories in the database that holds the server's
+/// records. So a change people make ([`MemoryProvider::add`],
+/// [`MemoryProvider::change`], [`MemoryProvider::forget`] and
+/// [`MemoryProvider::forget_scope`]) commits with what the server records of
+/// it ([`Record`]), its audit event and its webhook events, in one
+/// transaction: a change is never kept without its records, nor its records
+/// without it. And a save checks in its transaction that its agent and type
+/// are there, so it can't land after the deletion that has them forgotten
+/// ([`FORGET_JOB`]). The SQLite store does this here; another database's
+/// store does the same with its own tables.
 #[async_trait]
 pub trait MemoryProvider: Send + Sync {
     /// Its key: `[a-z0-9_]{1,32}`.
@@ -857,13 +861,16 @@ pub trait MemoryProvider: Send + Sync {
     /// what `record` builds from the memory as it was: the memory as it was.
     async fn forget(&self, scope: &MemoryScope, id: MemoryId, record: &Record<'_>) -> Result<Memory, MemoryError>;
 
-    /// Forgets every memory the scope keeps, whatever its audience and
-    /// whatever [`Manage`] says people can do: an erasure. Records with them,
-    /// in the same transaction, what `record` builds from each as it was and,
-    /// when it forgot any, `counted` of how many. How many it forgot.
+    /// Forgets the scope's `at_most` oldest memories (by when each was saved,
+    /// then ID), whatever their audience and whatever [`Manage`] says people
+    /// can do: a part of an erasure, which the server asks for again until it
+    /// forgets fewer. Records with them, in the same transaction, what
+    /// `record` builds from each as it was and, when it forgot any, `counted`
+    /// of how many. How many it forgot.
     async fn forget_scope(
         &self,
         scope: &MemoryScope,
+        at_most: u32,
         record: &Record<'_>,
         counted: &Audit<'_, u64>,
     ) -> Result<u64, MemoryError>;

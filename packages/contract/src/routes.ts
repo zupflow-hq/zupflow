@@ -49,9 +49,10 @@ export interface Route {
   showsSecretOnce?: true;
   /**
    * The response holds what people wrote (a memory's text), which is never
-   * kept anywhere but where it's saved. Idempotency records that its key
-   * completed but never saves the body, so a retry answers
-   * `409 idempotency_key_completed`.
+   * kept anywhere but where it's saved. Idempotency keeps only the ID of the
+   * memory it saved, never the body, so a retry answers that memory as a read
+   * shows it now, or `409 idempotency_key_completed` once it's forgotten, or
+   * when its kind can't list memories.
    */
   answerNeverKept?: true;
 }
@@ -1022,7 +1023,7 @@ export const routes: readonly Route[] = [
     method: "post",
     path: "/v1/workspaces/{ws}/agents/{agent}/memories",
     summary:
-      "Save a memory for the agent: owners, admins and developers, from the Console in Sandbox only, and API keys. Its origin is the caller. `422 memory_off` when the body names no type and the agent has none; `422 unknown_memory_type` (`fields.memory_type_id`), also for a type deleted while it saves, `422 invalid_memory_text` (`fields.text`), `422 memory_full` at the type's `max_notes`. Sends `memory.saved`; audited as `memory.saved`. Its answer holds the memory's text, so an idempotency key's retry answers `409 idempotency_key_completed`, never the answer again",
+      "Save a memory for the agent: owners, admins and developers, from the Console in Sandbox only, and API keys. Its origin is the caller. `422 memory_off` when the body names no type and the agent has none; `422 unknown_memory_type` (`fields.memory_type_id`), also for a type deleted while it saves, `422 invalid_memory_text` (`fields.text`), `422 memory_full` at the type's `max_notes`. With no type named, the agent's own type deleted while it saves is found once more, and the memory saved in the type the agent has then; deleted again, it's `422 unknown_memory_type` without `fields`. Sends `memory.saved`; audited as `memory.saved`. Its answer holds the memory's text, so an idempotency key keeps only the memory's ID: a retry answers the memory as it is now, and `409 idempotency_key_completed` once it's forgotten, or when its kind's `manage` doesn't let people list memories",
     callers: both,
     params: { ...ws, agent: idSchema("agent") },
     body: s.CreateMemoryInput,
@@ -1065,7 +1066,7 @@ export const routes: readonly Route[] = [
     method: "delete",
     path: "/v1/workspaces/{ws}/agents/{agent}/memories",
     summary:
-      "Forget everything the agent keeps in the workspace, in every memory type of a kind this server serves, whatever the kind's `manage` says: an erasure, for owners, admins and developers, from the Console in Sandbox only, and API keys. Sends a `memory.forgotten` for each memory; audited once for each type that held any, as `agent.memory_forgotten` naming the type and how many",
+      "Forget everything the agent keeps in the workspace, in every memory type of a kind this server serves, whatever the kind's `manage` says: an erasure, for owners, admins and developers, from the Console in Sandbox only, and API keys. Each type's memories go a hundred at a time, oldest first: each hundred sends a `memory.forgotten` for each memory and is audited once, as `agent.memory_forgotten` naming the type and how many. An erasure that fails partway has still forgotten the hundreds before; asking again forgets the rest",
     callers: both,
     params: { ...ws, agent: idSchema("agent") },
     response: noContent,

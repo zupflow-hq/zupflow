@@ -1,7 +1,8 @@
 //! The `JobQueue` suite: a job is claimed by one worker at a time, in its own
 //! scope, and finished, retried, postponed or buried only by the lease that
 //! holds it, named with that scope. Nothing reaches a job from another scope, with
-//! another lease, or after its lease was lost.
+//! another lease, or after its lease was lost. Each claim carries when the job
+//! was queued.
 //!
 //! Every test uses kinds of its own, so the cross-tenant claim of one test
 //! never takes another's jobs. Lease expiry and delays use real time with
@@ -22,6 +23,7 @@ use zupflow_core::environment::Environment;
 use zupflow_core::ids::{OrganizationId, WorkspaceId};
 use zupflow_core::jobs::{Job, JobError, JobId, JobOptions, JobQueue, LeaseToken, MAX_JOB_BYTES, Retry};
 use zupflow_core::scope::{Name, Scope};
+use zupflow_core::time::Timestamp;
 
 /// Makes a scope's organization and workspace exist, where the queue needs them.
 pub type Prepare = Arc<dyn Fn(Scope) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -92,16 +94,22 @@ pub async fn run(queue: &dyn JobQueue, prepare: Prepare) {
 async fn runs_a_job_once(queue: &dyn JobQueue, prepare: &Prepare) {
     let fixture = Fixture::new(prepare).await;
     let kind = fresh_kind("once");
+    let before = Timestamp::now().millis();
     let id = queue
         .enqueue(&fixture.workspace(), &kind, b"payload".to_vec(), JobOptions::default())
         .await
         .unwrap();
+    let after = Timestamp::now().millis();
     let job = claim(queue, &kind).await.expect("the job is due");
     assert_eq!(job.id, id);
     assert_eq!(job.scope, fixture.workspace());
     assert_eq!(job.kind, kind);
     assert_eq!(job.payload, b"payload");
     assert_eq!(job.attempt, 1);
+    assert!(
+        (before - 1_000..=after + 1_000).contains(&job.queued_at.millis()),
+        "queued when it was enqueued"
+    );
     assert!(claim(queue, &kind).await.is_none(), "a held job isn't claimed twice");
     queue.complete(&job.scope, job.id, &job.lease).await.unwrap();
     assert!(claim(queue, &kind).await.is_none(), "a completed job is gone");
@@ -378,6 +386,7 @@ async fn retries_until_the_attempts_run_out(queue: &dyn JobQueue, prepare: &Prep
     tokio::time::sleep(PAST_LEASE).await;
     let second = claim(queue, &kind).await.expect("retried");
     assert_eq!(second.attempt, 2);
+    assert_eq!(second.queued_at, first.queued_at, "still queued when it was");
     assert_eq!(
         queue
             .retry(&second.scope, second.id, &second.lease, Duration::ZERO, &reason)
@@ -421,6 +430,7 @@ async fn postpones_without_using_an_attempt(queue: &dyn JobQueue, prepare: &Prep
     tokio::time::sleep(PAST_LEASE).await;
     let again = claim(queue, &kind).await.expect("postponed, not dead");
     assert_eq!(again.attempt, 1, "the same attempt as before");
+    assert_eq!(again.queued_at, first.queued_at, "still queued when it was");
     assert_eq!(
         queue
             .retry(&again.scope, again.id, &again.lease, Duration::ZERO, &reason)

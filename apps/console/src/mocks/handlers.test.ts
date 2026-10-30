@@ -4423,26 +4423,58 @@ describe("memories", () => {
     expect(db().memories.filter((m) => m.agent_id === p.id)).toEqual([stray]);
   });
 
-  it("keeps a memory's idempotency record in its workspace, and never the answer, which holds its text", async () => {
+  it("keeps a memory's idempotency record in its workspace with only the memory's ID, never its text", async () => {
     const sandbox = ws("acme-sandbox");
     const p = publisher();
     const options = { idempotencyKey: "memory-record" };
-    await owner.memories.create(sandbox.id, p.id, { text: "Recorded once." }, options);
+    const saved = await owner.memories.create(sandbox.id, p.id, { text: "Recorded once." }, options);
     const row = must(db().idempotency_keys.find((r) => r.key === options.idempotencyKey));
     expect([row.organization_id, row.workspace_id, row.state, row.status, row.body]).toEqual([
       northwind(),
       sandbox.id,
       "completed",
       201,
-      null,
+      saved.id,
     ]);
+    // A retry answers the memory as it is now.
+    expect(await owner.memories.create(sandbox.id, p.id, { text: "Recorded once." }, options)).toEqual(saved);
+    const changed = await owner.memories.update(sandbox.id, p.id, saved.id, { text: "Changed since." });
+    expect(await owner.memories.create(sandbox.id, p.id, { text: "Recorded once." }, options)).toEqual(changed);
+    expect(keptBy(p).filter((m) => m.id === saved.id)).toHaveLength(1);
+    // Once it's forgotten, that the request completed.
+    await owner.memories.delete(sandbox.id, p.id, saved.id);
     const again = await failure(owner.memories.create(sandbox.id, p.id, { text: "Recorded once." }, options));
     expect([again.status, again.code, again.message]).toEqual([
       409,
       "idempotency_key_completed",
+      "This request already completed, and the memory it saved has since been forgotten. Start again with a new key to save it again.",
+    ]);
+    expect(keptBy(p).filter((m) => m.text === "Recorded once.")).toEqual([]);
+    // A key kept without the memory's ID has nothing to answer with.
+    must(db().idempotency_keys.find((r) => r.key === options.idempotencyKey)).body = null;
+    const unkept = await failure(owner.memories.create(sandbox.id, p.id, { text: "Recorded once." }, options));
+    expect([unkept.status, unkept.code, unkept.message]).toEqual([
+      409,
+      "idempotency_key_completed",
       "This request already completed, and its response held a memory's text, which is never kept. Find the memory in the agent's list, or start again with a new key.",
     ]);
-    expect(keptBy(p).filter((m) => m.text === "Recorded once.")).toHaveLength(1);
+    // A save's answer shows its memory; a retry shows it again only where a read would.
+    const shownOnce = { idempotencyKey: "memory-shown-once" };
+    const shown = await owner.memories.create(sandbox.id, p.id, { text: "Shown once." }, shownOnce);
+    const manage = must(KNOWN_MEMORY_KINDS.get(MEMORY_KIND_NOTES)).description.manage;
+    const allowed = { ...manage };
+    Object.assign(manage, { list: false });
+    try {
+      const unlisted = await failure(owner.memories.create(sandbox.id, p.id, { text: "Shown once." }, shownOnce));
+      expect([unlisted.status, unlisted.code, unlisted.message]).toEqual([
+        409,
+        "idempotency_key_completed",
+        "This request already completed, and the memory it saved is of a kind that can't list memories from the API or the Console, so it isn't shown again.",
+      ]);
+    } finally {
+      Object.assign(manage, allowed);
+    }
+    expect(await owner.memories.create(sandbox.id, p.id, { text: "Shown once." }, shownOnce)).toEqual(shown);
   });
 
   it("forgets everything an agent keeps whatever its kind lets people do, audited once for each type", async () => {

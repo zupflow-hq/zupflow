@@ -176,7 +176,13 @@ impl MemoryProvider for Unserved {
         Err(MemoryError::NotServed)
     }
 
-    async fn forget_scope(&self, _: &MemoryScope, _: &Record<'_>, _: &Audit<'_, u64>) -> Result<u64, MemoryError> {
+    async fn forget_scope(
+        &self,
+        _: &MemoryScope,
+        _: u32,
+        _: &Record<'_>,
+        _: &Audit<'_, u64>,
+    ) -> Result<u64, MemoryError> {
         Err(MemoryError::NotServed)
     }
 
@@ -275,7 +281,13 @@ mod tests {
         async fn forget(&self, _: &MemoryScope, _: MemoryId, _: &Record<'_>) -> Result<Memory, MemoryError> {
             Err(MemoryError::Unsupported)
         }
-        async fn forget_scope(&self, _: &MemoryScope, _: &Record<'_>, _: &Audit<'_, u64>) -> Result<u64, MemoryError> {
+        async fn forget_scope(
+            &self,
+            _: &MemoryScope,
+            _: u32,
+            _: &Record<'_>,
+            _: &Audit<'_, u64>,
+        ) -> Result<u64, MemoryError> {
             Err(MemoryError::Unsupported)
         }
         async fn forget_all(&self, _: &Forget) -> Result<(), MemoryError> {
@@ -349,7 +361,9 @@ mod tests {
             Err(MemoryError::NotServed)
         );
         assert_eq!(
-            stand_in.forget_scope(&scope(), &record_nothing, &never_counted).await,
+            stand_in
+                .forget_scope(&scope(), 100, &record_nothing, &never_counted)
+                .await,
             Err(MemoryError::NotServed),
             "nothing to forget"
         );

@@ -44,6 +44,7 @@ import {
   param,
   requireRole,
   route,
+  type SavedAgain,
   toUser,
   type WorkspaceAccess,
   workspaceAccess,
@@ -60,6 +61,8 @@ type Params = Record<string, string | readonly string[] | undefined>;
 /** How many agents a refusal names before it counts the rest. */
 const NAMED_HOLDERS = 5;
 const MAX_NAME = 60;
+/** How many memories an erasure forgets at a time in one type, as the backend asks a kind. */
+const ERASED_AT_ONCE = 100;
 
 /** A kind this server serves: one the mock knows and its database lists. */
 function servedKind(d: Db, kind: string): KnownKind | undefined {
@@ -295,6 +298,23 @@ function memoryOf(d: Db, agent: AgentRow, params: Params): Reached {
   const reached = row && reach(d, row);
   if (!reached) throw notFound("Memory");
   return reached;
+}
+
+/**
+ * What a save answers a retry with its idempotency key, which kept only the
+ * memory's ID: the memory as a read shows it now; `"forgotten"` once it's
+ * forgotten, its agent with it or not, and `"unlisted"` when its kind can't
+ * list memories, which the save's answer showed once.
+ */
+function savedAgain({ request, params }: { request: Request; params: Params }, id: string): SavedAgain {
+  const access = workspaceAccess(request, param(params, "ws"));
+  const d = db();
+  const agentId = param(params, "agent");
+  const agent = d.agents.find((a) => inWorkspace(a, access.workspace) && a.id === agentId);
+  const row = agent && d.memories.find((m) => keptBy(agent)(m) && m.id === id);
+  const reached = row && reach(d, row);
+  if (!reached) return "forgotten";
+  return reached.kind.description.manage.list ? created(toMemory(reached.row)) : "unlisted";
 }
 
 /** The memory type an agent uses now: its own, the organization's default for one on the default, or none. */
@@ -684,7 +704,7 @@ export function createMemoryHandlers(u: (path: string) => string) {
         announceMemory("memory.saved", row, now);
         audit(access, "memory.saved", memoryTarget(agent, row), { workspace: access.workspace });
         return created(toMemory(row));
-      }),
+      }, savedAgain),
     ),
 
     http.get(
@@ -751,21 +771,24 @@ export function createMemoryHandlers(u: (path: string) => string) {
           comparePlaces(placeOf(a), placeOf(b)),
         );
         const now = new Date().toISOString();
-        // A type at once, as its kind forgets it: each memory, oldest first, then how many.
+        // Each type a hundred at a time, as the backend asks its kind: each memory, oldest first, then how many.
         for (const type of types) {
-          const forgotten = reached
+          const kept = reached
             .filter((r) => r.type.id === type.id)
             .map((r) => r.row)
             .sort((a, b) => compareNames(a.created_at, b.created_at) || compareNames(a.id, b.id));
-          d.memories = d.memories.filter((m) => !forgotten.includes(m));
-          for (const row of forgotten) announceMemory("memory.forgotten", row, now);
-          const count = `${forgotten.length} ${forgotten.length === 1 ? "memory" : "memories"}`;
-          audit(
-            access,
-            "agent.memory_forgotten",
-            { type: "agent", id: agent.id, name: `${agent.name} · ${type.name} · ${count}` },
-            { workspace: access.workspace },
-          );
+          for (let start = 0; start < kept.length; start += ERASED_AT_ONCE) {
+            const forgotten = kept.slice(start, start + ERASED_AT_ONCE);
+            d.memories = d.memories.filter((m) => !forgotten.includes(m));
+            for (const row of forgotten) announceMemory("memory.forgotten", row, now);
+            const count = `${forgotten.length} ${forgotten.length === 1 ? "memory" : "memories"}`;
+            audit(
+              access,
+              "agent.memory_forgotten",
+              { type: "agent", id: agent.id, name: `${agent.name} · ${type.name} · ${count}` },
+              { workspace: access.workspace },
+            );
+          }
         }
         return noContent();
       }),

@@ -23,12 +23,17 @@
 //! is sent or recorded for it.
 //!
 //! Forgetting everything is an erasure: in each type of a kind this server
-//! serves, whatever the kind lets people do, the agent's memories go at
-//! once, each with its `memory.forgotten`, audited once for the type, as
-//! `agent.memory_forgotten` with how many.
+//! serves, whatever the kind lets people do, the agent's memories go a
+//! hundred at a time, oldest first, each with its `memory.forgotten`, and
+//! each hundred audited once, as `agent.memory_forgotten` with how many.
+//!
+//! A save's answer holds the memory's text, so a retry with its
+//! idempotency key has only the memory's ID kept, and answers the memory as
+//! it is now ([`saved_again`]).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Path, RawQuery, State};
@@ -226,12 +231,17 @@ fn origin_of(access: &Access) -> Origin {
 /// workspace's, environment's or organization's is the same `404`.
 async fn find_agent(state: &AppState, access: &WorkspaceAccess, agent: &str) -> Result<Agent, Failure> {
     let agent_id = AgentId::parse(agent).map_err(|_| agent_not_found())?;
+    agent_in(state, access, agent_id).await?.ok_or_else(agent_not_found)
+}
+
+/// The agent, in the request's workspace, as it is now: `None` once it's
+/// gone.
+async fn agent_in(state: &AppState, access: &WorkspaceAccess, agent_id: AgentId) -> Result<Option<Agent>, Failure> {
     state
         .agents
         .find_agent(access.access.organization_id, access.workspace.id, agent_id)
         .await
-        .map_err(|_| unavailable())?
-        .ok_or_else(agent_not_found)
+        .map_err(|_| unavailable())
 }
 
 /// Where the agent keeps its memories in `memory_type`: built from the
@@ -342,25 +352,39 @@ async fn find_memory(
     agent: &Agent,
     memory: &str,
 ) -> Result<Found, Failure> {
-    let memory_id = MemoryId::parse(memory).map_err(|_| memory_not_found())?;
+    look_up_memory(state, access, agent, memory)
+        .await?
+        .ok_or_else(memory_not_found)
+}
+
+/// [`find_memory`]: `None` for a memory it doesn't find.
+async fn look_up_memory(
+    state: &AppState,
+    access: &WorkspaceAccess,
+    agent: &Agent,
+    memory: &str,
+) -> Result<Option<Found>, Failure> {
+    let Ok(memory_id) = MemoryId::parse(memory) else {
+        return Ok(None);
+    };
     for memory_type in served_types(state, access).await? {
         let provider = state.memory_providers.provider(&memory_type.kind);
         let scope = scope_of(access, agent, &memory_type);
         match provider.get(&scope, memory_id).await {
             Ok(memory) => {
-                return Ok(Found {
+                return Ok(Some(Found {
                     memory,
                     memory_type,
                     provider,
                     scope,
-                });
+                }));
             }
             Err(MemoryError::NotFound | MemoryError::NotServed | MemoryError::Unsupported) => {}
             // The kind has logged the cause.
             Err(_) => return Err(unavailable()),
         }
     }
-    Err(memory_not_found())
+    Ok(None)
 }
 
 /// A memory as the audit log names it: by its agent and short ID, never by
@@ -513,7 +537,9 @@ fn create_input(body: &Object) -> Result<(&str, Option<&str>), Failure> {
 
 /// Saves a memory for the whole workspace, written by the caller, in the
 /// type the body names, or else the agent's own: even a type the agent
-/// doesn't use, and even while its memory is off.
+/// doesn't use, and even while its memory is off. When the agent or its own
+/// type goes while the memory is saved, both are found once more, and the
+/// memory saved in the type the agent has then.
 async fn create_memory(
     State(state): State<AppState>,
     caller: Caller,
@@ -527,28 +553,64 @@ async fn create_memory(
     let agent = find_agent(&state, &access, &agent).await?;
     let body = body.object()?;
     let (text, named) = create_input(&body)?;
-    let memory_type = match named {
-        Some(named) => named_type(&state, &access, named)
-            .await?
-            .ok_or_else(|| unknown_type("memory_type_id"))?,
-        None => current_type(&state, &access, &agent).await?.ok_or_else(|| {
-            Failure(ApiError::new(
-                422,
-                "memory_off",
-                format!(
-                    "{} has no memory to save to: its memory is off, or the organization has no default memory \
-                     type. Name a memory type.",
-                    agent.name
-                ),
-            ))
-        })?,
+    let saved = match named {
+        Some(named) => {
+            let memory_type = named_type(&state, &access, named)
+                .await?
+                .ok_or_else(|| unknown_type("memory_type_id"))?;
+            save_in(&state, &access, &agent, &memory_type, text).await?
+        }
+        None => {
+            let memory_type = own_type(&state, &access, &agent).await?;
+            match save_in(&state, &access, &agent, &memory_type, text).await? {
+                Some(saved) => Some(saved),
+                // The agent or its type went meanwhile: both found once more.
+                None => {
+                    let agent = agent_in(&state, &access, agent.id).await?.ok_or_else(agent_not_found)?;
+                    let memory_type = own_type(&state, &access, &agent).await?;
+                    save_in(&state, &access, &agent, &memory_type, text).await?
+                }
+            }
+        }
     };
-    let provider = provider_for(&state, &memory_type, Use::Add)?;
-    let settings = stored_settings(&*provider, &access, &memory_type)?;
-    let record = |change: &MemoryChange| recorded(&access, &agent, change);
+    match saved {
+        Some(saved) => Ok(envelope(StatusCode::CREATED, memory_view(&saved))),
+        None => Err(gone_meanwhile(&state, &access, agent.id, named.is_some()).await),
+    }
+}
+
+/// The type a save that names none saves in: the agent's own, `422
+/// memory_off` while it has none.
+async fn own_type(state: &AppState, access: &WorkspaceAccess, agent: &Agent) -> Result<MemoryType, Failure> {
+    current_type(state, access, agent).await?.ok_or_else(|| {
+        Failure(ApiError::new(
+            422,
+            "memory_off",
+            format!(
+                "{} has no memory to save to: its memory is off, or the organization has no default memory type. \
+                 Name a memory type.",
+                agent.name
+            ),
+        ))
+    })
+}
+
+/// Saves `text` in `memory_type` for the agent, written by the caller, with
+/// its records: `None` when its kind found nowhere to keep it, its agent or
+/// type gone meanwhile.
+async fn save_in(
+    state: &AppState,
+    access: &WorkspaceAccess,
+    agent: &Agent,
+    memory_type: &MemoryType,
+    text: &str,
+) -> Result<Option<Memory>, Failure> {
+    let provider = provider_for(state, memory_type, Use::Add)?;
+    let settings = stored_settings(&*provider, access, memory_type)?;
+    let record = |change: &MemoryChange| recorded(access, agent, change);
     let saved = provider
         .add(
-            &scope_of(&access, &agent, &memory_type),
+            &scope_of(access, agent, memory_type),
             MemoryId::generate(),
             &origin_of(&access.access),
             &settings,
@@ -558,7 +620,8 @@ async fn create_memory(
         )
         .await;
     match saved {
-        Ok(saved) => Ok(envelope(StatusCode::CREATED, memory_view(&saved))),
+        Ok(saved) => Ok(Some(saved)),
+        Err(MemoryError::NotFound) => Ok(None),
         Err(MemoryError::Full) => Err(ApiError::new(
             422,
             "memory_full",
@@ -570,24 +633,63 @@ async fn create_memory(
             ),
         )
         .into()),
-        Err(MemoryError::NotFound) => Err(gone_meanwhile(&state, &access, &agent).await),
-        Err(error) => Err(kind_failure(error, &memory_type, &*provider, Use::Add)),
+        Err(error) => Err(kind_failure(error, memory_type, &*provider, Use::Add)),
     }
 }
 
 /// What a save answers when its kind found nowhere to keep the memory: its
-/// agent went meanwhile (`404`), or else its type, which is then no type of
-/// the organization's.
-async fn gone_meanwhile(state: &AppState, access: &WorkspaceAccess, agent: &Agent) -> Failure {
-    match state
-        .agents
-        .find_agent(access.access.organization_id, access.workspace.id, agent.id)
-        .await
-    {
-        Ok(Some(_)) => unknown_type("memory_type_id"),
+/// agent went meanwhile (`404`), or else its type. A type the body named is
+/// then no type of the organization's; the agent's own, gone again once
+/// found once more, is refused naming no field, as the body named none.
+async fn gone_meanwhile(state: &AppState, access: &WorkspaceAccess, agent: AgentId, named: bool) -> Failure {
+    match agent_in(state, access, agent).await {
+        Ok(Some(_)) if named => unknown_type("memory_type_id"),
+        Ok(Some(agent)) => ApiError::new(
+            422,
+            "unknown_memory_type",
+            format!(
+                "{}'s memory type was deleted while the memory was saved. Save it again.",
+                agent.name
+            ),
+        )
+        .into(),
         Ok(None) => agent_not_found(),
-        Err(_) => unavailable(),
+        Err(failure) => failure,
     }
+}
+
+/// What a save's retry with its idempotency key finds of the memory the
+/// save kept the ID of ([`crate::idempotency::ANSWER_NEVER_KEPT`]).
+pub(crate) enum SavedAgain {
+    /// The memory as it is now, answered with the status the save was.
+    Now(Response),
+    /// Forgotten since, its agent with it or not.
+    Forgotten,
+    /// Kept by a kind that doesn't let people list memories, so shown only
+    /// as the save answered it, never again.
+    Unlisted,
+}
+
+/// The memory a save kept the ID of, for a retry with its key: found as a
+/// read finds it ([`get_memory`]).
+pub(crate) async fn saved_again(
+    state: &AppState,
+    access: &WorkspaceAccess,
+    agent: &str,
+    memory: &str,
+    status: StatusCode,
+) -> Result<SavedAgain, Failure> {
+    let Ok(agent_id) = AgentId::parse(agent) else {
+        return Ok(SavedAgain::Forgotten);
+    };
+    let Some(agent) = agent_in(state, access, agent_id).await? else {
+        return Ok(SavedAgain::Forgotten);
+    };
+    Ok(match look_up_memory(state, access, &agent, memory).await? {
+        None => SavedAgain::Forgotten,
+        Some(found) if !Use::List.allowed(found.provider.describe().manage) => SavedAgain::Unlisted,
+        Some(found) => SavedAgain::Now(envelope(status, memory_view(&found.memory))),
+    })
 }
 
 /// The type's settings as stored, checked again by its kind, which kept
@@ -682,12 +784,26 @@ async fn delete_memory(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// How many memories an erasure forgets in one call to a kind.
+const ERASED_AT_ONCE: u32 = 100;
+
+/// The longest an erasure waits between two calls to a kind: long enough
+/// for a writer kept waiting, which asks again every 100 ms, to ask several
+/// times.
+const LONGEST_PAUSE: Duration = Duration::from_millis(500);
+
 /// Forgets everything the agent keeps in the workspace, in every type of a
 /// kind this server serves, whatever the kind lets people do: an erasure.
-/// Each type at once, in one call to its kind, which commits with it a
-/// `memory.forgotten` for each memory and, when there was one, an
-/// `agent.memory_forgotten` naming the type and how many. A type that fails
-/// stops the rest; the types before stay forgotten, with their records.
+/// Each type's memories go [`ERASED_AT_ONCE`] at a time, oldest first, each
+/// time in one call to its kind, which commits with them a
+/// `memory.forgotten` for each and an `agent.memory_forgotten` naming the
+/// type and how many, until a call forgets fewer. No call holds the
+/// database for the whole erasure, and between two the erasure waits as long
+/// as the last took, up to [`LONGEST_PAUSE`], so the writers that waited
+/// meanwhile get it first: SQLite's lock goes to whoever asks first once
+/// it's free, and a writer it keeps waiting asks again at least every 100
+/// ms. A call that fails stops the rest; what went before stays forgotten,
+/// with its records, and asking again forgets the rest.
 async fn delete_memories(
     State(state): State<AppState>,
     caller: Caller,
@@ -698,13 +814,15 @@ async fn delete_memories(
     access.access.require(MemberRole::is_developer, "forget memories")?;
     console_may_act(&access, "forget memories")?;
     let agent = find_agent(&state, &access, &agent).await?;
-    // Each memory's event; the type's audit event counts them.
+    // Each memory's event; each call's audit event counts them.
     let record = |change: &MemoryChange| Recorded {
         audit: None,
         events: vec![memory_event(&access, change)],
     };
+    let mut pause = Duration::ZERO;
     for memory_type in served_types(&state, &access).await? {
         let provider = state.memory_providers.provider(&memory_type.kind);
+        let scope = scope_of(&access, &agent, &memory_type);
         let counted = |count: &u64| {
             let count = if *count == 1 {
                 "1 memory".to_owned()
@@ -717,10 +835,20 @@ async fn delete_memories(
             );
             workspace_audit(&access, AuditAction::AgentMemoryForgotten, target)
         };
-        provider
-            .forget_scope(&scope_of(&access, &agent, &memory_type), &record, &counted)
-            .await
-            .map_err(|error| kind_failure(error, &memory_type, &*provider, Use::Forget))?;
+        loop {
+            if !pause.is_zero() {
+                tokio::time::sleep(pause).await;
+            }
+            let started = tokio::time::Instant::now();
+            let forgotten = provider
+                .forget_scope(&scope, ERASED_AT_ONCE, &record, &counted)
+                .await
+                .map_err(|error| kind_failure(error, &memory_type, &*provider, Use::Forget))?;
+            pause = started.elapsed().min(LONGEST_PAUSE);
+            if forgotten < u64::from(ERASED_AT_ONCE) {
+                break;
+            }
+        }
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }

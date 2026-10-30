@@ -254,15 +254,22 @@ const SEARCH: &str = concat!(
     shown!(),
     " ORDER BY rank, updated_at DESC, id DESC LIMIT ?7"
 );
-/// Every note of the scope, oldest first, and then their removal.
+/// The scope's `?5` oldest notes, by when each was saved, then ID, and then
+/// their removal.
 const SCOPE_NOTES: &str = concat!(
     "SELECT ",
     columns!(),
     " FROM memory_notes WHERE ",
     in_scope!(),
-    " ORDER BY created_at, id"
+    " ORDER BY created_at, id LIMIT ?5"
 );
-const DELETE_SCOPE: &str = concat!("DELETE FROM memory_notes WHERE ", in_scope!());
+const DELETE_SCOPE: &str = concat!(
+    "DELETE FROM memory_notes WHERE ",
+    in_scope!(),
+    " AND id IN (SELECT id FROM memory_notes WHERE ",
+    in_scope!(),
+    " ORDER BY created_at, id LIMIT ?5)"
+);
 const FORGET_AGENT: &str = "DELETE FROM memory_notes WHERE organization_id = ? AND workspace_id = ? AND agent_id = ?";
 const FORGET_WORKSPACE: &str = "DELETE FROM memory_notes WHERE organization_id = ? AND workspace_id = ?";
 const FORGET_TYPE: &str = "DELETE FROM memory_notes WHERE organization_id = ? AND memory_type_id = ?";
@@ -509,15 +516,18 @@ impl NoteStore for SqliteNoteStore {
     async fn delete_scope(
         &self,
         scope: &MemoryScope,
+        at_most: u32,
         record: &Record<'_>,
         counted: &Audit<'_, u64>,
     ) -> Result<u64, MemoryError> {
         let mut transaction = self.immediate("delete_scope").await?;
         let rows = bind_scope(sqlx::query(SCOPE_NOTES), scope)
+            .bind(at_most)
             .fetch_all(&mut *transaction)
             .await
             .map_err(failed("delete_scope"))?;
         let deleted = bind_scope(sqlx::query(DELETE_SCOPE), scope)
+            .bind(at_most)
             .execute(&mut *transaction)
             .await
             .map_err(failed("delete_scope"))?;

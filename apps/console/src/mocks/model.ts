@@ -765,7 +765,10 @@ export interface IdempotencyRow {
   /** Method, path and an HMAC-SHA-256 of the body under the server key. */
   fingerprint: string;
   state: "running" | "completed";
-  /** The saved answer; `body` is null for a route that shows a secret once. */
+  /**
+   * The saved answer; `body` is null for a route that shows a secret once, and
+   * only the saved memory's ID for one whose answer holds what people wrote.
+   */
   status: number | null;
   body: string | null;
   created_at: string;

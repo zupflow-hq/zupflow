@@ -14,9 +14,12 @@
 //!   credential: its key belongs to the session its link names.
 //! - The same key and request replays the saved status and body; another
 //!   request answers `422`, one still in flight `409`.
-//! - `5xx` saves nothing. A route that shows a secret once, or whose answer
-//!   holds what people wrote, saves that it completed, never its body: a
-//!   retry answers `409 idempotency_key_completed`.
+//! - `5xx` saves nothing. A route that shows a secret once saves that it
+//!   completed, never its body: a retry answers `409
+//!   idempotency_key_completed`. One whose answer holds what people wrote
+//!   saves only the ID of the memory it saved, and a retry answers that
+//!   memory as it is now, or the same `409` once it's forgotten, or when its
+//!   kind can't list memories.
 
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{FromRequestParts, MatchedPath, RawPathParams, Request, State};
@@ -31,6 +34,7 @@ use zupflow_core::time::Timestamp;
 
 use crate::auth::{Access, Actor, AppState, Caller, WorkspaceAccess};
 use crate::http::Failure;
+use crate::memories::{SavedAgain, saved_again};
 
 /// Routes whose response shows a secret once, as the contract marks them
 /// (`x-zupflow-shows-secret-once`); a test holds the two lists equal.
@@ -44,7 +48,9 @@ pub const SHOWS_SECRET_ONCE: [&str; 5] = [
 
 /// Routes whose answer holds what people wrote, a memory's text, which is
 /// never kept, as the contract marks them (`x-zupflow-answer-never-kept`);
-/// a test holds the two lists equal.
+/// a test holds the two lists equal. Only the ID of the memory a request
+/// saved is kept with its key, and a retry answers the memory as it is now
+/// ([`saved_again`]).
 pub const ANSWER_NEVER_KEPT: [&str; 1] = ["/v1/workspaces/{ws}/agents/{agent}/memories"];
 
 /// Whether a route's successful answer is kept for a retry to replay.
@@ -62,6 +68,75 @@ fn completed_unkept(template: &str) -> Failure {
          resource in its list, or start again with a new key."
     };
     Failure(ApiError::new(409, "idempotency_key_completed", message))
+}
+
+/// What a retry is told of a save whose memory is forgotten since.
+fn completed_forgotten() -> Failure {
+    Failure(ApiError::new(
+        409,
+        "idempotency_key_completed",
+        "This request already completed, and the memory it saved has since been forgotten. Start again with a new \
+         key to save it again.",
+    ))
+}
+
+/// What a retry is told of a save whose memory's kind doesn't let people
+/// list memories: the save's answer showed it once, and nothing shows it
+/// again.
+fn completed_unlisted() -> Failure {
+    Failure(ApiError::new(
+        409,
+        "idempotency_key_completed",
+        "This request already completed, and the memory it saved is of a kind that can't list memories from the API \
+         or the Console, so it isn't shown again.",
+    ))
+}
+
+/// What a route whose answer is never kept keeps of a success: the ID of the
+/// memory it saved, `data.id` in its answer.
+fn saved_id(answer: &[u8]) -> Option<Vec<u8>> {
+    let answer: serde_json::Value = serde_json::from_slice(answer).ok()?;
+    let id = answer.get("data")?.get("id")?.as_str()?;
+    Some(id.as_bytes().to_vec())
+}
+
+/// A retry of a route whose answer is never kept, which completed with
+/// `status`: the memory it saved, by the ID kept, as a read shows it now.
+async fn answer_again(
+    state: &AppState,
+    parts: &mut Parts,
+    template: &str,
+    status: u16,
+    kept: Option<Vec<u8>>,
+) -> Response {
+    // No ID kept: nothing to answer with.
+    let Some(memory) = kept.and_then(|kept| String::from_utf8(kept).ok()) else {
+        return completed_unkept(template).into_response();
+    };
+    let Ok(params) = RawPathParams::from_request_parts(parts, state).await else {
+        return Failure(ApiError::internal()).into_response();
+    };
+    let param = |name: &str| {
+        params
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.to_owned())
+    };
+    let (Some(workspace), Some(agent)) = (param("ws"), param("agent")) else {
+        return Failure(ApiError::internal()).into_response();
+    };
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::CREATED);
+    let answer = async {
+        let caller = Caller::from_request_parts(parts, state).await?;
+        let access = WorkspaceAccess::resolve(state, caller, &parts.headers, &workspace).await?;
+        saved_again(state, &access, &agent, &memory, status).await
+    };
+    match answer.await {
+        Ok(SavedAgain::Now(answer)) => answer,
+        Ok(SavedAgain::Forgotten) => completed_forgotten().into_response(),
+        Ok(SavedAgain::Unlisted) => completed_unlisted().into_response(),
+        Err(failure) => failure.into_response(),
+    }
 }
 
 /// The same limit the routes read bodies with.
@@ -273,6 +348,11 @@ pub async fn idempotency(State(state): State<AppState>, request: Request, next: 
             ))
             .into_response();
         }
+        Ok(Begun::Replay { status, body })
+            if (200..300).contains(&status) && ANSWER_NEVER_KEPT.contains(&template.as_str()) =>
+        {
+            return answer_again(&state, &mut parts, &template, status, body).await;
+        }
         Ok(Begun::Replay { status, body: None }) if status != 204 => {
             return completed_unkept(&template).into_response();
         }
@@ -312,8 +392,19 @@ async fn run_and_save(
         state.idempotency.abandon(&scope, &key, &lock).await
     } else {
         // An error carries no secret and no one's words; a success is kept
-        // unless its route says never to.
-        let body = (!status.is_success() || keeps_answer(&template)).then(|| response_bytes.to_vec());
+        // unless its route says never to, and one whose answer holds what
+        // people wrote keeps only the ID of the memory it saved.
+        let body = if !status.is_success() || keeps_answer(&template) {
+            Some(response_bytes.to_vec())
+        } else if ANSWER_NEVER_KEPT.contains(&template.as_str()) {
+            let id = saved_id(&response_bytes);
+            if id.is_none() {
+                tracing::error!(event = "idempotency.unreadable_answer", template);
+            }
+            id
+        } else {
+            None
+        };
         state
             .idempotency
             .complete(&scope, &key, &lock, status.as_u16(), body)

@@ -130,7 +130,17 @@ type ResolverArgs = {
   params: Record<string, string | readonly string[] | undefined>;
 };
 
-export function route<A extends ResolverArgs>(fn: (args: A) => Promise<Response> | Response) {
+/**
+ * How a route whose answer is never kept (`answerNeverKept`) answers a retry
+ * with its key: the memory it saved, by the ID kept, as a read shows it now;
+ * `"forgotten"` once it's forgotten, `"unlisted"` when its kind can't list
+ * memories.
+ */
+export type AnswerAgain<A> = (args: A, id: string) => SavedAgain;
+
+export type SavedAgain = Response | "forgotten" | "unlisted";
+
+export function route<A extends ResolverArgs>(fn: (args: A) => Promise<Response> | Response, again?: AnswerAgain<A>) {
   return async (args: A) => {
     const [min, max] = latency;
     if (max > 0) await delay(min + Math.floor(Math.random() * (max - min)));
@@ -151,7 +161,7 @@ export function route<A extends ResolverArgs>(fn: (args: A) => Promise<Response>
         // Like Rust's ConsoleUser extractor: before path IDs, bodies and idempotency.
         if (caller.kind === "api_key" && !contract.callers.includes("api_key")) throw consoleOnly();
       }
-      return await idempotently(args.request, args.params, handle);
+      return await idempotently(args.request, args.params, handle, again && ((id) => again(args, id)));
     } catch (error) {
       return failureFor(error);
     }

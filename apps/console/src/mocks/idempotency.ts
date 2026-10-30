@@ -9,8 +9,11 @@
  *   routes), environment and credential.
  * - The same key and request replays the saved status and body; a different
  *   request answers `422`, one still in flight `409`.
- * - `5xx` saves nothing. A route that shows a secret once, or whose answer
- *   holds what people wrote, saves that its key completed, never the body.
+ * - `5xx` saves nothing. A route that shows a secret once saves that its key
+ *   completed, never the body. One whose answer holds what people wrote saves
+ *   only the ID of the memory it saved, and a retry answers that memory as it
+ *   is now, or `409 idempotency_key_completed` once it's forgotten, or when
+ *   its kind can't list memories.
  */
 import {
   IDEMPOTENCY_HEADER,
@@ -23,7 +26,14 @@ import {
 import { HttpResponse } from "msw";
 import { keyedDigest } from "./credentials";
 import { db, persist } from "./db";
-import { ApiFailure, authenticate, findSessionByReferenceCrossTenant, orgAccess, workspaceAccess } from "./http";
+import {
+  ApiFailure,
+  authenticate,
+  findSessionByReferenceCrossTenant,
+  orgAccess,
+  type SavedAgain,
+  workspaceAccess,
+} from "./http";
 import type { IdempotencyRow } from "./model";
 
 type Params = Record<string, string | readonly string[] | undefined>;
@@ -82,6 +92,26 @@ async function scopeOf(route: Route, request: Request, params: Params): Promise<
   throw new Error(`No idempotency scope for ${route.operationId}`);
 }
 
+/** What a route whose answer is never kept keeps of a success: the ID of the memory it saved, `data.id`. */
+async function savedId(response: Response): Promise<string | null> {
+  const answer: unknown = await response
+    .clone()
+    .json()
+    .catch(() => null);
+  const id = (answer as { data?: { id?: unknown } } | null)?.data?.id;
+  return typeof id === "string" ? id : null;
+}
+
+/** What a retry of a save is told when it can't be answered with the memory it saved. */
+const UNSHOWN = {
+  forgotten:
+    "This request already completed, and the memory it saved has since been forgotten. Start again with a new key to save it again.",
+  unlisted:
+    "This request already completed, and the memory it saved is of a kind that can't list memories from the API or the Console, so it isn't shown again.",
+  unkept:
+    "This request already completed, and its response held a memory's text, which is never kept. Find the memory in the agent's list, or start again with a new key.",
+} as const;
+
 function replay(row: IdempotencyRow): Response {
   const status = row.status ?? 200;
   return new HttpResponse(status === 204 ? null : row.body, {
@@ -98,9 +128,16 @@ const sameKey = (scope: Scope, key: string) => (r: IdempotencyRow) =>
 
 /**
  * Run `handle` at most once per key. `handle` returns the final response,
- * errors included; this throws {@link ApiFailure} for its own answers.
+ * errors included; this throws {@link ApiFailure} for its own answers. A route
+ * whose answer is never kept answers a retry with `answerAgain`, from the ID
+ * of the memory it saved.
  */
-export async function idempotently(request: Request, params: Params, handle: () => Promise<Response>) {
+export async function idempotently(
+  request: Request,
+  params: Params,
+  handle: () => Promise<Response>,
+  answerAgain?: (id: string) => SavedAgain,
+) {
   const url = new URL(request.url);
   const path = url.pathname.slice(Math.max(0, url.pathname.indexOf("/v1/")));
   const route = request.method === "POST" ? matchRoute("POST", path) : undefined;
@@ -138,13 +175,17 @@ export async function idempotently(request: Request, params: Params, handle: () 
       );
     }
     if (row.state === "completed") {
+      if (route.answerNeverKept && row.status !== null && row.status >= 200 && row.status < 300) {
+        // Only the ID of the memory it saved was kept: that memory, as a read shows it now.
+        const again = row.body === null ? undefined : answerAgain?.(row.body);
+        if (typeof again === "object") return again;
+        throw new ApiFailure(409, "idempotency_key_completed", UNSHOWN[again ?? "unkept"]);
+      }
       if (row.body === null && row.status !== 204) {
         throw new ApiFailure(
           409,
           "idempotency_key_completed",
-          route.answerNeverKept
-            ? "This request already completed, and its response held a memory's text, which is never kept. Find the memory in the agent's list, or start again with a new key."
-            : "This request already completed, and its response showed a secret that is never shown twice. Find the resource in its list, or start again with a new key.",
+          "This request already completed, and its response showed a secret that is never shown twice. Find the resource in its list, or start again with a new key.",
         );
       }
       return replay(row);
@@ -173,8 +214,15 @@ export async function idempotently(request: Request, params: Params, handle: () 
   persist();
 
   const response = await handle();
-  // An error carries no secret and no one's words; a success is kept unless its route says never to.
-  const body = (route.showsSecretOnce || route.answerNeverKept) && response.ok ? null : await response.clone().text();
+  // An error carries no secret and no one's words; a success is kept unless its route says never to, and one
+  // whose answer holds what people wrote keeps only the ID of the memory it saved.
+  const body = !response.ok
+    ? await response.clone().text()
+    : route.showsSecretOnce
+      ? null
+      : route.answerNeverKept
+        ? await savedId(response)
+        : await response.clone().text();
   // Another tab may have written while the handler ran, so find the row again in the current state.
   const store = db();
   if (response.status >= 500) {

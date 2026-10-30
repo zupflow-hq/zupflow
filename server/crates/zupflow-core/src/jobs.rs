@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::scope::{Name, Scope};
+use crate::time::Timestamp;
 
 /// Every adapter accepts payloads up to this size and refuses larger ones.
 pub const MAX_JOB_BYTES: usize = 64 << 10;
@@ -120,6 +121,8 @@ pub struct Job {
     /// Which attempt this claim is, from 1.
     pub attempt: u32,
     pub lease: LeaseToken,
+    /// When it was queued: the same for every claim.
+    pub queued_at: Timestamp,
 }
 
 /// What [`JobQueue::retry`] did.
