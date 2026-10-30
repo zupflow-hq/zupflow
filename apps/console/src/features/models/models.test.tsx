@@ -21,6 +21,8 @@ const { api, scope } = vi.hoisted(() => ({
   api: {
     modelConnections: { create: vi.fn() },
     models: { list: vi.fn(), get: vi.fn(), getDefault: vi.fn() },
+    memoryKinds: { list: vi.fn() },
+    memoryTypes: { list: vi.fn(), get: vi.fn(), getDefault: vi.fn() },
   },
   scope: {} as { org: Organization },
 }));
@@ -189,6 +191,13 @@ describe("connecting a provider", () => {
 });
 
 describe("the agent form's model", () => {
+  beforeEach(() => {
+    // The memory field beside the model: the organization has no memory type yet.
+    api.memoryKinds.list.mockResolvedValue([]);
+    api.memoryTypes.list.mockResolvedValue(page([]));
+    api.memoryTypes.getDefault.mockResolvedValue({ memory_type: null, updated_at: null, updated_by: null });
+  });
+
   function Fields() {
     const form = useAgentForm();
     return (
@@ -228,14 +237,14 @@ describe("the agent form's model", () => {
       "href",
       "/fernhill/sandbox/model-providers",
     );
-    expect(screen.getByRole("combobox")).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "Model" })).toBeDisabled();
   });
 
   it("warns when models exist but none is the default", async () => {
     api.models.list.mockResolvedValue(page([model("GPT-5", "openai", "OpenAI")]));
     api.models.getDefault.mockResolvedValue(noDefault);
     renderFields();
-    expect(await screen.findByText("(none chosen)")).toBeVisible();
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Model" })).toHaveTextContent("(none chosen)"));
     expect(screen.getByText(/Sandbox has no default model, and this agent doesn't choose one/)).toBeVisible();
   });
 });

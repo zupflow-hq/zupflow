@@ -25,6 +25,8 @@ import {
   type CreatedApiKey,
   type CreatedWebhookEndpoint,
   type CreateGrantInput,
+  type CreateMemoryInput,
+  type CreateMemoryTypeInput,
   type CreateModelConnectionInput,
   type CreateModelInput,
   type CreateOrganizationInput,
@@ -38,6 +40,9 @@ import {
   type Member,
   type MemberId,
   type MemberRole,
+  type MemoryId,
+  type MemoryListQuery,
+  type MemoryTypeId,
   type ModelConnectionId,
   type ModelId,
   type ModelListQuery,
@@ -57,6 +62,7 @@ import {
   type UpdateConfigurationInput,
   type UpdateConnectSettingsInput,
   type UpdateGrantInput,
+  type UpdateMemoryTypeInput,
   type UpdateModelConnectionInput,
   type UpdateOrganizationInput,
   type UpdateToolPolicyInput,
@@ -71,6 +77,7 @@ import {
 } from "@zupflow/sdk";
 import { useEffect, useRef } from "react";
 import { api } from "@/lib/api";
+import { isApiError } from "@/lib/errors";
 import { qk } from "@/lib/query-keys";
 
 /** For queries that are `enabled` only once an ID exists; reaching this without one is a bug. */
@@ -507,9 +514,13 @@ export function useAgent(wsId: WorkspaceId, id: AgentId) {
   return useQuery({ queryKey: qk.agent(wsId, id), queryFn: () => api.agents.get(wsId, id) });
 }
 
-/** An agent's model choice changes models' agent counts, in whichever organization the workspace is. */
-const modelProviderQueries = {
-  predicate: (query: { queryKey: readonly unknown[] }) => query.queryKey[2] === "model-providers",
+/**
+ * An agent's model and memory choices change models' and memory types' agent
+ * counts, in whichever organization the workspace is.
+ */
+const agentCountQueries = {
+  predicate: (query: { queryKey: readonly unknown[] }) =>
+    query.queryKey[2] === "model-providers" || query.queryKey[2] === "memory",
 };
 
 export function useCreateAgent(wsId: WorkspaceId) {
@@ -519,7 +530,7 @@ export function useCreateAgent(wsId: WorkspaceId) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.workspace(wsId) });
       qc.invalidateQueries({ queryKey: qk.viewer });
-      qc.invalidateQueries({ queryKey: ["org"], ...modelProviderQueries });
+      qc.invalidateQueries({ queryKey: ["org"], ...agentCountQueries });
     },
   });
 }
@@ -531,7 +542,9 @@ export function useUpdateAgent(wsId: WorkspaceId, id: AgentId) {
     onSuccess: (agent) => {
       qc.setQueryData(qk.agent(wsId, id), agent);
       qc.invalidateQueries({ queryKey: qk.agents(wsId), exact: true });
-      qc.invalidateQueries({ queryKey: ["org"], ...modelProviderQueries });
+      qc.invalidateQueries({ queryKey: ["org"], ...agentCountQueries });
+      // Its memories are listed in the type it uses, which may have changed.
+      qc.invalidateQueries({ queryKey: qk.agentMemories(wsId, id) });
     },
   });
 }
@@ -543,7 +556,7 @@ export function useDeleteAgent(wsId: WorkspaceId) {
     onSuccess: (_, id) => {
       qc.removeQueries({ queryKey: qk.agent(wsId, id) });
       qc.invalidateQueries({ queryKey: qk.workspace(wsId) });
-      qc.invalidateQueries({ queryKey: ["org"], ...modelProviderQueries });
+      qc.invalidateQueries({ queryKey: ["org"], ...agentCountQueries });
     },
   });
 }
@@ -837,6 +850,192 @@ export function useSetDefaultModel(orgId: OrganizationId, env: Environment) {
   return useMutation({
     mutationFn: (modelId: ModelId | null) => api.models.setDefault(orgId, env, { model_id: modelId }),
     onSuccess: invalidate,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Memory: the kinds this server serves, the organization's memory types and
+// its default (the same in Sandbox and Production), and what each agent
+// remembers in its workspace, one memory type at a time.
+
+/** Every agent's list of memories: which type an agent on the default lists follows the default. */
+const memoryListQueries = {
+  predicate: (query: { queryKey: readonly unknown[] }) =>
+    query.queryKey[0] === "ws" && query.queryKey[4] === "memories",
+};
+
+export function useMemoryKinds(orgId: OrganizationId) {
+  return useQuery({
+    queryKey: qk.memoryKinds(orgId),
+    queryFn: () => api.memoryKinds.list(orgId),
+    // The server's, not the organization's: it changes only when the deployment does.
+    staleTime: 5 * 60_000,
+  });
+}
+
+/** The organization's memory types, by name, a page at a time. */
+export function useMemoryTypeList(orgId: OrganizationId, limit = 25, enabled = true) {
+  return useInfiniteQuery({
+    queryKey: qk.memoryTypes(orgId, { limit }),
+    queryFn: ({ pageParam }) => api.memoryTypes.list(orgId, { limit, cursor: pageParam ?? undefined }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.pagination.next_cursor,
+    enabled,
+  });
+}
+
+/** One memory type, or nothing while there's no ID (an agent on the default, say). */
+export function useMemoryType(orgId: OrganizationId, id: MemoryTypeId | null | undefined) {
+  return useQuery({
+    queryKey: qk.memoryType(orgId, id ?? "none"),
+    queryFn: () => api.memoryTypes.get(orgId, required(id)),
+    enabled: Boolean(id),
+  });
+}
+
+export function useDefaultMemoryType(orgId: OrganizationId) {
+  return useQuery({
+    queryKey: qk.defaultMemoryType(orgId),
+    queryFn: () => api.memoryTypes.getDefault(orgId),
+  });
+}
+
+/** Refreshes the types and the default together, agents' memories with them, and the audit log. */
+function useInvalidateMemory(orgId: OrganizationId) {
+  const qc = useQueryClient();
+  return () => {
+    void qc.invalidateQueries({ queryKey: qk.memory(orgId) });
+    void qc.invalidateQueries(memoryListQueries);
+    void qc.invalidateQueries({ queryKey: qk.audit(orgId) });
+  };
+}
+
+export function useCreateMemoryType(orgId: OrganizationId) {
+  const invalidate = useInvalidateMemory(orgId);
+  return useMutation({
+    mutationFn: (input: CreateMemoryTypeInput) => api.memoryTypes.create(orgId, input),
+    onSuccess: invalidate,
+  });
+}
+
+export function useUpdateMemoryType(orgId: OrganizationId) {
+  const invalidate = useInvalidateMemory(orgId);
+  return useMutation({
+    mutationFn: ({ id, ...input }: UpdateMemoryTypeInput & { id: MemoryTypeId }) =>
+      api.memoryTypes.update(orgId, id, input),
+    onSuccess: invalidate,
+  });
+}
+
+/**
+ * Deleting a type forgets its memories in every workspace, so every agent's list is read again. Refused
+ * because something holds it, the types and the default are read again: what holds it may have changed.
+ */
+export function useDeleteMemoryType(orgId: OrganizationId) {
+  const qc = useQueryClient();
+  const invalidate = useInvalidateMemory(orgId);
+  return useMutation({
+    mutationFn: (id: MemoryTypeId) => api.memoryTypes.delete(orgId, id),
+    onSuccess: (_, id) => {
+      qc.removeQueries({ queryKey: qk.memoryType(orgId, id) });
+      invalidate();
+    },
+    onError: (error) => {
+      if (isApiError(error, "memory_type_in_use")) void qc.invalidateQueries({ queryKey: qk.memory(orgId) });
+    },
+  });
+}
+
+/** Chooses the organization's default memory type, or none with `null`. */
+export function useSetDefaultMemoryType(orgId: OrganizationId) {
+  const invalidate = useInvalidateMemory(orgId);
+  return useMutation({
+    mutationFn: (memoryTypeId: MemoryTypeId | null) =>
+      api.memoryTypes.setDefault(orgId, { memory_type_id: memoryTypeId }),
+    onSuccess: invalidate,
+  });
+}
+
+/** How many memories a page of an agent's list holds. */
+export const MEMORY_PAGE = 25;
+
+/**
+ * An agent's memories in one memory type, newest first, searched on the
+ * server, a page at a time. `memory_type` names the type, so the list never
+ * stands for another: the agent's own may change while it's shown.
+ */
+export function useMemories(
+  wsId: WorkspaceId,
+  agentId: AgentId,
+  query: Omit<MemoryListQuery, "cursor" | "limit">,
+  enabled = true,
+) {
+  return useInfiniteQuery({
+    queryKey: qk.memories(wsId, agentId, query),
+    queryFn: ({ pageParam }) =>
+      api.memories.list(wsId, agentId, { ...query, limit: MEMORY_PAGE, cursor: pageParam ?? undefined }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.pagination.next_cursor,
+    // While a new search loads, the last one's results stay, in the same type only: another type's never stand in.
+    placeholderData: (previous, previousQuery) => {
+      const before = previousQuery?.queryKey[5] as Omit<MemoryListQuery, "cursor" | "limit"> | undefined;
+      return enabled && before?.memory_type === query.memory_type ? previous : undefined;
+    },
+    enabled,
+    // A refusal (memory off, a kind this server doesn't serve) answers the same until something changes.
+    retry: false,
+  });
+}
+
+/** Reads the agent's memories again, whichever answer came: a refused change may mean one was forgotten meanwhile. */
+function useInvalidateMemories(wsId: WorkspaceId, agentId: AgentId) {
+  const qc = useQueryClient();
+  return () => qc.invalidateQueries({ queryKey: qk.agentMemories(wsId, agentId) });
+}
+
+/**
+ * Saves a memory, then reads the lists again whatever the answer: refused as
+ * full, one may have been forgotten or saved meanwhile. Refused because the
+ * agent's memory or its type changed, the agent and the memory types are read
+ * again too, so the page shows what it uses now.
+ */
+export function useCreateMemory(wsId: WorkspaceId, agentId: AgentId) {
+  const qc = useQueryClient();
+  const invalidate = useInvalidateMemories(wsId, agentId);
+  return useMutation({
+    mutationFn: (input: CreateMemoryInput) => api.memories.create(wsId, agentId, input),
+    onError: (error) => {
+      if (isApiError(error, "memory_off", "unknown_memory_type", "memory_kind_not_served")) {
+        void qc.invalidateQueries({ queryKey: qk.agent(wsId, agentId), exact: true });
+        void qc.invalidateQueries({ queryKey: ["org"], predicate: (query) => query.queryKey[2] === "memory" });
+      }
+    },
+    onSettled: invalidate,
+  });
+}
+
+export function useUpdateMemory(wsId: WorkspaceId, agentId: AgentId) {
+  const invalidate = useInvalidateMemories(wsId, agentId);
+  return useMutation({
+    mutationFn: ({ id, text }: { id: MemoryId; text: string }) => api.memories.update(wsId, agentId, id, { text }),
+    onSettled: invalidate,
+  });
+}
+
+export function useDeleteMemory(wsId: WorkspaceId, agentId: AgentId) {
+  const invalidate = useInvalidateMemories(wsId, agentId);
+  return useMutation({
+    mutationFn: (id: MemoryId) => api.memories.delete(wsId, agentId, id),
+    onSettled: invalidate,
+  });
+}
+
+/** Forgets everything the agent keeps in the workspace, in every memory type. */
+export function useForgetAllMemories(wsId: WorkspaceId, agentId: AgentId) {
+  const invalidate = useInvalidateMemories(wsId, agentId);
+  return useMutation({
+    mutationFn: () => api.memories.deleteAll(wsId, agentId),
+    onSettled: invalidate,
   });
 }
 

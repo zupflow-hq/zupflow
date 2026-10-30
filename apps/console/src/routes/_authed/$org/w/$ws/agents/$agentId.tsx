@@ -27,6 +27,8 @@ import { AgentFields, agentInput, useAgentForm } from "@/features/agents/agent-f
 import { StartRunSheet } from "@/features/agents/start-run-sheet";
 import { AgentChannels } from "@/features/channels/agent-channels";
 import { canChange, useCurrentWorkspace, useDocumentTitle, useOrg } from "@/features/context";
+import { AgentMemories } from "@/features/memory/agent-memories";
+import { AgentMemoryName } from "@/features/memory/agent-memory";
 import { AgentModelName } from "@/features/models/agent-model";
 import { useAgent, useDeleteAgent, useRuns, useUpdateAgent } from "@/features/queries";
 import { RunTable } from "@/features/runs/run-table";
@@ -34,7 +36,7 @@ import { useDetailCrumb } from "@/lib/crumbs";
 import { applyFieldErrors, toastError } from "@/lib/errors";
 import { idParam } from "@/lib/route-ids";
 
-const TABS = ["overview", "access", "channels", "configuration"] as const;
+const TABS = ["overview", "access", "channels", "memories", "configuration"] as const;
 
 export const Route = createFileRoute("/_authed/$org/w/$ws/agents/$agentId")({
   params: idParam("agentId", "agent"),
@@ -168,6 +170,7 @@ function AgentPage() {
             ) : null}
           </LineTabsTrigger>
           <LineTabsTrigger value="channels">Channels</LineTabsTrigger>
+          <LineTabsTrigger value="memories">Memories</LineTabsTrigger>
           <LineTabsTrigger value="configuration">Configuration</LineTabsTrigger>
         </LineTabsList>
         <TabsContent value="overview">
@@ -175,6 +178,7 @@ function AgentPage() {
         </TabsContent>
         <TabsContent value="access">{a ? <AgentAccess org={org} workspace={ws} agent={a} /> : null}</TabsContent>
         <TabsContent value="channels">{a ? <AgentChannels org={org} workspace={ws} agent={a} /> : null}</TabsContent>
+        <TabsContent value="memories">{a ? <AgentMemories org={org} workspace={ws} agent={a} /> : null}</TabsContent>
         <TabsContent value="configuration">
           {a ? <ConfigurationTab workspace={ws} agent={a} readOnly={!mayChange} /> : null}
         </TabsContent>
@@ -194,7 +198,10 @@ function AgentPage() {
             onOpenChange={setDeleting}
             title={`Delete ${a.name}?`}
             description={
-              <p>Its grants are removed immediately. Past runs stay in the run history. This can't be undone.</p>
+              <p>
+                Its grants are removed and its memories in {ws.name} forgotten immediately. Past runs stay in the run
+                history. This can't be undone.
+              </p>
             }
             confirmText={a.name}
             actionLabel="Delete agent"
@@ -262,9 +269,19 @@ function OverviewTab({ org, workspace, agent }: { org: Organization; workspace: 
               <RelativeTime iso={agent.updated_at} />
             </Property>
             <Property label="Memory" className="sm:grid-cols-1 sm:gap-1">
-              <span className="text-muted-foreground">
-                None. Each run gets its session context only; long-term memory isn't available yet.
-              </span>
+              <div className="space-y-1">
+                <div>
+                  <AgentMemoryName org={org} agent={agent} />
+                </div>
+                <Link
+                  to="/$org/w/$ws/agents/$agentId"
+                  params={{ org: org.slug, ws: workspace.id, agentId: agent.id }}
+                  search={{ tab: "memories" }}
+                  className="text-sm text-brand-ink underline-offset-4 hover:underline"
+                >
+                  View memories
+                </Link>
+              </div>
             </Property>
           </Properties>
         </Panel>

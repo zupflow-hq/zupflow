@@ -3,6 +3,7 @@ import {
   ActivityIcon,
   BlocksIcon,
   BoxesIcon,
+  BrainIcon,
   KeyRoundIcon,
   PlugIcon,
   SearchIcon,
@@ -27,6 +28,7 @@ const PAGES = [
   { label: "App catalog", to: "/$org/apps", icon: BlocksIcon },
   { label: "Connect", to: "/$org/connect", icon: PlugIcon },
   { label: "Model providers", to: "/$org/model-providers", icon: SparklesIcon },
+  { label: "Memory", to: "/$org/memory", icon: BrainIcon },
   { label: "API keys", to: "/$org/api-keys", icon: KeyRoundIcon },
   { label: "Webhooks", to: "/$org/webhooks", icon: WebhookIcon },
 ] as const;

@@ -4,7 +4,9 @@ import type {
   ChannelConversationListQuery,
   ChannelMessageListQuery,
   Environment,
+  MemoryListQuery,
   ModelListQuery,
+  PageQuery,
   RunListQuery,
   WebhookDeliveryListQuery,
 } from "@zupflow/sdk";
@@ -48,6 +50,12 @@ export const qk = {
   models: (orgId: string, query: Omit<ModelListQuery, "cursor">) =>
     ["org", orgId, "model-providers", "models", query] as const,
   defaultModel: (orgId: string, env: Environment) => ["org", orgId, "model-providers", "default", env] as const,
+  /** Memory: the kinds this server serves, the organization's types and its default. One prefix, so a change refreshes all three. */
+  memory: (orgId: string) => ["org", orgId, "memory"] as const,
+  memoryKinds: (orgId: string) => ["org", orgId, "memory", "kinds"] as const,
+  memoryTypes: (orgId: string, query: Omit<PageQuery, "cursor">) => ["org", orgId, "memory", "types", query] as const,
+  memoryType: (orgId: string, memoryTypeId: string) => ["org", orgId, "memory", "type", memoryTypeId] as const,
+  defaultMemoryType: (orgId: string) => ["org", orgId, "memory", "default"] as const,
   audit: (orgId: string, workspaceId?: string) => ["org", orgId, "audit", workspaceId ?? "all"] as const,
   /** The organization's channel tool levels and settings. */
   channelToolLevels: (orgId: string) => ["org", orgId, "channels", "tool-levels"] as const,
@@ -66,6 +74,10 @@ export const qk = {
   agents: (wsId: string) => ["ws", wsId, "agents"] as const,
   agent: (wsId: string, id: string) => ["ws", wsId, "agents", id] as const,
   grants: (wsId: string, agentId: string) => ["ws", wsId, "agents", agentId, "grants"] as const,
+  /** What the agent remembers in the workspace: every list, whichever memory type and search it shows. */
+  agentMemories: (wsId: string, agentId: string) => ["ws", wsId, "agents", agentId, "memories"] as const,
+  memories: (wsId: string, agentId: string, query: Omit<MemoryListQuery, "cursor" | "limit">) =>
+    ["ws", wsId, "agents", agentId, "memories", query] as const,
   runs: (wsId: string, query: RunListQuery = {}) => ["ws", wsId, "runs", "list", query] as const,
   run: (wsId: string, id: string) => ["ws", wsId, "runs", id] as const,
   runEvents: (wsId: string, id: string) => ["ws", wsId, "runs", id, "events"] as const,

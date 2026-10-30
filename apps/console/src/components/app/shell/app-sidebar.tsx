@@ -3,6 +3,7 @@ import {
   ActivityIcon,
   BlocksIcon,
   BoxesIcon,
+  BrainIcon,
   CheckIcon,
   ChevronsUpDownIcon,
   KeyRoundIcon,
@@ -166,6 +167,7 @@ export function AppSidebar() {
   const developerItems: NavItem[] = [
     { label: "Connect", icon: PlugIcon, to: "/$org/connect", params: o },
     { label: "Model providers", icon: SparklesIcon, to: "/$org/model-providers", params: o },
+    { label: "Memory", icon: BrainIcon, to: "/$org/memory", params: o },
     { label: "API keys", icon: KeyRoundIcon, to: "/$org/api-keys", params: o },
     { label: "Webhooks", icon: WebhookIcon, to: "/$org/webhooks", params: o },
   ];

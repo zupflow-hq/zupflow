@@ -24,7 +24,15 @@ import { Toolbar } from "@/components/app/toolbar";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { canAdminister } from "@/features/context";
 import {
@@ -36,8 +44,11 @@ import {
 import { WorkspacePicker } from "@/features/workspaces/workspace-picker";
 import { toastError } from "@/lib/errors";
 import { fullDateTime, shortId } from "@/lib/format";
+import { eventGroups } from "./event-groups";
 
 type Filters = Omit<WebhookDeliveryListQuery, "cursor" | "limit">;
+
+const DELIVERY_TYPE_GROUPS = eventGroups(WEBHOOK_DELIVERY_TYPES);
 
 const STATES = {
   pending: { label: "Pending", tone: "warning" },
@@ -151,10 +162,15 @@ export function WebhookHistory({
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="all">All event types</SelectItem>
-            {WEBHOOK_DELIVERY_TYPES.map((type) => (
-              <SelectItem key={type} value={type}>
-                {type}
-              </SelectItem>
+            {DELIVERY_TYPE_GROUPS.map((group) => (
+              <SelectGroup key={group.key}>
+                <SelectLabel>{group.label}</SelectLabel>
+                {group.types.map((type) => (
+                  <SelectItem key={type} value={type}>
+                    {type}
+                  </SelectItem>
+                ))}
+              </SelectGroup>
             ))}
           </SelectContent>
         </Select>

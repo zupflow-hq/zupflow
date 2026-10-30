@@ -32,6 +32,7 @@ import { canAdminister, useDocumentTitle, useOrg } from "@/features/context";
 import { useEnvironment } from "@/features/environment";
 import { useCreateWebhook, useDeleteWebhook, useUpdateWebhook, useWebhooks } from "@/features/queries";
 import { WebhookEndpointActions, WebhookSecretOverlap } from "@/features/webhooks/endpoint-actions";
+import { eventGroups } from "@/features/webhooks/event-groups";
 import { applyFieldErrors, toastError } from "@/lib/errors";
 
 export const Route = createFileRoute("/_authed/$org/webhooks/")({
@@ -202,6 +203,8 @@ function WebhooksPage() {
   );
 }
 
+const EVENT_GROUPS = eventGroups(WEBHOOK_EVENT_TYPES);
+
 const schema = z.object({
   url: z.string().trim().url("Enter a full https:// URL."),
   description: z.string().trim().max(200),
@@ -247,7 +250,7 @@ function EndpointDialog({
   const pending = create.isPending || update.isPending;
   return (
     <Dialog open={endpoint !== null} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>{existing ? "Edit endpoint" : `Add ${ENVIRONMENT_LABEL[environment]} endpoint`}</DialogTitle>
           <DialogDescription>
@@ -317,21 +320,36 @@ function EndpointDialog({
               render={({ field }) => (
                 <FormItem>
                   <FormLabel>Events</FormLabel>
-                  <div className="grid gap-x-4 gap-y-2 rounded-lg border p-3 sm:grid-cols-2">
-                    {WEBHOOK_EVENT_TYPES.map((type) => (
-                      <div key={type} className="flex items-center gap-2">
-                        <Checkbox
-                          id={`event-${type}`}
-                          checked={field.value?.includes(type)}
-                          onCheckedChange={(on) =>
-                            field.onChange(
-                              on ? [...(field.value ?? []), type] : (field.value ?? []).filter((t) => t !== type),
-                            )
-                          }
-                        />
-                        <Label htmlFor={`event-${type}`} className="font-mono text-[12px] font-normal">
-                          {type}
-                        </Label>
+                  <div className="rounded-lg border p-3 sm:columns-2 sm:gap-x-4">
+                    {EVENT_GROUPS.map((group) => (
+                      <div
+                        key={group.key}
+                        role="group"
+                        aria-labelledby={`events-${group.key}`}
+                        className="mb-3 space-y-2 break-inside-avoid last:mb-0"
+                      >
+                        <p id={`events-${group.key}`} className="text-xs font-medium text-muted-foreground">
+                          {group.label}
+                        </p>
+                        {group.types.map((type) => (
+                          <div key={type} className="flex items-center gap-2">
+                            <Checkbox
+                              id={`event-${type}`}
+                              checked={field.value?.includes(type)}
+                              onCheckedChange={(on) =>
+                                field.onChange(
+                                  on ? [...(field.value ?? []), type] : (field.value ?? []).filter((t) => t !== type),
+                                )
+                              }
+                            />
+                            <Label
+                              htmlFor={`event-${type}`}
+                              className="min-w-0 font-mono text-[12px] font-normal break-all"
+                            >
+                              {type}
+                            </Label>
+                          </div>
+                        ))}
                       </div>
                     ))}
                   </div>
