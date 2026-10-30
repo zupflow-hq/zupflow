@@ -656,7 +656,7 @@ export const routes: readonly Route[] = [
     operationId: "deleteAgent",
     method: "delete",
     path: "/v1/workspaces/{ws}/agents/{agent}",
-    summary: "Delete an agent and its grants",
+    summary: "Delete an agent, its grants and its memories",
     callers: both,
     params: { ...ws, agent: idSchema("agent") },
     response: noContent,
@@ -965,7 +965,7 @@ export const routes: readonly Route[] = [
     method: "delete",
     path: "/v1/organizations/{org}/memory-types/{memory_type}",
     summary:
-      "Delete a memory type: owners and admins, from the Console. Refused while it is the organization's default or an agent's (`409 memory_type_in_use`, naming them)",
+      "Delete a memory type: owners and admins, from the Console. Refused while it is the organization's default or an agent's (`409 memory_type_in_use`, naming them). Its memories, in every workspace, are forgotten with it, without a `memory.forgotten` for each",
     callers: consoleOnly,
     params: { ...org, memory_type: idSchema("memory_type") },
     response: noContent,
@@ -988,6 +988,79 @@ export const routes: readonly Route[] = [
     params: org,
     body: s.UpdateDefaultMemoryTypeInput,
     response: ok(s.DefaultMemoryType),
+  },
+
+  // What an agent remembers in one workspace. Every member and API key reads
+  // it; owners, admins and developers change it from the Console, in Sandbox
+  // only (`403 console_read_only_in_production`), and API keys from the
+  // customer's product. Another agent's, workspace's or organization's memory
+  // is `404`. A memory's type's kind says what people can do with it
+  // (`MemoryKind.manage`): what it can't is `422 memory_kind_unsupported`.
+  // Listing or saving in a type of a kind this server doesn't serve is
+  // `422 memory_kind_not_served`; by its ID, such a memory is `404`, as a
+  // server finds a memory through the kinds it serves.
+  {
+    operationId: "listMemories",
+    method: "get",
+    path: "/v1/workspaces/{ws}/agents/{agent}/memories",
+    summary:
+      "An agent's memories in one memory type, newest first, paged on the server: every one it keeps there, those saved in a direct conversation too. `422 unknown_memory_type` (`fields.memory_type`) for a type that isn't the organization's; a cursor the list didn't issue is `400 validation_failed` (`fields.cursor`)",
+    callers: both,
+    params: { ...ws, agent: idSchema("agent") },
+    query: s.MemoryListQuery,
+    response: ok(s.Memory, { list: true, paginated: true }),
+  },
+  {
+    operationId: "createMemory",
+    method: "post",
+    path: "/v1/workspaces/{ws}/agents/{agent}/memories",
+    summary:
+      "Save a memory for the agent: owners, admins and developers, from the Console in Sandbox only, and API keys. Its origin is the caller. `422 memory_off` when the body names no type and the agent has none; `422 unknown_memory_type` (`fields.memory_type_id`), `422 invalid_memory_text` (`fields.text`), `422 memory_full` at the type's `max_notes`. Sends `memory.saved`; audited as `memory.saved`",
+    callers: both,
+    params: { ...ws, agent: idSchema("agent") },
+    body: s.CreateMemoryInput,
+    response: created(s.Memory),
+  },
+  {
+    operationId: "getMemory",
+    method: "get",
+    path: "/v1/workspaces/{ws}/agents/{agent}/memories/{memory}",
+    summary:
+      "A memory of the agent, in whichever of its types keeps it: what a webhook names, as it is now. Forgotten, it's `404`",
+    callers: both,
+    params: { ...ws, agent: idSchema("agent"), memory: idSchema("memory") },
+    response: ok(s.Memory),
+  },
+  {
+    operationId: "updateMemory",
+    method: "patch",
+    path: "/v1/workspaces/{ws}/agents/{agent}/memories/{memory}",
+    summary:
+      "Change a memory's text: owners, admins and developers, from the Console in Sandbox only, and API keys. The memory is found first (`404`), then its kind's `manage` checked, then the text kept as for saving (`422 invalid_memory_text`, `fields.text`). Its origin becomes the caller; sends `memory.updated`, audited as `memory.updated`. The text it holds already changes nothing: not its `updated_at` or origin, and nothing is sent or audited",
+    callers: both,
+    params: { ...ws, agent: idSchema("agent"), memory: idSchema("memory") },
+    body: s.UpdateMemoryInput,
+    response: ok(s.Memory),
+  },
+  {
+    operationId: "deleteMemory",
+    method: "delete",
+    path: "/v1/workspaces/{ws}/agents/{agent}/memories/{memory}",
+    summary:
+      "Forget a memory: owners, admins and developers, from the Console in Sandbox only, and API keys. The memory is found first (`404`), then its kind's `manage` checked. Sends `memory.forgotten`; audited as `memory.forgotten`",
+    callers: both,
+    params: { ...ws, agent: idSchema("agent"), memory: idSchema("memory") },
+    response: noContent,
+  },
+  {
+    operationId: "deleteMemories",
+    method: "delete",
+    path: "/v1/workspaces/{ws}/agents/{agent}/memories",
+    summary:
+      "Forget everything the agent keeps in the workspace, in every memory type of a kind this server serves: owners, admins and developers, from the Console in Sandbox only, and API keys. Sends a `memory.forgotten` for each memory; audited once, as `agent.memory_forgotten` with how many, when there was at least one",
+    callers: both,
+    params: { ...ws, agent: idSchema("agent") },
+    response: noContent,
   },
 
   // Developer settings

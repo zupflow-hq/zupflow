@@ -47,14 +47,18 @@ export async function loadTenant(
   const grants = (await Promise.all(agents.map((a) => client.grants.list(w, a.id)))).flat();
   const grant = must(grants[0], `grant in ${workspaceSlug}`);
   const runs = (await client.runs.list(w, { limit: 100 })).items;
+  const agent = must(
+    agents.find((a) => a.id === grant.agent_id),
+    `agent with a grant in ${workspaceSlug}`,
+  );
+  // A memory type, where the target serves them and the organization has one; their attempts are left out
+  // otherwise.
+  const memoryType = await ifServed(async () => (await client.memoryTypes.list(org, { limit: 1 })).items[0]);
   return {
     org,
     workspace,
     sandbox,
-    agent: must(
-      agents.find((a) => a.id === grant.agent_id),
-      `agent with a grant in ${workspaceSlug}`,
-    ),
+    agent,
     grant,
     // A finished run, so a refused cancel can't be confused with one that came too late.
     // Of the granted agent, so a filter by that agent has something to leak.
@@ -79,9 +83,14 @@ export async function loadTenant(
     model: await ifServed(async () => must((await client.models.list(org, { limit: 1 })).items[0], "model")),
     hook: must((await client.webhooks.list(org))[0], "webhook"),
     member: must((await client.members.list(org))[0], "member"),
-    // A memory type, where the target serves them and the organization has one; their attempts are left out
-    // otherwise.
-    memoryType: await ifServed(async () => (await client.memoryTypes.list(org, { limit: 1 })).items[0]),
+    memoryType,
+    // A memory the agent keeps in that type, where the target serves them and there is one; their attempts are
+    // left out otherwise.
+    memory: memoryType
+      ? await ifServed(
+          async () => (await client.memories.list(w, agent.id, { memory_type: memoryType.id, limit: 1 })).items[0],
+        )
+      : undefined,
     // Channels, where the target serves them: the fixture's linked team, its installed app and connection.
     channel: await ifServed(async () => {
       const connection = must(
@@ -155,10 +164,23 @@ export async function snapshotOf(client: ZupflowClient, t: Tenant): Promise<stri
       await client.memoryTypes.list(t.org, { limit: 100 }),
       await client.memoryTypes.getDefault(t.org),
     ]),
+    await ifServed(() => memorySnapshot(client, t, agents)),
     await ifServed(() => channelSnapshot(client, t, agents)),
     await client.webhooks.list(t.org),
     await client.audit.list(t.org, { limit: 100 }),
   ]);
+}
+
+/** What each of the workspace's agents remembers, in its own memory type and in the tenant's. */
+async function memorySnapshot(client: ZupflowClient, t: Tenant, agents: { id: AgentId }[]) {
+  const w = t.workspace.id;
+  const { memoryType } = t;
+  return Promise.all(
+    agents.map(async (a) => [
+      await client.memories.list(w, a.id, { limit: 100 }),
+      memoryType ? await client.memories.list(w, a.id, { memory_type: memoryType.id, limit: 100 }) : null,
+    ]),
+  );
 }
 
 /** Everything the tenant's channels hold, as its members read it. */
@@ -428,6 +450,52 @@ export function attempts(
         ["[own org] delete memory type via own org", () => r.memoryTypes.delete(own.org, memoryType.id)],
       ]
     : [];
+  // Memories, only where the target serves them and the victim's agent keeps one (loadTenant found it then).
+  const { memory } = v;
+  const victimMemoriesAttempts: [string, () => Promise<unknown>][] = memory
+    ? [
+        ["[victim workspace] list memories", () => r.memories.list(w, v.agent.id)],
+        ["[victim workspace] get memory", () => r.memories.get(w, v.agent.id, memory.id)],
+        ["[victim workspace] save memory", () => r.memories.create(w, v.agent.id, { text: "Owned" })],
+        ["[victim workspace] change memory", () => r.memories.update(w, v.agent.id, memory.id, { text: "Owned" })],
+        ["[victim workspace] forget memory", () => r.memories.delete(w, v.agent.id, memory.id)],
+        ["[victim workspace] forget every memory", () => r.memories.deleteAll(w, v.agent.id)],
+      ]
+    : [];
+  const ownMemoriesAttempts: [string, () => Promise<unknown>][] = memory
+    ? [
+        ["[own workspace] victim agent's memories", () => r.memories.list(own.workspace.id, v.agent.id)],
+        ["[own workspace] get victim memory", () => r.memories.get(own.workspace.id, v.agent.id, memory.id)],
+        // Through the attacker's Sandbox, so Production's read-only refusal can't answer first.
+        [
+          "[own workspace] save memory for victim agent",
+          () => r.memories.create(own.sandbox.id, v.agent.id, { text: "Owned" }),
+        ],
+        [
+          "[own workspace] change victim memory",
+          () => r.memories.update(own.sandbox.id, v.agent.id, memory.id, { text: "Owned" }),
+        ],
+        ["[own workspace] forget victim memory", () => r.memories.delete(own.sandbox.id, v.agent.id, memory.id)],
+        ["[own workspace] forget victim agent's memories", () => r.memories.deleteAll(own.sandbox.id, v.agent.id)],
+        // The victim's memory under the attacker's own agent: the memory lookup alone.
+        ...(prepared
+          ? ([
+              [
+                "[own workspace] get victim memory as own agent's",
+                () => r.memories.get(own.sandbox.id, prepared.agent, memory.id),
+              ],
+              [
+                "[own workspace] change victim memory as own agent's",
+                () => r.memories.update(own.sandbox.id, prepared.agent, memory.id, { text: "Owned" }),
+              ],
+              [
+                "[own workspace] forget victim memory as own agent's",
+                () => r.memories.delete(own.sandbox.id, prepared.agent, memory.id),
+              ],
+            ] as [string, () => Promise<unknown>][])
+          : []),
+      ]
+    : [];
   const ownModelAttempts: [string, () => Promise<unknown>][] =
     connection && model
       ? [
@@ -517,6 +585,7 @@ export function attempts(
       () => r.workspaceApps.updateConfiguration(w, v.workspaceApp.id, { mcp_server_url: null }),
     ],
     ["[victim workspace] available apps", () => r.workspaceApps.available(w)],
+    ...victimMemoriesAttempts,
     // The victim's organization.
     ["[victim org] get organization", () => r.organizations.get(v.org)],
     ["[victim org] rename organization", () => r.organizations.update(v.org, { name: "Owned" })],
@@ -662,6 +731,7 @@ export function attempts(
         }),
     ],
     ["[own workspace] victim grant under own agent", () => r.grants.delete(own.workspace.id, own.agent.id, v.grant.id)],
+    ...ownMemoriesAttempts,
     [
       "[own workspace] connect with victim app",
       () =>

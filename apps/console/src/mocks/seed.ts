@@ -36,6 +36,7 @@ import type {
   GrantRow,
   InstallationRow,
   InstallationShortIdRow,
+  MemoryRow,
   MemoryTypeRow,
   ModelConnectionRow,
   ModelRow,
@@ -48,10 +49,10 @@ import { setLevels, suggestLevels } from "./policy";
 import { providerModel } from "./providers";
 import { mulberry32, type Rng, uuid } from "./random";
 import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
-import { appIn, issueShortId, timelineOf } from "./scope";
+import { appIn, drawShortId, issueShortId, timelineOf } from "./scope";
 import { listedFrom, recordListing } from "./tools";
 
-export const DB_SCHEMA = 29;
+export const DB_SCHEMA = 30;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -483,6 +484,7 @@ export function seed(nowMs: number = Date.now()): Db {
     memory_kinds: [MEMORY_KIND_NOTES],
     memory_types: [],
     default_memory_types: [],
+    memories: [],
     agents,
     grants,
     runs: [],
@@ -747,7 +749,7 @@ export function seed(nowMs: number = Date.now()): Db {
   seedTools(db, nowMs, sandboxTaskboard);
   seedLevels(db, nowMs, { google, taskboard, stripe, github }, jordan.id);
   seedWebhookHistory(db, nowMs);
-  seedMemory(db, nowMs, org.id, DEMO_USER_ID);
+  seedMemory(db, nowMs, org.id, DEMO_USER_ID, { publisher: sandboxPublisher, reporter: acmeReporter });
   // Seeded runs record their approvals as they're decided: newest first, like the log.
   db.audit.sort((a, b) => b.created_at.localeCompare(a.created_at));
   return db;
@@ -755,10 +757,19 @@ export function seed(nowMs: number = Date.now()): Db {
 
 /**
  * The demo organization's memory: one `notes` type with the kind's defaults,
- * chosen as its default, so every agent (each on the default) remembers.
- * Other organizations have none, as a new one has.
+ * chosen as its default, so every agent (each on the default) remembers. Two
+ * agents already keep a few notes: the Sandbox publisher's added from the
+ * Console and the API, and the Production reporter's from the API, as the
+ * Console doesn't write there. Other organizations have none, as a new one
+ * has.
  */
-function seedMemory(db: Db, nowMs: number, organizationId: OrganizationId, chosenBy: UserId) {
+function seedMemory(
+  db: Db,
+  nowMs: number,
+  organizationId: OrganizationId,
+  chosenBy: UserId,
+  agents: { publisher: AgentRow; reporter: AgentRow },
+) {
   const rng = mulberry32(20261030);
   const createdAt = new Date(nowMs - 12 * DAY).toISOString();
   const notes: MemoryTypeRow = {
@@ -778,6 +789,49 @@ function seedMemory(db: Db, nowMs: number, organizationId: OrganizationId, chose
     updated_at: createdAt,
     updated_by_user_id: chosenBy,
   });
+
+  const keyIn = (environment: Environment) =>
+    db.api_keys.find((k) => k.organization_id === organizationId && k.environment === environment && !k.revoked_at);
+  const sandboxKey = keyIn("sandbox");
+  const productionKey = keyIn("production");
+  const byMember: MemoryRow["origin"] = { type: "member", user_id: chosenBy };
+  const note = (agent: AgentRow, text: string, savedAgo: number, origin: MemoryRow["origin"]) => {
+    const taken = new Set(
+      db.memories
+        .filter((m) => m.agent_id === agent.id && m.workspace_id === agent.workspace_id)
+        .map((m) => m.short_id),
+    );
+    let shortId = drawShortId(rng);
+    while (taken.has(shortId)) shortId = drawShortId(rng);
+    const at = new Date(nowMs - savedAgo).toISOString();
+    db.memories.push({
+      id: newId("memory", { rng, at: nowMs - savedAgo }),
+      organization_id: agent.organization_id,
+      workspace_id: agent.workspace_id,
+      agent_id: agent.id,
+      memory_type_id: notes.id,
+      short_id: shortId,
+      text,
+      channel_conversation_id: null,
+      origin,
+      created_at: at,
+      updated_at: at,
+    });
+  };
+  const { publisher, reporter } = agents;
+  note(publisher, "Headlines use sentence case and stay under 70 characters.", 11 * DAY, byMember);
+  note(publisher, "Every draft links to at least one earlier post on the same topic.", 9 * DAY, byMember);
+  if (sandboxKey) {
+    const fromApi: MemoryRow["origin"] = { type: "api_key", api_key_id: sandboxKey.id };
+    note(publisher, "Images need alt text before a post is scheduled.", 6 * DAY, fromApi);
+  }
+  note(publisher, "Posts go out on Tuesdays and Thursdays, in the morning.", 2 * DAY, byMember);
+  if (productionKey) {
+    const fromApi: MemoryRow["origin"] = { type: "api_key", api_key_id: productionKey.id };
+    note(reporter, "The weekly summary covers the previous calendar week, Monday to Sunday.", 10 * DAY, fromApi);
+    note(reporter, "Amounts are shown in each invoice's own currency, rounded to whole units.", 8 * DAY, fromApi);
+    note(reporter, "Invoices more than 30 days past due are listed first.", 3 * DAY, fromApi);
+  }
 }
 
 /** Fixed scenarios and times relative to `nowMs`, so resetting repeats every delivery outcome. */

@@ -3552,6 +3552,125 @@
         "type": "string",
         "pattern": "^mem_[0-9A-Za-z]{22}$"
       },
+      "Memory": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/MemoryId"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/WorkspaceId"
+          },
+          "agent_id": {
+            "$ref": "#/components/schemas/AgentId"
+          },
+          "memory_type_id": {
+            "$ref": "#/components/schemas/MemoryTypeId"
+          },
+          "short_id": {
+            "$ref": "#/components/schemas/InstallationShortId"
+          },
+          "text": {
+            "type": "string"
+          },
+          "channel_conversation_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChannelConversationId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "origin": {
+            "$ref": "#/components/schemas/MemoryOrigin"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Instant"
+          }
+        },
+        "required": [
+          "id",
+          "workspace_id",
+          "agent_id",
+          "memory_type_id",
+          "short_id",
+          "text",
+          "channel_conversation_id",
+          "origin",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "MemoryForgottenWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "memory.forgotten"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "memory"
+              },
+              "id": {
+                "$ref": "#/components/schemas/MemoryId"
+              },
+              "agent_id": {
+                "$ref": "#/components/schemas/AgentId"
+              },
+              "memory_type_id": {
+                "$ref": "#/components/schemas/MemoryTypeId"
+              },
+              "origin": {
+                "$ref": "#/components/schemas/MemoryOrigin"
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "agent_id",
+              "memory_type_id",
+              "origin"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
+      },
+      "MemoryId": {
+        "type": "string",
+        "pattern": "^memo_[0-9A-Za-z]{22}$"
+      },
       "MemoryKind": {
         "type": "object",
         "properties": {
@@ -3602,6 +3721,127 @@
           "description",
           "settings_schema",
           "manage"
+        ]
+      },
+      "MemoryOrigin": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "run"
+              },
+              "run_id": {
+                "$ref": "#/components/schemas/RunId"
+              },
+              "tool_call_id": {
+                "$ref": "#/components/schemas/ToolCallId"
+              },
+              "after_app_content": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "type",
+              "run_id",
+              "tool_call_id",
+              "after_app_content"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "api_key"
+              },
+              "api_key_id": {
+                "$ref": "#/components/schemas/ApiKeyId"
+              }
+            },
+            "required": [
+              "type",
+              "api_key_id"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "member"
+              },
+              "user_id": {
+                "$ref": "#/components/schemas/UserId"
+              }
+            },
+            "required": [
+              "type",
+              "user_id"
+            ]
+          }
+        ]
+      },
+      "MemorySavedWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "memory.saved"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "memory"
+              },
+              "id": {
+                "$ref": "#/components/schemas/MemoryId"
+              },
+              "agent_id": {
+                "$ref": "#/components/schemas/AgentId"
+              },
+              "memory_type_id": {
+                "$ref": "#/components/schemas/MemoryTypeId"
+              },
+              "origin": {
+                "$ref": "#/components/schemas/MemoryOrigin"
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "agent_id",
+              "memory_type_id",
+              "origin"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
         ]
       },
       "MemoryType": {
@@ -3666,6 +3906,67 @@
       "MemoryTypeId": {
         "type": "string",
         "pattern": "^mtype_[0-9A-Za-z]{22}$"
+      },
+      "MemoryUpdatedWebhookEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/WebhookEventId"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationId"
+          },
+          "type": {
+            "type": "string",
+            "const": "memory.updated"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WebhookEventWorkspace"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "object": {
+                "type": "string",
+                "const": "memory"
+              },
+              "id": {
+                "$ref": "#/components/schemas/MemoryId"
+              },
+              "agent_id": {
+                "$ref": "#/components/schemas/AgentId"
+              },
+              "memory_type_id": {
+                "$ref": "#/components/schemas/MemoryTypeId"
+              },
+              "origin": {
+                "$ref": "#/components/schemas/MemoryOrigin"
+              }
+            },
+            "required": [
+              "object",
+              "id",
+              "agent_id",
+              "memory_type_id",
+              "origin"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "environment",
+          "organization_id",
+          "type",
+          "workspace",
+          "data"
+        ]
       },
       "Meta": {
         "type": "object",
@@ -6185,6 +6486,9 @@
               "channel_app.status_changed",
               "channel_connection.status_changed",
               "channel_conversation.paused",
+              "memory.saved",
+              "memory.updated",
+              "memory.forgotten",
               "webhook.test"
             ]
           },
@@ -6339,6 +6643,9 @@
               "channel_app.status_changed",
               "channel_connection.status_changed",
               "channel_conversation.paused",
+              "memory.saved",
+              "memory.updated",
+              "memory.forgotten",
               "webhook.test"
             ]
           },
@@ -6483,7 +6790,10 @@
                 "channel_app_manager.status_changed",
                 "channel_app.status_changed",
                 "channel_connection.status_changed",
-                "channel_conversation.paused"
+                "channel_conversation.paused",
+                "memory.saved",
+                "memory.updated",
+                "memory.forgotten"
               ]
             }
           },
@@ -6584,6 +6894,15 @@
           },
           {
             "$ref": "#/components/schemas/ChannelConversationPausedWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/MemorySavedWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/MemoryUpdatedWebhookEvent"
+          },
+          {
+            "$ref": "#/components/schemas/MemoryForgottenWebhookEvent"
           },
           {
             "$ref": "#/components/schemas/WebhookTestWebhookEvent"
@@ -11559,7 +11878,7 @@
       },
       "delete": {
         "operationId": "deleteAgent",
-        "summary": "Delete an agent and its grants",
+        "summary": "Delete an agent, its grants and its memories",
         "security": [
           {
             "consoleSession": [],
@@ -14117,7 +14436,7 @@
       },
       "delete": {
         "operationId": "deleteMemoryType",
-        "summary": "Delete a memory type: owners and admins, from the Console. Refused while it is the organization's default or an agent's (`409 memory_type_in_use`, naming them)",
+        "summary": "Delete a memory type: owners and admins, from the Console. Refused while it is the organization's default or an agent's (`409 memory_type_in_use`, naming them). Its memories, in every workspace, are forgotten with it, without a `memory.forgotten` for each",
         "security": [
           {
             "consoleSession": []
@@ -14305,6 +14624,502 @@
                 ]
               }
             }
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{ws}/agents/{agent}/memories": {
+      "get": {
+        "operationId": "listMemories",
+        "summary": "An agent's memories in one memory type, newest first, paged on the server: every one it keeps there, those saved in a direct conversation too. `422 unknown_memory_type` (`fields.memory_type`) for a type that isn't the organization's; a cursor the list didn't issue is `400 validation_failed` (`fields.cursor`)",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "agent",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/AgentId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Page size, 1 to 100 (default 25); values outside are clamped, and a non-integer means the default.",
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          },
+          {
+            "name": "memory_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "The memory type to list. By default the agent's own, or the organization's default for an agent on it; with none, the page is empty. One that isn't the organization's is `422 unknown_memory_type` (`fields.memory_type`).",
+              "$ref": "#/components/schemas/MemoryTypeId"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Only the memories holding every word of it, each a whole word, in any case and accent. Words are split at whitespace, and each needs a letter or a digit: with none, nothing matches. Blank lists every memory.",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Memory"
+                      }
+                    },
+                    "meta": {
+                      "$ref": "#/components/schemas/Meta"
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createMemory",
+        "summary": "Save a memory for the agent: owners, admins and developers, from the Console in Sandbox only, and API keys. Its origin is the caller. `422 memory_off` when the body names no type and the agent has none; `422 unknown_memory_type` (`fields.memory_type_id`), `422 invalid_memory_text` (`fields.text`), `422 memory_full` at the type's `max_notes`. Sends `memory.saved`; audited as `memory.saved`",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "agent",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/AgentId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Memory"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "text": {
+                    "type": "string"
+                  },
+                  "memory_type_id": {
+                    "$ref": "#/components/schemas/MemoryTypeId"
+                  }
+                },
+                "required": [
+                  "text"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteMemories",
+        "summary": "Forget everything the agent keeps in the workspace, in every memory type of a kind this server serves: owners, admins and developers, from the Console in Sandbox only, and API keys. Sends a `memory.forgotten` for each memory; audited once, as `agent.memory_forgotten` with how many, when there was at least one",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "agent",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/AgentId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Done"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{ws}/agents/{agent}/memories/{memory}": {
+      "get": {
+        "operationId": "getMemory",
+        "summary": "A memory of the agent, in whichever of its types keeps it: what a webhook names, as it is now. Forgotten, it's `404`",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "agent",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/AgentId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "memory",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/MemoryId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Memory"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "updateMemory",
+        "summary": "Change a memory's text: owners, admins and developers, from the Console in Sandbox only, and API keys. The memory is found first (`404`), then its kind's `manage` checked, then the text kept as for saving (`422 invalid_memory_text`, `fields.text`). Its origin becomes the caller; sends `memory.updated`, audited as `memory.updated`. The text it holds already changes nothing: not its `updated_at` or origin, and nothing is sent or audited",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "agent",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/AgentId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "memory",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/MemoryId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Memory"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "text"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteMemory",
+        "summary": "Forget a memory: owners, admins and developers, from the Console in Sandbox only, and API keys. The memory is found first (`404`), then its kind's `manage` checked. Sends `memory.forgotten`; audited as `memory.forgotten`",
+        "security": [
+          {
+            "consoleSession": [],
+            "organization": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "ws",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "agent",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/AgentId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "memory",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/MemoryId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Done"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }
@@ -14886,7 +15701,10 @@
                         "channel_app_manager.status_changed",
                         "channel_app.status_changed",
                         "channel_connection.status_changed",
-                        "channel_conversation.paused"
+                        "channel_conversation.paused",
+                        "memory.saved",
+                        "memory.updated",
+                        "memory.forgotten"
                       ]
                     }
                   }
@@ -15010,7 +15828,10 @@
                         "channel_app_manager.status_changed",
                         "channel_app.status_changed",
                         "channel_connection.status_changed",
-                        "channel_conversation.paused"
+                        "channel_conversation.paused",
+                        "memory.saved",
+                        "memory.updated",
+                        "memory.forgotten"
                       ]
                     }
                   },
@@ -15247,6 +16068,9 @@
                 "channel_app.status_changed",
                 "channel_connection.status_changed",
                 "channel_conversation.paused",
+                "memory.saved",
+                "memory.updated",
+                "memory.forgotten",
                 "webhook.test"
               ]
             }
@@ -18820,6 +19644,210 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/ChannelConversationPausedWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "memory.saved": {
+      "post": {
+        "operationId": "webhook_memory_saved",
+        "summary": "`memory.saved`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "memory.saved"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemorySavedWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "memory.updated": {
+      "post": {
+        "operationId": "webhook_memory_updated",
+        "summary": "`memory.updated`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "memory.updated"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryUpdatedWebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds, then fetch current state; any other answer or a timeout is retried."
+          }
+        }
+      }
+    },
+    "memory.forgotten": {
+      "post": {
+        "operationId": "webhook_memory_forgotten",
+        "summary": "`memory.forgotten`",
+        "parameters": [
+          {
+            "name": "Zupflow-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`t=<unix seconds>,v1=<lowercase hex HMAC-SHA256>` over `\"<t>.<raw body>\"` with the endpoint's signing secret; two `v1` values during a rotation. Verify against the raw body in constant time and reject a timestamp more than 300 seconds from your clock. The SDK's `verifyWebhook` does all of it."
+          },
+          {
+            "name": "Zupflow-Event-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The event's `id`: the same on every attempt and resend. Skip IDs you've already handled."
+          },
+          {
+            "name": "Zupflow-Delivery-Attempt",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Zupflow-Webhooks/1"
+            }
+          },
+          {
+            "name": "Zupflow-Event-Type",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "memory.forgotten"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryForgottenWebhookEvent"
               }
             }
           }

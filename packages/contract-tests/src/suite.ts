@@ -22,12 +22,15 @@ import {
   type ChannelAppManagerConnectResult,
   type CreateAgentInput,
   type CreateConnectSessionInput,
+  type CreateMemoryInput,
   type CreateMemoryTypeInput,
   createClient,
   createHttpTransport,
   type InstallationId,
   MEMORY_KIND_NOTES,
   type MemberId,
+  type Memory,
+  type MemoryId,
   type MemoryTypeId,
   type ModelConnectionId,
   type OrganizationId,
@@ -36,6 +39,7 @@ import {
   type UpdateChannelToolLevelsInput,
   type UpdateDefaultMemoryTypeInput,
   type UpdateInstallationInput,
+  type UpdateMemoryInput,
   type UpdateMemoryTypeInput,
   type WebhookDeliveryId,
   type WebhookDeliverySummary,
@@ -219,9 +223,26 @@ export function contractSuite(target: Target) {
       if ((await client.memoryTypes.list(organization, { limit: 1 })).items.length > 0) return;
       await client.memoryTypes.create(organization, { name: "Tenant notes", kind: MEMORY_KIND_NOTES });
     };
+    /**
+     * Gives the tenant's agent a memory in the tenant's memory type first, where the target serves them and it
+     * keeps none: a target's fixture needn't, and the isolation and role sweeps aim at one. Saved with an API
+     * key of the workspace's environment, as the Console saves in Sandbox only.
+     */
+    const withMemory = async (client: ZupflowClient, t: Tenant): Promise<Tenant> => {
+      if (t.memory || !t.memoryType || !serves("createMemory")) return t;
+      const { secret } = await client.apiKeys.create(t.org, {
+        name: "Tenant memory",
+        environment: t.workspace.environment,
+      });
+      const memory = await withKey(secret).memories.create(t.workspace.id, t.agent.id, {
+        text: "Prefers short answers.",
+        memory_type_id: t.memoryType.id,
+      });
+      return { ...t, memory };
+    };
     const northwind = async () => {
       await withMemoryType(owner, fx.organization);
-      return loadTenant(owner, fx.organization, "acme", "acme-sandbox");
+      return withMemory(owner, await loadTenant(owner, fx.organization, "acme", "acme-sandbox"));
     };
     /** `beta-labs`, given a workspace app of its own first: the fixture has none there. */
     const betaLabs = async () => {
@@ -235,11 +256,12 @@ export function contractSuite(target: Target) {
           auth_type: "token",
         });
       }
-      return loadTenant(owner, fx.organization, "beta-labs", "qa-playground");
+      return withMemory(owner, await loadTenant(owner, fx.organization, "beta-labs", "qa-playground"));
     };
     const larkspur = async () => {
-      await withMemoryType(as("outsider"), fx.otherOrganization);
-      return loadTenant(as("outsider"), fx.otherOrganization, "harbor", "harbor-sandbox");
+      const outsider = as("outsider");
+      await withMemoryType(outsider, fx.otherOrganization);
+      return withMemory(outsider, await loadTenant(outsider, fx.otherOrganization, "harbor", "harbor-sandbox"));
     };
 
     /** What the channel provider holds for an app: skips the case, naming the operation, when the target can't say. */
@@ -637,6 +659,25 @@ export function contractSuite(target: Target) {
         });
         await owner.agents.delete(sandbox.id, remembering.id);
         await owner.memoryTypes.delete(org, memoryType.id);
+
+        // What an agent remembers: a memory saved, listed, changed and forgotten, then everything forgotten.
+        const notes = await owner.memoryTypes.create(org, { name: "Contract notes", kind: MEMORY_KIND_NOTES });
+        const keeper = await owner.agents.create(sandbox.id, {
+          name: "Contract memory keeper",
+          description: "",
+          instructions: "Be brief.",
+          memory: "type",
+          memory_type_id: notes.id,
+        });
+        const memory = await owner.memories.create(sandbox.id, keeper.id, { text: "Prefers short answers." });
+        await owner.memories.list(sandbox.id, keeper.id);
+        await owner.memories.get(sandbox.id, keeper.id, memory.id);
+        await owner.memories.update(sandbox.id, keeper.id, memory.id, { text: "Prefers short, direct answers." });
+        await owner.memories.delete(sandbox.id, keeper.id, memory.id);
+        await owner.memories.create(sandbox.id, keeper.id, { text: "Ships on Thursdays." });
+        await owner.memories.deleteAll(sandbox.id, keeper.id);
+        await owner.agents.delete(sandbox.id, keeper.id);
+        await owner.memoryTypes.delete(org, notes.id);
       }
     });
 
@@ -4471,6 +4512,701 @@ export function contractSuite(target: Target) {
       });
     });
 
+    describe("memories", () => {
+      const org = () => fx.organization;
+      /** A prefix no other case uses, for the memory types and agents each case makes. */
+      const tagged = () => `M${Math.random().toString(36).slice(2, 8)}`;
+      /** A refusal as its status, code and the fields it names. */
+      const refusal = (error: ZupflowApiError) => [error.status, error.code, Object.keys(error.fields ?? {}).sort()];
+      /** A notes memory type of the case's own, with the settings it needs. */
+      const makeType = (name: string, settings?: Record<string, unknown>) =>
+        owner.memoryTypes.create(org(), { name, kind: MEMORY_KIND_NOTES, ...(settings ? { settings } : {}) });
+      /** An agent remembering in `memoryType`, in a Sandbox workspace by default: the Console saves there. */
+      const makeAgent = (
+        name: string,
+        memoryType: MemoryTypeId,
+        workspace: WorkspaceId = fx.workspaces.acmeSandbox.id,
+      ) =>
+        owner.agents.create(workspace, {
+          name,
+          description: "",
+          instructions: "",
+          memory: "type",
+          memory_type_id: memoryType,
+        });
+      /** IDs that name no type of the organization: one of the right form that doesn't exist, and a malformed one. */
+      const MISSING_TYPES = ["mtype_0000000000000000000000", "not-a-memory-type"] as MemoryTypeId[];
+      /** IDs that name no memory: one of the right form that doesn't exist, and a malformed one. */
+      const MISSING_MEMORIES = ["memo_0000000000000000000000", "not-a-memory"] as MemoryId[];
+      /** Newest first by when each was saved, then by ID: the order of every list. */
+      const newestFirst = (a: Memory, b: Memory) =>
+        Date.parse(b.created_at) - Date.parse(a.created_at) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0);
+      const texts = (memories: Memory[]) => memories.map((m) => m.text);
+      const answer = async (attempt: () => Promise<unknown>) => {
+        const error = await failure(attempt());
+        return `${error.status} ${error.code}`;
+      };
+
+      it("saves a memory on one line for the whole workspace, as its caller wrote it, and lists it", async () => {
+        const tag = tagged();
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const type = await makeType(`${tag} Notes`);
+        const agent = await makeAgent(`${tag} keeper`, type.id);
+        const me = (await owner.me.get()).user;
+        const saved = await owner.memories.create(sandbox, agent.id, {
+          text: "  Prefers answers\r\nin Portuguese.\u0007  ",
+        });
+        expect(saved).toMatchObject({
+          workspace_id: sandbox,
+          agent_id: agent.id,
+          memory_type_id: type.id,
+          text: "Prefers answers in Portuguese.",
+          channel_conversation_id: null,
+          origin: { type: "member", user_id: me.id },
+        });
+        expect(saved.short_id).toMatch(/^[a-z2-7]{6}$/);
+        expect(saved.updated_at).toBe(saved.created_at);
+        // An API key writes as itself.
+        const { key, secret } = await owner.apiKeys.create(org(), { name: `${tag} memories`, environment: "sandbox" });
+        const fromKey = await withKey(secret).memories.create(sandbox, agent.id, { text: "Ships on Thursdays." });
+        expect(fromKey.origin).toEqual({ type: "api_key", api_key_id: key.id });
+        expect(fromKey.short_id).not.toBe(saved.short_id);
+        // The agent's own type, or the one named: every member and key reads the same.
+        const listed = await owner.memories.list(sandbox, agent.id);
+        expect(listed.items).toEqual([saved, fromKey].sort(newestFirst));
+        expect(listed.pagination).toEqual({ next_cursor: null, total: 2 });
+        expect(await owner.memories.list(sandbox, agent.id, { memory_type: type.id })).toEqual(listed);
+        expect(await as("viewer").memories.list(sandbox, agent.id)).toEqual(listed);
+        expect(await withKey(secret).memories.list(sandbox, agent.id)).toEqual(listed);
+        // One at a time by its ID, as a webhook names it.
+        expect(await owner.memories.get(sandbox, agent.id, saved.id)).toEqual(saved);
+        expect(await as("viewer").memories.get(sandbox, agent.id, fromKey.id)).toEqual(fromKey);
+        expect(await withKey(secret).memories.get(sandbox, agent.id, saved.id)).toEqual(saved);
+        await owner.agents.delete(sandbox, agent.id);
+        await owner.memoryTypes.delete(org(), type.id);
+      });
+
+      it("keeps a note's text as the kind does: one line of 1 to 500 characters, counted as characters", async () => {
+        const tag = tagged();
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const type = await makeType(`${tag} Notes`);
+        const agent = await makeAgent(`${tag} keeper`, type.id);
+        const save = (text: string) => owner.memories.create(sandbox, agent.id, { text });
+        // Line breaks and tabs become spaces, other control characters go, and so do the invisible ones that
+        // hide or reorder text. Joiners, direction marks and emoji stay, and the ends are trimmed.
+        for (const [sent, kept] of [
+          ["a\r\nb\nc\rd\te", "a b c d e"],
+          ["a\u2028b\u0085c\u000Bd\u000Ce", "a b c d e"],
+          ["no\u0000nul\u0007bell\u001b[0m", "nonulbell[0m"],
+          ["tag\u{E0001}\u{E0041}\u{E0069}\u{E007F}s", "tags"],
+          ["\u202Aa\u202Bb\u202Cc\u202Dd\u202Ee", "abcde"],
+          ["\u2066a\u2067b\u2068c\u2069", "abc"],
+          ["zero\u200Bwidth\u2060join\u2061\u2062\u2063\u2064ers", "zerowidthjoiners"],
+          ["\uFEFFmark\u180Eed\uFFF9\uFFFA\uFFFB", "marked"],
+          ["👩\u200D💻 codes", "👩\u200D💻 codes"],
+          ["م\u200Cم", "م\u200Cم"],
+          ["a\u200Eb\u200Fc", "a\u200Eb\u200Fc"],
+          ["\u00A0\u3000 Prefers Português 🙂\u2003\u0085", "Prefers Português 🙂"],
+        ] as const) {
+          expect((await save(sent)).text, JSON.stringify(sent)).toBe(kept);
+        }
+        // 500 characters at most once trimmed, each a Unicode scalar value: 500 emoji are 1,000 UTF-16 units.
+        expect((await save(`  ${"é".repeat(500)}\n `)).text).toBe("é".repeat(500));
+        expect([...(await save("🙂".repeat(500))).text]).toHaveLength(500);
+        const before = await owner.memories.list(sandbox, agent.id, { limit: 100 });
+        for (const text of ["", "   ", "\n\t \u0000", "\u200B\uFEFF\u2060", "x".repeat(501), "🙂".repeat(501)]) {
+          expect(refusal(await failure(save(text))), JSON.stringify(text.slice(0, 12))).toEqual([
+            422,
+            "invalid_memory_text",
+            ["text"],
+          ]);
+        }
+        // What isn't text at all is the contract's refusal, as is a type that isn't an ID.
+        for (const [input, field] of [
+          [{}, "text"],
+          [{ text: 42 }, "text"],
+          [{ text: null }, "text"],
+          [{ text: "x", memory_type_id: 42 }, "memory_type_id"],
+          [{ text: "x", memory_type_id: null }, "memory_type_id"],
+        ] as [CreateMemoryInput, string][]) {
+          const refused = await failure(owner.memories.create(sandbox, agent.id, input));
+          expect(refusal(refused), JSON.stringify(input)).toEqual([400, "validation_failed", [field]]);
+        }
+        // A change is kept the same way, and a refused one changes nothing.
+        const memory = must(before.items[0], "a saved memory");
+        expect((await owner.memories.update(sandbox, agent.id, memory.id, { text: "One\nline." })).text).toBe(
+          "One line.",
+        );
+        for (const text of [" \n ", "x".repeat(501)]) {
+          const refused = await failure(owner.memories.update(sandbox, agent.id, memory.id, { text }));
+          expect(refusal(refused)).toEqual([422, "invalid_memory_text", ["text"]]);
+        }
+        const unchanged = await failure(
+          owner.memories.update(sandbox, agent.id, memory.id, { text: 7 } as unknown as UpdateMemoryInput),
+        );
+        expect(refusal(unchanged)).toEqual([400, "validation_failed", ["text"]]);
+        const after = await owner.memories.list(sandbox, agent.id, { limit: 100 });
+        expect(after.pagination.total).toBe(before.pagination.total);
+        expect(after.items.find((m) => m.id === memory.id)?.text).toBe("One line.");
+        await owner.agents.delete(sandbox, agent.id);
+        await owner.memoryTypes.delete(org(), type.id);
+      });
+
+      it("finds the memories holding every word of q, as whole words in any case and accent", async () => {
+        const tag = tagged();
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const type = await makeType(`${tag} Notes`);
+        const agent = await makeAgent(`${tag} keeper`, type.id);
+        for (const text of [
+          "Prefers answers in Portuguese.",
+          "Invoices go to the finance team.",
+          "The finance team meets on Mondays.",
+          "Café com leite, não chá.",
+          "Call or email, never text.",
+        ]) {
+          await owner.memories.create(sandbox, agent.id, { text });
+        }
+        const found = async (q: string) =>
+          texts((await owner.memories.list(sandbox, agent.id, { q, limit: 100 })).items).sort();
+        const mondays = ["The finance team meets on Mondays."];
+        expect(await found("FINANCE mondays"), "every word, in any case").toEqual(mondays);
+        expect(await found("finance")).toEqual([
+          "Invoices go to the finance team.",
+          "The finance team meets on Mondays.",
+        ]);
+        expect(await found("finance portuguese"), "every word, not any").toEqual([]);
+        expect(await found("cafe NAO"), "and any accent").toEqual(["Café com leite, não chá."]);
+        expect(await found("OR"), "a word, never an operator").toEqual(["Call or email, never text."]);
+        expect(await found("NOT finance")).toEqual([]);
+        expect(await found('"finance" mondays*'), "quotes and stars are no syntax").toEqual(mondays);
+        expect(await found("fin"), "whole words").toEqual([]);
+        // Blank lists every memory; words without a letter or a digit match none.
+        expect(await found(" \t ")).toHaveLength(5);
+        const none = await owner.memories.list(sandbox, agent.id, { q: "?! -- ..." });
+        expect([none.items, none.pagination]).toEqual([[], { next_cursor: null, total: 0 }]);
+        // A page at a time, the total counting every match.
+        const first = await owner.memories.list(sandbox, agent.id, { q: "finance", limit: 1 });
+        expect([first.items.length, first.pagination.total]).toEqual([1, 2]);
+        const cursor = must(first.pagination.next_cursor, "a second page");
+        const second = await owner.memories.list(sandbox, agent.id, { q: "finance", limit: 1, cursor });
+        expect([second.items.length, second.pagination.total, second.pagination.next_cursor]).toEqual([1, 2, null]);
+        expect(texts([...first.items, ...second.items]).sort()).toEqual(await found("finance"));
+        await owner.agents.delete(sandbox, agent.id);
+        await owner.memoryTypes.delete(org(), type.id);
+      });
+
+      it("lists a page at a time, newest first by when each was saved, and a change moves none", async () => {
+        const tag = tagged();
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const [type, other] = [await makeType(`${tag} Notes`), await makeType(`${tag} Other`)];
+        const agent = await makeAgent(`${tag} keeper`, type.id);
+        const neighbor = await makeAgent(`${tag} neighbor`, type.id);
+        const saved: Memory[] = [];
+        for (const text of ["One.", "Two.", "Three.", "Four.", "Five."]) {
+          saved.push(await owner.memories.create(sandbox, agent.id, { text }));
+        }
+        // Neither another type's nor another agent's.
+        await owner.memories.create(sandbox, agent.id, { text: "Another type's.", memory_type_id: other.id });
+        await owner.memories.create(sandbox, neighbor.id, { text: "Another agent's." });
+        const all = await owner.memories.list(sandbox, agent.id, { limit: 100 });
+        expect(all.items).toEqual([...saved].sort(newestFirst));
+        expect(all.pagination).toEqual({ next_cursor: null, total: 5 });
+        const paged: Memory[] = [];
+        let cursor: string | undefined;
+        do {
+          const page = await owner.memories.list(sandbox, agent.id, { limit: 2, cursor });
+          expect(page.items.length).toBeGreaterThan(0);
+          expect(page.items.length).toBeLessThanOrEqual(2);
+          expect(page.pagination.total).toBe(5);
+          paged.push(...page.items);
+          cursor = page.pagination.next_cursor ?? undefined;
+        } while (cursor);
+        expect(paged).toEqual(all.items);
+        // A change of text leaves a memory where it was saved.
+        const oldest = must(all.items.at(-1), "the oldest memory");
+        await owner.memories.update(sandbox, agent.id, oldest.id, { text: "One, changed." });
+        const relisted = await owner.memories.list(sandbox, agent.id, { limit: 100 });
+        expect(relisted.items.map((m) => m.id)).toEqual(all.items.map((m) => m.id));
+        // Out-of-range limits are clamped, and a cursor the list didn't issue is refused.
+        expect((await owner.memories.list(sandbox, agent.id, { limit: 0 })).items).toHaveLength(1);
+        expect((await owner.memories.list(sandbox, agent.id, { limit: 1000 })).items).toHaveLength(5);
+        const typesPage = await owner.memoryTypes.list(org(), { limit: 1 });
+        const otherList = must(typesPage.pagination.next_cursor, "a memory types cursor");
+        for (const bad of ["%%%", "not-a-cursor", otherList]) {
+          const error = await failure(owner.memories.list(sandbox, agent.id, { cursor: bad }));
+          expect(refusal(error), bad).toEqual([400, "validation_failed", ["cursor"]]);
+        }
+        for (const a of [agent, neighbor]) await owner.agents.delete(sandbox, a.id);
+        for (const t of [type, other]) await owner.memoryTypes.delete(org(), t.id);
+      });
+
+      it("lists and saves in the type a request names, or the agent's own, and has none while memory is off", async () => {
+        const tag = tagged();
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const [first, second] = [await makeType(`${tag} First`), await makeType(`${tag} Second`)];
+        const agent = await makeAgent(`${tag} keeper`, first.id);
+        const own = await owner.memories.create(sandbox, agent.id, { text: "Kept in the first." });
+        const named = await owner.memories.create(sandbox, agent.id, {
+          text: "Kept in the second.",
+          memory_type_id: second.id,
+        });
+        expect([own.memory_type_id, named.memory_type_id]).toEqual([first.id, second.id]);
+        expect((await owner.memories.list(sandbox, agent.id)).items).toEqual([own]);
+        expect((await owner.memories.list(sandbox, agent.id, { memory_type: second.id })).items).toEqual([named]);
+        // Off: no type of its own to list or save in, though a named one still is.
+        await owner.agents.update(sandbox, agent.id, { memory: "off" });
+        const empty = await owner.memories.list(sandbox, agent.id);
+        expect([empty.items, empty.pagination]).toEqual([[], { next_cursor: null, total: 0 }]);
+        const off = await failure(owner.memories.create(sandbox, agent.id, { text: "Nowhere." }));
+        expect(refusal(off)).toEqual([422, "memory_off", []]);
+        expect((await owner.memories.list(sandbox, agent.id, { memory_type: first.id })).items).toEqual([own]);
+        // On the default: the organization's, and none while it has none.
+        const previous = await owner.memoryTypes.getDefault(org());
+        await owner.agents.update(sandbox, agent.id, { memory: "default" });
+        await owner.memoryTypes.setDefault(org(), { memory_type_id: null });
+        expect((await owner.memories.list(sandbox, agent.id)).items).toEqual([]);
+        const noDefault = await failure(owner.memories.create(sandbox, agent.id, { text: "Nowhere." }));
+        expect(refusal(noDefault)).toEqual([422, "memory_off", []]);
+        await owner.memoryTypes.setDefault(org(), { memory_type_id: second.id });
+        expect((await owner.memories.list(sandbox, agent.id)).items).toEqual([named]);
+        expect((await owner.memories.create(sandbox, agent.id, { text: "Kept by default." })).memory_type_id).toBe(
+          second.id,
+        );
+        await owner.memoryTypes.setDefault(org(), { memory_type_id: previous.memory_type?.id ?? null });
+        // Only a type of the organization: not one that isn't there, nor another organization's.
+        const outsider = as("outsider");
+        const theirs = await outsider.memoryTypes.create(fx.otherOrganization, {
+          name: `${tag} Theirs`,
+          kind: MEMORY_KIND_NOTES,
+        });
+        for (const id of [...MISSING_TYPES, theirs.id]) {
+          const listed = await failure(owner.memories.list(sandbox, agent.id, { memory_type: id }));
+          expect(refusal(listed), id).toEqual([422, "unknown_memory_type", ["memory_type"]]);
+          const saved = await failure(owner.memories.create(sandbox, agent.id, { text: "x", memory_type_id: id }));
+          expect(refusal(saved), id).toEqual([422, "unknown_memory_type", ["memory_type_id"]]);
+        }
+        await outsider.memoryTypes.delete(fx.otherOrganization, theirs.id);
+        await owner.agents.delete(sandbox, agent.id);
+        for (const type of [first, second]) await owner.memoryTypes.delete(org(), type.id);
+      });
+
+      it("keeps up to the type's max_notes for each agent, with room again once one is forgotten", async () => {
+        const tag = tagged();
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const small = await makeType(`${tag} Small`, { max_notes: 2 });
+        const other = await makeType(`${tag} Other`);
+        const agent = await makeAgent(`${tag} keeper`, small.id);
+        const neighbor = await makeAgent(`${tag} neighbor`, small.id);
+        const first = await owner.memories.create(sandbox, agent.id, { text: "First." });
+        await owner.memories.create(sandbox, agent.id, { text: "Second." });
+        const full = await failure(owner.memories.create(sandbox, agent.id, { text: "Third." }));
+        expect(refusal(full)).toEqual([422, "memory_full", []]);
+        // Each agent and each type has room of its own, and a change needs none.
+        await owner.memories.create(sandbox, neighbor.id, { text: "Theirs." });
+        await owner.memories.create(sandbox, agent.id, { text: "Elsewhere.", memory_type_id: other.id });
+        await owner.memories.update(sandbox, agent.id, first.id, { text: "First, changed." });
+        // Forgetting one makes room.
+        await owner.memories.delete(sandbox, agent.id, first.id);
+        await owner.memories.create(sandbox, agent.id, { text: "Third." });
+        expect((await owner.memories.list(sandbox, agent.id)).pagination.total).toBe(2);
+        // The type's setting as it is now: lowered, it keeps what it has and takes no more.
+        await owner.memoryTypes.update(org(), small.id, { settings: { max_notes: 1 } });
+        const lowered = await failure(owner.memories.create(sandbox, agent.id, { text: "Fourth." }));
+        expect(refusal(lowered)).toEqual([422, "memory_full", []]);
+        expect((await owner.memories.list(sandbox, agent.id)).pagination.total).toBe(2);
+        for (const a of [agent, neighbor]) await owner.agents.delete(sandbox, a.id);
+        for (const t of [small, other]) await owner.memoryTypes.delete(org(), t.id);
+      });
+
+      it("changes a memory's text and who wrote it, and nothing at all for the text it holds", async () => {
+        const tag = tagged();
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const type = await makeType(`${tag} Notes`);
+        const agent = await makeAgent(`${tag} keeper`, type.id);
+        const saved = await owner.memories.create(sandbox, agent.id, { text: "Prefers email." });
+        const { key, secret } = await owner.apiKeys.create(org(), { name: `${tag} changes`, environment: "sandbox" });
+        const backend = withKey(secret);
+        // The text it holds, once kept as its kind keeps it: not when, nor who wrote it.
+        expect(await backend.memories.update(sandbox, agent.id, saved.id, { text: " Prefers\temail.\n" })).toEqual(
+          saved,
+        );
+        expect((await owner.memories.list(sandbox, agent.id)).items).toEqual([saved]);
+        const changed = await backend.memories.update(sandbox, agent.id, saved.id, {
+          text: "Prefers email, never calls.",
+        });
+        expect(changed).toEqual({
+          ...saved,
+          text: "Prefers email, never calls.",
+          origin: { type: "api_key", api_key_id: key.id },
+          updated_at: changed.updated_at,
+        });
+        expect(Date.parse(changed.updated_at)).toBeGreaterThanOrEqual(Date.parse(saved.updated_at));
+        expect((await owner.memories.list(sandbox, agent.id)).items).toEqual([changed]);
+        expect(await owner.memories.get(sandbox, agent.id, saved.id)).toEqual(changed);
+        // A memory that isn't there is not found, whether its ID is unknown or malformed: found first, before
+        // its text is looked at.
+        for (const id of MISSING_MEMORIES) {
+          for (const text of ["x", " \n ", "x".repeat(501)]) {
+            expect(await answer(() => owner.memories.update(sandbox, agent.id, id, { text })), id).toBe(
+              "404 not_found",
+            );
+          }
+          const notText = { text: 7 } as unknown as UpdateMemoryInput;
+          expect(await answer(() => owner.memories.update(sandbox, agent.id, id, notText)), id).toBe("404 not_found");
+          expect(await answer(() => owner.memories.get(sandbox, agent.id, id)), id).toBe("404 not_found");
+          expect(await answer(() => owner.memories.delete(sandbox, agent.id, id)), id).toBe("404 not_found");
+        }
+        await owner.agents.delete(sandbox, agent.id);
+        await owner.memoryTypes.delete(org(), type.id);
+      });
+
+      it("forgets one memory, or everything the agent keeps in the workspace, in every type", async () => {
+        const tag = tagged();
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const [first, second] = [await makeType(`${tag} First`), await makeType(`${tag} Second`)];
+        const agent = await makeAgent(`${tag} keeper`, first.id);
+        const neighbor = await makeAgent(`${tag} neighbor`, first.id);
+        const one = await owner.memories.create(sandbox, agent.id, { text: "One." });
+        const two = await owner.memories.create(sandbox, agent.id, { text: "Two." });
+        const three = await owner.memories.create(sandbox, agent.id, { text: "Three.", memory_type_id: second.id });
+        const fourth = await owner.memories.create(sandbox, agent.id, { text: "Four.", memory_type_id: second.id });
+        const theirs = await owner.memories.create(sandbox, neighbor.id, { text: "Theirs." });
+        await owner.memories.delete(sandbox, agent.id, one.id);
+        expect((await owner.memories.list(sandbox, agent.id)).items).toEqual([two]);
+        // A memory is reached by its ID alone, in whichever of the agent's types keeps it.
+        expect(await owner.memories.get(sandbox, agent.id, three.id)).toEqual(three);
+        const changed = await owner.memories.update(sandbox, agent.id, three.id, { text: "Three, changed." });
+        expect([changed.memory_type_id, changed.text]).toEqual([second.id, "Three, changed."]);
+        await owner.memories.delete(sandbox, agent.id, fourth.id);
+        expect((await owner.memories.list(sandbox, agent.id, { memory_type: second.id })).items).toEqual([changed]);
+        // Forgotten, it's not found.
+        for (const attempt of [
+          () => owner.memories.get(sandbox, agent.id, one.id),
+          () => owner.memories.delete(sandbox, agent.id, one.id),
+          () => owner.memories.update(sandbox, agent.id, one.id, { text: "Back." }),
+          () => owner.memories.get(sandbox, agent.id, fourth.id),
+        ]) {
+          expect(await answer(attempt)).toBe("404 not_found");
+        }
+        await owner.memories.deleteAll(sandbox, agent.id);
+        for (const memory of [two, changed]) {
+          expect(await answer(() => owner.memories.get(sandbox, agent.id, memory.id)), memory.text).toBe(
+            "404 not_found",
+          );
+        }
+        for (const memory_type of [first.id, second.id]) {
+          const page = await owner.memories.list(sandbox, agent.id, { memory_type });
+          expect([page.items, page.pagination.total], memory_type).toEqual([[], 0]);
+        }
+        expect((await owner.memories.list(sandbox, neighbor.id)).items).toEqual([theirs]);
+        // Nothing left to forget is no refusal.
+        await owner.memories.deleteAll(sandbox, agent.id);
+        for (const a of [agent, neighbor]) await owner.agents.delete(sandbox, a.id);
+        for (const t of [first, second]) await owner.memoryTypes.delete(org(), t.id);
+      });
+
+      it("lets every member read, and developers, admins, owners and API keys change, the Console in Sandbox only", async () => {
+        const tag = tagged();
+        const { acme, acmeSandbox } = fx.workspaces;
+        const type = await makeType(`${tag} Notes`);
+        const inSandbox = await makeAgent(`${tag} sandbox`, type.id);
+        const inProduction = await makeAgent(`${tag} production`, type.id, acme.id);
+        const changes = (c: ZupflowClient, ws: WorkspaceId, agent: AgentId, memory: MemoryId) =>
+          [
+            ["save", () => c.memories.create(ws, agent, { text: "Refused." })],
+            ["change", () => c.memories.update(ws, agent, memory, { text: "Refused." })],
+            ["forget", () => c.memories.delete(ws, agent, memory)],
+            ["forget everything", () => c.memories.deleteAll(ws, agent)],
+          ] as [string, () => Promise<unknown>][];
+        // A developer saves, changes and forgets in Sandbox; a viewer reads, and changes nothing.
+        const developer = as("developer");
+        const viewer = as("viewer");
+        const made = await developer.memories.create(acmeSandbox.id, inSandbox.id, { text: "By a developer." });
+        const changed = await developer.memories.update(acmeSandbox.id, inSandbox.id, made.id, {
+          text: "By a developer, changed.",
+        });
+        for (const [what, change] of changes(viewer, acmeSandbox.id, inSandbox.id, made.id)) {
+          expect(await answer(change), `viewer: ${what}`).toBe("403 forbidden");
+        }
+        expect((await viewer.memories.list(acmeSandbox.id, inSandbox.id)).items).toEqual([changed]);
+        expect(await viewer.memories.get(acmeSandbox.id, inSandbox.id, made.id)).toEqual(changed);
+        await developer.memories.delete(acmeSandbox.id, inSandbox.id, made.id);
+        await developer.memories.create(acmeSandbox.id, inSandbox.id, { text: "By a developer, again." });
+        await developer.memories.deleteAll(acmeSandbox.id, inSandbox.id);
+        expect((await owner.memories.list(acmeSandbox.id, inSandbox.id)).items).toEqual([]);
+        // In Production the product writes, with its key, and the Console reads, whatever the role.
+        const { secret } = await owner.apiKeys.create(org(), { name: `${tag} live`, environment: "production" });
+        const live = withKey(secret);
+        const saved = await live.memories.create(acme.id, inProduction.id, { text: "By the product." });
+        for (const persona of ["owner", "developer"] as const) {
+          const member = as(persona);
+          expect((await member.memories.list(acme.id, inProduction.id)).items, persona).toEqual([saved]);
+          expect(await member.memories.get(acme.id, inProduction.id, saved.id), persona).toEqual(saved);
+          for (const [what, change] of changes(member, acme.id, inProduction.id, saved.id)) {
+            expect(await answer(change), `${persona}: ${what}`).toBe("403 console_read_only_in_production");
+          }
+        }
+        for (const [what, change] of changes(viewer, acme.id, inProduction.id, saved.id)) {
+          expect(await answer(change), `viewer: ${what}`).toBe("403 forbidden");
+        }
+        expect(await viewer.memories.get(acme.id, inProduction.id, saved.id)).toEqual(saved);
+        expect((await live.memories.list(acme.id, inProduction.id)).items).toEqual([saved]);
+        expect(await live.memories.get(acme.id, inProduction.id, saved.id)).toEqual(saved);
+        const updated = await live.memories.update(acme.id, inProduction.id, saved.id, {
+          text: "By the product, again.",
+        });
+        expect(updated.text).toBe("By the product, again.");
+        // A key reaches its own environment's workspaces only.
+        const { secret: testSecret } = await owner.apiKeys.create(org(), {
+          name: `${tag} test`,
+          environment: "sandbox",
+        });
+        const test = withKey(testSecret);
+        for (const [what, attempt] of [
+          ["a Sandbox key lists Production's", () => test.memories.list(acme.id, inProduction.id)],
+          ["a Sandbox key reads Production's", () => test.memories.get(acme.id, inProduction.id, saved.id)],
+          ["a Sandbox key saves in Production", () => test.memories.create(acme.id, inProduction.id, { text: "x" })],
+          ["a Sandbox key forgets Production's", () => test.memories.delete(acme.id, inProduction.id, saved.id)],
+          ["a Production key lists Sandbox's", () => live.memories.list(acmeSandbox.id, inSandbox.id)],
+          [
+            "a Production key saves in Sandbox",
+            () => live.memories.create(acmeSandbox.id, inSandbox.id, { text: "x" }),
+          ],
+        ] as [string, () => Promise<unknown>][]) {
+          expect(await answer(attempt), what).toBe("404 not_found");
+        }
+        await live.memories.delete(acme.id, inProduction.id, saved.id);
+        expect((await owner.memories.list(acme.id, inProduction.id)).items).toEqual([]);
+        await owner.agents.delete(acmeSandbox.id, inSandbox.id);
+        await owner.agents.delete(acme.id, inProduction.id);
+        await owner.memoryTypes.delete(org(), type.id);
+      });
+
+      it("keeps an agent's memories to it: another agent's, workspace's or organization's are not found", async () => {
+        const tag = tagged();
+        const { acmeSandbox, qaPlayground } = fx.workspaces;
+        const type = await makeType(`${tag} Notes`);
+        const agent = await makeAgent(`${tag} keeper`, type.id);
+        const neighbor = await makeAgent(`${tag} neighbor`, type.id);
+        const elsewhere = await makeAgent(`${tag} elsewhere`, type.id, qaPlayground.id);
+        const kept = await owner.memories.create(acmeSandbox.id, agent.id, { text: "Kept here." });
+        const outsider = as("outsider");
+        const harbor = must(
+          (await outsider.workspaces.list(fx.otherOrganization, { environment: "sandbox", limit: 100 })).items[0],
+          "the other organization's Sandbox workspace",
+        );
+        const theirAgent = await outsider.agents.create(harbor.id, {
+          name: `${tag} theirs`,
+          description: "",
+          instructions: "",
+        });
+        const { secret } = await outsider.apiKeys.create(fx.otherOrganization, {
+          name: `${tag} theirs`,
+          environment: "sandbox",
+        });
+        const theirKey = withKey(secret);
+        const s = acmeSandbox.id;
+        const qa = qaPlayground.id;
+        for (const [what, attempt] of [
+          ["read as another agent's", () => owner.memories.get(s, neighbor.id, kept.id)],
+          ["changed as another agent's", () => owner.memories.update(s, neighbor.id, kept.id, { text: "Moved." })],
+          // Found first: text the kind refuses doesn't come before the memory.
+          ["changed to nothing as another agent's", () => owner.memories.update(s, neighbor.id, kept.id, { text: "" })],
+          ["forgotten as another agent's", () => owner.memories.delete(s, neighbor.id, kept.id)],
+          ["listed through another workspace", () => owner.memories.list(qa, agent.id)],
+          ["saved through another workspace", () => owner.memories.create(qa, agent.id, { text: "Moved." })],
+          ["read through another workspace", () => owner.memories.get(qa, agent.id, kept.id)],
+          ["changed through another workspace", () => owner.memories.update(qa, agent.id, kept.id, { text: "Moved." })],
+          ["read as another workspace's agent's", () => owner.memories.get(qa, elsewhere.id, kept.id)],
+          [
+            "changed as another workspace's agent's",
+            () => owner.memories.update(qa, elsewhere.id, kept.id, { text: "Moved." }),
+          ],
+          ["forgotten as another workspace's agent's", () => owner.memories.delete(qa, elsewhere.id, kept.id)],
+          ["forgotten all through another workspace", () => owner.memories.deleteAll(qa, agent.id)],
+          ["listed by another organization", () => outsider.memories.list(s, agent.id)],
+          ["read by another organization", () => outsider.memories.get(s, agent.id, kept.id)],
+          ["saved by another organization", () => outsider.memories.create(s, agent.id, { text: "Owned." })],
+          ["changed by another organization", () => outsider.memories.update(s, agent.id, kept.id, { text: "Owned." })],
+          ["forgotten by another organization", () => outsider.memories.delete(s, agent.id, kept.id)],
+          ["forgotten all by another organization", () => outsider.memories.deleteAll(s, agent.id)],
+          ["listed through its own workspace", () => outsider.memories.list(harbor.id, agent.id)],
+          ["read as its own agent's", () => outsider.memories.get(harbor.id, theirAgent.id, kept.id)],
+          [
+            "changed as its own agent's",
+            () => outsider.memories.update(harbor.id, theirAgent.id, kept.id, { text: "Owned." }),
+          ],
+          ["forgotten as its own agent's", () => outsider.memories.delete(harbor.id, theirAgent.id, kept.id)],
+          ["listed with its key", () => theirKey.memories.list(s, agent.id)],
+          ["read with its key", () => theirKey.memories.get(s, agent.id, kept.id)],
+          [
+            "changed with its key, as its own agent's",
+            () => theirKey.memories.update(harbor.id, theirAgent.id, kept.id, { text: "Owned." }),
+          ],
+        ] as [string, () => Promise<unknown>][]) {
+          expect(await answer(attempt), what).toBe("404 not_found");
+        }
+        // Nor is the organization's type another one's to save in or list.
+        const saved = await failure(
+          outsider.memories.create(harbor.id, theirAgent.id, { text: "Owned.", memory_type_id: type.id }),
+        );
+        expect(refusal(saved)).toEqual([422, "unknown_memory_type", ["memory_type_id"]]);
+        const listed = await failure(outsider.memories.list(harbor.id, theirAgent.id, { memory_type: type.id }));
+        expect(refusal(listed)).toEqual([422, "unknown_memory_type", ["memory_type"]]);
+        expect((await owner.memories.list(s, agent.id)).items).toEqual([kept]);
+        expect((await owner.memories.list(s, neighbor.id)).items).toEqual([]);
+        expect((await owner.memories.list(qa, elsewhere.id)).items).toEqual([]);
+        await outsider.agents.delete(harbor.id, theirAgent.id);
+        for (const a of [agent, neighbor]) await owner.agents.delete(s, a.id);
+        await owner.agents.delete(qa, elsewhere.id);
+        await owner.memoryTypes.delete(org(), type.id);
+      });
+
+      it("replays saving a memory with the same key, and refuses the key for another", async () => {
+        const tag = tagged();
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const type = await makeType(`${tag} Notes`);
+        const agent = await makeAgent(`${tag} keeper`, type.id);
+        const options = { idempotencyKey: `memory-${tag}` };
+        const first = await owner.memories.create(sandbox, agent.id, { text: "Once." }, options);
+        expect(await owner.memories.create(sandbox, agent.id, { text: "Once." }, options)).toEqual(first);
+        expect((await owner.memories.list(sandbox, agent.id)).items).toEqual([first]);
+        const reused = await failure(owner.memories.create(sandbox, agent.id, { text: "Twice." }, options));
+        expect([reused.status, reused.code]).toEqual([422, "idempotency_key_reused"]);
+        expect((await owner.memories.list(sandbox, agent.id)).items).toEqual([first]);
+        await owner.agents.delete(sandbox, agent.id);
+        await owner.memoryTypes.delete(org(), type.id);
+      });
+
+      it("sends each memory saved, changed or forgotten to its environment's endpoints, naming it, never its text", async () => {
+        const tag = tagged();
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const [first, second] = [await makeType(`${tag} First`), await makeType(`${tag} Second`)];
+        const agent = await makeAgent(`${tag} keeper`, first.id);
+        // Memory first: a target that doesn't serve it stops here, before its endpoints are refused the events.
+        expect((await owner.memories.list(sandbox, agent.id)).items).toEqual([]);
+        const events: WebhookEventType[] = ["memory.saved", "memory.updated", "memory.forgotten"];
+        const endpoint = async (environment: "sandbox" | "production", subscribed = events) =>
+          (
+            await owner.webhooks.create(org(), {
+              environment,
+              url: "https://hooks.northwind.example/memories",
+              description: "Memories",
+              events: subscribed,
+            })
+          ).endpoint;
+        const hook = await endpoint("sandbox");
+        const production = await endpoint("production");
+        const unsubscribed = await endpoint("sandbox", ["run.completed"]);
+        const saved = await owner.memories.create(sandbox, agent.id, { text: "Prefers email." });
+        // The text it holds already: nothing to send.
+        await owner.memories.update(sandbox, agent.id, saved.id, { text: "Prefers email." });
+        const changed = await owner.memories.update(sandbox, agent.id, saved.id, {
+          text: "Prefers email, never calls.",
+        });
+        const other = await owner.memories.create(sandbox, agent.id, {
+          text: "Ships on Thursdays.",
+          memory_type_id: second.id,
+        });
+        await owner.memories.delete(sandbox, agent.id, saved.id);
+        const last = await owner.memories.create(sandbox, agent.id, { text: "Invoices go out monthly." });
+        await owner.memories.deleteAll(sandbox, agent.id);
+
+        const rows = (await owner.webhooks.deliveries(org(), hook.id, { limit: 100 })).items;
+        const bodies = (await Promise.all(rows.map((row) => owner.webhooks.delivery(org(), hook.id, row.id)))).map(
+          (row) => row.event,
+        );
+        // What changed and where, never the text: the memory, its agent and type, and who wrote its text.
+        const named = (memory: Memory) => ({
+          object: "memory",
+          id: memory.id,
+          agent_id: memory.agent_id,
+          memory_type_id: memory.memory_type_id,
+          origin: memory.origin,
+        });
+        const byId = (a: { id: string }, b: { id: string }) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+        const dataOf = (type: string) =>
+          bodies
+            .filter((event) => event.type === type)
+            .map((event) => event.data)
+            .sort(byId);
+        expect(bodies).toHaveLength(7);
+        expect(dataOf("memory.saved")).toEqual([saved, other, last].map(named).sort(byId));
+        expect(dataOf("memory.updated")).toEqual([named(changed)]);
+        // Each memory forgotten: one by one, then everything left.
+        expect(dataOf("memory.forgotten")).toEqual([changed, other, last].map(named).sort(byId));
+        for (const memory of [saved, changed, other, last]) expect(JSON.stringify(bodies)).not.toContain(memory.text);
+        const workspace = await owner.workspaces.get(sandbox);
+        for (const event of bodies) {
+          expect(event).toMatchObject({
+            organization_id: org(),
+            environment: "sandbox",
+            workspace: { id: sandbox, external_id: workspace.external_id },
+          });
+        }
+        expect(new Set(rows.map((row) => row.event_id)).size).toBe(7);
+        expect((await owner.webhooks.deliveries(org(), production.id)).items).toEqual([]);
+        expect((await owner.webhooks.deliveries(org(), unsubscribed.id)).items).toEqual([]);
+        // What goes with its agent or its type is forgotten without an event for each.
+        const going = await makeAgent(`${tag} going`, second.id);
+        await owner.memories.create(sandbox, going.id, { text: "Goes with its agent." });
+        await owner.agents.delete(sandbox, going.id);
+        await owner.memories.create(sandbox, agent.id, { text: "Goes with its type.", memory_type_id: second.id });
+        await owner.memoryTypes.delete(org(), second.id);
+        const after = (await owner.webhooks.deliveries(org(), hook.id, { limit: 100 })).items;
+        expect(after.map((row) => row.event_type).sort()).toEqual(
+          [...rows.map((row) => row.event_type), "memory.saved", "memory.saved"].sort(),
+        );
+        for (const endpoint of [hook, production, unsubscribed]) await owner.webhooks.delete(org(), endpoint.id);
+        await owner.agents.delete(sandbox, agent.id);
+        await owner.memoryTypes.delete(org(), first.id);
+      });
+
+      it("records each change to a memory, naming it by its agent and short ID, never by its text", async () => {
+        const tag = tagged();
+        const sandbox = fx.workspaces.acmeSandbox.id;
+        const me = (await owner.me.get()).user;
+        const [first, second] = [await makeType(`${tag} First`), await makeType(`${tag} Second`)];
+        const agent = await makeAgent(`${tag} keeper`, first.id);
+        const saved = await owner.memories.create(sandbox, agent.id, { text: "Audited one." });
+        // The text it holds already: nothing to record.
+        await owner.memories.update(sandbox, agent.id, saved.id, { text: "Audited one." });
+        await owner.memories.update(sandbox, agent.id, saved.id, { text: "Audited one, changed." });
+        await owner.memories.delete(sandbox, agent.id, saved.id);
+        const two = await owner.memories.create(sandbox, agent.id, { text: "Audited two." });
+        const three = await owner.memories.create(sandbox, agent.id, {
+          text: "Audited three.",
+          memory_type_id: second.id,
+        });
+        await owner.memories.deleteAll(sandbox, agent.id);
+        // Nothing left to forget: nothing to record.
+        await owner.memories.deleteAll(sandbox, agent.id);
+        const events = (await owner.audit.list(org(), { limit: 6 })).items;
+        const recorded = events.map((e) => ({
+          action: e.action,
+          target: [e.target.type, e.target.id, e.target.name],
+          where: [e.workspace_id, e.environment],
+        }));
+        const named = (memory: Memory) => ["memory", memory.id, `${agent.name} · ${memory.short_id}`];
+        const where = [sandbox, "sandbox"];
+        expect(recorded).toHaveLength(6);
+        expect(recorded).toEqual(
+          expect.arrayContaining([
+            { action: "memory.saved", target: named(saved), where },
+            { action: "memory.updated", target: named(saved), where },
+            { action: "memory.forgotten", target: named(saved), where },
+            { action: "memory.saved", target: named(two), where },
+            { action: "memory.saved", target: named(three), where },
+            { action: "agent.memory_forgotten", target: ["agent", agent.id, `${agent.name} · 2 memories`], where },
+          ]),
+        );
+        for (const event of events) expect(event.actor).toEqual({ type: "user", id: me.id, name: me.name });
+        expect(JSON.stringify(events)).not.toContain("Audited");
+        await owner.agents.delete(sandbox, agent.id);
+        for (const type of [first, second]) await owner.memoryTypes.delete(org(), type.id);
+      });
+    });
+
     describe("channels", () => {
       const sandbox = () => fx.workspaces.acmeSandbox.id;
       const link = (workspaceId: WorkspaceId, client: ZupflowClient = owner, tokens: typeof TOKENS = TOKENS) =>
@@ -5204,6 +5940,22 @@ export function contractSuite(target: Target) {
               ...(serves("listModelConnections") ? [settled(c.modelConnections.list(fx.organization))] : []),
               ...(serves("listModels") ? [settled(c.models.list(fx.organization, { limit: 100 }))] : []),
               ...(serves("getDefaultModel") ? [settled(c.models.getDefault(fx.organization, "sandbox"))] : []),
+              ...(serves("listMemories")
+                ? [settled(Promise.all(agents.map((a) => c.memories.list(acme, a.id, { limit: 100 }))))]
+                : []),
+              // Each one by its ID too, as a webhook consumer reads it.
+              ...(serves("listMemories") && serves("getMemory")
+                ? [
+                    settled(
+                      Promise.all(
+                        agents.map(async (a) => {
+                          const { items } = await c.memories.list(acme, a.id, { limit: 100 });
+                          return Promise.all(items.map((m) => c.memories.get(acme, a.id, m.id)));
+                        }),
+                      ),
+                    ),
+                  ]
+                : []),
               settled(c.webhooks.list(fx.organization)),
               settled(c.connectSettings.get(fx.organization, "sandbox")),
               settled(c.toolPolicy.get(fx.organization)),
@@ -5233,6 +5985,8 @@ export function contractSuite(target: Target) {
         const channel = () => must(t.channel, "channels");
         // Read only by the memory type changes, which are dropped when the target doesn't serve them.
         const memoryType = () => must(t.memoryType, "memory type");
+        // Read only by the memory changes, which are dropped when the target doesn't serve them.
+        const memory = () => must(t.memory, "memory");
         const changes: [string, () => Promise<unknown>][] = [
           ["updateOrganization", () => c.organizations.update(t.org, { name: "Viewed" })],
           ["inviteMember", () => c.members.invite(t.org, { email: "v@northwind.example", role: "developer" })],
@@ -5308,6 +6062,9 @@ export function contractSuite(target: Target) {
           ],
           ["startRun", () => c.runs.create(w, t.agent.id, { input: "hi" })],
           ["cancelRun", () => c.runs.cancel(w, t.run.id)],
+          // Production's memories: the Console only reads them there, whatever its role.
+          ["createMemory", () => c.memories.create(w, t.agent.id, { text: "Viewed" })],
+          ["updateMemory", () => c.memories.update(w, t.agent.id, memory().id, { text: "Viewed" })],
           // Channels: Sandbox for what the Console may only do there, and Production's own objects otherwise.
           [
             "createChannelAppManager",
@@ -5348,6 +6105,8 @@ export function contractSuite(target: Target) {
             "updateChannelSettings",
             () => c.channelSettings.update(t.org, { ...CHANNEL_SETTINGS_DEFAULTS, breaker_runs: 5 }),
           ],
+          ["deleteMemory", () => c.memories.delete(w, t.agent.id, memory().id)],
+          ["deleteMemories", () => c.memories.deleteAll(w, t.agent.id)],
           ["deleteGrant", () => c.grants.delete(w, t.agent.id, t.grant.id)],
           ["deleteAgent", () => c.agents.delete(w, t.agent.id)],
           [

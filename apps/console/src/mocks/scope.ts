@@ -64,6 +64,13 @@ export function timelineOf(db: Db, scope: RunScope): RunEventRow[] {
 
 const SHORT_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
 
+/** Six random characters of lowercase base32: a short ID's form, for installations and memories alike. */
+export function drawShortId(rng: Rng = Math.random): string {
+  let shortId = "";
+  for (let i = 0; i < 6; i++) shortId += SHORT_ID_ALPHABET[Math.floor(rng() * SHORT_ID_ALPHABET.length)];
+  return shortId;
+}
+
 /** How many short IDs an issue draws before giving up, as the backend does. */
 export const SHORT_ID_DRAWS = 8;
 
@@ -76,8 +83,7 @@ export const SHORT_ID_DRAWS = 8;
  */
 export function issueShortId(issued: InstallationShortIdRow[], scope: Scoped, rng: Rng = Math.random): string {
   for (let draw = 0; draw < SHORT_ID_DRAWS; draw++) {
-    let shortId = "";
-    for (let i = 0; i < 6; i++) shortId += SHORT_ID_ALPHABET[Math.floor(rng() * SHORT_ID_ALPHABET.length)];
+    const shortId = drawShortId(rng);
     if (issued.some((row) => sameWorkspace(row, scope) && row.short_id === shortId)) continue;
     issued.push({
       organization_id: scope.organization_id,

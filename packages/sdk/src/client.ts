@@ -45,6 +45,7 @@ import type {
   CreatedConnectSession,
   CreatedWebhookEndpoint,
   CreateGrantInput,
+  CreateMemoryInput,
   CreateMemoryTypeInput,
   CreateModelConnectionInput,
   CreateModelInput,
@@ -64,7 +65,10 @@ import type {
   InviteMemberInput,
   Member,
   MemberId,
+  Memory,
+  MemoryId,
   MemoryKind,
+  MemoryListQuery,
   MemoryType,
   MemoryTypeId,
   Model,
@@ -105,6 +109,7 @@ import type {
   UpdateGrantInput,
   UpdateInstallationInput,
   UpdateMemberInput,
+  UpdateMemoryInput,
   UpdateMemoryTypeInput,
   UpdateModelConnectionInput,
   UpdateModelInput,
@@ -455,6 +460,24 @@ export function createClient(transport: Transport) {
         get<DefaultMemoryType>(`${org(organizationId)}/default-memory-type`),
       setDefault: (organizationId: OrganizationId, input: UpdateDefaultMemoryTypeInput) =>
         send<DefaultMemoryType>("PUT", `${org(organizationId)}/default-memory-type`, input),
+    },
+
+    /** What an agent remembers in a workspace: one memory type's at a time, newest first. */
+    memories: {
+      list: (workspaceId: WorkspaceId, agentId: AgentId, query: MemoryListQuery = {}) =>
+        getPage<Memory>(`${ws(workspaceId)}/agents/${enc(agentId)}/memories`, { ...query }),
+      create: (workspaceId: WorkspaceId, agentId: AgentId, input: CreateMemoryInput, options?: PostOptions) =>
+        post<Memory>(`${ws(workspaceId)}/agents/${enc(agentId)}/memories`, input, options),
+      /** One memory as it is now, in whichever of the agent's types keeps it: what a webhook names. */
+      get: (workspaceId: WorkspaceId, agentId: AgentId, memoryId: MemoryId) =>
+        get<Memory>(`${ws(workspaceId)}/agents/${enc(agentId)}/memories/${enc(memoryId)}`),
+      update: (workspaceId: WorkspaceId, agentId: AgentId, memoryId: MemoryId, input: UpdateMemoryInput) =>
+        send<Memory>("PATCH", `${ws(workspaceId)}/agents/${enc(agentId)}/memories/${enc(memoryId)}`, input),
+      delete: (workspaceId: WorkspaceId, agentId: AgentId, memoryId: MemoryId) =>
+        send<void>("DELETE", `${ws(workspaceId)}/agents/${enc(agentId)}/memories/${enc(memoryId)}`),
+      /** Forgets everything the agent keeps in the workspace, in every memory type. */
+      deleteAll: (workspaceId: WorkspaceId, agentId: AgentId) =>
+        send<void>("DELETE", `${ws(workspaceId)}/agents/${enc(agentId)}/memories`),
     },
 
     connectSettings: {
