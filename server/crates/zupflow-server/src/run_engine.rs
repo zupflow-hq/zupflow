@@ -63,7 +63,9 @@ use zupflow_core::runs::reducer::{
     ModelRequest, ModelResult, Plan, SendCheck, SendRequest, SendResult, Unanswered, UnansweredWhy, advance,
     calls_to_decide, fail_abandoned, frozen_offer, may_park_on, refuse_waiting,
 };
-use zupflow_core::runs::state::{CallDecision, CallRecord, CallVerdict, ClaimantId, InvocationId, RequestId, Snapshot};
+use zupflow_core::runs::state::{
+    CallDecision, CallRecord, CallVerdict, ClaimantId, FrozenMemory, InvocationId, RequestId, Snapshot,
+};
 use zupflow_core::runs::store::{
     Applied, REFUSE_WAITING_JOB, RUN_JOB, RunStore, StoreError, installation_of_job, run_of_job,
 };
@@ -76,6 +78,7 @@ use zupflow_mcp::CallError;
 use crate::auth::AppState;
 use crate::channel_tools;
 use crate::mcp_access::{self, Unreachable};
+use crate::memory_tools;
 use crate::model_access::{self, Unopened};
 use crate::run_observe;
 
@@ -495,6 +498,37 @@ impl<P: ToolPort> Driver<'_, P> {
                         outcome,
                     });
                 }
+                Io::SendMemory(send) => {
+                    let started = std::time::Instant::now();
+                    // Only the run's own type, as its first attempt froze it.
+                    let frozen = zupflow_core::runs::reducer::frozen_memory(&snapshot)
+                        .is_some_and(|frozen| frozen.memory_type_id == send.memory_type_id);
+                    let outcome = if frozen {
+                        memory_tools::send(self.state, self.agent_id, &send).await
+                    } else {
+                        SendOutcome::Refused {
+                            code: "tool_changed".to_owned(),
+                            message: "This call no longer matches what was decided, so it wasn't made.".to_owned(),
+                        }
+                    };
+                    run_observe::memory_sent(
+                        self.state,
+                        self.organization_id,
+                        self.workspace_id,
+                        self.environment,
+                        self.run_id,
+                        &send,
+                        &outcome,
+                        started.elapsed(),
+                    )
+                    .await;
+                    *sent = Some(SendResult {
+                        call_id: send.call_id,
+                        attempt: send.attempt,
+                        invocation_id: send.invocation_id,
+                        outcome,
+                    });
+                }
                 Io::Nothing if released => return Outcome::Leave,
                 Io::Nothing => {}
             }
@@ -530,7 +564,7 @@ impl<P: ToolPort> Driver<'_, P> {
         }
         match control.continuation {
             Continuation::NeedModel { .. } => {
-                facts.offer = self.offer_unless_frozen(snapshot).await?;
+                (facts.offer, facts.memory) = self.offer_unless_frozen(snapshot).await?;
                 facts.model_route = self.model_route(snapshot).await?;
                 // A channel run takes in what arrived in its thread since,
                 // at this turn boundary only: the reducer joins it to a
@@ -546,7 +580,7 @@ impl<P: ToolPort> Driver<'_, P> {
             }
             Continuation::AwaitModel { .. } => match model.map(|answer| &answer.result) {
                 None => {
-                    facts.offer = self.offer_unless_frozen(snapshot).await?;
+                    (facts.offer, facts.memory) = self.offer_unless_frozen(snapshot).await?;
                     facts.model_route = self.model_route(snapshot).await?;
                 }
                 Some(ModelResult::Answered(completion)) => {
@@ -575,6 +609,16 @@ impl<P: ToolPort> Driver<'_, P> {
                                 }
                                 decided
                             }
+                            ToolHost::Memory(memory_type_id) => {
+                                memory_tools::decide(
+                                    self.state,
+                                    self.organization_id,
+                                    snapshot.memory,
+                                    memory_type_id,
+                                    &tool.tool,
+                                )
+                                .await?
+                            }
                             _ => self.decide_offered(tool).await?,
                         };
                         facts.decisions.push((position, decision));
@@ -589,7 +633,7 @@ impl<P: ToolPort> Driver<'_, P> {
             },
             Continuation::NeedCall { turn, position } => match snapshot.call_at(turn, position) {
                 Some(call) if matches!(call.state, CallState::Allowed | CallState::Approved) => {
-                    let (check, opened) = self.send_check(call).await?;
+                    let (check, opened) = self.send_check(snapshot, call).await?;
                     facts.send_check = Some(check);
                     facts.invocation_id = Some(InvocationId::from_uuid(Uuid::now_v7()));
                     *reach = opened;
@@ -599,8 +643,8 @@ impl<P: ToolPort> Driver<'_, P> {
                 }
                 _ => {}
             },
-            // A channel post whose sender stopped is settled by finding it,
-            // rather than left unknown.
+            // A channel post or a memory call whose sender stopped is
+            // settled by finding what it did, rather than left unknown.
             Continuation::AwaitCall { call_id, attempt } => {
                 let lapsed = snapshot
                     .call(call_id)
@@ -630,6 +674,25 @@ impl<P: ToolPort> Driver<'_, P> {
                         attempted_at,
                     )
                     .await;
+                    if let Some(outcome) = settled {
+                        facts.sent = Some(SendResult {
+                            call_id,
+                            attempt,
+                            invocation_id: sending.invocation_id,
+                            outcome,
+                        });
+                    }
+                } else if let Some((call, sending)) = lapsed
+                    && call.target.as_ref().is_some_and(|target| target.memory().is_some())
+                {
+                    let settled = memory_tools::settle_lapsed(
+                        self.state,
+                        (self.organization_id, self.workspace_id, self.run_id),
+                        self.agent_id,
+                        snapshot,
+                        call,
+                    )
+                    .await?;
                     if let Some(outcome) = settled {
                         facts.sent = Some(SendResult {
                             call_id,
@@ -872,13 +935,38 @@ impl<P: ToolPort> Driver<'_, P> {
         }
     }
 
-    /// The tools to offer the run's first model attempt, read now; `None`
-    /// once an attempt froze them, since every later one offers those.
-    async fn offer_unless_frozen(&self, snapshot: &Snapshot) -> Result<Option<Offer>, &'static str> {
+    /// The tools to offer the run's first model attempt, read now, with its
+    /// memory: the agent's memory tools join its apps' by their own names,
+    /// and what it recalls is read with them. `None` once an attempt froze
+    /// them, since every later one offers those and sends that recall. A
+    /// channel run's session froze its tools when it started, without
+    /// memory for now.
+    async fn offer_unless_frozen(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<(Option<Offer>, Option<FrozenMemory>), &'static str> {
         if frozen_offer(snapshot).is_some() {
-            return Ok(None);
+            return Ok((None, None));
         }
-        self.reads().offer().await.map(Some)
+        let offer = self.reads().offer().await?;
+        if snapshot.session.is_some() {
+            return Ok((Some(offer), None));
+        }
+        let resolved = memory_tools::resolve(
+            self.state,
+            (self.organization_id, self.workspace_id),
+            self.agent_id,
+            snapshot.memory,
+        )
+        .await?;
+        let Some(memory) = resolved else {
+            return Ok((Some(offer), None));
+        };
+        let (offer, left_out) = offer.with(memory.tools);
+        for name in left_out {
+            tracing::warn!(event = "runs.memory_tool_not_offered", organization_id = %self.organization_id, workspace_id = %self.workspace_id, agent_id = %self.agent_id, memory_type_id = %memory.frozen.memory_type_id, %name);
+        }
+        Ok((Some(offer), Some(memory.frozen)))
     }
 
     /// The floor's and then the policy's decision on a call to an offered
@@ -899,11 +987,19 @@ impl<P: ToolPort> Driver<'_, P> {
     /// floor and the policy, and the tool's pinned definition. When it would
     /// be sent, its server is reached now, so a credential that needs
     /// reconnecting refuses it before it's recorded as sent.
-    async fn send_check(&self, call: &CallRecord) -> Result<(SendCheck, Option<P::Reach>), &'static str> {
+    async fn send_check(
+        &self,
+        snapshot: &Snapshot,
+        call: &CallRecord,
+    ) -> Result<(SendCheck, Option<P::Reach>), &'static str> {
         let Some(target) = &call.target else {
             // An open call always has a target; the reducer says so.
             return Err("run_inconsistent");
         };
+        if target.memory().is_some() {
+            let check = memory_tools::send_check(self.state, self.organization_id, snapshot.memory, call).await?;
+            return Ok((check, None));
+        }
         if target.channel().is_some() {
             let check = channel_tools::send_check(
                 self.state,
@@ -1017,6 +1113,9 @@ impl<P: ToolPort> Driver<'_, P> {
                 true,
             )
             .await;
+        }
+        if target.memory().is_some() {
+            return memory_tools::parking_check(self.state, self.organization_id, call).await;
         }
         let Some(installation_id) = target.installation_id else {
             return Err("run_inconsistent");

@@ -17,14 +17,14 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::ids::{
-    ApiKeyId, ChannelConnectionId, ChannelConversationId, InstallationId, ModelConnectionId, ModelId, OrganizationId,
-    RunId, ToolCallId, WorkspaceId,
+    ApiKeyId, ChannelConnectionId, ChannelConversationId, InstallationId, MemoryTypeId, ModelConnectionId, ModelId,
+    OrganizationId, RunId, ToolCallId, WorkspaceId,
 };
 use crate::models::{Message, TokenUsage};
 use crate::policy::{Decision, Verdict};
 use crate::runs::digest::Sha256Digest;
 use crate::runs::names::{Offer, ToolHost};
-use crate::runs::{ApprovalDecision, CallOutcome, CallState, Failure, RunStatus};
+use crate::runs::{ApprovalDecision, CallOutcome, CallState, Failure, MemoryMode, RunStatus};
 use crate::time::Timestamp;
 
 /// The execution version new runs are created under. A worker advances only
@@ -256,13 +256,17 @@ impl From<&Decision> for CallDecision {
 /// The installation and tool a call goes to, recorded with it when the
 /// model's name was looked up in the turn's frozen offer (decision 0047).
 /// A channel tool's call names its connection instead, whose short ID,
-/// label and provider stand where an installation's would; never both.
+/// label and provider stand where an installation's would; a memory tool's
+/// its memory type, whose name and kind stand where an installation's label
+/// and app's key would, with no short ID. Only ever one of the three.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundTarget {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installation_id: Option<InstallationId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_connection_id: Option<ChannelConnectionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_type_id: Option<MemoryTypeId>,
     pub installation_short_id: String,
     pub installation_label: String,
     pub app_key: String,
@@ -276,18 +280,22 @@ pub struct BoundTarget {
 impl BoundTarget {
     /// Where the call goes.
     pub fn host(&self) -> ToolHost {
-        match (self.installation_id, self.channel_connection_id) {
-            (Some(installation_id), _) => ToolHost::Installation(installation_id),
-            (None, Some(connection_id)) => ToolHost::Channel(connection_id),
-            (None, None) => ToolHost::Run,
-        }
+        ToolHost::of(self.installation_id, self.channel_connection_id, self.memory_type_id)
     }
 
     /// The channel connection a channel tool's call goes through.
     pub fn channel(&self) -> Option<ChannelConnectionId> {
         match self.host() {
             ToolHost::Channel(connection_id) => Some(connection_id),
-            ToolHost::Installation(_) | ToolHost::Run => None,
+            ToolHost::Installation(_) | ToolHost::Memory(_) | ToolHost::Run => None,
+        }
+    }
+
+    /// The memory type a memory tool's call is made in.
+    pub fn memory(&self) -> Option<MemoryTypeId> {
+        match self.host() {
+            ToolHost::Memory(memory_type_id) => Some(memory_type_id),
+            ToolHost::Installation(_) | ToolHost::Channel(_) | ToolHost::Run => None,
         }
     }
 }
@@ -364,6 +372,24 @@ pub enum ModelAttemptState {
     Unanswered,
 }
 
+/// A run's memory, resolved at its first model attempt and frozen with it,
+/// as its offer is: every later attempt reads it from the run, never from
+/// the store, so retries, restarts and approval pauses send the same bytes.
+/// `None` where it's kept: the run has no memory (its agent's is off, on a
+/// default the organization hasn't chosen, or of a kind this server doesn't
+/// serve).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FrozenMemory {
+    /// The memory type the run's memory tools are of; their calls are
+    /// decided on it as it is when they're made.
+    pub memory_type_id: MemoryTypeId,
+    /// The recall the run's first user message starts with, framed; `None`
+    /// when there's nothing to recall, and for a run started with memory
+    /// `off`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall: Option<String>,
+}
+
 /// One request to the model, as committed by `PrepareModel`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelAttempt {
@@ -374,6 +400,8 @@ pub struct ModelAttempt {
     pub request_digest: Sha256Digest,
     /// The tools offered, frozen.
     pub offer: Offer,
+    /// The run's memory, frozen with the offer.
+    pub memory: Option<FrozenMemory>,
     /// Unanswered because it was sent and no answer came in time.
     pub timed_out: bool,
 }
@@ -435,6 +463,8 @@ pub struct Snapshot {
     pub connection_id: Option<ModelConnectionId>,
     pub instructions: String,
     pub input: String,
+    /// What the run does with its agent's memory, as it was started.
+    pub memory: MemoryMode,
     /// In order: `turns[n].turn == n`.
     pub turns: Vec<CommittedTurn>,
     /// Every call, by turn and position.

@@ -23,14 +23,18 @@
 //! memory's workspace fails the change, which then changes nothing. A
 //! scope's oldest memories are forgotten as many at a time as asked,
 //! whatever the kind lets people do, with each memory's records and their
-//! count.
+//! count. A run's tool call records its change with it the same way, and a
+//! call whose answer was lost, settled, never makes its change twice nor
+//! records it twice, in its own scope only.
 //!
 //! `notes` adds: its tools' answers and refusals, writes refused before
 //! their arguments are read once denied, who wrote each note, search over
 //! only what the audience is shown, a run's changes only where its reach
-//! goes, the most notes a scope keeps, and a recall's exact bytes: the
-//! newest notes that fit, then a line counting the rest, each note as saved
-//! but for a frame tag.
+//! goes, the most notes a scope keeps, a recall's exact bytes (the newest
+//! notes that fit, then a line counting the rest, each note as saved but
+//! for a frame tag), and how a call whose answer was lost is settled: a
+//! save or a change found by its origin, a forget made only while its note
+//! is there, a search made again.
 //!
 //! `prepare` makes a [`Tenant`] exist, as the `NoteStore` suite's does.
 
@@ -86,6 +90,8 @@ pub async fn run(subject: Subject<'_>, prepare: Prepare) {
     finds_each_memory_by_its_id_in_its_scope(&subject, &prepare).await;
     forgets_exactly_what_it_names(&subject, &prepare).await;
     records_each_change_with_it(&subject, &prepare).await;
+    records_a_calls_change_with_it(&subject, &prepare).await;
+    settles_a_call_without_making_it_twice(&subject, &prepare).await;
     forgets_a_scope_with_its_records(&subject, &prepare).await;
 }
 
@@ -133,6 +139,7 @@ pub async fn run_notes(store: Arc<dyn NoteStore>, logs: Logs<'_>, prepare: Prepa
     shows_each_note_as_saved_but_for_a_frame_tag(&*notes, &prepare).await;
     searches_only_what_its_audience_is_shown(&*notes, &prepare).await;
     changes_only_where_a_runs_reach_goes(&*notes, &prepare).await;
+    settles_each_tools_call_by_what_it_did(&*notes, &prepare).await;
 }
 
 fn at(millis: i64) -> Timestamp {
@@ -1003,6 +1010,171 @@ async fn records_each_change_with_it(subject: &Subject<'_>, prepare: &Prepare) {
     );
 }
 
+/// A run's tool call records its change with it, as the server hands the
+/// records over: each call of a tool that writes, recorded once it answers;
+/// a refusal records nothing; and a record placed outside the memory's
+/// workspace fails the call, which then changes nothing.
+async fn records_a_calls_change_with_it(subject: &Subject<'_>, prepare: &Prepare) {
+    let provider = subject.provider;
+    let logs = subject.logs;
+    let t = tenant(prepare).await;
+    let scope = t.scope();
+    let workspace = Audience::Workspace;
+    let endpoint = watch(logs, t.organization_id).await;
+    let record = recorder(Environment::Sandbox);
+    let settings = defaults(provider);
+    let seen_now = || seen(logs, t.organization_id, t.workspace, endpoint);
+    let memory = (subject.remember)(scope, workspace, "Remembered by a run.".to_owned(), at(1)).await;
+    let mut expected = seen_now().await;
+    let origin = run_origin();
+    for (tool, arguments) in (subject.write_calls)(&memory) {
+        let denied = call_recording(
+            provider,
+            &scope,
+            &CallContext {
+                writes: MemoryWrites::Deny,
+                ..allowed(&origin, &workspace, &settings, at(2))
+            },
+            &tool,
+            arguments.clone(),
+            &record,
+        )
+        .await
+        .unwrap();
+        assert!(denied.is_error, "{tool}: refused while denied");
+        assert_eq!(seen_now().await, expected, "{tool}: a refusal records nothing");
+        let made = call_recording(
+            provider,
+            &scope,
+            &allowed(&origin, &workspace, &settings, at(3)),
+            &tool,
+            arguments,
+            &record,
+        )
+        .await
+        .unwrap();
+        let change = made
+            .change
+            .unwrap_or_else(|| panic!("{tool} changes something: {}", made.content));
+        expected.add(&change);
+        assert_eq!(seen_now().await, expected, "{tool}: recorded with its change");
+    }
+
+    let kept = (subject.remember)(scope, workspace, "Kept as it is.".to_owned(), at(4)).await;
+    let recalled = recall(provider, &scope, &workspace).await;
+    let elsewhere = sent_elsewhere(Environment::Production, t.sibling);
+    for (tool, arguments) in (subject.write_calls)(&kept) {
+        assert_eq!(
+            call_recording(
+                provider,
+                &scope,
+                &allowed(&origin, &workspace, &settings, at(5)),
+                &tool,
+                arguments,
+                &elsewhere,
+            )
+            .await,
+            Err(MemoryError::Unavailable),
+            "{tool}: a webhook event elsewhere fails the call"
+        );
+    }
+    assert_eq!(provider.get(&scope, kept.id).await.as_ref(), Ok(&kept));
+    assert_eq!(recall(provider, &scope, &workspace).await, recalled, "nothing changed");
+    assert_eq!(seen_now().await, expected, "nothing recorded");
+}
+
+/// A call whose answer was lost, settled, never makes its change twice: a
+/// call made, then settled, changes and records nothing more; one never
+/// made, settled, makes its change at most once, recorded with it, however
+/// often it's settled; and a settle reaches only its own scope.
+async fn settles_a_call_without_making_it_twice(subject: &Subject<'_>, prepare: &Prepare) {
+    let provider = subject.provider;
+    let logs = subject.logs;
+    let t = tenant(prepare).await;
+    let other = tenant(prepare).await;
+    let scope = t.scope();
+    let workspace = Audience::Workspace;
+    let endpoint = watch(logs, t.organization_id).await;
+    let record = recorder(Environment::Sandbox);
+    let settings = defaults(provider);
+    let seen_now = || seen(logs, t.organization_id, t.workspace, endpoint);
+    let listed = || async { provider.list(&scope, &everything()).await.unwrap().items };
+
+    // Made, then settled: nothing more.
+    let memory = (subject.remember)(scope, workspace, "Remembered before.".to_owned(), at(1)).await;
+    let mut expected = seen_now().await;
+    for (tool, arguments) in (subject.write_calls)(&memory) {
+        let origin = run_origin();
+        let context = allowed(&origin, &workspace, &settings, at(2));
+        let made = call_recording(provider, &scope, &context, &tool, arguments.clone(), &record)
+            .await
+            .unwrap();
+        expected.add(&made.change.expect("a change"));
+        let before = listed().await;
+        for _ in 0..2 {
+            let settled = settle_recording(provider, &scope, &context, &tool, arguments.clone(), &record)
+                .await
+                .unwrap();
+            assert!(
+                settled.as_ref().is_none_or(|settled| settled.change.is_none()),
+                "{tool}: made once: {settled:?}"
+            );
+            assert_eq!(listed().await, before, "{tool}: changing nothing more");
+            assert_eq!(seen_now().await, expected, "{tool}: recording nothing more");
+        }
+    }
+
+    // Never made, then settled: made at most once.
+    let memory = (subject.remember)(scope, workspace, "Remembered after.".to_owned(), at(3)).await;
+    let mut expected = seen_now().await;
+    for (tool, arguments) in (subject.write_calls)(&memory) {
+        let origin = run_origin();
+        let context = allowed(&origin, &workspace, &settings, at(4));
+        let first = settle_recording(provider, &scope, &context, &tool, arguments.clone(), &record)
+            .await
+            .unwrap();
+        if let Some(change) = first.as_ref().and_then(|first| first.change.as_ref()) {
+            expected.add(change);
+        }
+        assert_eq!(seen_now().await, expected, "{tool}: what it made, recorded with it");
+        let before = listed().await;
+        let again = settle_recording(provider, &scope, &context, &tool, arguments.clone(), &record)
+            .await
+            .unwrap();
+        assert!(
+            again.as_ref().is_none_or(|again| again.change.is_none()),
+            "{tool}: made once: {again:?}"
+        );
+        assert_eq!(listed().await, before, "{tool}: and once only");
+        assert_eq!(seen_now().await, expected, "{tool}: recorded once");
+    }
+
+    // What a call did here is never found from another scope, and settling
+    // it there changes nothing here: made there, if anywhere.
+    for (key, elsewhere) in t.changed_alone(&other) {
+        let memory = (subject.remember)(scope, workspace, format!("Remembered for the {key}."), at(5)).await;
+        for (tool, arguments) in (subject.write_calls)(&memory) {
+            let origin = run_origin();
+            let context = allowed(&origin, &workspace, &settings, at(6));
+            let made = call_recording(provider, &scope, &context, &tool, arguments.clone(), &record_nothing)
+                .await
+                .unwrap();
+            assert!(!made.is_error, "{key}: {tool}: {}", made.content);
+            let before = listed().await;
+            if let Ok(Some(settled)) =
+                settle_recording(provider, &elsewhere, &context, &tool, arguments, &record_nothing).await
+                && !settled.is_error
+            {
+                let change = settled
+                    .change
+                    .unwrap_or_else(|| panic!("{key}: {tool}: found from elsewhere: {}", settled.content));
+                assert_eq!(change.memory().scope(), elsewhere, "{key}: {tool}: made there");
+            }
+            assert_eq!(listed().await, before, "{key}: {tool}: nothing changed here");
+        }
+    }
+}
+
 /// Forgetting a scope forgets its oldest memories, as many at a time as
 /// asked, whatever their audience and whatever the kind lets people do (an
 /// erasure), recording each as it was and how many, and nothing of any other
@@ -1152,10 +1324,40 @@ async fn call_in(
     tool: &str,
     arguments: Value,
 ) -> CallResult {
+    call_recording(provider, scope, context, tool, arguments, &record_nothing)
+        .await
+        .unwrap()
+}
+
+/// A call to one of the kind's tools, recording its change with `record`.
+async fn call_recording(
+    provider: &dyn MemoryProvider,
+    scope: &MemoryScope,
+    context: &CallContext<'_>,
+    tool: &str,
+    arguments: Value,
+    record: &Record<'_>,
+) -> Result<CallResult, MemoryError> {
     let Value::Object(arguments) = arguments else {
         panic!("arguments are an object");
     };
-    provider.call(scope, context, tool, &arguments).await.unwrap()
+    provider.call(scope, context, tool, &arguments, record).await
+}
+
+/// Settles a call whose answer was lost, recording what it makes with
+/// `record`.
+async fn settle_recording(
+    provider: &dyn MemoryProvider,
+    scope: &MemoryScope,
+    context: &CallContext<'_>,
+    tool: &str,
+    arguments: Value,
+    record: &Record<'_>,
+) -> Result<Option<CallResult>, MemoryError> {
+    let Value::Object(arguments) = arguments else {
+        panic!("arguments are an object");
+    };
+    provider.settle(scope, context, tool, &arguments, record).await
 }
 
 /// Saves a note as a run does: the note saved.
@@ -2085,4 +2287,150 @@ async fn changes_only_where_a_runs_reach_goes(provider: &dyn MemoryProvider, pre
     .await;
     assert!(!forgotten.is_error, "{forgotten:?}");
     assert_eq!(provider.list(&scope, &everything()).await.unwrap().total, 0);
+}
+
+/// How `notes` settles a call whose answer was lost. A save or a change of
+/// text is found by the origin it wrote and answered as made, whatever the
+/// type's writes are now; one not found is made now, recorded with it, or
+/// refused while writes are denied. A forget whose note is still there is
+/// made now; one whose note is gone, or while writes are denied, can't be
+/// told. A search is made again.
+async fn settles_each_tools_call_by_what_it_did(provider: &dyn MemoryProvider, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let scope = t.scope();
+    let workspace = Audience::Workspace;
+    let settings = defaults(provider);
+    let settle = |origin: Origin, writes: MemoryWrites, tool: &'static str, arguments: Value| {
+        let settings = settings.clone();
+        async move {
+            let context = CallContext {
+                writes,
+                ..allowed(&origin, &workspace, &settings, at(10))
+            };
+            settle_recording(provider, &scope, &context, tool, arguments, &record_nothing)
+                .await
+                .unwrap()
+        }
+    };
+    let make = |origin: Origin, tool: &'static str, arguments: Value| {
+        let settings = settings.clone();
+        async move {
+            call_in(
+                provider,
+                &scope,
+                &allowed(&origin, &workspace, &settings, at(1)),
+                tool,
+                arguments,
+            )
+            .await
+        }
+    };
+    let answered = |result: Option<CallResult>| result.map(|result| (result.content, result.is_error, result.change.is_some()));
+
+    // A save made, then settled: found, and answered as made.
+    let first = run_origin();
+    let made = make(first, notes::SAVE_MEMORY, json!({ "text": "Saved once." })).await;
+    let Some(MemoryChange::Saved(note)) = made.change else {
+        panic!("saved: {made:?}");
+    };
+    let short = note.short_id.as_str().to_owned();
+    for writes in [MemoryWrites::Allow, MemoryWrites::Deny] {
+        assert_eq!(
+            answered(settle(first, writes, notes::SAVE_MEMORY, json!({ "text": "Saved once." })).await),
+            Some((format!("Saved as {short}."), false, false)),
+            "{writes:?}: found by its origin, whatever the writes are now"
+        );
+    }
+    assert_eq!(provider.list(&scope, &everything()).await.unwrap().total, 1, "saved once");
+
+    // A save never made: refused while denied, then made once.
+    let lost = run_origin();
+    let refused = settle(lost, MemoryWrites::Deny, notes::SAVE_MEMORY, json!({ "text": "Saved late." }))
+        .await
+        .expect("an answer");
+    assert!(refused.is_error && refused.change.is_none(), "{refused:?}");
+    assert_eq!(provider.list(&scope, &everything()).await.unwrap().total, 1, "nothing saved");
+    let late = settle(lost, MemoryWrites::Allow, notes::SAVE_MEMORY, json!({ "text": "Saved late." }))
+        .await
+        .expect("an answer");
+    let Some(MemoryChange::Saved(late_note)) = late.change.clone() else {
+        panic!("made now: {late:?}");
+    };
+    assert_eq!((late_note.text.as_str(), late_note.origin), ("Saved late.", lost));
+    assert_eq!(
+        answered(settle(lost, MemoryWrites::Allow, notes::SAVE_MEMORY, json!({ "text": "Saved late." })).await),
+        Some((format!("Saved as {}.", late_note.short_id.as_str()), false, false)),
+        "and once only"
+    );
+    assert_eq!(provider.list(&scope, &everything()).await.unwrap().total, 2);
+
+    // A change of text made, then settled; and one never made.
+    let changer = run_origin();
+    let changed = make(
+        changer,
+        notes::UPDATE_MEMORY,
+        json!({ "memory": short, "text": "Changed once." }),
+    )
+    .await;
+    assert!(!changed.is_error, "{changed:?}");
+    assert_eq!(
+        answered(
+            settle(
+                changer,
+                MemoryWrites::Deny,
+                notes::UPDATE_MEMORY,
+                json!({ "memory": short, "text": "Changed once." }),
+            )
+            .await
+        ),
+        Some((format!("Updated {short}."), false, false))
+    );
+    let late_changer = run_origin();
+    let changed_late = settle(
+        late_changer,
+        MemoryWrites::Allow,
+        notes::UPDATE_MEMORY,
+        json!({ "memory": short, "text": "Changed late." }),
+    )
+    .await
+    .expect("an answer");
+    assert_eq!(
+        changed_late.change.as_ref().map(|change| (&change.memory().text[..], change.memory().origin)),
+        Some(("Changed late.", late_changer)),
+        "made now: {changed_late:?}"
+    );
+
+    // A forget: made now while its note is there; can't be told once it's
+    // gone, or while writes are denied.
+    let forgetter = run_origin();
+    assert_eq!(
+        settle(forgetter, MemoryWrites::Deny, notes::FORGET_MEMORY, json!({ "memory": short })).await,
+        None,
+        "read-only now"
+    );
+    let forgot = settle(forgetter, MemoryWrites::Allow, notes::FORGET_MEMORY, json!({ "memory": short }))
+        .await
+        .expect("an answer");
+    assert_eq!(
+        (forgot.content.as_str(), forgot.is_error),
+        (format!("Forgot {short}.").as_str(), false)
+    );
+    assert!(matches!(forgot.change, Some(MemoryChange::Forgotten(_))), "{forgot:?}");
+    assert_eq!(
+        settle(forgetter, MemoryWrites::Allow, notes::FORGET_MEMORY, json!({ "memory": short })).await,
+        None,
+        "gone: by this call or another, it can't be told"
+    );
+    assert_eq!(provider.list(&scope, &everything()).await.unwrap().total, 1);
+
+    // A search is made again; a call it can't read the arguments of is
+    // answered as the call was.
+    let searcher = run_origin();
+    let searched = make(searcher, notes::SEARCH_MEMORY, json!({ "query": "late" })).await;
+    assert_eq!(
+        settle(searcher, MemoryWrites::Deny, notes::SEARCH_MEMORY, json!({ "query": "late" })).await,
+        Some(searched)
+    );
+    let unread = settle(run_origin(), MemoryWrites::Allow, notes::FORGET_MEMORY, json!({})).await;
+    assert!(unread.is_some_and(|unread| unread.is_error), "no note named");
 }

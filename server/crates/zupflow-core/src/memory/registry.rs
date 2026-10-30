@@ -135,7 +135,19 @@ impl MemoryProvider for Unserved {
         _: &CallContext<'_>,
         _: &str,
         _: &Map<String, Value>,
+        _: &Record<'_>,
     ) -> Result<CallResult, MemoryError> {
+        Err(MemoryError::NotServed)
+    }
+
+    async fn settle(
+        &self,
+        _: &MemoryScope,
+        _: &CallContext<'_>,
+        _: &str,
+        _: &Map<String, Value>,
+        _: &Record<'_>,
+    ) -> Result<Option<CallResult>, MemoryError> {
         Err(MemoryError::NotServed)
     }
 
@@ -246,6 +258,7 @@ mod tests {
             _: &CallContext<'_>,
             _: &str,
             _: &Map<String, Value>,
+            _: &Record<'_>,
         ) -> Result<CallResult, MemoryError> {
             Ok(CallResult::answer(self.name, None))
         }
@@ -343,8 +356,17 @@ mod tests {
             now: Timestamp::from_millis(0),
         };
         assert_eq!(
-            stand_in.call(&scope(), &context, "save_memory", &Map::new()).await,
+            stand_in
+                .call(&scope(), &context, "save_memory", &Map::new(), &record_nothing)
+                .await,
             Err(MemoryError::NotServed)
+        );
+        assert_eq!(
+            stand_in
+                .settle(&scope(), &context, "save_memory", &Map::new(), &record_nothing)
+                .await,
+            Err(MemoryError::NotServed),
+            "nothing to settle"
         );
         assert_eq!(
             stand_in

@@ -21,8 +21,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::apps::{APP_KEY_MAX, is_app_key};
-use crate::ids::{ChannelConnectionId, InstallationId};
+use crate::ids::{ChannelConnectionId, InstallationId, MemoryTypeId};
 use crate::installations::ShortId;
+use crate::memory::MemoryTool;
 use crate::models::{MAX_MODEL_TOOL_NAME, ToolSpec};
 use crate::runs::digest::Sha256Digest;
 
@@ -130,8 +131,28 @@ pub enum ToolHost {
     /// One of the agent's channel connections, through its provider
     /// ([`crate::channels::tools`]).
     Channel(ChannelConnectionId),
+    /// The agent's memory, in the memory type the run started with, through
+    /// its kind ([`crate::memory::MemoryProvider`]).
+    Memory(MemoryTypeId),
     /// The run itself: nothing is sent (`stay_silent`).
     Run,
+}
+
+impl ToolHost {
+    /// Where a tool or a call naming these goes: the first named, in this
+    /// order; the run itself when none is.
+    pub fn of(
+        installation_id: Option<InstallationId>,
+        channel_connection_id: Option<ChannelConnectionId>,
+        memory_type_id: Option<MemoryTypeId>,
+    ) -> Self {
+        match (installation_id, channel_connection_id, memory_type_id) {
+            (Some(installation_id), _, _) => Self::Installation(installation_id),
+            (None, Some(connection_id), _) => Self::Channel(connection_id),
+            (None, None, Some(memory_type_id)) => Self::Memory(memory_type_id),
+            (None, None, None) => Self::Run,
+        }
+    }
 }
 
 /// A tool as one turn offers it: the name the model calls it by, what the
@@ -139,9 +160,11 @@ pub enum ToolHost {
 ///
 /// An installation's tool names its installation; a channel tool its
 /// connection, whose short ID, label and provider key stand where an
-/// installation's would; a tool of the run itself (`stay_silent`) names
-/// neither. Never both. An offer stored before channel tools existed reads
-/// as it was written.
+/// installation's would; a memory tool its memory type, whose name and
+/// kind stand where an installation's label and app's key would, with no
+/// short ID; a tool of the run itself (`stay_silent`) names none. Only ever
+/// one. An offer stored before channel or memory tools existed reads as it
+/// was written.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OfferedTool {
     pub name: String,
@@ -152,6 +175,8 @@ pub struct OfferedTool {
     pub installation_id: Option<InstallationId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_connection_id: Option<ChannelConnectionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_type_id: Option<MemoryTypeId>,
     pub installation_short_id: String,
     pub installation_label: String,
     pub app_key: String,
@@ -164,11 +189,7 @@ pub struct OfferedTool {
 impl OfferedTool {
     /// Where a call to it goes.
     pub fn host(&self) -> ToolHost {
-        match (self.installation_id, self.channel_connection_id) {
-            (Some(installation_id), _) => ToolHost::Installation(installation_id),
-            (None, Some(connection_id)) => ToolHost::Channel(connection_id),
-            (None, None) => ToolHost::Run,
-        }
+        ToolHost::of(self.installation_id, self.channel_connection_id, self.memory_type_id)
     }
 
     /// The tool as the model is given it.
@@ -321,6 +342,7 @@ pub fn build_offer(candidates: impl IntoIterator<Item = Candidate>) -> BuiltOffe
             input_schema: candidate.input_schema,
             installation_id: Some(candidate.installation_id),
             channel_connection_id: None,
+            memory_type_id: None,
             installation_short_id: candidate.installation_short_id,
             installation_label: candidate.installation_label,
             app_key: candidate.app_key,
@@ -355,6 +377,60 @@ pub fn build_offer(candidates: impl IntoIterator<Item = Candidate>) -> BuiltOffe
         offer,
         clashes,
         excluded,
+    }
+}
+
+/// One of a memory kind's tools, as a run offers it in `memory_type_id`:
+/// the kind's fixed definition, by its own name and with its own
+/// description, so it reads the same in every run of every agent with the
+/// same kind and `writes`. The type's name and the kind's stand where an
+/// installation's label and app's would, for the run's timeline; the model
+/// never reads them.
+pub fn memory_tool(
+    memory_type_id: MemoryTypeId,
+    memory_type_name: &str,
+    kind: &str,
+    kind_name: &str,
+    tool: &MemoryTool,
+) -> OfferedTool {
+    OfferedTool {
+        name: tool.name.clone(),
+        description: tool.description.clone(),
+        input_schema: tool.input_schema.clone(),
+        installation_id: None,
+        channel_connection_id: None,
+        memory_type_id: Some(memory_type_id),
+        installation_short_id: String::new(),
+        installation_label: memory_type_name.to_owned(),
+        app_key: kind.to_owned(),
+        app_name: kind_name.to_owned(),
+        tool: tool.name.clone(),
+        definition_sha256: tool.definition_sha256(),
+    }
+}
+
+impl Offer {
+    /// This offer with `more` added, each by its own name, in the offer's
+    /// one order (by name), as a channel session's tools join its apps'. A
+    /// tool whose name a model can't call, or that's offered already (or
+    /// twice in `more`), is left out: their names, for the driver to log.
+    /// An app's tool is named `<app_key>_<short_id>_<tool>` and a channel
+    /// tool `<provider>_<short_id>_<tool>`, so a bare name such as
+    /// `save_memory` never meets one.
+    pub fn with(self, more: Vec<OfferedTool>) -> (Self, Vec<String>) {
+        let mut tools = self.tools;
+        let mut left_out = Vec::new();
+        for tool in more {
+            let taken = tools.iter().any(|offered| offered.name == tool.name);
+            if taken || !valid_model_name(&tool.name) {
+                left_out.push(tool.name);
+                continue;
+            }
+            tools.push(tool);
+        }
+        // Every name is valid and unique: checked above.
+        let offer = Self::new(tools).unwrap_or_default();
+        (offer, left_out)
     }
 }
 
@@ -712,6 +788,7 @@ mod tests {
             instructions: "",
             messages: &messages,
             tools: &specs,
+            memory: None,
             cache_key: None,
         };
         assert_eq!(crate::models::validate_turn(&turn), Ok(()));

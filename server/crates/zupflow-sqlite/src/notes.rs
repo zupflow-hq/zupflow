@@ -11,6 +11,9 @@
 //! with its deliveries and their jobs, as the outbox writes one, and the
 //! audit event, each only in the scope's own workspace.
 //!
+//! A note a run's call wrote is found by the call in its origin, the JSON
+//! it's kept as, within the full scope ([`BY_ORIGIN`]).
+//!
 //! A search is FTS5's: the notes holding every word, by word, in any case
 //! and accent, ranked by BM25, then newest first. BM25 weighs a word by how
 //! many of its table's rows hold it, so a table shared by every scope would
@@ -27,7 +30,9 @@ use sqlx::sqlite::{SqliteArguments, SqliteRow};
 use sqlx::{Connection, QueryBuilder, Row, Sqlite, SqliteConnection, Transaction};
 use uuid::Uuid;
 use zupflow_core::audit::Audit;
-use zupflow_core::ids::{AgentId, ChannelConversationId, MemoryId, MemoryTypeId, OrganizationId, WorkspaceId};
+use zupflow_core::ids::{
+    AgentId, ChannelConversationId, MemoryId, MemoryTypeId, OrganizationId, RunId, ToolCallId, WorkspaceId,
+};
 use zupflow_core::installations::ShortId;
 use zupflow_core::memory::notes::{NewNote, NoteRef, NoteStore, Reach, Recent};
 use zupflow_core::memory::{
@@ -191,6 +196,16 @@ const WRITTEN: &str = concat!(
     " AND ",
     written!(),
     " AND (id = ?7 OR short_id = ?8)"
+);
+/// The note whose origin is the run (`?5`) and call (`?6`) that wrote its
+/// text, whatever its audience: at most one, as a call writes one note.
+const BY_ORIGIN: &str = concat!(
+    "SELECT ",
+    columns!(),
+    " FROM memory_notes WHERE ",
+    in_scope!(),
+    " AND json_extract(origin, '$.type') = 'run' AND json_extract(origin, '$.run_id') = ?5 \
+     AND json_extract(origin, '$.tool_call_id') = ?6 ORDER BY updated_at DESC, id DESC LIMIT 1"
 );
 /// A note by its ID (`?5`), whatever its audience.
 const FIND: &str = concat!(
@@ -562,6 +577,21 @@ impl NoteStore for SqliteNoteStore {
             .await
             .map_err(failed("get"))?;
         row.as_ref().map(note_from).transpose()?.ok_or(MemoryError::NotFound)
+    }
+
+    async fn by_origin(
+        &self,
+        scope: &MemoryScope,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+    ) -> Result<Option<Memory>, MemoryError> {
+        let row = bind_scope(sqlx::query(BY_ORIGIN), scope)
+            .bind(run_id.to_string())
+            .bind(tool_call_id.to_string())
+            .fetch_optional(self.database.pool())
+            .await
+            .map_err(failed("by_origin"))?;
+        row.as_ref().map(note_from).transpose()
     }
 
     async fn recent(&self, scope: &MemoryScope, audience: &Audience, limit: u32) -> Result<Recent, MemoryError> {

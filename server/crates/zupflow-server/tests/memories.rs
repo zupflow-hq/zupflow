@@ -2012,8 +2012,20 @@ impl MemoryProvider for Limited {
         context: &CallContext<'_>,
         tool: &str,
         arguments: &Map<String, Value>,
+        record: &Record<'_>,
     ) -> Result<CallResult, MemoryError> {
-        self.notes.call(scope, context, tool, arguments).await
+        self.notes.call(scope, context, tool, arguments, record).await
+    }
+
+    async fn settle(
+        &self,
+        scope: &MemoryScope,
+        context: &CallContext<'_>,
+        tool: &str,
+        arguments: &Map<String, Value>,
+        record: &Record<'_>,
+    ) -> Result<Option<CallResult>, MemoryError> {
+        self.notes.settle(scope, context, tool, arguments, record).await
     }
 
     async fn list(&self, scope: &MemoryScope, filter: &MemoryFilter) -> Result<Page<Memory>, MemoryError> {

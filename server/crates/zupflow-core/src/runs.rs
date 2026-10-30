@@ -122,6 +122,37 @@ impl RunTrigger {
     }
 }
 
+/// What a run does with its agent's memory, as it was started: the
+/// contract's `RunMemory`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryMode {
+    /// The agent's memory as it's set: its own type, the organization's
+    /// default, or none.
+    #[default]
+    Agent,
+    /// No recall, and every call to a memory tool refused; the tools stay
+    /// offered, so the run's prompt is the one it would have been.
+    Off,
+}
+
+impl MemoryMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "agent" => Some(Self::Agent),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
 /// The contract's `RunChannel`: where a channel run came from.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RunChannel {
@@ -218,6 +249,8 @@ pub struct Run {
     pub trigger: RunTrigger,
     /// Where a channel run came from; `None` for any other.
     pub channel: Option<RunChannel>,
+    /// What it does with its agent's memory, as it was started.
+    pub memory: MemoryMode,
     pub status: RunStatus,
     pub input: String,
     pub output: Option<String>,
@@ -244,6 +277,9 @@ pub struct NewRun {
     pub session_id: SessionId,
     pub trigger: RunTrigger,
     pub input: String,
+    /// What it does with its agent's memory: a channel run's is
+    /// [`MemoryMode::Agent`].
+    pub memory: MemoryMode,
     /// The model resolved when the run was admitted (the agent's override,
     /// or its environment's default) and the agent's instructions: a later
     /// change to either doesn't change a run under way.

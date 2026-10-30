@@ -523,6 +523,7 @@ impl FakeProviders {
             instructions: &instructions,
             messages: &messages,
             tools: &tools,
+            memory: None,
             cache_key: None,
         };
         let completion = match self.model.complete(&ProviderAccess { kind, key: &key }, &turn).await {
@@ -622,9 +623,22 @@ fn read_chat(kind: ProviderKind, body: &Value) -> Result<(String, Vec<Message>, 
                 if !open.is_empty() {
                     return Err("messages: tool calls must be answered by tool messages");
                 }
-                messages.push(Message::User {
-                    text: text_content(content).ok_or("user: content")?,
-                });
+                match content {
+                    // Each `text` part is what the user said, apart, as a
+                    // Messages text block is.
+                    Some(Value::Array(parts)) if !parts.is_empty() => {
+                        for part in parts {
+                            if part.get("type").and_then(Value::as_str) != Some("text") {
+                                return Err("user: content");
+                            }
+                            let text = part.get("text").and_then(Value::as_str).ok_or("user: content")?;
+                            messages.push(Message::User { text: text.to_owned() });
+                        }
+                    }
+                    _ => messages.push(Message::User {
+                        text: text_content(content).ok_or("user: content")?,
+                    }),
+                }
             }
             Some("assistant") => {
                 if !open.is_empty() {

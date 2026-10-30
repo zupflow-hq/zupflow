@@ -6,7 +6,9 @@
 //! tool, an edit noted in the next turn, and the agent, its connection and
 //! its team renamed mid-session.
 //! The one break is the trim, when the history would go over its budget:
-//! once, there, and the runs after it continue again.
+//! once, there, and the runs after it continue again. A session has no
+//! memory yet: an agent that remembers is offered no memory tools in it,
+//! and recalls nothing.
 
 #![allow(clippy::unwrap_used)]
 
@@ -353,5 +355,29 @@ async fn continues_a_session_through_a_channel_tool_an_edit_and_a_rename() {
             !offered.contains("Release desk") && !offered.contains("North Renamed"),
             "{name}: {offered}"
         );
+    }
+}
+
+#[tokio::test]
+async fn offers_a_session_no_memory_tools_and_recalls_nothing() {
+    for (kind, model) in PATHS {
+        let (world, _) = on(kind, model).await;
+        let name = format!("{kind:?} {model}");
+        world.setup.with_memory("allow").await;
+        world.setup.save_note("Prefers answers in Portuguese.").await;
+        let before = turns(&world).len();
+        world.say(ANA, &format!("{} hello", world.main.mention()), None).await;
+        world.work().await;
+        let runs = world.runs(&world.main).await;
+        assert_eq!(runs[0]["status"], "completed", "{name}: {}", runs[0]);
+        assert_eq!(runs[0]["memory"], "agent", "{name}");
+        let sent = turns(&world).split_off(before);
+        assert!(!sent.is_empty(), "{name}");
+        for turn in &sent {
+            let raw = String::from_utf8_lossy(&turn.raw);
+            for absent in ["save_memory", "search_memory", "<memory>", "Portuguese"] {
+                assert!(!raw.contains(absent), "{name}: {absent} in {raw}");
+            }
+        }
     }
 }

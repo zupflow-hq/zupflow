@@ -35,18 +35,20 @@ use zupflow_core::channels::handling::DispatchReason;
 use zupflow_core::channels::tools;
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{
-    AgentId, ApiKeyId, ChannelConnectionId, ChannelConversationId, ChannelMessageId, InstallationId, ModelConnectionId,
-    ModelId, OrganizationId, RunEventId, RunId, SessionId, ToolCallId, WorkspaceId,
+    AgentId, ApiKeyId, ChannelConnectionId, ChannelConversationId, ChannelMessageId, InstallationId, MemoryTypeId,
+    ModelConnectionId, ModelId, OrganizationId, RunEventId, RunId, SessionId, ToolCallId, WorkspaceId,
 };
 use zupflow_core::models::MAX_RETRY_AFTER;
 use zupflow_core::runs::digest::Sha256Digest;
 use zupflow_core::runs::names::{Offer, ToolHost};
 use zupflow_core::runs::reducer::{
-    CONNECTION_REMOVED, CONNECTION_UNUSABLE, INSTALLATION_DISCONNECTED, INSTALLATION_REMOVED, target_digest,
+    CONNECTION_REMOVED, CONNECTION_UNUSABLE, INSTALLATION_DISCONNECTED, INSTALLATION_REMOVED, MEMORY_TYPE_REMOVED,
+    target_digest,
 };
 use zupflow_core::runs::state::{
     BoundTarget, CallAttempt, CallDecision, CallRecord, CallVerdict, ClaimantId, CommittedTurn, Continuation,
-    EXECUTION_VERSION, InvocationId, ModelAttempt, ModelAttemptState, RunControl, Snapshot, Usage, supports,
+    EXECUTION_VERSION, FrozenMemory, InvocationId, ModelAttempt, ModelAttemptState, RunControl, Snapshot, Usage,
+    supports,
 };
 use zupflow_core::runs::store::{Applied, Durability, MODEL_RETRY_STEP, Receipt, RunStore, StoreError, run_job};
 use zupflow_core::runs::transition::{
@@ -55,8 +57,9 @@ use zupflow_core::runs::transition::{
     SendLease, SendOutcome, SettleUnknown, TransitionId, TransitionRequest, Yield, YieldReason,
 };
 use zupflow_core::runs::{
-    AgentActivity, ApprovalDecision, CallOutcome, CallState, Failure, OrganizationRun, OrganizationRunFilter, Page,
-    Run, RunChannel, RunEvent, RunEventType, RunFilter, RunStatus, RunTrigger, RunUsage, TakenIn, UsageDay,
+    AgentActivity, ApprovalDecision, CallOutcome, CallState, Failure, MemoryMode, OrganizationRun,
+    OrganizationRunFilter, Page, Run, RunChannel, RunEvent, RunEventType, RunFilter, RunStatus, RunTrigger, RunUsage,
+    TakenIn, UsageDay,
 };
 use zupflow_core::scope::Scope;
 use zupflow_core::time::{Clock, SystemClock, Timestamp};
@@ -195,6 +198,7 @@ struct RunRow {
     model_connection_id: Option<Uuid>,
     instructions: String,
     input: String,
+    memory: MemoryMode,
     usage: RunUsage,
     silent_reason: Option<String>,
 }
@@ -207,7 +211,7 @@ async fn run_row(
 ) -> Result<Option<RunRow>, StoreError> {
     let row = sqlx::query(
         "SELECT status, continuation, revision, owner_epoch, owner_claimant, lease_until, cancel_requested_at, \
-         execution_version, job_id, agent_id, model, model_id, model_connection_id, instructions, input, \
+         execution_version, job_id, agent_id, model, model_id, model_connection_id, instructions, input, memory, \
          input_tokens, output_tokens, cache_read_input_tokens, cache_write_input_tokens, tool_calls, silent_reason \
          FROM runs WHERE organization_id = ? AND workspace_id = ? AND id = ?",
     )
@@ -219,6 +223,7 @@ async fn run_row(
     .map_err(failed("run_row"))?;
     let Some(row) = row else { return Ok(None) };
     let status: String = row.try_get("status").map_err(unreadable)?;
+    let memory: String = row.try_get("memory").map_err(unreadable)?;
     Ok(Some(RunRow {
         status: RunStatus::parse(&status).ok_or_else(|| corrupt("a run status"))?,
         continuation: row.try_get("continuation").map_err(unreadable)?,
@@ -235,6 +240,7 @@ async fn run_row(
         model_connection_id: row.try_get("model_connection_id").map_err(unreadable)?,
         instructions: row.try_get("instructions").map_err(unreadable)?,
         input: row.try_get("input").map_err(unreadable)?,
+        memory: MemoryMode::parse(&memory).ok_or_else(|| corrupt("a run's memory"))?,
         usage: run_usage(&row)?,
         silent_reason: row.try_get("silent_reason").map_err(unreadable)?,
     }))
@@ -254,16 +260,24 @@ fn call_from(row: &SqliteRow) -> Result<CallRecord, StoreError> {
     let text = |column: &str| row.try_get::<Option<String>, _>(column).map_err(unreadable);
     let installation: Option<Uuid> = row.try_get("installation_id").map_err(unreadable)?;
     let channel: Option<Uuid> = row.try_get("channel_connection_id").map_err(unreadable)?;
+    let memory: Option<Uuid> = row.try_get("memory_type_id").map_err(unreadable)?;
     let definition = digest(row, "definition_sha256")?;
-    let host = match (installation, channel) {
-        (Some(installation), None) => Some((Some(InstallationId::from_uuid(installation)), None)),
-        (None, Some(channel)) => Some((None, Some(ChannelConnectionId::from_uuid(channel)))),
-        (None, None) => None,
-        (Some(_), Some(_)) => return Err(corrupt("a call bound to an installation and a channel")),
+    let host = match (installation, channel, memory) {
+        (Some(installation), None, None) => Some((Some(InstallationId::from_uuid(installation)), None, None)),
+        (None, Some(channel), None) => Some((None, Some(ChannelConnectionId::from_uuid(channel)), None)),
+        (None, None, Some(memory)) => Some((None, None, Some(MemoryTypeId::from_uuid(memory)))),
+        (None, None, None) => None,
+        _ => return Err(corrupt("a call bound to more than one host")),
+    };
+    // A memory tool's call names no short ID.
+    let short_id = match (&host, text("installation_short_id")?) {
+        (Some((None, None, Some(_))), None) => Some(String::new()),
+        (Some((None, None, Some(_))), Some(_)) => return Err(corrupt("a memory tool's call with a short ID")),
+        (_, short_id) => short_id,
     };
     let target = match (
         host,
-        text("installation_short_id")?,
+        short_id,
         text("installation_label")?,
         text("app_key")?,
         text("app_name")?,
@@ -271,7 +285,7 @@ fn call_from(row: &SqliteRow) -> Result<CallRecord, StoreError> {
         definition,
     ) {
         (
-            Some((installation_id, channel_connection_id)),
+            Some((installation_id, channel_connection_id, memory_type_id)),
             Some(installation_short_id),
             Some(installation_label),
             Some(app_key),
@@ -281,6 +295,7 @@ fn call_from(row: &SqliteRow) -> Result<CallRecord, StoreError> {
         ) => Some(BoundTarget {
             installation_id,
             channel_connection_id,
+            memory_type_id,
             installation_short_id,
             installation_label,
             app_key,
@@ -386,8 +401,9 @@ pub(crate) async fn recorded_calls(
     run_id: RunId,
 ) -> Result<Vec<CallRecord>, StoreError> {
     sqlx::query(
-        "SELECT id, turn, position, model_call_id, name, installation_id, channel_connection_id, installation_short_id, \
-         installation_label, app_key, app_name, tool, definition_sha256, arguments, state, verdict, policy, mode, rule, reason, \
+        "SELECT id, turn, position, model_call_id, name, installation_id, channel_connection_id, memory_type_id, \
+         installation_short_id, installation_label, app_key, app_name, tool, definition_sha256, arguments, state, \
+         verdict, policy, mode, rule, reason, \
          call_digest, approval, approval_api_key_id, outcome, outcome_is_error, failure_code, failure_message \
          FROM run_tool_calls WHERE organization_id = ? AND workspace_id = ? AND run_id = ? ORDER BY turn, position",
     )
@@ -455,7 +471,7 @@ async fn load(
     }
 
     let model_attempts = sqlx::query(
-        "SELECT turn, attempt, state, request_digest, offer, timed_out FROM run_model_attempts \
+        "SELECT turn, attempt, state, request_digest, offer, memory_type_id, recall, timed_out FROM run_model_attempts \
          WHERE organization_id = ? AND workspace_id = ? AND run_id = ? ORDER BY turn, attempt",
     )
     .bind(scope.0)
@@ -468,12 +484,23 @@ async fn load(
     .map(|row| {
         let state: String = row.try_get("state").map_err(unreadable)?;
         let offer: String = row.try_get("offer").map_err(unreadable)?;
+        let memory_type_id: Option<Uuid> = row.try_get("memory_type_id").map_err(unreadable)?;
+        let recall: Option<String> = row.try_get("recall").map_err(unreadable)?;
+        let memory = match (memory_type_id, recall) {
+            (Some(memory_type_id), recall) => Some(FrozenMemory {
+                memory_type_id: MemoryTypeId::from_uuid(memory_type_id),
+                recall,
+            }),
+            (None, None) => None,
+            (None, Some(_)) => return Err(corrupt("a recall without its memory type")),
+        };
         Ok(ModelAttempt {
             turn: small(row, "turn")?,
             attempt: small(row, "attempt")?,
             state: parse_model_attempt_state(&state).ok_or_else(|| corrupt("a model attempt state"))?,
             request_digest: digest(row, "request_digest")?.ok_or_else(|| corrupt("a request digest"))?,
             offer: serde_json::from_str::<Offer>(&offer).map_err(unreadable)?,
+            memory,
             timed_out: row.try_get::<i64, _>("timed_out").map_err(unreadable)? != 0,
         })
     })
@@ -501,6 +528,7 @@ async fn load(
             connection_id: row.model_connection_id.map(ModelConnectionId::from_uuid),
             instructions: row.instructions,
             input: row.input,
+            memory: row.memory,
             turns,
             calls,
             model_attempts,
@@ -645,12 +673,13 @@ fn installation_went(failure: &Failure) -> bool {
     failure.code == INSTALLATION_REMOVED || failure.code == INSTALLATION_DISCONNECTED
 }
 
-/// Whether a refusal says the call's host went away: its installation, or
-/// its channel connection.
+/// Whether a refusal says the call's host went away: its installation, its
+/// channel connection, or its run's memory type.
 fn went(target: &BoundTarget, failure: &Failure) -> bool {
     match target.host() {
         ToolHost::Channel(_) => failure.code == CONNECTION_REMOVED || failure.code == CONNECTION_UNUSABLE,
         ToolHost::Installation(_) => installation_went(failure),
+        ToolHost::Memory(_) => failure.code == MEMORY_TYPE_REMOVED,
         ToolHost::Run => false,
     }
 }
@@ -699,18 +728,23 @@ struct Writer<'a> {
     events: Vec<(RunEventType, Value)>,
 }
 
-/// The tool a call's events name: an installation's, or a channel
-/// connection's, as the contract's `ToolCallRef` has it.
+/// The tool a call's events name: an installation's, a channel
+/// connection's or a memory type's, as the contract's `ToolCallRef` has it.
 fn reference(call_id: ToolCallId, target: &BoundTarget) -> Map<String, Value> {
     let mut data = Map::new();
     data.insert("call_id".to_owned(), json!(call_id));
-    match (target.installation_id, target.channel_connection_id) {
-        (_, Some(connection_id)) => {
+    match (target.installation_id, target.channel_connection_id, target.memory_type_id) {
+        (_, Some(connection_id), _) => {
             data.insert("channel_connection_id".to_owned(), json!(connection_id));
             data.insert("connection_label".to_owned(), json!(target.installation_label));
             data.insert("provider".to_owned(), json!(target.app_key));
         }
-        (installation_id, None) => {
+        (None, None, Some(memory_type_id)) => {
+            data.insert("memory_type_id".to_owned(), json!(memory_type_id));
+            data.insert("memory_type_name".to_owned(), json!(target.installation_label));
+            data.insert("kind".to_owned(), json!(target.app_key));
+        }
+        (installation_id, None, _) => {
             data.insert("installation_id".to_owned(), json!(installation_id));
             data.insert("installation_label".to_owned(), json!(target.installation_label));
             data.insert("app_name".to_owned(), json!(target.app_name));
@@ -776,10 +810,10 @@ impl Writer<'_> {
         let (verdict, reason) = decision.map(decision_columns).unzip();
         sqlx::query(
             "INSERT INTO run_tool_calls (id, organization_id, workspace_id, run_id, turn, position, model_call_id, \
-             name, installation_id, channel_connection_id, installation_short_id, installation_label, app_key, \
-             app_name, tool, definition_sha256, arguments, state, verdict, policy, mode, rule, reason, call_digest, \
-             outcome, outcome_is_error, failure_code, failure_message, finished_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             name, installation_id, channel_connection_id, memory_type_id, installation_short_id, installation_label, \
+             app_key, app_name, tool, definition_sha256, arguments, state, verdict, policy, mode, rule, reason, \
+             call_digest, outcome, outcome_is_error, failure_code, failure_message, finished_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(call.id.uuid())
         .bind(org)
@@ -795,7 +829,13 @@ impl Writer<'_> {
                 .and_then(|target| target.channel_connection_id)
                 .map(|id| id.uuid()),
         )
-        .bind(target.map(|target| target.installation_short_id.as_str()))
+        .bind(target.and_then(|target| target.memory_type_id).map(|id| id.uuid()))
+        // A memory tool's call names no short ID.
+        .bind(
+            target
+                .filter(|target| target.memory_type_id.is_none())
+                .map(|target| target.installation_short_id.as_str()),
+        )
         .bind(target.map(|target| target.installation_label.as_str()))
         .bind(target.map(|target| target.app_key.as_str()))
         .bind(target.map(|target| target.app_name.as_str()))
@@ -1359,11 +1399,30 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
             abandons,
             request_digest,
             offer,
+            memory,
             key_version,
             steer,
         }) => {
             if key_version.is_some() != snapshot.model_id.is_some() {
                 return Err(refused("a model attempt without the key version of the run's model"));
+            }
+            // A run's memory is frozen with its first attempt, and a run
+            // started without memory recalls nothing.
+            if snapshot
+                .model_attempts
+                .last()
+                .is_some_and(|frozen| frozen.memory.as_ref() != memory.as_ref())
+            {
+                return Err(refused("a model attempt with memory other than the run's"));
+            }
+            if snapshot.memory == MemoryMode::Off && memory.as_ref().is_some_and(|memory| memory.recall.is_some()) {
+                return Err(refused("a recall for a run started without memory"));
+            }
+            if memory
+                .as_ref()
+                .is_some_and(|memory| memory.recall.as_deref() == Some(""))
+            {
+                return Err(refused("an empty recall"));
             }
             if steer.is_some() && (snapshot.session.is_none() || *attempt != 1 || abandons.is_some()) {
                 return Err(refused("thread messages joining a run outside a turn's first attempt"));
@@ -1401,8 +1460,8 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
             let offer = serde_json::to_string(offer).map_err(|_| refused("an offer that isn't JSON"))?;
             sqlx::query(
                 "INSERT INTO run_model_attempts (id, organization_id, workspace_id, run_id, turn, attempt, state, \
-                 request_digest, offer, key_version, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?)",
+                 request_digest, offer, memory_type_id, recall, key_version, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(Uuid::now_v7())
             .bind(org)
@@ -1412,6 +1471,8 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
             .bind(i64::from(*attempt))
             .bind(request_digest.to_string())
             .bind(offer)
+            .bind(memory.as_ref().map(|memory| memory.memory_type_id.uuid()))
+            .bind(memory.as_ref().and_then(|memory| memory.recall.as_deref()))
             .bind(key_version.map(i64::from))
             .bind(now.millis())
             .bind(now.millis())
@@ -2188,7 +2249,7 @@ fn run_usage(row: &SqliteRow) -> Result<RunUsage, StoreError> {
 macro_rules! run_columns {
     () => {
         "r.id, r.organization_id, r.workspace_id, r.agent_id, a.name AS agent_name, r.session_id, r.trigger, \
-         r.status, r.input, r.output, r.input_tokens, r.output_tokens, r.cache_read_input_tokens, \
+         r.status, r.input, r.memory, r.output, r.input_tokens, r.output_tokens, r.cache_read_input_tokens, \
          r.cache_write_input_tokens, r.tool_calls, r.error_code, r.error_message, \
          r.created_at, r.started_at, r.finished_at, r.channel_connection_id, r.channel_conversation_id, \
          r.channel_thread_key, r.channel_reason, r.silent_reason, \
@@ -2239,6 +2300,7 @@ fn run_from(row: &SqliteRow) -> Result<Run, StoreError> {
     let status: String = row.try_get("status").map_err(unreadable)?;
     let error_code: Option<String> = row.try_get("error_code").map_err(unreadable)?;
     let error_message: Option<String> = row.try_get("error_message").map_err(unreadable)?;
+    let memory: String = row.try_get("memory").map_err(unreadable)?;
     Ok(Run {
         id: RunId::from_uuid(row.try_get("id").map_err(unreadable)?),
         organization_id: OrganizationId::from_uuid(row.try_get("organization_id").map_err(unreadable)?),
@@ -2248,6 +2310,7 @@ fn run_from(row: &SqliteRow) -> Result<Run, StoreError> {
         session_id: SessionId::from_uuid(row.try_get("session_id").map_err(unreadable)?),
         trigger: RunTrigger::parse(&trigger).ok_or_else(|| corrupt("a trigger"))?,
         channel: run_channel(row)?,
+        memory: MemoryMode::parse(&memory).ok_or_else(|| corrupt("a run's memory"))?,
         status: RunStatus::parse(&status).ok_or_else(|| corrupt("a run status"))?,
         input: row.try_get("input").map_err(unreadable)?,
         output: row.try_get("output").map_err(unreadable)?,
@@ -2363,11 +2426,11 @@ async fn admit(
         .map_err(|_| StoreError::Refused("an offer that isn't JSON"))?;
     sqlx::query(
         "INSERT INTO runs (id, organization_id, workspace_id, agent_id, session_id, trigger, job_id, status, input, \
-         model, model_id, model_connection_id, instructions, input_tokens, output_tokens, tool_calls, created_at, \
-         execution_version, revision, continuation, channel_session_id, channel_connection_id, \
+         memory, model, model_id, model_connection_id, instructions, input_tokens, output_tokens, tool_calls, \
+         created_at, execution_version, revision, continuation, channel_session_id, channel_connection_id, \
          channel_conversation_id, channel_thread_key, channel_reason, origin_message_id, session_sequence, \
          history_start_run_id, offer) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(run_id.uuid())
     .bind(organization_id.uuid())
@@ -2377,6 +2440,7 @@ async fn admit(
     .bind(admit.trigger.as_str())
     .bind(job_id)
     .bind(&admit.input)
+    .bind(admit.memory.as_str())
     .bind(&admit.model)
     .bind(admit.model_id.uuid())
     .bind(admit.connection_id.uuid())
@@ -3068,6 +3132,7 @@ mod tests {
                 session_id: zupflow_core::ids::SessionId::generate(),
                 trigger: RunTrigger::Console,
                 input: "hi".to_owned(),
+                memory: MemoryMode::Agent,
                 model: zupflow_core::model_store::RunModel {
                     model_id: ModelId::generate(),
                     connection_id: ModelConnectionId::generate(),

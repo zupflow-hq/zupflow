@@ -26,7 +26,7 @@ use zupflow_core::environment::Environment;
 use zupflow_core::ids::{OrganizationId, RunId, ToolCallId, WorkspaceId};
 use zupflow_core::metrics::{Measurement, ToolCallOutcome};
 use zupflow_core::runs::RunEventType;
-use zupflow_core::runs::reducer::{ChannelSendRequest, SendRequest};
+use zupflow_core::runs::reducer::{ChannelSendRequest, MemorySendRequest, SendRequest};
 use zupflow_core::runs::store::Receipt;
 use zupflow_core::runs::transition::{
     Authorization, Operation, RunEnding, SendOutcome, TransitionRequest, YieldReason,
@@ -143,6 +143,54 @@ pub async fn channel_sent(
                 call_id = %send.call_id,
                 attempt = send.attempt,
                 channel_connection_id = %send.connection_id,
+                tool = %send.tool,
+                outcome = kind.as_str(),
+                latency_ms,
+            )
+        };
+    }
+    if kind.is_failure() {
+        line!(warn);
+    } else {
+        line!(info);
+    }
+    state
+        .metrics
+        .record(
+            organization_id,
+            workspace_id,
+            environment,
+            Measurement::ToolCall { outcome: kind, latency },
+        )
+        .await;
+}
+
+/// After a memory call came back to its sender: as [`sent`], naming the
+/// run's memory type and the tool, never what the call wrote or answered.
+#[allow(clippy::too_many_arguments)]
+pub async fn memory_sent(
+    state: &AppState,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    environment: Environment,
+    run_id: RunId,
+    send: &MemorySendRequest,
+    outcome: &SendOutcome,
+    latency: Duration,
+) {
+    let kind = outcome_kind(outcome);
+    let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
+    macro_rules! line {
+        ($macro:ident) => {
+            tracing::$macro!(
+                event = "runs.call_answered",
+                %organization_id,
+                %workspace_id,
+                %environment,
+                %run_id,
+                call_id = %send.call_id,
+                attempt = send.attempt,
+                memory_type_id = %send.memory_type_id,
                 tool = %send.tool,
                 outcome = kind.as_str(),
                 latency_ms,

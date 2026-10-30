@@ -24,8 +24,12 @@ use crate::ids::{
 };
 use crate::runs::digest::{Sha256Digest, digest_json};
 use crate::runs::names::Offer;
-use crate::runs::state::{BoundTarget, CallDecision, ClaimantId, Continuation, InvocationId, RequestId, Usage, ser};
-use crate::runs::{ApprovalDecision, CallOutcome, CallState, ChannelAdmission, Failure, RunStatus, RunTrigger};
+use crate::runs::state::{
+    BoundTarget, CallDecision, ClaimantId, Continuation, FrozenMemory, InvocationId, RequestId, Usage, ser,
+};
+use crate::runs::{
+    ApprovalDecision, CallOutcome, CallState, ChannelAdmission, Failure, MemoryMode, RunStatus, RunTrigger,
+};
 use crate::time::Timestamp;
 
 /// The domain of transition IDs.
@@ -163,6 +167,8 @@ pub struct Admit {
     pub session_id: SessionId,
     pub trigger: RunTrigger,
     pub input: String,
+    /// What the run does with its agent's memory.
+    pub memory: MemoryMode,
     /// The provider's model ID the run calls.
     pub model: String,
     /// The organization's model and the connection it's reached through.
@@ -199,6 +205,10 @@ pub struct PrepareModel {
     pub abandons: Option<u32>,
     pub request_digest: Sha256Digest,
     pub offer: Offer,
+    /// The run's memory, frozen with the offer: resolved for its first
+    /// attempt, the same for every one after; `None` without memory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<FrozenMemory>,
     /// The version of the connection's key the attempt uses; `None` for a
     /// run admitted before organizations had models.
     #[serde(skip_serializing_if = "Option::is_none")]

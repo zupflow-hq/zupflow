@@ -2058,6 +2058,15 @@ export type RunChannel = z.infer<typeof RunChannel>;
 export const RunTrigger = z.enum(["api", "console", "channel"]);
 export type RunTrigger = z.infer<typeof RunTrigger>;
 
+/**
+ * What a run does with its agent's memory. `agent`: the agent's memory as
+ * it's set (its own type, the organization's default, or none). `off`: the
+ * run recalls nothing, and the agent's memory tools stay offered, so its
+ * prompt is the same, but every call to one is refused.
+ */
+export const RunMemory = z.enum(["agent", "off"]);
+export type RunMemory = z.infer<typeof RunMemory>;
+
 const runFields = {
   id: idSchema("run"),
   workspace_id: idSchema("workspace"),
@@ -2067,6 +2076,7 @@ const runFields = {
   trigger: RunTrigger,
   /** Where a `channel` run came from; null for any other. */
   channel: RunChannel.nullable(),
+  memory: RunMemory.describe("What the run was started with. A `channel` run's is `agent`."),
   status: RunStatus,
   input: z.string(),
   output: z.string().nullable(),
@@ -2083,7 +2093,12 @@ export type Run = z.infer<typeof Run>;
 export const OrganizationRun = named("OrganizationRun", z.object({ ...runFields, workspace: WorkspaceRef }));
 export type OrganizationRun = z.infer<typeof OrganizationRun>;
 
-export const CreateRunInput = z.object({ input: z.string() });
+export const CreateRunInput = z.object({
+  input: z.string(),
+  memory: RunMemory.optional().describe(
+    "`agent` (the default): the agent's memory as it's set. `off`: the run recalls nothing, and every call to a memory tool is refused. Any other value is `400 validation_failed` (`fields.memory`).",
+  ),
+});
 export type CreateRunInput = z.infer<typeof CreateRunInput>;
 
 export const RunListQuery = z.object({
@@ -2131,11 +2146,24 @@ export const ChannelToolCallRef = z.object({
   tool: z.string(),
 });
 export type ChannelToolCallRef = z.infer<typeof ChannelToolCallRef>;
-/** The tool a call targets: an installation's, or a channel connection's, never both. */
-export const ToolCallRef = z.union([InstallationToolCallRef, ChannelToolCallRef]);
+/**
+ * A call to one of the agent's memory tools, in the memory type the run
+ * started with: `kind` is the type's kind (`notes`), and `memory_type_name`
+ * the type's name when the run started.
+ */
+export const MemoryToolCallRef = z.object({
+  call_id: idSchema("tool_call"),
+  memory_type_id: idSchema("memory_type"),
+  memory_type_name: z.string(),
+  kind: z.string(),
+  tool: z.string(),
+});
+export type MemoryToolCallRef = z.infer<typeof MemoryToolCallRef>;
+/** The tool a call targets: an installation's, a channel connection's, or the agent's memory's; only one. */
+export const ToolCallRef = z.union([InstallationToolCallRef, ChannelToolCallRef, MemoryToolCallRef]);
 export type ToolCallRef = z.infer<typeof ToolCallRef>;
 const toolCall = <S extends z.ZodRawShape>(shape: S) =>
-  z.union([InstallationToolCallRef.extend(shape), ChannelToolCallRef.extend(shape)]);
+  z.union([InstallationToolCallRef.extend(shape), ChannelToolCallRef.extend(shape), MemoryToolCallRef.extend(shape)]);
 
 /** What became of channel messages a run took in: they started it, joined it mid-run, or were collected after it. */
 export const ChannelMessagesOutcome = z.enum(["started", "steered", "collected"]);

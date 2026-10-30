@@ -75,6 +75,7 @@ async fn caches(provider: &HttpModelProvider, kind: ProviderKind, key: &Provider
             instructions: &instructions,
             messages: &messages,
             tools: &tools,
+            memory: None,
             cache_key: Some(cache_key),
         };
         let answer = provider.complete(&ProviderAccess { kind, key }, &turn).await.unwrap();

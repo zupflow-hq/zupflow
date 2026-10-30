@@ -45,7 +45,9 @@ use serde_json::{Value, json};
 use zupflow_core::agents::Agent;
 use zupflow_core::audit::{AuditAction, AuditEntry, AuditObject, AuditPlace, AuditTarget};
 use zupflow_core::error::ApiError;
-use zupflow_core::ids::{AgentId, ChannelConversationId, MemoryId, MemoryTypeId, WebhookEventId, WorkspaceId};
+use zupflow_core::ids::{
+    AgentId, ChannelConversationId, MemoryId, MemoryTypeId, OrganizationId, WebhookEventId, WorkspaceId,
+};
 use zupflow_core::installations::ShortId;
 use zupflow_core::memory::type_store::{self, MemoryType};
 use zupflow_core::memory::{
@@ -55,6 +57,7 @@ use zupflow_core::memory::{
 use zupflow_core::organizations::MemberRole;
 use zupflow_core::time::Timestamp;
 use zupflow_core::webhooks::{NewWebhookEvent, WebhookEventType, event_body, memory_event_data};
+use zupflow_core::workspaces::Workspace;
 
 use crate::auth::{Access, Actor, AppState, Caller, WorkspaceAccess};
 use crate::channels::console_may_act;
@@ -408,10 +411,20 @@ fn workspace_audit(access: &WorkspaceAccess, action: AuditAction, target: AuditT
 /// A change's webhook event, for the endpoints of the workspace's
 /// environment that subscribe to it: it names the memory, never its text.
 fn memory_event(access: &WorkspaceAccess, change: &MemoryChange) -> NewWebhookEvent {
+    memory_event_in(access.access.organization_id, &access.workspace, change)
+}
+
+/// A change's webhook event in `workspace`, of `organization_id`, whoever
+/// made it: a person, an API key or a run's call. It names the memory and
+/// its origin, never its text.
+pub(crate) fn memory_event_in(
+    organization_id: OrganizationId,
+    workspace: &Workspace,
+    change: &MemoryChange,
+) -> NewWebhookEvent {
     let kind = WebhookEventType::of_memory_change(change);
     let id = WebhookEventId::generate();
     let now = Timestamp::now();
-    let workspace = &access.workspace;
     NewWebhookEvent {
         id,
         environment: workspace.environment,
@@ -422,7 +435,7 @@ fn memory_event(access: &WorkspaceAccess, change: &MemoryChange) -> NewWebhookEv
             kind.as_str(),
             now,
             workspace.environment,
-            access.access.organization_id,
+            organization_id,
             Some((workspace.id, workspace.external_id.as_deref())),
             memory_event_data(change.memory()),
         ),

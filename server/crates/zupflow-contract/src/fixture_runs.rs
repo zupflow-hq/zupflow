@@ -16,7 +16,7 @@ use zupflow_core::runs::reducer::{
 use zupflow_core::runs::state::{CallDecision, CallVerdict, ClaimantId, InvocationId, Snapshot};
 use zupflow_core::runs::store::{Applied, RunStore};
 use zupflow_core::runs::transition::SendOutcome;
-use zupflow_core::runs::{NewRun, RunTrigger};
+use zupflow_core::runs::{MemoryMode, NewRun, RunTrigger};
 use zupflow_core::time::Timestamp;
 
 /// The installation and tool a fixture run calls.
@@ -149,6 +149,7 @@ pub async fn seed(
             model,
             instructions: "Be brief.".to_owned(),
             channel: None,
+            memory: MemoryMode::Agent,
         },
     );
     runs.apply(organization_id, workspace_id, &admission)

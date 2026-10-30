@@ -9,16 +9,21 @@
 //!   refuses); each call's outcome a `tool_result` block naming its
 //!   `tool_use_id`, with `is_error` for an error outcome, in the `user`
 //!   message after the calls, before any text.
+//! - What the run recalled from its memory ([`Turn::memory`]) is the first
+//!   `text` block of the first user message, before the input, and never in
+//!   the system: a changed memory leaves the tools and instructions before
+//!   it cached. No recall, no block.
 //! - Tools are `{ name, description, input_schema }`.
 //! - Cache breakpoints (`cache_control`, the default five-minute lifetime),
-//!   three at most of the four Messages takes: on the system block (on the
+//!   never more than the four Messages takes: on the system block (on the
 //!   last tool when there are no instructions), so every run of an agent
-//!   shares the tools and instructions; on the last block of the last
-//!   message, so the next turn reads this one from the cache; and on the
-//!   last block of the message before the latest answer, where the turn
-//!   before put its last one, so a turn that added more than the twenty
-//!   blocks Messages looks back over still finds it. The system is then a
-//!   list of one `text` block.
+//!   shares the tools and instructions; on the recall, so every run with
+//!   the same memory shares it too; on the last block of the last message,
+//!   so the next turn reads this one from the cache; and on the last block
+//!   of the message before the latest answer, where the turn before put its
+//!   last one, so a turn that added more than the twenty blocks Messages
+//!   looks back over still finds it. The system is then a list of one
+//!   `text` block.
 //! - The answer is its `tool_use` blocks, else its text; a `thinking` block
 //!   is not kept, so later turns go without it, as Messages accepts when
 //!   every one is left out. `stop_reason` `max_tokens` (a cut-off call or
@@ -92,6 +97,14 @@ pub fn request(turn: &Turn<'_>) -> Value {
             Some((last, blocks)) if *last == role => blocks.extend(content),
             _ => messages.push((role, content)),
         }
+    }
+    // The recall leads the first user message, the conversation's first.
+    if let Some(memory) = turn.memory.filter(|memory| !memory.is_empty())
+        && let Some((_, first)) = messages.first_mut()
+    {
+        let mut recall = json!({ "type": "text", "text": memory });
+        mark(&mut recall);
+        first.insert(0, recall);
     }
     if let Some(answered) = messages.iter().rposition(|(role, _)| *role == "assistant")
         && let Some(before) = answered.checked_sub(1)

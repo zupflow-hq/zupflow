@@ -174,6 +174,7 @@ async fn keeps_every_notes_text_out_of_the_logs() {
             &context(&workspace, at(1)),
             notes::SAVE_MEMORY,
             &arguments(json!({ "text": format!("The vault code is {SECRET}.") })),
+            &record_nothing,
         )
         .await
         .unwrap();
@@ -181,11 +182,25 @@ async fn keeps_every_notes_text_out_of_the_logs() {
         panic!("saved: {saved:?}");
     };
     let short = note.short_id.as_str();
+    // A save whose answer was lost is found by its origin, and logs nothing of it.
+    let settled = kind
+        .settle(
+            &scope,
+            &context(&workspace, at(1)),
+            notes::SAVE_MEMORY,
+            &arguments(json!({ "text": format!("The vault code is {SECRET}.") })),
+            &record_nothing,
+        )
+        .await
+        .unwrap()
+        .expect("found");
+    assert!(!settled.is_error && settled.change.is_none(), "{settled:?}");
     kind.call(
         &scope,
         &context(&conversation, at(2)),
         notes::SAVE_MEMORY,
         &arguments(json!({ "text": format!("Here only: {SECRET}.") })),
+        &record_nothing,
     )
     .await
     .unwrap();
@@ -195,6 +210,7 @@ async fn keeps_every_notes_text_out_of_the_logs() {
             &context(&conversation, at(3)),
             notes::SEARCH_MEMORY,
             &arguments(json!({ "query": format!("\"{SECRET}\"*") })),
+            &record_nothing,
         )
         .await
         .unwrap();
@@ -212,6 +228,7 @@ async fn keeps_every_notes_text_out_of_the_logs() {
         &context(&workspace, at(4)),
         notes::UPDATE_MEMORY,
         &arguments(json!({ "memory": short, "text": format!("The vault code is {SECRET}, still.") })),
+        &record_nothing,
     )
     .await
     .unwrap();
@@ -230,6 +247,7 @@ async fn keeps_every_notes_text_out_of_the_logs() {
         &context(&workspace, at(6)),
         notes::FORGET_MEMORY,
         &arguments(json!({ "memory": short })),
+        &record_nothing,
     )
     .await
     .unwrap();

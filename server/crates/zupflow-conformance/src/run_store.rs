@@ -31,6 +31,13 @@
 //!   approval on one is refused, parked on or not yet, only with the reason
 //!   it went, and its run moves on; the runs such calls wait in are found
 //!   only in their own workspace.
+//! - **Memory**: a run keeps the memory it was started with (`agent` or
+//!   `off`), and the memory type and recall its first model attempt froze
+//!   with its offer; every later attempt is prepared with the same, a run
+//!   started with memory off recalls nothing, and a recall is never empty. A
+//!   memory tool's call keeps its type, with no short ID, and one waiting
+//!   for approval is refused before the run parks on it only because the
+//!   type was deleted.
 //!
 //! The suite drives runs with the reducer (`advance`) where a worker would,
 //! and builds the requests a buggy or stale caller would by hand. Its
@@ -51,22 +58,24 @@ use zupflow_core::agents::{AgentStore, NewAgent, SentMemory};
 use zupflow_core::audit::{AuditAction, AuditActor, AuditFilter, AuditObject, AuditStore};
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{
-    AgentId, ApiKeyId, InstallationId, ModelConnectionId, ModelId, OrganizationId, RunId, SessionId, ToolCallId,
-    WorkspaceId,
+    AgentId, ApiKeyId, InstallationId, MemoryTypeId, ModelConnectionId, ModelId, OrganizationId, RunId, SessionId,
+    ToolCallId, WorkspaceId,
 };
 use zupflow_core::jobs::{Job, JobError, JobQueue};
+use zupflow_core::memory::{MemoryWrites, notes};
 use zupflow_core::model_store::{RouteState, RunModel};
 use zupflow_core::models::{Completion, ModelToolCall, Reply, TokenUsage};
 use zupflow_core::runs::digest::{Sha256Digest, call_digest};
-use zupflow_core::runs::names::{Candidate, Offer, build_offer};
+use zupflow_core::runs::names::{Candidate, Offer, ToolHost, build_offer, memory_tool};
 use zupflow_core::runs::reducer::{
-    Approval, Facts, Gone, INSTALLATION_DISCONNECTED, INSTALLATION_REMOVED, InstallationCheck, Io, ModelAnswer,
-    ModelResult, Plan, SendCheck, SendRequest, SendResult, Unanswered, UnansweredWhy, admit, advance, calls_to_decide,
-    cancel, fail_abandoned, refuse_waiting, resolve_approval,
+    Approval, Facts, Gone, INSTALLATION_DISCONNECTED, INSTALLATION_REMOVED, InstallationCheck, Io,
+    MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE, ModelAnswer, ModelResult, Plan, SendCheck, SendRequest,
+    SendResult, Unanswered, UnansweredWhy, admit, advance, calls_to_decide, cancel, fail_abandoned, refuse_waiting,
+    resolve_approval,
 };
 use zupflow_core::runs::state::{
-    CallDecision, CallVerdict, ClaimantId, Continuation, EXECUTION_VERSION, InvocationId, ModelAttemptState, RequestId,
-    Snapshot,
+    CallDecision, CallVerdict, ClaimantId, Continuation, EXECUTION_VERSION, FrozenMemory, InvocationId,
+    ModelAttemptState, RequestId, Snapshot,
 };
 use zupflow_core::runs::store::{
     Applied, Durability, RUN_JOB, RUN_JOB_ATTEMPTS, Receipt, RunStore, StoreError, run_of_job,
@@ -77,7 +86,7 @@ use zupflow_core::runs::transition::{
     Settlement, TransitionRequest, Yield, YieldReason,
 };
 use zupflow_core::runs::{
-    ApprovalDecision, CallState, Failure, NewRun, OrganizationRunFilter, RunEventType, RunFilter, RunStatus,
+    ApprovalDecision, CallState, Failure, MemoryMode, NewRun, OrganizationRunFilter, RunEventType, RunFilter, RunStatus,
     RunTrigger, UsageDay,
 };
 use zupflow_core::scope::{Name, Scope};
@@ -220,6 +229,7 @@ fn new_run(agent_id: AgentId, input: &str) -> NewRun {
         session_id: SessionId::generate(),
         trigger: RunTrigger::Api,
         input: input.to_owned(),
+        memory: MemoryMode::Agent,
         model: run_model(),
         instructions: "Be brief.".to_owned(),
         channel: None,
@@ -656,6 +666,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     records_a_send_authorized_before_a_cancel(&stores, a, agent_a).await;
     holds_a_send_claim_once(&stores, a, agent_a).await;
     refuses_a_waiting_call_whose_installation_went(&stores, a, b, agent_a, agent_sibling, agent_b).await;
+    keeps_a_runs_memory_with_its_attempts(&stores, a, agent_a).await;
     keeps_a_late_outcome_as_evidence(&stores, a, agent_a).await;
     abandons_a_model_attempt_a_stopped_worker_left(&stores, a, agent_a).await;
     yields_without_using_an_attempt(&stores, a, agent_a).await;
@@ -1466,6 +1477,7 @@ async fn refuses_a_stale_or_expired_owner(stores: &Stores<'_>, a: Tenant, agent_
                 abandons: None,
                 request_digest: Sha256Digest::of(b"request"),
                 offer: offer(),
+                memory: None,
                 key_version: Some(1),
                 steer: None,
             }),
@@ -1579,6 +1591,7 @@ async fn refuses_steps_without_their_guards(stores: &Stores<'_>, a: Tenant, agen
         abandons: None,
         request_digest: Sha256Digest::of(b"request"),
         offer: offer(),
+        memory: None,
         key_version: Some(1),
         steer: None,
     });
@@ -1610,6 +1623,7 @@ async fn refuses_steps_without_their_guards(stores: &Stores<'_>, a: Tenant, agen
             abandons: None,
             request_digest: Sha256Digest::of(b"request"),
             offer: offer(),
+            memory: None,
             key_version: Some(1),
             steer: None,
         }),
@@ -2106,6 +2120,327 @@ async fn refuses_a_waiting_call_whose_installation_went(
         let theirs = snapshot(stores, there).await;
         let stop = cancel(there.org, there.ws, &theirs, caller(), RunTrigger::Api, person()).unwrap();
         committed(apply(stores, there, &stop).await);
+    }
+}
+
+/// The memory type the suite's runs remember in.
+fn customer_notes() -> MemoryTypeId {
+    MemoryTypeId::from_uuid(Uuid::from_u128(0x0199_0000_0000_7000_8000_0000_0000_0020))
+}
+
+const RECALL: &str = "<memory>\n- Prefers replies in Portuguese.\n</memory>";
+
+/// The suite's offer with the notes kind's tools of `memory_type_id` joined
+/// to it, as a run that remembers offers them.
+fn remembering(memory_type_id: MemoryTypeId) -> Offer {
+    let tools = notes::tools(MemoryWrites::Approve)
+        .iter()
+        .map(|tool| memory_tool(memory_type_id, "Customer notes", notes::KIND, notes::NAME, tool))
+        .collect();
+    let (offer, left_out) = offer().with(tools);
+    assert!(left_out.is_empty(), "a memory tool's name meets no app's");
+    offer
+}
+
+fn frozen(memory_type_id: MemoryTypeId, recall: Option<&str>) -> FrozenMemory {
+    FrozenMemory {
+        memory_type_id,
+        recall: recall.map(str::to_owned),
+    }
+}
+
+fn memory_decision(verdict: CallVerdict, rule: &str) -> CallDecision {
+    CallDecision {
+        verdict,
+        policy: "memory".to_owned(),
+        mode: None,
+        rule: rule.to_owned(),
+    }
+}
+
+/// The model calls one memory tool, with one argument.
+fn remember(id: &str, tool: &str, argument: (&str, &str)) -> Reply {
+    let mut arguments = Map::new();
+    arguments.insert(argument.0.to_owned(), json!(argument.1));
+    Reply::ToolCalls {
+        text: None,
+        calls: vec![ModelToolCall {
+            id: id.to_owned(),
+            name: tool.to_owned(),
+            arguments,
+        }],
+    }
+}
+
+/// A run keeps the memory it was started with, and the memory type and
+/// recall its first model attempt froze with its offer: every later attempt
+/// is prepared with the same, whatever a worker resolved since; a run
+/// started with memory off recalls nothing, and a recall is never empty. A
+/// memory tool's call keeps its type, with no short ID, through its decision
+/// and send, and one waiting for approval is refused before the run parks on
+/// it only because the type was deleted.
+async fn keeps_a_runs_memory_with_its_attempts(stores: &Stores<'_>, a: Tenant, agent_a: AgentId) {
+    let org = a.organization_id;
+    let ws = a.workspace;
+    let notes_type = customer_notes();
+    let prepare_with = |memory: Option<FrozenMemory>, turn: u32, attempt: u32, abandons: Option<u32>| {
+        Operation::PrepareModel(PrepareModel {
+            turn,
+            attempt,
+            abandons,
+            request_digest: Sha256Digest::of(b"request"),
+            offer: remembering(notes_type),
+            memory,
+            key_version: Some(1),
+            steer: None,
+        })
+    };
+
+    // Started with memory off: the run and its snapshot say so, and no
+    // attempt recalls anything. Its memory tools are frozen all the same.
+    let run = RunId::generate();
+    let quiet = At { org, ws, run };
+    let off = NewRun {
+        memory: MemoryMode::Off,
+        ..new_run(agent_a, "Without memory")
+    };
+    committed(apply(stores, quiet, &admit(org, ws, run, &off)).await);
+    assert_eq!(
+        stores.runs.find_run(org, ws, run).await.unwrap().unwrap().memory,
+        MemoryMode::Off
+    );
+    assert_eq!(snapshot(stores, quiet).await.memory, MemoryMode::Off);
+    let who = claimant();
+    let epoch = claim(stores, quiet, who).await;
+    let recalling = by_hand(
+        stores,
+        quiet,
+        owner(epoch, who, true),
+        prepare_with(Some(frozen(notes_type, Some(RECALL))), 0, 1, None),
+    )
+    .await;
+    refuses_with_nothing_written(stores, quiet, &recalling, "a recall for a run started with memory off").await;
+    let mut resolved = facts(stores, who, Some(epoch));
+    resolved.offer = Some(remembering(notes_type));
+    resolved.memory = Some(frozen(notes_type, None));
+    let (planned, _) = step(stores, quiet, &resolved).await;
+    let Io::CallModel(asked) = planned.io() else {
+        panic!("the model is asked");
+    };
+    assert_eq!(asked.memory, None, "nothing recalled");
+    let attempt = snapshot(stores, quiet).await.model_attempts[0].clone();
+    assert_eq!(
+        (attempt.memory, attempt.offer),
+        (Some(frozen(notes_type, None)), remembering(notes_type)),
+        "the type, frozen with the offer"
+    );
+
+    // Started with the agent's memory: the first attempt freezes what it
+    // resolved, recall and all.
+    let at = admitted(stores, org, ws, agent_a, "Remember me").await;
+    assert_eq!(
+        stores.runs.find_run(org, ws, at.run).await.unwrap().unwrap().memory,
+        MemoryMode::Agent
+    );
+    assert_eq!(snapshot(stores, at).await.memory, MemoryMode::Agent);
+    let who = claimant();
+    let epoch = claim(stores, at, who).await;
+    let empty = by_hand(
+        stores,
+        at,
+        owner(epoch, who, true),
+        prepare_with(Some(frozen(notes_type, Some(""))), 0, 1, None),
+    )
+    .await;
+    refuses_with_nothing_written(stores, at, &empty, "an empty recall").await;
+    let mut resolved = facts(stores, who, Some(epoch));
+    resolved.offer = Some(remembering(notes_type));
+    resolved.memory = Some(frozen(notes_type, Some(RECALL)));
+    let (planned, _) = step(stores, at, &resolved).await;
+    let Io::CallModel(asked) = planned.io() else {
+        panic!("the model is asked");
+    };
+    assert_eq!(asked.memory.as_deref(), Some(RECALL));
+    let first = snapshot(stores, at).await;
+    assert_eq!(
+        first.model_attempts[0].memory,
+        Some(frozen(notes_type, Some(RECALL))),
+        "frozen with the attempt"
+    );
+    let save = first.model_attempts[0]
+        .offer
+        .find("save_memory")
+        .expect("offered")
+        .clone();
+    assert_eq!(save.host(), ToolHost::Memory(notes_type));
+
+    // A later attempt with any other memory is refused; the reducer's
+    // prepares the same again, whatever the worker resolved now.
+    for (memory, why) in [
+        (None, "an attempt without the run's memory"),
+        (Some(frozen(notes_type, None)), "an attempt without the run's recall"),
+        (
+            Some(frozen(notes_type, Some("<memory>\n- Prefers email.\n</memory>"))),
+            "an attempt with another recall",
+        ),
+        (
+            Some(frozen(MemoryTypeId::generate(), Some(RECALL))),
+            "an attempt of another memory type",
+        ),
+    ] {
+        let later = by_hand(stores, at, owner(epoch, who, true), prepare_with(memory, 0, 2, Some(1))).await;
+        refuses_with_nothing_written(stores, at, &later, why).await;
+    }
+    let mut changed = facts(stores, who, Some(epoch));
+    changed.memory = Some(frozen(notes_type, Some("<memory>\n- Prefers email.\n</memory>")));
+    let (planned, _) = step(stores, at, &changed).await;
+    let Io::CallModel(asked) = planned.io() else {
+        panic!("the model is asked again");
+    };
+    assert_eq!((asked.attempt, asked.memory.as_deref()), (2, Some(RECALL)));
+    assert_eq!(
+        snapshot(stores, at).await.model_attempts[1].memory,
+        Some(frozen(notes_type, Some(RECALL))),
+        "the same memory, again"
+    );
+
+    // A memory tool's call keeps its type, with no short ID, through its
+    // send.
+    answer(
+        stores,
+        at,
+        who,
+        epoch,
+        remember("m1", "save_memory", ("text", "Prefers replies in Portuguese.")),
+        |_| memory_decision(CallVerdict::Allow, "allowed"),
+    )
+    .await;
+    let call = snapshot(stores, at).await.calls[0].clone();
+    let target = call.target.clone().expect("bound to its type");
+    assert_eq!(
+        (target.installation_id, target.channel_connection_id, target.memory_type_id),
+        (None, None, Some(notes_type))
+    );
+    assert_eq!(
+        (
+            target.installation_short_id.as_str(),
+            target.installation_label.as_str(),
+            target.app_key.as_str(),
+            target.app_name.as_str(),
+            target.tool.as_str(),
+        ),
+        ("", "Customer notes", notes::KIND, notes::NAME, "save_memory")
+    );
+    assert_eq!(target.definition_sha256, save.definition_sha256);
+    assert!(call.call_digest.is_some(), "decided on its digest");
+    let planned = at_send(stores, at, who, epoch, memory_decision(CallVerdict::Allow, "allowed")).await;
+    let Io::SendMemory(send) = planned.io().clone() else {
+        panic!("expected a memory call, got {planned:?}");
+    };
+    assert_eq!(
+        (send.memory_type_id, send.kind.as_str(), send.tool.as_str(), send.after_app_content),
+        (notes_type, notes::KIND, "save_memory", false)
+    );
+    assert_eq!(Some(send.call_digest), call.call_digest);
+    committed(apply(stores, at, &request(&planned)).await);
+    let mut sent = Facts::at(stores.clock.now());
+    let mut result = Map::new();
+    result.insert("result".to_owned(), json!("Saved."));
+    sent.sent = Some(SendResult {
+        call_id: send.call_id,
+        attempt: send.attempt,
+        invocation_id: send.invocation_id,
+        outcome: SendOutcome::Completed { result },
+    });
+    let recorded = committed(apply(stores, at, &request(&plan(stores, at, &sent).await)).await);
+    assert_eq!(kinds(&recorded), [RunEventType::ToolCallCompleted]);
+    assert_eq!(recorded.events[0].data["memory_type_id"], json!(notes_type));
+    assert_eq!(recorded.events[0].data["kind"], notes::KIND);
+    let saved = snapshot(stores, at).await;
+    assert_eq!(saved.calls[0].state, CallState::Completed);
+    assert_eq!(saved.calls[0].target, Some(target), "read back as it was bound");
+
+    // The next turn's attempt: the same memory again.
+    let (planned, _) = step(stores, at, &facts(stores, who, Some(epoch))).await;
+    let Io::CallModel(asked) = planned.io() else {
+        panic!("the model is asked for the next turn");
+    };
+    assert_eq!((asked.turn, asked.memory.as_deref()), (1, Some(RECALL)));
+
+    // A call waiting for approval whose type was deleted: refused before
+    // the run parks on it, only with that reason.
+    answer(
+        stores,
+        at,
+        who,
+        epoch,
+        remember("m2", "forget_memory", ("memory", "k7m2qd")),
+        |_| {
+            memory_decision(
+                CallVerdict::RequireApproval {
+                    reason: "Your organization requires approval for forget_memory.".to_owned(),
+                },
+                "organization_requires_approval",
+            )
+        },
+    )
+    .await;
+    let at_call = snapshot(stores, at).await;
+    let mut gone = facts(stores, who, Some(epoch));
+    gone.send_check = parking_check(&at_call, InstallationCheck::Removed);
+    let Operation::AuthorizeCall(mut authorize) = request_of(&advance(&at_call, &gone).unwrap()) else {
+        panic!("a refusal at the call");
+    };
+    let Authorization::Refuse { outcome, failure } = authorize.authorization.clone() else {
+        panic!("refused");
+    };
+    assert_eq!(
+        (failure.code.as_str(), failure.message.as_str()),
+        (MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE)
+    );
+    authorize.authorization = Authorization::Refuse {
+        outcome,
+        failure: Failure::new(INSTALLATION_REMOVED, "Personal was removed, so this call wasn't made."),
+    };
+    let other_reason = by_hand(stores, at, owner(epoch, who, true), Operation::AuthorizeCall(authorize)).await;
+    refuses_with_nothing_written(
+        stores,
+        at,
+        &other_reason,
+        "a waiting memory call refused for an installation's reason",
+    )
+    .await;
+    let (_, refused_here) = step(stores, at, &gone).await;
+    assert_eq!(kinds(&refused_here), [RunEventType::ToolCallFailed]);
+    assert_eq!(refused_here.events[0].data["error"]["code"], MEMORY_TYPE_REMOVED);
+    assert_eq!(refused_here.events[0].data["memory_type_name"], "Customer notes");
+    assert_eq!(refused_here.status, RunStatus::Running, "never parked");
+    let forgotten = snapshot(stores, at).await;
+    let call = forgotten
+        .calls
+        .iter()
+        .find(|call| call.model_call_id == "m2")
+        .unwrap();
+    assert_eq!(call.state, CallState::Refused);
+    assert_eq!(
+        call.outcome
+            .as_ref()
+            .map(|outcome| (outcome.content.as_str(), outcome.is_error)),
+        Some((MEMORY_TYPE_REMOVED_MESSAGE, true)),
+        "what the model reads back"
+    );
+
+    for at in [quiet, at] {
+        let stop = cancel(
+            org,
+            ws,
+            &snapshot(stores, at).await,
+            caller(),
+            RunTrigger::Api,
+            person(),
+        )
+        .unwrap();
+        committed(apply(stores, at, &stop).await);
     }
 }
 

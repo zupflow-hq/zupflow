@@ -20,8 +20,10 @@
 //!
 //! A change people make, from the API or the Console, commits with what the
 //! server records of it: its audit event and its webhook events
-//! ([`Record`]). What a deleted agent, workspace or type kept, each kind
-//! forgets when a job the deletion queued tells it to ([`FORGET_JOB`]).
+//! ([`Record`]). A change a run's tool call makes commits with its webhook
+//! events, and no audit event: the run's timeline is its record. What a
+//! deleted agent, workspace or type kept, each kind forgets when a job the
+//! deletion queued tells it to ([`FORGET_JOB`]).
 //!
 //! A run starts with its memory's **recall**: lines the kind gives, framed
 //! by the server ([`Recall::framed`]), none of which opens or closes the
@@ -30,7 +32,9 @@
 //! same bytes, and the same settings give the same tool definitions. A run
 //! keeps the tools it started with, so each call carries its type's writes
 //! as they are now ([`CallContext`]): once they're denied, the tools that
-//! write are refused.
+//! write are refused. A call whose answer was lost is settled by finding
+//! what it did, by the run and the call in its origin, and never makes its
+//! change twice ([`MemoryProvider::settle`]).
 //!
 //! - [`notes`]: the `notes` kind, and the [`notes::NoteStore`] it keeps its notes in.
 //! - [`registry`]: [`registry::MemoryProviders`], the kinds a server serves, by key.
@@ -553,8 +557,8 @@ pub struct Recorded {
 /// and it changes nothing.
 pub type Record<'a> = dyn Fn(&MemoryChange) -> Recorded + Send + Sync + 'a;
 
-/// What a change records when nothing is recorded with it: a run's tool
-/// call, whose change is in its answer ([`CallResult::change`]).
+/// What a change records when nothing is recorded with it, as a test's
+/// changes are.
 pub fn record_nothing(_: &MemoryChange) -> Recorded {
     Recorded::default()
 }
@@ -764,8 +768,9 @@ pub enum MemoryError {
 /// A kind keeps its memories in the database that holds the server's
 /// records. So a change people make ([`MemoryProvider::add`],
 /// [`MemoryProvider::change`], [`MemoryProvider::forget`] and
-/// [`MemoryProvider::forget_scope`]) commits with what the server records of
-/// it ([`Record`]), its audit event and its webhook events, in one
+/// [`MemoryProvider::forget_scope`]), or a run's tool call
+/// ([`MemoryProvider::call`]), commits with what the server records of it
+/// ([`Record`]), its audit event and its webhook events, in one
 /// transaction: a change is never kept without its records, nor its records
 /// without it. And a save checks in its transaction that its agent and type
 /// are there, so it can't land after the deletion that has them forgotten
@@ -798,16 +803,40 @@ pub trait MemoryProvider: Send + Sync {
 
     /// One call to one of its tools, after the server decided it. A call
     /// that can't do what it asks is answered as an error for the model to
-    /// read; `Err` only when the call couldn't be made at all. A tool that
-    /// writes, called while `context.writes` is `deny`, is refused that way,
-    /// even when the run still offers it.
+    /// read; `Err` only when the call couldn't be made at all, and then it
+    /// changed nothing. A tool that writes, called while `context.writes` is
+    /// `deny`, is refused that way, even when the run still offers it. A
+    /// change records with it what `record` builds from it (its webhook
+    /// events), in its transaction; a refusal records nothing. A save or a
+    /// change of text writes `context.origin` as who wrote it.
     async fn call(
         &self,
         scope: &MemoryScope,
         context: &CallContext<'_>,
         tool: &str,
         arguments: &Map<String, Value>,
+        record: &Record<'_>,
     ) -> Result<CallResult, MemoryError>;
+
+    /// Settles a call whose answer was lost, the worker making it having
+    /// stopped before it recorded what came of it: what the call did, found
+    /// by its origin (`context.origin`, the run and the call), answered as
+    /// it did it and recording nothing again; or, when it did nothing, the
+    /// call made now, as [`MemoryProvider::call`] makes it, recording with
+    /// it. Never makes a change twice. `None` when what came of it can't be
+    /// told: the server settles the call as unknown. A kind that can't find
+    /// what its calls did keeps this default.
+    async fn settle(
+        &self,
+        scope: &MemoryScope,
+        context: &CallContext<'_>,
+        tool: &str,
+        arguments: &Map<String, Value>,
+        record: &Record<'_>,
+    ) -> Result<Option<CallResult>, MemoryError> {
+        let _ = (scope, context, tool, arguments, record);
+        Ok(None)
+    }
 
     /// What a person is told the kind keeps when it refuses text
     /// ([`MemoryError::InvalidText`]): `notes` says `Write a note of 1 to 500

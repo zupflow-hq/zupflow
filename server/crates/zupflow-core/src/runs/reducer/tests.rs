@@ -150,6 +150,7 @@ fn fresh() -> Snapshot {
         connection_id: Some(connection_id()),
         instructions: "Be brief.".to_owned(),
         input: "Make a task.".to_owned(),
+        memory: MemoryMode::Agent,
         turns: Vec::new(),
         calls: Vec::new(),
         model_attempts: Vec::new(),
@@ -173,7 +174,7 @@ fn running(continuation: Continuation) -> Snapshot {
 /// Turn 0 prepared as attempt 1, awaiting its answer.
 fn awaiting_model() -> Snapshot {
     let mut snapshot = running(Continuation::AwaitModel { turn: 0, attempt: 1 });
-    let digest = model_request(&snapshot, 0, 1, None, &offer(), None)
+    let digest = model_request(&snapshot, 0, 1, None, (&offer(), None), None)
         .expect("a request")
         .digest();
     snapshot.model_attempts.push(ModelAttempt {
@@ -182,6 +183,7 @@ fn awaiting_model() -> Snapshot {
         state: ModelAttemptState::Prepared,
         request_digest: digest,
         offer: offer(),
+        memory: None,
         timed_out: false,
     });
     snapshot
@@ -222,7 +224,7 @@ fn record(n: u128, position: u32, name: &str, state: CallState) -> CallRecord {
 fn with_calls(continuation: Continuation, calls: Vec<CallRecord>) -> Snapshot {
     let mut snapshot = running(continuation);
     snapshot.turns.push(CommittedTurn { turn: 0, text: None });
-    let digest = model_request(&fresh(), 0, 1, None, &offer(), None)
+    let digest = model_request(&fresh(), 0, 1, None, (&offer(), None), None)
         .expect("a request")
         .digest();
     snapshot.model_attempts.push(ModelAttempt {
@@ -231,6 +233,7 @@ fn with_calls(continuation: Continuation, calls: Vec<CallRecord>) -> Snapshot {
         state: ModelAttemptState::Answered,
         request_digest: digest,
         offer: offer(),
+        memory: None,
         timed_out: false,
     });
     snapshot.calls = calls;
@@ -611,6 +614,7 @@ fn need_model_prepares_an_attempt_with_the_offer_frozen() {
             abandons: None,
             request_digest: request.digest(),
             offer: offer(),
+            memory: None,
             key_version: Some(3),
             steer: None,
         })
@@ -1055,7 +1059,7 @@ fn only_the_frozen_offer_names_tools() {
     let mut snapshot = awaiting_model();
     let frozen = build_offer([candidate(work(), "k7m2qd", "Work", "list_tasks")]).offer;
     snapshot.model_attempts[0].offer = frozen.clone();
-    snapshot.model_attempts[0].request_digest = model_request(&snapshot, 0, 1, None, &frozen, None)
+    snapshot.model_attempts[0].request_digest = model_request(&snapshot, 0, 1, None, (&frozen, None), None)
         .expect("a request")
         .digest();
     let facts = Facts {
@@ -1996,6 +2000,7 @@ fn admit_starts_every_run_the_same_way() {
         session_id: SessionId::from_uuid(Uuid::from_u128(21)),
         trigger: RunTrigger::Api,
         input: "Make a task.".to_owned(),
+        memory: MemoryMode::Off,
         model: RunModel {
             model_id: model_id(),
             connection_id: connection_id(),
@@ -2012,6 +2017,7 @@ fn admit_starts_every_run_the_same_way() {
         panic!("admits");
     };
     assert_eq!(admitted.execution_version, EXECUTION_VERSION);
+    assert_eq!(admitted.memory, MemoryMode::Off, "what the run was started with");
     assert_eq!(
         (admitted.model.as_str(), admitted.model_id, admitted.connection_id),
         ("model-a", model_id(), connection_id())
@@ -2409,6 +2415,7 @@ fn every_operation_says_where_it_leaves_the_run() {
                 abandons: None,
                 request_digest: Sha256Digest::of(b""),
                 offer: Offer::default(),
+                memory: None,
                 key_version: None,
                 steer: None,
             }),
@@ -2657,6 +2664,7 @@ fn commit(snapshot: &mut Snapshot, request: &TransitionRequest, now: Timestamp) 
                 state: ModelAttemptState::Prepared,
                 request_digest: prepare.request_digest,
                 offer: prepare.offer.clone(),
+                memory: None,
                 timed_out: false,
             });
         }
@@ -3427,7 +3435,7 @@ fn long_floats_in_a_frozen_offer_survive_storage() {
     long.input_schema = schema;
     let frozen = build_offer([long]).offer;
     let mut snapshot = running(Continuation::AwaitModel { turn: 0, attempt: 1 });
-    let digest = model_request(&snapshot, 0, 1, None, &frozen, None)
+    let digest = model_request(&snapshot, 0, 1, None, (&frozen, None), None)
         .expect("a request")
         .digest();
     // The store keeps the offer as JSON and reads it back.
@@ -3439,6 +3447,7 @@ fn long_floats_in_a_frozen_offer_survive_storage() {
         state: ModelAttemptState::Prepared,
         request_digest: digest,
         offer: read_back,
+        memory: None,
         timed_out: false,
     });
     let facts = Facts {
@@ -3559,6 +3568,7 @@ fn a_steer_joins_only_a_turns_first_attempt_and_is_resent_as_stored() {
         state: ModelAttemptState::Unanswered,
         request_digest: request.digest(),
         offer: offer(),
+        memory: None,
         timed_out: false,
     });
     let retry = planned(
@@ -3626,7 +3636,7 @@ fn channel_awaiting_model() -> Snapshot {
         session.offer = channel_offer();
     }
     snapshot.control.continuation = Continuation::AwaitModel { turn: 0, attempt: 1 };
-    let digest = model_request(&snapshot, 0, 1, None, &channel_offer(), None)
+    let digest = model_request(&snapshot, 0, 1, None, (&channel_offer(), None), None)
         .expect("a request")
         .digest();
     snapshot.model_attempts.push(ModelAttempt {
@@ -3635,6 +3645,7 @@ fn channel_awaiting_model() -> Snapshot {
         state: ModelAttemptState::Prepared,
         request_digest: digest,
         offer: channel_offer(),
+        memory: None,
         timed_out: false,
     });
     snapshot
@@ -3801,6 +3812,7 @@ fn an_empty_channel_answer_is_nudged_once_then_fails_the_run() {
         state: ModelAttemptState::Prepared,
         request_digest: request.digest(),
         offer: channel_offer(),
+        memory: None,
         timed_out: false,
     });
     nudged.control.continuation = Continuation::AwaitModel { turn: 1, attempt: 1 };
@@ -3878,6 +3890,7 @@ fn channel_after_reply(state: CallState) -> Snapshot {
         state: ModelAttemptState::Prepared,
         request_digest: request.digest(),
         offer: channel_offer(),
+        memory: None,
         timed_out: false,
     });
     snapshot.control.continuation = Continuation::AwaitModel { turn: 1, attempt: 1 };

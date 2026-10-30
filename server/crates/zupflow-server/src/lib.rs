@@ -32,6 +32,7 @@ pub mod invitations;
 pub mod mcp_access;
 pub mod memories;
 pub mod memory_forgetting;
+mod memory_tools;
 pub mod memory_types;
 pub mod model_access;
 pub mod model_providers;

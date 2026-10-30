@@ -2,7 +2,8 @@
 //! their full scope (organization, workspace, agent and type), each of its
 //! four keys changed alone; saved only in a scope that's there, up to its
 //! limit, with a short ID held once in it, saves made at once included;
-//! found there by ID, as they are now, whatever their audience;
+//! found there by ID, as they are now, whatever their audience, and by the
+//! run's call that wrote their text (its origin);
 //! changed and deleted only where their reach goes (a run in a direct
 //! conversation changes that conversation's notes only, a run elsewhere the
 //! workspace's, and the people who manage them every one), an update keeping
@@ -153,6 +154,7 @@ pub async fn run(store: &dyn NoteStore, logs: Logs<'_>, prepare: Prepare) {
     deletes_a_scopes_oldest_notes_with_their_records(store, logs, &prepare).await;
     saves_only_in_a_scope_that_is_there(store, &prepare).await;
     finds_a_note_by_its_id_in_its_scope_only(store, &prepare).await;
+    finds_a_note_by_the_call_that_wrote_it(store, &prepare).await;
     gives_each_note_a_short_id_once_in_its_scope(store, &prepare).await;
     keeps_a_scope_to_its_limit(store, &prepare).await;
     keeps_the_limit_and_short_ids_when_saved_at_once(store, &prepare).await;
@@ -347,6 +349,157 @@ async fn finds_a_note_by_its_id_in_its_scope_only(store: &dyn NoteStore, prepare
         store.get(&scope, direct.id).await,
         Err(MemoryError::NotFound),
         "nor once its agent's notes are"
+    );
+}
+
+/// The run's call that wrote a note's text finds it (how a call whose
+/// answer was lost finds what it did), in its own scope only, as it is now,
+/// whatever its audience: neither another call of the run nor the same
+/// call of another run, and not once another origin wrote its text, or
+/// once it's gone.
+async fn finds_a_note_by_the_call_that_wrote_it(store: &dyn NoteStore, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let other = tenant(prepare).await;
+    let scope = t.scope();
+    let (run_id, tool_call_id) = (RunId::generate(), ToolCallId::generate());
+    let by_call = |after_app_content| Origin::Run {
+        run_id,
+        tool_call_id,
+        after_app_content,
+    };
+    let saved_by = by_call(true);
+    let note = store
+        .insert(
+            &scope,
+            &note_of("Saved by a run's call.", &saved_by, &[short(1)]),
+            200,
+            at(1),
+            &record_nothing,
+        )
+        .await
+        .unwrap();
+    // Other notes of the scope, of another call or no run at all.
+    save(store, &scope, 2, "Saved by another call.", 2).await;
+    let person = member();
+    store
+        .insert(
+            &scope,
+            &note_of("Added by a person.", &person, &[short(3)]),
+            200,
+            at(3),
+            &record_nothing,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.by_origin(&scope, run_id, tool_call_id).await,
+        Ok(Some(note.clone()))
+    );
+    assert_eq!(
+        store.by_origin(&scope, run_id, ToolCallId::generate()).await,
+        Ok(None),
+        "another call of the run"
+    );
+    assert_eq!(
+        store.by_origin(&scope, RunId::generate(), tool_call_id).await,
+        Ok(None),
+        "the same call of another run"
+    );
+    for (key, elsewhere) in t.changed_alone(&other) {
+        assert_eq!(
+            store.by_origin(&elsewhere, run_id, tool_call_id).await,
+            Ok(None),
+            "{key}"
+        );
+    }
+    let direct = Origin::Run {
+        run_id,
+        tool_call_id: ToolCallId::generate(),
+        after_app_content: false,
+    };
+    let Origin::Run {
+        tool_call_id: direct_call,
+        ..
+    } = direct
+    else {
+        unreachable!("a run's origin");
+    };
+    let said = store
+        .insert(
+            &scope,
+            &NewNote {
+                channel_conversation_id: Some(ChannelConversationId::generate()),
+                ..note_of("Saved in a direct conversation.", &direct, &[short(4)])
+            },
+            200,
+            at(4),
+            &record_nothing,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.by_origin(&scope, run_id, direct_call).await,
+        Ok(Some(said)),
+        "whatever its audience"
+    );
+
+    // As it is now: its text written by the same call again, then by another
+    // origin, then gone.
+    let again = store
+        .update(
+            &scope,
+            NoteRef::Id(note.id),
+            Reach::Everything,
+            &by_call(false),
+            "Changed by the same call.",
+            at(5),
+            &record_nothing,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.by_origin(&scope, run_id, tool_call_id).await,
+        Ok(Some(again.memory.clone()))
+    );
+    let rewritten = store
+        .update(
+            &scope,
+            NoteRef::Id(note.id),
+            Reach::Everything,
+            &person,
+            "Changed by a person.",
+            at(6),
+            &record_nothing,
+        )
+        .await
+        .unwrap();
+    assert!(rewritten.changed);
+    assert_eq!(
+        store.by_origin(&scope, run_id, tool_call_id).await,
+        Ok(None),
+        "once another origin wrote its text"
+    );
+    let rewriter = by_call(false);
+    store
+        .update(
+            &scope,
+            NoteRef::Id(note.id),
+            Reach::Everything,
+            &rewriter,
+            "Changed by the call once more.",
+            at(7),
+            &record_nothing,
+        )
+        .await
+        .unwrap();
+    store
+        .delete(&scope, NoteRef::Id(note.id), Reach::Everything, &record_nothing)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.by_origin(&scope, run_id, tool_call_id).await,
+        Ok(None),
+        "once it's gone"
     );
 }
 

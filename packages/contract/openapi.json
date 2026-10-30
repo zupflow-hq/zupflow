@@ -4354,6 +4354,14 @@
               }
             ]
           },
+          "memory": {
+            "type": "string",
+            "enum": [
+              "agent",
+              "off"
+            ],
+            "description": "What the run was started with. A `channel` run's is `agent`."
+          },
           "status": {
             "type": "string",
             "enum": [
@@ -4422,6 +4430,7 @@
           "session_id",
           "trigger",
           "channel",
+          "memory",
           "status",
           "input",
           "output",
@@ -4589,6 +4598,14 @@
               }
             ]
           },
+          "memory": {
+            "type": "string",
+            "enum": [
+              "agent",
+              "off"
+            ],
+            "description": "What the run was started with. A `channel` run's is `agent`."
+          },
           "status": {
             "type": "string",
             "enum": [
@@ -4654,6 +4671,7 @@
           "session_id",
           "trigger",
           "channel",
+          "memory",
           "status",
           "input",
           "output",
@@ -5149,6 +5167,35 @@
                       "tool",
                       "arguments"
                     ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "call_id": {
+                        "$ref": "#/components/schemas/ToolCallId"
+                      },
+                      "memory_type_id": {
+                        "$ref": "#/components/schemas/MemoryTypeId"
+                      },
+                      "memory_type_name": {
+                        "type": "string"
+                      },
+                      "kind": {
+                        "type": "string"
+                      },
+                      "tool": {
+                        "type": "string"
+                      },
+                      "arguments": {}
+                    },
+                    "required": [
+                      "call_id",
+                      "memory_type_id",
+                      "memory_type_name",
+                      "kind",
+                      "tool",
+                      "arguments"
+                    ]
                   }
                 ]
               }
@@ -5250,6 +5297,39 @@
                       "channel_connection_id",
                       "connection_label",
                       "provider",
+                      "tool",
+                      "result",
+                      "duration_ms"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "call_id": {
+                        "$ref": "#/components/schemas/ToolCallId"
+                      },
+                      "memory_type_id": {
+                        "$ref": "#/components/schemas/MemoryTypeId"
+                      },
+                      "memory_type_name": {
+                        "type": "string"
+                      },
+                      "kind": {
+                        "type": "string"
+                      },
+                      "tool": {
+                        "type": "string"
+                      },
+                      "result": {},
+                      "duration_ms": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "call_id",
+                      "memory_type_id",
+                      "memory_type_name",
+                      "kind",
                       "tool",
                       "result",
                       "duration_ms"
@@ -5363,6 +5443,41 @@
                       "error",
                       "duration_ms"
                     ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "call_id": {
+                        "$ref": "#/components/schemas/ToolCallId"
+                      },
+                      "memory_type_id": {
+                        "$ref": "#/components/schemas/MemoryTypeId"
+                      },
+                      "memory_type_name": {
+                        "type": "string"
+                      },
+                      "kind": {
+                        "type": "string"
+                      },
+                      "tool": {
+                        "type": "string"
+                      },
+                      "error": {
+                        "$ref": "#/components/schemas/RunError"
+                      },
+                      "duration_ms": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "call_id",
+                      "memory_type_id",
+                      "memory_type_name",
+                      "kind",
+                      "tool",
+                      "error",
+                      "duration_ms"
+                    ]
                   }
                 ]
               }
@@ -5457,6 +5572,35 @@
                       "channel_connection_id",
                       "connection_label",
                       "provider",
+                      "tool",
+                      "arguments"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "call_id": {
+                        "$ref": "#/components/schemas/ToolCallId"
+                      },
+                      "memory_type_id": {
+                        "$ref": "#/components/schemas/MemoryTypeId"
+                      },
+                      "memory_type_name": {
+                        "type": "string"
+                      },
+                      "kind": {
+                        "type": "string"
+                      },
+                      "tool": {
+                        "type": "string"
+                      },
+                      "arguments": {}
+                    },
+                    "required": [
+                      "call_id",
+                      "memory_type_id",
+                      "memory_type_name",
+                      "kind",
                       "tool",
                       "arguments"
                     ]
@@ -12367,6 +12511,14 @@
                 "properties": {
                   "input": {
                     "type": "string"
+                  },
+                  "memory": {
+                    "description": "`agent` (the default): the agent's memory as it's set. `off`: the run recalls nothing, and every call to a memory tool is refused. Any other value is `400 validation_failed` (`fields.memory`).",
+                    "type": "string",
+                    "enum": [
+                      "agent",
+                      "off"
+                    ]
                   }
                 },
                 "required": [

@@ -16,13 +16,16 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 
-use crate::ids::{ChannelConnectionId, ChannelConversationId, InstallationId};
+use crate::ids::{ChannelConnectionId, ChannelConversationId, InstallationId, MemoryTypeId};
 
 /// The domain of a call's digest.
 pub const CALL_DOMAIN: &str = "zupflow.run.call.v1";
 
 /// The domain of a channel tool call's digest.
 pub const CHANNEL_CALL_DOMAIN: &str = "zupflow.run.channel_call.v1";
+
+/// The domain of a memory tool call's digest.
+pub const MEMORY_CALL_DOMAIN: &str = "zupflow.run.memory_call.v1";
 
 /// A SHA-256 digest, written `sha256:` and 64 lowercase hex characters.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -222,6 +225,29 @@ pub fn channel_call_digest(
     digest_json(CHANNEL_CALL_DOMAIN, &Value::Object(value))
 }
 
+/// A memory tool call's digest: the memory type the run started with, its
+/// kind and the tool, the definition it was decided against and its
+/// arguments. An approval is bound to it, and a send checks it again, so
+/// what's saved is exactly what was reviewed.
+pub fn memory_call_digest(
+    memory_type_id: MemoryTypeId,
+    kind: &str,
+    tool: &str,
+    definition_sha256: &Sha256Digest,
+    arguments: &Map<String, Value>,
+) -> Sha256Digest {
+    let mut value = Map::new();
+    value.insert("memory_type_id".to_owned(), Value::String(memory_type_id.to_string()));
+    value.insert("kind".to_owned(), Value::String(kind.to_owned()));
+    value.insert("tool".to_owned(), Value::String(tool.to_owned()));
+    value.insert(
+        "definition_sha256".to_owned(),
+        Value::String(definition_sha256.to_hex()),
+    );
+    value.insert("arguments".to_owned(), Value::Object(arguments.clone()));
+    digest_json(MEMORY_CALL_DOMAIN, &Value::Object(value))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -363,6 +389,47 @@ mod tests {
             call_digest(installation, "taskboard", "create_task", &definition, &Map::new()),
         ];
         for digest in changed {
+            assert_ne!(digest, base);
+        }
+    }
+
+    #[test]
+    fn a_memory_call_digest_covers_its_type_tool_definition_and_arguments() {
+        let memory_type = MemoryTypeId::from_uuid(Uuid::from_u128(1));
+        let definition = Sha256Digest::of(b"save_memory");
+        let arguments = object(json!({ "text": "Prefers mornings." }));
+        let base = memory_call_digest(memory_type, "notes", "save_memory", &definition, &arguments);
+        assert_eq!(
+            base,
+            memory_call_digest(memory_type, "notes", "save_memory", &definition, &arguments),
+            "the same call, the same digest"
+        );
+        let others = [
+            memory_call_digest(
+                MemoryTypeId::from_uuid(Uuid::from_u128(2)),
+                "notes",
+                "save_memory",
+                &definition,
+                &arguments,
+            ),
+            memory_call_digest(memory_type, "other", "save_memory", &definition, &arguments),
+            memory_call_digest(memory_type, "notes", "update_memory", &definition, &arguments),
+            memory_call_digest(
+                memory_type,
+                "notes",
+                "save_memory",
+                &Sha256Digest::of(b"other"),
+                &arguments,
+            ),
+            memory_call_digest(
+                memory_type,
+                "notes",
+                "save_memory",
+                &definition,
+                &object(json!({ "text": "Prefers evenings." })),
+            ),
+        ];
+        for digest in others {
             assert_ne!(digest, base);
         }
     }

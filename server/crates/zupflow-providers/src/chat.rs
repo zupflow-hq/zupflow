@@ -6,6 +6,11 @@
 //!   messages with their `tool_calls` (arguments as a JSON string); each
 //!   call's outcome a `tool` message naming its `tool_call_id`, an error
 //!   outcome led by `Error: `, since the protocol has no flag for it.
+//! - What the run recalled from its memory ([`Turn::memory`]) is a `text`
+//!   part of its own, the first of the first user message, before the
+//!   input's, and never in the system message: a changed memory leaves the
+//!   tools and instructions before it cached. No recall, no part, and the
+//!   message is as it would be without memory.
 //! - Tools are `function` tools, offered with `tool_choice: auto`.
 //! - Caching: OpenAI caches a prompt's prefix on its own, and OpenRouter
 //!   does for most hosts; both are sent the turn's `prompt_cache_key`
@@ -13,9 +18,10 @@
 //!   an agent's runs reach the same cache. Claude through OpenRouter
 //!   (`anthropic/` models) caches only at breakpoints, as Messages does
 //!   ([`crate::messages`]): its system, user and tool messages go as `text`
-//!   parts, and `cache_control` marks the system part, the last part of the
-//!   last message and the last part of the message before the latest
-//!   answer, where the turn before put its last one. Two gaps against
+//!   parts, and `cache_control` marks the system part, the recall's, the
+//!   last part of the last message and the last part of the message before
+//!   the latest answer, where the turn before put its last one: four at
+//!   most. Two gaps against
 //!   Messages: tools are never marked (OpenRouter documents breakpoints on
 //!   content parts only), so an agent without instructions gets no
 //!   breakpoint shared across its runs; and empty text stays a string,
@@ -115,16 +121,8 @@ fn caches_at_breakpoints(kind: ProviderKind, model: &str) -> bool {
     kind == ProviderKind::OpenRouter && model.starts_with("anthropic/")
 }
 
-/// Marks a message's last part as a cache breakpoint, unless it has no
-/// parts or its text is empty.
-fn mark(message: &mut Value) {
-    let Some(part) = message
-        .get_mut("content")
-        .and_then(Value::as_array_mut)
-        .and_then(|parts| parts.last_mut())
-    else {
-        return;
-    };
+/// Marks a part as a cache breakpoint, unless its text is empty.
+fn mark_part(part: &mut Value) {
     if part
         .get("text")
         .and_then(Value::as_str)
@@ -135,6 +133,37 @@ fn mark(message: &mut Value) {
     }
 }
 
+/// Marks a message's last part as a cache breakpoint, unless it has no
+/// parts or its text is empty.
+fn mark(message: &mut Value) {
+    if let Some(part) = message
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|parts| parts.last_mut())
+    {
+        mark_part(part);
+    }
+}
+
+/// The first user message with the recall as its first part, marked when
+/// the model caches at breakpoints, and the input as the next, unless it's
+/// empty.
+fn with_recall(message: &mut Value, memory: &str, breakpoints: bool) {
+    let mut recall = json!({ "type": "text", "text": memory });
+    if breakpoints {
+        mark_part(&mut recall);
+    }
+    let mut parts = vec![recall];
+    match message.get_mut("content").map(Value::take) {
+        Some(Value::Array(input)) => parts.extend(input),
+        Some(Value::String(input)) if !input.is_empty() => parts.push(json!({ "type": "text", "text": input })),
+        _ => {}
+    }
+    if let Value::Object(message) = message {
+        message.insert("content".to_owned(), Value::Array(parts));
+    }
+}
+
 /// The request body for a turn, to `kind`.
 pub fn request(kind: ProviderKind, turn: &Turn<'_>) -> Value {
     let breakpoints = caches_at_breakpoints(kind, turn.model);
@@ -142,7 +171,14 @@ pub fn request(kind: ProviderKind, turn: &Turn<'_>) -> Value {
     if !turn.instructions.is_empty() {
         messages.push(json!({ "role": "system", "content": content(turn.instructions, breakpoints) }));
     }
+    let first = messages.len();
     messages.extend(turn.messages.iter().map(|each| message(each, breakpoints)));
+    // The recall leads the first user message, the conversation's first.
+    if let Some(memory) = turn.memory.filter(|memory| !memory.is_empty())
+        && let Some(message) = messages.get_mut(first)
+    {
+        with_recall(message, memory, breakpoints);
+    }
     if breakpoints {
         if !turn.instructions.is_empty()
             && let Some(system) = messages.first_mut()
