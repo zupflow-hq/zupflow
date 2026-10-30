@@ -15,6 +15,15 @@
 //! conversation recalled only there, and a run there changing none of the
 //! workspace's; and forgetting everything of an agent, a workspace, a type
 //! or an organization forgets exactly that.
+//! A memory is found by its ID in its own scope only, as it is now, whatever
+//! its audience and whatever the kind lets people do with it. What people
+//! change is recorded with it, as the server hands the records over, read
+//! back through the [`Logs`] once the call answers: a refusal, or a change
+//! changing nothing, records nothing, and a record placed outside the
+//! memory's workspace fails the change, which then changes nothing. A
+//! scope's oldest memories are forgotten as many at a time as asked,
+//! whatever the kind lets people do, with each memory's records and their
+//! count.
 //!
 //! `notes` adds: its tools' answers and refusals, writes refused before
 //! their arguments are read once denied, who wrote each note, search over
@@ -31,17 +40,19 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 use zupflow_core::apps::ToolEffect;
-use zupflow_core::ids::{ApiKeyId, ChannelConversationId, RunId, ToolCallId, UserId};
+use zupflow_core::audit::{AuditEntry, AuditPlace};
+use zupflow_core::environment::Environment;
+use zupflow_core::ids::{AgentId, ApiKeyId, ChannelConversationId, MemoryId, RunId, ToolCallId, UserId};
 use zupflow_core::memory::notes::{self, NoteStore, Notes};
 use zupflow_core::memory::{
     Audience, CallContext, CallResult, Forget, Memory, MemoryChange, MemoryError, MemoryFilter, MemoryKind,
-    MemoryProvider, MemoryScope, MemoryTool, MemoryWrites, Origin, Rewritten, Settings,
+    MemoryProvider, MemoryScope, MemoryTool, MemoryWrites, Origin, Record, Rewritten, Settings, record_nothing,
 };
 use zupflow_core::policy::ToolLevel;
 use zupflow_core::time::Timestamp;
 
-use crate::note_store::tenant;
-pub use crate::note_store::{Prepare, Tenant};
+pub use crate::note_store::{Logs, Prepare, Tenant};
+use crate::note_store::{audit_in, counter, misplaced, recorder, seen, sent_elsewhere, tenant, watch};
 
 /// Has the kind remember `text` in a scope, as a run for `audience` would,
 /// at a moment: the memory it keeps.
@@ -53,12 +64,13 @@ pub type Remember =
 /// are allowed, made in this order.
 pub type WriteCalls = Arc<dyn Fn(&Memory) -> Vec<(String, Value)> + Send + Sync>;
 
-/// The kind under test, how it comes to remember something, and how a run
-/// calls the tools that write.
+/// The kind under test, how it comes to remember something, how a run calls
+/// the tools that write, and where what its changes record is read back.
 pub struct Subject<'a> {
     pub provider: &'a dyn MemoryProvider,
     pub remember: Remember,
     pub write_calls: WriteCalls,
+    pub logs: Logs<'a>,
 }
 
 /// Every kind's rules.
@@ -71,11 +83,15 @@ pub async fn run(subject: Subject<'_>, prepare: Prepare) {
     recalls_a_direct_memory_only_there(&subject, &prepare).await;
     changes_none_of_the_workspaces_memories_from_a_direct_conversation(&subject, &prepare).await;
     keeps_each_memory_to_its_scope(&subject, &prepare).await;
+    finds_each_memory_by_its_id_in_its_scope(&subject, &prepare).await;
     forgets_exactly_what_it_names(&subject, &prepare).await;
+    records_each_change_with_it(&subject, &prepare).await;
+    forgets_a_scope_with_its_records(&subject, &prepare).await;
 }
 
-/// The `notes` kind over `store`: every kind's rules, then its own.
-pub async fn run_notes(store: Arc<dyn NoteStore>, prepare: Prepare) {
+/// The `notes` kind over `store`, whose changes record in `logs`: every
+/// kind's rules, then its own.
+pub async fn run_notes(store: Arc<dyn NoteStore>, logs: Logs<'_>, prepare: Prepare) {
     let notes = Arc::new(Notes::new(store));
     let remember: Remember = {
         let notes = notes.clone();
@@ -103,6 +119,7 @@ pub async fn run_notes(store: Arc<dyn NoteStore>, prepare: Prepare) {
             provider: &*notes,
             remember,
             write_calls,
+            logs,
         },
         prepare.clone(),
     )
@@ -202,6 +219,11 @@ fn describes_itself(subject: &Subject<'_>) {
         "checked settings check the same"
     );
     assert_eq!(read_back(provider, &settings), settings, "and read back the same");
+    assert!(
+        !provider.text_rule().trim().is_empty(),
+        "what text it keeps, as a person reads it"
+    );
+    assert!(provider.limit(&settings) >= 1, "room for a memory");
 }
 
 fn offers_the_same_tools_for_the_same_settings(subject: &Subject<'_>) {
@@ -499,7 +521,14 @@ async fn keeps_each_memory_to_its_scope(subject: &Subject<'_>, prepare: &Prepare
         if manage.change {
             assert_eq!(
                 provider
-                    .change(&elsewhere, &person, memory.id, "Changed from elsewhere.", at(2))
+                    .change(
+                        &elsewhere,
+                        &person,
+                        memory.id,
+                        "Changed from elsewhere.",
+                        at(2),
+                        &record_nothing
+                    )
                     .await,
                 Err(MemoryError::NotFound),
                 "{key}"
@@ -507,7 +536,7 @@ async fn keeps_each_memory_to_its_scope(subject: &Subject<'_>, prepare: &Prepare
         }
         if manage.forget {
             assert_eq!(
-                provider.forget(&elsewhere, memory.id).await,
+                provider.forget(&elsewhere, memory.id, &record_nothing).await,
                 Err(MemoryError::NotFound),
                 "{key}"
             );
@@ -520,7 +549,14 @@ async fn keeps_each_memory_to_its_scope(subject: &Subject<'_>, prepare: &Prepare
     );
     if manage.change {
         let changed = provider
-            .change(&scope, &person, memory.id, "Kept to its scope, and changed.", at(3))
+            .change(
+                &scope,
+                &person,
+                memory.id,
+                "Kept to its scope, and changed.",
+                at(3),
+                &record_nothing,
+            )
             .await
             .unwrap();
         assert!(changed.changed);
@@ -536,7 +572,9 @@ async fn keeps_each_memory_to_its_scope(subject: &Subject<'_>, prepare: &Prepare
             api_key_id: ApiKeyId::generate(),
         };
         assert_eq!(
-            provider.change(&scope, &again, memory.id, &changed.text, at(4)).await,
+            provider
+                .change(&scope, &again, memory.id, &changed.text, at(4), &record_nothing)
+                .await,
             Ok(Rewritten {
                 memory: changed.clone(),
                 changed: false,
@@ -550,11 +588,11 @@ async fn keeps_each_memory_to_its_scope(subject: &Subject<'_>, prepare: &Prepare
         );
     }
     if manage.forget {
-        let forgotten = provider.forget(&scope, memory.id).await.unwrap();
+        let forgotten = provider.forget(&scope, memory.id, &record_nothing).await.unwrap();
         assert_eq!(forgotten.id, memory.id, "the memory as it was");
         assert_eq!(recall(provider, &scope, &Audience::Workspace).await, None, "forgotten");
         assert_eq!(
-            provider.forget(&scope, memory.id).await,
+            provider.forget(&scope, memory.id, &record_nothing).await,
             Err(MemoryError::NotFound),
             "once"
         );
@@ -564,7 +602,15 @@ async fn keeps_each_memory_to_its_scope(subject: &Subject<'_>, prepare: &Prepare
             user_id: UserId::generate(),
         };
         let added = provider
-            .add(&scope, &origin, &defaults(provider), "Added by a person.", at(5))
+            .add(
+                &scope,
+                MemoryId::generate(),
+                &origin,
+                &defaults(provider),
+                "Added by a person.",
+                at(5),
+                &record_nothing,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -575,6 +621,77 @@ async fn keeps_each_memory_to_its_scope(subject: &Subject<'_>, prepare: &Prepare
         assert!(recall(provider, &scope, &Audience::Workspace).await.is_some());
         for (key, elsewhere) in t.changed_alone(&other) {
             assert_eq!(recall(provider, &elsewhere, &Audience::Workspace).await, None, "{key}");
+        }
+    }
+}
+
+/// How the server finds a memory the API names: by its ID, in its scope,
+/// whatever its audience and whatever the kind lets people do with it.
+async fn finds_each_memory_by_its_id_in_its_scope(subject: &Subject<'_>, prepare: &Prepare) {
+    let provider = subject.provider;
+    let manage = provider.describe().manage;
+    let t = tenant(prepare).await;
+    let other = tenant(prepare).await;
+    let scope = t.scope();
+    let here = Audience::Direct(ChannelConversationId::generate());
+    let memory = (subject.remember)(scope, Audience::Workspace, "Found by its ID.".to_owned(), at(1)).await;
+    let direct = (subject.remember)(scope, here, "Found by its ID, though said directly.".to_owned(), at(2)).await;
+    for kept in [&memory, &direct] {
+        assert_eq!(
+            provider.get(&scope, kept.id).await.as_ref(),
+            Ok(kept),
+            "as remembered, whatever its audience"
+        );
+        for (key, elsewhere) in t.changed_alone(&other) {
+            assert_eq!(
+                provider.get(&elsewhere, kept.id).await,
+                Err(MemoryError::NotFound),
+                "{key}"
+            );
+        }
+    }
+    for neighbor in t.neighbors() {
+        let theirs = (subject.remember)(neighbor, Audience::Workspace, "A neighbor's.".to_owned(), at(3)).await;
+        assert_eq!(
+            provider.get(&scope, theirs.id).await,
+            Err(MemoryError::NotFound),
+            "{neighbor:?}"
+        );
+    }
+    assert_eq!(
+        provider.get(&scope, MemoryId::generate()).await,
+        Err(MemoryError::NotFound),
+        "an ID it never gave"
+    );
+    let person = Origin::Member {
+        user_id: UserId::generate(),
+    };
+    if manage.change {
+        let changed = provider
+            .change(
+                &scope,
+                &person,
+                memory.id,
+                "Found by its ID, and changed.",
+                at(4),
+                &record_nothing,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.get(&scope, memory.id).await,
+            Ok(changed.memory),
+            "as it is now"
+        );
+    }
+    if manage.forget {
+        for kept in [&memory, &direct] {
+            provider.forget(&scope, kept.id, &record_nothing).await.unwrap();
+            assert_eq!(
+                provider.get(&scope, kept.id).await,
+                Err(MemoryError::NotFound),
+                "once forgotten"
+            );
         }
     }
 }
@@ -691,6 +808,287 @@ async fn forgets_exactly_what_it_names(subject: &Subject<'_>, prepare: &Prepare)
         recalls().await,
         expect([false, false, false, false, true]),
         "an organization's, never another's"
+    );
+}
+
+/// What people change is recorded with it ([`zupflow_core::memory::Record`]):
+/// the audit event and webhook events the server hands the kind, built from
+/// the memory as saved, changed or forgotten, there once the call answers. A
+/// refusal, or a change that changes nothing, records nothing; a record the
+/// kind can't write where the memory is fails the change, which then changes
+/// nothing at all.
+async fn records_each_change_with_it(subject: &Subject<'_>, prepare: &Prepare) {
+    let provider = subject.provider;
+    let logs = subject.logs;
+    let manage = provider.describe().manage;
+    let t = tenant(prepare).await;
+    let other = tenant(prepare).await;
+    let scope = t.scope();
+    let endpoint = watch(logs, t.organization_id).await;
+    let record = recorder(Environment::Sandbox);
+    let settings = defaults(provider);
+    let person = Origin::Member {
+        user_id: UserId::generate(),
+    };
+    let seen_now = || seen(logs, t.organization_id, t.workspace, endpoint);
+    let mut memory = (subject.remember)(scope, Audience::Workspace, "Remembered by a run.".to_owned(), at(1)).await;
+    let mut expected = seen_now().await;
+
+    if manage.add {
+        let id = MemoryId::generate();
+        let added = provider
+            .add(&scope, id, &person, &settings, "Added by a person.", at(2), &record)
+            .await
+            .unwrap();
+        assert_eq!(added.id, id, "with the ID the server chose");
+        expected.add(&MemoryChange::Saved(added));
+        assert_eq!(seen_now().await, expected, "saved, with its records");
+        let nowhere = MemoryScope {
+            agent_id: AgentId::generate(),
+            ..scope
+        };
+        assert_eq!(
+            provider
+                .add(
+                    &nowhere,
+                    MemoryId::generate(),
+                    &person,
+                    &settings,
+                    "Added nowhere.",
+                    at(2),
+                    &record
+                )
+                .await,
+            Err(MemoryError::NotFound),
+            "an agent that isn't there"
+        );
+        assert_eq!(seen_now().await, expected, "a refusal records nothing");
+    }
+    if manage.change {
+        let changed = provider
+            .change(&scope, &person, memory.id, "Changed by a person.", at(3), &record)
+            .await
+            .unwrap();
+        assert!(changed.changed);
+        expected.add(&MemoryChange::Updated(changed.memory.clone()));
+        assert_eq!(seen_now().await, expected, "changed, with the memory as changed");
+        memory = changed.memory;
+        assert_eq!(
+            provider
+                .change(&scope, &person, memory.id, &memory.text, at(4), &record)
+                .await,
+            Ok(Rewritten {
+                memory: memory.clone(),
+                changed: false,
+            })
+        );
+        assert_eq!(
+            provider
+                .change(
+                    &scope,
+                    &person,
+                    MemoryId::generate(),
+                    "Changed nowhere.",
+                    at(4),
+                    &record
+                )
+                .await,
+            Err(MemoryError::NotFound)
+        );
+        for (key, elsewhere) in t.changed_alone(&other) {
+            assert_eq!(
+                provider
+                    .change(
+                        &elsewhere,
+                        &person,
+                        memory.id,
+                        "Changed from elsewhere.",
+                        at(4),
+                        &record
+                    )
+                    .await,
+                Err(MemoryError::NotFound),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            seen_now().await,
+            expected,
+            "its own text, or a refusal, records nothing"
+        );
+    }
+    if manage.forget {
+        for (key, elsewhere) in t.changed_alone(&other) {
+            assert_eq!(
+                provider.forget(&elsewhere, memory.id, &record).await,
+                Err(MemoryError::NotFound),
+                "{key}"
+            );
+        }
+        let forgotten = provider.forget(&scope, memory.id, &record).await.unwrap();
+        assert_eq!(forgotten, memory, "as it was");
+        expected.add(&MemoryChange::Forgotten(forgotten));
+        assert_eq!(seen_now().await, expected, "forgotten, with the memory as it was");
+        assert_eq!(
+            provider.forget(&scope, memory.id, &record).await,
+            Err(MemoryError::NotFound),
+            "once"
+        );
+        assert_eq!(seen_now().await, expected, "and recorded once");
+    }
+
+    // A record placed anywhere but the memory's workspace fails the change.
+    let kept = (subject.remember)(scope, Audience::Workspace, "Kept as it is.".to_owned(), at(5)).await;
+    let expected = seen_now().await;
+    let recalled = recall(provider, &scope, &Audience::Workspace).await;
+    let elsewhere = misplaced(Environment::Sandbox, t.sibling);
+    let sent = sent_elsewhere(Environment::Production, t.sibling);
+    let records: [(&str, &Record<'_>); 2] = [
+        ("an audit event elsewhere", &elsewhere),
+        ("a webhook event elsewhere", &sent),
+    ];
+    for (what, record) in records {
+        if manage.add {
+            let id = MemoryId::generate();
+            assert_eq!(
+                provider
+                    .add(&scope, id, &person, &settings, "Never kept.", at(6), record)
+                    .await,
+                Err(MemoryError::Unavailable),
+                "{what}: added"
+            );
+            assert_eq!(provider.get(&scope, id).await, Err(MemoryError::NotFound), "{what}");
+        }
+        if manage.change {
+            assert_eq!(
+                provider
+                    .change(&scope, &person, kept.id, "Never changed.", at(6), record)
+                    .await,
+                Err(MemoryError::Unavailable),
+                "{what}: changed"
+            );
+        }
+        if manage.forget {
+            assert_eq!(
+                provider.forget(&scope, kept.id, record).await,
+                Err(MemoryError::Unavailable),
+                "{what}: forgotten"
+            );
+        }
+        assert_eq!(
+            provider.forget_scope(&scope, 100, record, &counter(scope)).await,
+            Err(MemoryError::Unavailable),
+            "{what}: every one forgotten"
+        );
+        assert_eq!(provider.get(&scope, kept.id).await.as_ref(), Ok(&kept), "{what}");
+    }
+    let counted_elsewhere = |count: &u64| AuditEntry {
+        place: AuditPlace::Workspace(t.sibling),
+        ..counter(scope)(count)
+    };
+    assert_eq!(
+        provider.forget_scope(&scope, 100, &record, &counted_elsewhere).await,
+        Err(MemoryError::Unavailable),
+        "the count elsewhere"
+    );
+    assert_eq!(
+        recall(provider, &scope, &Audience::Workspace).await,
+        recalled,
+        "nothing changed"
+    );
+    assert_eq!(seen_now().await, expected, "nothing recorded");
+    assert!(
+        audit_in(logs, t.organization_id, t.sibling).await.is_empty(),
+        "nor where it was placed"
+    );
+}
+
+/// Forgetting a scope forgets its oldest memories, as many at a time as
+/// asked, whatever their audience and whatever the kind lets people do (an
+/// erasure), recording each as it was and how many, and nothing of any other
+/// scope's.
+async fn forgets_a_scope_with_its_records(subject: &Subject<'_>, prepare: &Prepare) {
+    let provider = subject.provider;
+    let logs = subject.logs;
+    let remember = &subject.remember;
+    let t = tenant(prepare).await;
+    let other = tenant(prepare).await;
+    let scope = t.scope();
+    let here = Audience::Direct(ChannelConversationId::generate());
+    let endpoint = watch(logs, t.organization_id).await;
+    let record = recorder(Environment::Sandbox);
+    let held = [
+        remember(
+            scope,
+            Audience::Workspace,
+            "Remembered for the workspace.".to_owned(),
+            at(1),
+        )
+        .await,
+        remember(scope, here, "Remembered directly.".to_owned(), at(2)).await,
+        remember(scope, Audience::Workspace, "Remembered last.".to_owned(), at(3)).await,
+    ];
+    let neighbors: Vec<MemoryScope> = t.neighbors().into_iter().chain([other.scope()]).collect();
+    for neighbor in &neighbors {
+        remember(*neighbor, Audience::Workspace, "A neighbor's.".to_owned(), at(3)).await;
+        remember(*neighbor, here, "A neighbor's, directly.".to_owned(), at(4)).await;
+    }
+    let mut recalls = Vec::new();
+    for neighbor in &neighbors {
+        recalls.push(recall(provider, neighbor, &here).await);
+    }
+    let mut expected = seen(logs, t.organization_id, t.workspace, endpoint).await;
+
+    assert_eq!(
+        provider.forget_scope(&scope, 2, &record, &counter(scope)).await,
+        Ok(2),
+        "the oldest two"
+    );
+    for gone in &held[..2] {
+        assert_eq!(provider.get(&scope, gone.id).await, Err(MemoryError::NotFound));
+    }
+    assert_eq!(
+        provider.get(&scope, held[2].id).await.as_ref(),
+        Ok(&held[2]),
+        "the newest kept"
+    );
+    for gone in &held[..2] {
+        expected.add(&MemoryChange::Forgotten(gone.clone()));
+    }
+    expected.add_counted(2);
+    assert_eq!(
+        seen(logs, t.organization_id, t.workspace, endpoint).await,
+        expected,
+        "each as it was, and how many"
+    );
+    assert_eq!(
+        provider.forget_scope(&scope, 2, &record, &counter(scope)).await,
+        Ok(1),
+        "the rest"
+    );
+    for audience in [Audience::Workspace, here] {
+        assert_eq!(recall(provider, &scope, &audience).await, None, "every one");
+    }
+    assert_eq!(provider.get(&scope, held[2].id).await, Err(MemoryError::NotFound));
+    for (neighbor, recalled) in neighbors.iter().zip(&recalls) {
+        assert_eq!(&recall(provider, neighbor, &here).await, recalled, "{neighbor:?}");
+    }
+    expected.add(&MemoryChange::Forgotten(held[2].clone()));
+    expected.add_counted(1);
+    assert_eq!(
+        seen(logs, t.organization_id, t.workspace, endpoint).await,
+        expected,
+        "each time, how many"
+    );
+    assert_eq!(
+        provider.forget_scope(&scope, 2, &record, &counter(scope)).await,
+        Ok(0),
+        "nothing left"
+    );
+    assert_eq!(
+        seen(logs, t.organization_id, t.workspace, endpoint).await,
+        expected,
+        "and nothing recorded"
     );
 }
 
@@ -814,6 +1212,20 @@ fn describes_notes(provider: &dyn MemoryProvider) {
         ["max_notes", "ranking", "recall_characters"],
         "each refused, by name"
     );
+
+    let properties = &description.settings_schema["properties"];
+    for (key, title) in [("recall_characters", "Recall length"), ("max_notes", "Note limit")] {
+        assert_eq!(properties[key]["title"], title, "{key}: a title to label it with");
+        assert!(
+            properties[key]["description"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
+            "{key}: and a description"
+        );
+    }
+
+    assert_eq!(provider.text_rule(), "Write a note of 1 to 500 characters on one line.");
+    assert_eq!(provider.limit(&settings), 200, "max_notes");
 
     let names = |writes: MemoryWrites| -> Vec<(String, ToolLevel)> {
         provider
@@ -1080,17 +1492,35 @@ async fn answers_its_tools(provider: &dyn MemoryProvider, prepare: &Prepare) {
     };
     assert_eq!(
         provider
-            .add(&scope, &person, &defaults(provider), " \r\n ", at(7))
+            .add(
+                &scope,
+                MemoryId::generate(),
+                &person,
+                &defaults(provider),
+                " \r\n ",
+                at(7),
+                &record_nothing
+            )
             .await,
         Err(MemoryError::InvalidText)
     );
     let added = provider
-        .add(&scope, &person, &defaults(provider), "Uses\nmetric units.", at(7))
+        .add(
+            &scope,
+            MemoryId::generate(),
+            &person,
+            &defaults(provider),
+            "Uses\nmetric units.",
+            at(7),
+            &record_nothing,
+        )
         .await
         .unwrap();
     assert_eq!(added.text, "Uses metric units.");
     assert_eq!(
-        provider.change(&scope, &person, added.id, "", at(8)).await,
+        provider
+            .change(&scope, &person, added.id, "", at(8), &record_nothing)
+            .await,
         Err(MemoryError::InvalidText)
     );
 }
@@ -1198,7 +1628,14 @@ async fn keeps_who_wrote_each_note(provider: &dyn MemoryProvider, prepare: &Prep
         user_id: UserId::generate(),
     };
     let cleared = provider
-        .change(&scope, &person, note.id, "Ships on Fridays, from May.", at(3))
+        .change(
+            &scope,
+            &person,
+            note.id,
+            "Ships on Fridays, from May.",
+            at(3),
+            &record_nothing,
+        )
         .await
         .unwrap();
     let rewritten = Memory {
@@ -1257,6 +1694,7 @@ async fn keeps_a_scope_to_its_limit(provider: &dyn MemoryProvider, prepare: &Pre
             .await
         }
     };
+    assert_eq!(provider.limit(&settings), 2, "as many as max_notes");
     let first = save(scope, "First.", 1).await;
     assert!(!save(scope, "Second.", 2).await.is_error);
     let full = save(scope, "Third.", 3).await;
@@ -1269,7 +1707,17 @@ async fn keeps_a_scope_to_its_limit(provider: &dyn MemoryProvider, prepare: &Pre
         )
     );
     assert_eq!(
-        provider.add(&scope, &run_origin(), &settings, "Third.", at(3)).await,
+        provider
+            .add(
+                &scope,
+                MemoryId::generate(),
+                &run_origin(),
+                &settings,
+                "Third.",
+                at(3),
+                &record_nothing
+            )
+            .await,
         Err(MemoryError::Full)
     );
     for neighbor in t.neighbors() {
@@ -1289,7 +1737,7 @@ async fn keeps_a_scope_to_its_limit(provider: &dyn MemoryProvider, prepare: &Pre
     )
     .await;
     assert!(!updated.is_error, "a full memory still changes");
-    provider.forget(&scope, note.id).await.unwrap();
+    provider.forget(&scope, note.id, &record_nothing).await.unwrap();
     assert!(!save(scope, "Third.", 6).await.is_error, "room again");
 }
 
@@ -1605,7 +2053,14 @@ async fn changes_only_where_a_runs_reach_goes(provider: &dyn MemoryProvider, pre
         user_id: UserId::generate(),
     };
     let rewritten = provider
-        .change(&scope, &person, direct.id, "Finance prefers email again.", at(6))
+        .change(
+            &scope,
+            &person,
+            direct.id,
+            "Finance prefers email again.",
+            at(6),
+            &record_nothing,
+        )
         .await
         .unwrap();
     assert!(rewritten.changed, "the people who manage notes reach any");

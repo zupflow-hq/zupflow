@@ -115,9 +115,11 @@ export interface Target {
  *   Channel tool levels and channel settings at their defaults (never saved).
  *   The channel provider accepts any configuration token and refresh token,
  *   and refuses one containing `invalid`.
- * - The `notes` memory kind served. Memory types and a default memory type
- *   are optional, here and in `larkspur`: the suite makes the types it needs,
- *   and passes with or without any at reset.
+ * - The `notes` memory kind served. Memory types, a default memory type and
+ *   memories are optional, here and in `larkspur`: the suite makes the types,
+ *   agents and memories it needs (a memory for each tenant's agent, saved with
+ *   an API key of its workspace's environment), and passes with or without any
+ *   at reset.
  *
  * Organization `larkspur`, owned by the outsider, with workspaces `harbor`
  * (Production) and `harbor-sandbox` (Sandbox). In `harbor`: an agent with a

@@ -28,6 +28,28 @@ fn knows_every_route_that_shows_a_secret_once() {
     assert_eq!(known, marked);
 }
 
+/// The routes whose answer is never kept for an idempotent retry, as it holds
+/// what people wrote, are exactly the ones the contract marks
+/// `x-zupflow-answer-never-kept`.
+#[test]
+fn knows_every_route_whose_answer_is_never_kept() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packages/contract/openapi.json");
+    let document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let marked: BTreeSet<String> = document["paths"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(_, operations)| operations["post"]["x-zupflow-answer-never-kept"] == true)
+        .map(|(path, _)| path.clone())
+        .collect();
+    let known: BTreeSet<String> = zupflow_server::idempotency::ANSWER_NEVER_KEPT
+        .iter()
+        .map(|path| (*path).to_owned())
+        .collect();
+    assert!(!known.is_empty());
+    assert_eq!(known, marked);
+}
+
 /// The `POST` routes an API key passes straight through are exactly the ones
 /// the contract doesn't open to API keys.
 #[test]

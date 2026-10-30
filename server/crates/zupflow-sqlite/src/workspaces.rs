@@ -16,6 +16,7 @@ use uuid::Uuid;
 use zupflow_core::audit::Audit;
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{OrganizationId, WorkspaceId};
+use zupflow_core::memory::Forget;
 use zupflow_core::time::Timestamp;
 use zupflow_core::workspaces::{
     NewWorkspace, Page, Workspace, WorkspaceError, WorkspaceFilter, WorkspaceSort, WorkspaceStats, WorkspaceStore,
@@ -325,6 +326,14 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         if deleted.rows_affected() != 1 {
             return Err(WorkspaceError::NotFound);
         }
+        // Each memory kind is told to forget what the workspace's agents kept.
+        let forget = Forget::Workspace {
+            organization_id,
+            workspace_id,
+        };
+        crate::memory_types::queue_forgetting(&mut transaction, &forget, None)
+            .await
+            .map_err(|_| WorkspaceError::Unavailable)?;
         transaction.commit().await.map_err(failed("commit"))?;
         Ok(())
     }

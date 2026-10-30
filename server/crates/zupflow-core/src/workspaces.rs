@@ -121,7 +121,10 @@ pub trait WorkspaceStore: Send + Sync {
     ) -> Result<Workspace, WorkspaceError>;
 
     /// Deletes the workspace and everything in it but its audit history,
-    /// recording `audit` of the workspace as it was.
+    /// recording `audit` of the workspace as it was, and queueing with it, in
+    /// the organization's scope, for each memory kind of the organization's
+    /// types, the job that has the kind forget what the workspace's agents
+    /// kept ([`crate::memory::Forget::job`]).
     async fn delete_workspace(
         &self,
         organization_id: OrganizationId,

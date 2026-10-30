@@ -1489,6 +1489,8 @@ export function createHandlers(apiBase: string) {
         d.runs = d.runs.filter((r) => !here(r));
         deleteWorkspaceChannels(d, workspace);
         d.grants = d.grants.filter((g) => !here(g));
+        // What its agents remember goes with them, without a `memory.forgotten` for each.
+        d.memories = d.memories.filter((m) => !here(m));
         d.agents = d.agents.filter((a) => !here(a));
         d.installations = d.installations.filter((i) => !here(i));
         d.installation_short_ids = d.installation_short_ids.filter((r) => !here(r));
@@ -2408,6 +2410,8 @@ export function createHandlers(apiBase: string) {
         const row = findAgent(access, idParam(params, "agent"));
         const d = db();
         d.grants = d.grants.filter((g) => !(inWorkspace(g, access.workspace) && g.agent_id === row.id));
+        // What it remembers goes with it, without a `memory.forgotten` for each.
+        d.memories = d.memories.filter((m) => !(inWorkspace(m, access.workspace) && m.agent_id === row.id));
         // Its apps are deleted with it, their connections disconnected.
         deleteAgentChannels(d, row, new Date().toISOString());
         d.agents = d.agents.filter((a) => a !== row);

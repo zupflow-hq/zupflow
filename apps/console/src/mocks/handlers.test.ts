@@ -30,7 +30,9 @@ import {
   type InstallationId,
   type InstallationTool,
   MEMORY_KIND_NOTES,
+  type MemoryId,
   type OrganizationId,
+  type UpdateMemoryInput,
   type WorkspaceId,
   ZupflowApiError,
 } from "@zupflow/sdk";
@@ -43,9 +45,11 @@ import { db, resetDb } from "./db";
 import { createHandlers, NO_SIGN_IN_HOST, OUTCOME_GRACE_MS, UNREACHABLE_HOST } from "./handlers";
 import { announceLifecycle, grantorAllows, setLatency, withdrawUngrantable, withExpiry } from "./http";
 import { hashReference, isId, newId, newReference, uuidOf } from "./ids";
-import type { IdempotencyRow, MembershipRow } from "./model";
+import { freeShortId, MEMORY_SHORT_ID_DRAWS } from "./memory";
+import { KNOWN_MEMORY_KINDS, noteText } from "./memory-kinds";
+import type { IdempotencyRow, MembershipRow, MemoryRow } from "./model";
 import { mulberry32 } from "./random";
-import { inWorkspace, issueShortId, runEventsKey, SHORT_ID_DRAWS, timelineOf } from "./scope";
+import { drawShortId, inWorkspace, issueShortId, runEventsKey, SHORT_ID_DRAWS, timelineOf } from "./scope";
 import { DEMO_USER_ID, seed } from "./seed";
 import { listedFrom, MAX_GONE, recordListing } from "./tools";
 
@@ -4196,6 +4200,327 @@ describe("memory types", () => {
     );
     expect([conflict.status, conflict.code]).toEqual([409, "memory_type_name_taken"]);
     expect(notes()).toEqual(typeBefore);
+  });
+});
+
+describe("memories", () => {
+  const northwind = () => must(northwindId(), "Northwind");
+  const notes = () => must(db().memory_types.find((t) => t.organization_id === northwind() && t.name === "Notes"));
+  const agentIn = (slug: string, name: string) => {
+    const workspace = ws(slug);
+    return must(
+      db().agents.find((a) => inWorkspace(a, workspace) && a.name === name),
+      name,
+    );
+  };
+  const publisher = () => agentIn("acme-sandbox", "Publishing assistant");
+  const reporter = () => agentIn("acme", "Finance reporter");
+  const keptBy = (agent: { organization_id: OrganizationId; workspace_id: WorkspaceId; id: string }) =>
+    db().memories.filter(
+      (m) =>
+        inWorkspace(m, { id: agent.workspace_id, organization_id: agent.organization_id }) && m.agent_id === agent.id,
+    );
+  /** A refusal as its status, code and field keys. */
+  const refusal = async (promise: Promise<unknown>) => {
+    const error = await failure(promise);
+    return [error.status, error.code, Object.keys(error.fields ?? {})];
+  };
+
+  it("seeds a few notes for two of the demo organization's agents, in its default type", async () => {
+    const d = db();
+    const [sandbox, production] = [ws("acme-sandbox"), ws("acme")];
+    const [p, r] = [publisher(), reporter()];
+    expect([keptBy(p).length, keptBy(r).length]).toEqual([4, 3]);
+    expect(d.memories).toHaveLength(7);
+    for (const m of d.memories) {
+      // For the whole workspace, in the default type, kept as the kind keeps text.
+      expect([m.organization_id, m.memory_type_id, m.channel_conversation_id, m.text], m.text).toEqual([
+        northwind(),
+        notes().id,
+        null,
+        noteText(m.text),
+      ]);
+      expect(m.short_id).toMatch(/^[a-z2-7]{6}$/);
+      expect(m.updated_at).toBe(m.created_at);
+      // Added by the demo member or with an API key of the workspace's environment.
+      const origin = m.origin;
+      if (origin.type === "member") {
+        expect(origin.user_id).toBe(DEMO_USER_ID);
+      } else {
+        expect(origin.type).toBe("api_key");
+        const key = must(d.api_keys.find((k) => origin.type === "api_key" && k.id === origin.api_key_id));
+        const environment = m.workspace_id === sandbox.id ? sandbox.environment : production.environment;
+        expect([key.organization_id, key.environment]).toEqual([northwind(), environment]);
+      }
+    }
+    for (const agent of [p, r]) {
+      const shortIds = keptBy(agent).map((m) => m.short_id);
+      expect(new Set(shortIds).size, agent.name).toBe(shortIds.length);
+      expect(agent.memory).toBe("default");
+    }
+    // The Console doesn't write in Production: the reporter's came from the API.
+    expect(keptBy(r).map((m) => m.origin.type)).toEqual(["api_key", "api_key", "api_key"]);
+    const listed = await owner.memories.list(sandbox.id, p.id);
+    const newestFirst = [...keptBy(p)].sort((a, b) => b.created_at.localeCompare(a.created_at));
+    expect(listed.items.map((m) => m.id)).toEqual(newestFirst.map((m) => m.id));
+    expect(listed.pagination).toEqual({ next_cursor: null, total: 4 });
+  });
+
+  it("keeps the memories of a kind the server doesn't serve out of reach, and forgets none of them", async () => {
+    const sandbox = ws("acme-sandbox").id;
+    const p = publisher();
+    const memory = must(keptBy(p)[0]);
+    const before = structuredClone(db().memories);
+    const [sent, recorded] = [db().webhook_events.length, db().audit.length];
+    db().memory_kinds = [];
+    // Listing or saving in the type names a kind it doesn't serve.
+    const notServed = [422, "memory_kind_not_served", []];
+    expect(await refusal(owner.memories.list(sandbox, p.id))).toEqual(notServed);
+    expect(await refusal(owner.memories.list(sandbox, p.id, { memory_type: notes().id, q: "posts" }))).toEqual(
+      notServed,
+    );
+    expect(await refusal(owner.memories.create(sandbox, p.id, { text: "Not kept." }))).toEqual(notServed);
+    // By its ID, it finds a memory through the kinds it serves: this one isn't there.
+    const notFound = [404, "not_found", []];
+    expect(await refusal(owner.memories.get(sandbox, p.id, memory.id))).toEqual(notFound);
+    for (const text of ["Not kept.", ""]) {
+      expect(await refusal(owner.memories.update(sandbox, p.id, memory.id, { text })), text).toEqual(notFound);
+    }
+    expect(await refusal(owner.memories.delete(sandbox, p.id, memory.id))).toEqual(notFound);
+    // Forgetting everything reaches the kinds it serves only: nothing goes, so nothing is sent or recorded.
+    await owner.memories.deleteAll(sandbox, p.id);
+    expect(db().memories).toEqual(before);
+    expect([db().webhook_events.length, db().audit.length]).toEqual([sent, recorded]);
+  });
+
+  it("refuses what a kind doesn't let people do with its memories", async () => {
+    const sandbox = ws("acme-sandbox").id;
+    const p = publisher();
+    const memory = must(keptBy(p)[0]);
+    const before = structuredClone(db().memories);
+    const manage = must(KNOWN_MEMORY_KINDS.get(MEMORY_KIND_NOTES)).description.manage;
+    const missing = "memo_0000000000000000000000" as MemoryId;
+    const attempts: [keyof typeof manage, () => Promise<unknown>, (() => Promise<unknown>)?][] = [
+      ["list", () => owner.memories.list(sandbox, p.id)],
+      ["list", () => owner.memories.get(sandbox, p.id, memory.id), () => owner.memories.get(sandbox, p.id, missing)],
+      ["add", () => owner.memories.create(sandbox, p.id, { text: "Not kept." })],
+      // The memory first, then what the kind lets people do, and only then the text, even one that isn't a string.
+      [
+        "change",
+        () => owner.memories.update(sandbox, p.id, memory.id, { text: "" }),
+        () => owner.memories.update(sandbox, p.id, missing, { text: "" }),
+      ],
+      [
+        "change",
+        () => owner.memories.update(sandbox, p.id, memory.id, { text: 7 } as unknown as UpdateMemoryInput),
+        () => owner.memories.update(sandbox, p.id, missing, { text: 7 } as unknown as UpdateMemoryInput),
+      ],
+      [
+        "forget",
+        () => owner.memories.delete(sandbox, p.id, memory.id),
+        () => owner.memories.delete(sandbox, p.id, missing),
+      ],
+    ];
+    for (const [what, attempt, missed] of attempts) {
+      manage[what] = false;
+      try {
+        expect(await refusal(attempt()), what).toEqual([422, "memory_kind_unsupported", []]);
+        if (missed) expect(await refusal(missed()), `${what}, a missing memory`).toEqual([404, "not_found", []]);
+      } finally {
+        manage[what] = true;
+      }
+    }
+    expect(db().memories).toEqual(before);
+  });
+
+  it("forgets a deleted workspace's, agent's or type's memories with it, without a memory.forgotten each", async () => {
+    const qa = ws("qa-playground");
+    const keeper = await owner.agents.create(qa.id, { name: "Playground keeper", description: "", instructions: "" });
+    await owner.memories.create(qa.id, keeper.id, { text: "Kept in the playground." });
+    expect(db().memories.filter((m) => m.workspace_id === qa.id)).toHaveLength(1);
+    await owner.workspaces.delete(qa.id);
+    expect(db().memories.filter((m) => m.workspace_id === qa.id)).toEqual([]);
+    // An agent's go with it, and no other agent's.
+    const p = publisher();
+    await owner.agents.delete(p.workspace_id, p.id);
+    expect(db().memories.filter((m) => m.agent_id === p.id)).toEqual([]);
+    expect(keptBy(reporter())).toHaveLength(3);
+    // A type's go with it, in every workspace.
+    await owner.memoryTypes.setDefault(northwind(), { memory_type_id: null });
+    await owner.memoryTypes.delete(northwind(), notes().id);
+    expect(db().memories).toEqual([]);
+    expect(db().webhook_events.filter((e) => e.body.type === "memory.forgotten")).toEqual([]);
+  });
+
+  it("lists a memory a run saved in a direct conversation with the workspace's", async () => {
+    const sandbox = ws("acme-sandbox");
+    const p = publisher();
+    const conversation = must(
+      db().channel_conversations.find((c) => inWorkspace(c, sandbox) && c.kind === "dm"),
+      "a direct conversation",
+    );
+    const run = must(
+      db().runs.find((r) => inWorkspace(r, sandbox) && r.agent_id === p.id),
+      "a run",
+    );
+    const at = new Date().toISOString();
+    const row: MemoryRow = {
+      id: newId("memory"),
+      organization_id: northwind(),
+      workspace_id: sandbox.id,
+      agent_id: p.id,
+      memory_type_id: notes().id,
+      short_id: "dmdmdm",
+      text: "Replies in the thread it was asked in.",
+      channel_conversation_id: conversation.id,
+      origin: { type: "run", run_id: run.id, tool_call_id: newId("tool_call"), after_app_content: true },
+      created_at: at,
+      updated_at: at,
+    };
+    db().memories.push(row);
+    const listed = await owner.memories.list(sandbox.id, p.id);
+    expect([listed.items[0], listed.pagination.total]).toEqual([
+      {
+        id: row.id,
+        workspace_id: row.workspace_id,
+        agent_id: row.agent_id,
+        memory_type_id: row.memory_type_id,
+        short_id: row.short_id,
+        text: row.text,
+        channel_conversation_id: row.channel_conversation_id,
+        origin: row.origin,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      },
+      5,
+    ]);
+  });
+
+  it("never reaches a memory through another organization's row", async () => {
+    const sandbox = ws("acme-sandbox").id;
+    const p = publisher();
+    const larkspur = must(db().organizations.find((o) => o.slug === "larkspur")?.id, "Larkspur");
+    // Mislabelled: another organization's row naming this workspace, agent and type.
+    const stray: MemoryRow = {
+      ...must(keptBy(p)[0]),
+      id: newId("memory"),
+      organization_id: larkspur,
+      short_id: "stray2",
+      text: "Belongs elsewhere.",
+    };
+    db().memories.push(stray);
+    const listed = await owner.memories.list(sandbox, p.id, { limit: 100 });
+    expect(listed.items.map((m) => m.id)).not.toContain(stray.id);
+    expect(listed.pagination.total).toBe(4);
+    expect(await refusal(owner.memories.update(sandbox, p.id, stray.id, { text: "Owned." }))).toEqual([
+      404,
+      "not_found",
+      [],
+    ]);
+    expect(await refusal(owner.memories.delete(sandbox, p.id, stray.id))).toEqual([404, "not_found", []]);
+    expect(await refusal(owner.memories.get(sandbox, p.id, stray.id))).toEqual([404, "not_found", []]);
+    await owner.memories.deleteAll(sandbox, p.id);
+    expect(db().memories.filter((m) => m.agent_id === p.id)).toEqual([stray]);
+  });
+
+  it("keeps a memory's idempotency record in its workspace with only the memory's ID, never its text", async () => {
+    const sandbox = ws("acme-sandbox");
+    const p = publisher();
+    const options = { idempotencyKey: "memory-record" };
+    const saved = await owner.memories.create(sandbox.id, p.id, { text: "Recorded once." }, options);
+    const row = must(db().idempotency_keys.find((r) => r.key === options.idempotencyKey));
+    expect([row.organization_id, row.workspace_id, row.state, row.status, row.body]).toEqual([
+      northwind(),
+      sandbox.id,
+      "completed",
+      201,
+      saved.id,
+    ]);
+    // A retry answers the memory as it is now.
+    expect(await owner.memories.create(sandbox.id, p.id, { text: "Recorded once." }, options)).toEqual(saved);
+    const changed = await owner.memories.update(sandbox.id, p.id, saved.id, { text: "Changed since." });
+    expect(await owner.memories.create(sandbox.id, p.id, { text: "Recorded once." }, options)).toEqual(changed);
+    expect(keptBy(p).filter((m) => m.id === saved.id)).toHaveLength(1);
+    // Once it's forgotten, that the request completed.
+    await owner.memories.delete(sandbox.id, p.id, saved.id);
+    const again = await failure(owner.memories.create(sandbox.id, p.id, { text: "Recorded once." }, options));
+    expect([again.status, again.code, again.message]).toEqual([
+      409,
+      "idempotency_key_completed",
+      "This request already completed, and the memory it saved has since been forgotten. Start again with a new key to save it again.",
+    ]);
+    expect(keptBy(p).filter((m) => m.text === "Recorded once.")).toEqual([]);
+    // A key kept without the memory's ID has nothing to answer with.
+    must(db().idempotency_keys.find((r) => r.key === options.idempotencyKey)).body = null;
+    const unkept = await failure(owner.memories.create(sandbox.id, p.id, { text: "Recorded once." }, options));
+    expect([unkept.status, unkept.code, unkept.message]).toEqual([
+      409,
+      "idempotency_key_completed",
+      "This request already completed, and its response held a memory's text, which is never kept. Find the memory in the agent's list, or start again with a new key.",
+    ]);
+    // A save's answer shows its memory; a retry shows it again only where a read would.
+    const shownOnce = { idempotencyKey: "memory-shown-once" };
+    const shown = await owner.memories.create(sandbox.id, p.id, { text: "Shown once." }, shownOnce);
+    const manage = must(KNOWN_MEMORY_KINDS.get(MEMORY_KIND_NOTES)).description.manage;
+    const allowed = { ...manage };
+    Object.assign(manage, { list: false });
+    try {
+      const unlisted = await failure(owner.memories.create(sandbox.id, p.id, { text: "Shown once." }, shownOnce));
+      expect([unlisted.status, unlisted.code, unlisted.message]).toEqual([
+        409,
+        "idempotency_key_completed",
+        "This request already completed, and the memory it saved is of a kind that can't list memories from the API or the Console, so it isn't shown again.",
+      ]);
+    } finally {
+      Object.assign(manage, allowed);
+    }
+    expect(await owner.memories.create(sandbox.id, p.id, { text: "Shown once." }, shownOnce)).toEqual(shown);
+  });
+
+  it("forgets everything an agent keeps whatever its kind lets people do, audited once for each type", async () => {
+    const sandbox = ws("acme-sandbox").id;
+    const p = publisher();
+    const second = await owner.memoryTypes.create(northwind(), { name: "Second notes", kind: MEMORY_KIND_NOTES });
+    await owner.memoryTypes.create(northwind(), { name: "Empty notes", kind: MEMORY_KIND_NOTES });
+    await owner.memories.create(sandbox, p.id, { text: "Kept in the second type.", memory_type_id: second.id });
+    const kept = keptBy(p).map((m) => m.id);
+    expect(kept).toHaveLength(5);
+    const [sent, audited] = [db().webhook_events.length, db().audit.length];
+    const manage = must(KNOWN_MEMORY_KINDS.get(MEMORY_KIND_NOTES)).description.manage;
+    const allowed = { ...manage };
+    Object.assign(manage, { list: false, add: false, change: false, forget: false });
+    try {
+      await owner.memories.deleteAll(sandbox, p.id);
+    } finally {
+      Object.assign(manage, allowed);
+    }
+    expect(keptBy(p)).toEqual([]);
+    expect(keptBy(reporter()), "another agent's stay").toHaveLength(3);
+    const forgotten = db()
+      .webhook_events.slice(sent)
+      .map((e) => [e.body.type, (e.body.data as { id: string }).id]);
+    expect(forgotten.sort()).toEqual(kept.map((id) => ["memory.forgotten", id]).sort());
+    const recorded = db()
+      .audit.slice(0, db().audit.length - audited)
+      .map((e) => [e.action, e.target.name])
+      .sort();
+    expect(recorded, "none for a type that held nothing").toEqual([
+      ["agent.memory_forgotten", "Publishing assistant · Notes · 4 memories"],
+      ["agent.memory_forgotten", "Publishing assistant · Second notes · 1 memory"],
+    ]);
+  });
+
+  it("draws a memory's short ID until one is free in its scope, and gives up after the fourth", () => {
+    const draws = (() => {
+      const rng = mulberry32(7);
+      return Array.from({ length: MEMORY_SHORT_ID_DRAWS }, () => drawShortId(rng));
+    })();
+    expect(draws).toHaveLength(4);
+    for (const shortId of draws) expect(shortId).toMatch(/^[a-z2-7]{6}$/);
+    expect(freeShortId(new Set(), mulberry32(7))).toBe(draws[0]);
+    expect(freeShortId(new Set(draws.slice(0, 1)), mulberry32(7))).toBe(draws[1]);
+    expect(freeShortId(new Set(draws.slice(0, 3)), mulberry32(7))).toBe(draws[3]);
+    expect(freeShortId(new Set(draws), mulberry32(7))).toBeNull();
   });
 });
 

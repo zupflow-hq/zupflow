@@ -30,7 +30,10 @@ Read `README.md` first, then `DEVELOPMENT.md`.
 - **Idempotency is one wrapper.** Every `POST` goes through it
   (`apps/console/src/mocks/idempotency.ts`, from `route`); never read
   `Idempotency-Key` in a handler. A route whose response shows a secret once
-  is marked `showsSecretOnce` in the contract, so its body is never saved.
+  is marked `showsSecretOnce` in the contract, and one whose response holds
+  what people wrote (a memory's text) `answerNeverKept`, so neither body is
+  ever saved: the second keeps only the ID of the memory it saved, and a
+  retry answers that memory as a read shows it now.
 - **Two layers of isolation.** No organization reaches another, and no
   workspace reaches another within its organization. Both scopes are explicit
   in every function, table, query, key and test; a globally unique ID never
@@ -118,9 +121,9 @@ Read `README.md` first, then `DEVELOPMENT.md`.
   caller and scope itself (`idempotency::scope_of`). A `POST` route outside
   `/v1/organizations…` and `/v1/workspaces/{ws}…` must be taught its scope
   there first, or every request with a key answers 500. A route whose answer
-  shows a secret once goes in `SHOWS_SECRET_ONCE`, and a `POST` route API keys
-  can't call goes in `NOT_FOR_API_KEYS`; tests hold both equal to the
-  contract.
+  shows a secret once goes in `SHOWS_SECRET_ONCE`, one whose answer holds what
+  people wrote in `ANSWER_NEVER_KEPT`, and a `POST` route API keys can't call
+  in `NOT_FOR_API_KEYS`; tests hold each equal to the contract.
 - A new route adds its `operationId` to `SERVED_OPERATIONS` (a test holds the
   list equal to what the router answers), and what it needs to the reference
   fixture in `zupflow-contract`'s `reset`. Then `pnpm contract:backend` runs

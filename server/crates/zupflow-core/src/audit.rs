@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::environment::Environment;
 use crate::ids::{
     AgentChannelId, AgentId, ApiKeyId, AppId, AuditEventId, ChannelAppId, ChannelAppManagerId, ChannelConnectionId,
-    InstallationId, MemberId, MemoryTypeId, ModelConnectionId, ModelId, OrganizationId, RunId, UserId,
+    InstallationId, MemberId, MemoryId, MemoryTypeId, ModelConnectionId, ModelId, OrganizationId, RunId, UserId,
     WebhookDeliveryId, WebhookEndpointId, WorkspaceId,
 };
 use crate::time::Timestamp;
@@ -148,6 +148,9 @@ pub enum AuditObject {
     /// The organization's default memory type, named by the type chosen;
     /// `None` when it was cleared.
     DefaultMemoryType(Option<MemoryTypeId>),
+    /// One thing an agent remembers, named by its agent and short ID, never
+    /// by its text.
+    Memory(MemoryId),
 }
 
 impl AuditObject {
@@ -177,6 +180,7 @@ impl AuditObject {
             Self::ChannelSettings => "channel_settings",
             Self::MemoryType(_) => "memory_type",
             Self::DefaultMemoryType(_) => "default_memory_type",
+            Self::Memory(_) => "memory",
         }
     }
 
@@ -202,6 +206,7 @@ impl AuditObject {
             Self::AgentChannel(id) => Some(id.uuid()),
             Self::MemoryType(id) => Some(id.uuid()),
             Self::DefaultMemoryType(id) => id.map(|id| id.uuid()),
+            Self::Memory(id) => Some(id.uuid()),
             Self::ToolPolicy | Self::ConnectSettings | Self::ChannelToolLevels | Self::ChannelSettings => None,
         }
     }
@@ -232,6 +237,7 @@ impl AuditObject {
             ("channel_settings", None) => Self::ChannelSettings,
             ("memory_type", Some(uuid)) => Self::MemoryType(MemoryTypeId::from_uuid(uuid)),
             ("default_memory_type", uuid) => Self::DefaultMemoryType(uuid.map(MemoryTypeId::from_uuid)),
+            ("memory", Some(uuid)) => Self::Memory(MemoryId::from_uuid(uuid)),
             _ => return None,
         })
     }
@@ -294,6 +300,7 @@ impl Serialize for AuditTarget {
             AuditObject::AgentChannel(id) => target.serialize_field("id", id)?,
             AuditObject::MemoryType(id) => target.serialize_field("id", id)?,
             AuditObject::DefaultMemoryType(id) => target.serialize_field("id", id)?,
+            AuditObject::Memory(id) => target.serialize_field("id", id)?,
             AuditObject::ToolPolicy
             | AuditObject::ConnectSettings
             | AuditObject::ChannelToolLevels
@@ -409,6 +416,13 @@ actions! {
     MemoryTypeUpdated => "memory_type.updated",
     MemoryTypeDeleted => "memory_type.deleted",
     DefaultMemoryTypeUpdated => "default_memory_type.updated",
+    MemorySaved => "memory.saved",
+    /// Its text changed.
+    MemoryUpdated => "memory.updated",
+    MemoryForgotten => "memory.forgotten",
+    /// Everything an agent kept in one memory type in its workspace
+    /// forgotten at once, named with the type and how many.
+    AgentMemoryForgotten => "agent.memory_forgotten",
 }
 
 impl Serialize for AuditAction {
@@ -581,6 +595,7 @@ mod tests {
             AuditObject::MemoryType(MemoryTypeId::from_uuid(uuid)),
             AuditObject::DefaultMemoryType(Some(MemoryTypeId::from_uuid(uuid))),
             AuditObject::DefaultMemoryType(None),
+            AuditObject::Memory(MemoryId::from_uuid(uuid)),
         ] {
             assert_eq!(AuditObject::from_stored(object.kind(), object.uuid()), Some(object));
         }

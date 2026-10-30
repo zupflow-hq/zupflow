@@ -14,7 +14,10 @@
 //! holds it): the store checks each, and that the member may still change
 //! memory types, in the transaction that makes the change. A type of a kind
 //! this server doesn't serve still reads, as not `served`: its agents run
-//! without memory.
+//! without memory. A deleted type's memories go with it, in every
+//! workspace, without a `memory.forgotten` for each: the deletion queues,
+//! in its own transaction, the job that has the type's kind forget them
+//! ([`crate::memory_forgetting`]).
 
 use std::collections::BTreeMap;
 

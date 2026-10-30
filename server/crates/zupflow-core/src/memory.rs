@@ -18,6 +18,11 @@
 //! is shown the workspace's memories too, and changes none of them. Each
 //! memory keeps who wrote its text ([`Origin`]).
 //!
+//! A change people make, from the API or the Console, commits with what the
+//! server records of it: its audit event and its webhook events
+//! ([`Record`]). What a deleted agent, workspace or type kept, each kind
+//! forgets when a job the deletion queued tells it to ([`FORGET_JOB`]).
+//!
 //! A run starts with its memory's **recall**: lines the kind gives, framed
 //! by the server ([`Recall::framed`]), none of which opens or closes the
 //! frame ([`shown_line`]), and fixed for the whole run so the provider's
@@ -37,21 +42,27 @@ pub mod type_store;
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::apps::ToolEffect;
+use crate::audit::{Audit, AuditEntry};
 use crate::ids::{
     AgentId, ApiKeyId, ChannelConversationId, MemoryId, MemoryTypeId, OrganizationId, RunId, ToolCallId, UserId,
     WorkspaceId,
 };
 use crate::installations::ShortId;
+use crate::jobs::{JobOptions, MAX_ATTEMPTS};
 use crate::models::Message;
 use crate::policy::ToolLevel;
+use crate::runs::QueuedJob;
 use crate::runs::digest::{Sha256Digest, canonical_json};
+use crate::scope::Name;
 use crate::time::Timestamp;
+use crate::webhooks::NewWebhookEvent;
 use crate::workspaces::Page;
 
 /// The longest kind key, in characters.
@@ -506,6 +517,48 @@ pub enum MemoryChange {
     Forgotten(Memory),
 }
 
+impl MemoryChange {
+    /// The memory changed: as it is now, or as it was when forgotten.
+    pub fn memory(&self) -> &Memory {
+        match self {
+            Self::Saved(memory) | Self::Updated(memory) | Self::Forgotten(memory) => memory,
+        }
+    }
+
+    pub fn into_memory(self) -> Memory {
+        match self {
+            Self::Saved(memory) | Self::Updated(memory) | Self::Forgotten(memory) => memory,
+        }
+    }
+}
+
+/// What one change to a memory records with it: its audit event, and its
+/// webhook events, each recorded with a delivery for every enabled endpoint
+/// of its organization and environment subscribed to its type, as
+/// [`crate::webhooks::WebhookStore::record_event`] records one. Built by the
+/// server, which knows who acts and what to call things, from the memory as
+/// the change left it; never its text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Recorded {
+    pub audit: Option<AuditEntry>,
+    pub events: Vec<NewWebhookEvent>,
+}
+
+/// What a change records, from each memory it saves, changes or forgets, as
+/// the change left it (as it was, for one forgotten). Called inside the
+/// change's own transaction, once for each such memory, after the change and
+/// before it commits: a committed change always has its records, and a
+/// refused or rolled-back one never does. Each is placed in the memory's
+/// own workspace: anything placed elsewhere fails the change, `Unavailable`,
+/// and it changes nothing.
+pub type Record<'a> = dyn Fn(&MemoryChange) -> Recorded + Send + Sync + 'a;
+
+/// What a change records when nothing is recorded with it: a run's tool
+/// call, whose change is in its answer ([`CallResult::change`]).
+pub fn record_nothing(_: &MemoryChange) -> Recorded {
+    Recorded::default()
+}
+
 /// What the model reads back from a call to a memory tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallResult {
@@ -592,7 +645,85 @@ impl Forget {
                 Self::Organization { .. } => true,
             }
     }
+
+    /// The job that has `kind` forget this, queued in the organization's
+    /// scope by the deletion it follows, in the deletion's own transaction
+    /// ([`FORGET_JOB`]). Its payload names what goes by its IDs, and the
+    /// kind.
+    pub fn job(&self, kind: &MemoryKind) -> Option<QueuedJob> {
+        let mut payload = Map::new();
+        payload.insert("kind".to_owned(), json!(kind));
+        payload.insert("organization_id".to_owned(), json!(self.organization_id()));
+        let what = match *self {
+            Self::Agent {
+                workspace_id, agent_id, ..
+            } => {
+                payload.insert("workspace_id".to_owned(), json!(workspace_id));
+                payload.insert("agent_id".to_owned(), json!(agent_id));
+                "agent"
+            }
+            Self::Workspace { workspace_id, .. } => {
+                payload.insert("workspace_id".to_owned(), json!(workspace_id));
+                "workspace"
+            }
+            Self::Type { memory_type_id, .. } => {
+                payload.insert("memory_type_id".to_owned(), json!(memory_type_id));
+                "memory_type"
+            }
+            Self::Organization { .. } => "organization",
+        };
+        payload.insert("what".to_owned(), json!(what));
+        Some(QueuedJob {
+            kind: Name::new(FORGET_JOB).ok()?,
+            payload: Value::Object(payload).to_string().into_bytes(),
+            options: JobOptions {
+                delay: Duration::ZERO,
+                max_attempts: FORGET_ATTEMPTS,
+            },
+        })
+    }
+
+    /// A forget job's payload, read back: what it forgets, and the kind
+    /// that forgets it.
+    pub fn of_job(payload: &[u8]) -> Option<(Self, MemoryKind)> {
+        let payload: Value = serde_json::from_slice(payload).ok()?;
+        let id = |key: &str| payload.get(key).and_then(Value::as_str);
+        let organization_id = OrganizationId::parse(id("organization_id")?).ok()?;
+        let workspace_id = || id("workspace_id").and_then(|id| WorkspaceId::parse(id).ok());
+        let forget = match id("what")? {
+            "agent" => Self::Agent {
+                organization_id,
+                workspace_id: workspace_id()?,
+                agent_id: AgentId::parse(id("agent_id")?).ok()?,
+            },
+            "workspace" => Self::Workspace {
+                organization_id,
+                workspace_id: workspace_id()?,
+            },
+            "memory_type" => Self::Type {
+                organization_id,
+                memory_type_id: MemoryTypeId::parse(id("memory_type_id")?).ok()?,
+            },
+            "organization" => Self::Organization { organization_id },
+            _ => return None,
+        };
+        Some((forget, MemoryKind::parse(id("kind")?)?))
+    }
 }
+
+/// The kind of the job that has a memory kind forget what went with an
+/// agent, a workspace or a memory type: each deletion queues one, in its own
+/// transaction, for each kind of the organization's memory types at that
+/// moment (the type's own kind, for a type), and a worker asks the kind
+/// ([`MemoryProvider::forget_all`]) until it has forgotten it. A kind the
+/// server doesn't serve waits for one that does, without using an attempt,
+/// longer each time, up to six hours.
+pub const FORGET_JOB: &str = "forget_memories";
+
+/// How many times a forget job is tried while its kind fails: as many as a
+/// job can be, backing off up to sixty minutes apart, so more than three
+/// days before it's given up on, loudly.
+pub const FORGET_ATTEMPTS: u32 = MAX_ATTEMPTS;
 
 /// A run that ended, for a kind that learns from runs.
 #[derive(Debug, Clone, Copy)]
@@ -629,6 +760,17 @@ pub enum MemoryError {
 
 /// A memory kind. Every method that reads or changes memories takes their
 /// scope first and reaches nothing outside it.
+///
+/// A kind keeps its memories in the database that holds the server's
+/// records. So a change people make ([`MemoryProvider::add`],
+/// [`MemoryProvider::change`], [`MemoryProvider::forget`] and
+/// [`MemoryProvider::forget_scope`]) commits with what the server records of
+/// it ([`Record`]), its audit event and its webhook events, in one
+/// transaction: a change is never kept without its records, nor its records
+/// without it. And a save checks in its transaction that its agent and type
+/// are there, so it can't land after the deletion that has them forgotten
+/// ([`FORGET_JOB`]). The SQLite store does this here; another database's
+/// store does the same with its own tables.
 #[async_trait]
 pub trait MemoryProvider: Send + Sync {
     /// Its key: `[a-z0-9_]{1,32}`.
@@ -667,23 +809,44 @@ pub trait MemoryProvider: Send + Sync {
         arguments: &Map<String, Value>,
     ) -> Result<CallResult, MemoryError>;
 
+    /// What a person is told the kind keeps when it refuses text
+    /// ([`MemoryError::InvalidText`]): `notes` says `Write a note of 1 to 500
+    /// characters on one line.`
+    fn text_rule(&self) -> String;
+
+    /// The most memories one agent keeps in one workspace in a type with
+    /// these settings: what a person is told when a save finds no room
+    /// ([`MemoryError::Full`]).
+    fn limit(&self, settings: &Settings) -> u32;
+
     /// A page of the scope's memories, newest first: every one, whatever its
     /// audience, for the people who manage them.
     async fn list(&self, scope: &MemoryScope, filter: &MemoryFilter) -> Result<Page<Memory>, MemoryError>;
 
+    /// One of the scope's memories by its ID, as it is now, whatever its
+    /// audience: how the server finds a memory the API names, before it
+    /// checks what [`Manage`] allows. `NotFound` unless the scope keeps it.
+    async fn get(&self, scope: &MemoryScope, id: MemoryId) -> Result<Memory, MemoryError>;
+
     /// Adds a memory from outside a run, the API or the Console, as `origin`
-    /// says: one for the whole workspace.
+    /// says: one for the whole workspace, with the ID the server chose.
+    /// Records with it what `record` builds from it as saved; a refusal
+    /// records nothing.
+    #[allow(clippy::too_many_arguments)]
     async fn add(
         &self,
         scope: &MemoryScope,
+        id: MemoryId,
         origin: &Origin,
         settings: &Settings,
         text: &str,
         now: Timestamp,
+        record: &Record<'_>,
     ) -> Result<Memory, MemoryError>;
 
-    /// Replaces a memory's text, as written by `origin`. The text it holds
-    /// already changes nothing ([`Rewritten`]).
+    /// Replaces a memory's text, as written by `origin`, recording with it
+    /// what `record` builds from the memory as changed. The text it holds
+    /// already changes nothing and records nothing ([`Rewritten`]).
     async fn change(
         &self,
         scope: &MemoryScope,
@@ -691,13 +854,30 @@ pub trait MemoryProvider: Send + Sync {
         id: MemoryId,
         text: &str,
         now: Timestamp,
+        record: &Record<'_>,
     ) -> Result<Rewritten, MemoryError>;
 
-    /// Forgets one memory, found by search no more either: the memory as it
-    /// was.
-    async fn forget(&self, scope: &MemoryScope, id: MemoryId) -> Result<Memory, MemoryError>;
+    /// Forgets one memory, found by search no more either, recording with it
+    /// what `record` builds from the memory as it was: the memory as it was.
+    async fn forget(&self, scope: &MemoryScope, id: MemoryId, record: &Record<'_>) -> Result<Memory, MemoryError>;
 
-    /// Everything for an agent, a workspace, a type or an organization.
+    /// Forgets the scope's `at_most` oldest memories (by when each was saved,
+    /// then ID), whatever their audience and whatever [`Manage`] says people
+    /// can do: a part of an erasure, which the server asks for again until it
+    /// forgets fewer. Records with them, in the same transaction, what
+    /// `record` builds from each as it was and, when it forgot any, `counted`
+    /// of how many. How many it forgot.
+    async fn forget_scope(
+        &self,
+        scope: &MemoryScope,
+        at_most: u32,
+        record: &Record<'_>,
+        counted: &Audit<'_, u64>,
+    ) -> Result<u64, MemoryError>;
+
+    /// Everything for an agent, a workspace, a type or an organization, once
+    /// it's deleted: no record of each memory. Forgetting what's gone already
+    /// is no failure, so the worker that asks may ask again ([`FORGET_JOB`]).
     async fn forget_all(&self, what: &Forget) -> Result<(), MemoryError>;
 
     /// A run ended; `notes` does nothing.
@@ -913,5 +1093,47 @@ mod tests {
             }
             .covers(&scope)
         );
+    }
+
+    #[test]
+    fn names_what_a_forget_job_forgets_by_its_ids() {
+        let organization_id = OrganizationId::from_uuid(Uuid::from_u128(1));
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(2));
+        let notes = MemoryKind::parse("notes").expect("a kind");
+        let other = MemoryKind::parse("team_notes_2").expect("a kind");
+        for what in [
+            Forget::Agent {
+                organization_id,
+                workspace_id,
+                agent_id: AgentId::from_uuid(Uuid::from_u128(3)),
+            },
+            Forget::Workspace {
+                organization_id,
+                workspace_id,
+            },
+            Forget::Type {
+                organization_id,
+                memory_type_id: MemoryTypeId::from_uuid(Uuid::from_u128(4)),
+            },
+            Forget::Organization { organization_id },
+        ] {
+            for kind in [&notes, &other] {
+                let job = what.job(kind).expect("a job");
+                assert_eq!(job.kind.as_str(), FORGET_JOB);
+                assert_eq!(job.options.max_attempts, FORGET_ATTEMPTS);
+                assert_eq!(Forget::of_job(&job.payload), Some((what, kind.clone())), "{what:?}");
+                let payload: Value = serde_json::from_slice(&job.payload).expect("JSON");
+                assert_eq!(payload["organization_id"], json!(organization_id), "prefixed IDs");
+            }
+        }
+        for malformed in [
+            json!({}),
+            json!({ "what": "agent", "kind": "notes", "organization_id": organization_id }),
+            json!({ "what": "everything", "kind": "notes", "organization_id": organization_id }),
+            json!({ "what": "organization", "kind": "Notes", "organization_id": organization_id }),
+            json!({ "what": "workspace", "kind": "notes", "organization_id": organization_id, "workspace_id": "ws_x" }),
+        ] {
+            assert_eq!(Forget::of_job(malformed.to_string().as_bytes()), None, "{malformed}");
+        }
     }
 }

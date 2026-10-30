@@ -206,6 +206,7 @@ export function buildOpenApi() {
       },
     };
     if (route.showsSecretOnce) operation["x-zupflow-shows-secret-once"] = true;
+    if (route.answerNeverKept) operation["x-zupflow-answer-never-kept"] = true;
     if (unwrapped) operation["x-zupflow-unwrapped"] = true;
     if (route.body) {
       operation.requestBody = { required: true, content: { "application/json": { schema: schemaOf(route.body) } } };
@@ -255,7 +256,10 @@ export function buildOpenApi() {
             "The same key and request replays the saved response; the same key with a different request answers",
             "`422 idempotency_key_reused`; a key still in flight answers `409 idempotency_request_in_progress`;",
             "a malformed key answers `400 invalid_idempotency_key`. Routes marked `x-zupflow-shows-secret-once`",
-            "never save their body: a retry answers `409 idempotency_key_completed`.",
+            "never save their body: a retry answers `409 idempotency_key_completed`. Routes marked",
+            "`x-zupflow-answer-never-kept` save only the ID of the memory they saved: a retry answers it as a read",
+            "shows it now, or `409 idempotency_key_completed` once it's forgotten, or when its kind can't list",
+            "memories.",
           ].join(" "),
         },
       },

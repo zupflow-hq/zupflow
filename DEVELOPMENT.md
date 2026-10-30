@@ -176,7 +176,8 @@ So far it serves `/health`, `/ready`, `/v1/sign-in-settings`, `/v1/me`, the
 signed-in person's invitations (accepted or declined only by the person whose
 verified email was invited), organizations, members,
 workspaces, API keys, the memory kinds it serves with the organization's
-memory types and its default one, catalog and workspace apps with their client
+memory types and its default one, what each agent remembers in its workspace,
+catalog and workspace apps with their client
 configurations, the apps available to a workspace, installations (read,
 renamed, disconnected and deleted), and Connect's settings and sessions with
 the hosted page's read, cancel and a token app's credentials, checked against
@@ -509,6 +510,34 @@ minute, 5 minutes, 30 minutes, 2, 6, 12 and 24 hours later (with jitter):
 eight attempts, at least once, unordered, the same event ID every time. An
 endpoint that has failed every attempt for three days is disabled; enabling
 it again doesn't replay what it missed.
+
+A memory saved, changed or forgotten through the API or the Console is
+recorded with the change, in the transaction the memory kind makes it in:
+its `memory.saved`, `memory.updated` or `memory.forgotten` event (the
+memory, its agent and type, and who wrote its text, never the text) with its
+deliveries, and its audit event. A kind keeps its memories in the database
+that holds the server's records, so a change and its records commit
+together, and a save, which checks in its transaction that its agent and
+type are there, can't land after the deletion that has them forgotten. The
+SQLite store does this here; another database's store does the same with its
+own tables. A request cut off leaves the change with its records, or
+neither. Text a memory already holds changes nothing and records nothing. An
+idempotency key keeps only a saved memory's ID, never its text: a retry
+answers the memory as a read shows it now, or `409
+idempotency_key_completed` once it's forgotten or when its kind can't list
+memories. Forgetting all of an agent's memories is an erasure, whatever its
+kinds let people do: each memory type's memories go a hundred at a time,
+oldest first, each hundred in a transaction of its own with one event per
+memory and one audit event naming the type and the count. The erasure waits
+between two of them as long as the last took, up to half a second, so other
+writers get the database meanwhile. Deleting an agent, a workspace or a
+memory type queues, in the same transaction, a job for each memory kind of
+the organization's types (the type's own kind, for a type) that has the kind
+forget what went, by its IDs, without an event for each. A worker asks the
+kind until it has, backing off up to sixty minutes apart and giving up,
+loudly, only after more than three days; a kind the server doesn't serve
+keeps its job, without using an attempt, for a server that does, looked at
+again after five minutes, then twice as long each time, up to six hours.
 
 Each endpoint has paginated delivery history at
 `GET /v1/organizations/{org}/webhooks/{hook}/deliveries`, filtered by

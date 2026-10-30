@@ -34,7 +34,8 @@
 //! it, nothing
 //! leaves the machine: the fixture's providers answer from memory, no model
 //! answers runs, and the only background work is making channel apps with the
-//! scripted provisioner, which reaches nothing.
+//! scripted provisioner, which reaches nothing, and having memory kinds forget
+//! what deletions leave them.
 
 mod fixture_apps;
 mod fixture_channels;
@@ -344,11 +345,15 @@ async fn serve(path: &str, serving: Serving) -> Result<(), String> {
         Vec::new()
     };
     // Apps are made by a job after `202`, with the scripted provisioner,
-    // which reaches nothing, and new messages are answered by theirs: both
+    // which reaches nothing, and new messages are answered by theirs; memory
+    // kinds forget what a deletion leaves them, in this process: these
     // workers run in every mode.
     let mut workers = workers;
     workers.push(tokio::spawn(zupflow_server::channels::run_worker(state.clone())));
     workers.push(tokio::spawn(zupflow_server::channel_inbound::run_worker(state.clone())));
+    workers.push(tokio::spawn(zupflow_server::memory_forgetting::run_worker(
+        state.clone(),
+    )));
     let served = axum::serve(listener, zupflow_server::app(state, guard))
         .await
         .map_err(|error| error.to_string());

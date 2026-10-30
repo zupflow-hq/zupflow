@@ -24,7 +24,7 @@ use zupflow_core::agents::{
 };
 use zupflow_core::audit::Audit;
 use zupflow_core::ids::{AgentId, AppId, GrantId, InstallationId, MemoryTypeId, ModelId, OrganizationId, WorkspaceId};
-use zupflow_core::memory::AgentMemory;
+use zupflow_core::memory::{AgentMemory, Forget};
 use zupflow_core::policy::{AppToolLevel, GrantLevels, NewToolLevel, PolicySettings, ToolLevel};
 use zupflow_core::time::Timestamp;
 
@@ -521,7 +521,8 @@ impl AgentStore for SqliteAgentStore {
         )
         .await
         .map_err(|_| AgentError::Unavailable)?;
-        // Its grants reference it with a cascading key: they go in this one statement.
+        // Its grants and notes reference it with a cascading key: they go in
+        // this one statement. Each memory kind is told to forget what it kept.
         sqlx::query("DELETE FROM agents WHERE organization_id = ? AND workspace_id = ? AND id = ?")
             .bind(organization_id.uuid())
             .bind(workspace_id.uuid())
@@ -529,6 +530,14 @@ impl AgentStore for SqliteAgentStore {
             .execute(&mut *transaction)
             .await
             .map_err(failed("delete_agent"))?;
+        let forget = Forget::Agent {
+            organization_id,
+            workspace_id,
+            agent_id,
+        };
+        crate::memory_types::queue_forgetting(&mut transaction, &forget, None)
+            .await
+            .map_err(|_| AgentError::Unavailable)?;
         crate::audit::record_in_workspace(&mut transaction, organization_id, workspace_id, &audit(&agent))
             .await
             .map_err(failed("audit"))?;

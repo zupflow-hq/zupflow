@@ -1290,6 +1290,103 @@ export type DefaultMemoryType = z.infer<typeof DefaultMemoryType>;
 export const UpdateDefaultMemoryTypeInput = z.object({ memory_type_id: idSchema("memory_type").nullable() });
 export type UpdateDefaultMemoryTypeInput = z.infer<typeof UpdateDefaultMemoryTypeInput>;
 
+/**
+ * Who wrote a memory's current text: a run's call of a memory tool, an API
+ * key, or a member from the Console. Saving a memory sets it, and so does
+ * each change of its text.
+ */
+export const MemoryOrigin = named(
+  "MemoryOrigin",
+  z.discriminatedUnion("type", [
+    z.object({
+      type: z.literal("run"),
+      run_id: idSchema("run"),
+      tool_call_id: idSchema("tool_call"),
+      /**
+       * The run had read an app's tool result before the call, so what it
+       * wrote may come from that content: a product can review it.
+       */
+      after_app_content: z.boolean(),
+    }),
+    z.object({ type: z.literal("api_key"), api_key_id: idSchema("api_key") }),
+    z.object({ type: z.literal("member"), user_id: idSchema("user") }),
+  ]),
+);
+export type MemoryOrigin = z.infer<typeof MemoryOrigin>;
+
+/**
+ * One thing an agent remembers in one workspace, in one memory type: for
+ * `notes`, a note. The memories are the agent's in that workspace: another
+ * agent's, workspace's or organization's is `404`. So is one, by its ID,
+ * whose memory type's kind this server doesn't serve: a server finds a
+ * memory through the kinds it serves.
+ */
+export const Memory = named(
+  "Memory",
+  z.object({
+    id: idSchema("memory"),
+    workspace_id: idSchema("workspace"),
+    agent_id: idSchema("agent"),
+    memory_type_id: idSchema("memory_type"),
+    /**
+     * How the agent names it, as in `[k7m2qd]`: random, and unique among the
+     * agent's memories of its type in the workspace. Never how the API finds it.
+     */
+    short_id: InstallationShortId,
+    /** As its kind keeps it: for `notes`, one line of 1 to 500 characters. */
+    text: z.string(),
+    /** Set when saved in a direct conversation: recalled and found only there. */
+    channel_conversation_id: idSchema("channel_conversation").nullable(),
+    origin: MemoryOrigin,
+    /** When it was saved. */
+    created_at: instant,
+    /** When its text last changed. */
+    updated_at: instant,
+  }),
+);
+export type Memory = z.infer<typeof Memory>;
+
+/** A page of an agent's memories in one memory type, newest first by when each was saved, then by ID. */
+export const MemoryListQuery = PageQuery.extend({
+  memory_type: idSchema("memory_type")
+    .optional()
+    .describe(
+      "The memory type to list. By default the agent's own, or the organization's default for an agent on it; with none, the page is empty. One that isn't the organization's is `422 unknown_memory_type` (`fields.memory_type`).",
+    ),
+  q: z
+    .string()
+    .optional()
+    .describe(
+      "Only the memories holding every word of it, each a whole word, in any case and accent. Words are split at whitespace, and each needs a letter or a digit: with none, nothing matches. Blank lists every memory.",
+    ),
+});
+export type MemoryListQuery = z.infer<typeof MemoryListQuery>;
+
+/**
+ * A memory for the whole workspace, in `memory_type_id` or, left out, the
+ * agent's own type (the organization's default for an agent on it):
+ * `422 memory_off` when it has none. The type is one of the organization's
+ * (`422 unknown_memory_type`, `fields.memory_type_id`), of a kind this server
+ * serves (`422 memory_kind_not_served`) that can add memories
+ * (`422 memory_kind_unsupported`). The kind keeps the text or refuses it
+ * (`422 invalid_memory_text`, `fields.text`), and the agent keeps fewer
+ * memories in the type than its `max_notes` (`422 memory_full`).
+ */
+export const CreateMemoryInput = z.object({
+  /**
+   * For `notes`: line breaks and tabs become spaces, other control characters
+   * and invisible ones that can hide or reorder text are removed, and what's
+   * left is trimmed; 1 to 500 characters must remain.
+   */
+  text: z.string(),
+  memory_type_id: idSchema("memory_type").optional(),
+});
+export type CreateMemoryInput = z.infer<typeof CreateMemoryInput>;
+
+/** New text, kept as for saving. The text the memory holds already changes nothing. */
+export const UpdateMemoryInput = z.object({ text: z.string() });
+export type UpdateMemoryInput = z.infer<typeof UpdateMemoryInput>;
+
 // ---------------------------------------------------------------------------
 // Tool permissions (decision 0040)
 
@@ -2186,13 +2283,20 @@ export const WEBHOOK_EVENT_TYPES = [
   "channel_app.status_changed",
   "channel_connection.status_changed",
   "channel_conversation.paused",
+  "memory.saved",
+  "memory.updated",
+  "memory.forgotten",
 ] as const;
 /**
  * The event types an endpoint can subscribe to. `webhook.test` is sent only
  * by the test button. `app.tools_changed` is sent when a listing of a
  * connected installation's tools changes one or more of them, once per
  * listing. `channel_app_manager.status_changed` is also sent, as `active`,
- * when a team is linked, through the API or hosted Connect.
+ * when a team is linked, through the API or hosted Connect. `memory.saved`,
+ * `memory.updated` and `memory.forgotten` are sent when an agent's memory is
+ * saved, its text changes, or it's forgotten: one for each memory
+ * `deleteMemories` forgets, and none for the memories that go with their
+ * agent, workspace or memory type.
  */
 export const WebhookEventType = z.enum(WEBHOOK_EVENT_TYPES);
 export type WebhookEventType = z.infer<typeof WebhookEventType>;
@@ -2235,6 +2339,17 @@ const channelMessageData = z.object({
   id: idSchema("channel_message"),
   connection_id: idSchema("channel_connection"),
   conversation_id: idSchema("channel_conversation"),
+});
+
+// A memory's events name it, its agent and its type, and who wrote its text
+// (a run's `origin` says when that may come from an app's content), never the
+// text: `getMemory` reads it, until it's forgotten.
+const memoryData = z.object({
+  object: z.literal("memory"),
+  id: idSchema("memory"),
+  agent_id: idSchema("agent"),
+  memory_type_id: idSchema("memory_type"),
+  origin: MemoryOrigin,
 });
 
 const webhookEventName = (type: string) =>
@@ -2338,6 +2453,10 @@ export const WebhookEvent = named(
       }),
       WebhookEventWorkspace,
     ),
+    // An agent's memory saved (from a run, the API or the Console), its text changed, or forgotten.
+    webhookEvent("memory.saved", memoryData, WebhookEventWorkspace),
+    webhookEvent("memory.updated", memoryData, WebhookEventWorkspace),
+    webhookEvent("memory.forgotten", memoryData, WebhookEventWorkspace),
     // The test button's event belongs to no workspace.
     webhookEvent(
       "webhook.test",

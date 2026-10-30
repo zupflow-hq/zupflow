@@ -43,6 +43,8 @@ import type {
   MemberId,
   MemberRole,
   MemberStatus,
+  MemoryId,
+  MemoryOrigin,
   MemoryTypeId,
   MemoryWrites,
   ModelConnectionId,
@@ -341,6 +343,27 @@ export interface DefaultMemoryTypeRow {
   memory_type_id: MemoryTypeId | null;
   updated_at: string;
   updated_by_user_id: UserId | null;
+}
+
+/**
+ * One thing an agent remembers, under its full scope as the backend keeps it:
+ * organization, workspace, agent and memory type. A memory in another scope
+ * is the same as one that doesn't exist. `short_id` is unique in the scope;
+ * `origin` is who wrote the current text.
+ */
+export interface MemoryRow {
+  id: MemoryId;
+  organization_id: OrganizationId;
+  workspace_id: WorkspaceId;
+  agent_id: AgentId;
+  memory_type_id: MemoryTypeId;
+  short_id: string;
+  text: string;
+  /** Set when saved in a direct conversation: recalled and found only there. */
+  channel_conversation_id: ChannelConversationId | null;
+  origin: MemoryOrigin;
+  created_at: string;
+  updated_at: string;
 }
 
 /** A tool call decided when the run was planned. */
@@ -697,6 +720,8 @@ export interface Db {
   memory_types: MemoryTypeRow[];
   /** Each organization's default memory type, at most one row each. */
   default_memory_types: DefaultMemoryTypeRow[];
+  /** What each agent remembers, in each memory type, under the memory's full scope. */
+  memories: MemoryRow[];
   api_keys: ApiKeyRow[];
   webhooks: WebhookEndpoint[];
   webhook_events: WebhookEventRow[];
@@ -740,7 +765,10 @@ export interface IdempotencyRow {
   /** Method, path and an HMAC-SHA-256 of the body under the server key. */
   fingerprint: string;
   state: "running" | "completed";
-  /** The saved answer; `body` is null for a route that shows a secret once. */
+  /**
+   * The saved answer; `body` is null for a route that shows a secret once, and
+   * only the saved memory's ID for one whose answer holds what people wrote.
+   */
   status: number | null;
   body: string | null;
   created_at: string;
