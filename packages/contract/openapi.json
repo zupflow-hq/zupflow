@@ -140,6 +140,24 @@
               }
             ]
           },
+          "memory": {
+            "type": "string",
+            "enum": [
+              "default",
+              "type",
+              "off"
+            ]
+          },
+          "memory_type_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryTypeId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "instructions": {
             "type": "string"
           },
@@ -183,6 +201,8 @@
           "name",
           "description",
           "model_id",
+          "memory",
+          "memory_type_id",
           "instructions",
           "status",
           "grant_count",
@@ -2740,6 +2760,46 @@
           "signing_secret"
         ]
       },
+      "DefaultMemoryType": {
+        "type": "object",
+        "properties": {
+          "memory_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryType"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Instant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updated_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/User"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "memory_type",
+          "updated_at",
+          "updated_by"
+        ]
+      },
       "DefaultModel": {
         "type": "object",
         "properties": {
@@ -3491,6 +3551,121 @@
       "MemberId": {
         "type": "string",
         "pattern": "^mem_[0-9A-Za-z]{22}$"
+      },
+      "MemoryKind": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "pattern": "^[a-z0-9_]{1,32}$"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "settings_schema": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "manage": {
+            "type": "object",
+            "properties": {
+              "list": {
+                "type": "boolean"
+              },
+              "add": {
+                "type": "boolean"
+              },
+              "change": {
+                "type": "boolean"
+              },
+              "forget": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "list",
+              "add",
+              "change",
+              "forget"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "name",
+          "description",
+          "settings_schema",
+          "manage"
+        ]
+      },
+      "MemoryType": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/MemoryTypeId"
+          },
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "pattern": "^[a-z0-9_]{1,32}$"
+          },
+          "settings": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "writes": {
+            "type": "string",
+            "enum": [
+              "allow",
+              "approve",
+              "deny"
+            ]
+          },
+          "served": {
+            "type": "boolean"
+          },
+          "agent_count": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "is_default": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Instant"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Instant"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "kind",
+          "settings",
+          "writes",
+          "served",
+          "agent_count",
+          "is_default",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "MemoryTypeId": {
+        "type": "string",
+        "pattern": "^mtype_[0-9A-Za-z]{22}$"
       },
       "Meta": {
         "type": "object",
@@ -11142,6 +11317,24 @@
                       }
                     ]
                   },
+                  "memory": {
+                    "type": "string",
+                    "enum": [
+                      "default",
+                      "type",
+                      "off"
+                    ]
+                  },
+                  "memory_type_id": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/MemoryTypeId"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
                   "instructions": {
                     "type": "string"
                   }
@@ -11324,6 +11517,24 @@
                     "anyOf": [
                       {
                         "$ref": "#/components/schemas/ModelId"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "memory": {
+                    "type": "string",
+                    "enum": [
+                      "default",
+                      "type",
+                      "off"
+                    ]
+                  },
+                  "memory_type_id": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/MemoryTypeId"
                       },
                       {
                         "type": "null"
@@ -13469,6 +13680,628 @@
                 },
                 "required": [
                   "model_id"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{org}/memory-kinds": {
+      "get": {
+        "operationId": "listMemoryKinds",
+        "summary": "The memory kinds this server serves, by key",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/MemoryKind"
+                      }
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{org}/memory-types": {
+      "get": {
+        "operationId": "listMemoryTypes",
+        "summary": "The organization's memory types, by name, paged on the server",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Page size, 1 to 100 (default 25); values outside are clamped, and a non-integer means the default.",
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/MemoryType"
+                      }
+                    },
+                    "meta": {
+                      "$ref": "#/components/schemas/Meta"
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createMemoryType",
+        "summary": "Create a memory type, a kind set up for the organization: owners and admins, from the Console. `422 unknown_memory_kind` (`fields.kind`) for a kind this server doesn't serve, `422 invalid_memory_settings` (`fields.settings.<key>`) for settings it refuses, `409 memory_type_name_taken`",
+        "security": [
+          {
+            "consoleSession": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/MemoryType"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string"
+                  },
+                  "settings": {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string"
+                    },
+                    "additionalProperties": {}
+                  },
+                  "writes": {
+                    "type": "string",
+                    "enum": [
+                      "allow",
+                      "approve",
+                      "deny"
+                    ]
+                  }
+                },
+                "required": [
+                  "name",
+                  "kind"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{org}/memory-types/{memory_type}": {
+      "get": {
+        "operationId": "getMemoryType",
+        "summary": "A memory type",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "memory_type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/MemoryTypeId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/MemoryType"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "updateMemoryType",
+        "summary": "Rename a memory type, or change its settings or writes: owners and admins, from the Console. Refused as for creating",
+        "security": [
+          {
+            "consoleSession": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "memory_type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/MemoryTypeId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/MemoryType"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "settings": {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string"
+                    },
+                    "additionalProperties": {}
+                  },
+                  "writes": {
+                    "type": "string",
+                    "enum": [
+                      "allow",
+                      "approve",
+                      "deny"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteMemoryType",
+        "summary": "Delete a memory type: owners and admins, from the Console. Refused while it is the organization's default or an agent's (`409 memory_type_in_use`, naming them)",
+        "security": [
+          {
+            "consoleSession": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          },
+          {
+            "name": "memory_type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/MemoryTypeId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Done"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{org}/default-memory-type": {
+      "get": {
+        "operationId": "getDefaultMemoryType",
+        "summary": "The memory type agents on the default use",
+        "security": [
+          {
+            "consoleSession": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console",
+          "api_key"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/DefaultMemoryType"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "operationId": "updateDefaultMemoryType",
+        "summary": "Choose the organization's default memory type, or none: owners and admins, from the Console",
+        "security": [
+          {
+            "consoleSession": []
+          }
+        ],
+        "x-zupflow-callers": [
+          "console"
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationId"
+            },
+            "description": "A malformed ID, or an ID of another type, answers 404 like a missing one."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "meta",
+                    "error"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/DefaultMemoryType"
+                    },
+                    "meta": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Meta"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "memory_type_id": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/MemoryTypeId"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "memory_type_id"
                 ]
               }
             }

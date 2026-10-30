@@ -10,6 +10,7 @@ import { INVITATION_TTL_DAYS, matchRoute, routes, WEBHOOK_EVENT_TYPES } from "@z
 import {
   type AgentChannel,
   type AgentId,
+  type AgentMemory,
   type ApiKeyId,
   type AppId,
   type AuthTemplate,
@@ -19,17 +20,22 @@ import {
   CHANNEL_TOOLS,
   type ChannelAppId,
   type ChannelAppManagerConnectResult,
+  type CreateAgentInput,
   type CreateConnectSessionInput,
+  type CreateMemoryTypeInput,
   createClient,
   createHttpTransport,
   type InstallationId,
+  MEMORY_KIND_NOTES,
   type MemberId,
+  type MemoryTypeId,
   type ModelConnectionId,
   type OrganizationId,
   type PutAgentChannelInput,
   type UpdateAppInput,
   type UpdateChannelToolLevelsInput,
   type UpdateInstallationInput,
+  type UpdateMemoryTypeInput,
   type WebhookDeliveryId,
   type WebhookDeliverySummary,
   type WebhookEndpoint,
@@ -60,6 +66,36 @@ const TOKENS = {
   configuration_token: "xoxe.xoxp-1-contract-token-0001",
   refresh_token: "xoxe-1-contract-refresh-0001",
 } as const;
+
+/** The `notes` kind, as every server of this repository describes it: its text byte for byte. */
+const NOTES_KIND = {
+  kind: "notes",
+  name: "Notes",
+  description:
+    "Short notes the agent saves with its tools, or people add, recalled at the start of each of its runs in the workspace. The agent searches for the ones left out.",
+  settings_schema: {
+    type: "object",
+    properties: {
+      recall_characters: {
+        type: "integer",
+        minimum: 0,
+        maximum: 32000,
+        default: 8000,
+        description:
+          "How many characters of notes a run starts with, counting each note's line. The oldest are left out first. 0 starts runs with none: the agent searches for them.",
+      },
+      max_notes: {
+        type: "integer",
+        minimum: 1,
+        maximum: 1000,
+        default: 200,
+        description: "The most notes one agent keeps in one workspace.",
+      },
+    },
+    additionalProperties: false,
+  },
+  manage: { list: true, add: true, change: true, forget: true },
+};
 
 /** An agent channel's settings, as `put` takes them. */
 const settingsOf = ({
@@ -173,7 +209,19 @@ export function contractSuite(target: Target) {
       const callId = must(requested?.type === "approval.requested" ? requested.data.call_id : null, "pending call");
       return { run, callId, events };
     };
-    const northwind = () => loadTenant(owner, fx.organization, "acme", "acme-sandbox");
+    /**
+     * Gives `organization` a memory type first, where the target serves them and it has none: a target's
+     * fixture needn't, and the isolation and role sweeps aim at one.
+     */
+    const withMemoryType = async (client: ZupflowClient, organization: OrganizationId) => {
+      if (!serves("listMemoryTypes") || !serves("createMemoryType")) return;
+      if ((await client.memoryTypes.list(organization, { limit: 1 })).items.length > 0) return;
+      await client.memoryTypes.create(organization, { name: "Tenant notes", kind: MEMORY_KIND_NOTES });
+    };
+    const northwind = async () => {
+      await withMemoryType(owner, fx.organization);
+      return loadTenant(owner, fx.organization, "acme", "acme-sandbox");
+    };
     /** `beta-labs`, given a workspace app of its own first: the fixture has none there. */
     const betaLabs = async () => {
       const beta = await workspaceBySlug("beta-labs");
@@ -188,7 +236,10 @@ export function contractSuite(target: Target) {
       }
       return loadTenant(owner, fx.organization, "beta-labs", "qa-playground");
     };
-    const larkspur = () => loadTenant(as("outsider"), fx.otherOrganization, "harbor", "harbor-sandbox");
+    const larkspur = async () => {
+      await withMemoryType(as("outsider"), fx.otherOrganization);
+      return loadTenant(as("outsider"), fx.otherOrganization, "harbor", "harbor-sandbox");
+    };
 
     /** What the channel provider holds for an app: skips the case, naming the operation, when the target can't say. */
     const secretsOf = async (app: ChannelAppId) => {
@@ -563,8 +614,28 @@ export function contractSuite(target: Target) {
           await new Promise((resolve) => setTimeout(resolve, 100));
         }
         await owner.agents.delete(sandbox.id, channelAgent.id);
-        // The provider's endpoint last: it needs what the provider knows of an app, which only the target can say.
+        // The provider's endpoint: it needs what the provider knows of an app, which only the target can say.
         await deliver(installed.app.id, { type: "url_verification", challenge: "contract" });
+
+        // Memory, organization-wide: the kinds served, a type made, changed, chosen as the default and named
+        // by an agent, then the default restored and the type removed.
+        await owner.memoryKinds.list(org);
+        const memoryType = await owner.memoryTypes.create(org, { name: "Contract memory", kind: MEMORY_KIND_NOTES });
+        await owner.memoryTypes.list(org);
+        await owner.memoryTypes.get(org, memoryType.id);
+        await owner.memoryTypes.update(org, memoryType.id, { writes: "approve" });
+        const previousMemory = await owner.memoryTypes.getDefault(org);
+        await owner.memoryTypes.setDefault(org, { memory_type_id: memoryType.id });
+        await owner.memoryTypes.setDefault(org, { memory_type_id: previousMemory.memory_type?.id ?? null });
+        const remembering = await owner.agents.create(sandbox.id, {
+          name: "Contract memory user",
+          description: "",
+          instructions: "Be brief.",
+          memory: "type",
+          memory_type_id: memoryType.id,
+        });
+        await owner.agents.delete(sandbox.id, remembering.id);
+        await owner.memoryTypes.delete(org, memoryType.id);
       }
     });
 
@@ -3744,6 +3815,602 @@ export function contractSuite(target: Target) {
       });
     });
 
+    describe("memory types", () => {
+      const org = () => fx.organization;
+      /**
+       * A prefix no other case uses: each case makes the memory types it needs and finds them by it, whatever
+       * else the organization holds (a target's fixture may have types and a default, or none).
+       */
+      const tagged = () => `M${Math.random().toString(36).slice(2, 8)}`;
+      const make = (name: string, input: Partial<CreateMemoryTypeInput> = {}, client: ZupflowClient = owner) =>
+        client.memoryTypes.create(org(), { name, kind: MEMORY_KIND_NOTES, ...input });
+      /** The organization's types named with `tag`, in the order the server lists them. */
+      const listedWith = async (tag: string) =>
+        (await owner.memoryTypes.list(org(), { limit: 100 })).items.filter((t) => t.name.startsWith(tag));
+      /** A refusal as its status, code and the fields it names. */
+      const refusal = (error: ZupflowApiError) => [error.status, error.code, Object.keys(error.fields ?? {}).sort()];
+      type MemoryInput = Pick<CreateAgentInput, "memory" | "memory_type_id">;
+      const agentInput = (name: string, memory: MemoryInput = {}) => ({
+        name,
+        description: "",
+        instructions: "",
+        ...memory,
+      });
+      /** IDs that name no type of the organization: one of the right form that doesn't exist, and a malformed one. */
+      const MISSING_TYPES = ["mtype_0000000000000000000000", "not-a-memory-type"] as MemoryTypeId[];
+
+      it("lists the kinds it serves by key, notes among them as the kind describes itself", async () => {
+        const kinds = await owner.memoryKinds.list(org());
+        const keys = kinds.map((k) => k.kind);
+        expect(keys).toEqual([...keys].sort());
+        expect(kinds.find((k) => k.kind === MEMORY_KIND_NOTES)).toEqual(NOTES_KIND);
+        // Every member and API key reads them, a key of either environment the same.
+        expect(await as("viewer").memoryKinds.list(org())).toEqual(kinds);
+        for (const environment of ["sandbox", "production"] as const) {
+          const { secret } = await owner.apiKeys.create(org(), { name: `Kinds ${environment}`, environment });
+          expect(await withKey(secret).memoryKinds.list(org())).toEqual(kinds);
+        }
+      });
+
+      it("makes a type of a kind with the kind's defaults filled in, and reads it back", async () => {
+        const tag = tagged();
+        const made = await make(`  ${tag} Notes  `);
+        expect(made).toMatchObject({
+          name: `${tag} Notes`,
+          kind: MEMORY_KIND_NOTES,
+          writes: "allow",
+          served: true,
+          agent_count: 0,
+          is_default: false,
+        });
+        expect(made.settings).toEqual({ recall_characters: 8000, max_notes: 200 });
+        expect(await owner.memoryTypes.get(org(), made.id)).toEqual(made);
+        // Each setting at its bounds, and each level of writes.
+        const lowest = await make(`${tag} lowest`, {
+          settings: { recall_characters: 0, max_notes: 1 },
+          writes: "deny",
+        });
+        expect([lowest.settings, lowest.writes]).toEqual([{ recall_characters: 0, max_notes: 1 }, "deny"]);
+        const highest = await make(`${tag} highest`, {
+          settings: { recall_characters: 32000, max_notes: 1000 },
+          writes: "approve",
+        });
+        expect([highest.settings, highest.writes]).toEqual([{ recall_characters: 32000, max_notes: 1000 }, "approve"]);
+        // The longest name is 60 characters, once trimmed.
+        const longest = await make(` ${tag}${"x".repeat(60 - tag.length)} `);
+        expect(longest.name).toHaveLength(60);
+        // One set for both environments: a key of either reads the same type.
+        for (const environment of ["sandbox", "production"] as const) {
+          const { secret } = await owner.apiKeys.create(org(), { name: `Types ${environment}`, environment });
+          expect(await withKey(secret).memoryTypes.get(org(), made.id)).toEqual(made);
+        }
+        for (const type of [made, lowest, highest, longest]) await owner.memoryTypes.delete(org(), type.id);
+      });
+
+      it("lists the organization's types by name in any case, a page at a time", async () => {
+        const tag = tagged();
+        const b = await make(`${tag} B`);
+        const a = await make(`${tag} a`);
+        const c = await make(`${tag} c`);
+        expect((await listedWith(tag)).map((t) => t.id)).toEqual([a.id, b.id, c.id]);
+        const all = await owner.memoryTypes.list(org(), { limit: 100 });
+        expect(all.pagination.total).toBe(all.items.length);
+        const paged: string[] = [];
+        let cursor: string | undefined;
+        do {
+          const page = await owner.memoryTypes.list(org(), { limit: 1, cursor });
+          expect(page.items).toHaveLength(1);
+          expect(page.pagination.total).toBe(all.items.length);
+          paged.push(...page.items.map((t) => t.id));
+          cursor = page.pagination.next_cursor ?? undefined;
+        } while (cursor);
+        expect(paged).toEqual(all.items.map((t) => t.id));
+        // Out-of-range limits are clamped, and a cursor the list didn't issue is refused.
+        expect((await owner.memoryTypes.list(org(), { limit: 0 })).items).toHaveLength(1);
+        const error = await failure(owner.memoryTypes.list(org(), { cursor: "%%%" }));
+        expect(refusal(error)).toEqual([400, "validation_failed", ["cursor"]]);
+        for (const type of [a, b, c]) await owner.memoryTypes.delete(org(), type.id);
+      });
+
+      it("refuses a kind it doesn't serve and settings the kind refuses, naming each, and makes nothing", async () => {
+        const tag = tagged();
+        for (const kind of ["no_such_kind", "Not a kind!"]) {
+          expect(refusal(await failure(make(`${tag} x`, { kind }))), kind).toEqual([
+            422,
+            "unknown_memory_kind",
+            ["kind"],
+          ]);
+        }
+        const several = await failure(
+          make(`${tag} x`, { settings: { recall_characters: 32001, max_notes: 0, colour: "blue" } }),
+        );
+        expect(refusal(several)).toEqual([
+          422,
+          "invalid_memory_settings",
+          ["settings.colour", "settings.max_notes", "settings.recall_characters"],
+        ]);
+        for (const value of [-1, 1.5, "100", null, true, [100], { characters: 100 }]) {
+          const refused = await failure(make(`${tag} x`, { settings: { recall_characters: value } }));
+          expect(refusal(refused), JSON.stringify(value)).toEqual([
+            422,
+            "invalid_memory_settings",
+            ["settings.recall_characters"],
+          ]);
+        }
+        // What the contract's shapes refuse is `400`, naming the field.
+        for (const [input, field] of [
+          [{ name: "", kind: MEMORY_KIND_NOTES }, "name"],
+          [{ name: "   ", kind: MEMORY_KIND_NOTES }, "name"],
+          [{ name: "x".repeat(61), kind: MEMORY_KIND_NOTES }, "name"],
+          [{ name: `${tag} x`, kind: MEMORY_KIND_NOTES, writes: "sometimes" }, "writes"],
+          [{ name: `${tag} x`, kind: MEMORY_KIND_NOTES, settings: [] }, "settings"],
+        ] as [CreateMemoryTypeInput, string][]) {
+          const invalid = await failure(owner.memoryTypes.create(org(), input));
+          expect(refusal(invalid), field).toEqual([400, "validation_failed", [field]]);
+        }
+        expect(await listedWith(tag)).toEqual([]);
+      });
+
+      it("keeps a name the organization's once, and lets a type keep its own", async () => {
+        const tag = tagged();
+        const shared = await make(`${tag} Shared`);
+        for (const name of [`${tag} Shared`, `  ${tag} Shared `]) {
+          expect(refusal(await failure(make(name))), name).toEqual([409, "memory_type_name_taken", ["name"]]);
+        }
+        const other = await make(`${tag} Other`);
+        const renamed = await failure(owner.memoryTypes.update(org(), other.id, { name: `${tag} Shared` }));
+        expect(refusal(renamed)).toEqual([409, "memory_type_name_taken", ["name"]]);
+        expect((await owner.memoryTypes.update(org(), shared.id, { name: ` ${tag} Shared ` })).name).toBe(
+          `${tag} Shared`,
+        );
+        expect((await listedWith(tag)).map((t) => t.name)).toEqual([`${tag} Other`, `${tag} Shared`]);
+        // Another organization's names are its own.
+        const theirs = await as("outsider").memoryTypes.create(fx.otherOrganization, {
+          name: `${tag} Shared`,
+          kind: MEMORY_KIND_NOTES,
+        });
+        expect(theirs.name).toBe(`${tag} Shared`);
+        await as("outsider").memoryTypes.delete(fx.otherOrganization, theirs.id);
+        for (const type of [shared, other]) await owner.memoryTypes.delete(org(), type.id);
+      });
+
+      it("changes a type's name, settings and writes, never its kind, and refuses as making one does", async () => {
+        const tag = tagged();
+        const made = await make(`${tag} Before`, { settings: { recall_characters: 4000 } });
+        expect(made.settings).toEqual({ recall_characters: 4000, max_notes: 200 });
+        const changed = await owner.memoryTypes.update(org(), made.id, {
+          name: `${tag} After`,
+          settings: { max_notes: 50 },
+          writes: "approve",
+        });
+        expect(changed).toMatchObject({
+          id: made.id,
+          name: `${tag} After`,
+          kind: MEMORY_KIND_NOTES,
+          writes: "approve",
+        });
+        // Settings are replaced whole: one left out takes the kind's default again.
+        expect(changed.settings).toEqual({ recall_characters: 8000, max_notes: 50 });
+        expect(await owner.memoryTypes.get(org(), made.id)).toEqual(changed);
+        // What an update doesn't send is kept, and the kind isn't something it can send.
+        const kept = await owner.memoryTypes.update(org(), made.id, {
+          kind: "other",
+        } as unknown as UpdateMemoryTypeInput);
+        expect([kept.name, kept.kind, kept.settings, kept.writes]).toEqual([
+          changed.name,
+          MEMORY_KIND_NOTES,
+          changed.settings,
+          changed.writes,
+        ]);
+        const refused = await failure(
+          owner.memoryTypes.update(org(), made.id, { settings: { max_notes: 1001, colour: "blue" } }),
+        );
+        expect(refusal(refused)).toEqual([422, "invalid_memory_settings", ["settings.colour", "settings.max_notes"]]);
+        expect(refusal(await failure(owner.memoryTypes.update(org(), made.id, { name: " " })))).toEqual([
+          400,
+          "validation_failed",
+          ["name"],
+        ]);
+        expect(
+          refusal(
+            await failure(
+              owner.memoryTypes.update(org(), made.id, { writes: "sometimes" } as unknown as UpdateMemoryTypeInput),
+            ),
+          ),
+        ).toEqual([400, "validation_failed", ["writes"]]);
+        const after = await owner.memoryTypes.get(org(), made.id);
+        expect([after.name, after.settings, after.writes]).toEqual([changed.name, changed.settings, changed.writes]);
+        // A type that isn't there is not found, whether its ID is unknown or malformed.
+        for (const id of MISSING_TYPES) {
+          for (const attempt of [
+            () => owner.memoryTypes.get(org(), id),
+            () => owner.memoryTypes.update(org(), id, { name: `${tag} x` }),
+            () => owner.memoryTypes.delete(org(), id),
+          ]) {
+            const error = await failure(attempt());
+            expect(`${error.status} ${error.code}`, id).toBe("404 not_found");
+          }
+        }
+        await owner.memoryTypes.delete(org(), made.id);
+      });
+
+      it("chooses the organization's default, one of its own types or none, and says who chose it", async () => {
+        const tag = tagged();
+        const me = (await owner.me.get()).user;
+        const previous = await owner.memoryTypes.getDefault(org());
+        const made = await make(`${tag} Default`);
+        const chosen = await owner.memoryTypes.setDefault(org(), { memory_type_id: made.id });
+        expect(chosen.memory_type).toMatchObject({ id: made.id, name: made.name, is_default: true });
+        expect(chosen.updated_at).not.toBeNull();
+        expect(chosen.updated_by?.id).toBe(me.id);
+        expect(await owner.memoryTypes.getDefault(org())).toEqual(chosen);
+        expect((await owner.memoryTypes.get(org(), made.id)).is_default).toBe(true);
+        // One default: whatever it replaced isn't any more.
+        const types = (await owner.memoryTypes.list(org(), { limit: 100 })).items;
+        expect(types.filter((t) => t.is_default).map((t) => t.id)).toEqual([made.id]);
+        // Every member and API key reads it.
+        expect(await as("viewer").memoryTypes.getDefault(org())).toEqual(chosen);
+        const { secret } = await owner.apiKeys.create(org(), { name: "Default reader", environment: "production" });
+        expect(await withKey(secret).memoryTypes.getDefault(org())).toEqual(chosen);
+        // Only a type of the organization.
+        for (const memory_type_id of MISSING_TYPES) {
+          const refused = await failure(owner.memoryTypes.setDefault(org(), { memory_type_id }));
+          expect(refusal(refused), memory_type_id).toEqual([422, "unknown_memory_type", ["memory_type_id"]]);
+        }
+        expect(await owner.memoryTypes.getDefault(org())).toEqual(chosen);
+        // None: agents on the default then run without memory.
+        const cleared = await owner.memoryTypes.setDefault(org(), { memory_type_id: null });
+        expect(cleared.memory_type).toBeNull();
+        expect(cleared.updated_at).not.toBeNull();
+        expect(cleared.updated_by?.id).toBe(me.id);
+        expect(await owner.memoryTypes.getDefault(org())).toEqual(cleared);
+        expect((await owner.memoryTypes.get(org(), made.id)).is_default).toBe(false);
+        await owner.memoryTypes.setDefault(org(), { memory_type_id: previous.memory_type?.id ?? null });
+        await owner.memoryTypes.delete(org(), made.id);
+      });
+
+      it("refuses deleting a type while it's the default or an agent's, naming them, and deletes it once free", async () => {
+        const tag = tagged();
+        const made = await make(`${tag} Held`);
+        const qa = fx.workspaces.qaPlayground;
+        const holder = await owner.agents.create(
+          qa.id,
+          agentInput(`${tag} holder`, { memory: "type", memory_type_id: made.id }),
+        );
+        expect((await owner.memoryTypes.get(org(), made.id)).agent_count).toBe(1);
+        const held = await failure(owner.memoryTypes.delete(org(), made.id));
+        expect([held.status, held.code, held.fields]).toEqual([
+          409,
+          "memory_type_in_use",
+          { agents: `${tag} holder (${qa.name})` },
+        ]);
+        expect(held.message).toContain(`${tag} holder (${qa.name})`);
+        // Its agent lets go; then it's held as the default.
+        await owner.agents.update(qa.id, holder.id, { memory: "default" });
+        expect((await owner.memoryTypes.get(org(), made.id)).agent_count).toBe(0);
+        const previous = await owner.memoryTypes.getDefault(org());
+        await owner.memoryTypes.setDefault(org(), { memory_type_id: made.id });
+        const asDefault = await failure(owner.memoryTypes.delete(org(), made.id));
+        expect([asDefault.status, asDefault.code, asDefault.fields]).toEqual([
+          409,
+          "memory_type_in_use",
+          { default_memory_type: made.name },
+        ]);
+        expect(asDefault.message).toContain(made.name);
+        await owner.memoryTypes.setDefault(org(), { memory_type_id: previous.memory_type?.id ?? null });
+        // Free: deleted, and gone.
+        await owner.memoryTypes.delete(org(), made.id);
+        for (const attempt of [
+          () => owner.memoryTypes.get(org(), made.id),
+          () => owner.memoryTypes.delete(org(), made.id),
+        ]) {
+          const gone = await failure(attempt());
+          expect(`${gone.status} ${gone.code}`).toBe("404 not_found");
+        }
+        expect(await listedWith(tag)).toEqual([]);
+        const named = await failure(owner.agents.update(qa.id, holder.id, { memory: "type", memory_type_id: made.id }));
+        expect(refusal(named)).toEqual([422, "unknown_memory_type", ["memory_type_id"]]);
+        await owner.agents.delete(qa.id, holder.id);
+      });
+
+      it("counts the agents that name a type in every workspace and environment, naming five at most", async () => {
+        const tag = tagged();
+        const made = await make(`${tag} Shared`);
+        const { qaPlayground, acmeSandbox, acme } = fx.workspaces;
+        const agents = [];
+        for (const [i, workspace] of [qaPlayground, acmeSandbox, acme, qaPlayground, acmeSandbox, acme].entries()) {
+          const input = agentInput(`${tag} agent ${i}`, { memory: "type", memory_type_id: made.id });
+          agents.push({ workspace, agent: await owner.agents.create(workspace.id, input) });
+        }
+        // An agent on the default isn't counted, even while the type is the default.
+        const onDefault = await owner.agents.create(qaPlayground.id, agentInput(`${tag} on the default`));
+        const previous = await owner.memoryTypes.getDefault(org());
+        await owner.memoryTypes.setDefault(org(), { memory_type_id: made.id });
+        expect((await owner.memoryTypes.get(org(), made.id)).agent_count).toBe(6);
+        const held = await failure(owner.memoryTypes.delete(org(), made.id));
+        expect([held.status, held.code, Object.keys(held.fields ?? {}).sort()]).toEqual([
+          409,
+          "memory_type_in_use",
+          ["agents", "default_memory_type"],
+        ]);
+        const named = must(held.fields?.agents, "the agents a refusal names");
+        expect(named.endsWith(", 1 more")).toBe(true);
+        const holders = agents.map(({ agent, workspace }) => `${agent.name} (${workspace.name})`);
+        expect(holders.filter((holder) => named.includes(holder))).toHaveLength(5);
+        expect(named).not.toContain(onDefault.name);
+        await owner.memoryTypes.setDefault(org(), { memory_type_id: previous.memory_type?.id ?? null });
+        for (const { agent, workspace } of agents) await owner.agents.delete(workspace.id, agent.id);
+        await owner.agents.delete(qaPlayground.id, onDefault.id);
+        await owner.memoryTypes.delete(org(), made.id);
+      });
+
+      it("lets go of a type when the agents naming it go, with their workspace too", async () => {
+        const tag = tagged();
+        const made = await make(`${tag} Released`);
+        const { qaPlayground, acmeSandbox } = fx.workspaces;
+        const input = agentInput(`${tag} holder`, { memory: "type", memory_type_id: made.id });
+        await owner.agents.create(qaPlayground.id, input);
+        const inSandbox = await owner.agents.create(acmeSandbox.id, input);
+        expect((await owner.memoryTypes.get(org(), made.id)).agent_count).toBe(2);
+        await owner.agents.delete(acmeSandbox.id, inSandbox.id);
+        expect((await owner.memoryTypes.get(org(), made.id)).agent_count).toBe(1);
+        await owner.workspaces.delete(qaPlayground.id);
+        expect((await owner.memoryTypes.get(org(), made.id)).agent_count).toBe(0);
+        await owner.memoryTypes.delete(org(), made.id);
+      });
+
+      it("keeps an agent on the default unless it names one of its organization's types, or turns memory off", async () => {
+        const tag = tagged();
+        const qa = fx.workspaces.qaPlayground.id;
+        const [first, second] = [await make(`${tag} First`), await make(`${tag} Second`)];
+        const count = async () => [
+          (await owner.memoryTypes.get(org(), first.id)).agent_count,
+          (await owner.memoryTypes.get(org(), second.id)).agent_count,
+        ];
+        const plain = await owner.agents.create(qa, agentInput(`${tag} plain`));
+        expect([plain.memory, plain.memory_type_id]).toEqual(["default", null]);
+        const off = await owner.agents.create(qa, agentInput(`${tag} off`, { memory: "off", memory_type_id: null }));
+        expect([off.memory, off.memory_type_id]).toEqual(["off", null]);
+        const typed = await owner.agents.create(
+          qa,
+          agentInput(`${tag} typed`, { memory: "type", memory_type_id: first.id }),
+        );
+        expect([typed.memory, typed.memory_type_id]).toEqual(["type", first.id]);
+        expect(await owner.agents.get(qa, typed.id)).toEqual(typed);
+        expect(await count()).toEqual([1, 0]);
+        // `type` needs a memory type, and a memory type needs `type`.
+        const mismatched: MemoryInput[] = [
+          { memory: "type" },
+          { memory: "type", memory_type_id: null },
+          { memory_type_id: first.id },
+          { memory: "default", memory_type_id: first.id },
+          { memory: "off", memory_type_id: first.id },
+        ];
+        for (const memory of mismatched) {
+          const refused = await failure(owner.agents.create(qa, agentInput(`${tag} refused`, memory)));
+          expect(refusal(refused), JSON.stringify(memory)).toEqual([400, "validation_failed", ["memory_type_id"]]);
+        }
+        for (const memory_type_id of MISSING_TYPES) {
+          const refused = await failure(
+            owner.agents.create(qa, agentInput(`${tag} refused`, { memory: "type", memory_type_id })),
+          );
+          expect(refusal(refused), memory_type_id).toEqual([422, "unknown_memory_type", ["memory_type_id"]]);
+        }
+        const unknown = await failure(
+          owner.agents.create(qa, agentInput(`${tag} refused`, { memory: "sometimes" as AgentMemory })),
+        );
+        expect(refusal(unknown)).toEqual([400, "validation_failed", ["memory"]]);
+        expect((await owner.agents.list(qa)).filter((a) => a.name === `${tag} refused`)).toEqual([]);
+
+        // An update keeps what it doesn't send.
+        const renamed = await owner.agents.update(qa, typed.id, { name: `${tag} renamed` });
+        expect([renamed.memory, renamed.memory_type_id]).toEqual(["type", first.id]);
+        const again = await owner.agents.update(qa, typed.id, { memory: "type" });
+        expect([again.memory, again.memory_type_id]).toEqual(["type", first.id]);
+        // A memory type alone moves an agent on `type` to it.
+        const moved = await owner.agents.update(qa, typed.id, { memory_type_id: second.id });
+        expect([moved.memory, moved.memory_type_id]).toEqual(["type", second.id]);
+        expect(await count()).toEqual([0, 1]);
+        // `off` and `default` clear it.
+        const cleared = await owner.agents.update(qa, typed.id, { memory: "off" });
+        expect([cleared.memory, cleared.memory_type_id]).toEqual(["off", null]);
+        expect(await count()).toEqual([0, 0]);
+        await owner.agents.update(qa, typed.id, { memory: "type", memory_type_id: first.id });
+        const back = await owner.agents.update(qa, typed.id, { memory: "default", memory_type_id: null });
+        expect([back.memory, back.memory_type_id]).toEqual(["default", null]);
+        // An agent ends on `type` with a type, or on another memory with none; a refused update changes nothing.
+        const onType = await owner.agents.update(qa, plain.id, { memory: "type", memory_type_id: first.id });
+        for (const [agent, memory] of [
+          [off, { memory_type_id: first.id }],
+          [off, { memory: "type" }],
+          [off, { memory: "default", memory_type_id: first.id }],
+          [onType, { memory_type_id: null }],
+          [onType, { memory: "type", memory_type_id: null }],
+        ] as [typeof off, MemoryInput][]) {
+          const refused = await failure(owner.agents.update(qa, agent.id, memory));
+          expect(refusal(refused), `${agent.name} ${JSON.stringify(memory)}`).toEqual([
+            400,
+            "validation_failed",
+            ["memory_type_id"],
+          ]);
+        }
+        for (const memory_type_id of MISSING_TYPES) {
+          const refused = await failure(owner.agents.update(qa, onType.id, { memory_type_id }));
+          expect(refusal(refused), memory_type_id).toEqual([422, "unknown_memory_type", ["memory_type_id"]]);
+        }
+        expect(await owner.agents.get(qa, onType.id)).toEqual(onType);
+        expect(await owner.agents.get(qa, off.id)).toEqual(off);
+        for (const agent of [plain, off, typed]) await owner.agents.delete(qa, agent.id);
+        for (const type of [first, second]) await owner.memoryTypes.delete(org(), type.id);
+      });
+
+      it("lets owners and admins change memory types and the default, from the Console only", async () => {
+        const tag = tagged();
+        const made = await make(`${tag} Roles`);
+        const changes = (c: ZupflowClient): [string, () => Promise<unknown>][] => [
+          ["createMemoryType", () => make(`${tag} theirs`, {}, c)],
+          ["updateMemoryType", () => c.memoryTypes.update(org(), made.id, { name: `${tag} renamed` })],
+          ["updateDefaultMemoryType", () => c.memoryTypes.setDefault(org(), { memory_type_id: made.id })],
+          ["deleteMemoryType", () => c.memoryTypes.delete(org(), made.id)],
+        ];
+        const reads = async (c: ZupflowClient) =>
+          JSON.stringify([
+            await c.memoryKinds.list(org()),
+            await c.memoryTypes.list(org(), { limit: 100 }),
+            await c.memoryTypes.get(org(), made.id),
+            await c.memoryTypes.getDefault(org()),
+          ]);
+        const before = await reads(owner);
+        for (const persona of ["developer", "viewer"] as const) {
+          for (const [what, change] of changes(as(persona))) {
+            const error = await failure(change());
+            expect(`${error.status} ${error.code}`, `${persona}: ${what}`).toBe("403 forbidden");
+          }
+          // Every member reads them.
+          expect(await reads(as(persona)), persona).toBe(before);
+        }
+        // API keys of either environment read them, and change none.
+        for (const environment of ["sandbox", "production"] as const) {
+          const { secret } = await owner.apiKeys.create(org(), { name: `Memory ${environment}`, environment });
+          const key = withKey(secret);
+          for (const [what, change] of changes(key)) {
+            const error = await failure(change());
+            expect(`${error.status} ${error.code}`, `${environment} key: ${what}`).toBe("403 console_only");
+          }
+          expect(await reads(key), environment).toBe(before);
+        }
+        expect(await reads(owner)).toBe(before);
+        // An admin may: the developer, made one.
+        const developerId = (await as("developer").me.get()).user.id;
+        const developer = must(
+          (await owner.members.list(org())).find((m) => m.user.id === developerId),
+          "the developer's membership",
+        );
+        await owner.members.update(org(), developer.id, { role: "admin" });
+        const admin = as("developer");
+        const theirs = await make(`${tag} theirs`, {}, admin);
+        expect((await admin.memoryTypes.update(org(), theirs.id, { writes: "deny" })).writes).toBe("deny");
+        const previous = await owner.memoryTypes.getDefault(org());
+        const chosen = await admin.memoryTypes.setDefault(org(), { memory_type_id: theirs.id });
+        expect([chosen.memory_type?.id, chosen.updated_by?.id]).toEqual([theirs.id, developerId]);
+        await admin.memoryTypes.setDefault(org(), { memory_type_id: previous.memory_type?.id ?? null });
+        await admin.memoryTypes.delete(org(), theirs.id);
+        await owner.members.update(org(), developer.id, { role: "developer" });
+        await owner.memoryTypes.delete(org(), made.id);
+      });
+
+      it("keeps one organization's memory types to itself: not found elsewhere, and never named", async () => {
+        const tag = tagged();
+        const made = await make(`${tag} Private`);
+        const outsider = as("outsider");
+        const other = fx.otherOrganization;
+        const { secret } = await outsider.apiKeys.create(other, { name: "Other memory", environment: "sandbox" });
+        const otherKey = withKey(secret);
+        for (const [what, attempt] of [
+          ["get through its own organization", () => outsider.memoryTypes.get(other, made.id)],
+          ["rename through its own organization", () => outsider.memoryTypes.update(other, made.id, { name: "x" })],
+          ["delete through its own organization", () => outsider.memoryTypes.delete(other, made.id)],
+          ["read the kinds", () => outsider.memoryKinds.list(org())],
+          ["list", () => outsider.memoryTypes.list(org())],
+          ["make one", () => outsider.memoryTypes.create(org(), { name: `${tag} x`, kind: MEMORY_KIND_NOTES })],
+          ["get", () => outsider.memoryTypes.get(org(), made.id)],
+          ["rename", () => outsider.memoryTypes.update(org(), made.id, { name: "x" })],
+          ["delete", () => outsider.memoryTypes.delete(org(), made.id)],
+          ["read the default", () => outsider.memoryTypes.getDefault(org())],
+          ["clear the default", () => outsider.memoryTypes.setDefault(org(), { memory_type_id: null })],
+          ["get with a key, through its own organization", () => otherKey.memoryTypes.get(other, made.id)],
+          ["get with a key", () => otherKey.memoryTypes.get(org(), made.id)],
+          ["list with a key", () => otherKey.memoryTypes.list(org())],
+          ["read the default with a key", () => otherKey.memoryTypes.getDefault(org())],
+        ] as [string, () => Promise<unknown>][]) {
+          const error = await failure(attempt());
+          expect(`${error.status} ${error.code}`, what).toBe("404 not_found");
+        }
+        // Nor is it the other organization's to choose as its default, or to give its agents.
+        const fallback = await failure(outsider.memoryTypes.setDefault(other, { memory_type_id: made.id }));
+        expect(refusal(fallback)).toEqual([422, "unknown_memory_type", ["memory_type_id"]]);
+        const harbor = must(
+          (await outsider.workspaces.list(other, { environment: "sandbox", limit: 100 })).items[0],
+          "the other organization's Sandbox workspace",
+        );
+        const named = await failure(
+          outsider.agents.create(harbor.id, agentInput(`${tag} theirs`, { memory: "type", memory_type_id: made.id })),
+        );
+        expect(refusal(named)).toEqual([422, "unknown_memory_type", ["memory_type_id"]]);
+        const theirs = await outsider.agents.create(harbor.id, agentInput(`${tag} theirs`));
+        const moved = await failure(
+          outsider.agents.update(harbor.id, theirs.id, { memory: "type", memory_type_id: made.id }),
+        );
+        expect(refusal(moved)).toEqual([422, "unknown_memory_type", ["memory_type_id"]]);
+        // Each organization's default is its own.
+        const theirDefault = await outsider.memoryTypes.getDefault(other);
+        const previous = await owner.memoryTypes.getDefault(org());
+        await owner.memoryTypes.setDefault(org(), { memory_type_id: made.id });
+        expect(await outsider.memoryTypes.getDefault(other)).toEqual(theirDefault);
+        const seen = JSON.stringify([
+          await outsider.memoryTypes.list(other, { limit: 100 }),
+          theirDefault,
+          await outsider.agents.get(harbor.id, theirs.id),
+        ]);
+        expect(seen).not.toContain(made.id);
+        await owner.memoryTypes.setDefault(org(), { memory_type_id: previous.memory_type?.id ?? null });
+        expect(await owner.memoryTypes.get(org(), made.id)).toEqual(made);
+        await outsider.agents.delete(harbor.id, theirs.id);
+        await owner.memoryTypes.delete(org(), made.id);
+      });
+
+      it("replays making a memory type with the same key, and refuses the key for another", async () => {
+        const tag = tagged();
+        const options = { idempotencyKey: `memory-type-${tag}` };
+        const input = { name: `${tag} Once`, kind: MEMORY_KIND_NOTES };
+        const first = await owner.memoryTypes.create(org(), input, options);
+        expect(await owner.memoryTypes.create(org(), input, options)).toEqual(first);
+        expect((await listedWith(tag)).map((t) => t.id)).toEqual([first.id]);
+        const reused = await failure(owner.memoryTypes.create(org(), { ...input, name: `${tag} Twice` }, options));
+        expect([reused.status, reused.code]).toEqual([422, "idempotency_key_reused"]);
+        expect((await listedWith(tag)).map((t) => t.id)).toEqual([first.id]);
+        await owner.memoryTypes.delete(org(), first.id);
+      });
+
+      it("records each change to memory types and the default, naming the type", async () => {
+        const tag = tagged();
+        const me = (await owner.me.get()).user;
+        const previous = await owner.memoryTypes.getDefault(org());
+        const made = await make(`${tag} Audited`);
+        await owner.memoryTypes.update(org(), made.id, { name: `${tag} Renamed` });
+        await owner.memoryTypes.setDefault(org(), { memory_type_id: made.id });
+        await owner.memoryTypes.setDefault(org(), { memory_type_id: null });
+        await owner.memoryTypes.delete(org(), made.id);
+        const events = (await owner.audit.list(org(), { limit: 5 })).items;
+        const recorded = events.map((e) => ({
+          action: e.action,
+          target: [e.target.type, e.target.id, e.target.name],
+          where: [e.workspace_id, e.environment],
+        }));
+        expect(recorded).toHaveLength(5);
+        // Organization-wide: in no workspace and no environment.
+        expect(recorded).toEqual(
+          expect.arrayContaining([
+            { action: "memory_type.created", target: ["memory_type", made.id, `${tag} Audited`], where: [null, null] },
+            { action: "memory_type.updated", target: ["memory_type", made.id, `${tag} Renamed`], where: [null, null] },
+            {
+              action: "default_memory_type.updated",
+              target: ["default_memory_type", made.id, `${tag} Renamed`],
+              where: [null, null],
+            },
+            {
+              action: "default_memory_type.updated",
+              target: ["default_memory_type", null, "None"],
+              where: [null, null],
+            },
+            { action: "memory_type.deleted", target: ["memory_type", made.id, `${tag} Renamed`], where: [null, null] },
+          ]),
+        );
+        for (const event of events) expect(event.actor).toEqual({ type: "user", id: me.id, name: me.name });
+        await owner.memoryTypes.setDefault(org(), { memory_type_id: previous.memory_type?.id ?? null });
+      });
+    });
+
     describe("channels", () => {
       const sandbox = () => fx.workspaces.acmeSandbox.id;
       const link = (workspaceId: WorkspaceId, client: ZupflowClient = owner, tokens: typeof TOKENS = TOKENS) =>
@@ -4504,6 +5171,8 @@ export function contractSuite(target: Target) {
         const model = () => must(t.model, "model");
         // Read only by the channel changes, which are dropped when the target doesn't serve them.
         const channel = () => must(t.channel, "channels");
+        // Read only by the memory type changes, which are dropped when the target doesn't serve them.
+        const memoryType = () => must(t.memoryType, "memory type");
         const changes: [string, () => Promise<unknown>][] = [
           ["updateOrganization", () => c.organizations.update(t.org, { name: "Viewed" })],
           ["inviteMember", () => c.members.invite(t.org, { email: "v@northwind.example", role: "developer" })],
@@ -4649,6 +5318,10 @@ export function contractSuite(target: Target) {
           ["updateDefaultModel", () => c.models.setDefault(t.org, model().environment, { model_id: null })],
           ["deleteModel", () => c.models.delete(t.org, model().id)],
           ["deleteModelConnection", () => c.modelConnections.delete(t.org, connection().id)],
+          ["createMemoryType", () => c.memoryTypes.create(t.org, { name: "Viewed", kind: MEMORY_KIND_NOTES })],
+          ["updateMemoryType", () => c.memoryTypes.update(t.org, memoryType().id, { name: "Viewed" })],
+          ["updateDefaultMemoryType", () => c.memoryTypes.setDefault(t.org, { memory_type_id: null })],
+          ["deleteMemoryType", () => c.memoryTypes.delete(t.org, memoryType().id)],
           ["createApiKey", () => c.apiKeys.create(t.org, { name: "x", environment: "sandbox" })],
           ["revokeApiKey", () => c.apiKeys.revoke(t.org, sandboxKey)],
           [
@@ -4745,6 +5418,10 @@ export function contractSuite(target: Target) {
           "resendWebhookDelivery",
           "updateChannelToolLevels",
           "updateChannelSettings",
+          "createMemoryType",
+          "updateMemoryType",
+          "deleteMemoryType",
+          "updateDefaultMemoryType",
         ]);
         const t = await northwind();
         const changes = changesBy(as("developer"), t, await sandboxKey());

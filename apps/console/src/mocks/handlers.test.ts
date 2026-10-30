@@ -29,6 +29,7 @@ import {
   type InstallationConnectResult,
   type InstallationId,
   type InstallationTool,
+  MEMORY_KIND_NOTES,
   type OrganizationId,
   type WorkspaceId,
   ZupflowApiError,
@@ -4075,6 +4076,126 @@ describe("model providers", () => {
       ["model.created", "sandbox"],
       ["model_connection.created", "sandbox"],
     ]);
+  });
+});
+
+describe("memory types", () => {
+  const northwind = () => must(northwindId(), "Northwind");
+  const larkspur = () => must(db().organizations.find((o) => o.slug === "larkspur")?.id, "Larkspur");
+  /** Larkspur's owner, acting in Larkspur. */
+  const outsider = () =>
+    clientFor(
+      must(db().memberships.find((m) => m.organization_id === larkspur() && m.role === "owner")?.user_id, "owner"),
+      larkspur,
+    );
+  const notes = () => must(db().memory_types.find((t) => t.organization_id === northwind() && t.name === "Notes"));
+
+  it("seeds the demo organization's notes as its default, with every agent on the default", async () => {
+    const d = db();
+    expect(d.memory_kinds).toEqual([MEMORY_KIND_NOTES]);
+    // Only the demo organization has memory; the others start as a new organization does.
+    expect(d.memory_types.map((t) => [t.organization_id, t.name, t.kind, t.settings, t.writes])).toEqual([
+      [northwind(), "Notes", MEMORY_KIND_NOTES, { max_notes: 200, recall_characters: 8000 }, "allow"],
+    ]);
+    expect(d.default_memory_types.map((r) => [r.organization_id, r.memory_type_id, r.updated_by_user_id])).toEqual([
+      [northwind(), notes().id, DEMO_USER_ID],
+    ]);
+    for (const agent of d.agents) expect([agent.memory, agent.memory_type_id], agent.name).toEqual(["default", null]);
+    const chosen = await owner.memoryTypes.getDefault(northwind());
+    expect(chosen.memory_type).toMatchObject({ id: notes().id, served: true, is_default: true, agent_count: 0 });
+    expect(await outsider().memoryTypes.getDefault(larkspur())).toEqual({
+      memory_type: null,
+      updated_at: null,
+      updated_by: null,
+    });
+    expect((await outsider().memoryTypes.list(larkspur())).items).toEqual([]);
+  });
+
+  it("keeps a type whose kind isn't served: not served, settings as stored, and no new ones of it", async () => {
+    const stored = { max_notes: 5, recall_characters: 10, retired: true };
+    notes().settings = stored;
+    db().memory_kinds = [];
+    expect(await owner.memoryKinds.list(northwind())).toEqual([]);
+    const read = await owner.memoryTypes.get(northwind(), notes().id);
+    expect([read.served, read.settings, read.is_default]).toEqual([false, stored, true]);
+    const refused = await failure(
+      owner.memoryTypes.create(northwind(), { name: "More notes", kind: MEMORY_KIND_NOTES }),
+    );
+    expect([refused.status, refused.code, Object.keys(refused.fields ?? {})]).toEqual([
+      422,
+      "unknown_memory_kind",
+      ["kind"],
+    ]);
+    // Nothing here can check its settings, so they're kept as given.
+    const updated = await owner.memoryTypes.update(northwind(), notes().id, { settings: { anything: "goes" } });
+    expect([updated.served, updated.settings]).toEqual([false, { anything: "goes" }]);
+    // Still a type of the organization: an agent may name it, and it's held while one does.
+    const agent = await owner.agents.create(ws("qa-playground").id, {
+      name: "Unserved memory",
+      description: "",
+      instructions: "",
+      memory: "type",
+      memory_type_id: notes().id,
+    });
+    expect([agent.memory, agent.memory_type_id]).toEqual(["type", notes().id]);
+    expect((await owner.memoryTypes.get(northwind(), notes().id)).agent_count).toBe(1);
+  });
+
+  it("never counts, defaults or holds a type with another organization's rows", async () => {
+    const type = notes();
+    const harbor = ws("harbor");
+    // Mislabelled: another organization's agent and default naming this organization's type.
+    const stray = must(db().agents.find((a) => a.organization_id === larkspur() && a.workspace_id === harbor.id));
+    Object.assign(stray, { memory: "type", memory_type_id: type.id });
+    db().default_memory_types.push({
+      organization_id: larkspur(),
+      memory_type_id: type.id,
+      updated_at: new Date().toISOString(),
+      updated_by_user_id: null,
+    });
+    // Its own organization stops holding it, so only the stray rows could.
+    await owner.memoryTypes.setDefault(northwind(), { memory_type_id: null });
+    const read = await owner.memoryTypes.get(northwind(), type.id);
+    expect([read.agent_count, read.is_default]).toEqual([0, false]);
+    expect((await outsider().memoryTypes.getDefault(larkspur())).memory_type).toBeNull();
+    await owner.memoryTypes.delete(northwind(), type.id);
+    expect(db().memory_types.some((t) => t.id === type.id)).toBe(false);
+  });
+
+  it("keeps a type's idempotency record in its organization, outside every workspace", async () => {
+    const options = { idempotencyKey: "memory-type-record" };
+    const made = await owner.memoryTypes.create(northwind(), { name: "Recorded", kind: MEMORY_KIND_NOTES }, options);
+    const row = must(db().idempotency_keys.find((r) => r.key === options.idempotencyKey));
+    expect([row.organization_id, row.workspace_id, row.state, row.status]).toEqual([
+      northwind(),
+      null,
+      "completed",
+      201,
+    ]);
+    expect(await owner.memoryTypes.create(northwind(), { name: "Recorded", kind: MEMORY_KIND_NOTES }, options)).toEqual(
+      made,
+    );
+    expect(db().memory_types.filter((t) => t.organization_id === northwind() && t.name === "Recorded")).toHaveLength(1);
+  });
+
+  it("changes nothing when an update is refused partway", async () => {
+    const qa = ws("qa-playground");
+    const agent = await owner.agents.create(qa.id, { name: "Unchanged", description: "", instructions: "" });
+    const before = structuredClone(must(db().agents.find((a) => a.id === agent.id)));
+    // A valid name and model with an invalid memory: none of it is applied.
+    const refused = await failure(
+      owner.agents.update(qa.id, agent.id, { name: "Changed", model_id: null, memory: "type", memory_type_id: null }),
+    );
+    expect([refused.status, refused.code]).toEqual([400, "validation_failed"]);
+    expect(must(db().agents.find((a) => a.id === agent.id))).toEqual(before);
+    const type = notes();
+    const typeBefore = structuredClone(type);
+    const taken = await owner.memoryTypes.create(northwind(), { name: "Taken", kind: MEMORY_KIND_NOTES });
+    const conflict = await failure(
+      owner.memoryTypes.update(northwind(), type.id, { name: taken.name, settings: { max_notes: 1 }, writes: "deny" }),
+    );
+    expect([conflict.status, conflict.code]).toEqual([409, "memory_type_name_taken"]);
+    expect(notes()).toEqual(typeBefore);
   });
 });
 

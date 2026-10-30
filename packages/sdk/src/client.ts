@@ -45,12 +45,14 @@ import type {
   CreatedConnectSession,
   CreatedWebhookEndpoint,
   CreateGrantInput,
+  CreateMemoryTypeInput,
   CreateModelConnectionInput,
   CreateModelInput,
   CreateOrganizationInput,
   CreateRunInput,
   CreateWebhookEndpointInput,
   CreateWorkspaceInput,
+  DefaultMemoryType,
   DefaultModel,
   Environment,
   GrantId,
@@ -62,6 +64,9 @@ import type {
   InviteMemberInput,
   Member,
   MemberId,
+  MemoryKind,
+  MemoryType,
+  MemoryTypeId,
   Model,
   ModelConnection,
   ModelConnectionId,
@@ -95,10 +100,12 @@ import type {
   UpdateChannelToolLevelsInput,
   UpdateConfigurationInput,
   UpdateConnectSettingsInput,
+  UpdateDefaultMemoryTypeInput,
   UpdateDefaultModelInput,
   UpdateGrantInput,
   UpdateInstallationInput,
   UpdateMemberInput,
+  UpdateMemoryTypeInput,
   UpdateModelConnectionInput,
   UpdateModelInput,
   UpdateOrganizationInput,
@@ -425,6 +432,29 @@ export function createClient(transport: Transport) {
         get<DefaultModel>(`${org(organizationId)}/default-models/${environment}`),
       setDefault: (organizationId: OrganizationId, environment: Environment, input: UpdateDefaultModelInput) =>
         send<DefaultModel>("PUT", `${org(organizationId)}/default-models/${environment}`, input),
+    },
+
+    /** The memory kinds this server serves. */
+    memoryKinds: {
+      list: (organizationId: OrganizationId) => get<MemoryKind[]>(`${org(organizationId)}/memory-kinds`),
+    },
+
+    /** The organization's memory types and its default, the same in both environments. */
+    memoryTypes: {
+      list: (organizationId: OrganizationId, query: PageQuery = {}) =>
+        getPage<MemoryType>(`${org(organizationId)}/memory-types`, { ...query }),
+      create: (organizationId: OrganizationId, input: CreateMemoryTypeInput, options?: PostOptions) =>
+        post<MemoryType>(`${org(organizationId)}/memory-types`, input, options),
+      get: (organizationId: OrganizationId, memoryTypeId: MemoryTypeId) =>
+        get<MemoryType>(`${org(organizationId)}/memory-types/${enc(memoryTypeId)}`),
+      update: (organizationId: OrganizationId, memoryTypeId: MemoryTypeId, input: UpdateMemoryTypeInput) =>
+        send<MemoryType>("PATCH", `${org(organizationId)}/memory-types/${enc(memoryTypeId)}`, input),
+      delete: (organizationId: OrganizationId, memoryTypeId: MemoryTypeId) =>
+        send<void>("DELETE", `${org(organizationId)}/memory-types/${enc(memoryTypeId)}`),
+      getDefault: (organizationId: OrganizationId) =>
+        get<DefaultMemoryType>(`${org(organizationId)}/default-memory-type`),
+      setDefault: (organizationId: OrganizationId, input: UpdateDefaultMemoryTypeInput) =>
+        send<DefaultMemoryType>("PUT", `${org(organizationId)}/default-memory-type`, input),
     },
 
     connectSettings: {

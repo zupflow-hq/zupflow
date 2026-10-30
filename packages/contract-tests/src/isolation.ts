@@ -79,6 +79,9 @@ export async function loadTenant(
     model: await ifServed(async () => must((await client.models.list(org, { limit: 1 })).items[0], "model")),
     hook: must((await client.webhooks.list(org))[0], "webhook"),
     member: must((await client.members.list(org))[0], "member"),
+    // A memory type, where the target serves them and the organization has one; their attempts are left out
+    // otherwise.
+    memoryType: await ifServed(async () => (await client.memoryTypes.list(org, { limit: 1 })).items[0]),
     // Channels, where the target serves them: the fixture's linked team, its installed app and connection.
     channel: await ifServed(async () => {
       const connection = must(
@@ -148,6 +151,10 @@ export async function snapshotOf(client: ZupflowClient, t: Tenant): Promise<stri
     await ifServed(() => client.modelConnections.list(t.org)),
     await ifServed(() => client.models.list(t.org, { limit: 100 })),
     await ifServed(() => Promise.all(ENVIRONMENTS.map((env) => client.models.getDefault(t.org, env)))),
+    await ifServed(async () => [
+      await client.memoryTypes.list(t.org, { limit: 100 }),
+      await client.memoryTypes.getDefault(t.org),
+    ]),
     await ifServed(() => channelSnapshot(client, t, agents)),
     await client.webhooks.list(t.org),
     await client.audit.list(t.org, { limit: 100 }),
@@ -397,6 +404,30 @@ export function attempts(
           ["[victim org] set default model", () => r.models.setDefault(v.org, model.environment, { model_id: null })],
         ]
       : [];
+  // Memory types, only where the target serves them and the organization has one (loadTenant found it then).
+  const { memoryType } = v;
+  const victimMemoryAttempts: [string, () => Promise<unknown>][] = memoryType
+    ? [
+        ["[victim org] memory kinds", () => r.memoryKinds.list(v.org)],
+        ["[victim org] list memory types", () => r.memoryTypes.list(v.org)],
+        ["[victim org] make memory type", () => r.memoryTypes.create(v.org, { name: "Owned", kind: memoryType.kind })],
+        ["[victim org] get memory type", () => r.memoryTypes.get(v.org, memoryType.id)],
+        ["[victim org] rename memory type", () => r.memoryTypes.update(v.org, memoryType.id, { name: "Owned" })],
+        ["[victim org] delete memory type", () => r.memoryTypes.delete(v.org, memoryType.id)],
+        ["[victim org] default memory type", () => r.memoryTypes.getDefault(v.org)],
+        ["[victim org] clear default memory type", () => r.memoryTypes.setDefault(v.org, { memory_type_id: null })],
+      ]
+    : [];
+  const ownMemoryAttempts: [string, () => Promise<unknown>][] = memoryType
+    ? [
+        ["[own org] memory type via own org", () => r.memoryTypes.get(own.org, memoryType.id)],
+        [
+          "[own org] rename memory type via own org",
+          () => r.memoryTypes.update(own.org, memoryType.id, { name: "Owned" }),
+        ],
+        ["[own org] delete memory type via own org", () => r.memoryTypes.delete(own.org, memoryType.id)],
+      ]
+    : [];
   const ownModelAttempts: [string, () => Promise<unknown>][] =
     connection && model
       ? [
@@ -530,6 +561,7 @@ export function attempts(
     ["[victim org] test webhook", () => r.webhooks.sendTest(v.org, v.hook.id)],
     ["[victim org] delete webhook", () => r.webhooks.delete(v.org, v.hook.id)],
     ...victimModelAttempts,
+    ...victimMemoryAttempts,
     ...channelAttempts(r, own, v, prepared),
     // The victim's child IDs, through the attacker's own organization and workspace.
     ["[own org] org app via own org", () => r.organizationApps.get(own.org, v.orgApp.id)],
@@ -553,6 +585,7 @@ export function attempts(
       () => r.toolPolicy.setLevels(own.org, v.orgApp.id, { levels: [{ tool: "x", level: "allow" }] }),
     ],
     ...ownModelAttempts,
+    ...ownMemoryAttempts,
     ["[own org] member via own org", () => r.members.update(own.org, v.member.id, { role: "owner" })],
     ["[own org] remove member via own org", () => r.members.remove(own.org, v.member.id)],
     ["[own workspace] agent via own workspace", () => r.agents.get(own.workspace.id, v.agent.id)],
