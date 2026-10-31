@@ -18,7 +18,9 @@
 //! keeps the recall it started with, and no session keeps recall text once
 //! it's marked and no run of it is under way. The recall a session keeps
 //! counts in its history budget as no more than half of it, and a run
-//! carries the budget.
+//! carries the budget. A run whose call to an app's tool completed, or
+//! failed with the tool's own error, marks its session as it ends, for
+//! every later run of it, a trim included.
 //! A message is read back byte for byte as it was recorded. Every change is
 //! made only by an editor who still may, and an agent's apps go with it.
 //! An app is made at least once: an attempt marks it before the provider is
@@ -63,8 +65,8 @@ use zupflow_core::connect::{ConnectIntent, ConnectSessionStatus, ConnectStore, N
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{
     AgentChannelId, AgentId, ApiKeyId, ChannelAppId, ChannelAppManagerId, ChannelConnectionId, ChannelConversationId,
-    ChannelMessageId, ConnectSessionId, MemberId, MemoryId, MemoryTypeId, ModelConnectionId, ModelId, OrganizationId,
-    RunId, ToolCallId, UserId, WorkspaceId,
+    ChannelMessageId, ConnectSessionId, InstallationId, MemberId, MemoryId, MemoryTypeId, ModelConnectionId, ModelId,
+    OrganizationId, RunId, ToolCallId, UserId, WorkspaceId,
 };
 use zupflow_core::installations::ShortId;
 use zupflow_core::jobs::{JobOptions, JobQueue};
@@ -76,18 +78,23 @@ use zupflow_core::memory::{
 };
 use zupflow_core::model_store::{RouteState, RunModel};
 use zupflow_core::models::Message;
-use zupflow_core::models::{Completion, Reply, TokenUsage};
+use zupflow_core::models::{Completion, ModelToolCall, Reply, TokenUsage};
 use zupflow_core::policy::ToolLevel;
 use zupflow_core::runs::QueuedJob;
+use zupflow_core::runs::digest::Sha256Digest;
 use zupflow_core::runs::history::{text_weight, weight};
-use zupflow_core::runs::names::{Offer, memory_tool};
-use zupflow_core::runs::reducer::{Facts, Io, ModelAnswer, ModelResult, SESSION_REMOVED, advance, cancel};
+use zupflow_core::runs::names::{Candidate, Offer, build_offer, memory_tool};
+use zupflow_core::runs::reducer::{
+    Facts, InstallationCheck, Io, ModelAnswer, ModelResult, SESSION_REMOVED, SendCheck, SendResult, advance,
+    calls_to_decide, cancel,
+};
 use zupflow_core::runs::state::{
-    ClaimantId, Continuation, FrozenMemory, InvocationId, RequestId, SessionMemory, SessionRecall, Snapshot,
+    CallDecision, CallVerdict, ClaimantId, Continuation, FrozenMemory, InvocationId, RequestId, SessionMemory,
+    SessionRecall, Snapshot,
 };
 use zupflow_core::runs::store::{Applied, RunStore};
-use zupflow_core::runs::transition::Operation;
-use zupflow_core::runs::{RunStatus, RunTrigger};
+use zupflow_core::runs::transition::{Operation, SendOutcome};
+use zupflow_core::runs::{CallState, RunStatus, RunTrigger};
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
 
@@ -152,6 +159,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     marks_only_the_sessions_whose_audience_may_recall_a_change(&stores, &prepare).await;
     drops_a_sessions_memory_once_its_conversation_is_shared(&stores, &prepare).await;
     counts_a_sessions_recall_in_its_history_budget(&stores, &prepare).await;
+    marks_a_run_session_once_a_run_reads_an_apps_result(&stores, &prepare).await;
     counts_the_breaker_under_concurrency(&stores, &prepare).await;
     counts_runs_and_reads_each_message_once(&stores, &prepare).await;
     links_a_team_through_a_connect_session(&stores, &prepare).await;
@@ -2402,6 +2410,209 @@ async fn counts_a_sessions_recall_in_its_history_budget(stores: &Stores<'_>, pre
         [Some(SHORT.to_owned())],
         "what the session kept"
     );
+}
+
+/// An app's tool, on one of the agent's installations.
+const APP_TOOL: &str = "taskboard_k7m2qd_list_tasks";
+
+/// [`template`], offering [`APP_TOOL`].
+fn offering_an_app() -> SessionTemplate {
+    let built = build_offer([Candidate {
+        installation_id: InstallationId::generate(),
+        installation_short_id: "k7m2qd".to_owned(),
+        installation_label: "Work".to_owned(),
+        app_key: "taskboard".to_owned(),
+        app_name: "Taskboard".to_owned(),
+        tool: "list_tasks".to_owned(),
+        description: "Lists the tasks.".to_owned(),
+        input_schema: serde_json::json!({ "type": "object" }),
+        definition_sha256: Sha256Digest::of(b"list_tasks"),
+    }]);
+    assert!(built.offer.find(APP_TOOL).is_some(), "{:?}", built.offer);
+    SessionTemplate {
+        offer: built.offer,
+        ..template()
+    }
+}
+
+/// The policy's decision on a call: `verdict`.
+fn decided(verdict: CallVerdict) -> CallDecision {
+    CallDecision {
+        verdict,
+        policy: "configured".to_owned(),
+        mode: Some("manual".to_owned()),
+        rule: "suite".to_owned(),
+    }
+}
+
+/// Drives a run as [`answer_run`] does, its first answer asking for
+/// [`APP_TOOL`] once, as `decision` decides, and the app answering
+/// `outcome` once the call is sent: the call's state as the run ends.
+async fn answer_calling(
+    stores: &Stores<'_>,
+    org: OrganizationId,
+    ws: WorkspaceId,
+    run: RunId,
+    decision: &CallDecision,
+    outcome: &SendOutcome,
+) -> CallState {
+    let invocation_id = InvocationId::from_uuid(uuid::Uuid::now_v7());
+    let mut facts = Facts {
+        claimant: Some(ClaimantId::from_uuid(uuid::Uuid::now_v7())),
+        offer: Some(Offer::default()),
+        model_route: Some(RouteState::Usable { key_version: 1 }),
+        invocation_id: Some(invocation_id),
+        call_ids: vec![ToolCallId::generate()],
+        ..Facts::at(now())
+    };
+    let mut asked = false;
+    for _ in 0..12 {
+        let snapshot = stores.runs.find_snapshot(org, ws, run).await.unwrap().expect("the run");
+        facts.model = None;
+        facts.decisions.clear();
+        facts.send_check = None;
+        facts.sent = None;
+        match snapshot.control.continuation {
+            Continuation::Done => return snapshot.calls.first().expect("the run's call").state,
+            Continuation::AwaitModel { turn, attempt } => {
+                let reply = if asked {
+                    Reply::Text("Done.".to_owned())
+                } else {
+                    Reply::ToolCalls {
+                        text: None,
+                        calls: vec![ModelToolCall {
+                            id: "call_1".to_owned(),
+                            name: APP_TOOL.to_owned(),
+                            arguments: serde_json::Map::new(),
+                        }],
+                    }
+                };
+                asked = true;
+                let completion = Completion {
+                    reply,
+                    usage: TokenUsage::default(),
+                };
+                facts.decisions = calls_to_decide(&snapshot, &completion, &facts.limits)
+                    .expect("the calls to decide")
+                    .into_iter()
+                    .map(|(position, _)| (position, decision.clone()))
+                    .collect();
+                facts.model = Some(ModelAnswer {
+                    turn,
+                    attempt,
+                    result: ModelResult::Answered(completion),
+                });
+            }
+            Continuation::NeedCall { turn, position } => {
+                let call = snapshot.call_at(turn, position).expect("the call");
+                facts.send_check = Some(SendCheck {
+                    call_id: call.id,
+                    installation: InstallationCheck::Usable,
+                    definition_sha256: call.target.as_ref().map(|target| target.definition_sha256),
+                    decision: decision.clone(),
+                });
+            }
+            Continuation::AwaitCall { call_id, attempt } => {
+                facts.sent = Some(SendResult {
+                    call_id,
+                    attempt,
+                    invocation_id,
+                    outcome: outcome.clone(),
+                });
+            }
+            _ => {}
+        }
+        let plan = advance(&snapshot, &facts).expect("a plan");
+        let request = plan.request().expect("a transition").clone();
+        if let Operation::Claim(claim) = request.operation() {
+            facts.claim = Some(claim.epoch);
+        }
+        let applied = stores.runs.apply(org, ws, &request).await;
+        assert!(matches!(applied, Ok(Applied::Committed(_))), "{applied:?}");
+    }
+    panic!("the run didn't end");
+}
+
+/// Whether an earlier run of a session read an app's tool result: a run
+/// whose call to an app's tool completed, or failed with the tool's own
+/// error, marks its session as it ends, and every later run of the session
+/// reads the mark, a trim included; a call that failed otherwise, whose
+/// outcome is unknown, or that the policy denied marks nothing.
+async fn marks_a_run_session_once_a_run_reads_an_apps_result(stores: &Stores<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let (_, _, connection) = installed(stores, &t, ws, t.agent).await;
+    let channel = stores.channels.list_agent_channels(org, ws, t.agent).await.unwrap()[0].id;
+    let thread = |thread: &'static str, template: &SessionTemplate| Thread {
+        ws,
+        connection,
+        channel,
+        conversation: SUPPORT,
+        thread,
+        template: template.clone(),
+    };
+    let marked = |snapshot: &Snapshot| {
+        snapshot
+            .session
+            .as_ref()
+            .expect("a channel run's session")
+            .app_content_read
+    };
+    let session_of = |run: RunId| async move { stores.runs.find_run(org, ws, run).await.unwrap().unwrap().session_id };
+    let offering = offering_an_app();
+    let allowed = decided(CallVerdict::Allow);
+    let denied = decided(CallVerdict::Deny {
+        reason: "Not for this agent.".to_owned(),
+    });
+    let answered = SendOutcome::Completed {
+        result: serde_json::Map::new(),
+    };
+    let its_error = SendOutcome::ToolError {
+        result: serde_json::Map::new(),
+    };
+
+    for (name, decision, outcome, state, marks) in [
+        ("12.answered", &allowed, &answered, CallState::Completed, true),
+        ("12.its_error", &allowed, &its_error, CallState::Failed, true),
+        (
+            "12.unreachable",
+            &allowed,
+            &SendOutcome::NotSent,
+            CallState::Failed,
+            false,
+        ),
+        ("12.unknown", &allowed, &SendOutcome::Unknown, CallState::Unknown, false),
+        ("12.denied", &denied, &answered, CallState::Refused, false),
+    ] {
+        let session = thread(name, &offering);
+        let (first, snapshot) = session.next_run(stores, &t, 1).await;
+        assert!(!marked(&snapshot), "{name}: nothing read yet");
+        assert_eq!(
+            answer_calling(stores, org, ws, first, decision, outcome).await,
+            state,
+            "{name}"
+        );
+        let (second, snapshot) = session.next_run(stores, &t, 2).await;
+        assert_eq!(marked(&snapshot), marks, "{name}: the next run");
+        answer_run(stores, org, ws, second, "Done.").await;
+        if !marks {
+            continue;
+        }
+        // Kept through a trim.
+        let trimmed = thread(
+            name,
+            &SessionTemplate {
+                history_budget: 1,
+                ..offering.clone()
+            },
+        );
+        let (third, snapshot) = trimmed.next_run(stores, &t, 3).await;
+        let context = snapshot.session.as_ref().expect("its session");
+        assert!(context.history.is_empty(), "{name}: trimmed: {:?}", context.history);
+        assert!(marked(&snapshot), "{name}: after a trim");
+        assert_eq!(session_of(third).await, session_of(first).await, "{name}");
+        answer_run(stores, org, ws, third, "Done.").await;
+    }
 }
 
 /// A message in its own thread of C0SUPPORT.
