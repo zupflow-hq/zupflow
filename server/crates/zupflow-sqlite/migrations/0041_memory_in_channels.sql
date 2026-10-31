@@ -33,9 +33,10 @@
 --   recall it started with. Saves, and a run's changes, still reach a
 --   session only at a trim or a new run session. Never set on a session
 --   without memory.
--- - `app_content_read`: whether a run of the session read an app's tool
---   result, set as such a run ends and kept from then on, so a save in a
---   later run says it may come from that content.
+-- - `app_content_read`: whether a run of the session's current run session
+--   read an app's tool result, set as such a run ends and kept through
+--   trims, so a save in a later run of it says it may come from that
+--   content. Back to 0 when a new run session starts, its history empty.
 --
 -- Sessions from before this have no memory: the next run that starts one
 -- with the agent's memory starts a new run session.

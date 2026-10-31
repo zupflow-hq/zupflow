@@ -1239,7 +1239,7 @@ pub trait ChannelStore: Send + Sync {
     /// the first run from that start, and again by the first run after a
     /// forget marked the session, which takes the mark as it starts; a
     /// session whose run read an app's tool result keeps that as the run
-    /// ends.
+    /// ends, for the later runs of the same run session, a trim included.
     async fn dispatch(
         &self,
         organization_id: OrganizationId,

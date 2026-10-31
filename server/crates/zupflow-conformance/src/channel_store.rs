@@ -20,7 +20,8 @@
 //! counts in its history budget as no more than half of it, and a run
 //! carries the budget. A run whose call to an app's tool completed, or
 //! failed with the tool's own error, marks its session as it ends, for
-//! every later run of it, a trim included.
+//! every later run of its run session, a trim included; a new run session
+//! starts without the mark.
 //! A message is read back byte for byte as it was recorded. Every change is
 //! made only by an editor who still may, and an agent's apps go with it.
 //! An app is made at least once: an attempt marks it before the provider is
@@ -2533,12 +2534,15 @@ async fn answer_calling(
     panic!("the run didn't end");
 }
 
-/// Whether an earlier run of a session read an app's tool result: a run
-/// whose call to an app's tool completed, or failed with the tool's own
-/// error, marks its session as it ends, and every later run of the session
-/// reads the mark, a trim included; a call that failed otherwise, whose
-/// outcome is unknown, or that the policy denied marks nothing.
+/// Whether an earlier run of a session's run session read an app's tool
+/// result: a run whose call to an app's tool completed, or failed with the
+/// tool's own error, marks its session as it ends, and every later run of
+/// the same run session reads the mark, a trim included; a call that failed
+/// otherwise, whose outcome is unknown, or that the policy denied marks
+/// nothing. A new run session starts without the mark, its history empty:
+/// one for another template, and one the retention sweep starts.
 async fn marks_a_run_session_once_a_run_reads_an_apps_result(stores: &Stores<'_>, prepare: &Prepare) {
+    const DAY: i64 = 24 * 60 * 60 * 1000;
     let t = tenant(prepare).await;
     let (org, ws) = (t.organization_id, t.sandbox);
     let (_, _, connection) = installed(stores, &t, ws, t.agent).await;
@@ -2613,6 +2617,39 @@ async fn marks_a_run_session_once_a_run_reads_an_apps_result(stores: &Stores<'_>
         assert_eq!(session_of(third).await, session_of(first).await, "{name}");
         answer_run(stores, org, ws, third, "Done.").await;
     }
+
+    // Another template starts a new run session, without the mark, until a
+    // run of it reads an app's result again.
+    let other = SessionTemplate {
+        instructions: "You are answering in Slack.\n\nBe terse.".to_owned(),
+        ..offering.clone()
+    };
+    let (last, _) = thread("12.answered", &offering).next_run(stores, &t, 4).await;
+    answer_run(stores, org, ws, last, "Done.").await;
+    let session = thread("12.answered", &other);
+    let (fresh, snapshot) = session.next_run(stores, &t, 5).await;
+    assert_ne!(session_of(fresh).await, session_of(last).await, "a new run session");
+    assert!(!marked(&snapshot), "a new run session starts without the mark");
+    assert_eq!(
+        answer_calling(stores, org, ws, fresh, &allowed, &answered).await,
+        CallState::Completed
+    );
+    let (again, snapshot) = session.next_run(stores, &t, 6).await;
+    assert!(marked(&snapshot));
+    answer_run(stores, org, ws, again, "Done.").await;
+
+    // So does the one the retention sweep starts once the history's text is
+    // gone, with the same template.
+    let later = Timestamp::from_millis(now().millis() + 31 * DAY);
+    stores.channels.sweep_retention(org, ws, later).await.unwrap();
+    let (swept, snapshot) = session.next_run(stores, &t, 7).await;
+    assert_ne!(session_of(swept).await, session_of(again).await, "a new run session");
+    assert!(snapshot.session.as_ref().unwrap().history.is_empty());
+    assert!(
+        !marked(&snapshot),
+        "the sweep's new run session starts without the mark"
+    );
+    answer_run(stores, org, ws, swept, "Done.").await;
 }
 
 /// A message in its own thread of C0SUPPORT.

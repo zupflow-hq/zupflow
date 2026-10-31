@@ -28,11 +28,12 @@
 //! A `dm`'s or a `group_dm`'s session recalls, finds and saves its own
 //! conversation's notes beside the workspace's, and nothing else sees them;
 //! a channel's saves are the workspace's. Once a run of a session read an
-//! app's tool result, a later save says it may come from it, a trim
-//! included. No turn marks more than four breakpoints, and a session reads
-//! and writes only its own organization, workspace, agent and memory type.
-//! A recall takes no more than half the history budget, so one that would
-//! fill it still leaves the session's earlier runs their room.
+//! app's tool result, a later save of its run session says it may come
+//! from it, a trim included. No turn marks more than four breakpoints, and
+//! a session reads and writes only its own organization, workspace, agent
+//! and memory type. A recall takes no more than half the history budget,
+//! so one that would fill it still leaves the session's earlier runs their
+//! room.
 
 #![allow(clippy::unwrap_used)]
 

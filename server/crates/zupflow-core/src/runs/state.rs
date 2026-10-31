@@ -484,9 +484,10 @@ pub struct SessionContext {
     /// together, the recall no more than half ([`super::history::recall_room`]).
     /// `0` once the session is gone, or moved on to another run session.
     pub history_budget: u64,
-    /// Whether a run of the session before this one read an app's tool
-    /// result: set as such a run ends, and kept for the session from then
-    /// on, a trim included ([`super::reducer::after_app_content`]).
+    /// Whether a run of the same run session before this one read an app's
+    /// tool result: set as such a run ends, and kept from then on, a trim
+    /// included ([`super::reducer::after_app_content`]). A new run session,
+    /// its history empty, starts without it.
     pub app_content_read: bool,
     /// In order of turn.
     pub steers: Vec<SteeredTurn>,
