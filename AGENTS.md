@@ -137,6 +137,15 @@ Read `README.md` first, then `DEVELOPMENT.md`.
 - Background work goes through `JobQueue`: claim with a lease, then finish,
   retry or bury naming the job's scope and lease. Delivery is at least once,
   so handlers are idempotent; payloads carry references, never secrets.
+- **A run's prompt holds still.** What a run sends before its conversation
+  (its tools, instructions and memory recall) is read once, for its first
+  model attempt, frozen with that attempt and read back from the run on every
+  later one; nothing that changes meanwhile (a grant, a policy, a memory
+  saved) changes those bytes, and a call is refused instead when it's decided
+  or sent. Memory tools are their kind's fixed definitions in the one list,
+  by name; the recall is the first block of the first user message, never the
+  system prompt, and never in `prompt_cache_key`; a turn marks at most four
+  breakpoints. `tests/prompt_cache.rs` holds every provider path to it.
 - Secrets are sealed with `keys::seal` under an `EncryptionContext` built from
   the trust context with the constructor for that kind of secret
   (`installation_credential`, `oauth_client_secret`, `webhook_signing_secret`),
