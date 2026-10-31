@@ -5038,4 +5038,47 @@ describe("memory in runs", () => {
     ]);
     expect(savedBy(run)).toEqual([]);
   });
+
+  it("refuses a memory call whose kind this server no longer serves, with that reason's own code", async () => {
+    const { run } = await start((await rememberer()).id, "Remember that the office closes at six.");
+    db().memory_kinds = [];
+    await drive(run);
+    expect(run.status).toBe("completed");
+    expect(memoryEvents(run).map((e) => (e.type === "tool_call.failed" ? e.data.error : e.type))).toEqual([
+      {
+        code: "memory_kind_not_served",
+        message: "This run's memory can't be reached on this server, so this call wasn't made.",
+      },
+    ]);
+    expect(savedBy(run)).toEqual([]);
+  });
+
+  it("refuses a memory call waiting for approval once its type is deleted, and the run moves on", async () => {
+    const agent = await rememberer();
+    await owner.memoryTypes.update(northwind(), notes().id, { writes: "approve" });
+    const { run } = await start(agent.id, "Remember that the office closes at six.");
+    await drive(run);
+    expect(run.status).toBe("waiting_for_approval");
+    const requested = must(memoryEvents(run)[0]);
+    if (requested.type !== "approval.requested") throw new Error("Not a request");
+    // The agent moves to another type, and the run's is deleted: nobody decides the call.
+    const other = await owner.memoryTypes.create(northwind(), { name: "Other notes", kind: MEMORY_KIND_NOTES });
+    await owner.agents.update(sandbox().id, agent.id, { memory: "type", memory_type_id: other.id });
+    await owner.memoryTypes.setDefault(northwind(), { memory_type_id: null });
+    await owner.memoryTypes.delete(northwind(), notes().id);
+    expect(run.status).toBe("running");
+    await drive(run);
+    expect(run.status).toBe("completed");
+    expect(memoryEvents(run).map((e) => (e.type === "tool_call.failed" ? e.data.error : e.type))).toEqual([
+      "approval.requested",
+      { code: "memory_type_removed", message: "This run's memory was deleted, so this call wasn't made." },
+    ]);
+    const decider = await keyed();
+    expect(
+      await failure(
+        decider.runs.resolveApproval(sandbox().id, run.id, { call_id: requested.data.call_id, decision: "approved" }),
+      ),
+    ).toMatchObject({ status: 409, code: "not_waiting" });
+    expect([savedBy(run), announcedFor(run)]).toEqual([[], []]);
+  });
 });

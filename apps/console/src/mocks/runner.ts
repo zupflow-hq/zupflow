@@ -49,7 +49,7 @@ const MEMORY_TYPE_REMOVED: RunError = {
   message: "This run's memory was deleted, so this call wasn't made.",
 };
 const MEMORY_NOT_SERVED: RunError = {
-  code: "tool_refused",
+  code: "memory_kind_not_served",
   message: "This run's memory can't be reached on this server, so this call wasn't made.",
 };
 const MEMORY_READ_ONLY: RunError = {
@@ -540,6 +540,44 @@ export function refuseWaitingOn(
     const step = run.plan.find((s) => s.kind === "tool_call" && s.call.call_id === callId);
     if (step?.kind !== "tool_call") continue;
     refuseCall(db, run, step.call, gone, at);
+    run.status = "running";
+    moved.push(run);
+  }
+  return moved;
+}
+
+/**
+ * Refuses the memory call each run of the organization waits on for approval
+ * in `memoryTypeId`, once the type is deleted: the run moves on without anyone
+ * deciding, the call refused with `memory_type_removed`, and a decision sent
+ * later answers `409 not_waiting`. The backend does this in a job the
+ * deletion queues; the mock at once. Only runs of exactly this organization
+ * are read, in any of its workspaces. The runs that moved on, to schedule.
+ */
+export function refuseWaitingInType(
+  db: Db,
+  organizationId: RunRow["organization_id"],
+  memoryTypeId: PlannedMemoryCall["memory_type_id"],
+  at: string,
+): RunRow[] {
+  const moved: RunRow[] = [];
+  for (const run of db.runs) {
+    if (run.organization_id !== organizationId || run.status !== "waiting_for_approval") continue;
+    const events = timelineOf(db, run);
+    const requested = [...events].reverse().find((event) => event.type === "approval.requested");
+    if (
+      requested?.type !== "approval.requested" ||
+      !("memory_type_id" in requested.data) ||
+      requested.data.memory_type_id !== memoryTypeId
+    )
+      continue;
+    const callId = requested.data.call_id;
+    if (events.some((event) => event.type === "approval.resolved" && event.data.call_id === callId)) continue;
+    const step = run.plan.find((s) => s.kind === "memory_call" && s.call.call_id === callId);
+    if (step?.kind !== "memory_call") continue;
+    pushEvent(db, run, at, "tool_call.failed", { ...memoryRef(step.call), error: MEMORY_TYPE_REMOVED, duration_ms: 0 });
+    run.plan = run.plan.filter((s) => callOf(s)?.call_id !== callId);
+    dropPart(run, callId);
     run.status = "running";
     moved.push(run);
   }

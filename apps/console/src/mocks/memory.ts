@@ -25,7 +25,7 @@ import {
 } from "@zupflow/sdk";
 import { http } from "msw";
 import { z } from "zod";
-import { db } from "./db";
+import { db, scheduleRun } from "./db";
 import {
   ADMINS,
   ApiFailure,
@@ -53,6 +53,7 @@ import { isId, newId } from "./ids";
 import { KNOWN_MEMORY_KINDS, type KnownKind, trimmed } from "./memory-kinds";
 import type { AgentRow, Db, MemoryRow, MemoryTypeRow, PlannedMemoryCall, RunRow } from "./model";
 import type { Rng } from "./random";
+import { refuseWaitingInType } from "./runner";
 import { drawShortId, inWorkspace, sameWorkspace } from "./scope";
 import { compareNames } from "./tools";
 
@@ -643,6 +644,10 @@ export function createMemoryHandlers(u: (path: string) => string) {
         d.memories = d.memories.filter(
           (m) => !(m.organization_id === row.organization_id && m.memory_type_id === row.id),
         );
+        // A run waiting for approval of a call in it moves on, the call refused.
+        for (const run of refuseWaitingInType(d, row.organization_id, row.id, new Date().toISOString())) {
+          scheduleRun(run);
+        }
         audit(access, "memory_type.deleted", { type: "memory_type", id: row.id, name: row.name });
         return noContent();
       }),
