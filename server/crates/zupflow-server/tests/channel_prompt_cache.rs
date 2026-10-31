@@ -1576,3 +1576,114 @@ async fn recalls_nothing_once_its_type_is_deleted_and_refuses_its_calls() {
         );
     }
 }
+
+/// What a turn's messages say, its recall among them, in tokens as the
+/// history budget counts them: a token for four bytes of their text, which
+/// is all a turn of runs that call no tools sends.
+fn text_tokens(kind: ProviderKind, body: &Value) -> u64 {
+    let prompt = Prompt::read(kind, body).unwrap();
+    let bytes: usize = prompt
+        .messages
+        .iter()
+        .map(|message| match &message["content"] {
+            Value::String(text) => text.len(),
+            Value::Array(parts) => parts
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .map(str::len)
+                .sum(),
+            _ => 0,
+        })
+        .sum();
+    u64::try_from(bytes).unwrap().div_ceil(4)
+}
+
+/// Saves `count` notes of 489 characters through the API, numbered from
+/// `from`.
+async fn long_notes(setup: &Setup, from: u32, count: u32) {
+    for n in from..from + count {
+        setup
+            .save_note(&format!("Note {n:02}: {}", "dolor sit amet ".repeat(32)))
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn keeps_the_recall_within_the_history_budget_beside_the_history_and_the_input() {
+    for (kind, model) in PATHS {
+        let (world, model_id, memory_type) = remembering(kind, model).await;
+        let name = format!("{kind:?} {model}");
+        narrow(&world, &model_id).await;
+        let setup = &world.setup;
+        let main = &world.main;
+        // A recall of about 900 tokens of the session's 3,300. Two long runs
+        // and a third long input take about 2,500: they'd fit without it,
+        // not with it, so the third run trims the first.
+        long_notes(setup, 1, 7).await;
+        let before = turns(&world).len();
+        let asked = world.say(ANA, &format!("{} {}", main.mention(), long(1)), None).await;
+        world.work().await;
+        for n in 2..=4 {
+            world.say(ANA, &long(n), Some(&asked.ts)).await;
+            world.work().await;
+        }
+        let runs = world.runs(main).await;
+        assert_eq!(runs.len(), 4, "{name}");
+        assert!(runs.iter().all(|run| run["status"] == "completed"), "{name}: {runs:?}");
+        assert!(runs.iter().all(|run| run["session_id"] == runs[0]["session_id"]));
+        let sent = turns(&world).split_off(before);
+        assert_eq!(sent.len(), 4, "{name}: one turn a run");
+        let recalled = recalls(kind, &sent);
+        let held = recalled[0].clone().unwrap();
+        assert!(held.len() / 4 > 850, "{name}: {}", held.len());
+        assert!(recalled.iter().all(|sent| sent.as_ref() == Some(&held)), "{name}");
+        for (index, turn) in sent.iter().enumerate() {
+            let tokens = text_tokens(kind, &turn.body);
+            assert!(tokens <= 3_300, "{name}: turn {index} takes {tokens}");
+        }
+        let broken: Vec<usize> = breaks(kind, &sent).into_iter().map(|(index, _)| index).collect();
+        assert_eq!(broken, [2, 3], "{name}: the third and fourth runs trim");
+        let opening = Prompt::read(kind, &sent[2].body).unwrap().messages[0].to_string();
+        assert!(opening.contains("2 lorem ipsum"), "{name}: {opening}");
+
+        // A session's first run whose recall wouldn't fit beside its input
+        // recalls the newest notes that do, and counts the rest.
+        let (status, body) = setup
+            .kit
+            .send(
+                call(
+                    "alice",
+                    Method::PATCH,
+                    format!("/v1/organizations/{}/memory-types/{memory_type}", setup.org),
+                )
+                .body(json!({ "settings": { "recall_characters": 32_000 } })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        long_notes(setup, 8, 22).await;
+        let before = turns(&world).len();
+        world.say(BO, &format!("{} hello", main.mention()), None).await;
+        world.work().await;
+        let runs = world.runs(main).await;
+        assert_eq!(runs.len(), 5, "{name}");
+        assert_eq!(runs[4]["status"], "completed", "{name}: {}", runs[4]);
+        assert_ne!(runs[4]["session_id"], runs[0]["session_id"], "{name}");
+        let first = &turns(&world)[before];
+        let tokens = text_tokens(kind, &first.body);
+        assert!((3_000..=3_300).contains(&tokens), "{name}: {tokens}");
+        let fitted = recall(kind, &first.body).unwrap();
+        assert!(
+            fitted.contains("Note 29: ") && !fitted.contains("Prefers answers in Portuguese."),
+            "{name}: {fitted}"
+        );
+        assert!(
+            fitted.ends_with(" older notes aren't shown. search_memory finds them.\n</memory>"),
+            "{name}: {fitted}"
+        );
+        assert_eq!(
+            kept(&world, World::run_id(&runs[4])).await,
+            keeping(&memory_type, Some(&fitted), Some(&fitted)),
+            "{name}: the session keeps what was sent"
+        );
+    }
+}

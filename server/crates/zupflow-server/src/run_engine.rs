@@ -41,8 +41,9 @@
 //! its audience (a `dm`'s or a `group_dm`'s own conversation beside the
 //! workspace, else the workspace), and the session keeps its recall: the
 //! first run from each history start reads it (`memory_tools::session_recall`),
-//! as does the first after a forget marked the session, and every other run
-//! from that start sends it again.
+//! as does the first after a forget marked the session, in the room the
+//! session's history budget leaves it, and every other run from that start
+//! sends it again.
 //!
 //! The job queue's lease and the run's claim go together: the job's lease
 //! is extended before every step that keeps the claim, and once a step
@@ -80,6 +81,7 @@ use zupflow_core::model_store::{ModelStatus, RouteState};
 use zupflow_core::models::{ProviderAccess, ProviderError, Turn, prompt_cache_key, validate_completion};
 use zupflow_core::policy::{CallApp, Decision, GrantedAs, OrganizationLevel, ToolCall, Verdict, floor};
 use zupflow_core::runs::digest::{Sha256Digest, call_digest};
+use zupflow_core::runs::history::recall_room;
 use zupflow_core::runs::names::{Candidate, Offer, OfferedTool, ToolHost, build_offer};
 use zupflow_core::runs::reducer::{
     Facts, Gone, Idle, InstallationCheck, Io, Limits, MODEL_FAILED, MODEL_KEY_INVALID, MODEL_UNAVAILABLE, ModelAnswer,
@@ -965,7 +967,8 @@ impl<P: ToolPort> Driver<'_, P> {
     /// sends that recall. A channel run offers its session's tools, fixed
     /// with its memory when the session began; the first run from the
     /// session's history start reads what it recalls, from the session's
-    /// type for its audience, and every other sends what the session kept.
+    /// type for its audience, in the room its history and input leave of
+    /// the session's budget, and every other sends what the session kept.
     async fn offer_unless_frozen(
         &self,
         snapshot: &Snapshot,
@@ -978,6 +981,7 @@ impl<P: ToolPort> Driver<'_, P> {
                         (self.organization_id, self.workspace_id),
                         self.agent_id,
                         memory,
+                        recall_room(session.history_budget, &session.history, &snapshot.input),
                     )
                     .await?,
                 ),

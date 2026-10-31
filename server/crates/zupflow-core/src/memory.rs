@@ -32,17 +32,18 @@
 //! by the server ([`Recall::framed`]), none of which opens or closes the
 //! frame ([`shown_line`]), and fixed for the whole run (a channel session's,
 //! for every run from one history start, until a forget marks the session)
-//! so the provider's prompt cache holds. The same memories, settings and
-//! audience give the same bytes, and the same settings give the same tool
-//! definitions. A run keeps the tools it started with, so each call carries
-//! its type's writes as they are now ([`CallContext`]): once they're denied,
-//! the tools that write are refused. A run's call that changes a memory
-//! commits a record of itself with the change ([`MadeCall`]), one for each
-//! call, and one that gives a memory the text it holds commits the record
-//! alone: a call whose answer was lost is answered by that record, whatever
-//! became of the memory since, and made then only when there's none
-//! ([`settle`]); a sender that commits after its call was settled changes
-//! nothing.
+//! so the provider's prompt cache holds. A channel run's takes only the room
+//! its session's history budget leaves ([`MemoryProvider::recall_within`]).
+//! The same memories, settings and audience give the same bytes, and the
+//! same settings give the same tool definitions. A run keeps the tools it
+//! started with, so each call carries its type's writes as they are now
+//! ([`CallContext`]): once they're denied, the tools that write are refused.
+//! A run's call that changes a memory commits a record of itself with the
+//! change ([`MadeCall`]), one for each call, and one that gives a memory the
+//! text it holds commits the record alone: a call whose answer was lost is
+//! answered by that record, whatever became of the memory since, and made
+//! then only when there's none ([`settle`]); a sender that commits after its
+//! call was settled changes nothing.
 //!
 //! - [`notes`]: the `notes` kind, and the [`notes::NoteStore`] it keeps its notes in.
 //! - [`registry`]: [`registry::MemoryProviders`], the kinds a server serves, by key.
@@ -504,6 +505,22 @@ impl Recall {
         block.push_str(RECALL_CLOSE);
         Some(block)
     }
+
+    /// How many bytes the block takes ([`Recall::framed`]): `0` with
+    /// nothing to recall.
+    pub fn framed_len(&self) -> usize {
+        framed_len(self.lines.iter().map(String::len))
+    }
+}
+
+/// How many bytes a block of lines this long takes ([`Recall::framed`]):
+/// `0` for none.
+pub fn framed_len(lines: impl IntoIterator<Item = usize>) -> usize {
+    let mut lines = lines.into_iter().peekable();
+    if lines.peek().is_none() {
+        return 0;
+    }
+    lines.fold(RECALL_OPEN.len() + 1 + RECALL_CLOSE.len(), |len, line| len + 1 + line)
 }
 
 /// A call to one of a kind's tools, as the server makes it: who makes it,
@@ -885,6 +902,28 @@ pub trait MemoryProvider: Send + Sync {
         audience: &Audience,
         settings: &Settings,
     ) -> Result<Recall, MemoryError>;
+
+    /// What a run in `scope` starts with, for `audience`, when its block
+    /// may take no more than `room` bytes ([`Recall::framed_len`]): a
+    /// channel run's, which keeps within its session's history budget. The
+    /// kind leaves out what doesn't fit, as it chooses, and recalls nothing
+    /// when nothing would. Same memories, settings, audience and room, same
+    /// bytes; with room for [`MemoryProvider::recall`], the same. By
+    /// default, that recall when it fits, and nothing when it doesn't.
+    async fn recall_within(
+        &self,
+        scope: &MemoryScope,
+        audience: &Audience,
+        settings: &Settings,
+        room: usize,
+    ) -> Result<Recall, MemoryError> {
+        let recall = self.recall(scope, audience, settings).await?;
+        Ok(if recall.framed_len() <= room {
+            recall
+        } else {
+            Recall::none()
+        })
+    }
 
     /// One call to one of its tools, after the server decided it. A call
     /// that can't do what it asks is answered as an error for the model to

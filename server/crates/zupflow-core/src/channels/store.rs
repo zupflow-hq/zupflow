@@ -493,6 +493,8 @@ pub struct SessionTemplate {
     /// The agent's memory type and the session's audience: `None` when the
     /// agent has none, or one of a kind this server doesn't serve.
     pub memory: Option<SessionMemory>,
+    /// What a run's history, its input and its recall may take together
+    /// ([`crate::runs::history::trimmed_start`]).
     pub history_budget: u64,
 }
 

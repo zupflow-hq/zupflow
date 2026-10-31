@@ -17,7 +17,8 @@
 //! moves only when the history would go over the session's budget, by
 //! whole runs and a quarter of the budget at least
 //! ([`zupflow_core::runs::history::trimmed_start`]), so the cache misses
-//! once per trim.
+//! once per trim. The recall counts in the budget with the new input: the
+//! one the session keeps, or kept last, for one read anew.
 //!
 //! A session's memory (its type and audience) is fixed with its tools, and
 //! the session keeps the recall its history begins with, once for each
@@ -50,7 +51,7 @@ use zupflow_core::ids::{
 use zupflow_core::memory::{Audience, MemoryScope};
 use zupflow_core::model_store::RunModel;
 use zupflow_core::models::Message;
-use zupflow_core::runs::history::{transcript, trimmed_start, weight as weight_of};
+use zupflow_core::runs::history::{text_weight, transcript, trimmed_start, weight as weight_of};
 use zupflow_core::runs::names::Offer;
 use zupflow_core::runs::reducer::{TOOL_ERROR, admit};
 use zupflow_core::runs::state::{
@@ -109,14 +110,16 @@ struct SessionRow {
     seen: Option<(Uuid, i64)>,
     /// When its turns last noted the thread's edits and deletes.
     changes_noted_at: Option<i64>,
+    /// The tokens the recall it keeps, or kept last, takes.
+    recall_weight: u64,
 }
 
 macro_rules! session_select {
     () => {
         "SELECT s.id, s.agent_channel_id, s.conversation_id, s.thread_key, s.session_id, s.active_run_id, \
          s.last_run_id, s.run_count, s.model, s.model_id, s.model_connection_id, s.instructions, s.offer, \
-         s.history_budget, s.memory_type_id, s.memory_audience, s.seen_message_id, s.seen_at, s.changes_noted_at \
-         FROM channel_sessions s"
+         s.history_budget, s.memory_type_id, s.memory_audience, s.seen_message_id, s.seen_at, s.changes_noted_at, \
+         s.recall FROM channel_sessions s"
     };
 }
 
@@ -204,6 +207,7 @@ fn session_from(row: &SqliteRow) -> Result<SessionRow, StoreError> {
         template,
         seen,
         changes_noted_at: get(row, "changes_noted_at")?,
+        recall_weight: get::<Option<String>>(row, "recall")?.as_deref().map_or(0, text_weight),
     })
 }
 
@@ -1334,7 +1338,11 @@ async fn start_session_run(
         .ok_or(StoreError::Refused("a session's runs are exhausted"))?;
     // Where the new run's history starts: where the last run's did, moved
     // forward by whole runs when the history would go over the budget,
-    // each run weighed as kept when it ended.
+    // each run weighed as kept when it ended, beside the input and the
+    // recall the session keeps. The run sends that recall from the same
+    // start; one it reads anew, after a trim or a forget, is about as long,
+    // and takes no more than the room left
+    // ([`zupflow_core::runs::history::recall_room`]).
     let runs = session_runs(connection, organization_id, workspace_id, key, session_id).await?;
     let start = runs
         .last()
@@ -1348,8 +1356,8 @@ async fn start_session_run(
             None => weight_of(&build_transcript(connection, organization_id, workspace_id, run.id, &run.input).await?),
         });
     }
-    let incoming = weight_of(&[Message::User { text: input.clone() }]);
-    let cut = trimmed_start(&weights, incoming, template.history_budget);
+    let fixed = weight_of(&[Message::User { text: input.clone() }]).saturating_add(session.recall_weight);
+    let cut = trimmed_start(&weights, fixed, template.history_budget);
     let history_start = runs.get(start + cut).map_or(run_id, |run| run.id);
     if cut > 0 {
         tracing::info!(
@@ -1712,11 +1720,11 @@ pub(crate) async fn take_steer(
 
 /// A channel run's session context: the transcripts of its session's runs
 /// from its history start, as kept when each ended, the session's tools,
-/// its memory with the recall it keeps for the run's start, whether an
-/// earlier run of it read an app's result, and the run's own steered turns.
-/// The session's memory is read only while the session holds the run's
-/// run session: a session that's gone, or moved on after the run, has
-/// none for it. `None` for any other run.
+/// its memory with the recall it keeps for the run's start, its history
+/// budget, whether an earlier run of it read an app's result, and the run's
+/// own steered turns. The session's memory and budget are read only while
+/// the session holds the run's run session: a session that's gone, or
+/// moved on after the run, has none for it. `None` for any other run.
 pub(crate) async fn session_context(
     connection: &mut SqliteConnection,
     organization_id: OrganizationId,
@@ -1789,7 +1797,7 @@ pub(crate) async fn session_context(
     .await?;
     let conversation_id = ChannelConversationId::from_uuid(origin_conversation);
     let held = sqlx::query(
-        "SELECT memory_type_id, memory_audience, recall, recall_start_run_id, app_content_read \
+        "SELECT memory_type_id, memory_audience, recall, recall_start_run_id, app_content_read, history_budget \
          FROM channel_sessions WHERE organization_id = ? AND workspace_id = ? AND id = ? AND session_id = ?",
     )
     .bind(organization_id.uuid())
@@ -1799,8 +1807,8 @@ pub(crate) async fn session_context(
     .fetch_optional(&mut *connection)
     .await
     .map_err(failed("session_context"))?;
-    let (memory, recall, app_content_read) = match &held {
-        None => (None, SessionRecall::Read(None), false),
+    let (memory, recall, app_content_read, history_budget) = match &held {
+        None => (None, SessionRecall::Read(None), false, 0),
         Some(row) => {
             let memory = session_memory(
                 get(row, "memory_type_id")?,
@@ -1812,7 +1820,16 @@ pub(crate) async fn session_context(
                 (Some(_), _) => SessionRecall::Unread,
                 (None, _) => SessionRecall::Read(None),
             };
-            (memory, recall, get::<i64>(row, "app_content_read")? != 0)
+            let history_budget = match get::<Option<i64>>(row, "history_budget")? {
+                Some(budget) => u64::try_from(budget).map_err(unreadable)?,
+                None => 0,
+            };
+            (
+                memory,
+                recall,
+                get::<i64>(row, "app_content_read")? != 0,
+                history_budget,
+            )
         }
     };
     Ok(Some(SessionContext {
@@ -1825,6 +1842,7 @@ pub(crate) async fn session_context(
         offer: serde_json::from_str::<Offer>(&offer).map_err(unreadable)?,
         memory,
         recall,
+        history_budget,
         app_content_read,
         steers: steered_turns(connection, organization_id, workspace_id, run_id).await?,
     }))

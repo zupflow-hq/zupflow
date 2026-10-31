@@ -479,6 +479,11 @@ pub struct SessionContext {
     pub memory: Option<SessionMemory>,
     /// What the session's history, from the run's start, begins with.
     pub recall: SessionRecall,
+    /// The session's history budget in tokens, as its latest run started
+    /// with it: what the history, the run's input and the recall may take
+    /// together ([`super::history::recall_room`]). `0` once the session is
+    /// gone, or moved on to another run session.
+    pub history_budget: u64,
     /// Whether a run of the session before this one read an app's tool
     /// result: set as such a run ends, and kept for the session from then
     /// on, a trim included ([`super::reducer::after_app_content`]).

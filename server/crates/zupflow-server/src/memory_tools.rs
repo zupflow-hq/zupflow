@@ -21,9 +21,10 @@
 //! joined to the session's, and its audience, a `dm`'s or a `group_dm`'s
 //! own conversation beside the workspace, else the workspace. The session
 //! keeps what it recalls, once for each history start: the first run from a
-//! start reads it from the session's type for that audience
-//! ([`session_recall`]), and every run from the same start sends those
-//! bytes. A save in one run reaches a later run of the session through the
+//! start reads it from the session's type for that audience, within the
+//! room the session's history budget leaves it ([`session_recall`]), and
+//! every run from the same start sends those bytes. A save in one run
+//! reaches a later run of the session through the
 //! conversation, and its recall at the next trim or session. A forget, a
 //! run's or a person's, records a mark on every session of its agent,
 //! workspace and type, and the next run of each reads the recall anew. Once
@@ -278,17 +279,28 @@ async fn starting(
     Ok(Some((served, tools)))
 }
 
-/// What `scope` recalls for `audience` in its served type now, framed.
-/// A recall that can't be read fails the step, to be tried again.
-async fn recall_for(served: &Served, scope: &MemoryScope, audience: &Audience) -> Result<Option<String>, &'static str> {
-    let recall = served
-        .provider
-        .recall(scope, audience, &served.settings)
-        .await
-        .map_err(|error| {
-            tracing::warn!(event = "runs.memory_unreadable", organization_id = %scope.organization_id, workspace_id = %scope.workspace_id, agent_id = %scope.agent_id, memory_type_id = %scope.memory_type_id, %error);
-            "memory_unavailable"
-        })?;
+/// What `scope` recalls for `audience` in its served type now, framed,
+/// taking no more than `room` bytes when there's a limit. A recall that
+/// can't be read fails the step, to be tried again.
+async fn recall_for(
+    served: &Served,
+    scope: &MemoryScope,
+    audience: &Audience,
+    room: Option<usize>,
+) -> Result<Option<String>, &'static str> {
+    let read = match room {
+        None => served.provider.recall(scope, audience, &served.settings).await,
+        Some(room) => {
+            served
+                .provider
+                .recall_within(scope, audience, &served.settings, room)
+                .await
+        }
+    };
+    let recall = read.map_err(|error| {
+        tracing::warn!(event = "runs.memory_unreadable", organization_id = %scope.organization_id, workspace_id = %scope.workspace_id, agent_id = %scope.agent_id, memory_type_id = %scope.memory_type_id, %error);
+        "memory_unavailable"
+    })?;
     Ok(recall.framed())
 }
 
@@ -309,7 +321,7 @@ pub(crate) async fn resolve(
         MemoryMode::Off => None,
         MemoryMode::Agent => {
             let scope = served.scope(organization_id, workspace_id, agent_id);
-            recall_for(&served, &scope, audience).await?
+            recall_for(&served, &scope, audience, None).await?
         }
     };
     Ok(Some(ResolvedMemory {
@@ -344,23 +356,25 @@ pub(crate) async fn session_memory(
 }
 
 /// What a channel session of `agent_id` recalls for the history a run
-/// starts from, read now from the session's own type for its audience:
-/// nothing once the type is deleted or while its kind isn't served. The
-/// tools stay the session's, whatever the type became. Settings its kind
-/// refuses now, or a recall that can't be read, fail the step, to be tried
-/// again.
+/// starts from, read now from the session's own type for its audience, in
+/// no more than `room` bytes, what the session's history budget leaves it
+/// ([`zupflow_core::runs::history::recall_room`]): nothing once the type is
+/// deleted or while its kind isn't served. The tools stay the session's,
+/// whatever the type became. Settings its kind refuses now, or a recall
+/// that can't be read, fail the step, to be tried again.
 pub(crate) async fn session_recall(
     state: &AppState,
     (organization_id, workspace_id): (OrganizationId, WorkspaceId),
     agent_id: AgentId,
     memory: &SessionMemory,
+    room: usize,
 ) -> Result<FrozenMemory, &'static str> {
     let recall = match type_now(state, organization_id, memory.memory_type_id).await? {
         TypeNow::Gone | TypeNow::NotServed => None,
         TypeNow::Unusable => return Err("memory_settings_refused"),
         TypeNow::Served(served) => {
             let scope = served.scope(organization_id, workspace_id, agent_id);
-            recall_for(&served, &scope, &memory.audience).await?
+            recall_for(&served, &scope, &memory.audience, Some(room)).await?
         }
     };
     Ok(FrozenMemory {

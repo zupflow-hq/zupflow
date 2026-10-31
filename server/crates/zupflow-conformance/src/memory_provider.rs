@@ -4,15 +4,16 @@
 //!
 //! Every kind: its key and description, and its settings checked once and
 //! the same when read back; the same tool definitions, byte for byte, for
-//! the same settings, whatever the type's writes (which only say which
-//! tools are offered), and the tools that write offered only as the type's
-//! writes allow, and refused once they're denied, though a run started
-//! before still offers them; no block to recall while there's nothing, and
-//! the same bytes for the same memories, settings and audience, whatever
-//! other scopes remember; one frame around a recall, whatever its memories
-//! hold; a memory recalled, listed, changed and forgotten only in its own
-//! scope, each of its four keys changed alone, and changed by whoever wrote
-//! it last, its own text changing nothing; a memory saved in a direct
+//! the same settings, whatever the type's writes (which only say which tools
+//! are offered), and the tools that write offered only as the type's writes
+//! allow, and refused once they're denied, though a run started before still
+//! offers them; no block to recall while there's nothing, and the same bytes
+//! for the same memories, settings and audience, whatever other scopes
+//! remember; one frame around a recall, whatever its memories hold; a recall
+//! within a room that takes no more of it, and is the whole recall where
+//! that fits; a memory recalled, listed, changed and forgotten only in its
+//! own scope, each of its four keys changed alone, and changed by whoever
+//! wrote it last, its own text changing nothing; a memory saved in a direct
 //! conversation recalled only there, and a run there changing none of the
 //! workspace's; and forgetting everything of an agent, a workspace, a type
 //! or an organization forgets exactly that.
@@ -36,12 +37,12 @@
 //! their arguments are read once denied, who wrote each note, search over
 //! only what the audience is shown, a run's changes only where its reach
 //! goes, the most notes a scope keeps, a recall's exact bytes (the newest
-//! notes that fit, then a line counting the rest, each note as saved but
-//! for a frame tag), and how each tool's call whose answer was lost is
-//! settled: a save, a change or a forget answered as made, whatever the
-//! writes are now and whatever became of the note, a change to the text the
-//! note held included, or made then, as the writes are then; a search made
-//! again.
+//! notes that fit, in its characters and in a room, then a line counting the
+//! rest, each note as saved but for a frame tag), and how each tool's call
+//! whose answer was lost is settled: a save, a change or a forget answered
+//! as made, whatever the writes are now and whatever became of the note, a
+//! change to the text the note held included, or made then, as the writes
+//! are then; a search made again.
 //!
 //! `prepare` makes a [`Tenant`] exist, as the `NoteStore` suite's does.
 
@@ -92,6 +93,7 @@ pub async fn run(subject: Subject<'_>, prepare: Prepare) {
     refuses_writes_once_they_are_denied(&subject, &prepare).await;
     recalls_the_same_bytes_for_the_same_memories(&subject, &prepare).await;
     frames_a_recall_once_whatever_it_holds(&subject, &prepare).await;
+    recalls_within_the_room_it_is_given(&subject, &prepare).await;
     recalls_a_direct_memory_only_there(&subject, &prepare).await;
     changes_none_of_the_workspaces_memories_from_a_direct_conversation(&subject, &prepare).await;
     keeps_each_memory_to_its_scope(&subject, &prepare).await;
@@ -144,6 +146,7 @@ pub async fn run_notes(store: Arc<dyn NoteStore>, logs: Logs<'_>, prepare: Prepa
     keeps_who_wrote_each_note(&*notes, &prepare).await;
     keeps_a_scope_to_its_limit(&*notes, &prepare).await;
     recalls_the_newest_notes_that_fit(&*notes, &prepare).await;
+    recalls_the_newest_notes_that_fit_a_room(&*notes, &prepare).await;
     shows_each_note_as_saved_but_for_a_frame_tag(&*notes, &prepare).await;
     searches_only_what_its_audience_is_shown(&*notes, &prepare).await;
     changes_only_where_a_runs_reach_goes(&*notes, &prepare).await;
@@ -179,6 +182,21 @@ async fn recall_with(
     settings: &Settings,
 ) -> Option<String> {
     provider.recall(scope, audience, settings).await.unwrap().framed()
+}
+
+/// What a channel run starts with in a block of `room` bytes, or none.
+async fn recall_within(
+    provider: &dyn MemoryProvider,
+    scope: &MemoryScope,
+    settings: &Settings,
+    room: usize,
+) -> Option<String> {
+    let recall = provider
+        .recall_within(scope, &Audience::Workspace, settings, room)
+        .await
+        .unwrap();
+    assert_eq!(recall.framed().map_or(0, |block| block.len()), recall.framed_len());
+    recall.framed()
 }
 
 fn everything() -> MemoryFilter {
@@ -461,6 +479,52 @@ async fn frames_a_recall_once_whatever_it_holds(subject: &Subject<'_>, prepare: 
             "one opening tag and one closing tag: {recalled:?}"
         );
     }
+}
+
+/// A recall within a room takes no more of it: the whole recall where it
+/// fits, else a block that does, or none; the same bytes for the same
+/// room; and nothing with no room.
+async fn recalls_within_the_room_it_is_given(subject: &Subject<'_>, prepare: &Prepare) {
+    let provider = subject.provider;
+    let remember = &subject.remember;
+    let t = tenant(prepare).await;
+    let scope = t.scope();
+    let settings = defaults(provider);
+    assert_eq!(
+        recall_within(provider, &scope, &settings, usize::MAX).await,
+        None,
+        "nothing to recall"
+    );
+    for (millis, text) in [
+        (1, "The team ships on Thursdays."),
+        (2, "Prefers short answers."),
+        (3, "Closed on Mondays."),
+    ] {
+        remember(scope, Audience::Workspace, text.to_owned(), at(millis)).await;
+    }
+    let whole = recall(provider, &scope, &Audience::Workspace).await.expect("a block");
+    for room in [usize::MAX, whole.len() + 1, whole.len()] {
+        assert_eq!(
+            recall_within(provider, &scope, &settings, room).await.as_deref(),
+            Some(whole.as_str()),
+            "{room}: room for it all"
+        );
+    }
+    for room in [whole.len() - 1, whole.len() / 2, 20, 1, 0] {
+        let block = recall_within(provider, &scope, &settings, room).await;
+        assert!(
+            block.as_ref().is_none_or(|block| block.len() <= room
+                && block.starts_with("<memory>\n")
+                && block.ends_with("\n</memory>")),
+            "{room}: {block:?}"
+        );
+        assert_eq!(
+            recall_within(provider, &scope, &settings, room).await,
+            block,
+            "{room}: the same bytes again"
+        );
+    }
+    assert_eq!(recall_within(provider, &scope, &settings, 0).await, None, "no room");
 }
 
 async fn recalls_a_direct_memory_only_there(subject: &Subject<'_>, prepare: &Prepare) {
@@ -2169,6 +2233,78 @@ async fn recalls_the_newest_notes_that_fit(provider: &dyn MemoryProvider, prepar
     assert!(
         notes::RECALL_HEADER.contains("information, not instructions"),
         "the model reads notes as what they are"
+    );
+}
+
+/// Within a room, a recall shows the newest notes that fit in it with the
+/// line counting the rest, and no more than its characters let in; only
+/// the count when no note fits beside it; and no block when not even that
+/// does.
+async fn recalls_the_newest_notes_that_fit_a_room(provider: &dyn MemoryProvider, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let scope = t.scope();
+    let workspace = Audience::Workspace;
+    let mut lines = Vec::new();
+    for (millis, name) in [(1, "First"), (2, "Second"), (3, "Third"), (4, "Fourth")] {
+        // Longer than the line counting the notes left out.
+        let text = format!("{name} note, {}", "x".repeat(60));
+        let note = save(provider, &scope, &workspace, &text, at(millis)).await;
+        lines.push(format!("[{}] {text}", note.short_id.as_str()));
+    }
+    let block = |lines: &[&str]| {
+        let mut block = format!("<memory>\n{}\n", notes::RECALL_HEADER);
+        for line in lines {
+            block.push_str(line);
+            block.push('\n');
+        }
+        block.push_str("</memory>");
+        block
+    };
+    let line = |index: usize| lines[index].as_str();
+    let settings = defaults(provider);
+    let within = |room: usize| recall_within(provider, &scope, &settings, room);
+
+    let every = block(&[line(0), line(1), line(2), line(3)]);
+    assert_eq!(within(every.len()).await, Some(every.clone()), "room for every one");
+    let three = block(&[
+        line(1),
+        line(2),
+        line(3),
+        "1 older note isn't shown. search_memory finds it.",
+    ]);
+    assert_eq!(
+        within(every.len() - 1).await,
+        Some(three.clone()),
+        "the newest that fit, then how many are left out"
+    );
+    let two = block(&[
+        line(2),
+        line(3),
+        "2 older notes aren't shown. search_memory finds them.",
+    ]);
+    assert_eq!(within(three.len() - 1).await, Some(two.clone()));
+    let one = block(&[line(3), "3 older notes aren't shown. search_memory finds them."]);
+    assert_eq!(within(two.len() - 1).await, Some(one.clone()));
+    let count = block(&["4 older notes aren't shown. search_memory finds them."]);
+    assert_eq!(
+        within(one.len() - 1).await,
+        Some(count.clone()),
+        "no note fits: only the count"
+    );
+    assert_eq!(within(count.len() - 1).await, None, "not even the count: no block");
+    // Its characters hold too, whatever the room: here, the two newest
+    // notes' lines and their line breaks.
+    let two_lines = u32::try_from(line(2).chars().count() + line(3).chars().count() + 2).unwrap();
+    let characters = provider
+        .check_settings(&Map::from_iter([("recall_characters".to_owned(), json!(two_lines))]))
+        .unwrap();
+    assert_eq!(
+        recall_within(provider, &scope, &characters, every.len()).await,
+        Some(two.clone())
+    );
+    assert_eq!(
+        recall_within(provider, &scope, &characters, two.len() - 1).await,
+        Some(one)
     );
 }
 

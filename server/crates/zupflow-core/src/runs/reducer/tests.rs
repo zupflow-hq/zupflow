@@ -3490,6 +3490,7 @@ fn in_session() -> Snapshot {
         offer: offer(),
         memory: None,
         recall: crate::runs::state::SessionRecall::Read(None),
+        history_budget: 1_000,
         app_content_read: false,
         steers: Vec::new(),
     });

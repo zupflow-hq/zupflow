@@ -12,7 +12,10 @@
 //! next run would go over it, the start moves forward by whole runs, at
 //! least a quarter of the budget at once, so the cache misses once per
 //! trim rather than on every run. The start is stored on the run, so every
-//! run until the next trim sends the same prefix.
+//! run until the next trim sends the same prefix. The recall counts in the
+//! budget with the history and the new input: the trim counts the one the
+//! session keeps, and a recall read anew takes only the room they leave
+//! ([`recall_room`]).
 
 use crate::models::{Message, ModelToolCall};
 use crate::runs::state::{CallRecord, CommittedTurn, SteeredTurn};
@@ -125,10 +128,9 @@ pub fn transcript(
     messages
 }
 
-/// Roughly how many tokens messages take: one per four bytes of what they
-/// say, as providers count closely enough for a budget.
-pub fn weight(messages: &[Message]) -> u64 {
-    let bytes: usize = messages
+/// What messages say, in bytes: [`weight`] counts a token for four.
+fn bytes(messages: &[Message]) -> usize {
+    messages
         .iter()
         .map(|message| match message {
             Message::User { text } => text.len(),
@@ -145,18 +147,34 @@ pub fn weight(messages: &[Message]) -> u64 {
             }
             Message::ToolResult { call_id, content, .. } => call_id.len() + content.len(),
         })
-        .sum();
+        .sum()
+}
+
+/// Roughly how many tokens messages take: one per four bytes of what they
+/// say, as providers count closely enough for a budget.
+pub fn weight(messages: &[Message]) -> u64 {
+    tokens(bytes(messages))
+}
+
+/// Roughly how many tokens a text takes, as [`weight`] counts a message's:
+/// a recall's block, say.
+pub fn text_weight(text: &str) -> u64 {
+    tokens(text.len())
+}
+
+fn tokens(bytes: usize) -> u64 {
     u64::try_from(bytes).unwrap_or(u64::MAX).div_ceil(4)
 }
 
 /// Where a new run's history starts, as an index into `weights` (the
 /// session's runs from the current start, oldest first): the current start
-/// (`0`) while they and the new input fit in `budget`; else moved forward
-/// by whole runs, at least a quarter of the budget at a time, until they
-/// fit. `weights.len()` when none are kept.
-pub fn trimmed_start(weights: &[u64], incoming: u64, budget: u64) -> usize {
+/// (`0`) while they fit in `budget` beside `fixed`, what the run sends
+/// whatever its history keeps (its input and the session's recall); else
+/// moved forward by whole runs, at least a quarter of the budget at a
+/// time, until they fit. `weights.len()` when none are kept.
+pub fn trimmed_start(weights: &[u64], fixed: u64, budget: u64) -> usize {
     let quarter = (budget / 4).max(1);
-    let mut total = weights.iter().fold(incoming, |sum, weight| sum.saturating_add(*weight));
+    let mut total = weights.iter().fold(fixed, |sum, weight| sum.saturating_add(*weight));
     let mut start = 0;
     while total > budget && start < weights.len() {
         let mut cut = 0u64;
@@ -167,6 +185,16 @@ pub fn trimmed_start(weights: &[u64], incoming: u64, budget: u64) -> usize {
         total = total.saturating_sub(cut);
     }
     start
+}
+
+/// The most bytes a channel run's recall may take ([`crate::memory::Recall::framed`])
+/// when the run reads it anew: what its session's `history` and its own
+/// `input` leave of the session's `budget`, four bytes to a token, so the
+/// run keeps within it as one sending the recall its session keeps does
+/// ([`trimmed_start`]). `0` when they take it all.
+pub fn recall_room(budget: u64, history: &[Message], input: &str) -> usize {
+    let taken = tokens(bytes(history).saturating_add(input.len()));
+    usize::try_from(budget.saturating_sub(taken).saturating_mul(4)).unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]
@@ -303,5 +331,19 @@ mod tests {
         assert_eq!(trimmed_start(&[50, 50], 90, 80), 2);
         assert_eq!(history_budget(Some(1_000)), 600);
         assert_eq!(history_budget(None), 76_800);
+    }
+
+    #[test]
+    fn leaves_a_recall_read_anew_the_room_its_history_and_input_leave() {
+        // 9 bytes of history and 3 of input: 3 tokens of 10.
+        let history = [user("hello"), user("nope")];
+        assert_eq!(recall_room(10, &history, "hey"), 28);
+        assert_eq!(recall_room(3, &history, "hey"), 0);
+        assert_eq!(recall_room(2, &history, "hey"), 0, "over: no room");
+        assert_eq!(text_weight("hello"), 2);
+        assert_eq!(text_weight(""), 0);
+        // A block within the room keeps the whole prompt within the budget.
+        let block = "b".repeat(recall_room(10, &history, "hey"));
+        assert!(weight(&[user(&format!("{block}hellonopehey"))]) <= 10);
     }
 }
