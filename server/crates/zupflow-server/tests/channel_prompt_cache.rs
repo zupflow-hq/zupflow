@@ -23,7 +23,8 @@
 //! change to a note reaches the session as a forget does; a run's own
 //! change, at its next trim. A conversation shared with another
 //! organization has no memory: from the sharing on, no run there has
-//! memory tools or recalls anything, a run under way aside.
+//! memory tools or recalls anything, a run under way aside. Nor does a
+//! session whose type's settings its kind refuses: the agent still answers.
 //! A `dm`'s or a `group_dm`'s session recalls, finds and saves its own
 //! conversation's notes beside the workspace's, and nothing else sees them;
 //! a channel's saves are the workspace's. Once a run of a session read an
@@ -1651,6 +1652,77 @@ async fn has_no_memory_in_a_conversation_shared_with_another_organization() {
             assert_eq!(
                 memory_tools(kind, &turn.body).is_empty(),
                 !before_sharing,
+                "{name}: turn {index}"
+            );
+        }
+    }
+}
+
+/// Stores settings `memory_type`'s kind refuses, as the server's own
+/// mistake would leave them.
+async fn refuse_settings(world: &World, memory_type: &str) {
+    let pool = database(world).await;
+    sqlx::query("UPDATE memory_types SET settings = '{\"max_notes\": 0}' WHERE id = ?")
+        .bind(MemoryTypeId::parse(memory_type).unwrap().uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn answers_without_memory_while_its_kind_refuses_its_types_settings() {
+    for (kind, model) in PATHS {
+        let (world, _, memory_type) = remembering(kind, model).await;
+        let name = format!("{kind:?} {model}");
+        let main = &world.main;
+        let before = turns(&world).len();
+        // A thread's session remembers, and goes idle; another's run starts
+        // with memory. Before that run runs, the type's settings become
+        // ones its kind refuses.
+        let idle = world.say(ANA, &format!("{} hello", main.mention()), None).await;
+        world.work().await;
+        world.say(ANA, &format!("{} hi", main.mention()), None).await;
+        world.handle().await;
+        refuse_settings(&world, &memory_type).await;
+        world.work().await;
+        // Then a follow-up in the idle thread, and a new thread.
+        world.say(ANA, "and now?", Some(&idle.ts)).await;
+        world.work().await;
+        world.say(ANA, &format!("{} hey", main.mention()), None).await;
+        world.work().await;
+
+        // The agent answers every message.
+        let runs = world.runs(main).await;
+        assert_eq!(runs.len(), 4, "{name}: {runs:?}");
+        assert!(runs.iter().all(|run| run["status"] == "completed"), "{name}: {runs:?}");
+        let by_input = |end: &str| {
+            runs.iter()
+                .find(|run| run["input"].as_str().unwrap().ends_with(end))
+                .unwrap_or_else(|| panic!("{name}: no run ends with {end}: {runs:?}"))
+        };
+        assert_ne!(
+            by_input("and now?")["session_id"],
+            by_input("@helper hello")["session_id"],
+            "{name}: the idle thread's next run starts a new run session"
+        );
+        let sent = turns(&world).split_off(before);
+        assert_eq!(sent.len(), 4, "{name}: a turn a run");
+        // The first remembers. The run begun with memory keeps its tools,
+        // and recalls nothing; the runs after begin without memory.
+        assert!(recall(kind, &sent[0].body).is_some(), "{name}");
+        assert!(!memory_tools(kind, &sent[0].body).is_empty(), "{name}");
+        assert_eq!(recall(kind, &sent[1].body), None, "{name}");
+        assert_eq!(
+            memory_tools(kind, &sent[1].body),
+            memory_tools(kind, &sent[0].body),
+            "{name}"
+        );
+        for (index, turn) in sent.iter().enumerate().skip(2) {
+            assert_eq!(recall(kind, &turn.body), None, "{name}: turn {index}");
+            assert_eq!(
+                memory_tools(kind, &turn.body),
+                Vec::<String>::new(),
                 "{name}: turn {index}"
             );
         }

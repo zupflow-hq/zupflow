@@ -491,8 +491,9 @@ pub struct SessionTemplate {
     pub instructions: String,
     pub offer: Offer,
     /// The agent's memory type and the session's audience: `None` when the
-    /// agent has none, or one of a kind this server doesn't serve, and in a
-    /// conversation shared with another organization.
+    /// agent has none, one of a kind this server doesn't serve, or one whose
+    /// settings its kind refuses now, and in a conversation shared with
+    /// another organization.
     pub memory: Option<SessionMemory>,
     /// What a run's history, its input and its recall may take together,
     /// the recall no more than half ([`crate::runs::history::trimmed_start`],
