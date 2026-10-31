@@ -16,8 +16,8 @@ use zupflow_core::ids::{
 use zupflow_core::installations::ShortId;
 use zupflow_core::memory::notes::{self, NewNote, NoteRef, NoteStore, Notes, Reach};
 use zupflow_core::memory::{
-    Audience, CallContext, MemoryChange, MemoryError, MemoryFilter, MemoryProvider, MemoryScope, MemoryWrites, Origin,
-    record_nothing,
+    self, Audience, CallContext, MemoryChange, MemoryError, MemoryFilter, MemoryProvider, MemoryScope, MemoryWrites,
+    Origin, record_nothing,
 };
 use zupflow_core::time::Timestamp;
 use zupflow_sqlite::{Database, SqliteNoteStore};
@@ -160,20 +160,24 @@ async fn keeps_every_notes_text_out_of_the_logs() {
     let origin = run_origin();
     let settings = notes::check_settings(&Map::new()).unwrap();
     let conversation = Audience::Direct(ChannelConversationId::generate());
-    let context = |audience, now| CallContext {
-        origin: &origin,
+    // Each call a run's own.
+    let origins: Vec<Origin> = (0..5).map(|_| run_origin()).collect();
+    let context = |n: usize, audience, now| CallContext {
+        origin: &origins[n],
         audience,
         settings: &settings,
         writes: MemoryWrites::Allow,
         now,
     };
     let workspace = Audience::Workspace;
+    let save = arguments(json!({ "text": format!("The vault code is {SECRET}.") }));
     let saved = kind
         .call(
             &scope,
-            &context(&workspace, at(1)),
+            &context(0, &workspace, at(1)),
             notes::SAVE_MEMORY,
-            &arguments(json!({ "text": format!("The vault code is {SECRET}.") })),
+            &save,
+            &record_nothing,
         )
         .await
         .unwrap();
@@ -181,20 +185,46 @@ async fn keeps_every_notes_text_out_of_the_logs() {
         panic!("saved: {saved:?}");
     };
     let short = note.short_id.as_str();
+    // A save whose answer was lost is answered as made, and its sender,
+    // committing after, is refused: neither logs anything of it.
+    let settled = memory::settle(
+        &kind,
+        &scope,
+        &context(0, &workspace, at(1)),
+        notes::SAVE_MEMORY,
+        &save,
+        &record_nothing,
+    )
+    .await
+    .unwrap();
+    assert!(!settled.is_error && settled.change.is_none(), "{settled:?}");
+    assert_eq!(
+        kind.call(
+            &scope,
+            &context(0, &workspace, at(1)),
+            notes::SAVE_MEMORY,
+            &save,
+            &record_nothing
+        )
+        .await,
+        Err(MemoryError::AlreadyMade)
+    );
     kind.call(
         &scope,
-        &context(&conversation, at(2)),
+        &context(1, &conversation, at(2)),
         notes::SAVE_MEMORY,
         &arguments(json!({ "text": format!("Here only: {SECRET}.") })),
+        &record_nothing,
     )
     .await
     .unwrap();
     let found = kind
         .call(
             &scope,
-            &context(&conversation, at(3)),
+            &context(2, &conversation, at(3)),
             notes::SEARCH_MEMORY,
             &arguments(json!({ "query": format!("\"{SECRET}\"*") })),
+            &record_nothing,
         )
         .await
         .unwrap();
@@ -209,9 +239,10 @@ async fn keeps_every_notes_text_out_of_the_logs() {
     assert_eq!(kind.list(&scope, &filter).await.unwrap().total, 2);
     kind.call(
         &scope,
-        &context(&workspace, at(4)),
+        &context(3, &workspace, at(4)),
         notes::UPDATE_MEMORY,
         &arguments(json!({ "memory": short, "text": format!("The vault code is {SECRET}, still.") })),
+        &record_nothing,
     )
     .await
     .unwrap();
@@ -227,9 +258,10 @@ async fn keeps_every_notes_text_out_of_the_logs() {
     .unwrap();
     kind.call(
         &scope,
-        &context(&workspace, at(6)),
+        &context(4, &workspace, at(6)),
         notes::FORGET_MEMORY,
         &arguments(json!({ "memory": short })),
+        &record_nothing,
     )
     .await
     .unwrap();
@@ -267,7 +299,7 @@ async fn keeps_every_notes_text_out_of_the_logs() {
 
     let logged = captured.text();
     assert!(
-        logged.contains("memory_notes.database_error"),
+        logged.contains("memory_notes.database_error") && logged.contains("memory_notes.call_made_already"),
         "the refusals are logged: {logged}"
     );
     assert!(!logged.to_lowercase().contains(SECRET), "never a note's text: {logged}");

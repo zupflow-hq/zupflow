@@ -1444,6 +1444,18 @@ impl zupflow_core::runs::RunStore for ReadsFailAfterCommit {
             .await
     }
 
+    async fn runs_waiting_in_type(
+        &self,
+        organization_id: OrganizationId,
+        memory_type_id: zupflow_core::ids::MemoryTypeId,
+        after: Option<RunId>,
+        limit: u32,
+    ) -> Result<Vec<(WorkspaceId, RunId)>, zupflow_core::runs::store::StoreError> {
+        self.inner
+            .runs_waiting_in_type(organization_id, memory_type_id, after, limit)
+            .await
+    }
+
     async fn abandoned_runs(
         &self,
         limit: u32,

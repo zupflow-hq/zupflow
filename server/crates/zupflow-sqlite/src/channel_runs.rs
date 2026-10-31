@@ -46,7 +46,7 @@ use zupflow_core::runs::reducer::admit;
 use zupflow_core::runs::state::{ChannelOrigin, SessionContext, SteeredTurn};
 use zupflow_core::runs::store::StoreError;
 use zupflow_core::runs::transition::{SeenMessage, Steer};
-use zupflow_core::runs::{ChannelAdmission, NewRun, RunStatus, RunTrigger, TakenIn};
+use zupflow_core::runs::{ChannelAdmission, MemoryMode, NewRun, RunStatus, RunTrigger, TakenIn};
 use zupflow_core::time::Timestamp;
 use zupflow_core::webhooks::WebhookEventType;
 
@@ -1319,6 +1319,8 @@ async fn start_session_run(
         session_id,
         trigger: RunTrigger::Channel,
         input,
+        // A channel run is `agent`; its session sends it no memory.
+        memory: MemoryMode::Agent,
         model: template.model.clone(),
         instructions: template.instructions.clone(),
         channel: Some(ChannelAdmission {

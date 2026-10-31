@@ -15,7 +15,13 @@
 //! there; a run there changes and forgets only that conversation's notes,
 //! and the people who manage an agent's notes see and change them all. A
 //! note keeps who wrote its text: saving it, or changing it, writes its
-//! origin, and its own text again changes nothing.
+//! origin, and its own text again changes nothing. A run's call that saves,
+//! changes or forgets a note is kept with its change, with its answer
+//! ([`super::MadeCall`]), one for each call, and one that gives a note the
+//! text it holds is kept alone: one whose answer was lost is answered that
+//! way, whatever became of the note since, and its change is never made
+//! again ([`NoteStore::made`]). A search, or a call the kind refused, keeps
+//! no record, and is made again.
 //!
 //! A recall shows the notes by last change, oldest first, one line each
 //! (`[k7m2qd] Prefers answers in Portuguese.`), under a line that says what
@@ -33,13 +39,13 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 
 use super::{
-    Audience, CallContext, CallResult, Forget, KindDescription, Manage, Memory, MemoryChange, MemoryError,
-    MemoryFilter, MemoryKind, MemoryProvider, MemoryScope, MemoryTool, MemoryWrites, Origin, Recall, Record, Rewritten,
-    Settings, SettingsRefusal, one_line, record_nothing, shown_line,
+    Audience, CallContext, CallResult, Forget, KindDescription, MadeCall, Manage, Memory, MemoryChange, MemoryError,
+    MemoryFilter, MemoryKind, MemoryProvider, MemoryScope, MemoryTool, MemoryWrites, Origin, Recall, Record, Recorded,
+    Rewritten, Settings, SettingsRefusal, one_line, shown_line,
 };
 use crate::apps::ToolEffect;
 use crate::audit::Audit;
-use crate::ids::{ChannelConversationId, MemoryId};
+use crate::ids::{ChannelConversationId, MemoryId, RunId, ToolCallId};
 use crate::installations::ShortId;
 use crate::policy::ToolLevel;
 use crate::time::Timestamp;
@@ -414,9 +420,11 @@ pub struct Recent {
 /// the rules that must hold across concurrent saves (the limit, a short ID
 /// once in its scope), keeps whatever a store searches with in step, and
 /// writes what `record` builds of the change ([`Record`]): its audit event,
-/// and its webhook events with their deliveries, placed in the scope's
-/// workspace. A record that can't be written fails the change, and a change
-/// refused records nothing.
+/// its webhook events with their deliveries, placed in the scope's
+/// workspace, and the run's call that made it ([`Recorded::call`]), once
+/// for each call, alone for an update to the text a note holds. A record
+/// that can't be written fails the change, a second of the same call fails
+/// it `AlreadyMade`, and a change refused records nothing.
 #[async_trait]
 pub trait NoteStore: Send + Sync {
     /// Saves a note in its scope, at `now`: `NotFound` when the scope's agent
@@ -436,7 +444,10 @@ pub trait NoteStore: Send + Sync {
     /// Replaces a note's text, as written by `origin` at `now`; `NotFound`
     /// unless `reach` reaches it. Searches find it by its new text only.
     /// Records what `record` builds from it as changed. The text it already
-    /// holds changes nothing and records nothing ([`Rewritten`]).
+    /// holds changes nothing ([`Rewritten`]), and records only the run's
+    /// call `record` builds from it, if any ([`Recorded::call`]): no audit
+    /// event, no webhook events. Another of the same call fails it
+    /// `AlreadyMade`, as after a change.
     #[allow(clippy::too_many_arguments)]
     async fn update(
         &self,
@@ -475,6 +486,18 @@ pub trait NoteStore: Send + Sync {
     /// One of the scope's notes by its ID, as it is now, whatever its
     /// audience: `NotFound` unless the scope keeps it.
     async fn get(&self, scope: &MemoryScope, id: MemoryId) -> Result<Memory, MemoryError>;
+
+    /// What run `run_id`'s call `tool_call_id` made in the scope, as it
+    /// recorded it ([`Recorded::call`], written with its change), whatever
+    /// became of the note since: `None` when it recorded nothing there (a
+    /// search, a refusal, or a call never made). How a call whose answer was
+    /// lost is answered as it was made.
+    async fn made(
+        &self,
+        scope: &MemoryScope,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+    ) -> Result<Option<MadeCall>, MemoryError>;
 
     /// The `limit` notes the audience is shown that changed last, newest
     /// first (by last change, then ID), and how many it's shown in all, both
@@ -571,12 +594,33 @@ fn not_found(tool: &str, short_id: &ShortId, audience: &Audience) -> CallResult 
 /// A tool that writes, called while the type's writes are denied.
 const READ_ONLY: &str = "This agent's memory is read-only now: it can search notes, not save, change or forget them.";
 
+/// What the model reads back from `tool`'s change of `note`: its short ID,
+/// never its text.
+fn answer(tool: &str, note: &Memory) -> String {
+    let short_id = note.short_id.as_str();
+    match tool {
+        SAVE_MEMORY => format!("Saved as {short_id}."),
+        UPDATE_MEMORY => format!("Updated {short_id}."),
+        _ => format!("Forgot {short_id}."),
+    }
+}
+
+/// What a run's call records with its change: what the server builds of it,
+/// and the call with its answer ([`MadeCall`]).
+fn with_call(record: &Record<'_>, context: &CallContext<'_>, tool: &str, change: &MemoryChange) -> Recorded {
+    Recorded {
+        call: MadeCall::of(context, tool, change.memory(), answer(tool, change.memory())),
+        ..record(change)
+    }
+}
+
 impl Notes {
     async fn save(
         &self,
         scope: &MemoryScope,
         context: &CallContext<'_>,
         arguments: &Map<String, Value>,
+        record: &Record<'_>,
     ) -> Result<CallResult, MemoryError> {
         let Some(text) = text_argument(arguments) else {
             return Ok(CallResult::refusal(
@@ -592,13 +636,10 @@ impl Notes {
             origin: context.origin,
             short_ids: &short_ids,
         };
-        match self
-            .store
-            .insert(scope, &note, max_notes, context.now, &record_nothing)
-            .await
-        {
+        let record = |change: &MemoryChange| with_call(record, context, SAVE_MEMORY, change);
+        match self.store.insert(scope, &note, max_notes, context.now, &record).await {
             Ok(saved) => Ok(CallResult::answer(
-                format!("Saved as {}.", saved.short_id.as_str()),
+                answer(SAVE_MEMORY, &saved),
                 Some(MemoryChange::Saved(saved)),
             )),
             Err(MemoryError::Full) => Ok(full(max_notes)),
@@ -611,6 +652,7 @@ impl Notes {
         scope: &MemoryScope,
         context: &CallContext<'_>,
         arguments: &Map<String, Value>,
+        record: &Record<'_>,
     ) -> Result<CallResult, MemoryError> {
         let Some(short_id) = short_id_argument(arguments) else {
             return Ok(CallResult::refusal(
@@ -624,14 +666,15 @@ impl Notes {
         };
         let note = NoteRef::ShortId(&short_id);
         let reach = Reach::Run(context.audience);
+        let record = |change: &MemoryChange| with_call(record, context, UPDATE_MEMORY, change);
         match self
             .store
-            .update(scope, note, reach, context.origin, &text, context.now, &record_nothing)
+            .update(scope, note, reach, context.origin, &text, context.now, &record)
             .await
         {
-            // The text it already held changed nothing.
+            // The text it already held changed nothing: the call is kept alone.
             Ok(Rewritten { memory, changed }) => Ok(CallResult::answer(
-                format!("Updated {}.", memory.short_id.as_str()),
+                answer(UPDATE_MEMORY, &memory),
                 changed.then_some(MemoryChange::Updated(memory)),
             )),
             Err(MemoryError::NotFound) => Ok(not_found(UPDATE_MEMORY, &short_id, context.audience)),
@@ -644,24 +687,26 @@ impl Notes {
         scope: &MemoryScope,
         context: &CallContext<'_>,
         arguments: &Map<String, Value>,
+        record: &Record<'_>,
     ) -> Result<CallResult, MemoryError> {
         let Some(short_id) = short_id_argument(arguments) else {
             return Ok(CallResult::refusal(
                 "Give forget_memory the note's ID: k7m2qd for [k7m2qd].",
             ));
         };
+        let record = |change: &MemoryChange| with_call(record, context, FORGET_MEMORY, change);
         match self
             .store
             .delete(
                 scope,
                 NoteRef::ShortId(&short_id),
                 Reach::Run(context.audience),
-                &record_nothing,
+                &record,
             )
             .await
         {
             Ok(forgotten) => Ok(CallResult::answer(
-                format!("Forgot {}.", forgotten.short_id.as_str()),
+                answer(FORGET_MEMORY, &forgotten),
                 Some(MemoryChange::Forgotten(forgotten)),
             )),
             Err(MemoryError::NotFound) => Ok(not_found(FORGET_MEMORY, &short_id, context.audience)),
@@ -755,6 +800,7 @@ impl MemoryProvider for Notes {
         context: &CallContext<'_>,
         tool: &str,
         arguments: &Map<String, Value>,
+        record: &Record<'_>,
     ) -> Result<CallResult, MemoryError> {
         let writes = NOTES_TOOLS
             .iter()
@@ -763,12 +809,22 @@ impl MemoryProvider for Notes {
             return Ok(CallResult::refusal(READ_ONLY));
         }
         match tool {
-            SAVE_MEMORY => self.save(scope, context, arguments).await,
-            UPDATE_MEMORY => self.update(scope, context, arguments).await,
-            FORGET_MEMORY => self.forget_one(scope, context, arguments).await,
+            SAVE_MEMORY => self.save(scope, context, arguments, record).await,
+            UPDATE_MEMORY => self.update(scope, context, arguments, record).await,
+            FORGET_MEMORY => self.forget_one(scope, context, arguments, record).await,
             SEARCH_MEMORY => self.search(scope, context.audience, arguments).await,
             _ => Ok(CallResult::refusal("That isn't a memory tool.")),
         }
+    }
+
+    /// As its store kept it with the change.
+    async fn made(
+        &self,
+        scope: &MemoryScope,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+    ) -> Result<Option<MadeCall>, MemoryError> {
+        self.store.made(scope, run_id, tool_call_id).await
     }
 
     async fn list(&self, scope: &MemoryScope, filter: &MemoryFilter) -> Result<Page<Memory>, MemoryError> {

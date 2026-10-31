@@ -266,6 +266,7 @@ mod tests {
                     instructions: "Be brief.",
                     messages,
                     tools: &tools(),
+                    memory: None,
                     cache_key: None,
                 },
             )

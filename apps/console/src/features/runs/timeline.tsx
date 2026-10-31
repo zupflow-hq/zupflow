@@ -109,11 +109,11 @@ function Row({
   );
 }
 
-/** Where a call goes: an installation's app and label, or a channel connection's provider and label. */
+/** Where a call goes: an installation's app and label, a channel connection's provider and label, or the agent's memory type. */
 function toolTarget(ref: ToolCallRef): string {
-  return "installation_id" in ref
-    ? `${ref.app_name} · ${ref.installation_label}`
-    : `${CHANNEL_PROVIDER_NAMES[ref.provider]} · ${ref.connection_label}`;
+  if ("installation_id" in ref) return `${ref.app_name} · ${ref.installation_label}`;
+  if ("memory_type_id" in ref) return `Memory · ${ref.memory_type_name}`;
+  return `${CHANNEL_PROVIDER_NAMES[ref.provider]} · ${ref.connection_label}`;
 }
 
 /** The conversation a channel call reads or sends to, and how to name it: its thread, or another conversation. */
@@ -122,7 +122,7 @@ function channelDestination(
   args: unknown,
   run: Run,
 ): { label: string; conversation: ChannelConversationId; thread?: string } | null {
-  if ("installation_id" in ref) return null;
+  if (!("channel_connection_id" in ref)) return null;
   const given = (args ?? {}) as { conversation?: unknown; thread?: unknown; person?: unknown };
   const origin = run.channel;
   if (ref.tool === "reply" && origin) {

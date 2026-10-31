@@ -41,6 +41,7 @@ fn turn<'a>(model: &'a str, messages: &'a [Message], tools: &'a [ToolSpec]) -> T
         instructions: "Be brief.",
         messages,
         tools,
+        memory: None,
         cache_key: None,
     }
 }

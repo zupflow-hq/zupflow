@@ -11,7 +11,9 @@
 //! type's notes reference it with a cascading key: they go with it, in the
 //! statement that deletes it, and the transaction queues the job that has
 //! its kind forget them wherever it keeps them ([`queue_forgetting`], which
-//! deleting an agent or a workspace queues too).
+//! deleting an agent or a workspace queues too), and the job that refuses
+//! the calls of runs still waiting for approval in it
+//! ([`refuse_waiting_in_type_job`]), in whichever workspace.
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -29,6 +31,7 @@ use zupflow_core::memory::type_store::{
 use zupflow_core::memory::{Forget, MemoryKind, MemoryWrites};
 use zupflow_core::model_store::HoldingAgent;
 use zupflow_core::organizations::User;
+use zupflow_core::runs::store::refuse_waiting_in_type_job;
 use zupflow_core::scope::Scope;
 use zupflow_core::time::Timestamp;
 use zupflow_core::workspaces::Page;
@@ -533,6 +536,21 @@ impl MemoryTypeStore for SqliteMemoryTypeStore {
         queue_forgetting(&mut transaction, &forget, Some(&memory_type.kind))
             .await
             .map_err(|_| MemoryTypeError::Unavailable)?;
+        // A run started in it keeps it to its end: a call of one waiting for
+        // approval is refused now, and the run moves on.
+        let refusals = refuse_waiting_in_type_job(memory_type_id).ok_or(MemoryTypeError::Unavailable)?;
+        insert_job(
+            &mut *transaction,
+            &Scope::Organization(organization_id),
+            &refusals.kind,
+            refusals.payload,
+            refusals.options,
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(event = "memory_types.refusals_not_queued", %error);
+            MemoryTypeError::Unavailable
+        })?;
         crate::audit::record(&mut transaction, organization_id, &audit(&memory_type))
             .await
             .map_err(failed("audit"))?;

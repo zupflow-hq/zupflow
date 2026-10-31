@@ -270,6 +270,7 @@ pub fn offered_tool(connection: &OfferingConnection<'_>, tool: &str) -> Option<O
         input_schema: schema,
         installation_id: None,
         channel_connection_id: Some(connection.id),
+        memory_type_id: None,
         installation_short_id: connection.short_id.to_owned(),
         installation_label: connection.label.to_owned(),
         app_key: connection.provider.as_str().to_owned(),
@@ -288,6 +289,7 @@ pub fn stay_silent() -> Option<OfferedTool> {
         input_schema: schema,
         installation_id: None,
         channel_connection_id: None,
+        memory_type_id: None,
         installation_short_id: String::new(),
         installation_label: String::new(),
         app_key: String::new(),
@@ -413,6 +415,7 @@ mod tests {
             instructions: "",
             messages: &messages,
             tools: &specs,
+            memory: None,
             cache_key: None,
         };
         assert_eq!(validate_turn(&turn), Ok(()));

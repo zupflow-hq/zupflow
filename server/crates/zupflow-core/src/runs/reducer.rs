@@ -11,8 +11,8 @@
 //! The worker's steps come from [`advance`]. The others have their own pure
 //! constructors: [`admit`] (the API), [`resolve_approval`] (an API key),
 //! [`cancel`] (the API or the Console), [`fail_abandoned`] (the sweep) and
-//! [`refuse_waiting`] (the job an installation's deletion or disconnection
-//! queues).
+//! [`refuse_waiting`] (the job an installation's deletion or disconnection,
+//! or a memory type's deletion, queues).
 //!
 //! | Continuation | Plan |
 //! | --- | --- |
@@ -34,23 +34,25 @@ use serde_json::{Map, Value, json};
 
 use crate::audit::AuditActor;
 use crate::channels::tools::{self, SILENT_WITHOUT_REASON, STAYED_SILENT};
-use crate::ids::{ApiKeyId, ChannelConnectionId, InstallationId, OrganizationId, RunId, ToolCallId, WorkspaceId};
+use crate::ids::{
+    ApiKeyId, ChannelConnectionId, InstallationId, MemoryTypeId, OrganizationId, RunId, ToolCallId, WorkspaceId,
+};
 use crate::model_store::RouteState;
 use crate::models::{Completion, Message, ModelToolCall, Reply, ToolSpec, Turn, validate_completion, validate_turn};
-use crate::runs::digest::{Sha256Digest, call_digest, channel_call_digest, digest_json};
+use crate::runs::digest::{Sha256Digest, call_digest, channel_call_digest, digest_json, memory_call_digest};
 use crate::runs::history::{NUDGE, blank};
 use crate::runs::names::{Offer, OfferedTool, ToolHost};
 use crate::runs::state::{
     BoundTarget, CallAttempt, CallDecision, CallRecord, CallVerdict, ClaimantId, Continuation, EXECUTION_VERSION,
-    InvocationId, ModelAttemptState, RequestId, Snapshot, SteeredTurn, Usage, supports,
+    FrozenMemory, InvocationId, ModelAttemptState, RequestId, Snapshot, SteeredTurn, Usage, supports,
 };
 use crate::runs::transition::{
     Admit, Authorization, AuthorizeCall, Cancel, Claim, Closing, CommitTurn, FailAbandoned, Finish, Guards,
     ModelAttemptRef, NewCall, Operation, OwnerGuard, Park, PrepareModel, RecordOutcome, RefuseWaiting, ResolveApproval,
-    RunEnding, SendGuard, SendLease, SendOutcome, SettleUnknown, Settlement, Steer, TransitionRequest, Yield,
+    RunEnding, SendGuard, SendLease, SendOutcome, SettleUnknown, Settlement, Steer, TransitionRequest, WentAway, Yield,
     YieldReason,
 };
-use crate::runs::{ApprovalDecision, CallOutcome, CallState, Failure, NewRun, RunStatus, RunTrigger};
+use crate::runs::{ApprovalDecision, CallOutcome, CallState, Failure, MemoryMode, NewRun, RunStatus, RunTrigger};
 use crate::time::Timestamp;
 
 /// The domain of model request digests.
@@ -116,6 +118,47 @@ pub const CONNECTION_REMOVED: &str = "channel_connection_removed";
 /// disconnected or needs reconnecting: refused, and the run goes on.
 pub const CONNECTION_UNUSABLE: &str = "channel_connection_unusable";
 
+/// The failure code, and the decision's rule, of a memory tool's call whose
+/// run's memory type was deleted: refused with [`MEMORY_TYPE_REMOVED_MESSAGE`],
+/// and the run goes on.
+pub const MEMORY_TYPE_REMOVED: &str = "memory_type_removed";
+
+/// What the model reads back for a memory tool's call whose run's memory
+/// type was deleted.
+pub const MEMORY_TYPE_REMOVED_MESSAGE: &str = "This run's memory was deleted, so this call wasn't made.";
+
+/// The failure code, and the decision's rule, of a memory tool's call in a
+/// run started with memory off: refused with [`MEMORY_OFF_MESSAGE`], and the
+/// run goes on.
+pub const MEMORY_OFF: &str = "memory_off";
+
+/// What the model reads back for a memory tool's call in a run started with
+/// memory off.
+pub const MEMORY_OFF_MESSAGE: &str = "Memory is off for this run.";
+
+/// The failure code, and the decision's rule, of a memory tool's call whose
+/// run's memory type is of a kind this server doesn't serve: refused with
+/// [`MEMORY_KIND_NOT_SERVED_MESSAGE`], and the run goes on. The code the
+/// memories API answers such a type with.
+pub const MEMORY_KIND_NOT_SERVED: &str = "memory_kind_not_served";
+
+/// What the model reads back for a memory tool's call whose run's memory
+/// type is of a kind this server doesn't serve.
+pub const MEMORY_KIND_NOT_SERVED_MESSAGE: &str =
+    "This run's memory can't be reached on this server, so this call wasn't made.";
+
+/// The failure code, and the decision's rule, of a memory tool's call whose
+/// run's memory type holds settings its kind refuses now (a server that
+/// changed what it accepts): refused with [`MEMORY_SETTINGS_INVALID_MESSAGE`],
+/// and the run goes on. The code a type's settings are refused with when
+/// it's saved.
+pub const MEMORY_SETTINGS_INVALID: &str = "invalid_memory_settings";
+
+/// What the model reads back for a memory tool's call whose run's memory
+/// type holds settings its kind refuses.
+pub const MEMORY_SETTINGS_INVALID_MESSAGE: &str =
+    "This run's memory has settings this server can't use, so this call wasn't made.";
+
 /// The failure code of a run whose model answered with nothing twice, and
 /// never called `stay_silent`.
 pub const EMPTY_OUTPUT: &str = "empty_output";
@@ -161,16 +204,25 @@ pub fn channel_changes(snapshot: &Snapshot) -> u32 {
     u32::try_from(counted).unwrap_or(u32::MAX)
 }
 
-/// The failure code of a call the floor, the policy or a channel's rules
-/// refused, unless its rule names its own (`outside_audience`,
-/// `rate_limited`).
+/// The failure code of a call the floor, the policy, a channel's rules or a
+/// run's memory refused, unless its rule names its own (`outside_audience`,
+/// `rate_limited`, [`MEMORY_OFF`], [`MEMORY_TYPE_REMOVED`],
+/// [`MEMORY_KIND_NOT_SERVED`], [`MEMORY_SETTINGS_INVALID`]).
 pub const TOOL_REFUSED: &str = "tool_refused";
 
 /// The code a refused call fails with: its rule's own, for the rules a
-/// channel tool's call is refused by, else [`TOOL_REFUSED`].
+/// channel tool's or a memory tool's call is refused by, else
+/// [`TOOL_REFUSED`]. A memory call refused for one reason fails with one
+/// code, whether it's refused when decided, checked before it's sent, or as
+/// it's made.
 pub fn refusal_code(decision: &CallDecision) -> &str {
     match decision.rule.as_str() {
-        rule @ ("outside_audience" | "rate_limited") => rule,
+        rule @ ("outside_audience"
+        | "rate_limited"
+        | MEMORY_OFF
+        | MEMORY_TYPE_REMOVED
+        | MEMORY_KIND_NOT_SERVED
+        | MEMORY_SETTINGS_INVALID) => rule,
         _ => TOOL_REFUSED,
     }
 }
@@ -193,6 +245,8 @@ fn gone_refusal(gone: Gone, target: &BoundTarget) -> (&'static str, String) {
                 target.app_name
             ),
         ),
+        // A memory type is only ever deleted.
+        (ToolHost::Memory(_), _) => (MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE.to_owned()),
         _ => gone.refusal(label),
     }
 }
@@ -344,6 +398,11 @@ pub struct Facts {
     /// [`super::names::build_offer`]. Needed only while the run has none
     /// ([`frozen_offer`]): every later attempt offers the same tools.
     pub offer: Option<Offer>,
+    /// The run's memory, resolved with [`Facts::offer`] for its first model
+    /// attempt and read only with it: `None` without memory. Every later
+    /// attempt sends the memory the first kept on the run
+    /// ([`frozen_memory`]).
+    pub memory: Option<FrozenMemory>,
     /// Whether the run's model can be called now, read with the offer for a
     /// run that names an organization's model.
     pub model_route: Option<RouteState>,
@@ -378,6 +437,7 @@ impl Facts {
             steps: 0,
             limits: Limits::default(),
             offer: None,
+            memory: None,
             model_route: None,
             model: None,
             decisions: Vec::new(),
@@ -403,6 +463,9 @@ pub struct ModelRequest {
     pub key_version: Option<u32>,
     pub model: String,
     pub instructions: String,
+    /// The run's recall, framed: the first block of its first user message
+    /// ([`Turn::memory`]). Frozen with the offer at the run's first attempt.
+    pub memory: Option<String>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
 }
@@ -413,14 +476,16 @@ impl ModelRequest {
         Turn {
             model: &self.model,
             instructions: &self.instructions,
+            memory: self.memory.as_deref(),
             messages: &self.messages,
             tools: &self.tools,
             cache_key: None,
         }
     }
 
-    /// The SHA-256 of what the model is sent: model, instructions,
-    /// conversation and tools.
+    /// The SHA-256 of what the model is sent: model, instructions, recall,
+    /// conversation and tools. A request without a recall leaves it out, so
+    /// it digests as it did before runs had memory.
     pub fn digest(&self) -> Sha256Digest {
         let messages: Vec<Value> = self
             .messages
@@ -449,15 +514,16 @@ impl ModelRequest {
                 |tool| json!({ "name": tool.name, "description": tool.description, "input_schema": tool.input_schema }),
             )
             .collect();
-        digest_json(
-            MODEL_REQUEST_DOMAIN,
-            &json!({
-                "model": self.model,
-                "instructions": self.instructions,
-                "messages": messages,
-                "tools": tools,
-            }),
-        )
+        let mut request = json!({
+            "model": self.model,
+            "instructions": self.instructions,
+            "messages": messages,
+            "tools": tools,
+        });
+        if let (Some(memory), Value::Object(fields)) = (&self.memory, &mut request) {
+            fields.insert("memory".to_owned(), json!(memory));
+        }
+        digest_json(MODEL_REQUEST_DOMAIN, &request)
     }
 }
 
@@ -501,6 +567,33 @@ pub struct ChannelSendRequest {
     pub provider: String,
 }
 
+/// One memory tool's call to make, under its send claim, in the memory
+/// type the run started with, through its kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySendRequest {
+    /// The run's scope: the memory is found in it, and only in it, with the
+    /// run's own agent.
+    pub organization_id: OrganizationId,
+    pub workspace_id: WorkspaceId,
+    pub run_id: RunId,
+    pub call_id: ToolCallId,
+    pub attempt: u32,
+    pub invocation_id: InvocationId,
+    /// Only the type the run's tools are of: never another.
+    pub memory_type_id: MemoryTypeId,
+    /// The kind's key, as the digest covers it.
+    pub kind: String,
+    pub tool: String,
+    pub arguments: Map<String, Value>,
+    /// The digest the call was decided (and any approval given) on: the
+    /// sender checks it again against what it is about to do.
+    pub call_digest: Sha256Digest,
+    pub definition_sha256: Sha256Digest,
+    /// Whether the model had read an app's tool result before it made the
+    /// call ([`after_app_content`]): kept with what the call writes.
+    pub after_app_content: bool,
+}
+
 /// The I/O a plan allows once its transition commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Io {
@@ -509,6 +602,8 @@ pub enum Io {
     SendCall(SendRequest),
     /// Boxed: a channel send is large beside the others.
     SendChannel(Box<ChannelSendRequest>),
+    /// Boxed, as a channel send is.
+    SendMemory(Box<MemorySendRequest>),
 }
 
 /// Why there's nothing to apply now.
@@ -928,12 +1023,23 @@ pub fn frozen_offer(snapshot: &Snapshot) -> Option<&Offer> {
         .or_else(|| snapshot.session.as_ref().map(|session| &session.offer))
 }
 
+/// The run's memory, frozen at its first model attempt with its offer and
+/// kept on the run. `None` before the first attempt (the driver resolves it
+/// then, [`Facts::memory`]), and for a run without memory.
+///
+/// Nothing reads the recall again during a run: a memory saved, changed or
+/// forgotten mid-run (by the run itself, too) reaches the next run, and
+/// this one's prompt keeps the bytes it started with.
+pub fn frozen_memory(snapshot: &Snapshot) -> Option<&FrozenMemory> {
+    snapshot.frozen_memory.as_ref()
+}
+
 fn model_request(
     snapshot: &Snapshot,
     turn: u32,
     attempt: u32,
     key_version: Option<u32>,
-    offer: &Offer,
+    (offer, memory): (&Offer, Option<&FrozenMemory>),
     steer: Option<&Steer>,
 ) -> Result<ModelRequest, AdvanceError> {
     let mut messages = conversation(snapshot)?;
@@ -942,16 +1048,50 @@ fn model_request(
             text: steer.text.clone(),
         });
     }
+    let recall = memory.and_then(|memory| sent_recall(snapshot, memory));
     Ok(ModelRequest {
         turn,
         attempt,
         key_version,
         model: snapshot.model.clone(),
         instructions: snapshot.instructions.clone(),
+        memory: recall,
         messages,
         tools: offer.specs(),
     })
 }
+
+/// The recall a run sends of `memory`: none for a run started with memory
+/// off, whatever a driver resolved, and never an empty one.
+fn sent_recall(snapshot: &Snapshot, memory: &FrozenMemory) -> Option<String> {
+    memory
+        .recall
+        .clone()
+        .filter(|recall| snapshot.memory == MemoryMode::Agent && !recall.is_empty())
+}
+
+/// Whether the model had read an app's (an installation's) tool result
+/// before it made `call`: a result of a call of an earlier turn, the app's
+/// own answer or its own error. What a memory tool writes then may come
+/// from that content, and its origin says so.
+pub fn after_app_content(snapshot: &Snapshot, call: &CallRecord) -> bool {
+    snapshot.calls.iter().any(|earlier| {
+        earlier.turn < call.turn
+            && earlier
+                .target
+                .as_ref()
+                .is_some_and(|target| matches!(target.host(), ToolHost::Installation(_)))
+            && (earlier.state == CallState::Completed
+                || (earlier.state == CallState::Failed
+                    && earlier
+                        .failure
+                        .as_ref()
+                        .is_some_and(|failure| failure.code == TOOL_ERROR)))
+    })
+}
+
+/// The failure code of a call whose tool answered with an error of its own.
+pub const TOOL_ERROR: &str = "tool_error";
 
 /// Where a call to `tool` goes; `None` for the run's own tool, which goes
 /// nowhere.
@@ -962,6 +1102,7 @@ fn bound(tool: &OfferedTool) -> Option<BoundTarget> {
     Some(BoundTarget {
         installation_id: tool.installation_id,
         channel_connection_id: tool.channel_connection_id,
+        memory_type_id: tool.memory_type_id,
         installation_short_id: tool.installation_short_id.clone(),
         installation_label: tool.installation_label.clone(),
         app_key: tool.app_key.clone(),
@@ -1003,6 +1144,13 @@ pub fn target_digest(
                 )
             })
         }
+        ToolHost::Memory(memory_type_id) => Some(memory_call_digest(
+            memory_type_id,
+            &target.app_key,
+            &target.tool,
+            definition,
+            arguments,
+        )),
         ToolHost::Run => None,
     }
 }
@@ -1070,7 +1218,7 @@ fn settlement(outcome: &SendOutcome, label: &str) -> Settlement {
         SendOutcome::ToolError { result } => Settlement {
             state: CallState::Failed,
             outcome: refused(Value::Object(result.clone()).to_string()),
-            failure: Some(Failure::new("tool_error", "The tool reported an error.")),
+            failure: Some(Failure::new(TOOL_ERROR, "The tool reported an error.")),
         },
         SendOutcome::NotSent => failed(
             "tool_unreachable",
@@ -1289,11 +1437,19 @@ impl Worker<'_> {
     }
 
     fn prepare(&self, turn: u32, abandons: Option<u32>) -> Result<Plan, AdvanceError> {
-        // Frozen at the first attempt: a fresh offer is for that one only.
-        let offer = match frozen_offer(self.snapshot) {
-            Some(frozen) => frozen,
-            None => self.facts.offer.as_ref().ok_or(AdvanceError::MissingFact("offer"))?,
+        // Frozen at the first attempt: a fresh offer, and the memory read
+        // with it, are for that one only. What's frozen is what's sent.
+        let (offer, memory) = match frozen_offer(self.snapshot) {
+            Some(frozen) => (frozen, frozen_memory(self.snapshot)),
+            None => (
+                self.facts.offer.as_ref().ok_or(AdvanceError::MissingFact("offer"))?,
+                self.facts.memory.as_ref(),
+            ),
         };
+        let memory = memory.map(|memory| FrozenMemory {
+            memory_type_id: memory.memory_type_id,
+            recall: sent_recall(self.snapshot, memory),
+        });
         // A run of an organization's model calls it only while the model and
         // its connection are there and the provider takes the key.
         let key_version = match self.snapshot.model_id {
@@ -1342,7 +1498,14 @@ impl Worker<'_> {
             .steer
             .as_ref()
             .filter(|_| self.snapshot.session.is_some() && attempt == 1 && abandons.is_none());
-        let request = model_request(self.snapshot, turn, attempt, key_version, offer, steer)?;
+        let request = model_request(
+            self.snapshot,
+            turn,
+            attempt,
+            key_version,
+            (offer, memory.as_ref()),
+            steer,
+        )?;
         validate_turn(&request.as_turn()).map_err(|_| AdvanceError::InvalidFact("a model request no model takes"))?;
         let operation = Operation::PrepareModel(PrepareModel {
             turn,
@@ -1350,6 +1513,7 @@ impl Worker<'_> {
             abandons,
             request_digest: request.digest(),
             offer: offer.clone(),
+            memory,
             key_version,
             steer: steer.cloned(),
         });
@@ -1386,7 +1550,14 @@ impl Worker<'_> {
             return Err(AdvanceError::InvalidFact("an answer to another model attempt"));
         }
         // Only its digest is compared: the key version isn't in it.
-        let request = model_request(self.snapshot, turn, attempt, None, &prepared.offer, None)?;
+        let request = model_request(
+            self.snapshot,
+            turn,
+            attempt,
+            None,
+            (&prepared.offer, frozen_memory(self.snapshot)),
+            None,
+        )?;
         if request.digest() != prepared.request_digest {
             return Err(AdvanceError::InvalidSnapshot(
                 "the conversation changed under a prepared model attempt",
@@ -1885,6 +2056,23 @@ impl Worker<'_> {
                 definition_sha256: target.definition_sha256,
                 provider: target.app_key.clone(),
             })),
+            ToolHost::Memory(memory_type_id) => Io::SendMemory(Box::new(MemorySendRequest {
+                organization_id: self.snapshot.organization_id,
+                workspace_id: self.snapshot.workspace_id,
+                run_id: self.snapshot.run_id,
+                call_id: call.id,
+                attempt,
+                invocation_id,
+                memory_type_id,
+                kind: target.app_key.clone(),
+                tool: target.tool.clone(),
+                arguments: call.arguments.clone(),
+                call_digest: call
+                    .call_digest
+                    .ok_or(AdvanceError::InvalidSnapshot("a memory call without its digest"))?,
+                definition_sha256: target.definition_sha256,
+                after_app_content: after_app_content(self.snapshot, call),
+            })),
             ToolHost::Run => return Err(AdvanceError::InvalidSnapshot("the run's own tool sent")),
         };
         Ok(self.apply(self.keeps(), operation, io))
@@ -1948,6 +2136,7 @@ pub fn admit(
             session_id: run.session_id,
             trigger: run.trigger,
             input: run.input.clone(),
+            memory: run.memory,
             model: run.model.provider_model_id.clone(),
             model_id: run.model.model_id,
             connection_id: run.model.connection_id,
@@ -2057,18 +2246,19 @@ pub fn resolve_approval(
     ))
 }
 
-/// Refuses the call the run waits on for approval because its installation,
-/// `installation_id`, went away (decision 0047): the call is never sent, and
-/// the run goes on without asking anyone. The job the installation's
-/// deletion or disconnection queued builds it; `request_id` is fresh for
-/// each of its requests. [`ControlError::NotWaiting`] unless the run waits
-/// for a decision on a call to that installation.
+/// Refuses the call the run waits on for approval because what it goes to,
+/// `went`, went away: its installation (decision 0047), or the memory type
+/// its run remembers in, only ever deleted. The call is never sent, and the
+/// run goes on without asking anyone. The job the deletion or disconnection
+/// queued builds it; `request_id` is fresh for each of its requests.
+/// [`ControlError::NotWaiting`] unless the run waits for a decision on a
+/// call to it.
 pub fn refuse_waiting(
     organization_id: OrganizationId,
     workspace_id: WorkspaceId,
     snapshot: &Snapshot,
     request_id: RequestId,
-    installation_id: InstallationId,
+    went: WentAway,
     gone: Gone,
 ) -> Result<TransitionRequest, ControlError> {
     let snapshot = in_scope(organization_id, workspace_id, snapshot)?;
@@ -2086,16 +2276,16 @@ pub fn refuse_waiting(
     let target = call
         .target
         .as_ref()
-        .filter(|target| target.installation_id == Some(installation_id))
+        .filter(|target| went.binds(target))
         .ok_or(ControlError::NotWaiting)?;
-    let (code, message) = gone.refusal(&target.installation_label);
+    let (code, message) = gone_refusal(gone, target);
     Ok(request(
         snapshot,
         Guards::default(),
         Operation::RefuseWaiting(RefuseWaiting {
             request_id,
             call_id,
-            installation_id,
+            went,
             outcome: refused(message.clone()),
             failure: Failure::new(code, message),
             next: next_after(snapshot, call)?,
@@ -2104,21 +2294,18 @@ pub fn refuse_waiting(
 }
 
 /// Whether a worker may be about to park the run on a call waiting for
-/// approval on `installation_id`: the run is at that call and hasn't parked.
-/// The worker read the installation before parking, perhaps before it went,
-/// so the job that refuses such calls waits for the park rather than miss it.
-pub fn may_park_on(snapshot: &Snapshot, installation_id: InstallationId) -> bool {
+/// approval on what `went`: the run is at that call and hasn't parked. The
+/// worker read the installation or the type before parking, perhaps before
+/// it went, so the job that refuses such calls waits for the park rather
+/// than miss it.
+pub fn may_park_on(snapshot: &Snapshot, went: WentAway) -> bool {
     let control = &snapshot.control;
     let Continuation::NeedCall { turn, position } = control.continuation else {
         return false;
     };
     control.status == RunStatus::Running
         && snapshot.call_at(turn, position).is_some_and(|call| {
-            call.state == CallState::AwaitingApproval
-                && call
-                    .target
-                    .as_ref()
-                    .is_some_and(|target| target.installation_id == Some(installation_id))
+            call.state == CallState::AwaitingApproval && call.target.as_ref().is_some_and(|target| went.binds(target))
         })
 }
 

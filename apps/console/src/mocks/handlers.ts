@@ -24,6 +24,7 @@ import {
   RemoveMemberQuery,
   ResolveApprovalInput,
   RUN_STATUSES,
+  RunMemory,
   type SignInSettings,
   TERMINAL_RUN_STATUSES,
   type UsageReport,
@@ -2632,6 +2633,8 @@ export function createHandlers(apiBase: string) {
           request,
           z.object({
             input: z.string().trim().min(1, "Write a message.").max(8000),
+            // The agent's memory as it's set, unless the run is started without it.
+            memory: z.enum(RunMemory.options, "Choose agent or off.").optional(),
           }),
         );
         // Resolved once, now: the run keeps this model even if the default changes before it starts.
@@ -2651,6 +2654,7 @@ export function createHandlers(apiBase: string) {
           session_id: newId("session"),
           trigger: access.kind === "api_key" ? "api" : "console",
           channel: null,
+          memory: input.memory ?? "agent",
           status: "queued",
           input: input.input,
           output: null,

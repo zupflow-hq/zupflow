@@ -14,12 +14,12 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 
 use super::{
-    Audience, CallContext, CallResult, Forget, KindDescription, Manage, Memory, MemoryError, MemoryFilter, MemoryKind,
-    MemoryProvider, MemoryScope, MemoryTool, MemoryWrites, Origin, Recall, Record, Rewritten, Settings,
+    Audience, CallContext, CallResult, Forget, KindDescription, MadeCall, Manage, Memory, MemoryError, MemoryFilter,
+    MemoryKind, MemoryProvider, MemoryScope, MemoryTool, MemoryWrites, Origin, Recall, Record, Rewritten, Settings,
     SettingsRefusal,
 };
 use crate::audit::Audit;
-use crate::ids::MemoryId;
+use crate::ids::{MemoryId, RunId, ToolCallId};
 use crate::time::Timestamp;
 use crate::workspaces::Page;
 
@@ -135,7 +135,12 @@ impl MemoryProvider for Unserved {
         _: &CallContext<'_>,
         _: &str,
         _: &Map<String, Value>,
+        _: &Record<'_>,
     ) -> Result<CallResult, MemoryError> {
+        Err(MemoryError::NotServed)
+    }
+
+    async fn made(&self, _: &MemoryScope, _: RunId, _: ToolCallId) -> Result<Option<MadeCall>, MemoryError> {
         Err(MemoryError::NotServed)
     }
 
@@ -246,6 +251,7 @@ mod tests {
             _: &CallContext<'_>,
             _: &str,
             _: &Map<String, Value>,
+            _: &Record<'_>,
         ) -> Result<CallResult, MemoryError> {
             Ok(CallResult::answer(self.name, None))
         }
@@ -343,8 +349,21 @@ mod tests {
             now: Timestamp::from_millis(0),
         };
         assert_eq!(
-            stand_in.call(&scope(), &context, "save_memory", &Map::new()).await,
+            stand_in
+                .call(&scope(), &context, "save_memory", &Map::new(), &record_nothing)
+                .await,
             Err(MemoryError::NotServed)
+        );
+        assert_eq!(
+            stand_in
+                .made(
+                    &scope(),
+                    RunId::from_uuid(Uuid::from_u128(7)),
+                    ToolCallId::from_uuid(Uuid::from_u128(8))
+                )
+                .await,
+            Err(MemoryError::NotServed),
+            "nothing to settle by"
         );
         assert_eq!(
             stand_in

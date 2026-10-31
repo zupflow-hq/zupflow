@@ -30,7 +30,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use zupflow_basic::in_process_metrics::InProcessMetrics;
 use zupflow_core::environment::Environment;
-use zupflow_core::ids::{InstallationId, OrganizationId, RunId, WorkspaceId};
+use zupflow_core::ids::{InstallationId, MemoryTypeId, OrganizationId, RunId, WorkspaceId};
 use zupflow_core::models::{
     Completion, Message, ModelProvider, ProviderAccess, ProviderError, TokenUsage, ToolSpec, Turn,
 };
@@ -230,7 +230,8 @@ pub struct Answer {
 pub struct Faults {
     armed: Mutex<Vec<Arc<Gate>>>,
     /// While set, the run store can't list the runs waiting on an
-    /// installation, as if the database were down for that read.
+    /// installation or in a memory type, as if the database were down for
+    /// that read.
     pub runs_waiting_on_unavailable: std::sync::atomic::AtomicBool,
     /// While set, the run store can't read a run's snapshot.
     pub snapshots_unavailable: std::sync::atomic::AtomicBool,
@@ -438,6 +439,21 @@ impl RunStore for FaultyRuns {
         }
         self.inner
             .runs_waiting_on(organization_id, workspace_id, installation_id, after, limit)
+            .await
+    }
+
+    async fn runs_waiting_in_type(
+        &self,
+        organization_id: OrganizationId,
+        memory_type_id: MemoryTypeId,
+        after: Option<RunId>,
+        limit: u32,
+    ) -> Result<Vec<(WorkspaceId, RunId)>, StoreError> {
+        if self.faults.runs_waiting_on_unavailable.load(Ordering::SeqCst) {
+            return Err(StoreError::Unavailable);
+        }
+        self.inner
+            .runs_waiting_in_type(organization_id, memory_type_id, after, limit)
             .await
     }
 

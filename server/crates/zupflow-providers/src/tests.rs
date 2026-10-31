@@ -104,6 +104,7 @@ async fn ask_model(
                 instructions: "Be brief.",
                 messages,
                 tools: &tools,
+                memory: None,
                 cache_key: Some(CACHE_KEY),
             },
         )
@@ -854,6 +855,7 @@ async fn refuses_a_breakpoint_where_the_provider_would() {
             instructions: "Be brief.",
             messages: &conversation,
             tools: &tools,
+            memory: None,
             cache_key: None,
         },
     );

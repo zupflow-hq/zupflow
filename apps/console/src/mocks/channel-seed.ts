@@ -343,6 +343,7 @@ function seedChannelRuns(db: Db, nowMs: number, rng: Rng, seed: ChannelRunSeed):
       reason,
       silent_reason: silent,
     },
+    memory: "agent",
     status: "completed",
     input: origin.text,
     output,

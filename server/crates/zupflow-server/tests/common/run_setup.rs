@@ -681,3 +681,127 @@ impl Setup {
         RunId::parse(id(&run["data"])).unwrap()
     }
 }
+
+/// The agent's memory: a `notes` type of the organization, its notes, and
+/// runs started with or without it.
+impl Setup {
+    /// A `notes` memory type of the organization whose agents write at
+    /// `writes` (`allow`, `approve` or `deny`): its ID.
+    pub async fn notes_type(&self, name: &str, writes: &str) -> String {
+        let (status, body) = self
+            .kit
+            .send(
+                call(
+                    "alice",
+                    Method::POST,
+                    format!("/v1/organizations/{}/memory-types", self.org),
+                )
+                .body(json!({ "name": name, "kind": "notes", "settings": {}, "writes": writes })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        id(&body["data"]).to_owned()
+    }
+
+    /// Has the agent remember in `memory_type`, its own type.
+    pub async fn remember_in(&self, memory_type: &str) {
+        let (status, body) = self
+            .kit
+            .send(
+                call(
+                    "alice",
+                    Method::PATCH,
+                    format!("/v1/workspaces/{}/agents/{}", self.ws, self.agent),
+                )
+                .naming(&self.org)
+                .body(json!({ "memory": "type", "memory_type_id": memory_type })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// Gives the agent a `notes` type of its own, writing at `writes`: the
+    /// type's ID.
+    pub async fn with_memory(&self, writes: &str) -> String {
+        let memory_type = self.notes_type("Customer notes", writes).await;
+        self.remember_in(&memory_type).await;
+        memory_type
+    }
+
+    /// Sets the type's `writes`.
+    pub async fn set_writes(&self, memory_type: &str, writes: &str) {
+        let (status, body) = self
+            .kit
+            .send(
+                call(
+                    "alice",
+                    Method::PATCH,
+                    format!("/v1/organizations/{}/memory-types/{memory_type}", self.org),
+                )
+                .body(json!({ "writes": writes })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// Saves `text` for the agent through the API, as alice: the memory.
+    pub async fn save_note(&self, text: &str) -> Value {
+        let (status, body) = self
+            .kit
+            .send(
+                call(
+                    "alice",
+                    Method::POST,
+                    format!("/v1/workspaces/{}/agents/{}/memories", self.ws, self.agent),
+                )
+                .naming(&self.org)
+                .body(json!({ "text": text })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        body["data"].clone()
+    }
+
+    /// The agent's memories, newest first, as the API lists them.
+    pub async fn notes(&self) -> Vec<Value> {
+        let (status, body) = self
+            .kit
+            .send(
+                call(
+                    "alice",
+                    Method::GET,
+                    format!("/v1/workspaces/{}/agents/{}/memories", self.ws, self.agent),
+                )
+                .naming(&self.org),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["data"].as_array().unwrap().clone()
+    }
+
+    /// Starts a run as alice with `memory` (`agent` or `off`); its ID.
+    /// Nothing works it yet.
+    pub async fn start_with_memory(&self, input: &str, memory: &str) -> RunId {
+        let (status, run) = self
+            .kit
+            .send(
+                call(
+                    "alice",
+                    Method::POST,
+                    format!("/v1/workspaces/{}/agents/{}/runs", self.ws, self.agent),
+                )
+                .naming(&self.org)
+                .body(json!({ "input": input, "memory": memory })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{run}");
+        assert_eq!(run["data"]["memory"], memory, "{run}");
+        RunId::parse(id(&run["data"])).unwrap()
+    }
+}
+
+/// `call <tool> <arguments>` for one of the agent's memory tools, which the
+/// model is offered by their own names.
+pub fn calling_memory(tool: &str, arguments: &Value) -> String {
+    format!("call {tool} {arguments}")
+}

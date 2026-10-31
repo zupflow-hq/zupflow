@@ -4,7 +4,8 @@
 //!
 //! Every kind: its key and description, and its settings checked once and
 //! the same when read back; the same tool definitions, byte for byte, for
-//! the same settings, and the tools that write offered only as the type's
+//! the same settings, whatever the type's writes (which only say which
+//! tools are offered), and the tools that write offered only as the type's
 //! writes allow, and refused once they're denied, though a run started
 //! before still offers them; no block to recall while there's nothing, and
 //! the same bytes for the same memories, settings and audience, whatever
@@ -23,17 +24,28 @@
 //! memory's workspace fails the change, which then changes nothing. A
 //! scope's oldest memories are forgotten as many at a time as asked,
 //! whatever the kind lets people do, with each memory's records and their
-//! count.
+//! count. A run's tool call records its change with it the same way, and
+//! itself with it: a call whose answer was lost, settled, is answered as it
+//! was made, whatever became of the memory since, and never makes its
+//! change twice nor records it twice; one that made none is made then,
+//! once; a sender that commits after its call was settled changes nothing;
+//! and what a call made is found in its own scope only. A kind that keeps
+//! no record of its calls settles none.
 //!
 //! `notes` adds: its tools' answers and refusals, writes refused before
 //! their arguments are read once denied, who wrote each note, search over
 //! only what the audience is shown, a run's changes only where its reach
-//! goes, the most notes a scope keeps, and a recall's exact bytes: the
-//! newest notes that fit, then a line counting the rest, each note as saved
-//! but for a frame tag.
+//! goes, the most notes a scope keeps, a recall's exact bytes (the newest
+//! notes that fit, then a line counting the rest, each note as saved but
+//! for a frame tag), and how each tool's call whose answer was lost is
+//! settled: a save, a change or a forget answered as made, whatever the
+//! writes are now and whatever became of the note, a change to the text the
+//! note held included, or made then, as the writes are then; a search made
+//! again.
 //!
 //! `prepare` makes a [`Tenant`] exist, as the `NoteStore` suite's does.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -45,7 +57,7 @@ use zupflow_core::environment::Environment;
 use zupflow_core::ids::{AgentId, ApiKeyId, ChannelConversationId, MemoryId, RunId, ToolCallId, UserId};
 use zupflow_core::memory::notes::{self, NoteStore, Notes};
 use zupflow_core::memory::{
-    Audience, CallContext, CallResult, Forget, Memory, MemoryChange, MemoryError, MemoryFilter, MemoryKind,
+    self, Audience, CallContext, CallResult, Forget, Memory, MemoryChange, MemoryError, MemoryFilter, MemoryKind,
     MemoryProvider, MemoryScope, MemoryTool, MemoryWrites, Origin, Record, Rewritten, Settings, record_nothing,
 };
 use zupflow_core::policy::ToolLevel;
@@ -86,6 +98,8 @@ pub async fn run(subject: Subject<'_>, prepare: Prepare) {
     finds_each_memory_by_its_id_in_its_scope(&subject, &prepare).await;
     forgets_exactly_what_it_names(&subject, &prepare).await;
     records_each_change_with_it(&subject, &prepare).await;
+    records_a_calls_change_with_it(&subject, &prepare).await;
+    settles_a_call_by_what_it_made(&subject, &prepare).await;
     forgets_a_scope_with_its_records(&subject, &prepare).await;
 }
 
@@ -133,6 +147,7 @@ pub async fn run_notes(store: Arc<dyn NoteStore>, logs: Logs<'_>, prepare: Prepa
     shows_each_note_as_saved_but_for_a_frame_tag(&*notes, &prepare).await;
     searches_only_what_its_audience_is_shown(&*notes, &prepare).await;
     changes_only_where_a_runs_reach_goes(&*notes, &prepare).await;
+    settles_each_tools_call_by_what_it_did(&*notes, &prepare).await;
 }
 
 fn at(millis: i64) -> Timestamp {
@@ -226,10 +241,25 @@ fn describes_itself(subject: &Subject<'_>) {
     assert!(provider.limit(&settings) >= 1, "room for a memory");
 }
 
+/// The same settings, the same tools, byte for byte. The type's writes say
+/// which are offered and at what level, never how one is defined: a tool
+/// offered at two levels is defined the same at both.
 fn offers_the_same_tools_for_the_same_settings(subject: &Subject<'_>) {
     let provider = subject.provider;
     let settings = defaults(provider);
     let read = read_back(provider, &settings);
+    let mut defined: BTreeMap<String, String> = BTreeMap::new();
+    for writes in MemoryWrites::ALL {
+        let tools = provider.tools(&settings, *writes);
+        for (tool, definition) in tools.iter().zip(definitions(&tools)) {
+            let first = defined.entry(tool.name.clone()).or_insert_with(|| definition.clone());
+            assert_eq!(
+                *first, definition,
+                "{writes:?}: {} defined the same at every writes",
+                tool.name
+            );
+        }
+    }
     for writes in MemoryWrites::ALL {
         let tools = provider.tools(&settings, *writes);
         assert_eq!(
@@ -286,19 +316,15 @@ async fn refuses_writes_once_they_are_denied(subject: &Subject<'_>, prepare: &Pr
     called.sort_unstable();
     assert_eq!(called, offered, "a call of each tool that writes");
     let recalled = recall(provider, &scope, &workspace).await;
-    let origin = run_origin();
-    let context = |writes: MemoryWrites, now: Timestamp| CallContext {
-        origin: &origin,
-        audience: &workspace,
-        settings: &settings,
-        writes,
-        now,
-    };
     for (tool, arguments) in &calls {
+        let origin = run_origin();
         let denied = call_in(
             provider,
             &scope,
-            &context(MemoryWrites::Deny, at(2)),
+            &CallContext {
+                writes: MemoryWrites::Deny,
+                ..allowed(&origin, &workspace, &settings, at(2))
+            },
             tool,
             arguments.clone(),
         )
@@ -312,7 +338,18 @@ async fn refuses_writes_once_they_are_denied(subject: &Subject<'_>, prepare: &Pr
     for (writes, millis) in [(MemoryWrites::Approve, 3), (MemoryWrites::Allow, 4)] {
         let memory = (subject.remember)(scope, workspace, format!("Remembered for {writes:?}."), at(millis)).await;
         for (tool, arguments) in (subject.write_calls)(&memory) {
-            let written = call_in(provider, &scope, &context(writes, at(millis)), &tool, arguments).await;
+            let origin = run_origin();
+            let written = call_in(
+                provider,
+                &scope,
+                &CallContext {
+                    writes,
+                    ..allowed(&origin, &workspace, &settings, at(millis))
+                },
+                &tool,
+                arguments,
+            )
+            .await;
             assert!(
                 !written.is_error && written.change.is_some(),
                 "{tool} writes while {writes:?}: {written:?}"
@@ -478,12 +515,11 @@ async fn changes_none_of_the_workspaces_memories_from_a_direct_conversation(subj
     .await;
     let recalled = recall(provider, &scope, &Audience::Workspace).await;
     let settings = defaults(provider);
-    let origin = run_origin();
     for (tool, arguments) in (subject.write_calls)(&memory) {
         call_in(
             provider,
             &scope,
-            &allowed(&origin, &here, &settings, at(2)),
+            &allowed(&run_origin(), &here, &settings, at(2)),
             &tool,
             arguments,
         )
@@ -1003,6 +1039,266 @@ async fn records_each_change_with_it(subject: &Subject<'_>, prepare: &Prepare) {
     );
 }
 
+/// A run's tool call records its change with it, as the server hands the
+/// records over: each call of a tool that writes, recorded once it answers;
+/// a refusal records nothing; and a record placed outside the memory's
+/// workspace fails the call, which then changes nothing.
+async fn records_a_calls_change_with_it(subject: &Subject<'_>, prepare: &Prepare) {
+    let provider = subject.provider;
+    let logs = subject.logs;
+    let t = tenant(prepare).await;
+    let scope = t.scope();
+    let workspace = Audience::Workspace;
+    let endpoint = watch(logs, t.organization_id).await;
+    let record = recorder(Environment::Sandbox);
+    let settings = defaults(provider);
+    let seen_now = || seen(logs, t.organization_id, t.workspace, endpoint);
+    let memory = (subject.remember)(scope, workspace, "Remembered by a run.".to_owned(), at(1)).await;
+    let mut expected = seen_now().await;
+    for (tool, arguments) in (subject.write_calls)(&memory) {
+        // Refused, a call can be made again: it made nothing.
+        let origin = run_origin();
+        let denied = call_recording(
+            provider,
+            &scope,
+            &CallContext {
+                writes: MemoryWrites::Deny,
+                ..allowed(&origin, &workspace, &settings, at(2))
+            },
+            &tool,
+            arguments.clone(),
+            &record,
+        )
+        .await
+        .unwrap();
+        assert!(denied.is_error, "{tool}: refused while denied");
+        assert_eq!(seen_now().await, expected, "{tool}: a refusal records nothing");
+        let made = call_recording(
+            provider,
+            &scope,
+            &allowed(&origin, &workspace, &settings, at(3)),
+            &tool,
+            arguments,
+            &record,
+        )
+        .await
+        .unwrap();
+        let change = made
+            .change
+            .unwrap_or_else(|| panic!("{tool} changes something: {}", made.content));
+        expected.add(&change);
+        assert_eq!(seen_now().await, expected, "{tool}: recorded with its change");
+    }
+
+    let kept = (subject.remember)(scope, workspace, "Kept as it is.".to_owned(), at(4)).await;
+    let recalled = recall(provider, &scope, &workspace).await;
+    let elsewhere = sent_elsewhere(Environment::Production, t.sibling);
+    for (tool, arguments) in (subject.write_calls)(&kept) {
+        let origin = run_origin();
+        assert_eq!(
+            call_recording(
+                provider,
+                &scope,
+                &allowed(&origin, &workspace, &settings, at(5)),
+                &tool,
+                arguments,
+                &elsewhere,
+            )
+            .await,
+            Err(MemoryError::Unavailable),
+            "{tool}: a webhook event elsewhere fails the call"
+        );
+    }
+    assert_eq!(provider.get(&scope, kept.id).await.as_ref(), Ok(&kept));
+    assert_eq!(recall(provider, &scope, &workspace).await, recalled, "nothing changed");
+    assert_eq!(seen_now().await, expected, "nothing recorded");
+}
+
+/// A call whose answer was lost is settled by what it made
+/// ([`memory::settle`]). One that made its change is answered as it was
+/// made, whatever became of the memory since (changed by a person, then
+/// forgotten), and the settle changes and records nothing. One that made
+/// none is made then, recorded with it, and answered as made after,
+/// however often it's settled; its sender, committing after, is refused or
+/// changes nothing. What a call made is never found from another scope, and
+/// settling it there changes nothing here. A kind that keeps no record of
+/// its calls answers `Unsupported`, and settles nothing.
+async fn settles_a_call_by_what_it_made(subject: &Subject<'_>, prepare: &Prepare) {
+    let provider = subject.provider;
+    let logs = subject.logs;
+    let manage = provider.describe().manage;
+    let t = tenant(prepare).await;
+    let other = tenant(prepare).await;
+    let scope = t.scope();
+    let workspace = Audience::Workspace;
+    let endpoint = watch(logs, t.organization_id).await;
+    let record = recorder(Environment::Sandbox);
+    let settings = defaults(provider);
+    let seen_now = || seen(logs, t.organization_id, t.workspace, endpoint);
+    let listed = || async { provider.list(&scope, &everything()).await.unwrap().items };
+    let answered = |result: CallResult| (result.content, result.is_error, result.change.is_some());
+
+    let kept = provider.made(&scope, RunId::generate(), ToolCallId::generate()).await;
+    if kept == Err(MemoryError::Unsupported) {
+        let memory = (subject.remember)(scope, workspace, "Remembered.".to_owned(), at(1)).await;
+        let before = listed().await;
+        for (tool, arguments) in (subject.write_calls)(&memory) {
+            let origin = run_origin();
+            let context = allowed(&origin, &workspace, &settings, at(2));
+            assert_eq!(
+                settle_recording(provider, &scope, &context, &tool, arguments, &record).await,
+                Err(MemoryError::Unsupported),
+                "{tool}: no record to settle by"
+            );
+        }
+        assert_eq!(listed().await, before, "nothing changed");
+        return;
+    }
+    assert_eq!(kept, Ok(None), "a call never made");
+
+    // Made, then settled: answered as made, whatever became of the memory
+    // since. Each call is made about a memory of its own.
+    let count =
+        (subject.write_calls)(&(subject.remember)(scope, workspace, "Called about.".to_owned(), at(1)).await).len();
+    for n in 0..count {
+        let memory = (subject.remember)(scope, workspace, format!("Remembered for call {n}."), at(1)).await;
+        let (tool, arguments) = (subject.write_calls)(&memory).swap_remove(n);
+        let mut expected = seen_now().await;
+        let origin = run_origin();
+        let context = allowed(&origin, &workspace, &settings, at(2));
+        let made = call_recording(provider, &scope, &context, &tool, arguments.clone(), &record)
+            .await
+            .unwrap();
+        let change = made
+            .change
+            .clone()
+            .unwrap_or_else(|| panic!("{tool} changes something: {}", made.content));
+        expected.add(&change);
+        let as_made = (made.content.clone(), false, false);
+        let settle = || async {
+            answered(
+                settle_recording(provider, &scope, &context, &tool, arguments.clone(), &record)
+                    .await
+                    .unwrap(),
+            )
+        };
+        let before = listed().await;
+        assert_eq!(settle().await, as_made, "{tool}: answered as made");
+        assert_eq!(listed().await, before, "{tool}: changing nothing more");
+        assert_eq!(seen_now().await, expected, "{tool}: recording nothing more");
+        let changed = change.memory();
+        if matches!(change, MemoryChange::Forgotten(_)) {
+            continue;
+        }
+        if manage.change {
+            let person = Origin::Member {
+                user_id: UserId::generate(),
+            };
+            let edited = provider
+                .change(
+                    &scope,
+                    &person,
+                    changed.id,
+                    "Changed by a person since.",
+                    at(3),
+                    &record,
+                )
+                .await
+                .unwrap();
+            assert!(edited.changed, "{tool}: a person's change");
+            expected.add(&MemoryChange::Updated(edited.memory.clone()));
+            let before = listed().await;
+            assert_eq!(settle().await, as_made, "{tool}: once a person changed it");
+            assert_eq!(listed().await, before, "{tool}: the person's change kept");
+            assert_eq!(seen_now().await, expected, "{tool}: recording nothing more");
+        }
+        if manage.forget {
+            let forgotten = provider.forget(&scope, changed.id, &record).await.unwrap();
+            expected.add(&MemoryChange::Forgotten(forgotten));
+            let before = listed().await;
+            assert_eq!(settle().await, as_made, "{tool}: once a person forgot it");
+            assert_eq!(listed().await, before, "{tool}: not made again");
+            assert_eq!(seen_now().await, expected, "{tool}: recording nothing more");
+        }
+    }
+
+    // Never made, then settled: made then, once; its sender, committing
+    // after, changes nothing.
+    let memory = (subject.remember)(scope, workspace, "Remembered after.".to_owned(), at(4)).await;
+    let mut expected = seen_now().await;
+    for (tool, arguments) in (subject.write_calls)(&memory) {
+        let origin = run_origin();
+        let context = allowed(&origin, &workspace, &settings, at(5));
+        let first = settle_recording(provider, &scope, &context, &tool, arguments.clone(), &record)
+            .await
+            .unwrap();
+        let change = first
+            .change
+            .clone()
+            .unwrap_or_else(|| panic!("{tool}: made now: {}", first.content));
+        expected.add(&change);
+        assert_eq!(seen_now().await, expected, "{tool}: recorded with it");
+        let before = listed().await;
+        let as_made = (first.content.clone(), false, false);
+        let again = settle_recording(provider, &scope, &context, &tool, arguments.clone(), &record)
+            .await
+            .unwrap();
+        assert_eq!(answered(again), as_made, "{tool}: answered as made then");
+        assert_eq!(listed().await, before, "{tool}: and made once only");
+        assert_eq!(seen_now().await, expected, "{tool}: recorded once");
+        let late = call_recording(provider, &scope, &context, &tool, arguments.clone(), &record).await;
+        match late {
+            Err(MemoryError::AlreadyMade) => assert_eq!(
+                make_recording(provider, &scope, &context, &tool, arguments, &record)
+                    .await
+                    .map(answered),
+                Ok(as_made.clone()),
+                "{tool}: its sender answered as the settle made it"
+            ),
+            Ok(late) => assert!(late.change.is_none(), "{tool}: its sender changes nothing: {late:?}"),
+            Err(error) => panic!("{tool}: its sender: {error}"),
+        }
+        assert_eq!(listed().await, before, "{tool}: its sender changes nothing");
+        assert_eq!(seen_now().await, expected, "{tool}: nor records anything");
+    }
+
+    // What a call made here is never found from another scope, and settling
+    // it there changes nothing here: made there, if anywhere.
+    for (key, elsewhere) in t.changed_alone(&other) {
+        let memory = (subject.remember)(scope, workspace, format!("Remembered for the {key}."), at(6)).await;
+        for (tool, arguments) in (subject.write_calls)(&memory) {
+            let origin = run_origin();
+            let Origin::Run {
+                run_id, tool_call_id, ..
+            } = origin
+            else {
+                unreachable!("a run's call");
+            };
+            let context = allowed(&origin, &workspace, &settings, at(7));
+            let made = call_recording(provider, &scope, &context, &tool, arguments.clone(), &record_nothing)
+                .await
+                .unwrap();
+            assert!(!made.is_error, "{key}: {tool}: {}", made.content);
+            assert_eq!(
+                provider.made(&elsewhere, run_id, tool_call_id).await,
+                Ok(None),
+                "{key}: {tool}: never found from elsewhere"
+            );
+            let before = listed().await;
+            if let Ok(settled) =
+                settle_recording(provider, &elsewhere, &context, &tool, arguments, &record_nothing).await
+                && !settled.is_error
+            {
+                let change = settled
+                    .change
+                    .unwrap_or_else(|| panic!("{key}: {tool}: found from elsewhere: {}", settled.content));
+                assert_eq!(change.memory().scope(), elsewhere, "{key}: {tool}: made there");
+            }
+            assert_eq!(listed().await, before, "{key}: {tool}: nothing changed here");
+        }
+    }
+}
+
 /// Forgetting a scope forgets its oldest memories, as many at a time as
 /// asked, whatever their audience and whatever the kind lets people do (an
 /// erasure), recording each as it was and how many, and nothing of any other
@@ -1152,10 +1448,56 @@ async fn call_in(
     tool: &str,
     arguments: Value,
 ) -> CallResult {
+    call_recording(provider, scope, context, tool, arguments, &record_nothing)
+        .await
+        .unwrap()
+}
+
+/// A call to one of the kind's tools, recording its change with `record`.
+async fn call_recording(
+    provider: &dyn MemoryProvider,
+    scope: &MemoryScope,
+    context: &CallContext<'_>,
+    tool: &str,
+    arguments: Value,
+    record: &Record<'_>,
+) -> Result<CallResult, MemoryError> {
     let Value::Object(arguments) = arguments else {
         panic!("arguments are an object");
     };
-    provider.call(scope, context, tool, &arguments).await.unwrap()
+    provider.call(scope, context, tool, &arguments, record).await
+}
+
+/// Settles a run's call whose answer was lost, as a server does
+/// ([`memory::settle`]), recording what it makes with `record`.
+async fn settle_recording(
+    provider: &dyn MemoryProvider,
+    scope: &MemoryScope,
+    context: &CallContext<'_>,
+    tool: &str,
+    arguments: Value,
+    record: &Record<'_>,
+) -> Result<CallResult, MemoryError> {
+    let Value::Object(arguments) = arguments else {
+        panic!("arguments are an object");
+    };
+    memory::settle(provider, scope, context, tool, &arguments, record).await
+}
+
+/// Makes a run's call as its sender does ([`memory::make`]), recording what
+/// it makes with `record`.
+async fn make_recording(
+    provider: &dyn MemoryProvider,
+    scope: &MemoryScope,
+    context: &CallContext<'_>,
+    tool: &str,
+    arguments: Value,
+    record: &Record<'_>,
+) -> Result<CallResult, MemoryError> {
+    let Value::Object(arguments) = arguments else {
+        panic!("arguments are an object");
+    };
+    memory::make(provider, scope, context, tool, &arguments, record).await
 }
 
 /// Saves a note as a run does: the note saved.
@@ -1588,22 +1930,16 @@ async fn keeps_who_wrote_each_note(provider: &dyn MemoryProvider, prepare: &Prep
     let settings = defaults(provider);
     let note = save(provider, &scope, &workspace, "Ships on Thursdays.", at(1)).await;
     let short = note.short_id.as_str();
+    let run_id = RunId::generate();
     let after_app = Origin::Run {
-        run_id: RunId::generate(),
+        run_id,
         tool_call_id: ToolCallId::generate(),
         after_app_content: true,
-    };
-    let context = |now: Timestamp| CallContext {
-        origin: &after_app,
-        audience: &workspace,
-        settings: &settings,
-        writes: MemoryWrites::Allow,
-        now,
     };
     let updated = call_in(
         provider,
         &scope,
-        &context(at(2)),
+        &allowed(&after_app, &workspace, &settings, at(2)),
         notes::UPDATE_MEMORY,
         json!({ "memory": short, "text": "Ships on Fridays." }),
     )
@@ -1652,10 +1988,15 @@ async fn keeps_who_wrote_each_note(provider: &dyn MemoryProvider, prepare: &Prep
         },
         "a person's later rewrite clears the mark"
     );
+    let again = Origin::Run {
+        run_id,
+        tool_call_id: ToolCallId::generate(),
+        after_app_content: true,
+    };
     let same = call_in(
         provider,
         &scope,
-        &context(at(4)),
+        &allowed(&again, &workspace, &settings, at(4)),
         notes::UPDATE_MEMORY,
         json!({ "memory": short, "text": "Ships on Fridays, from May." }),
     )
@@ -2085,4 +2426,297 @@ async fn changes_only_where_a_runs_reach_goes(provider: &dyn MemoryProvider, pre
     .await;
     assert!(!forgotten.is_error, "{forgotten:?}");
     assert_eq!(provider.list(&scope, &everything()).await.unwrap().total, 0);
+}
+
+/// How `notes` settles a call whose answer was lost. A save, a change of
+/// text or a forget it made is answered as made, whatever the type's writes
+/// are now and whatever became of the note since: forgotten or changed by a
+/// person, it's never saved, changed back or forgotten again. So is a
+/// change to the text the note held, which changed nothing: never made over
+/// a person's change since. One it didn't make is made then, as the type's
+/// writes are then (refused while denied), and answered as made after; its
+/// sender, committing after, is refused and changes nothing. A search is
+/// made again, and a call whose arguments can't be read is answered as the
+/// call was.
+async fn settles_each_tools_call_by_what_it_did(provider: &dyn MemoryProvider, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let scope = t.scope();
+    let workspace = Audience::Workspace;
+    let settings = defaults(provider);
+    let person = Origin::Member {
+        user_id: UserId::generate(),
+    };
+    let settle = |origin: Origin, writes: MemoryWrites, tool: &'static str, arguments: Value| {
+        let settings = settings.clone();
+        async move {
+            let context = CallContext {
+                writes,
+                ..allowed(&origin, &workspace, &settings, at(10))
+            };
+            settle_recording(provider, &scope, &context, tool, arguments, &record_nothing)
+                .await
+                .unwrap()
+        }
+    };
+    // Its sender, stalled until the call was settled, commits.
+    let sent_late = |origin: Origin, tool: &'static str, arguments: Value| {
+        let settings = settings.clone();
+        async move {
+            let context = allowed(&origin, &workspace, &settings, at(11));
+            let late = call_recording(provider, &scope, &context, tool, arguments.clone(), &record_nothing).await;
+            let answered = make_recording(provider, &scope, &context, tool, arguments, &record_nothing).await;
+            (
+                late,
+                answered.map(|answer| (answer.content, answer.is_error, answer.change.is_some())),
+            )
+        }
+    };
+    let make = |origin: Origin, tool: &'static str, arguments: Value| {
+        let settings = settings.clone();
+        async move {
+            call_in(
+                provider,
+                &scope,
+                &allowed(&origin, &workspace, &settings, at(1)),
+                tool,
+                arguments,
+            )
+            .await
+        }
+    };
+    let answered = |result: CallResult| (result.content, result.is_error, result.change.is_some());
+    let texts = || async {
+        provider
+            .list(&scope, &everything())
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|note| note.text)
+            .collect::<Vec<_>>()
+    };
+
+    // A save made, then settled: answered as made, whatever the writes are
+    // now, and not saved again once a person forgot it.
+    let first = run_origin();
+    let save_once = json!({ "text": "Saved once." });
+    let made = make(first, notes::SAVE_MEMORY, save_once.clone()).await;
+    let Some(MemoryChange::Saved(note)) = made.change else {
+        panic!("saved: {made:?}");
+    };
+    let short = note.short_id.as_str().to_owned();
+    for writes in [MemoryWrites::Allow, MemoryWrites::Deny] {
+        assert_eq!(
+            answered(settle(first, writes, notes::SAVE_MEMORY, save_once.clone()).await),
+            (format!("Saved as {short}."), false, false),
+            "{writes:?}: answered as made, whatever the writes are now"
+        );
+    }
+    assert_eq!(texts().await, ["Saved once."], "saved once");
+    provider.forget(&scope, note.id, &record_nothing).await.unwrap();
+    assert_eq!(
+        answered(settle(first, MemoryWrites::Allow, notes::SAVE_MEMORY, save_once).await),
+        (format!("Saved as {short}."), false, false),
+        "once a person forgot it"
+    );
+    assert_eq!(texts().await, Vec::<String>::new(), "never saved again");
+
+    // A save made, then changed by a person: the person's text kept.
+    let renewer = run_origin();
+    let renews = json!({ "text": "Renews in March." });
+    let made = make(renewer, notes::SAVE_MEMORY, renews.clone()).await;
+    let Some(MemoryChange::Saved(renewal)) = made.change else {
+        panic!("saved: {made:?}");
+    };
+    let renewal_short = renewal.short_id.as_str().to_owned();
+    provider
+        .change(&scope, &person, renewal.id, "Renews in April.", at(2), &record_nothing)
+        .await
+        .unwrap();
+    assert_eq!(
+        answered(settle(renewer, MemoryWrites::Allow, notes::SAVE_MEMORY, renews).await),
+        (format!("Saved as {renewal_short}."), false, false),
+        "once a person changed it"
+    );
+    assert_eq!(texts().await, ["Renews in April."], "the person's text kept");
+
+    // A change of text made, then changed by a person: never changed back.
+    let updater = run_origin();
+    let update = json!({ "memory": renewal_short, "text": "Renews in May." });
+    let updated = make(updater, notes::UPDATE_MEMORY, update.clone()).await;
+    assert!(matches!(updated.change, Some(MemoryChange::Updated(_))), "{updated:?}");
+    provider
+        .change(&scope, &person, renewal.id, "Renews in June.", at(3), &record_nothing)
+        .await
+        .unwrap();
+    for writes in [MemoryWrites::Allow, MemoryWrites::Deny] {
+        assert_eq!(
+            answered(settle(updater, writes, notes::UPDATE_MEMORY, update.clone()).await),
+            (format!("Updated {renewal_short}."), false, false),
+            "{writes:?}: answered as made"
+        );
+    }
+    assert_eq!(texts().await, ["Renews in June."], "never changed back");
+
+    // A change to the text the note held, which changed nothing, then
+    // changed by a person: answered as made, and never made over the
+    // person's change.
+    let unchanging = run_origin();
+    let same_text = json!({ "memory": renewal_short, "text": "Renews in June." });
+    let unchanged = make(unchanging, notes::UPDATE_MEMORY, same_text.clone()).await;
+    assert_eq!(
+        answered(unchanged),
+        (format!("Updated {renewal_short}."), false, false),
+        "changing nothing"
+    );
+    provider
+        .change(&scope, &person, renewal.id, "Renews in July.", at(4), &record_nothing)
+        .await
+        .unwrap();
+    for writes in [MemoryWrites::Allow, MemoryWrites::Deny] {
+        assert_eq!(
+            answered(settle(unchanging, writes, notes::UPDATE_MEMORY, same_text.clone()).await),
+            (format!("Updated {renewal_short}."), false, false),
+            "{writes:?}: answered as made"
+        );
+    }
+    assert_eq!(texts().await, ["Renews in July."], "the person's change kept");
+
+    // A forget made, then settled: answered as made, its note gone.
+    let forgetter = run_origin();
+    let forget = json!({ "memory": renewal_short });
+    let forgot = make(forgetter, notes::FORGET_MEMORY, forget.clone()).await;
+    assert!(matches!(forgot.change, Some(MemoryChange::Forgotten(_))), "{forgot:?}");
+    for writes in [MemoryWrites::Allow, MemoryWrites::Deny] {
+        assert_eq!(
+            answered(settle(forgetter, writes, notes::FORGET_MEMORY, forget.clone()).await),
+            (format!("Forgot {renewal_short}."), false, false),
+            "{writes:?}: answered as made"
+        );
+    }
+    assert_eq!(texts().await, Vec::<String>::new());
+
+    // A save never made: refused while denied, then made once. Its sender,
+    // committing after, is refused, and answered as the settle made it.
+    let lost = run_origin();
+    let save_late = json!({ "text": "Saved late." });
+    let refused = settle(lost, MemoryWrites::Deny, notes::SAVE_MEMORY, save_late.clone()).await;
+    assert!(refused.is_error && refused.change.is_none(), "{refused:?}");
+    assert_eq!(texts().await, Vec::<String>::new(), "nothing saved");
+    let late = settle(lost, MemoryWrites::Allow, notes::SAVE_MEMORY, save_late.clone()).await;
+    let Some(MemoryChange::Saved(late_note)) = late.change.clone() else {
+        panic!("made now: {late:?}");
+    };
+    assert_eq!((late_note.text.as_str(), late_note.origin), ("Saved late.", lost));
+    let late_short = late_note.short_id.as_str().to_owned();
+    let saved_late = (format!("Saved as {late_short}."), false, false);
+    assert_eq!(
+        answered(settle(lost, MemoryWrites::Allow, notes::SAVE_MEMORY, save_late.clone()).await),
+        saved_late,
+        "and once only"
+    );
+    assert_eq!(
+        sent_late(lost, notes::SAVE_MEMORY, save_late).await,
+        (Err(MemoryError::AlreadyMade), Ok(saved_late)),
+        "its sender"
+    );
+    assert_eq!(texts().await, ["Saved late."], "saved once");
+
+    // A change of text never made, settled: made now. Its sender, committing
+    // after a person changed the note, is refused: the person's text kept.
+    let late_changer = run_origin();
+    let change_late = json!({ "memory": late_short, "text": "Changed late." });
+    let changed_late = settle(
+        late_changer,
+        MemoryWrites::Allow,
+        notes::UPDATE_MEMORY,
+        change_late.clone(),
+    )
+    .await;
+    assert_eq!(
+        changed_late
+            .change
+            .as_ref()
+            .map(|change| (&change.memory().text[..], change.memory().origin)),
+        Some(("Changed late.", late_changer)),
+        "made now: {changed_late:?}"
+    );
+    provider
+        .change(
+            &scope,
+            &person,
+            late_note.id,
+            "Changed by a person.",
+            at(12),
+            &record_nothing,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sent_late(late_changer, notes::UPDATE_MEMORY, change_late).await,
+        (
+            Err(MemoryError::AlreadyMade),
+            Ok((format!("Updated {late_short}."), false, false))
+        ),
+        "its sender"
+    );
+    assert_eq!(texts().await, ["Changed by a person."], "the person's text kept");
+
+    // A forget never made: refused while denied, then made now, and
+    // answered as made after.
+    let late_forgetter = run_origin();
+    let forget_late = json!({ "memory": late_short });
+    let refused = settle(
+        late_forgetter,
+        MemoryWrites::Deny,
+        notes::FORGET_MEMORY,
+        forget_late.clone(),
+    )
+    .await;
+    assert!(
+        refused.is_error && refused.change.is_none(),
+        "read-only now: {refused:?}"
+    );
+    let forgot = settle(
+        late_forgetter,
+        MemoryWrites::Allow,
+        notes::FORGET_MEMORY,
+        forget_late.clone(),
+    )
+    .await;
+    assert_eq!(
+        (forgot.content.as_str(), forgot.is_error),
+        (format!("Forgot {late_short}.").as_str(), false)
+    );
+    assert!(matches!(forgot.change, Some(MemoryChange::Forgotten(_))), "{forgot:?}");
+    assert_eq!(
+        answered(settle(late_forgetter, MemoryWrites::Allow, notes::FORGET_MEMORY, forget_late).await),
+        (format!("Forgot {late_short}."), false, false),
+        "answered as made"
+    );
+    assert_eq!(texts().await, Vec::<String>::new());
+
+    // A search is made again; a call whose arguments can't be read is
+    // answered as the call was.
+    make(
+        run_origin(),
+        notes::SAVE_MEMORY,
+        json!({ "text": "Searched for later." }),
+    )
+    .await;
+    let searcher = run_origin();
+    let searched = make(searcher, notes::SEARCH_MEMORY, json!({ "query": "later" })).await;
+    assert!(searched.content.contains("Searched for later."), "{searched:?}");
+    assert_eq!(
+        settle(
+            searcher,
+            MemoryWrites::Deny,
+            notes::SEARCH_MEMORY,
+            json!({ "query": "later" })
+        )
+        .await,
+        searched
+    );
+    let unread = settle(run_origin(), MemoryWrites::Allow, notes::FORGET_MEMORY, json!({})).await;
+    assert!(unread.is_error, "no note named");
 }

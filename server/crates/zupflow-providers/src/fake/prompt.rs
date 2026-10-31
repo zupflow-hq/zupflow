@@ -11,7 +11,11 @@
 //!
 //! [`Caches`] answers how much of a prompt a provider read from its cache
 //! and wrote to it, counting a token per four bytes of each part's JSON
-//! (no minimum length, so short test prompts cache too):
+//! (no minimum length, so short test prompts cache too). A part is a tool,
+//! a system block or message, a Messages content block, or a chat
+//! message, each of whose content parts is one when it has a list of them
+//! (the first with the message's other fields), so a prompt that differs
+//! only from a message's second part on still shares its first:
 //!
 //! - Anthropic, and Claude through OpenRouter, cache only at breakpoints.
 //!   At each breakpoint the prompt up to it is looked up, and so is every
@@ -249,8 +253,29 @@ impl Prompt {
                 let index = self.messages.len();
                 self.markers
                     .extend(marked.iter().map(|part| format!("messages[{index}].content[{part}]")));
-                self.parts
-                    .push((format!("{index}:{}", part(&message)), !marked.is_empty()));
+                match message.get("content") {
+                    // Each content part is a part of its own, the first
+                    // with the message's other fields.
+                    Some(Value::Array(content)) if !content.is_empty() => {
+                        let mut others = message.as_object().cloned().unwrap_or_default();
+                        others.remove("content");
+                        for (part_index, content_part) in content.iter().enumerate() {
+                            let key = if part_index == 0 {
+                                format!(
+                                    "{index}:{}:0:{}",
+                                    part(&Value::Object(others.clone())),
+                                    part(content_part)
+                                )
+                            } else {
+                                format!("{index}:{part_index}:{}", part(content_part))
+                            };
+                            self.parts.push((key, marked.contains(&part_index)));
+                        }
+                    }
+                    _ => self
+                        .parts
+                        .push((format!("{index}:{}", part(&message)), !marked.is_empty())),
+                }
                 self.messages.push(message);
             }
         }

@@ -31,6 +31,14 @@
 //!   approval on one is refused, parked on or not yet, only with the reason
 //!   it went, and its run moves on; the runs such calls wait in are found
 //!   only in their own workspace.
+//! - **Memory**: a run keeps the memory it was started with (`agent` or
+//!   `off`), and the memory type and recall its first model attempt froze
+//!   with its offer; every later attempt is prepared with the same, a run
+//!   started with memory off recalls nothing, and a recall is never empty. A
+//!   memory tool's call keeps its type, with no short ID, and one waiting
+//!   for approval is refused, parked on or not yet, only because the type
+//!   was deleted; the runs such calls wait in are found across the
+//!   organization's workspaces, and only there.
 //!
 //! The suite drives runs with the reducer (`advance`) where a worker would,
 //! and builds the requests a buggy or stale caller would by hand. Its
@@ -51,22 +59,23 @@ use zupflow_core::agents::{AgentStore, NewAgent, SentMemory};
 use zupflow_core::audit::{AuditAction, AuditActor, AuditFilter, AuditObject, AuditStore};
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{
-    AgentId, ApiKeyId, InstallationId, ModelConnectionId, ModelId, OrganizationId, RunId, SessionId, ToolCallId,
-    WorkspaceId,
+    AgentId, ApiKeyId, InstallationId, MemoryTypeId, ModelConnectionId, ModelId, OrganizationId, RunId, SessionId,
+    ToolCallId, WorkspaceId,
 };
 use zupflow_core::jobs::{Job, JobError, JobQueue};
+use zupflow_core::memory::{MemoryWrites, notes};
 use zupflow_core::model_store::{RouteState, RunModel};
 use zupflow_core::models::{Completion, ModelToolCall, Reply, TokenUsage};
-use zupflow_core::runs::digest::{Sha256Digest, call_digest};
-use zupflow_core::runs::names::{Candidate, Offer, build_offer};
+use zupflow_core::runs::digest::{Sha256Digest, call_digest, memory_call_digest};
+use zupflow_core::runs::names::{Candidate, Offer, ToolHost, build_offer, memory_tool};
 use zupflow_core::runs::reducer::{
-    Approval, Facts, Gone, INSTALLATION_DISCONNECTED, INSTALLATION_REMOVED, InstallationCheck, Io, ModelAnswer,
-    ModelResult, Plan, SendCheck, SendRequest, SendResult, Unanswered, UnansweredWhy, admit, advance, calls_to_decide,
-    cancel, fail_abandoned, refuse_waiting, resolve_approval,
+    Approval, Facts, Gone, INSTALLATION_DISCONNECTED, INSTALLATION_REMOVED, InstallationCheck, Io, MEMORY_TYPE_REMOVED,
+    MEMORY_TYPE_REMOVED_MESSAGE, ModelAnswer, ModelResult, Plan, SendCheck, SendRequest, SendResult, Unanswered,
+    UnansweredWhy, admit, advance, calls_to_decide, cancel, fail_abandoned, refuse_waiting, resolve_approval,
 };
 use zupflow_core::runs::state::{
-    CallDecision, CallVerdict, ClaimantId, Continuation, EXECUTION_VERSION, InvocationId, ModelAttemptState, RequestId,
-    Snapshot,
+    CallDecision, CallVerdict, ClaimantId, Continuation, EXECUTION_VERSION, FrozenMemory, InvocationId,
+    ModelAttemptState, RequestId, Snapshot,
 };
 use zupflow_core::runs::store::{
     Applied, Durability, RUN_JOB, RUN_JOB_ATTEMPTS, Receipt, RunStore, StoreError, run_of_job,
@@ -74,11 +83,11 @@ use zupflow_core::runs::store::{
 use zupflow_core::runs::transition::{
     Authorization, AuthorizeCall, Claim, Closing, CommitTurn, Conflict, Finish, Guards, NewCall, Operation, OwnerGuard,
     PrepareModel, RecordOutcome, RefuseWaiting, RunEnding, SendGuard, SendLease, SendOutcome, SettleUnknown,
-    Settlement, TransitionRequest, Yield, YieldReason,
+    Settlement, TransitionRequest, WentAway, Yield, YieldReason,
 };
 use zupflow_core::runs::{
-    ApprovalDecision, CallState, Failure, NewRun, OrganizationRunFilter, RunEventType, RunFilter, RunStatus,
-    RunTrigger, UsageDay,
+    ApprovalDecision, CallState, Failure, MemoryMode, NewRun, OrganizationRunFilter, RunEventType, RunFilter,
+    RunStatus, RunTrigger, UsageDay,
 };
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::{Clock, Timestamp};
@@ -220,6 +229,7 @@ fn new_run(agent_id: AgentId, input: &str) -> NewRun {
         session_id: SessionId::generate(),
         trigger: RunTrigger::Api,
         input: input.to_owned(),
+        memory: MemoryMode::Agent,
         model: run_model(),
         instructions: "Be brief.".to_owned(),
         channel: None,
@@ -656,6 +666,8 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     records_a_send_authorized_before_a_cancel(&stores, a, agent_a).await;
     holds_a_send_claim_once(&stores, a, agent_a).await;
     refuses_a_waiting_call_whose_installation_went(&stores, a, b, agent_a, agent_sibling, agent_b).await;
+    keeps_a_runs_memory_with_its_attempts(&stores, a, agent_a).await;
+    refuses_a_waiting_memory_call_whose_type_went(&stores, a, b, agent_a, agent_sibling, agent_b).await;
     keeps_a_late_outcome_as_evidence(&stores, a, agent_a).await;
     abandons_a_model_attempt_a_stopped_worker_left(&stores, a, agent_a).await;
     yields_without_using_an_attempt(&stores, a, agent_a).await;
@@ -1466,6 +1478,7 @@ async fn refuses_a_stale_or_expired_owner(stores: &Stores<'_>, a: Tenant, agent_
                 abandons: None,
                 request_digest: Sha256Digest::of(b"request"),
                 offer: offer(),
+                memory: None,
                 key_version: Some(1),
                 steer: None,
             }),
@@ -1579,6 +1592,7 @@ async fn refuses_steps_without_their_guards(stores: &Stores<'_>, a: Tenant, agen
         abandons: None,
         request_digest: Sha256Digest::of(b"request"),
         offer: offer(),
+        memory: None,
         key_version: Some(1),
         steer: None,
     });
@@ -1610,6 +1624,7 @@ async fn refuses_steps_without_their_guards(stores: &Stores<'_>, a: Tenant, agen
             abandons: None,
             request_digest: Sha256Digest::of(b"request"),
             offer: offer(),
+            memory: None,
             key_version: Some(1),
             steer: None,
         }),
@@ -1868,7 +1883,15 @@ async fn refuses_a_waiting_call_whose_installation_went(
     );
 
     // The job's request, applied in another scope: not found, nothing changed.
-    let request = refuse_waiting(org, a.workspace, &parked, caller(), personal(), Gone::Removed).unwrap();
+    let request = refuse_waiting(
+        org,
+        a.workspace,
+        &parked,
+        caller(),
+        WentAway::Installation(personal()),
+        Gone::Removed,
+    )
+    .unwrap();
     let before = state(stores, at).await;
     for (organization, workspace) in [
         (org, a.sibling),
@@ -1924,7 +1947,7 @@ async fn refuses_a_waiting_call_whose_installation_went(
         (
             Guards::default(),
             RefuseWaiting {
-                installation_id: work(),
+                went: WentAway::Installation(work()),
                 ..refuse.clone()
             },
             "an installation the call isn't bound to",
@@ -2002,7 +2025,15 @@ async fn refuses_a_waiting_call_whose_installation_went(
     );
     assert!(run_job(stores, at).await.is_none(), "no second job");
     // Another job's, or a decision, from the same revision: one winner.
-    let late = refuse_waiting(org, a.workspace, &parked, caller(), personal(), Gone::Removed).unwrap();
+    let late = refuse_waiting(
+        org,
+        a.workspace,
+        &parked,
+        caller(),
+        WentAway::Installation(personal()),
+        Gone::Removed,
+    )
+    .unwrap();
     assert_eq!(
         apply(stores, at, &late).await,
         Ok(Applied::Conflict(Conflict::Revision))
@@ -2107,6 +2138,657 @@ async fn refuses_a_waiting_call_whose_installation_went(
         let stop = cancel(there.org, there.ws, &theirs, caller(), RunTrigger::Api, person()).unwrap();
         committed(apply(stores, there, &stop).await);
     }
+}
+
+/// The memory type the suite's runs remember in.
+fn customer_notes() -> MemoryTypeId {
+    MemoryTypeId::from_uuid(Uuid::from_u128(0x0199_0000_0000_7000_8000_0000_0000_0020))
+}
+
+const RECALL: &str = "<memory>\n- Prefers replies in Portuguese.\n</memory>";
+
+/// The suite's offer with the notes kind's tools of `memory_type_id` joined
+/// to it, as a run that remembers offers them.
+fn remembering(memory_type_id: MemoryTypeId) -> Offer {
+    let tools = notes::tools(MemoryWrites::Approve)
+        .iter()
+        .map(|tool| memory_tool(memory_type_id, "Customer notes", notes::KIND, notes::NAME, tool))
+        .collect();
+    let (offer, left_out) = offer().with(tools);
+    assert!(left_out.is_empty(), "a memory tool's name meets no app's");
+    offer
+}
+
+fn frozen(memory_type_id: MemoryTypeId, recall: Option<&str>) -> FrozenMemory {
+    FrozenMemory {
+        memory_type_id,
+        recall: recall.map(str::to_owned),
+    }
+}
+
+fn memory_decision(verdict: CallVerdict, rule: &str) -> CallDecision {
+    CallDecision {
+        verdict,
+        policy: "memory".to_owned(),
+        mode: None,
+        rule: rule.to_owned(),
+    }
+}
+
+/// The model calls one memory tool, with one argument.
+fn remember(id: &str, tool: &str, argument: (&str, &str)) -> Reply {
+    let mut arguments = Map::new();
+    arguments.insert(argument.0.to_owned(), json!(argument.1));
+    Reply::ToolCalls {
+        text: None,
+        calls: vec![ModelToolCall {
+            id: id.to_owned(),
+            name: tool.to_owned(),
+            arguments,
+        }],
+    }
+}
+
+/// A run keeps the memory it was started with, and the memory type and
+/// recall its first model attempt froze with its offer: every later attempt
+/// is prepared with the same, whatever a worker resolved since; a run
+/// started with memory off recalls nothing, and a recall is never empty. A
+/// memory tool's call keeps its type, with no short ID, through its decision
+/// and send, and one waiting for approval is refused before the run parks on
+/// it only because the type was deleted.
+async fn keeps_a_runs_memory_with_its_attempts(stores: &Stores<'_>, a: Tenant, agent_a: AgentId) {
+    let org = a.organization_id;
+    let ws = a.workspace;
+    let notes_type = customer_notes();
+    let prepare_with = |memory: Option<FrozenMemory>, turn: u32, attempt: u32, abandons: Option<u32>| {
+        Operation::PrepareModel(PrepareModel {
+            turn,
+            attempt,
+            abandons,
+            request_digest: Sha256Digest::of(b"request"),
+            offer: remembering(notes_type),
+            memory,
+            key_version: Some(1),
+            steer: None,
+        })
+    };
+
+    // Started with memory off: the run and its snapshot say so, and no
+    // attempt recalls anything. Its memory tools are frozen all the same.
+    let run = RunId::generate();
+    let quiet = At { org, ws, run };
+    let off = NewRun {
+        memory: MemoryMode::Off,
+        ..new_run(agent_a, "Without memory")
+    };
+    committed(apply(stores, quiet, &admit(org, ws, run, &off)).await);
+    assert_eq!(
+        stores.runs.find_run(org, ws, run).await.unwrap().unwrap().memory,
+        MemoryMode::Off
+    );
+    assert_eq!(snapshot(stores, quiet).await.memory, MemoryMode::Off);
+    let who = claimant();
+    let epoch = claim(stores, quiet, who).await;
+    let recalling = by_hand(
+        stores,
+        quiet,
+        owner(epoch, who, true),
+        prepare_with(Some(frozen(notes_type, Some(RECALL))), 0, 1, None),
+    )
+    .await;
+    refuses_with_nothing_written(stores, quiet, &recalling, "a recall for a run started with memory off").await;
+    let mut resolved = facts(stores, who, Some(epoch));
+    resolved.offer = Some(remembering(notes_type));
+    resolved.memory = Some(frozen(notes_type, None));
+    let (planned, _) = step(stores, quiet, &resolved).await;
+    let Io::CallModel(asked) = planned.io() else {
+        panic!("the model is asked");
+    };
+    assert_eq!(asked.memory, None, "nothing recalled");
+    let started = snapshot(stores, quiet).await;
+    assert_eq!(
+        (started.frozen_memory, &started.model_attempts[0].offer),
+        (Some(frozen(notes_type, None)), &remembering(notes_type)),
+        "the type kept on the run, with the attempt's offer"
+    );
+
+    // Started with the agent's memory: the first attempt freezes what it
+    // resolved, recall and all.
+    let at = admitted(stores, org, ws, agent_a, "Remember me").await;
+    assert_eq!(
+        stores.runs.find_run(org, ws, at.run).await.unwrap().unwrap().memory,
+        MemoryMode::Agent
+    );
+    assert_eq!(snapshot(stores, at).await.memory, MemoryMode::Agent);
+    let who = claimant();
+    let epoch = claim(stores, at, who).await;
+    let empty = by_hand(
+        stores,
+        at,
+        owner(epoch, who, true),
+        prepare_with(Some(frozen(notes_type, Some(""))), 0, 1, None),
+    )
+    .await;
+    refuses_with_nothing_written(stores, at, &empty, "an empty recall").await;
+    let mut resolved = facts(stores, who, Some(epoch));
+    resolved.offer = Some(remembering(notes_type));
+    resolved.memory = Some(frozen(notes_type, Some(RECALL)));
+    let (planned, _) = step(stores, at, &resolved).await;
+    let Io::CallModel(asked) = planned.io() else {
+        panic!("the model is asked");
+    };
+    assert_eq!(asked.memory.as_deref(), Some(RECALL));
+    let first = snapshot(stores, at).await;
+    assert_eq!(
+        first.frozen_memory,
+        Some(frozen(notes_type, Some(RECALL))),
+        "kept on the run by its first attempt"
+    );
+    let save = first.model_attempts[0]
+        .offer
+        .find("save_memory")
+        .expect("offered")
+        .clone();
+    assert_eq!(save.host(), ToolHost::Memory(notes_type));
+
+    // A later attempt with any other memory is refused; the reducer's
+    // prepares the same again, whatever the worker resolved now.
+    for (memory, why) in [
+        (None, "an attempt without the run's memory"),
+        (Some(frozen(notes_type, None)), "an attempt without the run's recall"),
+        (
+            Some(frozen(notes_type, Some("<memory>\n- Prefers email.\n</memory>"))),
+            "an attempt with another recall",
+        ),
+        (
+            Some(frozen(MemoryTypeId::generate(), Some(RECALL))),
+            "an attempt of another memory type",
+        ),
+    ] {
+        let later = by_hand(stores, at, owner(epoch, who, true), prepare_with(memory, 0, 2, Some(1))).await;
+        refuses_with_nothing_written(stores, at, &later, why).await;
+    }
+    let mut changed = facts(stores, who, Some(epoch));
+    changed.memory = Some(frozen(notes_type, Some("<memory>\n- Prefers email.\n</memory>")));
+    let (planned, _) = step(stores, at, &changed).await;
+    let Io::CallModel(asked) = planned.io() else {
+        panic!("the model is asked again");
+    };
+    assert_eq!((asked.attempt, asked.memory.as_deref()), (2, Some(RECALL)));
+    let again = snapshot(stores, at).await;
+    assert_eq!(
+        (again.model_attempts.len(), again.frozen_memory),
+        (2, Some(frozen(notes_type, Some(RECALL)))),
+        "the same memory, kept once"
+    );
+
+    // A memory tool's call keeps its type, with no short ID, through its
+    // send; one bound to another type than its name means is refused, even
+    // digested to match.
+    let commit = answer_request(
+        stores,
+        at,
+        who,
+        epoch,
+        remember("m1", "save_memory", ("text", "Prefers replies in Portuguese.")),
+        |_| memory_decision(CallVerdict::Allow, "allowed"),
+    )
+    .await;
+    let Operation::CommitTurn(mut elsewhere) = commit.operation().clone() else {
+        panic!("a turn");
+    };
+    let other_type = MemoryTypeId::generate();
+    let forged = &mut elsewhere.calls[0];
+    let target = forged.target.as_mut().expect("bound to its type");
+    target.memory_type_id = Some(other_type);
+    forged.call_digest = Some(memory_call_digest(
+        other_type,
+        &target.app_key,
+        &target.tool,
+        &target.definition_sha256,
+        &forged.arguments,
+    ));
+    let elsewhere = by_hand(stores, at, *commit.guards(), Operation::CommitTurn(elsewhere)).await;
+    refuses_with_nothing_written(stores, at, &elsewhere, "a memory call bound to another type").await;
+    committed(apply(stores, at, &commit).await);
+    let call = snapshot(stores, at).await.calls[0].clone();
+    let target = call.target.clone().expect("bound to its type");
+    assert_eq!(
+        (
+            target.installation_id,
+            target.channel_connection_id,
+            target.memory_type_id
+        ),
+        (None, None, Some(notes_type))
+    );
+    assert_eq!(
+        (
+            target.installation_short_id.as_str(),
+            target.installation_label.as_str(),
+            target.app_key.as_str(),
+            target.app_name.as_str(),
+            target.tool.as_str(),
+        ),
+        ("", "Customer notes", notes::KIND, notes::NAME, "save_memory")
+    );
+    assert_eq!(target.definition_sha256, save.definition_sha256);
+    assert!(call.call_digest.is_some(), "decided on its digest");
+    let planned = at_send(stores, at, who, epoch, memory_decision(CallVerdict::Allow, "allowed")).await;
+    let Io::SendMemory(send) = planned.io().clone() else {
+        panic!("expected a memory call, got {planned:?}");
+    };
+    assert_eq!(
+        (
+            send.memory_type_id,
+            send.kind.as_str(),
+            send.tool.as_str(),
+            send.after_app_content
+        ),
+        (notes_type, notes::KIND, "save_memory", false)
+    );
+    assert_eq!(Some(send.call_digest), call.call_digest);
+    committed(apply(stores, at, &request(&planned)).await);
+    let mut sent = Facts::at(stores.clock.now());
+    let mut result = Map::new();
+    result.insert("result".to_owned(), json!("Saved."));
+    sent.sent = Some(SendResult {
+        call_id: send.call_id,
+        attempt: send.attempt,
+        invocation_id: send.invocation_id,
+        outcome: SendOutcome::Completed { result },
+    });
+    let recorded = committed(apply(stores, at, &request(&plan(stores, at, &sent).await)).await);
+    assert_eq!(kinds(&recorded), [RunEventType::ToolCallCompleted]);
+    assert_eq!(recorded.events[0].data["memory_type_id"], json!(notes_type));
+    assert_eq!(recorded.events[0].data["kind"], notes::KIND);
+    let saved = snapshot(stores, at).await;
+    assert_eq!(saved.calls[0].state, CallState::Completed);
+    assert_eq!(saved.calls[0].target, Some(target), "read back as it was bound");
+
+    // The next turn's attempt: the same memory again.
+    let (planned, _) = step(stores, at, &facts(stores, who, Some(epoch))).await;
+    let Io::CallModel(asked) = planned.io() else {
+        panic!("the model is asked for the next turn");
+    };
+    assert_eq!((asked.turn, asked.memory.as_deref()), (1, Some(RECALL)));
+
+    // A call waiting for approval whose type was deleted: refused before
+    // the run parks on it, only with that reason.
+    answer(
+        stores,
+        at,
+        who,
+        epoch,
+        remember("m2", "forget_memory", ("memory", "k7m2qd")),
+        |_| {
+            memory_decision(
+                CallVerdict::RequireApproval {
+                    reason: "Your organization requires approval for forget_memory.".to_owned(),
+                },
+                "organization_requires_approval",
+            )
+        },
+    )
+    .await;
+    let at_call = snapshot(stores, at).await;
+    let mut gone = facts(stores, who, Some(epoch));
+    gone.send_check = parking_check(&at_call, InstallationCheck::Removed);
+    let Operation::AuthorizeCall(mut authorize) = request_of(&advance(&at_call, &gone).unwrap()) else {
+        panic!("a refusal at the call");
+    };
+    let Authorization::Refuse { outcome, failure } = authorize.authorization.clone() else {
+        panic!("refused");
+    };
+    assert_eq!(
+        (failure.code.as_str(), failure.message.as_str()),
+        (MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE)
+    );
+    authorize.authorization = Authorization::Refuse {
+        outcome,
+        failure: Failure::new(INSTALLATION_REMOVED, "Personal was removed, so this call wasn't made."),
+    };
+    let other_reason = by_hand(stores, at, owner(epoch, who, true), Operation::AuthorizeCall(authorize)).await;
+    refuses_with_nothing_written(
+        stores,
+        at,
+        &other_reason,
+        "a waiting memory call refused for an installation's reason",
+    )
+    .await;
+    let (_, refused_here) = step(stores, at, &gone).await;
+    assert_eq!(kinds(&refused_here), [RunEventType::ToolCallFailed]);
+    assert_eq!(refused_here.events[0].data["error"]["code"], MEMORY_TYPE_REMOVED);
+    assert_eq!(refused_here.events[0].data["memory_type_name"], "Customer notes");
+    assert_eq!(refused_here.status, RunStatus::Running, "never parked");
+    let forgotten = snapshot(stores, at).await;
+    let call = forgotten.calls.iter().find(|call| call.model_call_id == "m2").unwrap();
+    assert_eq!(call.state, CallState::Refused);
+    assert_eq!(
+        call.outcome
+            .as_ref()
+            .map(|outcome| (outcome.content.as_str(), outcome.is_error)),
+        Some((MEMORY_TYPE_REMOVED_MESSAGE, true)),
+        "what the model reads back"
+    );
+
+    // Once a run is finished, its recall isn't kept; its type is.
+    for at in [quiet, at] {
+        let stop = cancel(
+            org,
+            ws,
+            &snapshot(stores, at).await,
+            caller(),
+            RunTrigger::Api,
+            person(),
+        )
+        .unwrap();
+        committed(apply(stores, at, &stop).await);
+        assert_eq!(
+            snapshot(stores, at).await.frozen_memory,
+            Some(frozen(notes_type, None)),
+            "a finished run keeps no recall"
+        );
+    }
+}
+
+/// A run of `agent` remembering in `memory_type_id`, its one call, to
+/// forget a note, waiting for approval: the run is at the call, not parked
+/// on it yet. Its claimant and epoch with it.
+async fn waiting_in_type(
+    stores: &Stores<'_>,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    agent: AgentId,
+    memory_type_id: MemoryTypeId,
+) -> (At, ClaimantId, u64) {
+    let at = admitted(stores, organization_id, workspace_id, agent, "Forget that").await;
+    let who = claimant();
+    let epoch = claim(stores, at, who).await;
+    let mut resolved = facts(stores, who, Some(epoch));
+    resolved.offer = Some(remembering(memory_type_id));
+    resolved.memory = Some(frozen(memory_type_id, Some(RECALL)));
+    step(stores, at, &resolved).await;
+    answer(
+        stores,
+        at,
+        who,
+        epoch,
+        remember("m1", "forget_memory", ("memory", "k7m2qd")),
+        |_| {
+            memory_decision(
+                CallVerdict::RequireApproval {
+                    reason: "Your organization requires approval for forget_memory.".to_owned(),
+                },
+                "organization_requires_approval",
+            )
+        },
+    )
+    .await;
+    (at, who, epoch)
+}
+
+/// A memory call waiting for approval in a type that was deleted: once the
+/// run parked on it, refused by the job the deletion queued, only for that
+/// type and only with `memory_type_removed`; the run moves on and its job
+/// is queued. The runs such calls wait in are found across the
+/// organization's workspaces, parked or about to park, and never from
+/// another organization, even with the same type ID.
+async fn refuses_a_waiting_memory_call_whose_type_went(
+    stores: &Stores<'_>,
+    a: Tenant,
+    b: Tenant,
+    agent_a: AgentId,
+    agent_sibling: AgentId,
+    agent_b: AgentId,
+) {
+    let org = a.organization_id;
+    let notes_type = customer_notes();
+    let (here, who, epoch) = waiting_in_type(stores, org, a.workspace, agent_a, notes_type).await;
+    let (sibling, sibling_who, sibling_epoch) =
+        waiting_in_type(stores, org, a.sibling, agent_sibling, notes_type).await;
+    let (theirs, their_who, their_epoch) =
+        waiting_in_type(stores, b.organization_id, b.workspace, agent_b, notes_type).await;
+
+    // Not parked yet: found all the same, for the job to wait on.
+    let mut ours = vec![(a.workspace, here.run), (a.sibling, sibling.run)];
+    ours.sort_by_key(|(_, run)| *run);
+    assert_eq!(
+        stores
+            .runs
+            .runs_waiting_in_type(org, notes_type, None, 10)
+            .await
+            .unwrap(),
+        ours,
+        "in every workspace of the organization"
+    );
+    for (at, who, epoch) in [
+        (here, who, epoch),
+        (sibling, sibling_who, sibling_epoch),
+        (theirs, their_who, their_epoch),
+    ] {
+        step(stores, at, &facts(stores, who, Some(epoch))).await;
+        assert_eq!(snapshot(stores, at).await.control.status, RunStatus::WaitingForApproval);
+    }
+    assert_eq!(
+        stores
+            .runs
+            .runs_waiting_in_type(org, notes_type, None, 10)
+            .await
+            .unwrap(),
+        ours
+    );
+    assert_eq!(
+        stores
+            .runs
+            .runs_waiting_in_type(org, notes_type, None, 1)
+            .await
+            .unwrap(),
+        ours[..1],
+        "a page at a time"
+    );
+    assert_eq!(
+        stores
+            .runs
+            .runs_waiting_in_type(org, notes_type, Some(ours[0].1), 10)
+            .await
+            .unwrap(),
+        ours[1..],
+        "paged after a run"
+    );
+    assert_eq!(
+        stores
+            .runs
+            .runs_waiting_in_type(b.organization_id, notes_type, None, 10)
+            .await
+            .unwrap(),
+        [(b.workspace, theirs.run)],
+        "another organization finds only its own"
+    );
+    assert!(
+        stores
+            .runs
+            .runs_waiting_in_type(org, MemoryTypeId::generate(), None, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing waits in another type"
+    );
+    assert!(
+        stores
+            .runs
+            .runs_waiting_on(org, a.workspace, personal(), None, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nor on an installation"
+    );
+
+    // The run waits on a memory call: never refused as an installation's.
+    let parked = snapshot(stores, here).await;
+    let first = parked.calls[0].id;
+    assert_eq!(
+        parked.control.continuation,
+        Continuation::AwaitApproval { call_id: first }
+    );
+    assert!(
+        refuse_waiting(
+            org,
+            a.workspace,
+            &parked,
+            caller(),
+            WentAway::Installation(personal()),
+            Gone::Removed
+        )
+        .is_err()
+    );
+    assert!(
+        refuse_waiting(
+            org,
+            a.workspace,
+            &parked,
+            caller(),
+            WentAway::MemoryType(MemoryTypeId::generate()),
+            Gone::Removed
+        )
+        .is_err()
+    );
+    let request = refuse_waiting(
+        org,
+        a.workspace,
+        &parked,
+        caller(),
+        WentAway::MemoryType(notes_type),
+        Gone::Removed,
+    )
+    .unwrap();
+
+    // Applied in another scope: not found, nothing changed.
+    let before = state(stores, here).await;
+    for (organization, workspace) in [
+        (org, a.sibling),
+        (b.organization_id, b.workspace),
+        (b.organization_id, a.workspace),
+    ] {
+        assert_eq!(
+            stores.runs.apply(organization, workspace, &request).await,
+            Err(StoreError::NotFound)
+        );
+    }
+    assert_eq!(state(stores, here).await, before, "nothing changed");
+
+    // By hand: only for the type the call is in, only with the reason it
+    // went.
+    let Operation::RefuseWaiting(refuse) = request.operation().clone() else {
+        panic!("a refusal");
+    };
+    for (operation, why) in [
+        (
+            RefuseWaiting {
+                went: WentAway::MemoryType(MemoryTypeId::generate()),
+                ..refuse.clone()
+            },
+            "a type the call isn't in",
+        ),
+        (
+            RefuseWaiting {
+                went: WentAway::Installation(personal()),
+                ..refuse.clone()
+            },
+            "an installation the call isn't bound to",
+        ),
+        (
+            RefuseWaiting {
+                failure: Failure::new(INSTALLATION_REMOVED, "Personal was removed, so this call wasn't made."),
+                ..refuse.clone()
+            },
+            "an installation's reason",
+        ),
+        (
+            RefuseWaiting {
+                failure: Failure::new("tool_refused", "No."),
+                ..refuse.clone()
+            },
+            "another reason",
+        ),
+    ] {
+        let by_hand = by_hand(stores, here, Guards::default(), Operation::RefuseWaiting(operation)).await;
+        refuses_with_nothing_written(stores, here, &by_hand, why).await;
+    }
+
+    // The job's request commits: the call refused, never sent, the run
+    // running again for its next turn, its job queued.
+    jobs_of(stores, RUN_JOB, Some(here.run)).await;
+    let receipt = committed(apply(stores, here, &request).await);
+    assert_eq!(
+        (receipt.status, receipt.continuation, receipt.lease_until),
+        (RunStatus::Running, Continuation::NeedModel { turn: 1 }, None)
+    );
+    assert_eq!(kinds(&receipt), [RunEventType::ToolCallFailed], "the timeline says why");
+    assert_eq!(receipt.events[0].data["call_id"], json!(first));
+    assert_eq!(receipt.events[0].data["error"]["code"], MEMORY_TYPE_REMOVED);
+    assert_eq!(receipt.events[0].data["error"]["message"], MEMORY_TYPE_REMOVED_MESSAGE);
+    assert_eq!(receipt.events[0].data["memory_type_id"], json!(notes_type));
+    assert_eq!(receipt.events[0].data["memory_type_name"], "Customer notes");
+    let job = run_job(stores, here).await.expect("the run's job, queued with it");
+    assert_eq!(job.scope, Scope::Workspace(org, a.workspace));
+    stores.jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+    let refused = snapshot(stores, here).await;
+    let call = refused.call(first).unwrap();
+    assert_eq!(call.state, CallState::Refused);
+    assert_eq!(
+        call.outcome
+            .as_ref()
+            .map(|outcome| (outcome.content.as_str(), outcome.is_error)),
+        Some((MEMORY_TYPE_REMOVED_MESSAGE, true)),
+        "what the model reads back"
+    );
+    assert_eq!(call.approval, None, "nobody decided it");
+    assert!(call.attempts.is_empty(), "never authorized to send");
+    let late = refuse_waiting(
+        org,
+        a.workspace,
+        &parked,
+        caller(),
+        WentAway::MemoryType(notes_type),
+        Gone::Removed,
+    )
+    .unwrap();
+    assert_eq!(
+        apply(stores, here, &late).await,
+        Ok(Applied::Conflict(Conflict::Revision)),
+        "another job's, from the same revision: one winner"
+    );
+    assert_eq!(
+        stores
+            .runs
+            .runs_waiting_in_type(org, notes_type, None, 10)
+            .await
+            .unwrap(),
+        [(a.sibling, sibling.run)],
+        "nothing waits in it here any more"
+    );
+
+    for at in [here, sibling, theirs] {
+        let stop = cancel(
+            at.org,
+            at.ws,
+            &snapshot(stores, at).await,
+            caller(),
+            RunTrigger::Api,
+            person(),
+        )
+        .unwrap();
+        committed(apply(stores, at, &stop).await);
+    }
+    assert!(
+        stores
+            .runs
+            .runs_waiting_in_type(org, notes_type, None, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a finished run waits on nothing"
+    );
 }
 
 fn request_of(plan: &Plan) -> Operation {

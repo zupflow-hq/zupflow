@@ -293,16 +293,21 @@ its stop reason and token counts; a Claude model's thinking isn't kept
 between turns.
 
 Each turn's request starts with the one before it exactly (the same tools
-and instructions, then the earlier messages as sent) so providers serve it
-from their prompt cache. Anthropic, and Claude through OpenRouter
+and instructions, the run's recall, then the earlier messages as sent) so
+providers serve it from their prompt cache. A run's recall (what its agent
+remembers, framed in `<memory>`) is the first block of its first user
+message, before its input, never the system prompt: a `text` block of its
+own, or a content part of its own to OpenAI and OpenRouter; with nothing to
+recall there's no block at all. Anthropic, and Claude through OpenRouter
 (`anthropic/` models, sent with `text` parts), cache only at breakpoints:
 `cache_control` marks the instructions (the last tool without them), the
-last message and the message before the latest answer, where the turn before
-put its last one (three of the four allowed, five-minute lifetime); through
-OpenRouter tools aren't marked and an empty text isn't either. OpenAI
-and OpenRouter cache on their own and get a `prompt_cache_key`: `zf_` and a
-digest of the organization, workspace, agent and tool list, so an agent's
-runs share it and it names nothing. Token counts keep what a turn read from
+recall, the last message and the message before the latest answer, where
+the turn before put its last one (never more than the four allowed,
+five-minute lifetime); through OpenRouter tools aren't marked and an empty
+text isn't either. OpenAI and OpenRouter cache on their own and get a
+`prompt_cache_key`: `zf_` and a digest of the organization, workspace, agent
+and tool list, never the recall, so an agent's runs share it and it names
+nothing. Token counts keep what a turn read from
 the cache and wrote to it as parts of its input tokens
 (`cache_read_input_tokens`, `cache_write_input_tokens`), on each model
 attempt, turn and run and in usage.
@@ -375,8 +380,11 @@ run, its events, the audit log, the API or the logs
 request's bytes, checks breakpoints as each provider does, and fakes each
 provider's prompt cache, so tests check that every turn of a run continues
 the one before and reads it from the cache on every provider path, through
-tool calls, an approval pause, a worker restart, a retry and a key rotation
-(`tests/prompt_cache.rs`); each adapter also has a golden test of its bytes. Live tests against the
+tool calls, an approval pause, a worker restart, a retry and a key rotation,
+and with memory: a save mid-run, a change to the memory between runs, a run
+with memory off, the same recall through a retry, a restart and an approval
+pause, and never more than four breakpoints (`tests/prompt_cache.rs`); each
+adapter also has a golden test of its bytes. Live tests against the
 real providers are opt-in: `ZUPFLOW_LIVE_OPENAI_KEY`,
 `ZUPFLOW_LIVE_ANTHROPIC_KEY` or `ZUPFLOW_LIVE_OPENROUTER_KEY` (and optionally
 `ZUPFLOW_LIVE_<KIND>_MODEL`) run the catalog and model suites with
@@ -403,6 +411,39 @@ leaves the list as it was: a call to a tool no longer allowed is refused when
 it's decided or sent, one to a tool whose definition changed since (a change
 accepted mid-run) as no longer available in this run, and a tool granted since
 waits for the next run.
+An API or Console run is started with its agent's memory (`memory: "agent"`,
+the default) or without it (`"off"`). Its memory is resolved with its tools,
+at the first model attempt, and frozen with them: the agent's memory type
+(its own, or the organization's default), that kind's fixed tool definitions
+for the type's `writes` (`deny` offers only `search_memory`), under the
+kind's own names (`save_memory`), which no app's tool can have, joined to
+the one list by name, and the recall, the type's memories as the kind
+recalls them for the workspace, kept on the run once with its digest. Every
+later attempt sends the same again from the run, held to it by the digest,
+through a retry, a restart or an approval pause; nothing reads the recall
+again during a run, the run drops it when it ends and keeps the digest, and
+what it saves reaches the next run. A run with memory off is offered the
+same tools, recalls nothing, and has every call to one refused
+(`memory_off`). Each memory call is decided as it's made, on the type as it
+is then: `search_memory` is allowed, a tool that writes follows the type's
+`writes` now (`approve` pauses the run as an app's call does, `deny` refuses
+it), and a call is refused whose type was deleted (`memory_type_removed`),
+whose kind this server doesn't serve (`memory_kind_not_served`) or whose
+stored settings its kind refuses now (`invalid_memory_settings`), with the
+same code whether that's found when it's decided, just before it's made or
+as it's made. Deleting a type queues a job in the same transaction that
+refuses each call waiting for approval in it, in any workspace of its
+organization, so its run goes on without anyone deciding. A call is made in
+the run's own organization, workspace and agent, with an origin naming the
+run, the call and whether the model had read an app's result before it
+(`after_app_content`), and one that changes a memory commits a record of
+itself with its change, one for each call; one that gives a memory the
+text it holds commits the record alone, with no webhook event. One whose
+worker stopped is answered by that record, as it was made, whatever became
+of the memory since, and its change is never made again; one with no record
+(a search, a refusal, or a call never made) is made then. A worker that
+makes its call after another settled it is refused, and changes nothing. A
+channel session's runs have no memory.
 Each call it asks for is decided (floor, then policy) and recorded with its
 policy, mode and rule; allowed calls go only to their own installation's MCP
 server through the safe outbound path, with its credential injected last. A
@@ -430,7 +471,8 @@ Every transition a run commits is logged as one JSON line (`runs.transition`,
 with the run's ID, organization, workspace and environment, the operation and
 the call, turn, code or outcome it concerned), and every send that comes back
 as another (`runs.call_answered`, with its latency); never a run's input, the
-model's text, a call's arguments or result, or a credential. The same
+model's text, a memory's text or a run's recall, a call's arguments or
+result, or a credential. The same
 transitions are counted through the `Metrics` trait: runs started, waiting,
 completed, failed (by code) and cancelled; tool calls by how their send came
 back, with a latency histogram; calls refused or settled unknown; model
@@ -515,7 +557,9 @@ A memory saved, changed or forgotten through the API or the Console is
 recorded with the change, in the transaction the memory kind makes it in:
 its `memory.saved`, `memory.updated` or `memory.forgotten` event (the
 memory, its agent and type, and who wrote its text, never the text) with its
-deliveries, and its audit event. A kind keeps its memories in the database
+deliveries, and its audit event. A run's memory call records its event the
+same way, with the change, and no audit event: the run's timeline is the
+record. A kind keeps its memories in the database
 that holds the server's records, so a change and its records commit
 together, and a save, which checks in its transaction that its agent and
 type are there, can't land after the deletion that has them forgotten. The
@@ -997,7 +1041,10 @@ the generated `openapi.json`) and enforces the API's
 rules: membership before existence, environment-matched configuration with no
 fallback, single-use Connect sessions, exact return-URL allowlists,
 workspace-coherent grants, approvals only from API keys, and no Console
-actions in Production. It also simulates runs. Those rules are pinned by
+actions in Production. It also simulates runs; one asked to remember
+something saves it with the agent's memory tool, decided as the backend
+decides it (memory off, a type read-only, needing approval or deleted since).
+Those rules are pinned by
 the shared contract suite in `packages/contract-tests`, which reaches a server
 only over HTTP and runs against the mock in `src/mocks/handlers.test.ts`; the
 backend runs the same suite by setting `ZUPFLOW_CONTRACT_URL` (see

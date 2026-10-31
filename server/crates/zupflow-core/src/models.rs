@@ -73,10 +73,10 @@ pub enum Message {
 
 /// One turn: everything a model is sent.
 ///
-/// A run's turns only ever grow at the end: the same model, instructions and
-/// tools (frozen at the run's first model attempt), and the conversation of
-/// the turn before with what came of it after. That keeps every turn's
-/// request a prefix of the next one, which providers cache.
+/// A run's turns only ever grow at the end: the same model, instructions,
+/// tools and memory (frozen at the run's first model attempt), and the
+/// conversation of the turn before with what came of it after. That keeps
+/// every turn's request a prefix of the next one, which providers cache.
 #[derive(Debug, Clone, Copy)]
 pub struct Turn<'a> {
     /// The provider's own model ID, as the run's model names it.
@@ -85,6 +85,13 @@ pub struct Turn<'a> {
     pub instructions: &'a str,
     pub messages: &'a [Message],
     pub tools: &'a [ToolSpec],
+    /// What the run recalled from its agent's memory, framed: sent as the
+    /// first block of the first user message, before what the run was
+    /// started with, and never in the instructions, so a changed memory
+    /// leaves the instructions and tools before it cached. The same bytes on
+    /// every turn of a run. `None` (nothing recalled) sends no block; never
+    /// empty.
+    pub memory: Option<&'a str>,
     /// What a provider that caches prompts by prefix on its own routes the
     /// turn by, so turns sharing a prefix reach the same cache
     /// ([`prompt_cache_key`]): never a secret, and the same for every run of
@@ -279,6 +286,9 @@ pub fn validate_turn(turn: &Turn<'_>) -> Result<(), &'static str> {
     if turn.model.is_empty() {
         return Err("no model");
     }
+    if turn.memory.is_some_and(str::is_empty) {
+        return Err("an empty memory");
+    }
     let mut names = std::collections::HashSet::new();
     for tool in turn.tools {
         if !valid_tool_name(&tool.name) {
@@ -412,6 +422,7 @@ mod tests {
             instructions: "",
             messages,
             tools,
+            memory: None,
             cache_key: None,
         })
     }
@@ -473,6 +484,7 @@ mod tests {
             instructions: "",
             messages: &messages,
             tools: &[],
+            memory: None,
             cache_key: None,
         };
         let answer = |ids: &[&str]| Completion {

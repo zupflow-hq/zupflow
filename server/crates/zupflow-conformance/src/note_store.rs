@@ -17,7 +17,11 @@
 //! and its webhook events with their deliveries) in its own transaction: a
 //! change refused or changing nothing records nothing, and a record placed
 //! outside the note's workspace fails the change, which then changes
-//! nothing. The suite reads them back through the [`Logs`].
+//! nothing. The suite reads them back through the [`Logs`]. A run's call
+//! that changes a note is kept with its change, once, and one that gives a
+//! note the text it holds is kept alone, recording nothing else: another
+//! change of the same call fails, changing nothing, and the call is read
+//! back in its own scope only, whatever became of the note since.
 //!
 //! Which note ranks first is the store's own: a suite can't hold another
 //! database to SQLite's BM25, so its order is tested where it's kept.
@@ -43,7 +47,7 @@ use zupflow_core::installations::ShortId;
 use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::memory::notes::{NewNote, NoteRef, NoteStore, Reach};
 use zupflow_core::memory::{
-    Audience, Forget, Memory, MemoryChange, MemoryError, MemoryScope, Origin, Record, Recorded, Rewritten,
+    Audience, Forget, MadeCall, Memory, MemoryChange, MemoryError, MemoryScope, Origin, Record, Recorded, Rewritten,
     record_nothing,
 };
 use zupflow_core::time::Timestamp;
@@ -150,6 +154,7 @@ pub struct Logs<'a> {
 pub async fn run(store: &dyn NoteStore, logs: Logs<'_>, prepare: Prepare) {
     records_each_change_with_it(store, logs, &prepare).await;
     records_nothing_with_a_refusal(store, logs, &prepare).await;
+    keeps_each_calls_change_once(store, logs, &prepare).await;
     deletes_a_scopes_oldest_notes_with_their_records(store, logs, &prepare).await;
     saves_only_in_a_scope_that_is_there(store, &prepare).await;
     finds_a_note_by_its_id_in_its_scope_only(store, &prepare).await;
@@ -347,6 +352,284 @@ async fn finds_a_note_by_its_id_in_its_scope_only(store: &dyn NoteStore, prepare
         store.get(&scope, direct.id).await,
         Err(MemoryError::NotFound),
         "nor once its agent's notes are"
+    );
+}
+
+/// [`recorder`], with run `run_id`'s call `tool_call_id`, made with `tool`
+/// at `millis` and answered `answer` ([`Recorded::call`]).
+fn with_call(
+    run_id: RunId,
+    tool_call_id: ToolCallId,
+    tool: &'static str,
+    answer: &str,
+    millis: i64,
+) -> impl Fn(&MemoryChange) -> Recorded + Send + Sync {
+    let record = recorder(Environment::Sandbox);
+    let answer = answer.to_owned();
+    move |change| Recorded {
+        call: Some(MadeCall {
+            run_id,
+            tool_call_id,
+            tool: tool.to_owned(),
+            memory_id: change.memory().id,
+            answer: answer.clone(),
+            at: at(millis),
+        }),
+        ..record(change)
+    }
+}
+
+/// A run's call that changes a note is kept with its change, in its
+/// transaction, and read back as it was kept, in its own scope only:
+/// neither another call of the run nor the same call of another run. It's
+/// kept once: another change of the same call, in a later transaction or
+/// the same one, fails `AlreadyMade` and changes nothing, its records
+/// included. A call that gives a note the text it holds changes nothing,
+/// and is kept all the same, alone, with no audit or webhook event, once;
+/// a person's has no call, and records nothing. A call kept stays whatever
+/// becomes of its note, and of every note of its type.
+async fn keeps_each_calls_change_once(store: &dyn NoteStore, logs: Logs<'_>, prepare: &Prepare) {
+    let t = tenant(prepare).await;
+    let other = tenant(prepare).await;
+    let scope = t.scope();
+    let endpoint = watch(logs, t.organization_id).await;
+    let seen_now = || seen(logs, t.organization_id, t.workspace, endpoint);
+    let mut expected = Seen::default();
+    let run_id = RunId::generate();
+    let call = |tool_call_id| Origin::Run {
+        run_id,
+        tool_call_id,
+        after_app_content: false,
+    };
+    let saving = ToolCallId::generate();
+    let saved = store
+        .insert(
+            &scope,
+            &note_of("Prefers email.", &call(saving), &[short(1)]),
+            200,
+            at(1),
+            &with_call(run_id, saving, "save_memory", "Saved as the note.", 1),
+        )
+        .await
+        .unwrap();
+    expected.add(&MemoryChange::Saved(saved.clone()));
+    let kept = MadeCall {
+        run_id,
+        tool_call_id: saving,
+        tool: "save_memory".to_owned(),
+        memory_id: saved.id,
+        answer: "Saved as the note.".to_owned(),
+        at: at(1),
+    };
+    assert_eq!(store.made(&scope, run_id, saving).await, Ok(Some(kept.clone())));
+    assert_eq!(
+        store.made(&scope, run_id, ToolCallId::generate()).await,
+        Ok(None),
+        "another call of the run"
+    );
+    assert_eq!(
+        store.made(&scope, RunId::generate(), saving).await,
+        Ok(None),
+        "the same call of another run"
+    );
+    for (key, elsewhere) in t.changed_alone(&other) {
+        assert_eq!(store.made(&elsewhere, run_id, saving).await, Ok(None), "{key}");
+    }
+
+    // The same call again, in a later transaction: refused, changing
+    // nothing and recording nothing.
+    let again = with_call(run_id, saving, "save_memory", "Saved again.", 2);
+    let person = member();
+    store
+        .insert(
+            &scope,
+            &note_of("Added by a person.", &person, &[short(2)]),
+            200,
+            at(2),
+            &record_nothing,
+        )
+        .await
+        .unwrap();
+    let before = texts(store, &scope).await;
+    assert_eq!(
+        store
+            .insert(
+                &scope,
+                &note_of("Saved twice.", &call(saving), &[short(3)]),
+                200,
+                at(3),
+                &again
+            )
+            .await,
+        Err(MemoryError::AlreadyMade),
+        "saved"
+    );
+    assert_eq!(
+        store
+            .update(
+                &scope,
+                NoteRef::Id(saved.id),
+                Reach::Everything,
+                &call(saving),
+                "Changed by the same call.",
+                at(3),
+                &again
+            )
+            .await,
+        Err(MemoryError::AlreadyMade),
+        "changed"
+    );
+    assert_eq!(
+        store
+            .delete(&scope, NoteRef::Id(saved.id), Reach::Everything, &again)
+            .await,
+        Err(MemoryError::AlreadyMade),
+        "forgotten"
+    );
+    // The same call twice in one transaction: every note of the scope, each
+    // recording the call.
+    let forgetting = ToolCallId::generate();
+    let twice = with_call(run_id, forgetting, "forget_memory", "Forgot them.", 3);
+    assert_eq!(
+        store.delete_scope(&scope, 100, &twice, &counter(scope)).await,
+        Err(MemoryError::AlreadyMade),
+        "in one transaction"
+    );
+    assert_eq!(texts(store, &scope).await, before, "nothing changed");
+    assert_eq!(store.get(&scope, saved.id).await, Ok(saved.clone()));
+    assert_eq!(seen_now().await, expected, "nothing recorded");
+    assert_eq!(store.made(&scope, run_id, saving).await, Ok(Some(kept.clone())));
+    assert_eq!(store.made(&scope, run_id, forgetting).await, Ok(None), "nor the call");
+
+    // A call that gives the note the text it holds changes nothing, and is
+    // kept all the same, alone: no audit event, no webhook event. Once only.
+    let unchanging = ToolCallId::generate();
+    let unchanging_call = with_call(run_id, unchanging, "update_memory", "Updated the note.", 4);
+    let unchanged = store
+        .update(
+            &scope,
+            NoteRef::Id(saved.id),
+            Reach::Everything,
+            &call(unchanging),
+            "Prefers email.",
+            at(4),
+            &unchanging_call,
+        )
+        .await;
+    assert_eq!(
+        unchanged,
+        Ok(Rewritten {
+            memory: saved.clone(),
+            changed: false,
+        }),
+        "its own text"
+    );
+    assert_eq!(seen_now().await, expected, "the call alone");
+    assert_eq!(
+        store.made(&scope, run_id, unchanging).await,
+        Ok(Some(MadeCall {
+            run_id,
+            tool_call_id: unchanging,
+            tool: "update_memory".to_owned(),
+            memory_id: saved.id,
+            answer: "Updated the note.".to_owned(),
+            at: at(4),
+        })),
+        "kept"
+    );
+    assert_eq!(
+        store
+            .update(
+                &scope,
+                NoteRef::Id(saved.id),
+                Reach::Everything,
+                &call(unchanging),
+                "Prefers email.",
+                at(5),
+                &unchanging_call
+            )
+            .await,
+        Err(MemoryError::AlreadyMade),
+        "the same call again"
+    );
+    // A person's has no call: it records nothing.
+    let unchanged = store
+        .update(
+            &scope,
+            NoteRef::Id(saved.id),
+            Reach::Everything,
+            &person,
+            "Prefers email.",
+            at(5),
+            &recorder(Environment::Sandbox),
+        )
+        .await
+        .unwrap();
+    assert!(!unchanged.changed);
+    assert_eq!(seen_now().await, expected, "nothing for a person's");
+    assert_eq!(
+        store.get(&scope, saved.id).await,
+        Ok(saved.clone()),
+        "the note as it was"
+    );
+
+    // Each call that changes it is kept, and the first stays whatever
+    // becomes of the note.
+    let updating = ToolCallId::generate();
+    let updated = store
+        .update(
+            &scope,
+            NoteRef::Id(saved.id),
+            Reach::Everything,
+            &call(updating),
+            "Prefers email, in English.",
+            at(5),
+            &with_call(run_id, updating, "update_memory", "Updated the note.", 5),
+        )
+        .await
+        .unwrap();
+    expected.add(&MemoryChange::Updated(updated.memory.clone()));
+    let forgotten = store
+        .delete(
+            &scope,
+            NoteRef::Id(saved.id),
+            Reach::Everything,
+            &with_call(run_id, forgetting, "forget_memory", "Forgot the note.", 6),
+        )
+        .await
+        .unwrap();
+    expected.add(&MemoryChange::Forgotten(forgotten));
+    assert_eq!(seen_now().await, expected);
+    for (tool_call_id, tool, answer, millis) in [
+        (saving, "save_memory", "Saved as the note.", 1),
+        (unchanging, "update_memory", "Updated the note.", 4),
+        (updating, "update_memory", "Updated the note.", 5),
+        (forgetting, "forget_memory", "Forgot the note.", 6),
+    ] {
+        assert_eq!(
+            store.made(&scope, run_id, tool_call_id).await,
+            Ok(Some(MadeCall {
+                run_id,
+                tool_call_id,
+                tool: tool.to_owned(),
+                memory_id: saved.id,
+                answer: answer.to_owned(),
+                at: at(millis),
+            })),
+            "{tool}, once the note is gone"
+        );
+    }
+    store
+        .delete_all(&Forget::Type {
+            organization_id: t.organization_id,
+            memory_type_id: t.memory_type,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store.made(&scope, run_id, saving).await,
+        Ok(Some(kept)),
+        "once every note of its type is gone"
     );
 }
 
@@ -1498,6 +1781,7 @@ pub(crate) fn recorder(environment: Environment) -> impl Fn(&MemoryChange) -> Re
                 ),
                 created_at: now,
             }],
+            call: None,
         }
     }
 }

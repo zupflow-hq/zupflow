@@ -58,6 +58,7 @@ import type {
   RunError,
   RunEvent,
   RunId,
+  RunMemory,
   RunStatus,
   RunTrigger,
   RunUsage,
@@ -378,6 +379,21 @@ export interface PlannedCall {
   error: RunError | null;
 }
 
+/**
+ * A call to one of the agent's memory tools, in the memory type the run
+ * resolved when it was planned: decided when it's made, on the type as it
+ * is then, as the backend decides it.
+ */
+export interface PlannedMemoryCall {
+  call_id: ToolCallId;
+  memory_type_id: MemoryTypeId;
+  /** The type's name when the run was planned. */
+  memory_type_name: string;
+  kind: string;
+  tool: string;
+  arguments: { text: string };
+}
+
 /** One scripted step of a simulated run. */
 export type RunStep =
   | { kind: "start" }
@@ -385,6 +401,8 @@ export type RunStep =
   | { kind: "approval"; call: PlannedCall }
   | { kind: "tool_call"; call: PlannedCall }
   | { kind: "tool_result"; call: PlannedCall; duration_ms: number }
+  /** Decided and made in one step; `approved` once a person approved it. */
+  | { kind: "memory_call"; call: PlannedMemoryCall; duration_ms: number; approved: boolean }
   | {
       kind: "complete";
       /** What each planned call achieved; denied calls are removed before completion. */
@@ -404,6 +422,8 @@ export interface RunRow {
   trigger: RunTrigger;
   /** Where a channel run came from. */
   channel: RunChannelRow | null;
+  /** What the run was started with: its agent's memory, or none (`off`). A channel run's is `agent`. */
+  memory: RunMemory;
   status: RunStatus;
   input: string;
   output: string | null;

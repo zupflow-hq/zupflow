@@ -6,10 +6,16 @@
 //! in it, what must hold across concurrent saves: the scope's agent and type
 //! are there, the scope keeps fewer notes than its limit, and a short ID is
 //! held once in it. An update writes the text, who wrote it and when, or,
-//! with the text the note already holds, nothing at all. What a change
-//! records ([`Record`]) is written in its transaction: each webhook event
-//! with its deliveries and their jobs, as the outbox writes one, and the
-//! audit event, each only in the scope's own workspace.
+//! with the text the note already holds, nothing but a run's call (below).
+//! What a change records ([`Record`]) is written in its transaction: each
+//! webhook event with its deliveries and their jobs, as the outbox writes
+//! one, and the audit event, each only in the scope's own workspace.
+//!
+//! A run's call that changes a note is written with its change, in
+//! `memory_calls`, one row for each call ([`INSERT_CALL`]), and one that
+//! gives a note the text it holds is written alone, with no event: a second
+//! of the same call fails its change, `AlreadyMade`, and the transaction
+//! rolls back. Its row is read back within the full scope ([`MADE`]).
 //!
 //! A search is FTS5's: the notes holding every word, by word, in any case
 //! and accent, ranked by BM25, then newest first. BM25 weighs a word by how
@@ -27,11 +33,13 @@ use sqlx::sqlite::{SqliteArguments, SqliteRow};
 use sqlx::{Connection, QueryBuilder, Row, Sqlite, SqliteConnection, Transaction};
 use uuid::Uuid;
 use zupflow_core::audit::Audit;
-use zupflow_core::ids::{AgentId, ChannelConversationId, MemoryId, MemoryTypeId, OrganizationId, WorkspaceId};
+use zupflow_core::ids::{
+    AgentId, ChannelConversationId, MemoryId, MemoryTypeId, OrganizationId, RunId, ToolCallId, WorkspaceId,
+};
 use zupflow_core::installations::ShortId;
 use zupflow_core::memory::notes::{NewNote, NoteRef, NoteStore, Reach, Recent};
 use zupflow_core::memory::{
-    Audience, Forget, Memory, MemoryChange, MemoryError, MemoryScope, Origin, Record, Recorded, Rewritten,
+    Audience, Forget, MadeCall, Memory, MemoryChange, MemoryError, MemoryScope, Origin, Record, Recorded, Rewritten,
 };
 use zupflow_core::time::Timestamp;
 use zupflow_core::workspaces::Page;
@@ -91,15 +99,34 @@ fn read(error: impl std::fmt::Display) -> MemoryError {
     MemoryError::Unavailable
 }
 
-/// Writes what a change records, in its transaction: each webhook event, with
-/// a delivery and its job for every endpoint subscribed to it, and the audit
-/// event. Either placed anywhere but the scope's workspace fails the change.
+/// Writes what a change records, in its transaction: the run's call that
+/// made it, each webhook event, with a delivery and its job for every
+/// endpoint subscribed to it, and the audit event. An event placed anywhere
+/// but the scope's workspace fails the change, and so does a call that made
+/// its change already (`AlreadyMade`): its transaction rolls back, and it
+/// changes nothing.
 async fn write_records(
     connection: &mut SqliteConnection,
     scope: &MemoryScope,
     recorded: &Recorded,
     operation: &'static str,
 ) -> Result<(), MemoryError> {
+    if let Some(call) = &recorded.call {
+        let written = bind_scope(sqlx::query(INSERT_CALL), scope)
+            .bind(call.tool_call_id.uuid())
+            .bind(call.run_id.uuid())
+            .bind(call.tool.as_str())
+            .bind(call.memory_id.uuid())
+            .bind(call.answer.as_str())
+            .bind(call.at.millis())
+            .execute(&mut *connection)
+            .await
+            .map_err(failed(operation))?;
+        if written.rows_affected() == 0 {
+            tracing::warn!(event = "memory_notes.call_made_already", operation);
+            return Err(MemoryError::AlreadyMade);
+        }
+    }
     for event in &recorded.events {
         if event.workspace_id != Some(scope.workspace_id) {
             tracing::error!(event = "memory_notes.event_misplaced", operation);
@@ -191,6 +218,19 @@ const WRITTEN: &str = concat!(
     " AND ",
     written!(),
     " AND (id = ?7 OR short_id = ?8)"
+);
+/// A run's call (`?5`) of run `?6` that changed a note, or gave it the text
+/// it held, with its tool (`?7`), the note (`?8`), its answer (`?9`) and
+/// when (`?10`): none when the call was made already, as a call's row is its
+/// only one.
+const INSERT_CALL: &str = "INSERT INTO memory_calls (id, organization_id, workspace_id, agent_id, memory_type_id, \
+     run_id, tool, memory_id, answer, created_at) VALUES (?5, ?1, ?2, ?3, ?4, ?6, ?7, ?8, ?9, ?10) \
+     ON CONFLICT DO NOTHING";
+/// What run `?5`'s call `?6` changed in the scope, as its change wrote it.
+const MADE: &str = concat!(
+    "SELECT tool, memory_id, answer, created_at FROM memory_calls WHERE ",
+    in_scope!(),
+    " AND run_id = ?5 AND id = ?6"
 );
 /// A note by its ID (`?5`), whatever its audience.
 const FIND: &str = concat!(
@@ -480,13 +520,23 @@ impl NoteStore for SqliteNoteStore {
                 }
             }
             // It holds that text already, or there's no such note to change.
+            // A run's call to that text changed nothing, and keeps only
+            // itself: no event, no audit event. Settled later, it's answered
+            // as it was made, never made again over a change since.
             None => {
                 let row = bind_note(bind_written(sqlx::query(WRITTEN), scope, reach), note)
                     .fetch_optional(&mut *transaction)
                     .await
                     .map_err(failed("update"))?;
+                let unchanged =
+                    MemoryChange::Updated(row.as_ref().map(note_from).transpose()?.ok_or(MemoryError::NotFound)?);
+                let call = Recorded {
+                    call: record(&unchanged).call,
+                    ..Recorded::default()
+                };
+                write_records(&mut transaction, scope, &call, "update").await?;
                 Rewritten {
-                    memory: row.as_ref().map(note_from).transpose()?.ok_or(MemoryError::NotFound)?,
+                    memory: unchanged.into_memory(),
                     changed: false,
                 }
             }
@@ -562,6 +612,31 @@ impl NoteStore for SqliteNoteStore {
             .await
             .map_err(failed("get"))?;
         row.as_ref().map(note_from).transpose()?.ok_or(MemoryError::NotFound)
+    }
+
+    async fn made(
+        &self,
+        scope: &MemoryScope,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+    ) -> Result<Option<MadeCall>, MemoryError> {
+        let row = bind_scope(sqlx::query(MADE), scope)
+            .bind(run_id.uuid())
+            .bind(tool_call_id.uuid())
+            .fetch_optional(self.database.pool())
+            .await
+            .map_err(failed("made"))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(MadeCall {
+            run_id,
+            tool_call_id,
+            tool: row.try_get("tool").map_err(read)?,
+            memory_id: MemoryId::from_uuid(row.try_get("memory_id").map_err(read)?),
+            answer: row.try_get("answer").map_err(read)?,
+            at: Timestamp::from_millis(row.try_get("created_at").map_err(read)?),
+        }))
     }
 
     async fn recent(&self, scope: &MemoryScope, audience: &Audience, limit: u32) -> Result<Recent, MemoryError> {

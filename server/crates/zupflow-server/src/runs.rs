@@ -15,6 +15,11 @@
 //! applied by the store with its events, audit row and job. A cancel or a
 //! decision races the run's worker on the run's revision: when the worker
 //! moves first, it's built again from the run as it is then.
+//!
+//! A run is started with its agent's memory (`memory: "agent"`, the
+//! default) or without it (`"off"`): no recall, and the same memory tools
+//! offered, every call to one refused. The run keeps what it was started
+//! with; the engine resolves the memory itself (`memory_tools`).
 
 use std::collections::BTreeMap;
 
@@ -36,8 +41,8 @@ use zupflow_core::runs::state::{RequestId, Snapshot};
 use zupflow_core::runs::store::{Applied, Receipt, StoreError};
 use zupflow_core::runs::transition::TransitionRequest;
 use zupflow_core::runs::{
-    ApprovalDecision, Failure as RunFailure, MAX_INPUT, NewRun, OrganizationRun, OrganizationRunFilter, Page, Run,
-    RunEvent, RunFilter, RunStatus, RunTrigger, RunUsage, day_of,
+    ApprovalDecision, Failure as RunFailure, MAX_INPUT, MemoryMode, NewRun, OrganizationRun, OrganizationRunFilter,
+    Page, Run, RunEvent, RunFilter, RunStatus, RunTrigger, RunUsage, day_of,
 };
 use zupflow_core::time::Timestamp;
 
@@ -76,6 +81,8 @@ struct RunView {
     trigger: &'static str,
     /// Where a channel run came from; null for any other.
     channel: Option<zupflow_core::runs::RunChannel>,
+    /// What it was started with: `agent` or `off`.
+    memory: &'static str,
     status: &'static str,
     input: String,
     output: Option<String>,
@@ -95,6 +102,7 @@ fn run_view(run: Run) -> RunView {
         session_id: run.session_id,
         trigger: run.trigger.as_str(),
         channel: run.channel,
+        memory: run.memory.as_str(),
         status: run.status.as_str(),
         input: run.input,
         output: run.output,
@@ -633,8 +641,17 @@ async fn start_run(
             Some(input)
         }
     });
+    // `agent` unless it says otherwise: its agent's memory as it's set.
+    let memory = match body.0.get("memory") {
+        None => Some(MemoryMode::Agent),
+        Some(Value::String(memory)) => MemoryMode::parse(memory),
+        Some(_) => None,
+    };
+    if memory.is_none() {
+        fields.invalid("memory", "Choose agent or off.");
+    }
     fields.finish()?;
-    let Some(input) = input else {
+    let (Some(input), Some(memory)) = (input, memory) else {
         return Err(ApiError::internal().into());
     };
     // Resolved once, now: the agent's model, or else its environment's
@@ -668,6 +685,7 @@ async fn start_run(
             model,
             instructions: agent.instructions,
             channel: None,
+            memory,
         },
     );
     let receipt = match state
