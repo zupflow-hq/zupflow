@@ -17,8 +17,9 @@
 //! moves only when the history would go over the session's budget, by
 //! whole runs and a quarter of the budget at least
 //! ([`zupflow_core::runs::history::trimmed_start`]), so the cache misses
-//! once per trim. The recall counts in the budget with the new input: the
-//! one the session keeps, or kept last, for one read anew.
+//! once per trim. The recall counts in the budget with the new input, as no
+//! more than half of it: the one the session keeps, or kept last, for one
+//! read anew, which takes no more than that half.
 //!
 //! A session's memory (its type and audience) is fixed with its tools, and
 //! the session keeps the recall its history begins with, once for each
@@ -51,7 +52,7 @@ use zupflow_core::ids::{
 use zupflow_core::memory::{Audience, MemoryScope};
 use zupflow_core::model_store::RunModel;
 use zupflow_core::models::Message;
-use zupflow_core::runs::history::{text_weight, transcript, trimmed_start, weight as weight_of};
+use zupflow_core::runs::history::{recall_share, text_weight, transcript, trimmed_start, weight as weight_of};
 use zupflow_core::runs::names::Offer;
 use zupflow_core::runs::reducer::{TOOL_ERROR, admit};
 use zupflow_core::runs::state::{
@@ -1339,10 +1340,12 @@ async fn start_session_run(
     // Where the new run's history starts: where the last run's did, moved
     // forward by whole runs when the history would go over the budget,
     // each run weighed as kept when it ended, beside the input and the
-    // recall the session keeps. The run sends that recall from the same
-    // start; one it reads anew, after a trim or a forget, is about as long,
-    // and takes no more than the room left
-    // ([`zupflow_core::runs::history::recall_room`]).
+    // recall the session keeps, counted as no more than its share of the
+    // budget, half ([`recall_share`]). The run sends that recall from the
+    // same start; one it reads anew, after a trim or a forget, takes no
+    // more than the room left, up to that share
+    // ([`zupflow_core::runs::history::recall_room`]), so a long recall
+    // leaves the history room rather than trimming it all on every run.
     let runs = session_runs(connection, organization_id, workspace_id, key, session_id).await?;
     let start = runs
         .last()
@@ -1356,7 +1359,8 @@ async fn start_session_run(
             None => weight_of(&build_transcript(connection, organization_id, workspace_id, run.id, &run.input).await?),
         });
     }
-    let fixed = weight_of(&[Message::User { text: input.clone() }]).saturating_add(session.recall_weight);
+    let recall = session.recall_weight.min(recall_share(template.history_budget));
+    let fixed = weight_of(&[Message::User { text: input.clone() }]).saturating_add(recall);
     let cut = trimmed_start(&weights, fixed, template.history_budget);
     let history_start = runs.get(start + cut).map_or(run_id, |run| run.id);
     if cut > 0 {

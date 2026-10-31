@@ -22,9 +22,9 @@
 //! own conversation beside the workspace, else the workspace. The session
 //! keeps what it recalls, once for each history start: the first run from a
 //! start reads it from the session's type for that audience, within the
-//! room the session's history budget leaves it ([`session_recall`]), and
-//! every run from the same start sends those bytes. A save in one run
-//! reaches a later run of the session through the
+//! room the session's history budget leaves it, half the budget at most
+//! ([`session_recall`]), and every run from the same start sends those
+//! bytes. A save in one run reaches a later run of the session through the
 //! conversation, and its recall at the next trim or session. A forget, a
 //! run's or a person's, records a mark on every session of its agent,
 //! workspace and type, and the next run of each reads the recall anew. Once
@@ -357,11 +357,12 @@ pub(crate) async fn session_memory(
 
 /// What a channel session of `agent_id` recalls for the history a run
 /// starts from, read now from the session's own type for its audience, in
-/// no more than `room` bytes, what the session's history budget leaves it
-/// ([`zupflow_core::runs::history::recall_room`]): nothing once the type is
-/// deleted or while its kind isn't served. The tools stay the session's,
-/// whatever the type became. Settings its kind refuses now, or a recall
-/// that can't be read, fail the step, to be tried again.
+/// no more than `room` bytes, what the session's history budget leaves it,
+/// half the budget at most ([`zupflow_core::runs::history::recall_room`]):
+/// nothing once the type is deleted or while its kind isn't served. The
+/// tools stay the session's, whatever the type became. Settings its kind
+/// refuses now, or a recall that can't be read, fail the step, to be tried
+/// again.
 pub(crate) async fn session_recall(
     state: &AppState,
     (organization_id, workspace_id): (OrganizationId, WorkspaceId),

@@ -42,8 +42,8 @@
 //! workspace, else the workspace), and the session keeps its recall: the
 //! first run from each history start reads it (`memory_tools::session_recall`),
 //! as does the first after a forget marked the session, in the room the
-//! session's history budget leaves it, and every other run from that start
-//! sends it again.
+//! session's history budget leaves it, half the budget at most, and every
+//! other run from that start sends it again.
 //!
 //! The job queue's lease and the run's claim go together: the job's lease
 //! is extended before every step that keeps the claim, and once a step
@@ -968,7 +968,8 @@ impl<P: ToolPort> Driver<'_, P> {
     /// with its memory when the session began; the first run from the
     /// session's history start reads what it recalls, from the session's
     /// type for its audience, in the room its history and input leave of
-    /// the session's budget, and every other sends what the session kept.
+    /// the session's budget, half of it at most, and every other sends what
+    /// the session kept.
     async fn offer_unless_frozen(
         &self,
         snapshot: &Snapshot,

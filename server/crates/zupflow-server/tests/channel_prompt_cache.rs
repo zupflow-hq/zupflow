@@ -24,6 +24,8 @@
 //! app's tool result, a later save says it may come from it, a trim
 //! included. No turn marks more than four breakpoints, and a session reads
 //! and writes only its own organization, workspace, agent and memory type.
+//! A recall takes no more than half the history budget, so one that would
+//! fill it still leaves the session's earlier runs their room.
 
 #![allow(clippy::unwrap_used)]
 
@@ -1608,6 +1610,26 @@ async fn long_notes(setup: &Setup, from: u32, count: u32) {
     }
 }
 
+/// Has `memory_type` recall up to `characters` of notes.
+async fn recall_characters(setup: &Setup, memory_type: &str, characters: u32) {
+    let (status, body) = setup
+        .kit
+        .send(
+            call(
+                "alice",
+                Method::PATCH,
+                format!("/v1/organizations/{}/memory-types/{memory_type}", setup.org),
+            )
+            .body(json!({ "settings": { "recall_characters": characters } })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// The most bytes a recall read anew takes in a session of [`narrow`]'s
+/// budget: half of its 3,300 tokens, four bytes to a token.
+const HALF_THE_BUDGET: usize = 3_300 / 2 * 4;
+
 #[tokio::test]
 async fn keeps_the_recall_within_the_history_budget_beside_the_history_and_the_input() {
     for (kind, model) in PATHS {
@@ -1646,20 +1668,10 @@ async fn keeps_the_recall_within_the_history_budget_beside_the_history_and_the_i
         let opening = Prompt::read(kind, &sent[2].body).unwrap().messages[0].to_string();
         assert!(opening.contains("2 lorem ipsum"), "{name}: {opening}");
 
-        // A session's first run whose recall wouldn't fit beside its input
-        // recalls the newest notes that do, and counts the rest.
-        let (status, body) = setup
-            .kit
-            .send(
-                call(
-                    "alice",
-                    Method::PATCH,
-                    format!("/v1/organizations/{}/memory-types/{memory_type}", setup.org),
-                )
-                .body(json!({ "settings": { "recall_characters": 32_000 } })),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
+        // A session's first run whose recall would take more than half the
+        // budget recalls the newest notes that fit in that half, and counts
+        // the rest.
+        recall_characters(setup, &memory_type, 32_000).await;
         long_notes(setup, 8, 22).await;
         let before = turns(&world).len();
         world.say(BO, &format!("{} hello", main.mention()), None).await;
@@ -1670,8 +1682,14 @@ async fn keeps_the_recall_within_the_history_budget_beside_the_history_and_the_i
         assert_ne!(runs[4]["session_id"], runs[0]["session_id"], "{name}");
         let first = &turns(&world)[before];
         let tokens = text_tokens(kind, &first.body);
-        assert!((3_000..=3_300).contains(&tokens), "{name}: {tokens}");
+        assert!((1_500..=1_700).contains(&tokens), "{name}: {tokens}");
         let fitted = recall(kind, &first.body).unwrap();
+        // Within half the budget, short of it by less than a note's line.
+        assert!(
+            (HALF_THE_BUDGET - 500..=HALF_THE_BUDGET).contains(&fitted.len()),
+            "{name}: {}",
+            fitted.len()
+        );
         assert!(
             fitted.contains("Note 29: ") && !fitted.contains("Prefers answers in Portuguese."),
             "{name}: {fitted}"
@@ -1685,5 +1703,70 @@ async fn keeps_the_recall_within_the_history_budget_beside_the_history_and_the_i
             keeping(&memory_type, Some(&fitted), Some(&fitted)),
             "{name}: the session keeps what was sent"
         );
+    }
+}
+
+#[tokio::test]
+async fn keeps_every_earlier_run_of_a_session_beside_a_recall_that_would_fill_the_budget() {
+    for (kind, model) in PATHS {
+        let (world, model_id, memory_type) = remembering(kind, model).await;
+        let name = format!("{kind:?} {model}");
+        narrow(&world, &model_id).await;
+        let setup = &world.setup;
+        let main = &world.main;
+        // Notes of more than the whole budget, which the type would recall
+        // in full.
+        recall_characters(setup, &memory_type, 32_000).await;
+        long_notes(setup, 1, 29).await;
+        let before = turns(&world).len();
+        let asked = world
+            .say(
+                BO,
+                &format!("{} hello, my name is Bo and my order is 4417", main.mention()),
+                None,
+            )
+            .await;
+        world.work().await;
+        for text in [
+            "what's my order number?",
+            "and what's my name?",
+            "thanks, one more question",
+            "bye",
+        ] {
+            world.say(BO, text, Some(&asked.ts)).await;
+            world.work().await;
+        }
+        let runs = world.runs(main).await;
+        assert_eq!(runs.len(), 5, "{name}");
+        assert!(runs.iter().all(|run| run["status"] == "completed"), "{name}: {runs:?}");
+        assert!(runs.iter().all(|run| run["session_id"] == runs[0]["session_id"]));
+        let sent = turns(&world).split_off(before);
+        assert_eq!(sent.len(), 5, "{name}: one turn a run");
+        let broken = breaks(kind, &sent);
+        assert!(broken.is_empty(), "{name}: no run trims: {broken:?}");
+        // The recall takes half the budget, and every run sends it again.
+        let held = recall(kind, &sent[0].body).unwrap();
+        assert!(held.len() <= HALF_THE_BUDGET, "{name}: {}", held.len());
+        assert!(
+            held.ends_with(" older notes aren't shown. search_memory finds them.\n</memory>"),
+            "{name}: {held}"
+        );
+        assert!(
+            recalls(kind, &sent).iter().all(|sent| sent.as_ref() == Some(&held)),
+            "{name}"
+        );
+        // Every run carries the runs before it, the first one's order number
+        // included.
+        for (index, turn) in sent.iter().enumerate() {
+            let tokens = text_tokens(kind, &turn.body);
+            assert!(tokens <= 3_300, "{name}: turn {index} takes {tokens}");
+            let messages = Prompt::read(kind, &turn.body).unwrap().messages;
+            assert_eq!(messages.len(), 2 * index + 1, "{name}: turn {index}");
+            assert!(
+                messages[0].to_string().contains("my order is 4417"),
+                "{name}: turn {index}: {}",
+                messages[0]
+            );
+        }
     }
 }

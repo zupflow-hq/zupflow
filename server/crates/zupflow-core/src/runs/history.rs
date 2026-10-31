@@ -13,9 +13,11 @@
 //! least a quarter of the budget at once, so the cache misses once per
 //! trim rather than on every run. The start is stored on the run, so every
 //! run until the next trim sends the same prefix. The recall counts in the
-//! budget with the history and the new input: the trim counts the one the
-//! session keeps, and a recall read anew takes only the room they leave
-//! ([`recall_room`]).
+//! budget with the history and the new input, and takes no more than half
+//! of it ([`recall_share`]): a recall read anew takes the room they leave,
+//! up to that half ([`recall_room`]), and the trim counts the one the
+//! session keeps as no more than that half, so a long recall leaves the
+//! history room instead of trimming it all on every run.
 
 use crate::models::{Message, ModelToolCall};
 use crate::runs::state::{CallRecord, CommittedTurn, SteeredTurn};
@@ -187,14 +189,24 @@ pub fn trimmed_start(weights: &[u64], fixed: u64, budget: u64) -> usize {
     start
 }
 
+/// The most of a session's history `budget` its recall takes, in tokens:
+/// half. A recall read anew takes no more ([`recall_room`]), and the trim
+/// counts the one a session keeps as no more ([`trimmed_start`]'s `fixed`),
+/// so the history always has the other half beside the new input.
+pub fn recall_share(budget: u64) -> u64 {
+    budget / 2
+}
+
 /// The most bytes a channel run's recall may take ([`crate::memory::Recall::framed`])
 /// when the run reads it anew: what its session's `history` and its own
-/// `input` leave of the session's `budget`, four bytes to a token, so the
-/// run keeps within it as one sending the recall its session keeps does
+/// `input` leave of the session's `budget`, and no more than its share
+/// ([`recall_share`]), four bytes to a token, so the run keeps within the
+/// budget as one sending the recall its session keeps does
 /// ([`trimmed_start`]). `0` when they take it all.
 pub fn recall_room(budget: u64, history: &[Message], input: &str) -> usize {
     let taken = tokens(bytes(history).saturating_add(input.len()));
-    usize::try_from(budget.saturating_sub(taken).saturating_mul(4)).unwrap_or(usize::MAX)
+    let room = budget.saturating_sub(taken).min(recall_share(budget));
+    usize::try_from(room.saturating_mul(4)).unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]
@@ -334,16 +346,39 @@ mod tests {
     }
 
     #[test]
-    fn leaves_a_recall_read_anew_the_room_its_history_and_input_leave() {
-        // 9 bytes of history and 3 of input: 3 tokens of 10.
+    fn leaves_a_recall_read_anew_the_room_its_history_and_input_leave_up_to_half() {
+        // 9 bytes of history and 3 of input: 3 tokens of 20, which leave 17,
+        // and half the budget is 10.
         let history = [user("hello"), user("nope")];
-        assert_eq!(recall_room(10, &history, "hey"), 28);
+        assert_eq!(recall_share(20), 10);
+        assert_eq!(recall_room(20, &history, "hey"), 40, "half the budget");
+        // Of 10, they leave 7: less than half.
+        assert_eq!(recall_room(10, &history, "hey"), 20, "half the budget, 5 tokens");
+        assert_eq!(recall_room(8, &history, "hey"), 16, "4 tokens, half of 8");
+        assert_eq!(recall_room(4, &history, "hey"), 4, "1 token, all they leave");
         assert_eq!(recall_room(3, &history, "hey"), 0);
         assert_eq!(recall_room(2, &history, "hey"), 0, "over: no room");
+        assert_eq!(recall_room(1, &[], ""), 0, "half of 1 is nothing");
         assert_eq!(text_weight("hello"), 2);
         assert_eq!(text_weight(""), 0);
-        // A block within the room keeps the whole prompt within the budget.
-        let block = "b".repeat(recall_room(10, &history, "hey"));
-        assert!(weight(&[user(&format!("{block}hellonopehey"))]) <= 10);
+        // A block within the room keeps the whole prompt within the budget,
+        // and takes no more than half of it.
+        for budget in [3, 4, 8, 10, 20, 1_000] {
+            let block = "b".repeat(recall_room(budget, &history, "hey"));
+            assert!(text_weight(&block) <= recall_share(budget), "{budget}");
+            assert!(weight(&[user(&format!("{block}hellonopehey"))]) <= budget, "{budget}");
+        }
+        // Kept, it counts as no more than half: a history that fits beside
+        // the half stays whole, however long the recall.
+        let kept = 2_000u64;
+        assert_eq!(
+            trimmed_start(&[200, 200], 100 + kept.min(recall_share(1_000)), 1_000),
+            0
+        );
+        assert_eq!(
+            trimmed_start(&[200, 200], 100 + kept, 1_000),
+            2,
+            "counted whole, it would trim all"
+        );
     }
 }

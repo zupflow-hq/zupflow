@@ -33,7 +33,8 @@
 //! frame ([`shown_line`]), and fixed for the whole run (a channel session's,
 //! for every run from one history start, until a forget marks the session)
 //! so the provider's prompt cache holds. A channel run's takes only the room
-//! its session's history budget leaves ([`MemoryProvider::recall_within`]).
+//! its session's history budget leaves, and no more than half the budget
+//! ([`MemoryProvider::recall_within`]).
 //! The same memories, settings and audience give the same bytes, and the
 //! same settings give the same tool definitions. A run keeps the tools it
 //! started with, so each call carries its type's writes as they are now

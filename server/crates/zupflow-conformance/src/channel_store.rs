@@ -15,7 +15,8 @@
 //! deleting its type, marks the session in the same transaction, and no
 //! other: its next run reads the recall anew, its history kept, while a run
 //! under way keeps the recall it started with. The recall a session keeps
-//! counts in its history budget, and a run carries the budget.
+//! counts in its history budget as no more than half of it, and a run
+//! carries the budget.
 //! A message is read back byte for byte as it was recorded. Every change is
 //! made only by an editor who still may, and an agent's apps go with it.
 //! An app is made at least once: an attempt marks it before the provider is
@@ -1653,8 +1654,13 @@ impl Thread {
     /// Starts the session's next run, with its `n`th message: the run's ID
     /// and its snapshot.
     async fn next_run(&self, stores: &Stores<'_>, t: &Tenant, n: u32) -> (RunId, Snapshot) {
+        self.next_run_saying(stores, t, n, "what's due?").await
+    }
+
+    /// [`Thread::next_run`], its message saying `text`.
+    async fn next_run_saying(&self, stores: &Stores<'_>, t: &Tenant, n: u32, text: &str) -> (RunId, Snapshot) {
         let external_id = format!("{}.{n}", self.thread);
-        let mut new = message(&external_id, "C0SUPPORT", "what's due?", 1_000);
+        let mut new = message(&external_id, "C0SUPPORT", text, 1_000);
         new.thread_key = self.thread.to_owned();
         let asked = stores
             .channels
@@ -1943,10 +1949,12 @@ async fn reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(sto
 }
 
 /// The recall a session keeps counts in its history budget, beside the
-/// history and the new input: a run whose history and input fit the budget
-/// but not with the recall trims its history, and reads the recall anew;
-/// one whose recall fits with them keeps both. A run's session carries the
-/// budget it started with, for the room a recall read anew may take.
+/// history and the new input, as no more than half the budget: a run whose
+/// history and input fit beside that half keeps them, however long the
+/// recall; one whose history and input fit the budget, but not beside the
+/// recall's half, trims its history and reads the recall anew; and a short
+/// recall counts as it is. A run's session carries the budget it started
+/// with, for the room a recall read anew may take.
 async fn counts_a_sessions_recall_in_its_history_budget(stores: &Stores<'_>, prepare: &Prepare) {
     const SHORT: &str = "<memory>\n[k7m2qd] Prefers replies in Portuguese.\n</memory>";
     let t = tenant(prepare).await;
@@ -1960,39 +1968,65 @@ async fn counts_a_sessions_recall_in_its_history_budget(stores: &Stores<'_>, pre
         thread: "9.budget",
         template: remembering(&template(), MemoryTypeId::generate()),
     };
-    assert_eq!(session.template.history_budget, 1_000);
-    // A recall of over a thousand tokens: as long as the session's budget,
-    // without the history and the input beside it.
+    let budget = session.template.history_budget;
+    assert_eq!(budget, 1_000);
+    let input_weight = |snapshot: &Snapshot| {
+        weight(&[Message::User {
+            text: snapshot.input.clone(),
+        }])
+    };
+    // A recall of over a thousand tokens, longer than the session's whole
+    // budget, as one kept since the budget was larger may be.
     let long = format!("<memory>\n{}\n</memory>", "x".repeat(4_000));
-    assert!(text_weight(&long) > session.template.history_budget);
+    assert!(text_weight(&long) > budget);
     assert_eq!(
         session.answered(stores, &t, 1, &long).await,
         (SessionRecall::Unread, Some(long.clone()))
     );
 
-    // The next run's history and input fit without it, so it trims them,
-    // and reads the recall anew.
+    // Counted as half the budget, it leaves the next run's history and
+    // input room: the run keeps them, and sends the recall the session
+    // keeps.
     let (second, snapshot) = session.next_run(stores, &t, 2).await;
-    let context = snapshot.session.expect("its session");
-    assert_eq!(context.history_budget, 1_000, "the budget it started with");
-    assert!(context.history.is_empty(), "trimmed: {:?}", context.history);
-    assert_eq!(context.recall, SessionRecall::Unread);
-    // As short as the first run's input, which its answer follows.
-    assert!(weight(&[Message::User { text: snapshot.input }]) < 100);
+    let context = snapshot.session.clone().expect("its session");
+    assert_eq!(context.history_budget, budget, "the budget it started with");
+    assert_eq!(context.history.len(), 2, "the first run's input and answer");
+    assert_eq!(context.recall, SessionRecall::Read(Some(long.clone())));
+    let earlier = weight(&context.history) + input_weight(&snapshot);
+    assert!(earlier < 100, "{earlier}");
     assert_eq!(
         answer_remembering(stores, org, ws, second, &read(session.memory_type_id(), SHORT)).await,
+        [Some(long.clone())],
+        "what the session kept"
+    );
+
+    // A long input fits the budget beside the history, but not beside the
+    // recall's half too: the run trims the history and reads the recall
+    // anew.
+    let (third, snapshot) = session.next_run_saying(stores, &t, 3, &"y".repeat(2_000)).await;
+    let context = snapshot.session.clone().expect("its session");
+    let input = input_weight(&snapshot);
+    assert!((500..600).contains(&input), "{input}");
+    assert!(
+        earlier * 2 + input <= budget,
+        "the history and the input fit the budget alone"
+    );
+    assert!(context.history.is_empty(), "trimmed: {:?}", context.history);
+    assert_eq!(context.recall, SessionRecall::Unread);
+    assert_eq!(
+        answer_remembering(stores, org, ws, third, &read(session.memory_type_id(), SHORT)).await,
         [Some(SHORT.to_owned())]
     );
 
-    // A short recall fits with the history and the input: the next run
-    // keeps them.
-    let (third, snapshot) = session.next_run(stores, &t, 3).await;
-    let context = snapshot.session.expect("its session");
-    assert_eq!(context.history.len(), 2, "the second run's input and answer");
+    // A short recall counts as it is, and fits with the history and the
+    // input: the next run keeps them.
+    let (fourth, snapshot) = session.next_run(stores, &t, 4).await;
+    let context = snapshot.session.clone().expect("its session");
+    assert_eq!(context.history.len(), 2, "the third run's input and answer");
     assert_eq!(context.recall, SessionRecall::Read(Some(SHORT.to_owned())));
-    assert!(weight(&context.history) + weight(&[Message::User { text: snapshot.input }]) + text_weight(SHORT) <= 1_000);
+    assert!(weight(&context.history) + input_weight(&snapshot) + text_weight(SHORT) <= budget);
     assert_eq!(
-        answer_remembering(stores, org, ws, third, &read(session.memory_type_id(), &long)).await,
+        answer_remembering(stores, org, ws, fourth, &read(session.memory_type_id(), &long)).await,
         [Some(SHORT.to_owned())],
         "what the session kept"
     );
