@@ -552,7 +552,9 @@ mod tests {
     use zupflow_core::memory::MemoryWrites;
     use zupflow_core::memory::notes::{self, FORGET_MEMORY, SAVE_MEMORY, SEARCH_MEMORY, UPDATE_MEMORY};
     use zupflow_core::runs::MemoryMode;
-    use zupflow_core::runs::reducer::{MEMORY_OFF, MEMORY_OFF_MESSAGE, MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE};
+    use zupflow_core::runs::reducer::{
+        MEMORY_OFF, MEMORY_OFF_MESSAGE, MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE,
+    };
     use zupflow_core::runs::state::CallVerdict;
 
     use super::{NOT_SERVED, POLICY, READ_ONLY, TypeNow, decision_now, level_decision};
@@ -583,7 +585,10 @@ mod tests {
                 assert_eq!(verdict, expected, "{tool} with writes {}", writes.as_str());
             }
             // A search only reads, whatever the writes.
-            assert_eq!(level_decision(SEARCH_MEMORY, &offered, &every).verdict, CallVerdict::Allow);
+            assert_eq!(
+                level_decision(SEARCH_MEMORY, &offered, &every).verdict,
+                CallVerdict::Allow
+            );
             assert!(matches!(
                 level_decision("erase_everything", &offered, &every).verdict,
                 CallVerdict::Deny { .. }
@@ -612,7 +617,10 @@ mod tests {
                     reason: MEMORY_TYPE_REMOVED_MESSAGE.to_owned()
                 }
             );
-            assert_eq!(decision_now(MemoryMode::Agent, &TypeNow::NotServed, tool).rule, NOT_SERVED);
+            assert_eq!(
+                decision_now(MemoryMode::Agent, &TypeNow::NotServed, tool).rule,
+                NOT_SERVED
+            );
         }
     }
 }

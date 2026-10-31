@@ -4010,3 +4010,292 @@ fn a_runs_channel_changes_count_edits_and_reactions_beside_posts() {
     ];
     assert_eq!(channel_changes(&snapshot), 4);
 }
+
+// ---------------------------------------------------------------------------
+// The run's memory
+
+const RECALL: &str = "<memory>\n- Prefers replies in Portuguese.\n</memory>";
+
+fn memory_type() -> MemoryTypeId {
+    MemoryTypeId::from_uuid(Uuid::from_u128(40))
+}
+
+fn recalled(recall: Option<&str>) -> FrozenMemory {
+    FrozenMemory {
+        memory_type_id: memory_type(),
+        recall: recall.map(str::to_owned),
+    }
+}
+
+/// The offer with the notes kind's tools of [`memory_type`] joined to it.
+fn remembering() -> Offer {
+    let tools = crate::memory::notes::tools(crate::memory::MemoryWrites::Allow)
+        .iter()
+        .map(|tool| crate::runs::names::memory_tool(memory_type(), "Customer notes", "notes", "Notes", tool))
+        .collect();
+    let (offer, left_out) = offer().with(tools);
+    assert!(left_out.is_empty(), "a memory tool's name meets no app's");
+    offer
+}
+
+/// A call of `turn` to the memory tool `name`, in `state`.
+fn memory_record(n: u128, turn: u32, name: &str, state: CallState) -> CallRecord {
+    let offered = remembering();
+    let tool = offered.find(name).expect("offered");
+    CallRecord {
+        id: call_id(n),
+        turn,
+        position: 0,
+        model_call_id: format!("m{n}"),
+        model_tool_name: name.to_owned(),
+        target: bound(tool),
+        arguments: arguments(),
+        state,
+        decision: None,
+        call_digest: Some(memory_call_digest(
+            memory_type(),
+            "notes",
+            name,
+            &tool.definition_sha256,
+            &arguments(),
+        )),
+        approval: None,
+        outcome: state.is_settled().then(|| CallOutcome {
+            content: "done".to_owned(),
+            is_error: false,
+        }),
+        failure: None,
+        attempts: Vec::new(),
+    }
+}
+
+fn prepared_with(plan: &Plan) -> (&PrepareModel, &ModelRequest) {
+    let Operation::PrepareModel(prepared) = operation(plan) else {
+        panic!("prepares");
+    };
+    let Io::CallModel(request) = plan.io() else {
+        panic!("calls the model");
+    };
+    (prepared, request)
+}
+
+#[test]
+fn freezes_the_memory_with_the_offer_and_sends_its_recall_first() {
+    let snapshot = running(Continuation::NeedModel { turn: 0 });
+    let facts = Facts {
+        offer: Some(remembering()),
+        memory: Some(recalled(Some(RECALL))),
+        ..claimed()
+    };
+    let plan = planned(&snapshot, &facts);
+    let (prepared, request) = prepared_with(&plan);
+    assert_eq!(prepared.offer, remembering());
+    assert_eq!(prepared.memory, Some(recalled(Some(RECALL))), "frozen with the offer");
+    assert_eq!(request.memory.as_deref(), Some(RECALL));
+    assert_eq!(request.as_turn().memory, Some(RECALL));
+    assert_eq!(
+        request.messages,
+        vec![Message::User {
+            text: "Make a task.".to_owned()
+        }],
+        "the input as it was: the provider puts the recall before it"
+    );
+    let names: Vec<&str> = request.tools.iter().map(|tool| tool.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "forget_memory",
+            "save_memory",
+            "search_memory",
+            WORK_CREATE,
+            WORK_LIST,
+            PERSONAL_CREATE,
+            "update_memory"
+        ],
+        "one list, by name"
+    );
+    // The recall is part of what's sent, so of its digest.
+    let without = Facts {
+        offer: Some(remembering()),
+        ..claimed()
+    };
+    let plain = planned(&snapshot, &without);
+    let (prepared, plain) = prepared_with(&plain);
+    assert_eq!((prepared.memory.as_ref(), plain.memory.as_ref()), (None, None));
+    assert_eq!(plain.tools, request.tools);
+    assert_ne!(plain.digest(), request.digest());
+}
+
+#[test]
+fn every_later_attempt_sends_the_memory_its_first_froze() {
+    let mut snapshot = running(Continuation::AwaitModel { turn: 0, attempt: 1 });
+    let frozen = recalled(Some(RECALL));
+    let digest = model_request(&snapshot, 0, 1, None, (&remembering(), Some(&frozen)), None)
+        .expect("a request")
+        .digest();
+    snapshot.model_attempts.push(ModelAttempt {
+        turn: 0,
+        attempt: 1,
+        state: ModelAttemptState::Prepared,
+        request_digest: digest,
+        offer: remembering(),
+        memory: Some(frozen.clone()),
+        timed_out: false,
+    });
+    // Its worker stopped. The memory changed since, and so did what a
+    // worker resolves now: neither reaches this run.
+    let facts = Facts {
+        offer: Some(offer()),
+        memory: Some(recalled(Some("<memory>\n- Prefers email.\n</memory>"))),
+        ..claimed()
+    };
+    let plan = planned(&snapshot, &facts);
+    let (prepared, request) = prepared_with(&plan);
+    assert_eq!((prepared.attempt, prepared.abandons), (2, Some(1)));
+    assert_eq!((&prepared.offer, &prepared.memory), (&remembering(), &Some(frozen)));
+    assert_eq!(request.memory.as_deref(), Some(RECALL));
+    assert_eq!(request.digest(), digest, "the same bytes again");
+    // An answer to the first attempt is still checked against what it sent.
+    let mut answered_snapshot = snapshot.clone();
+    answered_snapshot.model_attempts[0].memory = Some(recalled(Some("<memory>\n- Other.\n</memory>")));
+    let answer = Facts {
+        model: Some(answered(0, 1, Reply::Text("Done.".to_owned()))),
+        ..claimed()
+    };
+    assert_eq!(
+        advance(&answered_snapshot, &answer),
+        Err(AdvanceError::InvalidSnapshot(
+            "the conversation changed under a prepared model attempt"
+        )),
+        "a recall other than the one sent"
+    );
+}
+
+#[test]
+fn sends_no_recall_with_memory_off_or_nothing_to_recall_and_the_same_tools() {
+    let mut off = running(Continuation::NeedModel { turn: 0 });
+    off.memory = MemoryMode::Off;
+    let agent = running(Continuation::NeedModel { turn: 0 });
+    let remembers = planned(
+        &agent,
+        &Facts {
+            offer: Some(remembering()),
+            memory: Some(recalled(Some(RECALL))),
+            ..claimed()
+        },
+    );
+    let (_, remembers) = prepared_with(&remembers);
+    for (snapshot, recall, why) in [
+        (&off, Some(RECALL), "memory off"),
+        (&agent, Some(""), "an empty recall"),
+        (&agent, None, "nothing to recall"),
+    ] {
+        let facts = Facts {
+            offer: Some(remembering()),
+            memory: Some(recalled(recall)),
+            ..claimed()
+        };
+        let plan = planned(snapshot, &facts);
+        let (prepared, request) = prepared_with(&plan);
+        assert_eq!(request.memory, None, "{why}");
+        assert_eq!(
+            prepared.memory,
+            Some(recalled(None)),
+            "{why}: the type kept, with what's sent"
+        );
+        assert_eq!(request.tools, remembers.tools, "{why}: the same tools");
+    }
+}
+
+#[test]
+fn sends_a_memory_call_in_the_runs_type_saying_whether_an_apps_result_came_first() {
+    let earlier = record(1, 0, WORK_LIST, CallState::Completed);
+    let mut call = memory_record(2, 1, "save_memory", CallState::Allowed);
+    call.decision = Some(allow());
+    let mut snapshot = with_calls(
+        Continuation::NeedCall { turn: 1, position: 0 },
+        vec![earlier, call.clone()],
+    );
+    snapshot.turns.push(CommittedTurn { turn: 1, text: None });
+    let facts = Facts {
+        send_check: Some(check(&call, allow())),
+        invocation_id: Some(invocation(1)),
+        ..claimed()
+    };
+    let plan = planned(&snapshot, &facts);
+    let Io::SendMemory(send) = plan.io() else {
+        panic!("a memory call, got {plan:?}");
+    };
+    let save = remembering().find("save_memory").expect("offered").clone();
+    assert_eq!(
+        **send,
+        MemorySendRequest {
+            organization_id: organization(),
+            workspace_id: workspace(),
+            run_id: run_id(),
+            call_id: call.id,
+            attempt: 1,
+            invocation_id: invocation(1),
+            memory_type_id: memory_type(),
+            kind: "notes".to_owned(),
+            tool: "save_memory".to_owned(),
+            arguments: arguments(),
+            call_digest: call.call_digest.expect("digested"),
+            definition_sha256: save.definition_sha256,
+            after_app_content: true,
+        }
+    );
+    assert!(matches!(
+        operation(&plan),
+        Operation::AuthorizeCall(AuthorizeCall {
+            authorization: Authorization::Send { attempt: 1, .. },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn counts_only_an_apps_results_of_earlier_turns_as_read_before_a_memory_call() {
+    let call = memory_record(9, 1, "save_memory", CallState::Allowed);
+    let settled = |state: CallState, code: Option<&str>| {
+        let mut earlier = record(1, 0, WORK_LIST, state);
+        earlier.failure = code.map(|code| Failure::new(code, "It failed."));
+        earlier
+    };
+    let mut same_turn = record(1, 1, WORK_LIST, CallState::Completed);
+    same_turn.turn = 1;
+    for (earlier, read, why) in [
+        (settled(CallState::Completed, None), true, "an app's answer"),
+        (settled(CallState::Failed, Some(TOOL_ERROR)), true, "an app's own error"),
+        (
+            settled(CallState::Failed, Some("tool_unavailable")),
+            false,
+            "a call that never reached the app",
+        ),
+        (
+            settled(CallState::Refused, Some("tool_refused")),
+            false,
+            "a refused call",
+        ),
+        (
+            settled(CallState::Denied, Some("approval_denied")),
+            false,
+            "a denied call",
+        ),
+        (
+            settled(CallState::Unknown, Some("outcome_unknown")),
+            false,
+            "an outcome unknown",
+        ),
+        (same_turn, false, "a call of the same turn, whose answer it hadn't read"),
+        (
+            memory_record(1, 0, "search_memory", CallState::Completed),
+            false,
+            "memory's own answer",
+        ),
+    ] {
+        let mut snapshot = running(Continuation::NeedCall { turn: 1, position: 0 });
+        snapshot.calls = vec![earlier, call.clone()];
+        assert_eq!(after_app_content(&snapshot, &call), read, "{why}");
+    }
+}

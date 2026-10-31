@@ -606,11 +606,7 @@ impl Notes {
             origin: context.origin,
             short_ids: &short_ids,
         };
-        match self
-            .store
-            .insert(scope, &note, max_notes, context.now, record)
-            .await
-        {
+        match self.store.insert(scope, &note, max_notes, context.now, record).await {
             Ok(saved) => Ok(CallResult::answer(
                 format!("Saved as {}.", saved.short_id.as_str()),
                 Some(MemoryChange::Saved(saved)),

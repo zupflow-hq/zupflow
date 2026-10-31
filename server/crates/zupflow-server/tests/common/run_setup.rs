@@ -691,8 +691,12 @@ impl Setup {
         let (status, body) = self
             .kit
             .send(
-                call("alice", Method::POST, format!("/v1/organizations/{}/memory-types", self.org))
-                    .body(json!({ "name": name, "kind": "notes", "settings": {}, "writes": writes })),
+                call(
+                    "alice",
+                    Method::POST,
+                    format!("/v1/organizations/{}/memory-types", self.org),
+                )
+                .body(json!({ "name": name, "kind": "notes", "settings": {}, "writes": writes })),
             )
             .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");

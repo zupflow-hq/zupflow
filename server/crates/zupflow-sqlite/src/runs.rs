@@ -733,7 +733,11 @@ struct Writer<'a> {
 fn reference(call_id: ToolCallId, target: &BoundTarget) -> Map<String, Value> {
     let mut data = Map::new();
     data.insert("call_id".to_owned(), json!(call_id));
-    match (target.installation_id, target.channel_connection_id, target.memory_type_id) {
+    match (
+        target.installation_id,
+        target.channel_connection_id,
+        target.memory_type_id,
+    ) {
         (_, Some(connection_id), _) => {
             data.insert("channel_connection_id".to_owned(), json!(connection_id));
             data.insert("connection_label".to_owned(), json!(target.installation_label));

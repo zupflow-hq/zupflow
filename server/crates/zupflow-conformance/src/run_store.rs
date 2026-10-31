@@ -68,10 +68,9 @@ use zupflow_core::models::{Completion, ModelToolCall, Reply, TokenUsage};
 use zupflow_core::runs::digest::{Sha256Digest, call_digest};
 use zupflow_core::runs::names::{Candidate, Offer, ToolHost, build_offer, memory_tool};
 use zupflow_core::runs::reducer::{
-    Approval, Facts, Gone, INSTALLATION_DISCONNECTED, INSTALLATION_REMOVED, InstallationCheck, Io,
-    MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE, ModelAnswer, ModelResult, Plan, SendCheck, SendRequest,
-    SendResult, Unanswered, UnansweredWhy, admit, advance, calls_to_decide, cancel, fail_abandoned, refuse_waiting,
-    resolve_approval,
+    Approval, Facts, Gone, INSTALLATION_DISCONNECTED, INSTALLATION_REMOVED, InstallationCheck, Io, MEMORY_TYPE_REMOVED,
+    MEMORY_TYPE_REMOVED_MESSAGE, ModelAnswer, ModelResult, Plan, SendCheck, SendRequest, SendResult, Unanswered,
+    UnansweredWhy, admit, advance, calls_to_decide, cancel, fail_abandoned, refuse_waiting, resolve_approval,
 };
 use zupflow_core::runs::state::{
     CallDecision, CallVerdict, ClaimantId, Continuation, EXECUTION_VERSION, FrozenMemory, InvocationId,
@@ -86,8 +85,8 @@ use zupflow_core::runs::transition::{
     Settlement, TransitionRequest, Yield, YieldReason,
 };
 use zupflow_core::runs::{
-    ApprovalDecision, CallState, Failure, MemoryMode, NewRun, OrganizationRunFilter, RunEventType, RunFilter, RunStatus,
-    RunTrigger, UsageDay,
+    ApprovalDecision, CallState, Failure, MemoryMode, NewRun, OrganizationRunFilter, RunEventType, RunFilter,
+    RunStatus, RunTrigger, UsageDay,
 };
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::{Clock, Timestamp};
@@ -2318,7 +2317,11 @@ async fn keeps_a_runs_memory_with_its_attempts(stores: &Stores<'_>, a: Tenant, a
     let call = snapshot(stores, at).await.calls[0].clone();
     let target = call.target.clone().expect("bound to its type");
     assert_eq!(
-        (target.installation_id, target.channel_connection_id, target.memory_type_id),
+        (
+            target.installation_id,
+            target.channel_connection_id,
+            target.memory_type_id
+        ),
         (None, None, Some(notes_type))
     );
     assert_eq!(
@@ -2338,7 +2341,12 @@ async fn keeps_a_runs_memory_with_its_attempts(stores: &Stores<'_>, a: Tenant, a
         panic!("expected a memory call, got {planned:?}");
     };
     assert_eq!(
-        (send.memory_type_id, send.kind.as_str(), send.tool.as_str(), send.after_app_content),
+        (
+            send.memory_type_id,
+            send.kind.as_str(),
+            send.tool.as_str(),
+            send.after_app_content
+        ),
         (notes_type, notes::KIND, "save_memory", false)
     );
     assert_eq!(Some(send.call_digest), call.call_digest);
@@ -2416,11 +2424,7 @@ async fn keeps_a_runs_memory_with_its_attempts(stores: &Stores<'_>, a: Tenant, a
     assert_eq!(refused_here.events[0].data["memory_type_name"], "Customer notes");
     assert_eq!(refused_here.status, RunStatus::Running, "never parked");
     let forgotten = snapshot(stores, at).await;
-    let call = forgotten
-        .calls
-        .iter()
-        .find(|call| call.model_call_id == "m2")
-        .unwrap();
+    let call = forgotten.calls.iter().find(|call| call.model_call_id == "m2").unwrap();
     assert_eq!(call.state, CallState::Refused);
     assert_eq!(
         call.outcome

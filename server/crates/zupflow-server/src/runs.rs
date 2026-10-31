@@ -15,6 +15,11 @@
 //! applied by the store with its events, audit row and job. A cancel or a
 //! decision races the run's worker on the run's revision: when the worker
 //! moves first, it's built again from the run as it is then.
+//!
+//! A run is started with its agent's memory (`memory: "agent"`, the
+//! default) or without it (`"off"`): no recall, and the same memory tools
+//! offered, every call to one refused. The run keeps what it was started
+//! with; the engine resolves the memory itself (`memory_tools`).
 
 use std::collections::BTreeMap;
 

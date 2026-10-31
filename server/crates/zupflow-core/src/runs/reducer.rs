@@ -1056,7 +1056,10 @@ pub fn after_app_content(snapshot: &Snapshot, call: &CallRecord) -> bool {
                 .is_some_and(|target| matches!(target.host(), ToolHost::Installation(_)))
             && (earlier.state == CallState::Completed
                 || (earlier.state == CallState::Failed
-                    && earlier.failure.as_ref().is_some_and(|failure| failure.code == TOOL_ERROR)))
+                    && earlier
+                        .failure
+                        .as_ref()
+                        .is_some_and(|failure| failure.code == TOOL_ERROR)))
     })
 }
 
@@ -1468,7 +1471,14 @@ impl Worker<'_> {
             .steer
             .as_ref()
             .filter(|_| self.snapshot.session.is_some() && attempt == 1 && abandons.is_none());
-        let request = model_request(self.snapshot, turn, attempt, key_version, (offer, memory.as_ref()), steer)?;
+        let request = model_request(
+            self.snapshot,
+            turn,
+            attempt,
+            key_version,
+            (offer, memory.as_ref()),
+            steer,
+        )?;
         validate_turn(&request.as_turn()).map_err(|_| AdvanceError::InvalidFact("a model request no model takes"))?;
         let operation = Operation::PrepareModel(PrepareModel {
             turn,

@@ -174,7 +174,10 @@ async fn saves_with_the_run_and_the_call_as_its_origin_and_records_the_change_wi
     assert_eq!(recalled.len(), 3);
     assert!(recalled.iter().all(|recall| recall == &recalled[0]));
     let recall = recalled[0].as_deref().unwrap();
-    assert!(recall.contains("Prefers answers in Portuguese.") && !recall.contains("Saved"), "{recall}");
+    assert!(
+        recall.contains("Prefers answers in Portuguese.") && !recall.contains("Saved"),
+        "{recall}"
+    );
 
     // Each save committed its webhook event, naming the memory and the run,
     // never its text; nothing was audited.
@@ -309,7 +312,9 @@ async fn waits_for_approval_of_a_save_and_makes_it_only_once_approved() {
 async fn refuses_a_call_once_the_runs_type_is_deleted() {
     let (setup, memory_type) = remembering("approve").await;
     let search = calling_memory("search_memory", &json!({ "query": "Fridays" }));
-    let run = setup.start(&format!("{}\nthen\n{search}", save("Ships on Fridays."))).await;
+    let run = setup
+        .start(&format!("{}\nthen\n{search}", save("Ships on Fridays.")))
+        .await;
     setup.kit.drain(Worker::A).await;
     assert_eq!(setup.get(run).await["status"], "waiting_for_approval");
     // While the save waits, the agent stops remembering and its type is
@@ -412,12 +417,7 @@ async fn stopped_at(point: Point, input: &str, notes_before: &[&str]) -> (Setup,
 async fn settles_a_save_whose_worker_stopped_without_making_it_twice() {
     // Saved, and the worker stopped before recording it: found by the run
     // and the call.
-    let (setup, run) = stopped_at(
-        Point::Before(Write::RecordOutcome),
-        &save("Ships on Fridays."),
-        &[],
-    )
-    .await;
+    let (setup, run) = stopped_at(Point::Before(Write::RecordOutcome), &save("Ships on Fridays."), &[]).await;
     assert_eq!(setup.get(run).await["status"], "completed");
     let notes = setup.notes().await;
     assert_eq!(notes.len(), 1, "{notes:?}");
@@ -577,8 +577,12 @@ async fn reads_and_writes_only_its_own_organization_workspace_agent_and_type() {
     let (status, created) = setup
         .kit
         .send(
-            call("bob", Method::POST, format!("/v1/organizations/{}/memory-types", elsewhere.org))
-                .body(json!({ "name": "Customer notes", "kind": "notes", "settings": {} })),
+            call(
+                "bob",
+                Method::POST,
+                format!("/v1/organizations/{}/memory-types", elsewhere.org),
+            )
+            .body(json!({ "name": "Customer notes", "kind": "notes", "settings": {} })),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");

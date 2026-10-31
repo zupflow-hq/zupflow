@@ -26,6 +26,17 @@
 //! the same for every run of the agent with the same tools, outside the
 //! request's digest.
 //!
+//! An API or Console run's memory is resolved with its tools and frozen
+//! with them (`memory_tools::resolve`): the agent's memory type, its
+//! kind's tools for the type's `writes`, joined to the one list by name,
+//! and the recall, which every attempt sends again as the first block of
+//! the first user message. Nothing reads the recall again during a run, and
+//! the cache key never covers it. Each memory call is decided as it's made,
+//! on the type as it is then, made in the run's own scope with a webhook
+//! row committed with its change, and a lapsed one is settled by finding
+//! its change by origin, never made twice. A channel session's runs have no
+//! memory.
+//!
 //! The job queue's lease and the run's claim go together: the job's lease
 //! is extended before every step that keeps the claim, and once a step
 //! releases the claim (it parks, yields or finishes) the store has queued,
@@ -939,8 +950,8 @@ impl<P: ToolPort> Driver<'_, P> {
     /// memory: the agent's memory tools join its apps' by their own names,
     /// and what it recalls is read with them. `None` once an attempt froze
     /// them, since every later one offers those and sends that recall. A
-    /// channel run's session froze its tools when it started, without
-    /// memory for now.
+    /// channel run's session froze its tools when it started, with no
+    /// memory.
     async fn offer_unless_frozen(
         &self,
         snapshot: &Snapshot,

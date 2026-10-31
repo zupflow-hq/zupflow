@@ -2325,7 +2325,8 @@ async fn settles_each_tools_call_by_what_it_did(provider: &dyn MemoryProvider, p
             .await
         }
     };
-    let answered = |result: Option<CallResult>| result.map(|result| (result.content, result.is_error, result.change.is_some()));
+    let answered =
+        |result: Option<CallResult>| result.map(|result| (result.content, result.is_error, result.change.is_some()));
 
     // A save made, then settled: found, and answered as made.
     let first = run_origin();
@@ -2341,24 +2342,50 @@ async fn settles_each_tools_call_by_what_it_did(provider: &dyn MemoryProvider, p
             "{writes:?}: found by its origin, whatever the writes are now"
         );
     }
-    assert_eq!(provider.list(&scope, &everything()).await.unwrap().total, 1, "saved once");
+    assert_eq!(
+        provider.list(&scope, &everything()).await.unwrap().total,
+        1,
+        "saved once"
+    );
 
     // A save never made: refused while denied, then made once.
     let lost = run_origin();
-    let refused = settle(lost, MemoryWrites::Deny, notes::SAVE_MEMORY, json!({ "text": "Saved late." }))
-        .await
-        .expect("an answer");
+    let refused = settle(
+        lost,
+        MemoryWrites::Deny,
+        notes::SAVE_MEMORY,
+        json!({ "text": "Saved late." }),
+    )
+    .await
+    .expect("an answer");
     assert!(refused.is_error && refused.change.is_none(), "{refused:?}");
-    assert_eq!(provider.list(&scope, &everything()).await.unwrap().total, 1, "nothing saved");
-    let late = settle(lost, MemoryWrites::Allow, notes::SAVE_MEMORY, json!({ "text": "Saved late." }))
-        .await
-        .expect("an answer");
+    assert_eq!(
+        provider.list(&scope, &everything()).await.unwrap().total,
+        1,
+        "nothing saved"
+    );
+    let late = settle(
+        lost,
+        MemoryWrites::Allow,
+        notes::SAVE_MEMORY,
+        json!({ "text": "Saved late." }),
+    )
+    .await
+    .expect("an answer");
     let Some(MemoryChange::Saved(late_note)) = late.change.clone() else {
         panic!("made now: {late:?}");
     };
     assert_eq!((late_note.text.as_str(), late_note.origin), ("Saved late.", lost));
     assert_eq!(
-        answered(settle(lost, MemoryWrites::Allow, notes::SAVE_MEMORY, json!({ "text": "Saved late." })).await),
+        answered(
+            settle(
+                lost,
+                MemoryWrites::Allow,
+                notes::SAVE_MEMORY,
+                json!({ "text": "Saved late." })
+            )
+            .await
+        ),
         Some((format!("Saved as {}.", late_note.short_id.as_str()), false, false)),
         "and once only"
     );
@@ -2395,7 +2422,10 @@ async fn settles_each_tools_call_by_what_it_did(provider: &dyn MemoryProvider, p
     .await
     .expect("an answer");
     assert_eq!(
-        changed_late.change.as_ref().map(|change| (&change.memory().text[..], change.memory().origin)),
+        changed_late
+            .change
+            .as_ref()
+            .map(|change| (&change.memory().text[..], change.memory().origin)),
         Some(("Changed late.", late_changer)),
         "made now: {changed_late:?}"
     );
@@ -2404,20 +2434,37 @@ async fn settles_each_tools_call_by_what_it_did(provider: &dyn MemoryProvider, p
     // gone, or while writes are denied.
     let forgetter = run_origin();
     assert_eq!(
-        settle(forgetter, MemoryWrites::Deny, notes::FORGET_MEMORY, json!({ "memory": short })).await,
+        settle(
+            forgetter,
+            MemoryWrites::Deny,
+            notes::FORGET_MEMORY,
+            json!({ "memory": short })
+        )
+        .await,
         None,
         "read-only now"
     );
-    let forgot = settle(forgetter, MemoryWrites::Allow, notes::FORGET_MEMORY, json!({ "memory": short }))
-        .await
-        .expect("an answer");
+    let forgot = settle(
+        forgetter,
+        MemoryWrites::Allow,
+        notes::FORGET_MEMORY,
+        json!({ "memory": short }),
+    )
+    .await
+    .expect("an answer");
     assert_eq!(
         (forgot.content.as_str(), forgot.is_error),
         (format!("Forgot {short}.").as_str(), false)
     );
     assert!(matches!(forgot.change, Some(MemoryChange::Forgotten(_))), "{forgot:?}");
     assert_eq!(
-        settle(forgetter, MemoryWrites::Allow, notes::FORGET_MEMORY, json!({ "memory": short })).await,
+        settle(
+            forgetter,
+            MemoryWrites::Allow,
+            notes::FORGET_MEMORY,
+            json!({ "memory": short })
+        )
+        .await,
         None,
         "gone: by this call or another, it can't be told"
     );
@@ -2428,7 +2475,13 @@ async fn settles_each_tools_call_by_what_it_did(provider: &dyn MemoryProvider, p
     let searcher = run_origin();
     let searched = make(searcher, notes::SEARCH_MEMORY, json!({ "query": "late" })).await;
     assert_eq!(
-        settle(searcher, MemoryWrites::Deny, notes::SEARCH_MEMORY, json!({ "query": "late" })).await,
+        settle(
+            searcher,
+            MemoryWrites::Deny,
+            notes::SEARCH_MEMORY,
+            json!({ "query": "late" })
+        )
+        .await,
         Some(searched)
     );
     let unread = settle(run_origin(), MemoryWrites::Allow, notes::FORGET_MEMORY, json!({})).await;

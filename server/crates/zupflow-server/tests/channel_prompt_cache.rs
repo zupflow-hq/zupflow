@@ -7,7 +7,7 @@
 //! its team renamed mid-session.
 //! The one break is the trim, when the history would go over its budget:
 //! once, there, and the runs after it continue again. A session has no
-//! memory yet: an agent that remembers is offered no memory tools in it,
+//! memory: an agent that remembers is offered no memory tools in it,
 //! and recalls nothing.
 
 #![allow(clippy::unwrap_used)]

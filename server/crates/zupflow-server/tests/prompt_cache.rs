@@ -267,7 +267,10 @@ impl OnPath {
         let messages = opening["messages"].as_array_mut().unwrap();
         let system = match self.kind {
             ProviderKind::Anthropic => 0,
-            _ => messages.iter().take_while(|message| message["role"] == "system").count(),
+            _ => messages
+                .iter()
+                .take_while(|message| message["role"] == "system")
+                .count(),
         };
         messages.truncate(system + usize::from(blocks > 0));
         if blocks > 0 {
@@ -786,8 +789,14 @@ async fn reads_the_tools_and_instructions_from_the_cache_after_the_memory_change
         assert_ne!(was, now, "{name}: the next run reads the change");
         let read = path.answered(*second).await[0];
         let head = path.opening(&next.body, 0);
-        assert!(read.read >= head, "{name}: read {read:?}, tools and instructions {head}");
-        assert!(read.read < path.opening(&next.body, 1), "{name}: the changed recall can't be: {read:?}");
+        assert!(
+            read.read >= head,
+            "{name}: read {read:?}, tools and instructions {head}"
+        );
+        assert!(
+            read.read < path.opening(&next.body, 1),
+            "{name}: the changed recall can't be: {read:?}"
+        );
     }
 }
 
@@ -801,14 +810,20 @@ async fn offers_the_same_tools_and_key_with_memory_off_and_reads_them_from_the_c
         let name = path.name();
         let (a, b) = (path.prompt(with), path.prompt(without));
         assert_eq!(a.tools, b.tools, "{name}: the same tools, memory's among them");
-        assert!(path.tools(without).iter().any(|(tool, _)| tool == "save_memory"), "{name}");
+        assert!(
+            path.tools(without).iter().any(|(tool, _)| tool == "save_memory"),
+            "{name}"
+        );
         assert_eq!(a.system, b.system, "{name}");
         assert_eq!(with.body.get("prompt_cache_key"), without.body.get("prompt_cache_key"));
         assert!(path.recall(&with.body).is_some(), "{name}");
         assert_eq!(path.recall(&without.body), None, "{name}: nothing recalled");
         let read = path.answered(*off).await[0];
         let head = path.opening(&without.body, 0);
-        assert!(read.read >= head, "{name}: read {read:?}, tools and instructions {head}");
+        assert!(
+            read.read >= head,
+            "{name}: read {read:?}, tools and instructions {head}"
+        );
     }
 }
 
@@ -889,7 +904,12 @@ async fn sends_the_same_recall_through_an_approval_pause_with_the_memory_changed
             "{recall}"
         );
         path.assert_cached(run, &turns).await;
-        assert_eq!(path.setup.notes().await.len(), 3, "{}: saved once approved", path.name());
+        assert_eq!(
+            path.setup.notes().await.len(),
+            3,
+            "{}: saved once approved",
+            path.name()
+        );
     }
 }
 
@@ -935,7 +955,12 @@ async fn marks_at_most_four_breakpoints_on_every_turn() {
             // instructions uses all four.
             if at_breakpoints(kind, model) && (kind == ProviderKind::Anthropic || !instructions.is_empty()) {
                 for turn in &turns[1..] {
-                    assert_eq!(markers(kind, &turn.body).unwrap().len(), MAX_BREAKPOINTS, "{}", path.name());
+                    assert_eq!(
+                        markers(kind, &turn.body).unwrap().len(),
+                        MAX_BREAKPOINTS,
+                        "{}",
+                        path.name()
+                    );
                 }
             }
             path.assert_cached(run, &turns).await;

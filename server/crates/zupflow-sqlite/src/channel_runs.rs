@@ -1319,7 +1319,7 @@ async fn start_session_run(
         session_id,
         trigger: RunTrigger::Channel,
         input,
-        // Channel runs go without memory for now: `agent`, with none.
+        // A channel run is `agent`; its session sends it no memory.
         memory: MemoryMode::Agent,
         model: template.model.clone(),
         instructions: template.instructions.clone(),

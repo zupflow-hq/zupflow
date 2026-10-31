@@ -261,7 +261,11 @@ impl Prompt {
                         others.remove("content");
                         for (part_index, content_part) in content.iter().enumerate() {
                             let key = if part_index == 0 {
-                                format!("{index}:{}:0:{}", part(&Value::Object(others.clone())), part(content_part))
+                                format!(
+                                    "{index}:{}:0:{}",
+                                    part(&Value::Object(others.clone())),
+                                    part(content_part)
+                                )
                             } else {
                                 format!("{index}:{part_index}:{}", part(content_part))
                             };
