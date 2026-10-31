@@ -443,7 +443,8 @@ worker stopped is answered by that record, as it was made, whatever became
 of the memory since, and its change is never made again; one with no record
 (a search, a refusal, or a call never made) is made then. A worker that
 makes its call after another settled it is refused, and changes nothing. A
-channel session's runs have no memory.
+channel run's memory is its session's (below): it's decided, made and settled
+the same way.
 Each call it asks for is decided (floor, then policy) and recorded with its
 policy, mode and rule; allowed calls go only to their own installation's MCP
 server through the safe outbound path, with its credential injected last. A
@@ -683,15 +684,43 @@ the conversation's breaker in the transaction that starts it. Each run of a
 session continues
 the ones before it byte for byte, so the provider's prompt cache holds across
 runs: the session fixes its model, instructions (a fixed channel preface, then
-the agent's own) and tools when it starts, every message reaches the model
+the agent's own), tools and memory when it starts, every message reaches the model
 once (a late job finds its message read), rendered when it's taken in (at most
 8,000 characters a turn), each run's transcript is kept as sent when it ends,
 and the history is trimmed by whole runs, a quarter of its budget (60% of the
 model's context window) at a time, so the cache misses once per trim. Messages that
 arrive mid-run join it at its next turn boundary (`steer`) or wait and start
-one run after it (`collect`). `tests/channel_runs.rs` drives all of it through
-the route with a fake team chat, and `tests/channel_prompt_cache.rs` checks the
-prefix turn by turn on the Anthropic and OpenAI paths.
+one run after it (`collect`). A run whose dispatch finds the agent's model,
+instructions, tools or memory changed starts a new run session, its history
+and recall starting over; a collected run continues the session as it is.
+
+A channel run remembers as its session does (`memory: "agent"`; there's no
+`off` for one). The session's memory is the agent's type when it starts, with
+the kind's tools for the type's `writes` joined to its list by their own
+names, for the session's audience: a session in a `dm` or a `group_dm`
+recalls and finds the workspace's memories and that conversation's own, and
+what it saves is stamped with the conversation, recalled and found there
+only; one in a channel or a private channel is the workspace's, and never
+sees a direct conversation's. The session keeps its recall, once for each
+history start: the first run from a start reads it from the session's own
+type for that audience with its first model attempt, and every other run
+from that start sends the same bytes, as the first block of the history's
+first message, so each run continues the one before; a run keeps only the
+type and the recall's digest. A save in one run reaches the session's later
+runs through the conversation, and the recall at the next trim or run
+session. A trim reads the recall anew from the session's type, which
+recalls nothing once the type is deleted (its calls are refused
+`memory_type_removed`, as any run's are), and the tools stay as they were. A
+`dm`'s messages outside threads are one session, so its recall is read again
+only at a trim or a new run session. Once a run of a session read an app's tool result, every
+later save in the session says so (`after_app_content`), a trim included. A
+run that uses its session's memory fails `channel_session_removed` if the
+session goes, with its agent's channel, connection or app, while it's under
+way. `tests/channel_runs.rs` drives all of it through the route with a fake
+team chat, and `tests/channel_prompt_cache.rs` checks the prefix turn by turn
+on the Anthropic and OpenAI paths, with memory too (the recall's bytes and
+place, the audiences, `after_app_content`, a deleted type, isolation, and
+never more than four breakpoints, through OpenRouter to Claude as well).
 
 ### Agents in Slack
 
