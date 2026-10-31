@@ -17,10 +17,19 @@ const agent = await zupflow.agents.create(workspaceId, {
   description: "Plans the week from the person's tasks.",
   instructions: "You help the person plan their week. Be brief.",
   model_id: null, // the environment's default model
+  memory: "default", // the organization's default memory type
 });
 ```
 
 A `paused` agent refuses new runs (`422 agent_paused`).
+
+## Memory
+
+An agent's `memory` says what it remembers with: the organization's default memory type (`default`, when left out), one of the organization's types (`type`, named in `memory_type_id`), or nothing (`off`). See [Memory](/concepts/memory/).
+
+- `type` needs a `memory_type_id`, and a `memory_type_id` needs `type` (`400 validation_failed`). It must be one of the organization's memory types (`422 unknown_memory_type`).
+- Changing `memory` to `default` or `off` clears `memory_type_id`.
+- Deleting an agent forgets its memories.
 
 ## Grants
 
@@ -76,3 +85,5 @@ Three layers decide every call a model asks for, and the strictest wins: the ins
 3. **Just before sending,** the call is decided again on what holds then. A call that now needs approval waits for it; one now refused, whose installation was removed or disconnected, or whose tool changed since, isn't sent.
 
 A workspace app's tools have no organization level: its grants alone decide, inside the floor.
+
+An agent's memory tools aren't granted. Its memory type's `writes` decides each call to them when it's made: see [Memory](/concepts/memory/#the-notes-kind).

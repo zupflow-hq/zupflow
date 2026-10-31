@@ -42,6 +42,7 @@ await zupflow.runs.cancel(workspaceId, run.id);
 | `agents`, `grants` | Agents and what they may use. |
 | `runs`, `organizationRuns` | Runs, their events, approvals and cancelling. |
 | `modelConnections`, `models` | Model providers. |
+| `memoryKinds`, `memoryTypes`, `memories` | Memory types, the default type and what agents remember. |
 | `apiKeys`, `webhooks`, `connectSettings` | Developer settings. |
 
 ## Idempotency

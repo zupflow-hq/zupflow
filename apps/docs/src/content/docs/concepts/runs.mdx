@@ -70,7 +70,31 @@ await zupflow.runs.resolveApproval(workspaceId, runId, {
 
 - **Only an API key can decide.** A Console session gets `403 approval_requires_api_key`: the Console observes approvals, the person decides in your product.
 - A denial's `reason` goes back to the model as the call's result, so it can carry on without the call.
-- Deleting or disconnecting the installation refuses its waiting calls, so the run goes on without anyone deciding. A decision sent after that answers `409 not_waiting`.
+- Deleting or disconnecting the installation refuses its waiting calls, so the run goes on without anyone deciding. Deleting a memory type does the same for the memory calls waiting in it. A decision sent after that answers `409 not_waiting`.
+
+## Memory
+
+A run starts with its agent's [memory](/concepts/memory/): it recalls what the agent remembers in the workspace, and the agent's memory tools join its tools. The recall is read once, before the first model call, and stays the same for the whole run. What the run saves reaches the next one.
+
+Start a run with `memory: "off"` to leave memory out of it. It recalls nothing, and every call to a memory tool is refused; the tools stay offered, so its prompt is the same as any other run's. A run's `memory` says how it started: `agent` (the default) or `off`.
+
+```ts
+const run = await zupflow.runs.create(workspaceId, agentId, {
+  input,
+  memory: "off",
+});
+```
+
+Memory calls are on the timeline like any call. Their `tool_call.*` and `approval.requested` events name the memory type (`memory_type_id`, `memory_type_name` and `kind`) where an app's call names its installation, and a write that needs approval is decided like any other. A memory call that isn't made fails with a code that says why, and the run goes on:
+
+| `error.code` | Why |
+| --- | --- |
+| `memory_off` | The run was started with `memory: "off"`. |
+| `memory_type_removed` | The run's memory type was deleted. |
+| `memory_kind_not_served` | This server doesn't serve the type's kind. |
+| `invalid_memory_settings` | The type holds settings its kind refuses now. |
+| `tool_refused` | The type's `writes` is `deny` now: the memory is read-only. |
+| `memory_unavailable` | The memory couldn't be reached just now. Nothing changed. |
 
 ## Cancelling
 
@@ -78,4 +102,4 @@ await zupflow.runs.resolveApproval(workspaceId, runId, {
 
 ## Durability
 
-Runs survive interruptions. Each step is saved before it's taken, and a call whose outcome was lost mid-send is settled as **unknown**, never sent again. A run nothing can take forward any more fails with `run_unavailable`.
+Runs survive interruptions. Each step is saved before it's taken, and a call whose outcome was lost mid-send is settled as **unknown**, never sent again. A memory call that changed a memory but lost its answer is answered from the record saved with the change, so the change is never made twice. A run nothing can take forward any more fails with `run_unavailable`.
