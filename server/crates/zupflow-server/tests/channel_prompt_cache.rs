@@ -21,7 +21,9 @@
 //! those, for a direct conversation's note, only that conversation's; none
 //! keeps the recall's text once no run of it is under way. A person's
 //! change to a note reaches the session as a forget does; a run's own
-//! change, at its next trim.
+//! change, at its next trim. A conversation shared with another
+//! organization has no memory: from the sharing on, no run there has
+//! memory tools or recalls anything, a run under way aside.
 //! A `dm`'s or a `group_dm`'s session recalls, finds and saves its own
 //! conversation's notes beside the workspace's, and nothing else sees them;
 //! a channel's saves are the workspace's. Once a run of a session read an
@@ -47,7 +49,7 @@ use common::{PROVIDER_KEY, Server, call};
 use faults::{Point, Worker};
 use run_setup::{Setup, Tenant, calling_memory, id, setup_on};
 use serde_json::{Value, json};
-use zupflow_channels::fake::ChatMessage;
+use zupflow_channels::fake::{ChatMessage, Poster};
 use zupflow_core::ids::{MemoryTypeId, RunId};
 use zupflow_core::memory::RECALL_OPEN;
 use zupflow_core::model_providers::ProviderKind;
@@ -1561,6 +1563,96 @@ async fn recalls_a_persons_change_at_a_sessions_next_run_and_a_runs_at_its_next_
         for (index, turn) in sent.iter().enumerate() {
             let opening = Prompt::read(kind, &turn.body).unwrap().messages[0].to_string();
             assert!(opening.contains("hello"), "{name}: turn {index}: {opening}");
+        }
+    }
+}
+
+/// The memory tools a turn offered, by name.
+fn memory_tools(kind: ProviderKind, body: &Value) -> Vec<String> {
+    Prompt::read(kind, body)
+        .unwrap()
+        .tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str().or(tool["function"]["name"].as_str()))
+        .filter(|name| name.ends_with("_memory"))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn has_no_memory_in_a_conversation_shared_with_another_organization() {
+    for (kind, model) in PATHS {
+        let (world, _, _) = remembering(kind, model).await;
+        let name = format!("{kind:?} {model}");
+        let main = &world.main;
+        world.configure(main, json!({ "mid_run": "collect" })).await;
+        let guest = Poster::external("U0GUEST", "T0SOUTH");
+        let before = turns(&world).len();
+        // A thread's session remembers, and goes idle; another's run starts
+        // with memory. Before that run runs, someone of another
+        // organization posts in the channel, which shares it (the agent
+        // doesn't answer them), and a follow-up waits for the run.
+        let idle = world.say(ANA, &format!("{} hello", main.mention()), None).await;
+        world.work().await;
+        let busy = world.say(ANA, &format!("{} hi", main.mention()), None).await;
+        world.handle().await;
+        world.post_as(&[main], SUPPORT, &guest, "hi all", None).await;
+        world.say(ANA, "and the weather?", Some(&busy.ts)).await;
+        world.work().await;
+        // Then a follow-up in the idle thread, a new thread in the shared
+        // channel, and a dm shared with another organization, whose person
+        // the agent may answer.
+        world.say(ANA, "and tomorrow?", Some(&idle.ts)).await;
+        world.work().await;
+        world.say(ANA, &format!("{} hi again", main.mention()), None).await;
+        world.work().await;
+        world.configure(main, json!({ "allow_external": true })).await;
+        world.post_as(&[main], "D0GUEST", &guest, "hello", None).await;
+        world.work().await;
+
+        let runs = world.runs(main).await;
+        assert_eq!(runs.len(), 6, "{name}: {runs:?}");
+        assert!(runs.iter().all(|run| run["status"] == "completed"), "{name}: {runs:?}");
+        let by_input = |end: &str| {
+            runs.iter()
+                .find(|run| run["input"].as_str().unwrap().ends_with(end))
+                .unwrap_or_else(|| panic!("{name}: no run ends with {end}: {runs:?}"))
+        };
+        let remembering = [by_input("@helper hello"), by_input("@helper hi")];
+        // Each thread's next run, after the sharing, starts a new run
+        // session: the collected one, and the idle thread's next.
+        for (began, next) in remembering
+            .iter()
+            .zip([by_input("and the weather?"), by_input("and tomorrow?")])
+        {
+            assert_ne!(next["session_id"], began["session_id"], "{name}: {next}");
+        }
+        // Only the runs begun before the sharing have memory, to their end.
+        for run in &runs {
+            let remembers = kept(&world, World::run_id(run)).await.memory_type_id.is_some();
+            assert_eq!(
+                remembers,
+                remembering.iter().any(|began| began["id"] == run["id"]),
+                "{name}: {run}"
+            );
+        }
+        // Their turns recall and offer the memory tools; from the sharing
+        // on, none does: the collected run's, the idle thread's next, the
+        // new thread's and the shared dm's.
+        let sent = turns(&world).split_off(before);
+        assert_eq!(sent.len(), 6, "{name}: a turn a run");
+        for (index, turn) in sent.iter().enumerate() {
+            let before_sharing = index < 2;
+            assert_eq!(
+                recall(kind, &turn.body).is_some(),
+                before_sharing,
+                "{name}: turn {index}"
+            );
+            assert_eq!(
+                memory_tools(kind, &turn.body).is_empty(),
+                !before_sharing,
+                "{name}: turn {index}"
+            );
         }
     }
 }

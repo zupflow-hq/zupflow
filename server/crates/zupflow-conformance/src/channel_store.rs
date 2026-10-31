@@ -150,6 +150,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     keeps_a_sessions_memory_and_one_recall_per_history_start(&stores, &prepare).await;
     reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(&stores, &prepare).await;
     marks_only_the_sessions_whose_audience_may_recall_a_change(&stores, &prepare).await;
+    drops_a_sessions_memory_once_its_conversation_is_shared(&stores, &prepare).await;
     counts_a_sessions_recall_in_its_history_budget(&stores, &prepare).await;
     counts_the_breaker_under_concurrency(&stores, &prepare).await;
     counts_runs_and_reads_each_message_once(&stores, &prepare).await;
@@ -2214,6 +2215,108 @@ async fn marks_only_the_sessions_whose_audience_may_recall_a_change(stores: &Sto
         .unwrap();
     assert_eq!(forgotten, 1);
     assert_eq!(marked().await, [true, true, true], "a chunk with a workspace note");
+}
+
+/// A session whose conversation is shared with another organization after
+/// it began has no memory from its next run on: what waited for the run
+/// under way starts a new run session with the session's own template, its
+/// memory tools left out and nothing recalled, as a run the server starts
+/// there would. The run under way keeps its memory to its end.
+async fn drops_a_sessions_memory_once_its_conversation_is_shared(stores: &Stores<'_>, prepare: &Prepare) {
+    const RECALL: &str = "<memory>\n[k7m2qd] Prefers replies in Portuguese.\n</memory>";
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let (_, _, connection) = installed(stores, &t, ws, t.agent).await;
+    let channel = stores.channels.list_agent_channels(org, ws, t.agent).await.unwrap()[0].id;
+    let customer = MemoryTypeId::generate();
+    let session = Thread {
+        ws,
+        connection,
+        channel,
+        conversation: SUPPORT,
+        thread: "11.shared",
+        template: remembering(&template(), customer),
+    };
+    let (first, snapshot) = session.next_run(stores, &t, 1).await;
+    assert!(snapshot.session.expect("its session").memory.is_some());
+
+    // Someone of another organization's team posts in the conversation
+    // while the run is under way, which shares it, and a follow-up in the
+    // thread waits for the run.
+    let mut guest = message("11.guest", SUPPORT.0, "hi all", 1_000);
+    guest.conversation.is_external = true;
+    guest.thread_key = "11.guest".to_owned();
+    if let Some(author) = guest.author.as_mut() {
+        author.team_id = Some("T0SOUTH".to_owned());
+    }
+    let shared = stores
+        .channels
+        .record_message(org, ws, connection, &guest, now())
+        .await
+        .unwrap()
+        .message;
+    let conversation = stores
+        .channels
+        .find_conversation(org, ws, connection, shared.conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(conversation.is_external);
+    let mut follow_up = message("11.shared.2", SUPPORT.0, "and the weather?", 1_000);
+    follow_up.thread_key = session.thread.to_owned();
+    let asked = stores
+        .channels
+        .record_message(org, ws, connection, &follow_up, now())
+        .await
+        .unwrap()
+        .message;
+    let unshared = session.template.without_memory();
+    assert_eq!(
+        stores
+            .channels
+            .dispatch(
+                org,
+                ws,
+                &dispatch_of(asked.id, channel, "11.shared.2"),
+                Some(&unshared),
+                now()
+            )
+            .await,
+        Ok(DispatchOutcome::Waiting)
+    );
+
+    // The run under way recalls as it began, and ends; what waited starts
+    // a new run session, without the memory.
+    assert_eq!(
+        answer_remembering(stores, org, ws, first, &read(customer, RECALL)).await,
+        [Some(RECALL.to_owned())]
+    );
+    let found = stores
+        .channels
+        .find_session(org, ws, channel, asked.conversation_id, session.thread)
+        .await
+        .unwrap()
+        .expect("the thread's session");
+    let collected = found.active_run_id.expect("a run collecting the follow-up");
+    let began = stores.runs.find_run(org, ws, first).await.unwrap().unwrap();
+    let next = stores.runs.find_run(org, ws, collected).await.unwrap().unwrap();
+    assert_ne!(next.session_id, began.session_id, "a new run session");
+    let context = stores
+        .runs
+        .find_snapshot(org, ws, collected)
+        .await
+        .unwrap()
+        .unwrap()
+        .session
+        .expect("its session");
+    assert_eq!(context.memory, None);
+    assert_eq!(context.recall, SessionRecall::Read(None));
+    assert_eq!(
+        context.offer, unshared.offer,
+        "the session's tools, its memory's left out"
+    );
+    assert!(context.offer.tools().iter().all(|tool| tool.memory_type_id.is_none()));
+    assert!(context.history.is_empty(), "its history starts over");
 }
 
 /// The recall a session keeps counts in its history budget, beside the

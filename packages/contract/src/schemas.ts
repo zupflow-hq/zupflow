@@ -1687,7 +1687,11 @@ export const ChannelConversation = named(
     kind: ChannelConversationKind,
     /** Null for a DM, and when the provider doesn't say. */
     name: z.string().nullable(),
-    /** Shared with another organization (Slack Connect). */
+    /**
+     * Shared with another organization (Slack Connect). An agent's runs that
+     * start here once it's shared have no memory: no memory tools, and
+     * nothing recalled.
+     */
     is_external: z.boolean(),
     /** Whether the connection's identity is in it. */
     identity_is_member: z.boolean(),

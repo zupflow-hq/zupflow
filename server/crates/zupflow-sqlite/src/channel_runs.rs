@@ -1467,10 +1467,12 @@ async fn start_session_run(
 /// Ends a channel run's hold on its session, in the transaction that ends
 /// the run: its transcript is kept for the runs after it, the session is
 /// free, the run is its last, and what waited for it starts the next run,
-/// as collected, with the session's own template, counted against the
-/// conversation's breaker. Nothing starts while the agent is paused or
-/// gone, the connection isn't connected, or the conversation is paused (its
-/// waiting messages are paused too). Any other run: nothing.
+/// as collected, with the session's own template (without its memory, in
+/// a new run session, once the conversation is shared with another
+/// organization), counted against the conversation's breaker. Nothing
+/// starts while the agent is paused or gone, the connection isn't
+/// connected, or the conversation is paused (its waiting messages are
+/// paused too). Any other run: nothing.
 pub(crate) async fn run_ended(
     connection: &mut SqliteConnection,
     organization_id: OrganizationId,
@@ -1528,7 +1530,7 @@ pub(crate) async fn run_ended(
         return Ok(());
     };
     let state = sqlx::query(
-        "SELECT a.status AS agent_status, c.status AS connection_status \
+        "SELECT a.status AS agent_status, c.status AS connection_status, v.is_external AS shared \
          FROM agent_channels h \
          JOIN agents a ON a.organization_id = h.organization_id AND a.workspace_id = h.workspace_id \
          AND a.id = h.agent_id \
@@ -1554,13 +1556,20 @@ pub(crate) async fn run_ended(
         // They wait for the agent's next run in the thread.
         return Ok(());
     }
+    // A conversation shared with another organization since the session
+    // began has no memory: what waited starts a new run session without
+    // it, as a run started there now would.
+    let unshared = match &session.template {
+        Some(own) if own.memory.is_some() && get::<bool>(&state, "shared")? => Some(own.without_memory()),
+        _ => None,
+    };
     // A paused conversation pauses what waited, as the breaker does.
     start_session_run(
         connection,
         organization_id,
         workspace_id,
         &session,
-        None,
+        unshared.as_ref(),
         TakenIn::Collected,
         now,
     )

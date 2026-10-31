@@ -435,7 +435,9 @@ fn candidate(context: &InboundContext, senders: bool) -> Result<Option<Admitted<
 /// the channel preface before its instructions, its tools, its memory for
 /// the conversation's audience (a `dm`'s or a `group_dm`'s own, beside the
 /// workspace's; else the workspace's), and the history budget its model's
-/// context window allows. `None` when it has no model.
+/// context window allows. A conversation shared with another organization
+/// has no memory, of any kind: the workspace's memories never reach people
+/// outside it, and nothing said there is kept. `None` when it has no model.
 async fn session_template(
     state: &AppState,
     organization_id: OrganizationId,
@@ -492,9 +494,12 @@ async fn session_template(
     tools.extend(crate::channel_tools::session_tools(state, organization_id, &context.connection, channel).await?);
     let mut offer = Offer::new(tools).map_err(|_| "offer_invalid")?;
     let audience = Audience::in_conversation(context.conversation.kind, context.conversation.id);
-    let memory = match crate::memory_tools::session_memory(state, (organization_id, workspace_id), agent.id, audience)
-        .await?
-    {
+    let memory = if context.conversation.is_external {
+        None
+    } else {
+        crate::memory_tools::session_memory(state, (organization_id, workspace_id), agent.id, audience).await?
+    };
+    let memory = match memory {
         None => None,
         Some((memory, memory_tools)) => {
             let (joined, left_out) = offer.with(memory_tools);

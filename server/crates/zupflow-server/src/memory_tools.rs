@@ -19,7 +19,8 @@
 //! **A channel session's, once.** A channel session fixes its memory with
 //! its tools when it begins ([`session_memory`]): the type, the kind's tools
 //! joined to the session's, and its audience, a `dm`'s or a `group_dm`'s
-//! own conversation beside the workspace, else the workspace. The session
+//! own conversation beside the workspace, else the workspace. A session in
+//! a conversation shared with another organization has none. The session
 //! keeps what it recalls, once for each history start: the first run from a
 //! start reads it from the session's type for that audience, within the
 //! room the session's history budget leaves it, half the budget at most

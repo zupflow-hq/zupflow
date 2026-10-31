@@ -491,7 +491,8 @@ pub struct SessionTemplate {
     pub instructions: String,
     pub offer: Offer,
     /// The agent's memory type and the session's audience: `None` when the
-    /// agent has none, or one of a kind this server doesn't serve.
+    /// agent has none, or one of a kind this server doesn't serve, and in a
+    /// conversation shared with another organization.
     pub memory: Option<SessionMemory>,
     /// What a run's history, its input and its recall may take together,
     /// the recall no more than half ([`crate::runs::history::trimmed_start`],
@@ -522,6 +523,17 @@ impl SessionTemplate {
             && self.instructions == other.instructions
             && specs(self) == specs(other)
             && self.memory == other.memory
+    }
+
+    /// This template with no memory: its memory tools left out of the
+    /// offer, everything else as it is. A session's own template, once its
+    /// conversation is shared with another organization.
+    pub fn without_memory(&self) -> SessionTemplate {
+        SessionTemplate {
+            offer: self.offer.without_memory(),
+            memory: None,
+            ..self.clone()
+        }
     }
 }
 
