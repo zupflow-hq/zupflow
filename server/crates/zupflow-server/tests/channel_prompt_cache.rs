@@ -17,7 +17,8 @@
 //! forgets, its history kept, and so does deleting its type (it recalls
 //! nothing then, and its calls are refused); a run under way keeps the
 //! recall it started with, and ends as it would have. Only the sessions of
-//! the forget's agent, workspace and type read their recall anew.
+//! the forget's agent, workspace and type read their recall anew, and none
+//! keeps the recall's text once no run of it is under way.
 //! A `dm`'s or a `group_dm`'s session recalls, finds and saves its own
 //! conversation's notes beside the workspace's, and nothing else sees them;
 //! a channel's saves are the workspace's. Once a run of a session read an
@@ -685,6 +686,47 @@ async fn refreshing(world: &World, run: &Value) -> bool {
     marked == 1
 }
 
+/// Whether the session of the channel run `run`, of the setup's
+/// organization, keeps recall text.
+async fn holds_recall(world: &World, run: &Value) -> bool {
+    let (org, _) = world.setup.scope();
+    let ws = zupflow_core::ids::WorkspaceId::parse(run["workspace_id"].as_str().unwrap()).unwrap();
+    let pool = database(world).await;
+    let held: i64 = sqlx::query_scalar(
+        "SELECT s.recall IS NOT NULL FROM runs r JOIN channel_sessions s ON s.organization_id = r.organization_id \
+         AND s.workspace_id = r.workspace_id AND s.id = r.channel_session_id \
+         WHERE r.organization_id = ? AND r.workspace_id = ? AND r.id = ?",
+    )
+    .bind(org.uuid())
+    .bind(ws.uuid())
+    .bind(World::run_id(run).uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    held == 1
+}
+
+/// What each of the organization's channel sessions keeps of its recall,
+/// oldest first: the text, its weight in tokens, and whether its next run
+/// is marked to read it anew.
+async fn at_rest(world: &World) -> Vec<(Option<String>, i64, bool)> {
+    let (org, _) = world.setup.scope();
+    let pool = database(world).await;
+    let rows: Vec<(Option<String>, i64, i64)> = sqlx::query_as(
+        "SELECT recall, recall_weight, refresh_recall FROM channel_sessions WHERE organization_id = ? \
+         ORDER BY created_at, id",
+    )
+    .bind(org.uuid())
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    rows.into_iter()
+        .map(|(recall, weight, marked)| (recall, weight, marked == 1))
+        .collect()
+}
+
 /// The agent's last channel run, which must have completed.
 async fn last_run(world: &World, name: &str) -> RunId {
     let runs = world.runs(&world.main).await;
@@ -1288,13 +1330,30 @@ async fn forgets_a_note_at_a_sessions_next_run_whoever_forgets_it_its_history_ke
         world.work().await;
         let waiting = World::run_id(world.runs(main).await.last().unwrap());
         forget(setup, &saved[1]).await;
+        let rest = at_rest(&world).await;
+        assert_eq!(rest.len(), 1, "{name}: {rest:?}");
+        assert!(
+            rest[0].0.as_ref().is_some_and(|recall| recall.contains(NOTES[1])) && rest[0].2,
+            "{name}: the run under way keeps its recall: {rest:?}"
+        );
         world.approve(waiting).await;
         world.work().await;
+        // Its session keeps no recall text once it ends, only its weight.
+        let rest = at_rest(&world).await;
+        assert!(rest[0].0.is_none() && rest[0].1 > 0 && rest[0].2, "{name}: {rest:?}");
         // The third follows; then, with the session idle, a person forgets
         // the last, and two more runs follow.
         world.say(BO, "thanks", Some(&asked.ts)).await;
         world.work().await;
+        let rest = at_rest(&world).await;
+        assert!(
+            rest[0].0.as_ref().is_some_and(|recall| recall.contains(NOTES[2])) && !rest[0].2,
+            "{name}: {rest:?}"
+        );
         forget(setup, &saved[2]).await;
+        // The idle session keeps no recall text from the forget on.
+        let rest = at_rest(&world).await;
+        assert!(rest[0].0.is_none() && rest[0].1 > 0 && rest[0].2, "{name}: {rest:?}");
         for text in ["and tomorrow?", "ok"] {
             world.say(ANA, text, Some(&asked.ts)).await;
             world.work().await;
@@ -1395,6 +1454,8 @@ async fn marks_only_the_sessions_of_the_forgets_agent_workspace_and_type() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
+    let colleagues = ("alice", setup.org.as_str(), setup.ws.as_str(), id(&created["data"]));
+    save_for(setup, colleagues, Some(&memory_type), "Prefers short answers.").await;
     let colleague = world
         .install(
             "alice",
@@ -1418,6 +1479,13 @@ async fn marks_only_the_sessions_of_the_forgets_agent_workspace_and_type() {
     world.work().await;
     let neighbour = setup.sibling("neighbour", "tk_neighbour").await;
     remembers(setup, &neighbour, &memory_type).await;
+    save_for(
+        setup,
+        tenant_of(&neighbour),
+        Some(&memory_type),
+        "Prefers short answers.",
+    )
+    .await;
     let sibling = world
         .install(
             "alice",
@@ -1451,17 +1519,30 @@ async fn marks_only_the_sessions_of_the_forgets_agent_workspace_and_type() {
         marks
     };
     assert_eq!(marks().await, [false; 4], "nothing forgotten yet");
+    // Whether each session keeps recall text: all but the first, whose type
+    // holds nothing to recall.
+    let held = || async {
+        let mut held = Vec::new();
+        for run in &session_runs {
+            held.push(holds_recall(&world, run).await);
+        }
+        held
+    };
+    assert_eq!(held().await, [false, true, true, true]);
     let follow_up = || async {
         world.say(BO, "and now?", Some(&asked.ts)).await;
         world.work().await;
     };
 
-    // A person forgets the agent's note: only its session in the type.
+    // A person forgets the agent's note: only its session in the type,
+    // which keeps no recall text from then on.
     let noted = setup.save_note("Ships on Fridays.").await;
     forget(setup, &noted).await;
     assert_eq!(marks().await, [false, true, false, false]);
+    assert_eq!(held().await, [false, false, true, true]);
     follow_up().await;
     assert_eq!(marks().await, [false; 4], "the next run takes the mark");
+    assert_eq!(held().await, [false, true, true, true], "and reads the recall anew");
 
     // An erasure of everything the agent keeps: the same.
     let (status, body) = setup
@@ -1477,8 +1558,10 @@ async fn marks_only_the_sessions_of_the_forgets_agent_workspace_and_type() {
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     assert_eq!(marks().await, [false, true, false, false]);
+    assert_eq!(held().await, [false, false, true, true]);
     follow_up().await;
     assert_eq!(marks().await, [false; 4]);
+    assert_eq!(held().await, [false, false, true, true], "nothing left to recall");
 
     // Deleting the other type: only the session kept on it.
     let (status, body) = setup
@@ -1537,6 +1620,9 @@ async fn recalls_nothing_once_its_type_is_deleted_and_refuses_its_calls() {
             ))
             .await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        // The run under way keeps the recall it started with.
+        let rest = at_rest(&world).await;
+        assert!(rest[0].0.is_some() && rest[0].2, "{name}: {rest:?}");
         world
             .say(BO, &format!("and this\n{}", save("Ships on Fridays.")), Some(&asked.ts))
             .await;

@@ -533,13 +533,20 @@ impl MemoryTypeStore for SqliteMemoryTypeStore {
             .map_err(failed("delete_type"))?;
         // Every channel session kept on it, in any of the organization's
         // workspaces, reads its recall anew at its next run, which recalls
-        // nothing now: a run under way keeps the recall it started with.
-        sqlx::query("UPDATE channel_sessions SET refresh_recall = 1 WHERE organization_id = ? AND memory_type_id = ?")
-            .bind(organization_id.uuid())
-            .bind(memory_type_id.uuid())
-            .execute(&mut *transaction)
-            .await
-            .map_err(failed("delete_type"))?;
+        // nothing now: a run under way keeps the recall it started with, and
+        // loses its text as it ends; any other session loses it now, as
+        // `channel_runs::refresh_recall` has it.
+        sqlx::query(
+            "UPDATE channel_sessions SET refresh_recall = 1, \
+             recall = CASE WHEN active_run_id IS NULL THEN NULL ELSE recall END, \
+             recall_start_run_id = CASE WHEN active_run_id IS NULL THEN NULL ELSE recall_start_run_id END \
+             WHERE organization_id = ? AND memory_type_id = ?",
+        )
+        .bind(organization_id.uuid())
+        .bind(memory_type_id.uuid())
+        .execute(&mut *transaction)
+        .await
+        .map_err(failed("delete_type"))?;
         let forget = Forget::Type {
             organization_id,
             memory_type_id,

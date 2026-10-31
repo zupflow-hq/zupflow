@@ -14,15 +14,22 @@
 --   recall's digest. A new start (a trim, or a new run session) reads it
 --   anew. A recall is never empty, and never without its start or the
 --   session's memory; a start is never without the session's memory.
+-- - `recall_weight`: the tokens the recall the session keeps takes, kept
+--   when a mark clears its text (below), so the next run's trim still
+--   counts what the runs from that start sent. Set with the recall, and
+--   back to 0 when a new run session starts; never more than 0 without
+--   the session's memory, nor 0 beside a recall.
 -- - `refresh_recall`: set when what the session recalls may hold a memory
 --   forgotten since: a memory of its agent, in its workspace and type,
 --   forgotten through the API or by a run (one of the session's own
 --   included), in the forget's own transaction; and every session kept on a
---   type when the type is deleted. The session's next run clears it and
---   reads the recall anew, from the same history start: a run under way
---   keeps the recall it started with. Saves and changes still reach a
---   session only at a trim or a new run session. Never set on a session
---   without memory.
+--   type when the type is deleted. The same transaction clears the recall's
+--   text and start on a session with no run under way, and a marked
+--   session's run clears them as it ends, so no forgotten text stays at
+--   rest. The session's next run clears the mark and reads the recall anew,
+--   from the same history start: a run under way keeps the recall it
+--   started with. Saves and changes still reach a session only at a trim or
+--   a new run session. Never set on a session without memory.
 -- - `app_content_read`: whether a run of the session read an app's tool
 --   result, set as such a run ends and kept from then on, so a save in a
 --   later run says it may come from that content.
@@ -46,6 +53,10 @@ ALTER TABLE channel_sessions ADD COLUMN recall_start_run_id UUID
 
 ALTER TABLE channel_sessions ADD COLUMN recall TEXT
     CHECK (recall IS NULL OR (recall_start_run_id IS NOT NULL AND length(recall) >= 1));
+
+ALTER TABLE channel_sessions ADD COLUMN recall_weight INTEGER NOT NULL DEFAULT 0
+    CHECK (recall_weight >= 0 AND (recall_weight = 0 OR memory_type_id IS NOT NULL)
+        AND (recall IS NULL OR recall_weight >= 1));
 
 ALTER TABLE channel_sessions ADD COLUMN refresh_recall INTEGER NOT NULL DEFAULT 0
     CHECK (refresh_recall IN (0, 1) AND (refresh_recall = 0 OR memory_type_id IS NOT NULL));

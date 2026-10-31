@@ -27,8 +27,10 @@
 //! ([`keep_recall`]), and every other run from that start sends it again.
 //! A forget marks the sessions that may recall what it forgot
 //! ([`refresh_recall`]): the next run of each reads the recall anew, from
-//! the same start. When one of its runs read an app's tool result, the
-//! session keeps that as it ends, for what later runs save.
+//! the same start, and a marked session keeps no recall text once no run of
+//! it is under way, only its weight for the trim. When one of its runs read
+//! an app's tool result, the session keeps that as it ends, for what later
+//! runs save.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -111,7 +113,8 @@ struct SessionRow {
     seen: Option<(Uuid, i64)>,
     /// When its turns last noted the thread's edits and deletes.
     changes_noted_at: Option<i64>,
-    /// The tokens the recall it keeps, or kept last, takes.
+    /// The tokens the recall it keeps takes, or took when a mark cleared
+    /// its text ([`refresh_recall`]).
     recall_weight: u64,
 }
 
@@ -120,7 +123,7 @@ macro_rules! session_select {
         "SELECT s.id, s.agent_channel_id, s.conversation_id, s.thread_key, s.session_id, s.active_run_id, \
          s.last_run_id, s.run_count, s.model, s.model_id, s.model_connection_id, s.instructions, s.offer, \
          s.history_budget, s.memory_type_id, s.memory_audience, s.seen_message_id, s.seen_at, s.changes_noted_at, \
-         s.recall FROM channel_sessions s"
+         s.recall_weight FROM channel_sessions s"
     };
 }
 
@@ -208,7 +211,7 @@ fn session_from(row: &SqliteRow) -> Result<SessionRow, StoreError> {
         template,
         seen,
         changes_noted_at: get(row, "changes_noted_at")?,
-        recall_weight: get::<Option<String>>(row, "recall")?.as_deref().map_or(0, text_weight),
+        recall_weight: u64::try_from(get::<i64>(row, "recall_weight")?).map_err(unreadable)?,
     })
 }
 
@@ -1417,7 +1420,9 @@ async fn start_session_run(
     // The memory is fixed with the tools; a new run session reads what it
     // recalls anew, as does each history start ([`keep_recall`]), and the
     // first run after a forget marked the session ([`refresh_recall`]),
-    // which takes the mark: its history stays as it is.
+    // which takes the mark: its history stays as it is, and so does the
+    // weight of the recall its runs sent, for the next trim. A new run
+    // session starts with none.
     let started = sqlx::query(
         "UPDATE channel_sessions SET session_id = ?1, active_run_id = ?2, run_count = ?3, seen_message_id = ?4, \
          seen_at = ?5, model = ?6, model_id = ?7, model_connection_id = ?8, instructions = ?9, offer = ?10, \
@@ -1426,7 +1431,9 @@ async fn start_session_run(
          memory_type_id = ?17, memory_audience = ?18, \
          recall = CASE WHEN session_id = ?1 AND memory_type_id IS ?17 AND refresh_recall = 0 THEN recall END, \
          recall_start_run_id = CASE WHEN session_id = ?1 AND memory_type_id IS ?17 AND refresh_recall = 0 \
-         THEN recall_start_run_id END, refresh_recall = 0 \
+         THEN recall_start_run_id END, \
+         recall_weight = CASE WHEN session_id = ?1 AND memory_type_id IS ?17 THEN recall_weight ELSE 0 END, \
+         refresh_recall = 0 \
          WHERE organization_id = ?14 AND workspace_id = ?15 AND id = ?16 AND active_run_id IS NULL",
     )
     .bind(session_id.uuid())
@@ -1489,11 +1496,16 @@ pub(crate) async fn run_ended(
     keep_transcript(connection, organization_id, workspace_id, run_id, &input).await?;
     // A run that read an app's tool result (its answer, or its own error)
     // marks the session: what any later run of it saves may come from it.
+    // A session marked to read its recall anew while the run was under way
+    // ([`refresh_recall`]) keeps no recall text once it ends, only its
+    // weight.
     let freed = sqlx::query(
         "UPDATE channel_sessions SET active_run_id = NULL, last_run_id = ?1, updated_at = ?2, \
          app_content_read = CASE WHEN app_content_read = 1 OR EXISTS (SELECT 1 FROM run_tool_calls c \
          WHERE c.organization_id = ?3 AND c.workspace_id = ?4 AND c.run_id = ?1 AND c.installation_id IS NOT NULL \
-         AND (c.state = 'completed' OR (c.state = 'failed' AND c.failure_code = ?6))) THEN 1 ELSE 0 END \
+         AND (c.state = 'completed' OR (c.state = 'failed' AND c.failure_code = ?6))) THEN 1 ELSE 0 END, \
+         recall = CASE WHEN refresh_recall = 1 THEN NULL ELSE recall END, \
+         recall_start_run_id = CASE WHEN refresh_recall = 1 THEN NULL ELSE recall_start_run_id END \
          WHERE organization_id = ?3 AND workspace_id = ?4 AND id = ?5 AND active_run_id = ?1",
     )
     .bind(run_id.uuid())
@@ -1853,11 +1865,11 @@ pub(crate) async fn session_context(
 }
 
 /// Keeps what a channel run's first model attempt recalls on its session,
-/// for every run from the run's history start: once, by the first run from
-/// that start, and never another recall for it. The run's session must
-/// hold the run, in the run's run session, with `memory`'s type. `false`
-/// when it doesn't, or keeps another recall for that start: nothing is
-/// written.
+/// for every run from the run's history start, with its weight for the
+/// trim: once, by the first run from that start, and never another recall
+/// for it. The run's session must hold the run, in the run's run session,
+/// with `memory`'s type. `false` when it doesn't, or keeps another recall
+/// for that start: nothing is written.
 pub(crate) async fn keep_recall(
     connection: &mut SqliteConnection,
     organization_id: OrganizationId,
@@ -1884,8 +1896,9 @@ pub(crate) async fn keep_recall(
         return Ok(false);
     };
     let session_id: Uuid = get(&run, "session_id")?;
+    let weight = memory.recall.as_deref().map_or(0, text_weight);
     let kept = sqlx::query(
-        "UPDATE channel_sessions SET recall = ?1, recall_start_run_id = ?2, updated_at = ?3 \
+        "UPDATE channel_sessions SET recall = ?1, recall_start_run_id = ?2, recall_weight = ?10, updated_at = ?3 \
          WHERE organization_id = ?4 AND workspace_id = ?5 AND id = ?6 AND session_id = ?7 AND active_run_id = ?8 \
          AND memory_type_id = ?9 AND (recall_start_run_id IS NOT ?2 OR recall IS ?1)",
     )
@@ -1898,6 +1911,7 @@ pub(crate) async fn keep_recall(
     .bind(session_id)
     .bind(run_id.uuid())
     .bind(memory.memory_type_id.uuid())
+    .bind(i64::try_from(weight).map_err(unreadable)?)
     .execute(&mut *connection)
     .await
     .map_err(failed("keep_recall"))?;
@@ -1907,12 +1921,17 @@ pub(crate) async fn keep_recall(
 /// Marks every channel session of `scope`'s agent, in its workspace, kept
 /// on its type, to read its recall anew at its next run, in the transaction
 /// of the forget that asks it ([`zupflow_core::memory::Recorded::refresh_recall`]):
-/// a session may recall what was forgotten until then. Only a run's start
-/// reads the mark ([`start_session_run`]), so a run under way keeps the
-/// recall it started with.
+/// a session may recall what was forgotten until then. A session with no
+/// run under way keeps no recall text from then on, only its weight for the
+/// trim; one whose run is under way loses it as the run ends
+/// ([`run_ended`]). Only a run's start reads the mark
+/// ([`start_session_run`]), so a run under way keeps the recall it started
+/// with.
 pub(crate) async fn refresh_recall(connection: &mut SqliteConnection, scope: &MemoryScope) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE channel_sessions SET refresh_recall = 1 \
+        "UPDATE channel_sessions SET refresh_recall = 1, \
+         recall = CASE WHEN active_run_id IS NULL THEN NULL ELSE recall END, \
+         recall_start_run_id = CASE WHEN active_run_id IS NULL THEN NULL ELSE recall_start_run_id END \
          WHERE organization_id = ?1 AND workspace_id = ?2 AND memory_type_id = ?4 AND refresh_recall = 0 \
          AND agent_channel_id IN (SELECT id FROM agent_channels \
          WHERE organization_id = ?1 AND workspace_id = ?2 AND agent_id = ?3)",

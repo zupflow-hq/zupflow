@@ -1636,15 +1636,20 @@ async fn notes_type(stores: &Stores<'_>, t: &Tenant, name: &str) -> MemoryTypeId
     memory_type_id
 }
 
-/// A session in its own thread of C0SUPPORT, on an agent channel, started
-/// with `template` every time.
+/// A session in its own thread of a conversation, on an agent channel,
+/// started with `template` every time.
 struct Thread {
     ws: WorkspaceId,
     connection: ChannelConnectionId,
     channel: AgentChannelId,
+    /// The conversation's external ID and kind ([`SUPPORT`] for most).
+    conversation: (&'static str, ConversationKind),
     thread: &'static str,
     template: SessionTemplate,
 }
+
+/// The channel most threads are in.
+const SUPPORT: (&str, ConversationKind) = ("C0SUPPORT", ConversationKind::Channel);
 
 impl Thread {
     fn memory_type_id(&self) -> MemoryTypeId {
@@ -1660,7 +1665,9 @@ impl Thread {
     /// [`Thread::next_run`], its message saying `text`.
     async fn next_run_saying(&self, stores: &Stores<'_>, t: &Tenant, n: u32, text: &str) -> (RunId, Snapshot) {
         let external_id = format!("{}.{n}", self.thread);
-        let mut new = message(&external_id, "C0SUPPORT", text, 1_000);
+        let (conversation, kind) = self.conversation;
+        let mut new = message(&external_id, conversation, text, 1_000);
+        new.conversation.kind = kind;
         new.thread_key = self.thread.to_owned();
         let asked = stores
             .channels
@@ -1708,6 +1715,33 @@ impl Thread {
         assert_eq!(sent.len(), 1, "{}: one model attempt", self.thread);
         (session.recall, sent[0].clone())
     }
+
+    /// What the idle session keeps of its recall, as its last run reads it:
+    /// [`SessionRecall::Unread`] once it keeps none, its text gone.
+    async fn kept_recall(&self, stores: &Stores<'_>, t: &Tenant) -> SessionRecall {
+        let org = t.organization_id;
+        let named = ConversationFilter {
+            q: Some(self.conversation.0.to_owned()),
+            kind: None,
+        };
+        let conversations = stores
+            .channels
+            .list_conversations(org, self.ws, self.connection, &named, None, 10)
+            .await
+            .unwrap()
+            .items;
+        assert_eq!(conversations.len(), 1, "{}", self.thread);
+        let session = stores
+            .channels
+            .find_session(org, self.ws, self.channel, conversations[0].id, self.thread)
+            .await
+            .unwrap()
+            .expect("the thread's session");
+        assert_eq!(session.active_run_id, None, "{}: idle", self.thread);
+        let last = session.last_run_id.expect("a run of the session");
+        let snapshot = stores.runs.find_snapshot(org, self.ws, last).await.unwrap().unwrap();
+        snapshot.session.expect("a channel run's session").recall
+    }
 }
 
 /// A forget reaches every session that may recall what it forgot at the
@@ -1718,7 +1752,9 @@ impl Thread {
 /// none; and deleting a type marks every session kept on it, in every
 /// workspace. A run under way keeps the recall it started with and ends as
 /// it would have; the next run reads the recall anew, and the one after
-/// sends what it read.
+/// sends what it read. No forgotten text stays at rest: a session marked
+/// with no run under way keeps no recall text from the change on, and one
+/// marked while its run was under way keeps none once the run ends.
 async fn reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(stores: &Stores<'_>, prepare: &Prepare) {
     const RECALL: &str = "<memory>\n[k7m2qd] Prefers replies in Portuguese.\n</memory>";
     const LATER: &str = "<memory>\n[p3x9tw] Ships on Fridays.\n</memory>";
@@ -1739,6 +1775,7 @@ async fn reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(sto
         ws,
         connection: own,
         channel: channel(ws, t.agent).await,
+        conversation: SUPPORT,
         thread: "8.own",
         template: remembering(&base, customer),
     };
@@ -1759,6 +1796,7 @@ async fn reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(sto
             ws: t.sibling,
             connection: siblings,
             channel: channel(t.sibling, t.sibling_agent).await,
+            conversation: SUPPORT,
             thread: "8.sibling",
             template: remembering(&base, customer),
         },
@@ -1879,6 +1917,11 @@ async fn reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(sto
     );
     let ended = stores.runs.find_run(org, ws, second).await.unwrap().unwrap();
     assert_eq!(ended.status, RunStatus::Completed);
+    assert_eq!(
+        session.kept_recall(stores, &t).await,
+        SessionRecall::Unread,
+        "no recall text once the run ends"
+    );
 
     // The next run reads it anew, from the same history start; the one after
     // sends what it read.
@@ -1915,6 +1958,14 @@ async fn reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(sto
         .unwrap();
     assert_eq!(forgotten, 2, "the changed note and the one saved since");
     assert_eq!(
+        session.kept_recall(stores, &t).await,
+        SessionRecall::Unread,
+        "an idle session marked keeps no recall text"
+    );
+    for other in &others {
+        assert_eq!(other.kept_recall(stores, &t).await, kept, "{}", other.thread);
+    }
+    assert_eq!(
         session.answered(stores, &t, 5, RECALL).await,
         (SessionRecall::Unread, Some(RECALL.to_owned()))
     );
@@ -1934,6 +1985,11 @@ async fn reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(sto
         .delete_type(org, customer, t.admin, &by_suite)
         .await
         .expect("a type no agent names goes");
+    assert_eq!(session.kept_recall(stores, &t).await, SessionRecall::Unread);
+    for (other, marked) in others.iter().zip([false, true, true]) {
+        let expected = if marked { SessionRecall::Unread } else { kept.clone() };
+        assert_eq!(other.kept_recall(stores, &t).await, expected, "{}", other.thread);
+    }
     assert_eq!(
         session.answered(stores, &t, 6, LATER).await,
         (SessionRecall::Unread, Some(LATER.to_owned()))
@@ -1965,6 +2021,7 @@ async fn counts_a_sessions_recall_in_its_history_budget(stores: &Stores<'_>, pre
         ws,
         connection,
         channel,
+        conversation: SUPPORT,
         thread: "9.budget",
         template: remembering(&template(), MemoryTypeId::generate()),
     };

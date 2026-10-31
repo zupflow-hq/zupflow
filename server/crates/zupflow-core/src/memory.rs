@@ -590,8 +590,10 @@ pub struct Recorded {
     /// kept on its type, to read its recall anew at its next run, from the
     /// same history start: set for a forget, so a memory forgotten isn't
     /// recalled again, though a session otherwise keeps its recall until a
-    /// trim. A run under way keeps the recall it started with. Marked once
-    /// for a change that forgets many.
+    /// trim. A run under way keeps the recall it started with. A marked
+    /// session keeps no recall text once no run of it is under way: one
+    /// with none loses it with the change, one with a run as the run ends.
+    /// Marked once for a change that forgets many.
     pub refresh_recall: bool,
     /// The run's call that made the change, kept with it: one for each call,
     /// ever. Another for the same call, in this transaction or an earlier
