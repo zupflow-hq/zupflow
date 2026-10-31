@@ -76,7 +76,7 @@ await zupflow.runs.resolveApproval(workspaceId, runId, {
 
 A run starts with its agent's [memory](/concepts/memory/): it recalls what the agent remembers in the workspace, and the agent's memory tools join its tools. The recall is read once, before the first model call, and stays the same for the whole run. What the run saves reaches the next one.
 
-Start a run with `memory: "off"` to leave memory out of it. It recalls nothing, and every call to a memory tool is refused; the tools stay offered, so its prompt is the same as any other run's. A run's `memory` says how it started: `agent` (the default) or `off`.
+Start a run with `memory: "off"` to keep a conversation the person doesn't want remembered out of the agent's memory. It recalls nothing, and every call to a memory tool is refused. The tools stay offered, so it sends the same tools and instructions as any other run and keeps their cache; only the recall is left out. A run's `memory` says how it started: `agent` (the default) or `off`.
 
 ```ts
 const run = await zupflow.runs.create(workspaceId, agentId, {
@@ -93,7 +93,8 @@ Memory calls are on the timeline like any call. Their `tool_call.*` and `approva
 | `memory_type_removed` | The run's memory type was deleted. |
 | `memory_kind_not_served` | This server doesn't serve the type's kind. |
 | `invalid_memory_settings` | The type holds settings its kind refuses now. |
-| `tool_refused` | The type's `writes` is `deny` now: the memory is read-only. |
+| `tool_refused` | The type's `writes` is `deny` now (the memory is read-only), or its kind has no such tool. |
+| `tool_changed` | The call no longer matches the tool as it was decided, so it wasn't made. |
 | `memory_unavailable` | The memory couldn't be reached just now. Nothing changed. |
 
 ## Cancelling
@@ -102,4 +103,4 @@ Memory calls are on the timeline like any call. Their `tool_call.*` and `approva
 
 ## Durability
 
-Runs survive interruptions. Each step is saved before it's taken, and a call whose outcome was lost mid-send is settled as **unknown**, never sent again. A memory call that changed a memory but lost its answer is answered from the record saved with the change, so the change is never made twice. A run nothing can take forward any more fails with `run_unavailable`.
+Runs survive interruptions. Each step is saved before it's taken, and a call whose outcome was lost mid-send is settled as **unknown**, never sent again. A memory call whose outcome was lost is settled from what the memory recorded: one that changed a memory is answered from the record saved with the change, so the change is never made twice; one that left none, like a search, is made then. A run nothing can take forward any more fails with `run_unavailable`.

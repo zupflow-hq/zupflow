@@ -7,38 +7,21 @@ sidebar:
 
 import { Aside } from "@astrojs/starlight/components";
 
-An agent can **remember**: keep short notes from one conversation and start its next runs with them. What it remembers belongs to one agent in one workspace, so it stays with that customer of yours. Your product reads, changes and forgets it through the API, and hears about every change by webhook.
+An agent can **remember**: keep short notes from one conversation and start its next runs with them. What it remembers belongs to one agent in one workspace, so it stays with that customer of yours. Your product reads, changes and forgets it through the API, and hears by webhook when a memory is saved, changed or forgotten. See the [API reference](/reference/api/#group-memory) for every field and error.
 
-## Kinds and types
+## Memory types
 
-A **memory kind** is how a memory works: what it keeps, the tools the agent gets, and what a run recalls. A server serves each kind by its key. Zupflow serves the [`notes`](#the-notes-kind) kind, and a server may serve more: `GET /v1/organizations/{org}/memory-kinds` lists yours, each with the JSON Schema of its settings and what people can do with its memories (`manage`).
+A **memory kind** is how a memory works: what it keeps, the agent's tools and what a run recalls. A **memory type** is your organization's named setup of a kind. Zupflow serves the [`notes`](#the-notes-kind) kind, and an agent whose type's kind isn't served runs without memory.
 
-A **memory type** is your organization's named setup of a kind:
+Owners and admins manage types and choose the default on the Console's **Memory** page; API keys only read them (`403 console_only`). Sandbox and Production share them. One that is the default or an agent's can't be deleted (`409 memory_type_in_use`).
 
-| Field | What it is |
-| --- | --- |
-| `name` | 1 to 60 characters, unique in the organization. |
-| `kind` | The kind it sets up, like `notes`. Fixed once the type exists. |
-| `settings` | The kind's settings, checked by the kind, with its defaults filled in. |
-| `writes` | Whether its agents write their memory with their tools: `allow` (the default), `approve` or `deny`. |
-
-A type also shows how many agents name it (`agent_count`), whether it's the default (`is_default`), and whether this server serves its kind (`served`). An agent whose type isn't served runs without memory.
-
-Owners and admins create, change and delete memory types, and choose the default, from the Console only, on the organization's **Memory** page. Every member and the organization's API keys read them; an API key that tries to change one gets `403 console_only`. Types are the organization's, not an environment's: Sandbox and Production use the same ones.
-
-A type that is the default or an agent's can't be deleted (`409 memory_type_in_use`, naming them). Deleting a type [forgets](#forgetting) its memories in every workspace.
-
-## The default and the agent's setting
-
-An organization has at most one **default memory type**. Each agent's `memory` says which memory it uses:
+Each agent's `memory` says which type it remembers with:
 
 | `memory` | The agent remembers with |
 | --- | --- |
-| `default` | The organization's default type. What an agent gets when `memory` is left out. |
-| `type` | The type in its `memory_type_id`, one of the organization's. |
-| `off` | Nothing, whatever the default: no memory tools and no recall. |
-
-**Memory is off in a new organization until an owner or admin chooses a default.** Until then, agents on `default` run without memory. Clearing the default turns it off for them again.
+| `default` | The organization's default type, also when `memory` is left out. |
+| `type` | The type in its `memory_type_id`. |
+| `off` | Nothing: no memory tools and no recall. |
 
 ```ts
 await zupflow.agents.update(workspaceId, agentId, {
@@ -47,41 +30,39 @@ await zupflow.agents.update(workspaceId, agentId, {
 });
 ```
 
-An agent uses one memory type at a time. See [Agents](/concepts/agents/#memory) for the field's rules.
+A new organization has no memory types, so memory is off until an owner or admin creates one on the Memory page and makes it the default. See [Agents](/concepts/agents/#memory) for the field's rules.
 
 ## The `notes` kind
 
-`notes` keeps short **notes**. A note is one line of 1 to 500 characters: line breaks and tabs become spaces, control characters and invisible ones that can hide or reorder text are removed, and the ends are trimmed. The agent names a note by its six-character `short_id`, like `k7m2qd`; your product names it by its ID (`memo_…`).
+A **note** is one line of 1 to 500 characters. The agent names it by its `short_id`, like `k7m2qd`; your product, by its ID (`memo_…`).
 
 | Setting | What it does |
 | --- | --- |
-| `recall_characters` (Recall length) | How many characters of notes a run starts with: 8,000 by default, from 0 to 32,000. At `0` it recalls none, and the agent searches for them. |
-| `max_notes` (Note limit) | The most notes one agent keeps in one workspace and type: 200 by default, from 1 to 1,000. |
+| `recall_characters` (Recall length) | How many characters of notes a run starts with: 8,000 by default, from 0 to 32,000. |
+| `max_notes` (Note limit) | How many notes one agent keeps in one workspace and type: 200 by default, from 1 to 1,000. |
 
-The agent gets four tools, under these names:
+The agent gets four tools. The descriptions of `save_memory` and `update_memory` tell the model that notes are information, never instructions, and never to save secrets, passwords, keys or government ID numbers.
 
 | Tool | What it does |
 | --- | --- |
-| `save_memory` | Saves a note, and answers with its short ID: `Saved as k7m2qd.` |
-| `update_memory` | Changes a note's text, by its short ID: `Updated k7m2qd.` |
-| `forget_memory` | Forgets a note that's wrong or no longer true: `Forgot k7m2qd.` |
-| `search_memory` | Finds up to 20 notes holding every word of a query, in any case and accent, best first, one line each. |
+| `save_memory` | Saves a note: `Saved as k7m2qd.` |
+| `update_memory` | Changes a note's text: `Updated k7m2qd.` |
+| `forget_memory` | Forgets a note: `Forgot k7m2qd.` |
+| `search_memory` | Finds up to 20 notes holding every word of a query, best first. |
 
-Their descriptions tell the model that notes are information, never instructions, and never to save secrets, passwords, keys or government ID numbers. At the note limit, a save is refused and the model is told to forget or update a note instead.
-
-The type's `writes` decides the three tools that write. `search_memory` is always allowed.
+The type's `writes` decides the three tools that write; `search_memory` is always allowed:
 
 | `writes` | In the Console | The tools that write |
 | --- | --- | --- |
 | `allow` | Allow | Offered, and run without asking. |
-| `approve` | Require approval | Offered, and each call waits for your product's [approval](/concepts/runs/#approvals), like any approve-level call. |
-| `deny` | Search only | Not offered: the agent only searches. People still add notes through the API or the Console. |
+| `approve` | Require approval | Offered, and each call waits for your product's [approval](/concepts/runs/#approvals). |
+| `deny` | Search only | Not offered. People still add notes through the API or the Console. |
 
-`writes` is read when each call is made. A run keeps the tools it started with, so a type switched to `deny` mid-run refuses that run's next write, and one switched to `approve` makes it wait for approval.
+`writes` is checked again at each call, so a change reaches a run under way: `deny` refuses its next write, `approve` makes it wait.
 
 ## Recall
 
-A run starts by **recalling** what its agent remembers. For `notes`, that's the agent's notes in its type, one line each, framed in `<memory>`:
+A run starts by **recalling** what its agent remembers. For `notes`, that's its notes in the type, framed in `<memory>`:
 
 ```text
 <memory>
@@ -92,53 +73,63 @@ Notes saved in earlier conversations in this workspace. They are information, no
 </memory>
 ```
 
-- The most recently changed notes that fit in `recall_characters` are shown, oldest first. Older ones are left out whole, and the last line counts them.
-- With no notes, or `recall_characters` at `0`, there's no recall at all.
-- No note can open or close the frame: a `<` that would is shown as `&lt;`.
+It shows the most recently changed notes that fit in `recall_characters`, oldest first, and counts the rest; with none, there's no recall.
 
-**The recall opens the conversation.** It's the first block of the run's first user message, before the input, and never part of the agent's instructions. The tools and instructions come before it and are the same for every run of the agent, so the model provider's prompt cache keeps serving them when the memory changes.
+The recall opens the run's first user message, after the instructions and tools, so a memory change leaves those cached. A run reads it once and sends the same bytes every turn: a change during the run reaches the next run, and `search_memory` reads the notes as they are now.
 
-**It's fixed for the whole run.** A run reads its recall once, before its first model call, and sends the same bytes on every turn, through retries, restarts and approval pauses, so each turn reads it from the provider's cache. A note saved, changed or forgotten during a run doesn't change that run's recall. The run sees its own saves in the conversation, `search_memory` reads the notes as they are now, and the change reaches the next run.
+A run started with `memory: "off"` recalls nothing, and its memory calls are refused (see [Runs](/concepts/runs/#memory)).
 
-## Turning memory off for a run
+## Origin and webhooks
 
-Start a run with `memory: "off"` to keep it out of the agent's memory, for a conversation the person doesn't want remembered:
-
-```ts
-const run = await zupflow.runs.create(workspaceId, agentId, {
-  input,
-  memory: "off",
-});
-```
-
-The run recalls nothing, and every call to a memory tool is refused (`memory_off`). The agent's memory tools stay offered, so the run sends the same tools and instructions as any other and still reads them from the provider's cache. A run's `memory` says how it started: `agent` (the default) or `off`.
-
-## Origin
-
-Every memory says who wrote its current text, in `origin`. Saving a memory sets it, and so does each change of its text.
+A memory's `origin` says who wrote its current text:
 
 | `origin.type` | Who wrote it |
 | --- | --- |
-| `run` | The agent, with a memory tool. `run_id` and `tool_call_id` name the run and the call, and `after_app_content` says what it had read. |
+| `run` | The agent. `run_id` and `tool_call_id` name the run and the call; `after_app_content` says whether it had read an app's tool result first. |
 | `api_key` | Your backend. `api_key_id` names the key. |
 | `member` | A person in the Console. `user_id` names them. |
 
-`after_app_content` is `true` when the run had read an app's tool result before the call: an issue, an email or a page from one of the customer's connected accounts. What the agent saved may then come from that content rather than from the person, and content someone else wrote can carry instructions aimed at the agent. Your product can show such memories to the person to confirm, or forget them. To review every save before it's kept, set the type's `writes` to `approve`.
+An app's tool result, like an email, can carry instructions aimed at the agent, so what the agent saves after one may come from that content. Your product can ask the person to keep or forget such memories, or set `writes` to `approve`.
 
-## Isolation
+Saves, changes and forgets send `memory.saved`, `memory.updated` and `memory.forgotten` [webhooks](/concepts/webhooks/). Their `data` names the memory, its agent and type, and its `origin` (for a forget, whoever last wrote the text), never its text. [`getMemory`](/reference/api/#getMemory) reads the memory as it is now, and answers `404` once it's forgotten.
 
-A memory belongs to one organization, one workspace, one agent and one memory type, and is reached only through all four.
+```json
+{
+  "object": "memory",
+  "id": "memo_034HXJ2mQ8vKe4TzRb7NcW",
+  "agent_id": "agt_034HXHH2LZFzvoaSAhfGVC",
+  "memory_type_id": "mtype_034GbT5kWq9NmY2xLc8RfD",
+  "origin": {
+    "type": "run",
+    "run_id": "run_034HXHH2LZFzvoaSAhfGVD",
+    "tool_call_id": "call_034HXJ1rV6pZs3KdW9TgMe",
+    "after_app_content": true
+  }
+}
+```
 
-- Another agent in the workspace never recalls or finds it, and neither does the same agent in another workspace.
-- A memory of another agent, workspace or organization answers `404`, like one that doesn't exist. An API key reaches only its own environment's workspaces.
-- An agent moved to another type recalls that type's memories. The old type's stay as they are (list them with `memory_type`), and come back if the agent moves back.
+With `verified` from [verifying a delivery](/concepts/webhooks/#verifying-a-delivery):
+
+```ts
+if (!verified.known) return; // a newer event type
+switch (verified.event.type) {
+  case "memory.saved":
+  case "memory.updated": {
+    const { workspace, data } = verified.event;
+    if (data.origin.type === "run" && data.origin.after_app_content) {
+      const memory = await zupflow.memories.get(workspace.id, data.agent_id, data.id);
+      // ask the person whether to keep memory.text
+    }
+    break;
+  }
+}
+```
 
 ## Managing memories
 
 Your product manages an agent's memories through the API:
 
 ```ts
-// What the agent remembers here, newest first: one memory type at a time
 const { items } = await zupflow.memories.list(workspaceId, agentId, {
   q: "fiscal year",
 });
@@ -153,98 +144,36 @@ await zupflow.memories.update(workspaceId, agentId, memory.id, {
 await zupflow.memories.delete(workspaceId, agentId, memory.id);
 ```
 
-- A list shows one type's memories: the agent's current type, or the one `memory_type` names. `q` keeps those holding every word, in any case and accent.
-- A save goes to the agent's current type, or the one `memory_type_id` names. With no type to save to it's `422 memory_off`, at the note limit `422 memory_full`, and for text the kind doesn't keep `422 invalid_memory_text`.
-- Updating a memory with the text it already holds changes nothing and sends nothing.
-- The kind's `manage` says what people can do with its memories; anything else is `422 memory_kind_unsupported`. `notes` lets people do everything. A type of a kind this server doesn't serve is `422 memory_kind_not_served`.
+- A list shows one type's memories, newest first: the agent's type, or the one `memory_type` names. `q` keeps those holding every word.
+- A save goes to the agent's type, or the one `memory_type_id` names: `422 memory_off` with none, `422 memory_full` at the note limit, and `422 invalid_memory_text` for text the kind doesn't keep.
+- A save retried with the same `Idempotency-Key` answers the memory as it is now, or `409 idempotency_key_completed` once it's forgotten.
+- Updating a memory to the text it already holds changes nothing and sends nothing.
+- Another agent never recalls or finds a memory, and neither does an agent of another workspace. Through another agent, workspace or organization, it answers `404`.
+- An agent moved to another type recalls that type's memories; the old type's stay, for when it moves back.
 
-Every member and the organization's API keys read memories. API keys change them; in the Console, owners, admins and developers change them in Sandbox only (`403 console_read_only_in_production`). Each change through the API or the Console is in the audit log, never with the memory's text. A run's own saves are on its timeline instead.
-
-In the Console, an agent's **Memories** tab lists what it remembers in its workspace, one type at a time, with search. In Sandbox, people add, change and forget memories there.
-
-## Webhooks
-
-| Event | When |
-| --- | --- |
-| `memory.saved` | A memory was saved: by a run, through the API or in the Console. |
-| `memory.updated` | A memory's text changed. |
-| `memory.forgotten` | A memory was forgotten. |
-
-Like every event, they're lean: they name the memory, its agent and type, and its `origin`, never its text. Read the memory as it is now with `getMemory`, which answers `404` once it's forgotten.
-
-```json
-{
-  "id": "evt_034HXJ3nF5hRw8YcQ2LkPa",
-  "type": "memory.saved",
-  "created_at": "2026-10-04T21:04:11Z",
-  "environment": "production",
-  "organization_id": "org_034CmCMi0M7gup3a0htwn5",
-  "workspace": {
-    "id": "ws_034FpGDIRLk8Of6gikx8DG",
-    "external_id": "cus_1042"
-  },
-  "data": {
-    "object": "memory",
-    "id": "memo_034HXJ2mQ8vKe4TzRb7NcW",
-    "agent_id": "agt_034HXHH2LZFzvoaSAhfGVC",
-    "memory_type_id": "mtype_034GbT5kWq9NmY2xLc8RfD",
-    "origin": {
-      "type": "run",
-      "run_id": "run_034HXHH2LZFzvoaSAhfGVD",
-      "tool_call_id": "call_034HXJ1rV6pZs3KdW9TgMe",
-      "after_app_content": true
-    }
-  }
-}
-```
-
-```ts
-switch (verified.event.type) {
-  case "memory.saved": {
-    const { workspace, data } = verified.event;
-    if (data.origin.type === "run" && data.origin.after_app_content) {
-      const memory = await zupflow.memories.get(
-        workspace.id,
-        data.agent_id,
-        data.id,
-      );
-      // ask the person whether to keep memory.text
-    }
-    break;
-  }
-}
-```
-
-`deleteMemories` sends a `memory.forgotten` for each memory it forgets. The memories that go with their agent, workspace or memory type send none.
+Members and API keys read memories; the Console lists them on the agent's **Memories** tab. API keys change them, as do owners, admins and developers in the Console, in Sandbox only. Each save, change and forget through the API or the Console is in the audit log, and an erasure once per hundred memories (`agent.memory_forgotten`), never with the text.
 
 ## Forgetting
 
 A forgotten memory is gone: never recalled, found or listed again.
 
-- `deleteMemory` (`memories.delete` in the SDK) forgets one memory, and the agent's `forget_memory` forgets one note in a run.
-- `deleteMemories` (`memories.deleteAll`) forgets everything the agent keeps in the workspace, in every memory type, whatever the kind lets people do. It goes a hundred memories at a time, oldest first: one cut off partway has still forgotten what it reached, and asking again forgets the rest.
-- Deleting an agent forgets its memories. Deleting a workspace forgets what its agents remembered, and deleting a memory type forgets its memories in every workspace.
-- A run already under way keeps the recall it started with until it ends. Then its recall is dropped. In a team chat, the session's next run recalls without the forgotten memory (see [Team chats](#team-chats)).
+- [`deleteMemory`](/reference/api/#deleteMemory) forgets one memory, as the agent's `forget_memory` does in a run.
+- [`deleteMemories`](/reference/api/#deleteMemories) (`memories.deleteAll`) forgets everything the agent keeps in the workspace, in every memory type whose kind is served, whatever the kind lets people do, with a `memory.forgotten` for each. It goes a hundred at a time, so one cut off partway can be asked again.
+- Deleting an agent, a workspace or a memory type forgets the memories that go with it, sending no `memory.forgotten`.
+- A run under way keeps the recall it started with until it ends, then drops it, as a [team chat](#team-chats)'s session does.
 
 <Aside>
-  Forgetting a memory doesn't change runs that already happened. A run's own records, its conversation and its tool
-  calls, keep what it read and wrote, a search's results and a save's text included, for as long as runs are kept.
+  Forgetting a memory doesn't change runs that already happened: their conversations and tool calls keep what they read
+  and wrote for as long as runs are kept.
 </Aside>
 
 ## Team chats
 
-An agent can also answer people in a team's chat through its channels. There it remembers with the same memory type, tools, decisions and approvals, and a channel run's `memory` is always `agent`. Who a memory is for depends on the conversation:
+An agent can also talk with people in a team chat, like Slack. Who a memory is for depends on the conversation:
 
-- **In a direct message or group DM,** the agent recalls and finds the workspace's memories and that conversation's own. What it saves there is for that conversation only: its `channel_conversation_id` is set.
-- **In a channel or private channel,** it recalls and finds the workspace's memories. What it saves there is for the whole workspace: its `channel_conversation_id` is `null`.
+- **In a direct message or group DM,** the agent recalls and finds the workspace's memories and that conversation's own, and saves, changes and forgets only the conversation's. The API names their conversation in `channel_conversation_id`; the Console marks them Direct conversation.
+- **In a channel,** what it recalls, finds and saves is the workspace's.
 
-A direct conversation never changes or forgets the workspace's memories: its `update_memory` and `forget_memory` reach only the notes saved in it. People see and manage every memory through the API and the Console, each with the conversation it belongs to. Tell the people who talk to the agent: what's said in a channel can be remembered for the whole workspace, and what's said in a direct message for that conversation, until it's forgotten.
+A conversation shared with another organization has no memory. Tell the people who talk to the agent that what they say can be remembered until it's forgotten.
 
-A conversation with the agent is a **session**: a thread in a channel or group DM, or a direct message's messages outside threads (each thread in a direct message is a session of its own). A session takes the agent's memory when it starts and keeps its recall from one message to the next, so the provider's cache holds.
-
-- **A forgotten memory leaves the recall at the session's next run.** However it's forgotten (`deleteMemory`, `deleteMemories`, or the agent's own `forget_memory` in that session or another), every session of that agent, workspace and memory type reads its recall again when its next run starts. Only the recall is read again, so that run misses the provider's cache from the recall on, once per forget. A run already under way keeps the recall it started with.
-- A memory saved or changed during a session reaches its recall when the session's history is trimmed, or in the next session. Until then, the session sees its own saves in the conversation, and `search_memory` always reads the memories as they are now.
-- When the agent's memory changes (another type, none, or `writes` that change its tools), the next message that starts a run starts a new session, with the memory as it is then.
-- Once any run of a session has read an app's tool result, every later save in that session has `after_app_content: true`.
-- If the session's memory type is deleted, its memory calls are refused (`memory_type_removed`) and, from its next run, it recalls nothing.
-- A run that uses its session's memory fails with `channel_session_removed` if the agent's channel, its connection or its app is removed while it's under way.
+The agent's runs in one thread, or in a direct message outside threads, form a **session** and share its recall, which can be shorter than `recall_characters` to leave room for the conversation. Its next run reads the recall again after a memory is forgotten in any way, or changed through the API or the Console; what the agent saves or changes reaches it when the history is trimmed, or in a new session. Once a session has read an app's tool result, its later saves have `after_app_content: true`, even after a trim.

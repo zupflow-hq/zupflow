@@ -25,13 +25,13 @@ Webhooks tell your backend when something happens that it should act on. Endpoin
 | `memory.saved`, `memory.updated`, `memory.forgotten` | An agent's memory was saved, its text changed, or it was forgotten. |
 | `webhook.test` | The Console's test button. Needs no subscription. |
 
-Events are **lean**: type, IDs, environment, the workspace's `external_id` and the object's status. Read the object through the API for the rest. A memory's events name its agent, its type and its `origin`, never its text: read it with `getMemory` (see [Memory](/concepts/memory/#webhooks)).
+Events are **lean**: type, IDs, environment, the workspace's `external_id` and the object's status. Read the object through the API for the rest. A memory's events name its agent, its type and its `origin`, never its text: read it with `getMemory` (see [Memory](/concepts/memory/#origin-and-webhooks)).
 
 ```json
 {
   "id": "evt_034HXHH2LZFzvoaSAhfGVC",
   "type": "run.completed",
-  "created_at": "2026-10-04T21:04:11Z",
+  "created_at": "2026-10-04T21:04:11.000Z",
   "environment": "production",
   "organization_id": "org_034CmCMi0M7gup3a0htwn5",
   "workspace": { "id": "ws_034FpGDIRLk8Of6gikx8DG", "external_id": "cus_1042" },

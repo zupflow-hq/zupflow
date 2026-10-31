@@ -104,9 +104,9 @@ A run gets its agent's [memory](/concepts/memory/) with its tools (`memory_tools
 
 At the run's first model attempt, the driver reads the agent's memory type (its own, or the organization's default), the kind's tools for the type's settings and `writes`, and what the run recalls in its workspace. The memory tools join the frozen list under their own names, like `save_memory`. The type and the recall are kept on the run, once, so every later attempt (a retry, another worker, a turn after an approval) sends the same tools and the same recall, byte for byte; the store holds each attempt to the recall's digest. Nothing reads the recall again during the run: what a run saves reaches the next one. The recall goes with the run's last transition, and its digest stays.
 
-An agent without memory, or whose type's kind the server doesn't serve, gets no memory tools and no recall. A run started with memory `off` offers the same tools as one with memory, so its prompt and its cache key are the same; it recalls nothing, and each memory call is refused (`memory_off`).
+An agent without memory, or whose type's kind the server doesn't serve, gets no memory tools and no recall. A run started with memory `off` offers the same tools as one with memory, so its tools, instructions and cache key are the same; it recalls nothing, and each memory call is refused (`memory_off`).
 
-A run in a channel session uses the memory its session took when it started. A session in a direct message or group DM recalls the workspace's memories and its conversation's own; one in a channel, the workspace's only (see [Team chats](/concepts/memory/#team-chats)). The session keeps its recall from one run to the next and reads it again when its history is trimmed. A forget reaches it sooner: forgetting a memory marks every session of that agent, workspace and type in the forget's own transaction (deleting a type marks every session kept on it), and a marked session's next run reads its recall again from the same history start. Only the recall misses the cache, once per forget, and a run under way keeps the recall it started with.
+A run in a channel session takes its memory from the session instead (see [In a channel session](#in-a-channel-session)).
 
 ### The recall and the prompt cache
 
@@ -159,6 +159,21 @@ A sender that commits after its call was settled finds the record and changes no
 
 Deleting a type queues a `refuse_waiting_calls` job in the same transaction, in the organization's scope, naming the type only. The run worker takes it, finds the calls waiting for approval in that type in any of the organization's workspaces, and refuses each (`memory_type_removed`) through the reducer and the store, so those runs move on without anyone deciding. A decision sent afterwards gets `409 not_waiting`. A call not yet decided is refused by the same rule when it's decided or made.
 
+### In a channel session
+
+A channel run uses the memory its session took when it started: the agent's type, the kind's tools for its `writes`, and the session's audience. Its `memory` is always `agent`. A session in a direct message or group DM recalls and searches the workspace's memories and its conversation's own, and what it saves is stamped with the conversation; one in a channel or private channel has the workspace's only (see [Team chats](/concepts/memory/#team-chats)). A session in a conversation shared with another organization gets no memory tools and recalls nothing, and a conversation that becomes shared gets none from its next session. A session whose type's settings its kind refuses starts without memory, as one whose kind isn't served does, and the server logs it.
+
+The session keeps one recall for each history start, and every run from that start sends the same bytes. A trim reads it again from the session's type. A recall read again takes no more than half the session's history budget (60% of the model's context window), so it can be shorter than `recall_characters`, and a trim counts a kept recall as half the budget at most. What a run saves or changes reaches its own session's later runs through the conversation, and each session's recall at that session's next trim, or in a new session.
+
+Some changes mark sessions in their own transaction, so that each marked session's next run reads its recall again from the same history start:
+
+- **A forget** (`deleteMemory`, each hundred of `deleteMemories`, a run's `forget_memory`) **and an edit through the API or the Console.** A memory kept for one direct conversation marks only that conversation's sessions; a workspace's memory marks every session of its agent, workspace and type. A run's own edit, like a save, marks nothing.
+- **Deleting a type** marks every session kept on it. From their next run, they recall nothing, and their memory calls are refused (`memory_type_removed`).
+
+A marked session's next run misses the cache from the recall on, once per mark; a run under way keeps the recall it started with. No session keeps the text a forget or an edit took away: a marked session with no run under way loses its recall text in the marking transaction, and one with a run loses it as that run ends. The session keeps the cleared recall's size, which its trims still count.
+
+Once a run of a session has read an app's tool result, every later save in the session has `after_app_content`, through trims, until the thread starts a new session. A run that uses its session's memory fails with `channel_session_removed` if the session goes with the agent's channel, connection or app while it's under way.
+
 ## Keeping the prompt cache warm
 
 Model providers cache the prefix of a prompt. Zupflow keeps that prefix stable on purpose:
@@ -166,7 +181,7 @@ Model providers cache the prefix of a prompt. Zupflow keeps that prefix stable o
 - **Append only.** Each turn's request starts with the one before it, byte for byte. Nothing earlier in the conversation is rewritten.
 - **Frozen tools and recall.** The tool list, the descriptions and the [recall](#the-recall-and-the-prompt-cache) never change within a run.
 - **A stable cache key.** Every turn is sent with the agent's prompt cache key: `zf_` plus a digest of the organization, workspace, agent and tools. Every run of the agent with the same tools shares it, and it names nothing a provider could read.
-- **Sessions.** A run in a channel session continues the session's earlier runs from their stored transcripts, so everything before its new messages is a cached prefix. History is trimmed by whole runs, at least a quarter of the budget at a time, so the cache misses once per trim (and from the recall on, once per forget) rather than on every run.
+- **Sessions.** A run in a channel session continues the session's earlier runs from their stored transcripts, so everything before its new messages is a cached prefix. History is trimmed by whole runs, at least a quarter of the budget at a time, so the cache misses once per trim, and from the recall on once per [mark](#in-a-channel-session), rather than on every run.
 
 The server's `prompt_cache` tests guard each of these.
 

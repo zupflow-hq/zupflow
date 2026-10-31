@@ -5,7 +5,7 @@ sidebar:
   order: 5
 ---
 
-Every resource outside the server's own memory is a trait in `zupflow-core`. The server holds each one as an `Arc<dyn Trait>` in `AppState` and never names a concrete type outside `main.rs`. Each trait has a conformance suite in `zupflow-conformance` that every implementation must pass.
+Every resource outside the server process is a trait in `zupflow-core`. The server holds each one as an `Arc<dyn Trait>` in `AppState` and never names a concrete type outside `main.rs`. Each trait has a conformance suite in `zupflow-conformance` that every implementation must pass.
 
 ```mermaid
 flowchart TB
@@ -194,10 +194,12 @@ async fn call(
     record: &Record<'_>,
 ) -> Result<CallResult, MemoryError>;
 async fn made(&self, scope: &MemoryScope, run_id: RunId, tool_call_id: ToolCallId) -> Result<Option<MadeCall>, MemoryError>;
+fn text_rule(&self) -> String;
+fn limit(&self, settings: &Settings) -> u32;
 async fn forget_all(&self, what: &Forget) -> Result<(), MemoryError>;
 ```
 
-One memory kind, served by its key (`notes`). It checks a memory type's settings, gives the tools a run offers for the type's `writes`, builds a run's recall, and makes each memory call once the server has decided it; `made` reads back what a run's call did. What people do through the API goes through `list`, `get`, `add`, `change`, `forget` and `forget_scope`, an erasure's next batch. `forget_all` forgets everything of an agent, a workspace, a type or an organization once it's deleted, and may be asked again.
+One memory kind, served by its key (`notes`). It checks a memory type's settings, gives the tools a run offers for the type's `writes`, builds a run's recall, and makes each memory call once the server has decided it; `made` reads back what a run's call did. `text_rule` and `limit` tell a person what the kind keeps when it refuses their text (`invalid_memory_text`), and how many memories it keeps when their save finds no room (`memory_full`). What people do through the API goes through `list`, `get`, `add`, `change`, `forget` and `forget_scope`, an erasure's next batch. `forget_all` forgets everything of an agent, a workspace, a type or an organization once it's deleted, and may be asked again.
 
 `MemoryProviders` holds the kinds a server serves, by key, as `ChannelProviders` holds channel providers: each type is served by its own kind, and nothing picks one kind for the whole server. A stored type whose kind isn't served answers through a stand-in, so its agents run without memory (`served: false`). `bootstrap::memory_providers` serves `notes` over the `NoteStore` it's given, and a deployment may add kinds of its own.
 
@@ -214,7 +216,7 @@ Like every adapter, a kind never logs a memory's text.
 
 ### NoteStore
 
-Where the `notes` kind keeps its notes. What a note is, the settings, the tools, the recall's lines and what a search matches are written once, in `zupflow-core`, over this trait: `insert`, `update`, `delete`, `delete_scope`, `get`, `made`, `recent`, `search`, `list` and `delete_all`, each taking the scope first. Each change is one transaction that holds what concurrent saves must keep (the note limit, a short ID once in its scope) and writes what the change records with it.
+Where the `notes` kind keeps its notes. What a note is, the settings, the tools, the recall's lines and what a search matches are written once, in `zupflow-core`, over this trait: `insert`, `update`, `delete`, `delete_scope`, `get`, `made`, `recent`, `search` and `list`, each taking the scope first, and `delete_all`, which takes what to forget (`&Forget`), as `forget_all` does. Each change is one transaction that holds what concurrent saves must keep (the note limit, a short ID once in its scope) and writes what the change records with it.
 
 `SqliteNoteStore` keeps notes in `memory_notes`, in the database that holds everything else. A search is FTS5's: every word, in any case and accent, ranked by BM25, then newest first. Each search indexes only the notes it may find, in a temporary table of its own connection, so its order depends on no other scope's notes and no index keeps a note that's gone. Another database implements the same trait and passes the `note_store` suite; how it ranks is its own.
 
