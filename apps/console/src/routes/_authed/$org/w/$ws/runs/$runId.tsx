@@ -162,6 +162,14 @@ function RunPage() {
                       ) : null}
                     </Property>
                   ) : null}
+                  {r.memory === "off" ? (
+                    <Property label="Memory" className="sm:grid-cols-1 sm:gap-1">
+                      <span>Off for this run</span>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        It recalled nothing, and its memory tools refused every call.
+                      </p>
+                    </Property>
+                  ) : null}
                   <Property label="Input tokens" className="sm:grid-cols-1 sm:gap-1">
                     <InputTokens usage={r.usage} />
                   </Property>

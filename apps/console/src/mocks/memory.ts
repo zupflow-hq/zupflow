@@ -51,7 +51,7 @@ import {
 } from "./http";
 import { isId, newId } from "./ids";
 import { KNOWN_MEMORY_KINDS, type KnownKind, trimmed } from "./memory-kinds";
-import type { AgentRow, Db, MemoryRow, MemoryTypeRow } from "./model";
+import type { AgentRow, Db, MemoryRow, MemoryTypeRow, PlannedMemoryCall, RunRow } from "./model";
 import type { Rng } from "./random";
 import { drawShortId, inWorkspace, sameWorkspace } from "./scope";
 import { compareNames } from "./tools";
@@ -399,6 +399,80 @@ export const MEMORY_SHORT_ID_DRAWS = 4;
 export function freeShortId(taken: ReadonlySet<string>, rng: Rng = secureRandom): string | null {
   const drawn = Array.from({ length: MEMORY_SHORT_ID_DRAWS }, () => drawShortId(rng));
   return drawn.find((shortId) => !taken.has(shortId)) ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// What a run does with its agent's memory, as the run engine does it.
+
+/** A memory type with its kind, which this server serves. */
+export interface ServedType {
+  type: MemoryTypeRow;
+  kind: KnownKind;
+}
+
+/**
+ * The memory a run of `agent` resolves now: its own type or the
+ * organization's default, with its kind; none when its memory is off, on a
+ * default nobody chose, or of a kind this server doesn't serve.
+ */
+export function runMemoryOf(d: Db, agent: AgentRow): ServedType | undefined {
+  const type = currentTypeOf(d, agent);
+  const kind = type && servedKind(d, type.kind);
+  return type && kind ? { type, kind } : undefined;
+}
+
+/** A run's memory type as it is now, in its organization: `gone` once deleted, `not_served` once its kind isn't. */
+export function memoryTypeNow(
+  d: Db,
+  organizationId: OrganizationId,
+  memoryTypeId: MemoryTypeId,
+): ServedType | "gone" | "not_served" {
+  const type = memoryTypeIn(d, organizationId, memoryTypeId);
+  if (!type) return "gone";
+  const kind = servedKind(d, type.kind);
+  return kind ? { type, kind } : "not_served";
+}
+
+/**
+ * A run's `save_memory`, made in the run's own organization, workspace and
+ * agent, in the type it started with: what the model reads back, or null
+ * when the kind refused it (text it doesn't keep, or a full memory). Its
+ * origin names the run and the call; its webhook event is written with it,
+ * and no audit event: the run's timeline is the record.
+ */
+export function saveFromRun(
+  d: Db,
+  run: Pick<RunRow, "id" | "organization_id" | "workspace_id" | "agent_id">,
+  { type, kind }: ServedType,
+  call: Pick<PlannedMemoryCall, "call_id" | "arguments">,
+  afterAppContent: boolean,
+  at: string,
+): string | null {
+  const text = kind.text(call.arguments.text);
+  if (text === null) return null;
+  const scope = d.memories.filter(
+    (m) => sameWorkspace(m, run) && m.agent_id === run.agent_id && m.memory_type_id === type.id,
+  );
+  if (scope.length >= kind.limit(type.settings)) return null;
+  const shortId = freeShortId(new Set(scope.map((m) => m.short_id)));
+  if (shortId === null) return null;
+  const row: MemoryRow = {
+    id: newId("memory"),
+    organization_id: run.organization_id,
+    workspace_id: run.workspace_id,
+    agent_id: run.agent_id,
+    memory_type_id: type.id,
+    short_id: shortId,
+    text,
+    // An API or Console run remembers for the whole workspace.
+    channel_conversation_id: null,
+    origin: { type: "run", run_id: run.id, tool_call_id: call.call_id, after_app_content: afterAppContent },
+    created_at: at,
+    updated_at: at,
+  };
+  d.memories.push(row);
+  announceMemory("memory.saved", row, at);
+  return `Saved as ${shortId}.`;
 }
 
 // A list is newest first by when each memory was saved, to the millisecond,

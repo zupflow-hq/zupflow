@@ -24,6 +24,7 @@ import {
   type CreateConnectSessionInput,
   type CreateMemoryInput,
   type CreateMemoryTypeInput,
+  type CreateRunInput,
   createClient,
   createHttpTransport,
   type InstallationId,
@@ -2361,6 +2362,40 @@ export function contractSuite(target: Target) {
         await owner.agents.update(qa, agent.id, { status: "paused" });
         const error = await failure(owner.runs.create(qa, agent.id, { input: "hi" }));
         expect(error.code).toBe("agent_paused");
+      });
+
+      it("starts a run with its agent's memory unless told to start it without, and refuses anything else", async () => {
+        const qa = fx.workspaces.qaPlayground.id;
+        const agent = await owner.agents.create(qa, { name: "Remembering", description: "", instructions: "" });
+        const remembering = await owner.runs.create(qa, agent.id, { input: "hi" });
+        await owner.runs.cancel(qa, remembering.id);
+        const forgetting = await owner.runs.create(qa, agent.id, { input: "hi", memory: "off" });
+        await owner.runs.cancel(qa, forgetting.id);
+        expect([remembering.memory, forgetting.memory]).toEqual(["agent", "off"]);
+        expect((await owner.runs.get(qa, forgetting.id)).memory).toBe("off");
+        const listed = await owner.runs.list(qa, { agent_id: agent.id });
+        expect(listed.items.map((run) => [run.id, run.memory])).toEqual([
+          [forgetting.id, "off"],
+          [remembering.id, "agent"],
+        ]);
+        const organization = await owner.organizationRuns.list(fx.organization, {
+          environment: "sandbox",
+          workspace_id: qa,
+          limit: 100,
+        });
+        expect(organization.items.find((run) => run.id === forgetting.id)?.memory).toBe("off");
+        for (const memory of ["none", "Agent", "", null, true]) {
+          const refused = await failure(
+            owner.runs.create(qa, agent.id, { input: "hi", memory } as unknown as CreateRunInput),
+          );
+          expect([refused.status, refused.code, Object.keys(refused.fields ?? {})], String(memory)).toEqual([
+            400,
+            "validation_failed",
+            ["memory"],
+          ]);
+        }
+        // Refused, nothing was started.
+        expect((await owner.runs.list(qa, { agent_id: agent.id })).items).toHaveLength(2);
       });
 
       it("never lets the Console act on Production accounts", async () => {

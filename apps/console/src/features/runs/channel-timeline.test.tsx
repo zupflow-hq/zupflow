@@ -77,6 +77,7 @@ const run: Run = {
     reason: "mentioned",
     silent_reason: null,
   },
+  memory: "agent",
   status: "completed",
   input: origin.text,
   output: null,

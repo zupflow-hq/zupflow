@@ -52,7 +52,7 @@ import { advanceRun, enqueueRun, planRun, resolveApproval } from "./runner";
 import { appIn, drawShortId, issueShortId, timelineOf } from "./scope";
 import { listedFrom, recordListing } from "./tools";
 
-export const DB_SCHEMA = 30;
+export const DB_SCHEMA = 31;
 export const DEMO_USER_ID = "usr_031DCoVdPC4Z4DgUS9oR60" satisfies UserId;
 
 const MINUTE = 60_000;
@@ -1564,6 +1564,7 @@ function seedRuns(db: Db, rng: Rng, nowMs: number, specs: RunSeed[]) {
         session_id: newId("session", { rng, at: createdMs }),
         trigger: rng() < 0.9 ? "api" : "console",
         channel: null,
+        memory: "agent",
         status: "queued",
         input: spec.prompts[Math.floor(rng() * spec.prompts.length)] ?? "Hello",
         output: null,

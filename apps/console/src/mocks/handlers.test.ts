@@ -41,13 +41,13 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { signUp } from "./accounts";
 import { slackSignature } from "./channels";
 import * as credentials from "./credentials";
-import { db, resetDb } from "./db";
+import { cancelScheduledRun, db, resetDb } from "./db";
 import { createHandlers, NO_SIGN_IN_HOST, OUTCOME_GRACE_MS, UNREACHABLE_HOST } from "./handlers";
 import { announceLifecycle, grantorAllows, setLatency, withdrawUngrantable, withExpiry } from "./http";
 import { hashReference, isId, newId, newReference, uuidOf } from "./ids";
 import { freeShortId, MEMORY_SHORT_ID_DRAWS } from "./memory";
 import { KNOWN_MEMORY_KINDS, noteText } from "./memory-kinds";
-import type { IdempotencyRow, MembershipRow, MemoryRow } from "./model";
+import type { AgentRow, IdempotencyRow, MembershipRow, MemoryRow, RunRow } from "./model";
 import { mulberry32 } from "./random";
 import { drawShortId, inWorkspace, issueShortId, runEventsKey, SHORT_ID_DRAWS, timelineOf } from "./scope";
 import { DEMO_USER_ID, seed } from "./seed";
@@ -4839,5 +4839,203 @@ describe("channels", () => {
     const acmeRuns = (await owner.runs.list(ws("acme").id, { limit: 100 })).items.filter((r) => r.channel);
     expect(acmeRuns.length).toBeGreaterThan(0);
     expect(acmeRuns.some((r) => messages.some((m) => m.id === r.channel?.origin_message_id))).toBe(false);
+  });
+});
+
+describe("memory in runs", () => {
+  const northwind = () => must(northwindId(), "Northwind");
+  const notes = () => must(db().memory_types.find((t) => t.organization_id === northwind() && t.name === "Notes"));
+  const sandbox = () => ws("acme-sandbox");
+  const sandboxTaskboard = () =>
+    must(
+      db().installations.find(
+        (i) => inWorkspace(i, sandbox()) && i.app_id === app("taskboard").id && i.status === "connected",
+      ),
+      "Taskboard in acme-sandbox",
+    );
+  /** An agent on the organization's default memory, Notes; with the Taskboard's `list_tasks` when `reads`. */
+  const rememberer = async (reads = false) => {
+    const agent = await owner.agents.create(sandbox().id, { name: "Rememberer", description: "", instructions: "" });
+    if (reads) {
+      await owner.grants.create(sandbox().id, agent.id, {
+        installation_id: sandboxTaskboard().id,
+        tools: ["list_tasks"],
+        approval_required: [],
+      });
+    }
+    return agent;
+  };
+  /** A run of `agent`, planned again from a fixed seed without a simulated model failure, and off the timers. */
+  const start = async (agentId: AgentRow["id"], input: string, memory?: "agent" | "off") => {
+    const { planRun } = await import("./runner");
+    const created = await owner.runs.create(sandbox().id, agentId, memory ? { input, memory } : { input });
+    const run = must(db().runs.find((r) => inWorkspace(r, sandbox()) && r.id === created.id));
+    cancelScheduledRun(run);
+    for (let seed = 1; ; seed++) {
+      run.plan = planRun(db(), run, mulberry32(seed));
+      if (!run.plan.some((step) => step.kind === "fail")) break;
+    }
+    return { created, run };
+  };
+  /** Runs it until it waits for a decision or ends. */
+  const drive = async (run: RunRow) => {
+    const { advanceRun } = await import("./runner");
+    cancelScheduledRun(run);
+    for (let i = 0; i < 40 && ["queued", "running"].includes(run.status); i++) {
+      advanceRun(db(), run, new Date().toISOString(), () => 0.5);
+    }
+    return run;
+  };
+  /** The run's events about memory calls. */
+  const memoryEvents = (run: RunRow) =>
+    timelineOf(db(), run).filter(
+      (e) => (e.type.startsWith("tool_call.") || e.type === "approval.requested") && "memory_type_id" in e.data,
+    );
+  const savedBy = (run: RunRow) => db().memories.filter((m) => m.origin.type === "run" && m.origin.run_id === run.id);
+  const announcedFor = (run: RunRow) =>
+    db().webhook_events.filter(
+      (e) =>
+        e.body.type.startsWith("memory.") &&
+        "origin" in e.body.data &&
+        e.body.data.origin.type === "run" &&
+        e.body.data.origin.run_id === run.id,
+    );
+  const keyed = async () => {
+    const created = await owner.apiKeys.create(northwind(), { name: "Decider", environment: "sandbox" });
+    return createClient(createHttpTransport({ baseUrl: API, getToken: async () => created.secret }));
+  };
+
+  it("saves what a run is asked to remember in its type, its origin naming the run and the call, with a webhook event and no audit event", async () => {
+    const { run, created } = await start((await rememberer(true)).id, "Remember that the launch slipped to May.");
+    expect(created.memory).toBe("agent");
+    await drive(run);
+    expect(run.status).toBe("completed");
+    const events = memoryEvents(run);
+    expect(events.map((e) => e.type)).toEqual(["tool_call.started", "tool_call.completed"]);
+    const completed = must(events[1]);
+    if (completed.type !== "tool_call.completed") throw new Error("Not completed");
+    expect(completed.data).toMatchObject({
+      memory_type_id: notes().id,
+      memory_type_name: "Notes",
+      kind: MEMORY_KIND_NOTES,
+      tool: "save_memory",
+    });
+    const [saved, ...more] = savedBy(run);
+    expect(more).toEqual([]);
+    expect(must(saved)).toMatchObject({
+      organization_id: northwind(),
+      workspace_id: sandbox().id,
+      agent_id: run.agent_id,
+      memory_type_id: notes().id,
+      text: "The launch slipped to May.",
+      channel_conversation_id: null,
+      // The Taskboard's answer came before it.
+      origin: { type: "run", run_id: run.id, tool_call_id: completed.data.call_id, after_app_content: true },
+    });
+    expect(completed.data.result).toEqual({ result: `Saved as ${must(saved).short_id}.` });
+    // Its webhook event names it and never its text; no audit event: the run's timeline is the record.
+    const announced = announcedFor(run);
+    expect(announced.map((e) => [e.body.type, e.workspace_id])).toEqual([["memory.saved", sandbox().id]]);
+    expect(JSON.stringify(announced)).not.toContain("slipped");
+    expect(db().audit.some((a) => a.target.id === must(saved).id)).toBe(false);
+    // The API lists it as the run saved it.
+    const listed = await owner.memories.list(sandbox().id, run.agent_id);
+    expect(listed.items.find((m) => m.id === must(saved).id)?.origin).toEqual(must(saved).origin);
+    // With nothing read from an app first, its origin says so.
+    const { run: alone } = await start((await rememberer()).id, "Remember: invoices go out on Fridays");
+    await drive(alone);
+    expect(savedBy(alone).map((m) => [m.text, m.origin.type === "run" && m.origin.after_app_content])).toEqual([
+      ["Invoices go out on Fridays.", false],
+    ]);
+  });
+
+  it("refuses every memory call of a run started with memory off, and saves nothing", async () => {
+    const { run, created } = await start((await rememberer()).id, "Remember that Ana prefers email.", "off");
+    expect(created.memory).toBe("off");
+    await drive(run);
+    expect(run.status).toBe("completed");
+    const events = memoryEvents(run);
+    expect(events.map((e) => [e.type, e.type === "tool_call.failed" ? e.data.error : null])).toEqual([
+      ["tool_call.failed", { code: "memory_off", message: "Memory is off for this run." }],
+    ]);
+    expect([savedBy(run), announcedFor(run)]).toEqual([[], []]);
+    // An agent whose memory is off is offered no memory tools at all.
+    const agent = await rememberer();
+    await owner.agents.update(sandbox().id, agent.id, { memory: "off" });
+    const { run: none } = await start(agent.id, "Remember that Ana prefers email.");
+    await drive(none);
+    expect([memoryEvents(none), savedBy(none)]).toEqual([[], []]);
+  });
+
+  it("decides each memory call on its type's writes when it's made, pausing for approval as an app's call does", async () => {
+    const agent = await rememberer();
+    // Read-only since the run was planned: refused, with the fixed message.
+    const { run: readOnly } = await start(agent.id, "Remember that the office closes at six.");
+    await owner.memoryTypes.update(northwind(), notes().id, { writes: "deny" });
+    await drive(readOnly);
+    expect(memoryEvents(readOnly).map((e) => (e.type === "tool_call.failed" ? e.data.error : e.type))).toEqual([
+      { code: "tool_refused", message: "This agent's memory is read-only now, so it can't be changed." },
+    ]);
+    expect(savedBy(readOnly)).toEqual([]);
+
+    // Approval first: the run waits, names the call's memory type, and goes on once approved.
+    await owner.memoryTypes.update(northwind(), notes().id, { writes: "approve" });
+    const decider = await keyed();
+    const { run: approved } = await start(agent.id, "Remember that the office closes at six.");
+    await drive(approved);
+    expect(approved.status).toBe("waiting_for_approval");
+    const requested = must(memoryEvents(approved)[0]);
+    if (requested.type !== "approval.requested") throw new Error("Not a request");
+    expect(requested.data).toMatchObject({
+      memory_type_id: notes().id,
+      memory_type_name: "Notes",
+      kind: MEMORY_KIND_NOTES,
+      tool: "save_memory",
+      arguments: { text: "The office closes at six." },
+    });
+    await decider.runs.resolveApproval(sandbox().id, approved.id, {
+      call_id: requested.data.call_id,
+      decision: "approved",
+    });
+    await drive(approved);
+    expect(approved.status).toBe("completed");
+    expect(memoryEvents(approved).map((e) => e.type)).toEqual([
+      "approval.requested",
+      "tool_call.started",
+      "tool_call.completed",
+    ]);
+    expect(savedBy(approved).map((m) => m.text)).toEqual(["The office closes at six."]);
+
+    // Denied: never made, and the model is told.
+    const { run: denied } = await start(agent.id, "Remember that the office closes at six.");
+    await drive(denied);
+    const waiting = must(memoryEvents(denied)[0]);
+    if (waiting.type !== "approval.requested") throw new Error("Not a request");
+    await decider.runs.resolveApproval(sandbox().id, denied.id, { call_id: waiting.data.call_id, decision: "denied" });
+    await drive(denied);
+    expect(denied.status).toBe("completed");
+    expect(memoryEvents(denied).map((e) => e.type)).toEqual(["approval.requested"]);
+    expect(
+      timelineOf(db(), denied).some(
+        (e) =>
+          e.type === "message.assistant" &&
+          /^Skipping save_memory in Notes — the request was denied\.$/.test(e.data.text),
+      ),
+    ).toBe(true);
+    expect([savedBy(denied), announcedFor(denied)]).toEqual([[], []]);
+  });
+
+  it("refuses a memory call whose type was deleted after the run started", async () => {
+    const agent = await rememberer();
+    const { run } = await start(agent.id, "Remember that the office closes at six.");
+    await owner.agents.update(sandbox().id, agent.id, { memory: "off" });
+    await owner.memoryTypes.setDefault(northwind(), { memory_type_id: null });
+    await owner.memoryTypes.delete(northwind(), notes().id);
+    await drive(run);
+    expect(run.status).toBe("completed");
+    expect(memoryEvents(run).map((e) => (e.type === "tool_call.failed" ? e.data.error.code : e.type))).toEqual([
+      "memory_type_removed",
+    ]);
+    expect(savedBy(run)).toEqual([]);
   });
 });
