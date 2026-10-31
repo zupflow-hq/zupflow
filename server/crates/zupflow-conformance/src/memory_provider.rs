@@ -39,8 +39,9 @@
 //! notes that fit, then a line counting the rest, each note as saved but
 //! for a frame tag), and how each tool's call whose answer was lost is
 //! settled: a save, a change or a forget answered as made, whatever the
-//! writes are now and whatever became of the note, or made then, as the
-//! writes are then; a search made again.
+//! writes are now and whatever became of the note, a change to the text the
+//! note held included, or made then, as the writes are then; a search made
+//! again.
 //!
 //! `prepare` makes a [`Tenant`] exist, as the `NoteStore` suite's does.
 
@@ -2430,11 +2431,13 @@ async fn changes_only_where_a_runs_reach_goes(provider: &dyn MemoryProvider, pre
 /// How `notes` settles a call whose answer was lost. A save, a change of
 /// text or a forget it made is answered as made, whatever the type's writes
 /// are now and whatever became of the note since: forgotten or changed by a
-/// person, it's never saved, changed back or forgotten again. One it didn't
-/// make is made then, as the type's writes are then (refused while denied),
-/// and answered as made after; its sender, committing after, is refused and
-/// changes nothing. A search is made again, and a call whose arguments
-/// can't be read is answered as the call was.
+/// person, it's never saved, changed back or forgotten again. So is a
+/// change to the text the note held, which changed nothing: never made over
+/// a person's change since. One it didn't make is made then, as the type's
+/// writes are then (refused while denied), and answered as made after; its
+/// sender, committing after, is refused and changes nothing. A search is
+/// made again, and a call whose arguments can't be read is answered as the
+/// call was.
 async fn settles_each_tools_call_by_what_it_did(provider: &dyn MemoryProvider, prepare: &Prepare) {
     let t = tenant(prepare).await;
     let scope = t.scope();
@@ -2554,6 +2557,30 @@ async fn settles_each_tools_call_by_what_it_did(provider: &dyn MemoryProvider, p
         );
     }
     assert_eq!(texts().await, ["Renews in June."], "never changed back");
+
+    // A change to the text the note held, which changed nothing, then
+    // changed by a person: answered as made, and never made over the
+    // person's change.
+    let unchanging = run_origin();
+    let same_text = json!({ "memory": renewal_short, "text": "Renews in June." });
+    let unchanged = make(unchanging, notes::UPDATE_MEMORY, same_text.clone()).await;
+    assert_eq!(
+        answered(unchanged),
+        (format!("Updated {renewal_short}."), false, false),
+        "changing nothing"
+    );
+    provider
+        .change(&scope, &person, renewal.id, "Renews in July.", at(4), &record_nothing)
+        .await
+        .unwrap();
+    for writes in [MemoryWrites::Allow, MemoryWrites::Deny] {
+        assert_eq!(
+            answered(settle(unchanging, writes, notes::UPDATE_MEMORY, same_text.clone()).await),
+            (format!("Updated {renewal_short}."), false, false),
+            "{writes:?}: answered as made"
+        );
+    }
+    assert_eq!(texts().await, ["Renews in July."], "the person's change kept");
 
     // A forget made, then settled: answered as made, its note gone.
     let forgetter = run_origin();

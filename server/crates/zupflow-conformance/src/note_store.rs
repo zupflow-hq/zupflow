@@ -18,9 +18,10 @@
 //! change refused or changing nothing records nothing, and a record placed
 //! outside the note's workspace fails the change, which then changes
 //! nothing. The suite reads them back through the [`Logs`]. A run's call
-//! that changes a note is kept with its change, once: another change of
-//! the same call fails, changing nothing, and the call is read back in its
-//! own scope only, whatever became of the note since.
+//! that changes a note is kept with its change, once, and one that gives a
+//! note the text it holds is kept alone, recording nothing else: another
+//! change of the same call fails, changing nothing, and the call is read
+//! back in its own scope only, whatever became of the note since.
 //!
 //! Which note ranks first is the store's own: a suite can't hold another
 //! database to SQLite's BM25, so its order is tested where it's kept.
@@ -383,8 +384,10 @@ fn with_call(
 /// neither another call of the run nor the same call of another run. It's
 /// kept once: another change of the same call, in a later transaction or
 /// the same one, fails `AlreadyMade` and changes nothing, its records
-/// included. A call that changes nothing isn't kept, and one that was stays
-/// whatever becomes of its note, and of every note of its type.
+/// included. A call that gives a note the text it holds changes nothing,
+/// and is kept all the same, alone, with no audit or webhook event, once;
+/// a person's has no call, and records nothing. A call kept stays whatever
+/// becomes of its note, and of every note of its type.
 async fn keeps_each_calls_change_once(store: &dyn NoteStore, logs: Logs<'_>, prepare: &Prepare) {
     let t = tenant(prepare).await;
     let other = tenant(prepare).await;
@@ -498,8 +501,10 @@ async fn keeps_each_calls_change_once(store: &dyn NoteStore, logs: Logs<'_>, pre
     assert_eq!(store.made(&scope, run_id, saving).await, Ok(Some(kept.clone())));
     assert_eq!(store.made(&scope, run_id, forgetting).await, Ok(None), "nor the call");
 
-    // A call that changes nothing isn't kept.
+    // A call that gives the note the text it holds changes nothing, and is
+    // kept all the same, alone: no audit event, no webhook event. Once only.
     let unchanging = ToolCallId::generate();
+    let unchanging_call = with_call(run_id, unchanging, "update_memory", "Updated the note.", 4);
     let unchanged = store
         .update(
             &scope,
@@ -508,12 +513,65 @@ async fn keeps_each_calls_change_once(store: &dyn NoteStore, logs: Logs<'_>, pre
             &call(unchanging),
             "Prefers email.",
             at(4),
-            &with_call(run_id, unchanging, "update_memory", "Updated the note.", 4),
+            &unchanging_call,
+        )
+        .await;
+    assert_eq!(
+        unchanged,
+        Ok(Rewritten {
+            memory: saved.clone(),
+            changed: false,
+        }),
+        "its own text"
+    );
+    assert_eq!(seen_now().await, expected, "the call alone");
+    assert_eq!(
+        store.made(&scope, run_id, unchanging).await,
+        Ok(Some(MadeCall {
+            run_id,
+            tool_call_id: unchanging,
+            tool: "update_memory".to_owned(),
+            memory_id: saved.id,
+            answer: "Updated the note.".to_owned(),
+            at: at(4),
+        })),
+        "kept"
+    );
+    assert_eq!(
+        store
+            .update(
+                &scope,
+                NoteRef::Id(saved.id),
+                Reach::Everything,
+                &call(unchanging),
+                "Prefers email.",
+                at(5),
+                &unchanging_call
+            )
+            .await,
+        Err(MemoryError::AlreadyMade),
+        "the same call again"
+    );
+    // A person's has no call: it records nothing.
+    let unchanged = store
+        .update(
+            &scope,
+            NoteRef::Id(saved.id),
+            Reach::Everything,
+            &person,
+            "Prefers email.",
+            at(5),
+            &recorder(Environment::Sandbox),
         )
         .await
         .unwrap();
     assert!(!unchanged.changed);
-    assert_eq!(store.made(&scope, run_id, unchanging).await, Ok(None), "its own text");
+    assert_eq!(seen_now().await, expected, "nothing for a person's");
+    assert_eq!(
+        store.get(&scope, saved.id).await,
+        Ok(saved.clone()),
+        "the note as it was"
+    );
 
     // Each call that changes it is kept, and the first stays whatever
     // becomes of the note.
@@ -544,6 +602,7 @@ async fn keeps_each_calls_change_once(store: &dyn NoteStore, logs: Logs<'_>, pre
     assert_eq!(seen_now().await, expected);
     for (tool_call_id, tool, answer, millis) in [
         (saving, "save_memory", "Saved as the note.", 1),
+        (unchanging, "update_memory", "Updated the note.", 4),
         (updating, "update_memory", "Updated the note.", 5),
         (forgetting, "forget_memory", "Forgot the note.", 6),
     ] {

@@ -17,9 +17,10 @@
 //! note keeps who wrote its text: saving it, or changing it, writes its
 //! origin, and its own text again changes nothing. A run's call that saves,
 //! changes or forgets a note is kept with its change, with its answer
-//! ([`super::MadeCall`]), one for each call: one whose answer was lost is
-//! answered that way, whatever became of the note since, and its change is
-//! never made again ([`NoteStore::made`]). A call that changed nothing keeps
+//! ([`super::MadeCall`]), one for each call, and one that gives a note the
+//! text it holds is kept alone: one whose answer was lost is answered that
+//! way, whatever became of the note since, and its change is never made
+//! again ([`NoteStore::made`]). A search, or a call the kind refused, keeps
 //! no record, and is made again.
 //!
 //! A recall shows the notes by last change, oldest first, one line each
@@ -421,9 +422,9 @@ pub struct Recent {
 /// writes what `record` builds of the change ([`Record`]): its audit event,
 /// its webhook events with their deliveries, placed in the scope's
 /// workspace, and the run's call that made it ([`Recorded::call`]), once
-/// for each call. A record that can't be written fails the change, a second
-/// of the same call fails it `AlreadyMade`, and a change refused records
-/// nothing.
+/// for each call, alone for an update to the text a note holds. A record
+/// that can't be written fails the change, a second of the same call fails
+/// it `AlreadyMade`, and a change refused records nothing.
 #[async_trait]
 pub trait NoteStore: Send + Sync {
     /// Saves a note in its scope, at `now`: `NotFound` when the scope's agent
@@ -443,7 +444,10 @@ pub trait NoteStore: Send + Sync {
     /// Replaces a note's text, as written by `origin` at `now`; `NotFound`
     /// unless `reach` reaches it. Searches find it by its new text only.
     /// Records what `record` builds from it as changed. The text it already
-    /// holds changes nothing and records nothing ([`Rewritten`]).
+    /// holds changes nothing ([`Rewritten`]), and records only the run's
+    /// call `record` builds from it, if any ([`Recorded::call`]): no audit
+    /// event, no webhook events. Another of the same call fails it
+    /// `AlreadyMade`, as after a change.
     #[allow(clippy::too_many_arguments)]
     async fn update(
         &self,
@@ -483,10 +487,11 @@ pub trait NoteStore: Send + Sync {
     /// audience: `NotFound` unless the scope keeps it.
     async fn get(&self, scope: &MemoryScope, id: MemoryId) -> Result<Memory, MemoryError>;
 
-    /// What run `run_id`'s call `tool_call_id` changed in the scope, as its
-    /// change recorded it ([`Recorded::call`], written with the change),
-    /// whatever became of the note since: `None` when it changed nothing
-    /// there. How a call whose answer was lost is answered as it was made.
+    /// What run `run_id`'s call `tool_call_id` made in the scope, as it
+    /// recorded it ([`Recorded::call`], written with its change), whatever
+    /// became of the note since: `None` when it recorded nothing there (a
+    /// search, a refusal, or a call never made). How a call whose answer was
+    /// lost is answered as it was made.
     async fn made(
         &self,
         scope: &MemoryScope,
@@ -667,7 +672,7 @@ impl Notes {
             .update(scope, note, reach, context.origin, &text, context.now, &record)
             .await
         {
-            // The text it already held changed nothing.
+            // The text it already held changed nothing: the call is kept alone.
             Ok(Rewritten { memory, changed }) => Ok(CallResult::answer(
                 answer(UPDATE_MEMORY, &memory),
                 changed.then_some(MemoryChange::Updated(memory)),

@@ -40,11 +40,12 @@
 //! memory's text, a call's arguments or its answer.
 //!
 //! **Once.** A call that changes a memory commits a record of itself with
-//! its change, one for each call ([`Recorded::call`]). A call whose sender
+//! its change, one for each call ([`Recorded::call`]), and one that gives a
+//! memory the text it holds commits the record alone. A call whose sender
 //! stopped before recording what came of it is settled by that record
 //! ([`MemoryProvider::made`]): answered as it was made, whatever became of
 //! the memory or its type since, and its change never made again; with
-//! none (it changed nothing, or was never made), it's made then, as
+//! none (a search, a refusal, or a call never made), it's made then, as
 //! [`memory::settle`] does. A sender that commits after its call was
 //! settled is refused, changing nothing ([`memory::make`]). A call of a kind
 //! that keeps no record, or that this server doesn't serve, is settled

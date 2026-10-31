@@ -33,10 +33,11 @@
 //! keeps the tools it started with, so each call carries its type's writes
 //! as they are now ([`CallContext`]): once they're denied, the tools that
 //! write are refused. A run's call that changes a memory commits a record of
-//! itself with the change ([`MadeCall`]), one for each call: a call whose
+//! itself with the change ([`MadeCall`]), one for each call, and one that
+//! gives a memory the text it holds commits the record alone: a call whose
 //! answer was lost is answered by that record, whatever became of the memory
-//! since, and made then only if it changed nothing ([`settle`]); a sender
-//! that commits after its call was settled changes nothing.
+//! since, and made then only when there's none ([`settle`]); a sender that
+//! commits after its call was settled changes nothing.
 //!
 //! - [`notes`]: the `notes` kind, and the [`notes::NoteStore`] it keeps its notes in.
 //! - [`registry`]: [`registry::MemoryProviders`], the kinds a server serves, by key.
@@ -552,7 +553,9 @@ pub struct Recorded {
     /// The run's call that made the change, kept with it: one for each call,
     /// ever. Another for the same call, in this transaction or an earlier
     /// one, fails the change ([`MemoryError::AlreadyMade`]), and it changes
-    /// nothing. Set on a call's first change only.
+    /// nothing. Set on a call's first change only. A call that gives a
+    /// memory the text it holds changes nothing, and keeps this alone: no
+    /// audit event, no webhook events.
     pub call: Option<MadeCall>,
 }
 
@@ -605,7 +608,9 @@ impl MadeCall {
 /// before it commits: a committed change always has its records, and a
 /// refused or rolled-back one never does. Each is placed in the memory's
 /// own workspace: anything placed elsewhere fails the change, `Unavailable`,
-/// and it changes nothing.
+/// and it changes nothing. It's called for a run's call that gives a memory
+/// the text it holds too, as for an update, and only the call it builds is
+/// kept ([`Recorded::call`]).
 pub type Record<'a> = dyn Fn(&MemoryChange) -> Recorded + Send + Sync + 'a;
 
 /// What a change records when nothing is recorded with it, as a test's
@@ -811,9 +816,9 @@ pub enum MemoryError {
     NotServed,
     #[error("not a cursor from this list")]
     InvalidCursor,
-    /// The run's call made its change already ([`Recorded::call`]): this
-    /// one changed nothing.
-    #[error("the call made its change already")]
+    /// The run's call was made already ([`Recorded::call`]): this one
+    /// changed nothing.
+    #[error("the call was made already")]
     AlreadyMade,
 }
 
@@ -864,9 +869,10 @@ pub trait MemoryProvider: Send + Sync {
     /// change records with it what `record` builds from it (its webhook
     /// events) and, for a run's call (`context.origin`), the call itself
     /// with its answer ([`Recorded::call`]), in its transaction; a refusal
-    /// records nothing. A call that made its change already fails,
-    /// `AlreadyMade`, changing nothing. A save or a change of text writes
-    /// `context.origin` as who wrote it.
+    /// records nothing, and a call giving a memory the text it holds records
+    /// the call alone. A call made already fails, `AlreadyMade`, changing
+    /// nothing. A save or a change of text writes `context.origin` as who
+    /// wrote it.
     async fn call(
         &self,
         scope: &MemoryScope,
@@ -876,11 +882,12 @@ pub trait MemoryProvider: Send + Sync {
         record: &Record<'_>,
     ) -> Result<CallResult, MemoryError>;
 
-    /// What run `run_id`'s call `tool_call_id` changed in `scope`, as its
-    /// change recorded it ([`Recorded::call`]), whatever became of the memory
-    /// since: `None` when it changed nothing there, or wasn't made. A kind
-    /// that keeps no such record answers `Unsupported`, and a call of its
-    /// whose answer was lost is settled unknown.
+    /// What run `run_id`'s call `tool_call_id` made in `scope`, as it
+    /// recorded it ([`Recorded::call`]), whatever became of the memory
+    /// since: `None` when it recorded nothing there (a search, a refusal),
+    /// or wasn't made. A kind that keeps no such record answers
+    /// `Unsupported`, and a call of its whose answer was lost is settled
+    /// unknown.
     async fn made(
         &self,
         scope: &MemoryScope,
@@ -970,7 +977,7 @@ pub trait MemoryProvider: Send + Sync {
 }
 
 /// Makes a run's call through `provider` ([`MemoryProvider::call`]), unless
-/// it made its change already: then it's answered as that change recorded it
+/// it was made already: then it's answered as it recorded it
 /// ([`MemoryProvider::made`]), and nothing changes again. What a sender that
 /// stalled past its claim finds once its call was settled meanwhile.
 pub async fn make(
@@ -1003,9 +1010,8 @@ pub async fn make(
 /// before it recorded what came of it: answered as its change recorded it
 /// when it made one ([`MemoryProvider::made`]), whatever became of the memory
 /// since, and its change never made again; made now, as [`make`] makes it,
-/// when it made none. A call that changed nothing has no record, so it's
-/// made again: a search searches again, and a change of a memory to the text
-/// it held then changes it now if it was edited since.
+/// when it made none. A call that recorded nothing (a search, a refusal) is
+/// made again: a search searches again.
 pub async fn settle(
     provider: &dyn MemoryProvider,
     scope: &MemoryScope,

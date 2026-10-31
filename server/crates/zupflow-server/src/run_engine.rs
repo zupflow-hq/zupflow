@@ -35,9 +35,9 @@
 //! on the type as it is then, made in the run's own scope with a webhook
 //! row and a record of the call committed with its change, and a lapsed one
 //! is settled by that record: answered as made, whatever became of the
-//! memory since, and its change never made again; one with no record (it
-//! changed nothing, or was never made) is made then. A channel session's
-//! runs have no memory.
+//! memory since, and its change never made again; one with no record (a
+//! search, a refusal, or a call never made) is made then. A channel
+//! session's runs have no memory.
 //!
 //! The job queue's lease and the run's claim go together: the job's lease
 //! is extended before every step that keeps the claim, and once a step

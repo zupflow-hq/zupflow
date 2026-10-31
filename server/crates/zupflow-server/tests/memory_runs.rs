@@ -636,10 +636,11 @@ async fn answered(setup: &Setup, run: RunId) -> String {
     calls[0].outcome.clone().unwrap().content
 }
 
-/// A call whose change committed and whose worker stopped before recording
-/// it is answered as it was made, whatever a person did to its memory
-/// since: a save forgotten or edited isn't saved again, an update edited
-/// since isn't made again over the edit, and a forget answers as it forgot.
+/// A call made, whose worker stopped before recording what came of it, is
+/// answered as it was made, whatever a person did to its memory since: a
+/// save forgotten or edited isn't saved again, an update edited since isn't
+/// made again over the edit, even one that gave the note the text it held,
+/// and a forget answers as it forgot.
 #[tokio::test]
 async fn answers_a_lapsed_call_as_it_was_made_whatever_became_of_its_memory() {
     // A save, forgotten before the call was settled.
@@ -710,6 +711,26 @@ async fn answers_a_lapsed_call_as_it_was_made_whatever_became_of_its_memory() {
         .filter(|(kind, _)| kind == "memory.forgotten")
         .count();
     assert_eq!(forgotten, 1, "forgotten once");
+
+    // An update to the text the note held, which changed nothing, edited
+    // before the call was settled: answered as it was made, the edit kept,
+    // and nothing sent for the run.
+    let (setup, _) = remembering("allow").await;
+    let note = setup.save_note("Ships on Fridays.").await;
+    let unchanged = calling_memory(
+        "update_memory",
+        &json!({ "memory": short_id(&note), "text": "Ships on Fridays." }),
+    );
+    let run = setup.start(&unchanged).await;
+    stopped_after_making(&setup, edit_note(&setup, &note, "Ships on Wednesdays.")).await;
+    assert_eq!(
+        answered(&setup, run).await,
+        result(&format!("Updated {}.", short_id(&note)))
+    );
+    let notes = setup.notes().await;
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["text"], "Ships on Wednesdays.", "the edit kept");
+    assert_eq!(changes(&setup, "memory.updated").await, (0, 1), "the edit's only");
 }
 
 /// A worker stalls after claiming a save's send, before making it; its

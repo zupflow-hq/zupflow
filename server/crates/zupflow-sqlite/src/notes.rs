@@ -6,15 +6,16 @@
 //! in it, what must hold across concurrent saves: the scope's agent and type
 //! are there, the scope keeps fewer notes than its limit, and a short ID is
 //! held once in it. An update writes the text, who wrote it and when, or,
-//! with the text the note already holds, nothing at all. What a change
-//! records ([`Record`]) is written in its transaction: each webhook event
-//! with its deliveries and their jobs, as the outbox writes one, and the
-//! audit event, each only in the scope's own workspace.
+//! with the text the note already holds, nothing but a run's call (below).
+//! What a change records ([`Record`]) is written in its transaction: each
+//! webhook event with its deliveries and their jobs, as the outbox writes
+//! one, and the audit event, each only in the scope's own workspace.
 //!
 //! A run's call that changes a note is written with its change, in
-//! `memory_calls`, one row for each call ([`INSERT_CALL`]): a second of the
-//! same call fails its change, `AlreadyMade`, and the transaction rolls
-//! back. Its row is read back within the full scope ([`MADE`]).
+//! `memory_calls`, one row for each call ([`INSERT_CALL`]), and one that
+//! gives a note the text it holds is written alone, with no event: a second
+//! of the same call fails its change, `AlreadyMade`, and the transaction
+//! rolls back. Its row is read back within the full scope ([`MADE`]).
 //!
 //! A search is FTS5's: the notes holding every word, by word, in any case
 //! and accent, ranked by BM25, then newest first. BM25 weighs a word by how
@@ -218,9 +219,10 @@ const WRITTEN: &str = concat!(
     written!(),
     " AND (id = ?7 OR short_id = ?8)"
 );
-/// A run's call (`?5`) of run `?6` that changed a note, with its tool
-/// (`?7`), the note (`?8`), its answer (`?9`) and when (`?10`): none when
-/// the call made its change already, as a call's row is its only one.
+/// A run's call (`?5`) of run `?6` that changed a note, or gave it the text
+/// it held, with its tool (`?7`), the note (`?8`), its answer (`?9`) and
+/// when (`?10`): none when the call was made already, as a call's row is its
+/// only one.
 const INSERT_CALL: &str = "INSERT INTO memory_calls (id, organization_id, workspace_id, agent_id, memory_type_id, \
      run_id, tool, memory_id, answer, created_at) VALUES (?5, ?1, ?2, ?3, ?4, ?6, ?7, ?8, ?9, ?10) \
      ON CONFLICT DO NOTHING";
@@ -518,13 +520,23 @@ impl NoteStore for SqliteNoteStore {
                 }
             }
             // It holds that text already, or there's no such note to change.
+            // A run's call to that text changed nothing, and keeps only
+            // itself: no event, no audit event. Settled later, it's answered
+            // as it was made, never made again over a change since.
             None => {
                 let row = bind_note(bind_written(sqlx::query(WRITTEN), scope, reach), note)
                     .fetch_optional(&mut *transaction)
                     .await
                     .map_err(failed("update"))?;
+                let unchanged =
+                    MemoryChange::Updated(row.as_ref().map(note_from).transpose()?.ok_or(MemoryError::NotFound)?);
+                let call = Recorded {
+                    call: record(&unchanged).call,
+                    ..Recorded::default()
+                };
+                write_records(&mut transaction, scope, &call, "update").await?;
                 Rewritten {
-                    memory: row.as_ref().map(note_from).transpose()?.ok_or(MemoryError::NotFound)?,
+                    memory: unchanged.into_memory(),
                     changed: false,
                 }
             }

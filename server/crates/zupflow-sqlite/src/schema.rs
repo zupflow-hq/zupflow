@@ -105,8 +105,8 @@ const TABLES: &[(&str, Scoping)] = &[
     ("memory_types", Scoping::Organization),
     ("default_memory_types", Scoping::Organization),
     ("memory_notes", Scoping::Workspace),
-    // What each run's memory call changed, one row per call, kept while
-    // its workspace is.
+    // Each run's memory call that changed a memory, or gave one the text it
+    // held: one row per call, kept while its workspace is.
     ("memory_calls", Scoping::Workspace),
     // A deleted workspace's events stay in the log.
     ("audit_events", Scoping::History),

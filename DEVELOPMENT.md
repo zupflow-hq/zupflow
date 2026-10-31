@@ -437,12 +437,13 @@ organization, so its run goes on without anyone deciding. A call is made in
 the run's own organization, workspace and agent, with an origin naming the
 run, the call and whether the model had read an app's result before it
 (`after_app_content`), and one that changes a memory commits a record of
-itself with its change, one for each call. One whose worker stopped is
-answered by that record, as it was made, whatever became of the memory
-since, and its change is never made again; one with no record (it changed
-nothing, or was never made) is made then. A worker that makes its call
-after another settled it is refused, and changes nothing. A channel
-session's runs have no memory.
+itself with its change, one for each call; one that gives a memory the
+text it holds commits the record alone, with no webhook event. One whose
+worker stopped is answered by that record, as it was made, whatever became
+of the memory since, and its change is never made again; one with no record
+(a search, a refusal, or a call never made) is made then. A worker that
+makes its call after another settled it is refused, and changes nothing. A
+channel session's runs have no memory.
 Each call it asks for is decided (floor, then policy) and recorded with its
 policy, mode and rule; allowed calls go only to their own installation's MCP
 server through the safe outbound path, with its credential injected last. A
