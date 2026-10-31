@@ -418,19 +418,31 @@ at the first model attempt, and frozen with them: the agent's memory type
 for the type's `writes` (`deny` offers only `search_memory`), under the
 kind's own names (`save_memory`), which no app's tool can have, joined to
 the one list by name, and the recall, the type's memories as the kind
-recalls them for the workspace. Every later attempt sends the same again
-from the run, through a retry, a restart or an approval pause; nothing reads
-the recall again during a run, and what it saves reaches the next run. A run
-with memory off is offered the same tools, recalls nothing, and has every
-call to one refused (`memory_off`). Each memory call is decided as it's
-made, on the type as it is then: `search_memory` is allowed, a tool that
-writes follows the type's `writes` now (`approve` pauses the run as an app's
-call does, `deny` refuses it), and a call whose type was deleted is refused
-(`memory_type_removed`). It's made in the run's own organization, workspace
-and agent, with an origin naming the run, the call and whether the model had
-read an app's result before it (`after_app_content`); one whose worker
-stopped is settled by finding its change by that origin, never made twice.
-A channel session's runs have no memory.
+recalls them for the workspace, kept on the run once with its digest. Every
+later attempt sends the same again from the run, held to it by the digest,
+through a retry, a restart or an approval pause; nothing reads the recall
+again during a run, the run drops it when it ends and keeps the digest, and
+what it saves reaches the next run. A run with memory off is offered the
+same tools, recalls nothing, and has every call to one refused
+(`memory_off`). Each memory call is decided as it's made, on the type as it
+is then: `search_memory` is allowed, a tool that writes follows the type's
+`writes` now (`approve` pauses the run as an app's call does, `deny` refuses
+it), and a call is refused whose type was deleted (`memory_type_removed`),
+whose kind this server doesn't serve (`memory_kind_not_served`) or whose
+stored settings its kind refuses now (`invalid_memory_settings`), with the
+same code whether that's found when it's decided, just before it's made or
+as it's made. Deleting a type queues a job in the same transaction that
+refuses each call waiting for approval in it, in any workspace of its
+organization, so its run goes on without anyone deciding. A call is made in
+the run's own organization, workspace and agent, with an origin naming the
+run, the call and whether the model had read an app's result before it
+(`after_app_content`), and one that changes a memory commits a record of
+itself with its change, one for each call. One whose worker stopped is
+answered by that record, as it was made, whatever became of the memory
+since, and its change is never made again; one with no record (it changed
+nothing, or was never made) is made then. A worker that makes its call
+after another settled it is refused, and changes nothing. A channel
+session's runs have no memory.
 Each call it asks for is decided (floor, then policy) and recorded with its
 policy, mode and rule; allowed calls go only to their own installation's MCP
 server through the safe outbound path, with its credential injected last. A
