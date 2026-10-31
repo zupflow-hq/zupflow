@@ -1220,8 +1220,10 @@ pub trait ChannelStore: Send + Sync {
     /// `None` starts a run with the session's own, and leaves the dispatch
     /// waiting when it has none. Each run's snapshot carries the session's
     /// memory and the recall it keeps for the run's history start, read by
-    /// the first run from that start; a session whose run read an app's
-    /// tool result keeps that as the run ends.
+    /// the first run from that start, and again by the first run after a
+    /// forget marked the session, which takes the mark as it starts; a
+    /// session whose run read an app's tool result keeps that as the run
+    /// ends.
     async fn dispatch(
         &self,
         organization_id: OrganizationId,

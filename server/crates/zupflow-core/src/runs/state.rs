@@ -411,10 +411,11 @@ pub struct SessionMemory {
 /// What a channel session's history, from a run's start, begins with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionRecall {
-    /// Not read for the run's history start yet: the first run from that
-    /// start reads it with its first model attempt, from the session's own
-    /// type for its audience ([`super::reducer::Facts::memory`]), and the
-    /// session keeps it for every run from the same start.
+    /// Not read for the run's history start yet, or not since a forget
+    /// marked the session: the run reads it with its first model attempt,
+    /// from the session's own type for its audience
+    /// ([`super::reducer::Facts::memory`]), and the session keeps it for
+    /// every run from the same start, until the next forget.
     Unread,
     /// Read for the run's history start, framed: `None` when there was
     /// nothing to recall, and for a session without memory.

@@ -23,8 +23,10 @@
 //! the session keeps the recall its history begins with, once for each
 //! start: the first run from a start reads it with its first model attempt
 //! ([`keep_recall`]), and every other run from that start sends it again.
-//! When one of its runs read an app's tool result, the session keeps that
-//! as it ends, for what later runs save.
+//! A forget marks the sessions that may recall what it forgot
+//! ([`refresh_recall`]): the next run of each reads the recall anew, from
+//! the same start. When one of its runs read an app's tool result, the
+//! session keeps that as it ends, for what later runs save.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -45,7 +47,7 @@ use zupflow_core::ids::{
     AgentChannelId, AgentId, ChannelConnectionId, ChannelConversationId, ChannelMessageId, MemoryTypeId,
     ModelConnectionId, ModelId, OrganizationId, RunId, SessionId, WorkspaceId,
 };
-use zupflow_core::memory::Audience;
+use zupflow_core::memory::{Audience, MemoryScope};
 use zupflow_core::model_store::RunModel;
 use zupflow_core::models::Message;
 use zupflow_core::runs::history::{transcript, trimmed_start, weight as weight_of};
@@ -1401,15 +1403,18 @@ async fn start_session_run(
     .await?;
     let offer = to_json(&template.offer)?;
     // The memory is fixed with the tools; a new run session reads what it
-    // recalls anew, as does each history start ([`keep_recall`]).
+    // recalls anew, as does each history start ([`keep_recall`]), and the
+    // first run after a forget marked the session ([`refresh_recall`]),
+    // which takes the mark: its history stays as it is.
     let started = sqlx::query(
         "UPDATE channel_sessions SET session_id = ?1, active_run_id = ?2, run_count = ?3, seen_message_id = ?4, \
          seen_at = ?5, model = ?6, model_id = ?7, model_connection_id = ?8, instructions = ?9, offer = ?10, \
          history_budget = ?11, updated_at = ?12, changes_noted_at = CASE WHEN ?13 IS NULL THEN changes_noted_at \
          WHEN changes_noted_at IS NULL OR changes_noted_at < ?13 THEN ?13 ELSE changes_noted_at END, \
          memory_type_id = ?17, memory_audience = ?18, \
-         recall = CASE WHEN session_id = ?1 AND memory_type_id IS ?17 THEN recall END, \
-         recall_start_run_id = CASE WHEN session_id = ?1 AND memory_type_id IS ?17 THEN recall_start_run_id END \
+         recall = CASE WHEN session_id = ?1 AND memory_type_id IS ?17 AND refresh_recall = 0 THEN recall END, \
+         recall_start_run_id = CASE WHEN session_id = ?1 AND memory_type_id IS ?17 AND refresh_recall = 0 \
+         THEN recall_start_run_id END, refresh_recall = 0 \
          WHERE organization_id = ?14 AND workspace_id = ?15 AND id = ?16 AND active_run_id IS NULL",
     )
     .bind(session_id.uuid())
@@ -1875,4 +1880,26 @@ pub(crate) async fn keep_recall(
     .await
     .map_err(failed("keep_recall"))?;
     Ok(kept.rows_affected() == 1)
+}
+
+/// Marks every channel session of `scope`'s agent, in its workspace, kept
+/// on its type, to read its recall anew at its next run, in the transaction
+/// of the forget that asks it ([`zupflow_core::memory::Recorded::refresh_recall`]):
+/// a session may recall what was forgotten until then. Only a run's start
+/// reads the mark ([`start_session_run`]), so a run under way keeps the
+/// recall it started with.
+pub(crate) async fn refresh_recall(connection: &mut SqliteConnection, scope: &MemoryScope) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE channel_sessions SET refresh_recall = 1 \
+         WHERE organization_id = ?1 AND workspace_id = ?2 AND memory_type_id = ?4 AND refresh_recall = 0 \
+         AND agent_channel_id IN (SELECT id FROM agent_channels \
+         WHERE organization_id = ?1 AND workspace_id = ?2 AND agent_id = ?3)",
+    )
+    .bind(scope.organization_id.uuid())
+    .bind(scope.workspace_id.uuid())
+    .bind(scope.agent_id.uuid())
+    .bind(scope.memory_type_id.uuid())
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
 }

@@ -415,9 +415,10 @@ pub struct Facts {
     /// attempt and read only with it: `None` without memory. Every later
     /// attempt sends the memory the first kept on the run
     /// ([`frozen_memory`]). A channel run's is its session's: the first run
-    /// from the session's history start reads its recall, from the
-    /// session's type for its audience ([`SessionRecall::Unread`]), and
-    /// every other run sends the one the session kept.
+    /// from the session's history start, or after a forget marked the
+    /// session, reads its recall, from the session's type for its audience
+    /// ([`SessionRecall::Unread`]), and every other run sends the one the
+    /// session kept.
     pub memory: Option<FrozenMemory>,
     /// Whether the run's model can be called now, read with the offer for a
     /// run that names an organization's model.
@@ -1055,8 +1056,9 @@ pub fn frozen_offer(snapshot: &Snapshot) -> Option<&Offer> {
 /// A channel run's memory is its session's, fixed when the session began,
 /// with the recall the session keeps for the run's history start: so every
 /// run of the session sends the same tools and the same recall until a
-/// trim moves the start. `None` until the first run from that start read
-/// it ([`SessionRecall::Unread`]), and for a session without memory.
+/// trim moves the start, or a forget marks the session for its next run.
+/// `None` until the first run from that start, or that next run, read it
+/// ([`SessionRecall::Unread`]), and for a session without memory.
 pub fn frozen_memory(snapshot: &Snapshot) -> Option<FrozenMemory> {
     let Some(session) = &snapshot.session else {
         return snapshot.frozen_memory.clone();

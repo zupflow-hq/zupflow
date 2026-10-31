@@ -706,21 +706,30 @@ history start: the first run from a start reads it from the session's own
 type for that audience with its first model attempt, and every other run
 from that start sends the same bytes, as the first block of the history's
 first message, so each run continues the one before; a run keeps only the
-type and the recall's digest. A save in one run reaches the session's later
-runs through the conversation, and the recall at the next trim or run
-session. A trim reads the recall anew from the session's type, which
-recalls nothing once the type is deleted (its calls are refused
-`memory_type_removed`, as any run's are), and the tools stay as they were. A
-`dm`'s messages outside threads are one session, so its recall is read again
-only at a trim or a new run session. Once a run of a session read an app's tool result, every
+type and the recall's digest. A save or a change in one run reaches the
+session's later runs through the conversation, and the recall at the next
+trim or run session; a `dm`'s messages outside threads are one session, so
+they learn of notes saved elsewhere only then. A trim reads the recall anew
+from the session's type. A forget reaches every session sooner: forgetting
+a memory (`deleteMemory`, each hundred of `deleteMemories`, or a run's
+`forget_memory`, the session's own included) marks every channel session of
+that agent, in that workspace, kept on that type, in the forget's own
+transaction, and deleting a type marks every session kept on it; the next
+run of a marked session reads the recall anew from the same history start,
+so only the recall block misses the cache, once per forget, and its history
+isn't trimmed. A run under way keeps the recall it started with, and ends as
+it would have. A deleted type recalls nothing (its calls are refused
+`memory_type_removed`, as any run's are), and the tools stay as they were.
+Once a run of a session read an app's tool result, every
 later save in the session says so (`after_app_content`), a trim included. A
 run that uses its session's memory fails `channel_session_removed` if the
 session goes, with its agent's channel, connection or app, while it's under
 way. `tests/channel_runs.rs` drives all of it through the route with a fake
 team chat, and `tests/channel_prompt_cache.rs` checks the prefix turn by turn
 on the Anthropic and OpenAI paths, with memory too (the recall's bytes and
-place, the audiences, `after_app_content`, a deleted type, isolation, and
-never more than four breakpoints, through OpenRouter to Claude as well).
+place, the audiences, `after_app_content`, a forget reaching each session at
+its next run, a deleted type, isolation, and never more than four
+breakpoints, through OpenRouter to Claude as well).
 
 ### Agents in Slack
 

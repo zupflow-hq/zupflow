@@ -21,24 +21,28 @@
 //! A change people make, from the API or the Console, commits with what the
 //! server records of it: its audit event and its webhook events
 //! ([`Record`]). A change a run's tool call makes commits with its webhook
-//! events, and no audit event: the run's timeline is its record. What a
-//! deleted agent, workspace or type kept, each kind forgets when a job the
-//! deletion queued tells it to ([`FORGET_JOB`]).
+//! events, and no audit event: the run's timeline is its record. A forget,
+//! either way, also marks the channel sessions that may recall what it
+//! forgot, so each reads its recall anew at its next run
+//! ([`Recorded::refresh_recall`]). What a deleted agent, workspace or type
+//! kept, each kind forgets when a job the deletion queued tells it to
+//! ([`FORGET_JOB`]).
 //!
 //! A run starts with its memory's **recall**: lines the kind gives, framed
 //! by the server ([`Recall::framed`]), none of which opens or closes the
 //! frame ([`shown_line`]), and fixed for the whole run (a channel session's,
-//! for every run from one history start) so the provider's prompt cache
-//! holds. The same memories, settings and audience give the same bytes,
-//! and the same settings give the same tool definitions. A run
-//! keeps the tools it started with, so each call carries its type's writes
-//! as they are now ([`CallContext`]): once they're denied, the tools that
-//! write are refused. A run's call that changes a memory commits a record of
-//! itself with the change ([`MadeCall`]), one for each call, and one that
-//! gives a memory the text it holds commits the record alone: a call whose
-//! answer was lost is answered by that record, whatever became of the memory
-//! since, and made then only when there's none ([`settle`]); a sender that
-//! commits after its call was settled changes nothing.
+//! for every run from one history start, until a forget marks the session)
+//! so the provider's prompt cache holds. The same memories, settings and
+//! audience give the same bytes, and the same settings give the same tool
+//! definitions. A run keeps the tools it started with, so each call carries
+//! its type's writes as they are now ([`CallContext`]): once they're denied,
+//! the tools that write are refused. A run's call that changes a memory
+//! commits a record of itself with the change ([`MadeCall`]), one for each
+//! call, and one that gives a memory the text it holds commits the record
+//! alone: a call whose answer was lost is answered by that record, whatever
+//! became of the memory since, and made then only when there's none
+//! ([`settle`]); a sender that commits after its call was settled changes
+//! nothing.
 //!
 //! - [`notes`]: the `notes` kind, and the [`notes::NoteStore`] it keeps its notes in.
 //! - [`registry`]: [`registry::MemoryProviders`], the kinds a server serves, by key.
@@ -552,17 +556,25 @@ impl MemoryChange {
     }
 }
 
-/// What one change to a memory records with it: its audit event, and its
+/// What one change to a memory records with it: its audit event, its
 /// webhook events, each recorded with a delivery for every enabled endpoint
 /// of its organization and environment subscribed to its type, as
-/// [`crate::webhooks::WebhookStore::record_event`] records one. Built by the
-/// server, which knows who acts and what to call things, from the memory as
-/// the change left it; never its text. A run's call adds itself
-/// ([`Recorded::call`]).
+/// [`crate::webhooks::WebhookStore::record_event`] records one, and, for a
+/// forget, the channel sessions it reaches ([`Recorded::refresh_recall`]).
+/// Built by the server, which knows who acts and what to call things, from
+/// the memory as the change left it; never its text. A run's call adds
+/// itself ([`Recorded::call`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Recorded {
     pub audit: Option<AuditEntry>,
     pub events: Vec<NewWebhookEvent>,
+    /// Marks every channel session of the scope's agent, in its workspace,
+    /// kept on its type, to read its recall anew at its next run, from the
+    /// same history start: set for a forget, so a memory forgotten isn't
+    /// recalled again, though a session otherwise keeps its recall until a
+    /// trim. A run under way keeps the recall it started with. Marked once
+    /// for a change that forgets many.
+    pub refresh_recall: bool,
     /// The run's call that made the change, kept with it: one for each call,
     /// ever. Another for the same call, in this transaction or an earlier
     /// one, fails the change ([`MemoryError::AlreadyMade`]), and it changes

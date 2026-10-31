@@ -10,7 +10,11 @@
 //! the runs that start, and each message read once in a run session. A
 //! session keeps the memory it began with, and one recall for each history
 //! start, read by the first run from it; other memory starts a new run
-//! session, and a run whose session went with its memory fails.
+//! session, and a run whose session went with its memory fails. Forgetting
+//! a note a session may recall (its agent's, in its workspace and type), or
+//! deleting its type, marks the session in the same transaction, and no
+//! other: its next run reads the recall anew, its history kept, while a run
+//! under way keeps the recall it started with.
 //! A message is read back byte for byte as it was recorded. Every change is
 //! made only by an editor who still may, and an agent's apps go with it.
 //! An app is made at least once: an attempt marks it before the provider is
@@ -55,12 +59,15 @@ use zupflow_core::connect::{ConnectIntent, ConnectSessionStatus, ConnectStore, N
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{
     AgentChannelId, AgentId, ApiKeyId, ChannelAppId, ChannelAppManagerId, ChannelConnectionId, ChannelConversationId,
-    ChannelMessageId, ConnectSessionId, MemberId, MemoryTypeId, ModelConnectionId, ModelId, OrganizationId, RunId,
-    ToolCallId, UserId, WorkspaceId,
+    ChannelMessageId, ConnectSessionId, MemberId, MemoryId, MemoryTypeId, ModelConnectionId, ModelId, OrganizationId,
+    RunId, ToolCallId, UserId, WorkspaceId,
 };
+use zupflow_core::installations::ShortId;
 use zupflow_core::jobs::{JobOptions, JobQueue};
 use zupflow_core::keys::{Sealed, WrappedKey};
-use zupflow_core::memory::{Audience, MemoryWrites, notes};
+use zupflow_core::memory::notes::{self, NewNote, NoteRef, NoteStore, Reach};
+use zupflow_core::memory::type_store::{MemoryTypeStore, NewMemoryType};
+use zupflow_core::memory::{Audience, MemoryError, MemoryKind, MemoryScope, MemoryWrites, Origin, record_nothing};
 use zupflow_core::model_store::{RouteState, RunModel};
 use zupflow_core::models::Message;
 use zupflow_core::models::{Completion, Reply, TokenUsage};
@@ -69,7 +76,7 @@ use zupflow_core::runs::QueuedJob;
 use zupflow_core::runs::names::{Offer, memory_tool};
 use zupflow_core::runs::reducer::{Facts, Io, ModelAnswer, ModelResult, SESSION_REMOVED, advance, cancel};
 use zupflow_core::runs::state::{
-    ClaimantId, Continuation, FrozenMemory, InvocationId, RequestId, SessionMemory, SessionRecall,
+    ClaimantId, Continuation, FrozenMemory, InvocationId, RequestId, SessionMemory, SessionRecall, Snapshot,
 };
 use zupflow_core::runs::store::{Applied, RunStore};
 use zupflow_core::runs::transition::Operation;
@@ -78,6 +85,7 @@ use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
 
 use crate::audit_store::{by_suite, by_suite_in};
+use crate::note_store;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Tenant {
@@ -114,6 +122,10 @@ pub struct Stores<'a> {
     pub jobs: &'a dyn JobQueue,
     /// The runs a session starts, in the same store.
     pub runs: &'a dyn RunStore,
+    /// The notes a session recalls, and the types it's kept on, in the same
+    /// store: a forget marks the sessions that may recall what it forgot.
+    pub notes: &'a dyn NoteStore,
+    pub memory_types: &'a dyn MemoryTypeStore,
 }
 
 pub async fn run(stores: Stores<'_>, prepare: Prepare) {
@@ -129,6 +141,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     catches_up_only_on_its_own_join(&stores, &prepare).await;
     starts_one_run_per_session(&stores, &prepare).await;
     keeps_a_sessions_memory_and_one_recall_per_history_start(&stores, &prepare).await;
+    reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(&stores, &prepare).await;
     counts_the_breaker_under_concurrency(&stores, &prepare).await;
     counts_runs_and_reads_each_message_once(&stores, &prepare).await;
     links_a_team_through_a_connect_session(&stores, &prepare).await;
@@ -1451,26 +1464,7 @@ async fn keeps_a_sessions_memory_and_one_recall_per_history_start(stores: &Store
     let (_, _, connection) = installed(stores, &t, ws, t.agent).await;
     let channel = stores.channels.list_agent_channels(org, ws, t.agent).await.unwrap()[0].clone();
     let base = template();
-    let remembering = |memory_type_id: MemoryTypeId| {
-        let tools = notes::tools(MemoryWrites::Allow)
-            .iter()
-            .map(|tool| memory_tool(memory_type_id, "Customer notes", notes::KIND, notes::NAME, tool))
-            .collect();
-        let (offer, left_out) = Offer::default().with(tools);
-        assert!(left_out.is_empty());
-        SessionTemplate {
-            offer,
-            memory: Some(SessionMemory {
-                memory_type_id,
-                audience: Audience::Workspace,
-            }),
-            ..base.clone()
-        }
-    };
-    let read = |memory_type_id: MemoryTypeId, recall: &str| FrozenMemory {
-        memory_type_id,
-        recall: Some(recall.to_owned()),
-    };
+    let remembering = |memory_type_id: MemoryTypeId| remembering(&base, memory_type_id);
     let mut sent = 0;
     let mut start = |template: SessionTemplate| {
         sent += 1;
@@ -1586,6 +1580,363 @@ async fn keeps_a_sessions_memory_and_one_recall_per_history_start(stores: &Store
     let failed = stores.runs.find_run(org, ws, orphaned).await.unwrap().unwrap();
     assert_eq!(failed.status, RunStatus::Failed);
     assert_eq!(failed.error.map(|error| error.code), Some(SESSION_REMOVED.to_owned()));
+}
+
+/// `base`, remembering in `memory_type_id` for the workspace, with the
+/// `notes` kind's tools.
+fn remembering(base: &SessionTemplate, memory_type_id: MemoryTypeId) -> SessionTemplate {
+    let tools = notes::tools(MemoryWrites::Allow)
+        .iter()
+        .map(|tool| memory_tool(memory_type_id, "Customer notes", notes::KIND, notes::NAME, tool))
+        .collect();
+    let (offer, left_out) = Offer::default().with(tools);
+    assert!(left_out.is_empty());
+    SessionTemplate {
+        offer,
+        memory: Some(SessionMemory {
+            memory_type_id,
+            audience: Audience::Workspace,
+        }),
+        ..base.clone()
+    }
+}
+
+/// What a model attempt reads of `memory_type_id`: `recall`.
+fn read(memory_type_id: MemoryTypeId, recall: &str) -> FrozenMemory {
+    FrozenMemory {
+        memory_type_id,
+        recall: Some(recall.to_owned()),
+    }
+}
+
+/// A `notes` type of the organization's, as its admin makes it.
+async fn notes_type(stores: &Stores<'_>, t: &Tenant, name: &str) -> MemoryTypeId {
+    let memory_type_id = MemoryTypeId::generate();
+    stores
+        .memory_types
+        .create_type(
+            t.organization_id,
+            memory_type_id,
+            t.admin,
+            &NewMemoryType {
+                name: name.to_owned(),
+                kind: MemoryKind::parse(notes::KIND).unwrap(),
+                settings: notes::check_settings(&serde_json::Map::new()).unwrap(),
+                writes: MemoryWrites::Allow,
+            },
+            now(),
+            &by_suite,
+        )
+        .await
+        .expect("an admin makes a type");
+    memory_type_id
+}
+
+/// A session in its own thread of C0SUPPORT, on an agent channel, started
+/// with `template` every time.
+struct Thread {
+    ws: WorkspaceId,
+    connection: ChannelConnectionId,
+    channel: AgentChannelId,
+    thread: &'static str,
+    template: SessionTemplate,
+}
+
+impl Thread {
+    fn memory_type_id(&self) -> MemoryTypeId {
+        self.template.memory.expect("a session with memory").memory_type_id
+    }
+
+    /// Starts the session's next run, with its `n`th message: the run's ID
+    /// and its snapshot.
+    async fn next_run(&self, stores: &Stores<'_>, t: &Tenant, n: u32) -> (RunId, Snapshot) {
+        let external_id = format!("{}.{n}", self.thread);
+        let mut new = message(&external_id, "C0SUPPORT", "what's due?", 1_000);
+        new.thread_key = self.thread.to_owned();
+        let asked = stores
+            .channels
+            .record_message(t.organization_id, self.ws, self.connection, &new, now())
+            .await
+            .unwrap()
+            .message;
+        let outcome = stores
+            .channels
+            .dispatch(
+                t.organization_id,
+                self.ws,
+                &dispatch_of(asked.id, self.channel, &external_id),
+                Some(&self.template),
+                now(),
+            )
+            .await
+            .unwrap();
+        let DispatchOutcome::Started { run_id } = outcome else {
+            panic!("a run starts in the idle session: {outcome:?}");
+        };
+        let snapshot = stores
+            .runs
+            .find_snapshot(t.organization_id, self.ws, run_id)
+            .await
+            .unwrap()
+            .expect("the run");
+        (run_id, snapshot)
+    }
+
+    /// Starts the session's next run and answers it, as having read
+    /// `recall` if it reads one: what its session's recall was as it
+    /// started, and what it sent.
+    async fn answered(&self, stores: &Stores<'_>, t: &Tenant, n: u32, recall: &str) -> (SessionRecall, Option<String>) {
+        let (run, snapshot) = self.next_run(stores, t, n).await;
+        let session = snapshot.session.expect("a channel run's session");
+        let sent = answer_remembering(
+            stores,
+            t.organization_id,
+            self.ws,
+            run,
+            &read(self.memory_type_id(), recall),
+        )
+        .await;
+        assert_eq!(sent.len(), 1, "{}: one model attempt", self.thread);
+        (session.recall, sent[0].clone())
+    }
+}
+
+/// A forget reaches every session that may recall what it forgot at the
+/// session's next run, its history kept: forgetting a note of a session's
+/// agent, in its workspace and type, alone or with its scope's oldest,
+/// marks every such session in the forget's own transaction, and no other;
+/// a save, a change, a forget that doesn't ask it and one that fails mark
+/// none; and deleting a type marks every session kept on it, in every
+/// workspace. A run under way keeps the recall it started with and ends as
+/// it would have; the next run reads the recall anew, and the one after
+/// sends what it read.
+async fn reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(stores: &Stores<'_>, prepare: &Prepare) {
+    const RECALL: &str = "<memory>\n[k7m2qd] Prefers replies in Portuguese.\n</memory>";
+    const LATER: &str = "<memory>\n[p3x9tw] Ships on Fridays.\n</memory>";
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let customer = notes_type(stores, &t, "Customer notes").await;
+    let orders = notes_type(stores, &t, "Order notes").await;
+    let base = template();
+    let (_, _, own) = installed(stores, &t, ws, t.agent).await;
+    let (_, _, colleagues) = installed(stores, &t, ws, t.other_agent).await;
+    let (_, _, siblings) = installed(stores, &t, t.sibling, t.sibling_agent).await;
+    let channel = |ws: WorkspaceId, agent: AgentId| async move {
+        stores.channels.list_agent_channels(org, ws, agent).await.unwrap()[0].id
+    };
+    // The agent's session in the type, and beside it the agent's in another
+    // type, another agent's in the type, and another workspace's agent's.
+    let session = Thread {
+        ws,
+        connection: own,
+        channel: channel(ws, t.agent).await,
+        thread: "8.own",
+        template: remembering(&base, customer),
+    };
+    let others = [
+        Thread {
+            thread: "8.orders",
+            template: remembering(&base, orders),
+            ..session
+        },
+        Thread {
+            connection: colleagues,
+            channel: channel(ws, t.other_agent).await,
+            thread: "8.colleague",
+            template: remembering(&base, customer),
+            ..session
+        },
+        Thread {
+            ws: t.sibling,
+            connection: siblings,
+            channel: channel(t.sibling, t.sibling_agent).await,
+            thread: "8.sibling",
+            template: remembering(&base, customer),
+        },
+    ];
+    let scope = MemoryScope {
+        organization_id: org,
+        workspace_id: ws,
+        agent_id: t.agent,
+        memory_type_id: customer,
+    };
+    let member = Origin::Member { user_id: t.admin_user };
+    let mut notes = Vec::new();
+    for (n, text) in [
+        "Prefers replies in Portuguese.",
+        "Ships on Fridays.",
+        "Closed on Mondays.",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let short_ids = [ShortId::from_bits(u32::try_from(n).unwrap() + 1)];
+        let note = NewNote {
+            id: MemoryId::generate(),
+            text,
+            channel_conversation_id: None,
+            origin: &member,
+            short_ids: &short_ids,
+        };
+        notes.push(
+            stores
+                .notes
+                .insert(&scope, &note, 200, now(), &record_nothing)
+                .await
+                .unwrap(),
+        );
+    }
+    let recorded = note_store::recorder(Environment::Sandbox);
+
+    // Each session's first run reads its recall, and the session keeps it.
+    assert_eq!(
+        session.answered(stores, &t, 1, RECALL).await,
+        (SessionRecall::Unread, Some(RECALL.to_owned()))
+    );
+    for other in &others {
+        assert_eq!(
+            other.answered(stores, &t, 1, RECALL).await,
+            (SessionRecall::Unread, Some(RECALL.to_owned())),
+            "{}",
+            other.thread
+        );
+    }
+
+    // A save and a change mark nothing; nor does a forget that doesn't ask,
+    // nor one whose records can't be written, which forgets nothing.
+    let short_ids = [ShortId::from_bits(4)];
+    let saved = NewNote {
+        id: MemoryId::generate(),
+        text: "Opens at nine.",
+        channel_conversation_id: None,
+        origin: &member,
+        short_ids: &short_ids,
+    };
+    stores
+        .notes
+        .insert(&scope, &saved, 200, now(), &recorded)
+        .await
+        .unwrap();
+    stores
+        .notes
+        .update(
+            &scope,
+            NoteRef::Id(notes[0].id),
+            Reach::Everything,
+            &member,
+            "Prefers replies in Spanish.",
+            now(),
+            &recorded,
+        )
+        .await
+        .unwrap();
+    stores
+        .notes
+        .delete(&scope, NoteRef::Id(notes[2].id), Reach::Everything, &record_nothing)
+        .await
+        .unwrap();
+    assert_eq!(
+        stores
+            .notes
+            .delete(
+                &scope,
+                NoteRef::Id(notes[1].id),
+                Reach::Everything,
+                &note_store::sent_elsewhere(Environment::Sandbox, t.sibling),
+            )
+            .await,
+        Err(MemoryError::Unavailable)
+    );
+    let (second, snapshot) = session.next_run(stores, &t, 2).await;
+    let kept = SessionRecall::Read(Some(RECALL.to_owned()));
+    assert_eq!(snapshot.session.unwrap().recall, kept, "nothing marked it");
+
+    // A forget marks it while that run is under way: the run sends the
+    // recall it started with to its end.
+    stores
+        .notes
+        .delete(&scope, NoteRef::Id(notes[1].id), Reach::Everything, &recorded)
+        .await
+        .unwrap();
+    let snapshot = stores.runs.find_snapshot(org, ws, second).await.unwrap().unwrap();
+    assert_eq!(
+        snapshot.session.unwrap().recall,
+        kept,
+        "a run under way keeps its recall"
+    );
+    assert_eq!(
+        answer_remembering(stores, org, ws, second, &read(customer, LATER)).await,
+        [Some(RECALL.to_owned())]
+    );
+    let ended = stores.runs.find_run(org, ws, second).await.unwrap().unwrap();
+    assert_eq!(ended.status, RunStatus::Completed);
+
+    // The next run reads it anew, from the same history start; the one after
+    // sends what it read.
+    let (third, snapshot) = session.next_run(stores, &t, 3).await;
+    let marked = snapshot.session.unwrap();
+    assert_eq!(
+        (marked.recall, marked.history.len()),
+        (SessionRecall::Unread, 4),
+        "the first two runs' inputs and answers"
+    );
+    assert_eq!(
+        answer_remembering(stores, org, ws, third, &read(customer, LATER)).await,
+        [Some(LATER.to_owned())]
+    );
+    assert_eq!(
+        session.answered(stores, &t, 4, RECALL).await,
+        (SessionRecall::Read(Some(LATER.to_owned())), Some(LATER.to_owned()))
+    );
+    // No other session was marked.
+    for other in &others {
+        assert_eq!(
+            other.answered(stores, &t, 2, LATER).await,
+            (kept.clone(), Some(RECALL.to_owned())),
+            "{}",
+            other.thread
+        );
+    }
+
+    // Forgetting the scope's oldest marks it once, whatever the count.
+    let forgotten = stores
+        .notes
+        .delete_scope(&scope, 10, &recorded, &note_store::counter(scope))
+        .await
+        .unwrap();
+    assert_eq!(forgotten, 2, "the changed note and the one saved since");
+    assert_eq!(
+        session.answered(stores, &t, 5, RECALL).await,
+        (SessionRecall::Unread, Some(RECALL.to_owned()))
+    );
+    for other in &others {
+        assert_eq!(
+            other.answered(stores, &t, 3, LATER).await,
+            (kept.clone(), Some(RECALL.to_owned())),
+            "{}",
+            other.thread
+        );
+    }
+
+    // Deleting the type marks every session kept on it, in every workspace,
+    // and no other.
+    stores
+        .memory_types
+        .delete_type(org, customer, t.admin, &by_suite)
+        .await
+        .expect("a type no agent names goes");
+    assert_eq!(
+        session.answered(stores, &t, 6, LATER).await,
+        (SessionRecall::Unread, Some(LATER.to_owned()))
+    );
+    for (other, marked) in others.iter().zip([false, true, true]) {
+        let expected = if marked {
+            (SessionRecall::Unread, Some(LATER.to_owned()))
+        } else {
+            (kept.clone(), Some(RECALL.to_owned()))
+        };
+        assert_eq!(other.answered(stores, &t, 4, LATER).await, expected, "{}", other.thread);
+    }
 }
 
 /// A message in its own thread of C0SUPPORT.

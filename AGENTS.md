@@ -148,8 +148,9 @@ Read `README.md` first, then `DEVELOPMENT.md`.
   breakpoints. `tests/prompt_cache.rs` holds every provider path to it. A
   channel session holds it across its runs: its tools, instructions and
   memory are fixed when it starts, and its recall is read once for each
-  history start and kept on the session, never again per run
-  (`tests/channel_prompt_cache.rs`).
+  history start and kept on the session, never again per run, but for the
+  next run after a forget marked the session, in the forget's own
+  transaction (`tests/channel_prompt_cache.rs`).
 - Secrets are sealed with `keys::seal` under an `EncryptionContext` built from
   the trust context with the constructor for that kind of secret
   (`installation_credential`, `oauth_client_secret`, `webhook_signing_secret`),

@@ -24,9 +24,11 @@
 //! start reads it from the session's type for that audience
 //! ([`session_recall`]), and every run from the same start sends those
 //! bytes. A save in one run reaches a later run of the session through the
-//! conversation, and its recall at the next trim or session. Once the type
-//! is deleted, a trimmed session recalls nothing, and its calls are refused
-//! as any run's are.
+//! conversation, and its recall at the next trim or session. A forget, a
+//! run's or a person's, records a mark on every session of its agent,
+//! workspace and type, and the next run of each reads the recall anew. Once
+//! the type is deleted, a session recalls nothing from its next run, and its
+//! calls are refused as any run's are.
 //!
 //! **Decided live.** Each call is decided when the model makes it, and again
 //! just before it's sent, from the run's type as it is then ([`decide`]): a
@@ -514,11 +516,14 @@ fn answered(result: CallResult) -> SendOutcome {
 }
 
 /// What a run's change records with it: its webhook events, placed in the
-/// run's workspace, and no audit event. The kind adds the call itself.
+/// run's workspace, and no audit event; a forget marks the agent's channel
+/// sessions in the type, the run's own included, which keeps its recall to
+/// its end. The kind adds the call itself.
 fn recorded(organization_id: OrganizationId, workspace: &Workspace, change: &MemoryChange) -> Recorded {
     Recorded {
         audit: None,
         events: vec![memory_event_in(organization_id, workspace, change)],
+        refresh_recall: matches!(change, MemoryChange::Forgotten(_)),
         call: None,
     }
 }

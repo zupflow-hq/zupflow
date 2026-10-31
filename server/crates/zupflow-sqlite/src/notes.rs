@@ -9,7 +9,10 @@
 //! with the text the note already holds, nothing but a run's call (below).
 //! What a change records ([`Record`]) is written in its transaction: each
 //! webhook event with its deliveries and their jobs, as the outbox writes
-//! one, and the audit event, each only in the scope's own workspace.
+//! one, and the audit event, each only in the scope's own workspace; and,
+//! for a forget, the mark on the channel sessions of the scope's agent, in
+//! its workspace and type, so each reads its recall anew at its next run,
+//! once however many notes the change forgets.
 //!
 //! A run's call that changes a note is written with its change, in
 //! `memory_calls`, one row for each call ([`INSERT_CALL`]), and one that
@@ -101,10 +104,10 @@ fn read(error: impl std::fmt::Display) -> MemoryError {
 
 /// Writes what a change records, in its transaction: the run's call that
 /// made it, each webhook event, with a delivery and its job for every
-/// endpoint subscribed to it, and the audit event. An event placed anywhere
-/// but the scope's workspace fails the change, and so does a call that made
-/// its change already (`AlreadyMade`): its transaction rolls back, and it
-/// changes nothing.
+/// endpoint subscribed to it, the audit event, and the mark on the channel
+/// sessions it reaches. An event placed anywhere but the scope's workspace
+/// fails the change, and so does a call that made its change already
+/// (`AlreadyMade`): its transaction rolls back, and it changes nothing.
 async fn write_records(
     connection: &mut SqliteConnection,
     scope: &MemoryScope,
@@ -141,6 +144,11 @@ async fn write_records(
     }
     if let Some(entry) = &recorded.audit {
         crate::audit::record_in_workspace(&mut *connection, scope.organization_id, scope.workspace_id, entry)
+            .await
+            .map_err(failed(operation))?;
+    }
+    if recorded.refresh_recall {
+        crate::channel_runs::refresh_recall(&mut *connection, scope)
             .await
             .map_err(failed(operation))?;
     }
@@ -586,9 +594,18 @@ impl NoteStore for SqliteNoteStore {
             tracing::error!(event = "memory_notes.scope_moved", operation = "delete_scope");
             return Err(MemoryError::Unavailable);
         }
+        // The sessions they reach are marked once, after every note's records.
+        let mut refresh = false;
         for row in &rows {
             let forgotten = MemoryChange::Forgotten(note_from(row)?);
-            write_records(&mut transaction, scope, &record(&forgotten), "delete_scope").await?;
+            let mut recorded = record(&forgotten);
+            refresh |= std::mem::take(&mut recorded.refresh_recall);
+            write_records(&mut transaction, scope, &recorded, "delete_scope").await?;
+        }
+        if refresh {
+            crate::channel_runs::refresh_recall(&mut transaction, scope)
+                .await
+                .map_err(failed("delete_scope"))?;
         }
         let count = rows.len() as u64;
         if count > 0 {
