@@ -16,6 +16,18 @@
 //! cache key are an `agent` run's, recalls nothing, and every call to one is
 //! refused (`memory_off`).
 //!
+//! **A channel session's, once.** A channel session fixes its memory with
+//! its tools when it begins ([`session_memory`]): the type, the kind's tools
+//! joined to the session's, and its audience, a `dm`'s or a `group_dm`'s
+//! own conversation beside the workspace, else the workspace. The session
+//! keeps what it recalls, once for each history start: the first run from a
+//! start reads it from the session's type for that audience
+//! ([`session_recall`]), and every run from the same start sends those
+//! bytes. A save in one run reaches a later run of the session through the
+//! conversation, and its recall at the next trim or session. Once the type
+//! is deleted, a trimmed session recalls nothing, and its calls are refused
+//! as any run's are.
+//!
 //! **Decided live.** Each call is decided when the model makes it, and again
 //! just before it's sent, from the run's type as it is then ([`decide`]): a
 //! tool that reads is allowed; one that writes takes the type's `writes`
@@ -30,14 +42,16 @@
 //! the kind doesn't have as an app's unknown tool is).
 //!
 //! **Made in the run's scope.** A call reaches only the run's organization,
-//! workspace and agent, in its type ([`MemoryScope`]), with the type's
-//! `writes` as they are when it's made, and the run and the call as the
-//! origin of what it writes, saying whether the model had read an app's tool
-//! result before it ([`after_app_content`]). A change commits its
-//! `memory.saved`, `memory.updated` or `memory.forgotten` webhook events in
-//! its own transaction ([`Record`]). The engine audits no tool call, a memory
-//! tool's neither: the run's timeline is the record. No log line holds a
-//! memory's text, a call's arguments or its answer.
+//! workspace and agent, in its type ([`MemoryScope`]), for the run's
+//! audience ([`memory_audience`]: an API or Console run's is the
+//! workspace's), with the type's `writes` as they are when it's made, and
+//! the run and the call as the origin of what it writes, saying whether the
+//! model had read an app's tool result before it, in the run or, for a
+//! channel run, in its session ([`after_app_content`]). A change commits
+//! its `memory.saved`, `memory.updated` or `memory.forgotten` webhook events
+//! in its own transaction ([`Record`]). The engine audits no tool call, a
+//! memory tool's neither: the run's timeline is the record. No log line
+//! holds a memory's text, a call's arguments or its answer.
 //!
 //! **Once.** A call that changes a memory commits a record of itself with
 //! its change, one for each call ([`Recorded::call`]), and one that gives a
@@ -70,9 +84,9 @@ use zupflow_core::runs::names::{OfferedTool, memory_tool};
 use zupflow_core::runs::reducer::{
     InstallationCheck, MEMORY_KIND_NOT_SERVED, MEMORY_KIND_NOT_SERVED_MESSAGE, MEMORY_OFF, MEMORY_OFF_MESSAGE,
     MEMORY_SETTINGS_INVALID, MEMORY_SETTINGS_INVALID_MESSAGE, MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE,
-    MemorySendRequest, SendCheck, after_app_content, refusal_code,
+    MemorySendRequest, SendCheck, after_app_content, memory_audience, refusal_code,
 };
-use zupflow_core::runs::state::{CallDecision, CallRecord, CallVerdict, FrozenMemory, Snapshot};
+use zupflow_core::runs::state::{CallDecision, CallRecord, CallVerdict, FrozenMemory, SessionMemory, Snapshot};
 use zupflow_core::runs::transition::SendOutcome;
 use zupflow_core::workspaces::Workspace;
 
@@ -214,20 +228,18 @@ pub(crate) struct ResolvedMemory {
     pub(crate) frozen: FrozenMemory,
 }
 
-/// The memory a run of `agent_id` starts with, read now for its first model
-/// attempt: `None` when the agent has none (its memory is off, or it's on
-/// the organization's default and there's none) or this server doesn't
-/// serve its type's kind. A run started with memory `off` gets the same
-/// tools and recalls nothing. A type or a recall that can't be read, or
-/// settings its kind refuses now, fail the step, to be tried again, as an
-/// offer that can't be read does: a run never starts without the memory its
-/// agent has.
-pub(crate) async fn resolve(
+/// The agent's memory type as a run or a session starts with it, read now,
+/// served, with the kind's tools for its settings and `writes`: `None` when
+/// the agent has none (its memory is off, or it's on the organization's
+/// default and there's none) or this server doesn't serve its kind. A type
+/// deleted since the agent's memory was read, or settings its kind refuses
+/// now, fail the step, to be tried again: a run never starts without the
+/// memory its agent has.
+async fn starting(
     state: &AppState,
     (organization_id, workspace_id): (OrganizationId, WorkspaceId),
     agent_id: AgentId,
-    mode: MemoryMode,
-) -> Result<Option<ResolvedMemory>, &'static str> {
+) -> Result<Option<(Served, Vec<OfferedTool>)>, &'static str> {
     let Some(run_memory) = state
         .memory_types
         .run_memory(organization_id, workspace_id, agent_id)
@@ -261,28 +273,98 @@ pub(crate) async fn resolve(
             )
         })
         .collect();
+    Ok(Some((served, tools)))
+}
+
+/// What `scope` recalls for `audience` in its served type now, framed.
+/// A recall that can't be read fails the step, to be tried again.
+async fn recall_for(served: &Served, scope: &MemoryScope, audience: &Audience) -> Result<Option<String>, &'static str> {
+    let recall = served
+        .provider
+        .recall(scope, audience, &served.settings)
+        .await
+        .map_err(|error| {
+            tracing::warn!(event = "runs.memory_unreadable", organization_id = %scope.organization_id, workspace_id = %scope.workspace_id, agent_id = %scope.agent_id, memory_type_id = %scope.memory_type_id, %error);
+            "memory_unavailable"
+        })?;
+    Ok(recall.framed())
+}
+
+/// The memory a run of `agent_id` starts with, read now for its first model
+/// attempt ([`starting`]), recalling for `audience`. A run started with
+/// memory `off` gets the same tools and recalls nothing.
+pub(crate) async fn resolve(
+    state: &AppState,
+    (organization_id, workspace_id): (OrganizationId, WorkspaceId),
+    agent_id: AgentId,
+    mode: MemoryMode,
+    audience: &Audience,
+) -> Result<Option<ResolvedMemory>, &'static str> {
+    let Some((served, tools)) = starting(state, (organization_id, workspace_id), agent_id).await? else {
+        return Ok(None);
+    };
     let recall = match mode {
         MemoryMode::Off => None,
         MemoryMode::Agent => {
             let scope = served.scope(organization_id, workspace_id, agent_id);
-            let recall = served
-                .provider
-                .recall(&scope, &Audience::Workspace, &served.settings)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(event = "runs.memory_unreadable", %organization_id, %workspace_id, %agent_id, memory_type_id = %memory_type.id, %error);
-                    "memory_unavailable"
-                })?;
-            recall.framed()
+            recall_for(&served, &scope, audience).await?
         }
     };
     Ok(Some(ResolvedMemory {
         tools,
         frozen: FrozenMemory {
-            memory_type_id: memory_type.id,
+            memory_type_id: served.memory_type.id,
             recall,
         },
     }))
+}
+
+/// The memory a channel session of `agent_id` begins with, for `audience`,
+/// read now ([`starting`]): its tools, to join the session's by their own
+/// names, and the type and the audience it keeps with them. What it
+/// recalls is read by the first run from each of its history starts
+/// ([`session_recall`]).
+pub(crate) async fn session_memory(
+    state: &AppState,
+    scope: (OrganizationId, WorkspaceId),
+    agent_id: AgentId,
+    audience: Audience,
+) -> Result<Option<(SessionMemory, Vec<OfferedTool>)>, &'static str> {
+    Ok(starting(state, scope, agent_id).await?.map(|(served, tools)| {
+        (
+            SessionMemory {
+                memory_type_id: served.memory_type.id,
+                audience,
+            },
+            tools,
+        )
+    }))
+}
+
+/// What a channel session of `agent_id` recalls for the history a run
+/// starts from, read now from the session's own type for its audience:
+/// nothing once the type is deleted or while its kind isn't served. The
+/// tools stay the session's, whatever the type became. Settings its kind
+/// refuses now, or a recall that can't be read, fail the step, to be tried
+/// again.
+pub(crate) async fn session_recall(
+    state: &AppState,
+    (organization_id, workspace_id): (OrganizationId, WorkspaceId),
+    agent_id: AgentId,
+    memory: &SessionMemory,
+) -> Result<FrozenMemory, &'static str> {
+    let recall = match type_now(state, organization_id, memory.memory_type_id).await? {
+        TypeNow::Gone | TypeNow::NotServed => None,
+        TypeNow::Unusable => return Err("memory_settings_refused"),
+        TypeNow::Served(served) => {
+            let scope = served.scope(organization_id, workspace_id, agent_id);
+            recall_for(&served, &scope, &memory.audience).await?
+        }
+    };
+    Ok(FrozenMemory {
+        memory_type_id: memory.memory_type_id,
+        recall,
+    })
 }
 
 // --- Decisions ---------------------------------------------------------------------
@@ -441,7 +523,8 @@ fn recorded(organization_id: OrganizationId, workspace: &Workspace, change: &Mem
     }
 }
 
-/// One memory call to make, in its run's scope, as it was decided.
+/// One memory call to make, in its run's scope, for its audience, as it
+/// was decided.
 struct Call<'a> {
     organization_id: OrganizationId,
     workspace_id: WorkspaceId,
@@ -454,6 +537,7 @@ struct Call<'a> {
     call_digest: Sha256Digest,
     definition_sha256: Sha256Digest,
     after_app_content: bool,
+    audience: Audience,
 }
 
 impl<'a> Call<'a> {
@@ -470,6 +554,7 @@ impl<'a> Call<'a> {
             call_digest: send.call_digest,
             definition_sha256: send.definition_sha256,
             after_app_content: send.after_app_content,
+            audience: send.audience,
         }
     }
 }
@@ -534,7 +619,7 @@ async fn make(state: &AppState, agent_id: AgentId, call: &Call<'_>) -> Result<Se
     };
     let context = CallContext {
         origin: &origin,
-        audience: &Audience::Workspace,
+        audience: &call.audience,
         settings: &served.settings,
         writes: served.memory_type.writes,
         now: state.clock.now(),
@@ -564,9 +649,10 @@ async fn make(state: &AppState, agent_id: AgentId, call: &Call<'_>) -> Result<Se
 /// it, in the run's scope. A call that made its change is answered as its
 /// change recorded it ([`MemoryProvider::made`]), whatever became of the
 /// memory, or of its type, since; one that made none is made now, as it's
-/// sent. `None` when what came of it can't be told, its kind keeping no
-/// record of its calls or not served here: the call is settled unknown. A
-/// store that can't be read fails the step, to be tried again.
+/// sent, for the run's audience. `None` when what came of it can't be told,
+/// its kind keeping no record of its calls or not served here, or the run's
+/// audience went with its session: the call is settled unknown. A store
+/// that can't be read fails the step, to be tried again.
 pub(crate) async fn settle_lapsed(
     state: &AppState,
     (organization_id, workspace_id, run_id): (OrganizationId, WorkspaceId, RunId),
@@ -603,6 +689,9 @@ pub(crate) async fn settle_lapsed(
         Err(MemoryError::Unavailable) => return Err("store_unavailable"),
         Err(_) => return Ok(None),
     }
+    let Some(audience) = memory_audience(snapshot) else {
+        return Ok(None);
+    };
     let call = Call {
         organization_id,
         workspace_id,
@@ -615,6 +704,7 @@ pub(crate) async fn settle_lapsed(
         call_digest,
         definition_sha256: target.definition_sha256,
         after_app_content: after_app_content(snapshot, call),
+        audience,
     };
     make(state, agent_id, &call).await.map(Some)
 }

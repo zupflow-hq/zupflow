@@ -528,11 +528,11 @@ pub(super) async fn sweep_retention(
         }
     }
     // Part of its history is gone: the session's next run starts a new run
-    // session, and reads its thread anew.
+    // session, and reads its thread, and what it recalls, anew.
     for session in sessions {
         sqlx::query(
             "UPDATE channel_sessions SET session_id = ?, seen_message_id = NULL, seen_at = NULL, \
-             changes_noted_at = NULL, updated_at = ? \
+             changes_noted_at = NULL, recall = NULL, recall_start_run_id = NULL, updated_at = ? \
              WHERE organization_id = ? AND workspace_id = ? AND id = ? AND active_run_id IS NULL",
         )
         .bind(SessionId::generate().uuid())

@@ -37,7 +37,11 @@
 //! is settled by that record: answered as made, whatever became of the
 //! memory since, and its change never made again; one with no record (a
 //! search, a refusal, or a call never made) is made then. A channel
-//! session's runs have no memory.
+//! session's memory is fixed with its tools when the session begins, for
+//! its audience (a `dm`'s or a `group_dm`'s own conversation beside the
+//! workspace, else the workspace), and the session keeps its recall: the
+//! first run from each history start reads it (`memory_tools::session_recall`),
+//! and every other run from that start sends it again.
 //!
 //! The job queue's lease and the run's claim go together: the job's lease
 //! is extended before every step that keeps the claim, and once a step
@@ -70,6 +74,7 @@ use zupflow_core::ids::{
 };
 use zupflow_core::installations::{Installation, InstallationStatus, InstalledApp};
 use zupflow_core::jobs::{Job, JobId, LeaseToken, Retry};
+use zupflow_core::memory::Audience;
 use zupflow_core::model_store::{ModelStatus, RouteState};
 use zupflow_core::models::{ProviderAccess, ProviderError, Turn, prompt_cache_key, validate_completion};
 use zupflow_core::policy::{CallApp, Decision, GrantedAs, OrganizationLevel, ToolCall, Verdict, floor};
@@ -81,7 +86,7 @@ use zupflow_core::runs::reducer::{
     calls_to_decide, fail_abandoned, frozen_offer, may_park_on, refuse_waiting,
 };
 use zupflow_core::runs::state::{
-    CallDecision, CallRecord, CallVerdict, ClaimantId, FrozenMemory, InvocationId, RequestId, Snapshot,
+    CallDecision, CallRecord, CallVerdict, ClaimantId, FrozenMemory, InvocationId, RequestId, SessionRecall, Snapshot,
 };
 use zupflow_core::runs::store::{
     Applied, REFUSE_WAITING_JOB, RUN_JOB, RunStore, StoreError, installation_of_job, memory_type_of_job, run_of_job,
@@ -954,26 +959,42 @@ impl<P: ToolPort> Driver<'_, P> {
 
     /// The tools to offer the run's first model attempt, read now, with its
     /// memory: the agent's memory tools join its apps' by their own names,
-    /// and what it recalls is read with them. `None` once an attempt froze
-    /// them, since every later one offers those and sends that recall. A
-    /// channel run's session froze its tools when it started, with no
-    /// memory.
+    /// and what it recalls, for the workspace, is read with them. `None`
+    /// once an attempt froze them, since every later one offers those and
+    /// sends that recall. A channel run offers its session's tools, fixed
+    /// with its memory when the session began; the first run from the
+    /// session's history start reads what it recalls, from the session's
+    /// type for its audience, and every other sends what the session kept.
     async fn offer_unless_frozen(
         &self,
         snapshot: &Snapshot,
     ) -> Result<(Option<Offer>, Option<FrozenMemory>), &'static str> {
+        if let Some(session) = &snapshot.session {
+            let read = match (&session.memory, &session.recall) {
+                (Some(memory), SessionRecall::Unread) => Some(
+                    memory_tools::session_recall(
+                        self.state,
+                        (self.organization_id, self.workspace_id),
+                        self.agent_id,
+                        memory,
+                    )
+                    .await?,
+                ),
+                _ => None,
+            };
+            return Ok((None, read));
+        }
         if frozen_offer(snapshot).is_some() {
             return Ok((None, None));
         }
         let offer = self.reads().offer().await?;
-        if snapshot.session.is_some() {
-            return Ok((Some(offer), None));
-        }
+        // An API or Console run's memory is the workspace's.
         let resolved = memory_tools::resolve(
             self.state,
             (self.organization_id, self.workspace_id),
             self.agent_id,
             snapshot.memory,
+            &Audience::Workspace,
         )
         .await?;
         let Some(memory) = resolved else {

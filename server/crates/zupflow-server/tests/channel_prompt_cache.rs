@@ -6,9 +6,20 @@
 //! tool, an edit noted in the next turn, and the agent, its connection and
 //! its team renamed mid-session.
 //! The one break is the trim, when the history would go over its budget:
-//! once, there, and the runs after it continue again. A session has no
-//! memory: an agent that remembers is offered no memory tools in it,
-//! and recalls nothing.
+//! once, there, and the runs after it continue again.
+//!
+//! With memory, a session is fixed with its memory as with its tools: every
+//! run of it sends the same tools, instructions and recall, the recall once,
+//! as the first block of the history, and the next run reads them from the
+//! cache; a save in one run doesn't change what a later one recalls, and a
+//! trim reads the recall anew from the session's own type (nothing, once
+//! that type is deleted, and its calls are refused), as a new session does.
+//! A `dm`'s or a `group_dm`'s session recalls, finds and saves its own
+//! conversation's notes beside the workspace's, and nothing else sees them;
+//! a channel's saves are the workspace's. Once a run of a session read an
+//! app's tool result, a later save says it may come from it, a trim
+//! included. No turn marks more than four breakpoints, and a session reads
+//! and writes only its own organization, workspace, agent and memory type.
 
 #![allow(clippy::unwrap_used)]
 
@@ -24,11 +35,17 @@ use axum::http::{Method, StatusCode};
 use channel_world::{ANA, BO, World, world};
 use common::{PROVIDER_KEY, Server, call};
 use faults::{Point, Worker};
-use run_setup::{id, setup_on};
-use serde_json::json;
+use run_setup::{Setup, Tenant, calling_memory, id, setup_on};
+use serde_json::{Value, json};
+use zupflow_channels::fake::ChatMessage;
+use zupflow_core::ids::{MemoryTypeId, RunId};
+use zupflow_core::memory::RECALL_OPEN;
 use zupflow_core::model_providers::ProviderKind;
+use zupflow_core::runs::CallState;
+use zupflow_core::runs::digest::Sha256Digest;
+use zupflow_core::runs::state::CallRecord;
 use zupflow_providers::fake::Received;
-use zupflow_providers::fake::prompt::check_prefix;
+use zupflow_providers::fake::prompt::{MAX_BREAKPOINTS, Prompt, at_breakpoints, check_prefix, markers};
 
 /// The paths, each with a model it serves that calls tools.
 const PATHS: [(ProviderKind, &str); 2] = [
@@ -81,6 +98,32 @@ async fn on(kind: ProviderKind, model: &str) -> (World, String) {
 
 fn turns(world: &World) -> Vec<Received> {
     world.setup.server.models.turns()
+}
+
+async fn database(world: &World) -> sqlx::SqlitePool {
+    sqlx::SqlitePool::connect(&format!("sqlite:{}", world.setup.kit.database().display()))
+        .await
+        .unwrap()
+}
+
+/// Gives the model a small context window: a history budget of 3,300
+/// tokens, which three [`long`] messages and their answers nearly fill.
+async fn narrow(world: &World, model_id: &str) {
+    let pool = database(world).await;
+    let model = zupflow_core::ids::ModelId::parse(model_id).unwrap();
+    let (org, _) = world.setup.scope();
+    sqlx::query("UPDATE models SET context_window = 5500 WHERE organization_id = ? AND id = ?")
+        .bind(org.uuid())
+        .bind(model.uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+/// A message of about 500 tokens, which the model answers by repeating.
+fn long(n: u32) -> String {
+    format!("{n} {}", "lorem ipsum ".repeat(166))
 }
 
 /// Which consecutive turns don't continue the one before, by index.
@@ -203,26 +246,10 @@ async fn breaks_the_prefix_once_when_the_history_is_trimmed() {
     for (kind, model) in PATHS {
         let (world, model_id) = on(kind, model).await;
         let name = format!("{kind:?} {model}");
-        // A small window: a budget of 3,300 tokens, so the fourth long
-        // message trims the first run away, and a short one after fits.
-        let pool = sqlx::SqlitePool::connect(&format!(
-            "sqlite:{}",
-            world.setup.server.directory.join("zupflow.sqlite").display()
-        ))
-        .await
-        .unwrap();
-        let model_uuid = zupflow_core::ids::ModelId::parse(&model_id).unwrap().uuid();
-        let (org, _) = world.setup.scope();
-        sqlx::query("UPDATE models SET context_window = 5500 WHERE organization_id = ? AND id = ?")
-            .bind(org.uuid())
-            .bind(model_uuid)
-            .execute(&pool)
-            .await
-            .unwrap();
-        pool.close().await;
-
+        // The fourth long message trims the first run away, and a short one
+        // after fits.
+        narrow(&world, &model_id).await;
         let main = &world.main;
-        let long = |n: u32| format!("{n} {}", "lorem ipsum ".repeat(166));
         let before = turns(&world).len();
         let asked = world.say(ANA, &format!("{} {}", main.mention(), long(1)), None).await;
         world.work().await;
@@ -358,26 +385,909 @@ async fn continues_a_session_through_a_channel_tool_an_edit_and_a_rename() {
     }
 }
 
+// --- Memory ------------------------------------------------------------------------
+
+fn save(text: &str) -> String {
+    calling_memory("save_memory", &json!({ "text": text }))
+}
+
+fn search(query: &str) -> String {
+    calling_memory("search_memory", &json!({ "query": query }))
+}
+
+/// [`on`], with the agent remembering in a `notes` type of its own that
+/// writes at `allow`, and one note saved, so every session has something to
+/// recall: the world, its model's ID and the type's ID.
+async fn remembering(kind: ProviderKind, model: &str) -> (World, String, String) {
+    let (world, model_id) = on(kind, model).await;
+    let memory_type = world.setup.with_memory("allow").await;
+    world.setup.save_note("Prefers answers in Portuguese.").await;
+    (world, model_id, memory_type)
+}
+
+/// The recall a turn's body sent: the first block of its first message,
+/// framed, its breakpoint left out. `None` without one.
+fn recall(kind: ProviderKind, body: &Value) -> Option<String> {
+    let prompt = Prompt::read(kind, body).unwrap();
+    let block = prompt.messages.first()?["content"].as_array()?.first()?.clone();
+    block["text"]
+        .as_str()
+        .filter(|text| text.starts_with(RECALL_OPEN))
+        .map(str::to_owned)
+}
+
+/// Each turn's recall, in order.
+fn recalls(kind: ProviderKind, turns: &[Received]) -> Vec<Option<String>> {
+    turns.iter().map(|turn| recall(kind, &turn.body)).collect()
+}
+
+/// The breakpoints a turn's body should carry on a path that takes them:
+/// after the instructions (a session's are never empty: they open with its
+/// preface), on the recall, on the last block of the message before the
+/// latest answer, and on the last block of the last message. None on a path
+/// that caches on its own.
+fn expected_markers(kind: ProviderKind, model: &str, body: &Value) -> Vec<String> {
+    if !at_breakpoints(kind, model) {
+        return Vec::new();
+    }
+    let mut messages: Vec<&Value> = body["messages"].as_array().unwrap().iter().collect();
+    if kind != ProviderKind::Anthropic {
+        messages.retain(|message| message["role"] != "system");
+    }
+    let last_block = |index: usize| {
+        let blocks = messages[index]["content"].as_array().unwrap().len();
+        format!("messages[{index}].content[{}]", blocks - 1)
+    };
+    let mut expected = vec!["system[0]".to_owned()];
+    if recall(kind, body).is_some() {
+        expected.push("messages[0].content[0]".to_owned());
+    }
+    if let Some(answer) = messages.iter().rposition(|message| message["role"] == "assistant") {
+        expected.push(last_block(answer - 1));
+    }
+    expected.push(last_block(messages.len() - 1));
+    expected
+}
+
+/// One answered model attempt's tokens, as stored.
+#[derive(Debug, Clone, Copy)]
+struct Attempt {
+    input: u64,
+    read: u64,
+}
+
+/// The run's answered model attempts, in order.
+async fn answered(world: &World, run: RunId) -> Vec<Attempt> {
+    let (org, ws) = world.setup.scope();
+    let pool = database(world).await;
+    let rows: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT input_tokens, cache_read_input_tokens FROM run_model_attempts \
+         WHERE organization_id = ? AND workspace_id = ? AND run_id = ? AND state = 'answered' \
+         ORDER BY turn, attempt",
+    )
+    .bind(org.uuid())
+    .bind(ws.uuid())
+    .bind(run.uuid())
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    rows.into_iter()
+        .map(|(input, read)| Attempt {
+            input: u64::try_from(input).unwrap(),
+            read: u64::try_from(read).unwrap(),
+        })
+        .collect()
+}
+
+/// What a channel run keeps of its memory, and what its session keeps.
+#[derive(Debug, PartialEq, Eq)]
+struct Kept {
+    memory_type_id: Option<MemoryTypeId>,
+    /// The run's own copy of its recall: never one.
+    recall: Option<String>,
+    digest: Option<String>,
+    /// The recall the session keeps for its current history start.
+    session_recall: Option<String>,
+}
+
+async fn kept(world: &World, run: RunId) -> Kept {
+    let (org, ws) = world.setup.scope();
+    let pool = database(world).await;
+    let (memory_type_id, recall, digest, session_recall): (
+        Option<uuid::Uuid>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT r.memory_type_id, r.recall, r.recall_digest, s.recall FROM runs r \
+         JOIN channel_sessions s ON s.organization_id = r.organization_id AND s.workspace_id = r.workspace_id \
+         AND s.id = r.channel_session_id \
+         WHERE r.organization_id = ? AND r.workspace_id = ? AND r.id = ?",
+    )
+    .bind(org.uuid())
+    .bind(ws.uuid())
+    .bind(run.uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    Kept {
+        memory_type_id: memory_type_id.map(MemoryTypeId::from_uuid),
+        recall,
+        digest,
+        session_recall,
+    }
+}
+
+/// What a channel run of `memory_type` that sent `recall` keeps, in a
+/// session that keeps `session_recall`.
+fn keeping(memory_type: &str, recall: Option<&str>, session_recall: Option<&str>) -> Kept {
+    Kept {
+        memory_type_id: Some(MemoryTypeId::parse(memory_type).unwrap()),
+        recall: None,
+        digest: recall.map(|recall| Sha256Digest::of(recall.as_bytes()).to_string()),
+        session_recall: session_recall.map(str::to_owned),
+    }
+}
+
+/// The run's calls to its memory tools, in order.
+async fn memory_calls(setup: &Setup, run: RunId) -> Vec<CallRecord> {
+    setup
+        .calls(run)
+        .await
+        .into_iter()
+        .map(|call| call.record)
+        .filter(|call| call.target.as_ref().is_some_and(|target| target.memory().is_some()))
+        .collect()
+}
+
+/// What the model read back from each of the run's memory searches.
+async fn found(setup: &Setup, run: RunId) -> Vec<String> {
+    memory_calls(setup, run)
+        .await
+        .into_iter()
+        .filter(|call| call.model_tool_name == "search_memory")
+        .map(|call| {
+            assert_eq!(call.state, CallState::Completed, "{call:?}");
+            call.outcome.unwrap().content
+        })
+        .collect()
+}
+
+/// The texts of the agent's memories in `memory_type`, as the API lists
+/// them to `tenant`'s user.
+async fn texts(setup: &Setup, tenant: (&str, &str, &str, &str), memory_type: Option<&str>) -> Vec<String> {
+    let (user, org, ws, agent) = tenant;
+    let query = memory_type.map_or_else(String::new, |memory_type| format!("?memory_type={memory_type}"));
+    let (status, body) = setup
+        .kit
+        .send(
+            call(
+                user,
+                Method::GET,
+                format!("/v1/workspaces/{ws}/agents/{agent}/memories{query}"),
+            )
+            .naming(org),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|note| note["text"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The setup's agent, as [`texts`] takes it.
+fn own(setup: &Setup) -> (&str, &str, &str, &str) {
+    ("alice", &setup.org, &setup.ws, &setup.agent)
+}
+
+/// Saves `text` for `agent` as `tenant`'s user, in `memory_type` or, left
+/// out, the agent's own.
+async fn save_for(setup: &Setup, tenant: (&str, &str, &str, &str), memory_type: Option<&str>, text: &str) {
+    let (user, org, ws, agent) = tenant;
+    let mut body = json!({ "text": text });
+    if let Some(memory_type) = memory_type {
+        body["memory_type_id"] = json!(memory_type);
+    }
+    let (status, created) = setup
+        .kit
+        .send(
+            call(
+                user,
+                Method::POST,
+                format!("/v1/workspaces/{ws}/agents/{agent}/memories"),
+            )
+            .naming(org)
+            .body(body),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+}
+
+/// Has `tenant`'s agent remember in `memory_type`.
+async fn remembers(setup: &Setup, tenant: &Tenant, memory_type: &str) {
+    let (status, body) = setup
+        .kit
+        .send(
+            call(
+                &tenant.user,
+                Method::PATCH,
+                format!("/v1/workspaces/{}/agents/{}", tenant.ws, tenant.agent),
+            )
+            .naming(&tenant.org)
+            .body(json!({ "memory": "type", "memory_type_id": memory_type })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+fn tenant_of(tenant: &Tenant) -> (&str, &str, &str, &str) {
+    (&tenant.user, &tenant.org, &tenant.ws, &tenant.agent)
+}
+
+/// Ana posts `text` in the conversation `channel`, of Slack's
+/// `channel_type`, to the setup's agent.
+async fn post_in(world: &World, channel: &str, channel_type: &str, text: &str) -> ChatMessage {
+    let message = world.chat.post(channel, channel_type, ANA, text, None, world.now());
+    world.deliver(&world.main, &world.chat.delivery(&message)).await;
+    message
+}
+
+/// The agent's last channel run, which must have completed.
+async fn last_run(world: &World, name: &str) -> RunId {
+    let runs = world.runs(&world.main).await;
+    let run = runs.last().unwrap();
+    assert_eq!(run["status"], "completed", "{name}: {run}");
+    World::run_id(run)
+}
+
 #[tokio::test]
-async fn offers_a_session_no_memory_tools_and_recalls_nothing() {
+async fn sends_every_run_of_a_session_the_same_tools_instructions_and_recall_from_the_cache() {
     for (kind, model) in PATHS {
-        let (world, _) = on(kind, model).await;
+        let (world, _, memory_type) = remembering(kind, model).await;
         let name = format!("{kind:?} {model}");
-        world.setup.with_memory("allow").await;
-        world.setup.save_note("Prefers answers in Portuguese.").await;
+        let main = &world.main;
+        let lookup = world.setup.calling("lookup", r#"{"n":1}"#).await;
         let before = turns(&world).len();
-        world.say(ANA, &format!("{} hello", world.main.mention()), None).await;
+        // A run with a call, and two that follow up in the thread.
+        let asked = world
+            .say(ANA, &format!("{} look it up\n{lookup}", main.mention()), None)
+            .await;
         world.work().await;
-        let runs = world.runs(&world.main).await;
-        assert_eq!(runs[0]["status"], "completed", "{name}: {}", runs[0]);
-        assert_eq!(runs[0]["memory"], "agent", "{name}");
+        world.say(BO, "thanks", Some(&asked.ts)).await;
+        world.work().await;
+        world.say(ANA, "and tomorrow?", Some(&asked.ts)).await;
+        world.work().await;
+
+        let runs = world.runs(main).await;
+        assert_eq!(runs.len(), 3, "{name}");
+        for run in &runs {
+            assert_eq!(run["status"], "completed", "{name}: {run}");
+            assert_eq!(run["memory"], "agent", "{name}");
+            assert_eq!(run["session_id"], runs[0]["session_id"], "{name}");
+        }
         let sent = turns(&world).split_off(before);
-        assert!(!sent.is_empty(), "{name}");
+        assert_eq!(sent.len(), 4, "{name}: the call and its answer, then a turn a run");
+        assert_eq!(breaks(kind, &sent), [], "{name}: every turn continues the one before");
+        // Every turn offers the session's tools, its memory's among them,
+        // after the same instructions, and opens with the same recall, once.
+        let first = Prompt::read(kind, &sent[0].body).unwrap();
+        let recalled = recall(kind, &sent[0].body).unwrap_or_else(|| panic!("{name}: no recall"));
+        assert!(
+            recalled.contains("Prefers answers in Portuguese."),
+            "{name}: {recalled}"
+        );
         for turn in &sent {
+            let prompt = Prompt::read(kind, &turn.body).unwrap();
+            assert_eq!(prompt.tools, first.tools, "{name}");
+            assert_eq!(prompt.system, first.system, "{name}");
+            assert_eq!(recall(kind, &turn.body).as_ref(), Some(&recalled), "{name}");
             let raw = String::from_utf8_lossy(&turn.raw);
-            for absent in ["save_memory", "search_memory", "<memory>", "Portuguese"] {
-                assert!(!raw.contains(absent), "{name}: {absent} in {raw}");
+            assert_eq!(raw.matches(RECALL_OPEN).count(), 1, "{name}: recalled once: {raw}");
+        }
+        let offered: String = first.tools.iter().map(Value::to_string).collect();
+        for tool in [
+            "save_memory",
+            "search_memory",
+            "update_memory",
+            "forget_memory",
+            "_lookup",
+            "stay_silent",
+        ] {
+            assert!(offered.contains(tool), "{name}: {tool} in {offered}");
+        }
+        // Each attempt read all of the one before from the cache, the next
+        // run's first too: the tools, the instructions, the recall and the
+        // runs before it.
+        let mut attempts = Vec::new();
+        for run in &runs {
+            attempts.extend(answered(&world, World::run_id(run)).await);
+        }
+        assert_eq!(attempts.len(), 4, "{name}");
+        for pair in attempts.windows(2) {
+            assert!(pair[1].read >= pair[0].input, "{name}: {attempts:?}");
+        }
+        // The session keeps the recall, once; each run keeps its type and
+        // the recall's digest.
+        for run in &runs {
+            assert_eq!(
+                kept(&world, World::run_id(run)).await,
+                keeping(&memory_type, Some(&recalled), Some(&recalled)),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn reads_a_sessions_recall_again_only_at_a_trim_or_for_a_new_session() {
+    for (kind, model) in PATHS {
+        let (world, model_id, memory_type) = remembering(kind, model).await;
+        let name = format!("{kind:?} {model}");
+        narrow(&world, &model_id).await;
+        let main = &world.main;
+        let before = turns(&world).len();
+        // The first run saves a note; the fifth long message trims the
+        // history to the third run's, and a short one after fits.
+        let asked = world
+            .say(
+                ANA,
+                &format!("{} hello\n{}", main.mention(), save("Ships on Fridays.")),
+                None,
+            )
+            .await;
+        world.work().await;
+        for n in 2..=5 {
+            world.say(ANA, &long(n), Some(&asked.ts)).await;
+            world.work().await;
+        }
+        // A person saves a note after the trim.
+        world.setup.save_note("Closed on Mondays.").await;
+        world.say(ANA, "ok", Some(&asked.ts)).await;
+        world.work().await;
+
+        let runs = world.runs(main).await;
+        assert_eq!(runs.len(), 6, "{name}");
+        assert!(runs.iter().all(|run| run["status"] == "completed"), "{name}: {runs:?}");
+        assert!(runs.iter().all(|run| run["session_id"] == runs[0]["session_id"]));
+        let sent = turns(&world).split_off(before);
+        assert_eq!(sent.len(), 7, "{name}: the save and its answer, then a turn a run");
+        let broken: Vec<usize> = breaks(kind, &sent).into_iter().map(|(index, _)| index).collect();
+        assert_eq!(broken, [5], "{name}: only the fifth run starts a new prefix");
+        let recalled: Vec<String> = recalls(kind, &sent)
+            .into_iter()
+            .map(|recall| recall.unwrap_or_else(|| panic!("{name}: a turn without a recall")))
+            .collect();
+        // Until the trim, every turn recalls what the session began with,
+        // not what its first run saved.
+        assert!(recalled[..5].iter().all(|recall| recall == &recalled[0]), "{name}");
+        assert!(
+            recalled[0].contains("Prefers answers in Portuguese.") && !recalled[0].contains("Ships on Fridays."),
+            "{name}: {}",
+            recalled[0]
+        );
+        // The trim reads it again from the session's type, the save in it,
+        // ahead of the third run's input; the run after it sends the same.
+        assert!(
+            recalled[5].contains("Prefers answers in Portuguese.") && recalled[5].contains("Ships on Fridays."),
+            "{name}: {}",
+            recalled[5]
+        );
+        assert_eq!(recalled[6], recalled[5], "{name}");
+        let opening = Prompt::read(kind, &sent[5].body).unwrap().messages[0].to_string();
+        assert!(opening.contains("3 lorem ipsum"), "{name}: {opening}");
+        // The session keeps the trim's recall; each run, its own's digest.
+        for (index, run) in runs.iter().enumerate() {
+            let sent = if index < 4 { &recalled[0] } else { &recalled[5] };
+            assert_eq!(
+                kept(&world, World::run_id(run)).await,
+                keeping(&memory_type, Some(sent), Some(&recalled[5])),
+                "{name}: run {index}"
+            );
+        }
+
+        // A new session reads it as it is now.
+        let before = turns(&world).len();
+        world.say(BO, &format!("{} hello", main.mention()), None).await;
+        world.work().await;
+        let runs = world.runs(main).await;
+        assert_eq!(runs.len(), 7, "{name}");
+        assert_ne!(runs[6]["session_id"], runs[0]["session_id"], "{name}");
+        let fresh = recall(kind, &turns(&world)[before].body).unwrap();
+        assert!(
+            fresh.contains("Ships on Fridays.") && fresh.contains("Closed on Mondays."),
+            "{name}: {fresh}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn keeps_a_direct_conversations_notes_to_it_and_a_channels_to_the_workspace() {
+    const ANAS: &str = "Ana's review is on Friday.";
+    const TRIOS: &str = "The trio meets on Tuesdays.";
+    const WORKSPACES: [&str; 3] = [
+        "Prefers answers in Portuguese.",
+        "Support closes at six.",
+        "Payroll runs on the 25th.",
+    ];
+    for (kind, model) in PATHS {
+        let (world, _, _) = remembering(kind, model).await;
+        let name = format!("{kind:?} {model}");
+        let main = &world.main;
+        // Each place saves a note: Ana's dm, a group dm, a channel and a
+        // private one.
+        let dm = world
+            .post(&[main], "D0ANA", ANA, &format!("remember\n{}", save(ANAS)), None)
+            .await;
+        world.work().await;
+        let to_agent = |text: &str| format!("{} remember\n{}", main.mention(), save(text));
+        post_in(&world, "G0TRIO", "mpim", &to_agent(TRIOS)).await;
+        world.work().await;
+        world.say(ANA, &to_agent(WORKSPACES[1]), None).await;
+        world.work().await;
+        post_in(&world, "G0PRIVATE", "group", &to_agent(WORKSPACES[2])).await;
+        world.work().await;
+        let runs = world.runs(main).await;
+        assert_eq!(runs.len(), 4, "{name}");
+        assert!(runs.iter().all(|run| run["status"] == "completed"), "{name}: {runs:?}");
+        // A direct conversation's note is stamped with it; the others are
+        // the workspace's.
+        let (status, body) = world
+            .setup
+            .kit
+            .send(
+                call(
+                    "alice",
+                    Method::GET,
+                    format!(
+                        "/v1/workspaces/{}/agents/{}/memories",
+                        world.setup.ws, world.setup.agent
+                    ),
+                )
+                .naming(&world.setup.org),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let stamped = |text: &str| {
+            body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|note| note["text"] == text)
+                .unwrap_or_else(|| panic!("{name}: {text} not saved: {body}"))["channel_conversation_id"]
+                .clone()
+        };
+        assert_eq!(
+            stamped(ANAS),
+            json!(world.conversation_id(main, "D0ANA").await),
+            "{name}"
+        );
+        assert_eq!(
+            stamped(TRIOS),
+            json!(world.conversation_id(main, "G0TRIO").await),
+            "{name}"
+        );
+        for text in WORKSPACES {
+            assert_eq!(stamped(text), Value::Null, "{name}: {text}");
+        }
+
+        // Then each place recalls and searches, in a session of its own (a
+        // dm's top-level messages are one session, so Ana's in a thread of
+        // it): Ana's dm and the group dm their own notes, nothing else the
+        // others.
+        let looking = format!("{}\n{}", search("review"), search("trio"));
+        let asking = format!("{} look\n{looking}", main.mention());
+        let mut seen = Vec::new();
+        for (place, channel, channel_type, user, thread) in [
+            ("Ana's dm", "D0ANA", "im", ANA, Some(dm.ts.as_str())),
+            ("Bo's dm", "D0BO", "im", BO, None),
+            ("the group dm", "G0TRIO", "mpim", ANA, None),
+            ("a channel", "C0SUPPORT", "channel", ANA, None),
+            ("a private channel", "G0PRIVATE", "group", ANA, None),
+        ] {
+            let before = turns(&world).len();
+            let text = if channel_type == "im" {
+                format!("look\n{looking}")
+            } else {
+                asking.clone()
+            };
+            let message = world.chat.post(channel, channel_type, user, &text, thread, world.now());
+            world.deliver(main, &world.chat.delivery(&message)).await;
+            world.work().await;
+            let run = last_run(&world, &name).await;
+            let recalled = recall(kind, &turns(&world)[before].body).unwrap();
+            seen.push((place, recalled, found(&world.setup, run).await));
+        }
+        // An API run is the workspace's.
+        let before = turns(&world).len();
+        let run = world.setup.start(&looking).await;
+        world.setup.kit.drain(Worker::A).await;
+        assert_eq!(world.setup.get(run).await["status"], "completed", "{name}");
+        let recalled = recall(kind, &turns(&world)[before].body).unwrap();
+        seen.push(("an API run", recalled, found(&world.setup, run).await));
+
+        for (place, recalled, found) in &seen {
+            for text in WORKSPACES {
+                assert!(recalled.contains(text), "{name}: {place} recalls {text}: {recalled}");
+            }
+            let mine = |text: &str| match text {
+                ANAS => *place == "Ana's dm",
+                _ => *place == "the group dm",
+            };
+            for (text, which) in [(ANAS, 0), (TRIOS, 1)] {
+                assert_eq!(recalled.contains(text), mine(text), "{name}: {place}: {recalled}");
+                assert_eq!(found[which].contains(text), mine(text), "{name}: {place}: {found:?}");
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn marks_every_later_save_of_a_session_once_a_run_read_an_apps_result_a_trim_included() {
+    for (kind, model) in PATHS {
+        let (world, model_id, _) = remembering(kind, model).await;
+        let name = format!("{kind:?} {model}");
+        narrow(&world, &model_id).await;
+        let main = &world.main;
+        let lookup = world.setup.calling("lookup", r#"{"n":1}"#).await;
+        let before = turns(&world).len();
+        // A save before any app's result was read; a run that reads one; a
+        // save in the run after it.
+        let asked = world
+            .say(
+                ANA,
+                &format!("{} hello\n{}", main.mention(), save("Saved first.")),
+                None,
+            )
+            .await;
+        world.work().await;
+        world.say(ANA, &format!("look it up\n{lookup}"), Some(&asked.ts)).await;
+        world.work().await;
+        world
+            .say(
+                ANA,
+                &format!("note it\n{}", save("Saved after the lookup.")),
+                Some(&asked.ts),
+            )
+            .await;
+        world.work().await;
+        // Long runs, until the history is trimmed past the run that read
+        // the result: a save then says so still.
+        for n in 4..=6 {
+            world.say(ANA, &long(n), Some(&asked.ts)).await;
+            world.work().await;
+        }
+        world
+            .say(
+                ANA,
+                &format!("{}\n{}", long(7), save("Saved after the trim.")),
+                Some(&asked.ts),
+            )
+            .await;
+        world.work().await;
+        // Another thread's session read no app's result.
+        world
+            .say(
+                BO,
+                &format!("{} hello\n{}", main.mention(), save("Saved elsewhere.")),
+                None,
+            )
+            .await;
+        world.work().await;
+
+        let runs = world.runs(main).await;
+        assert_eq!(runs.len(), 8, "{name}");
+        assert!(runs.iter().all(|run| run["status"] == "completed"), "{name}: {runs:?}");
+        let sent = turns(&world).split_off(before);
+        // Two turns for each of the three runs with a call, one for each
+        // long one, two for the trimmed one and two in the other thread.
+        assert_eq!(sent.len(), 13, "{name}");
+        let broken: Vec<usize> = breaks(kind, &sent[..11]).into_iter().map(|(index, _)| index).collect();
+        assert_eq!(broken, [9], "{name}: the seventh run is trimmed");
+        let opening = Prompt::read(kind, &sent[9].body).unwrap().messages[0].to_string();
+        assert!(opening.contains("5 lorem ipsum"), "{name}: past the lookup: {opening}");
+        let notes = world.setup.notes().await;
+        for (text, after_app_content) in [
+            ("Saved first.", false),
+            ("Saved after the lookup.", true),
+            ("Saved after the trim.", true),
+            ("Saved elsewhere.", false),
+        ] {
+            let note = notes
+                .iter()
+                .find(|note| note["text"] == text)
+                .unwrap_or_else(|| panic!("{name}: {text} not saved: {notes:?}"));
+            assert_eq!(note["origin"]["type"], "run", "{name}: {note}");
+            assert_eq!(note["origin"]["after_app_content"], after_app_content, "{name}: {text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn marks_at_most_four_breakpoints_on_every_turn_of_every_run_of_a_session() {
+    let paths = [
+        PATHS[0],
+        PATHS[1],
+        (ProviderKind::OpenRouter, "anthropic/claude-sonnet-4.5"),
+    ];
+    for (kind, model) in paths {
+        let (world, model_id, _) = remembering(kind, model).await;
+        let name = format!("{kind:?} {model}");
+        narrow(&world, &model_id).await;
+        let main = &world.main;
+        let mut lookups = Vec::new();
+        for n in 1..=3 {
+            lookups.push(world.setup.calling("lookup", &json!({ "n": n }).to_string()).await);
+        }
+        let before = turns(&world).len();
+        // Rounds of calls, a save, follow-ups and a trim.
+        let asked = world
+            .say(
+                ANA,
+                &format!(
+                    "{} look these up\n{}\n{}\nthen\n{}",
+                    main.mention(),
+                    lookups[0],
+                    lookups[1],
+                    lookups[2]
+                ),
+                None,
+            )
+            .await;
+        world.work().await;
+        world
+            .say(
+                BO,
+                &format!("note it\n{}\nthen\n{}", save("Ships on Fridays."), lookups[0]),
+                Some(&asked.ts),
+            )
+            .await;
+        world.work().await;
+        for n in 1..=4 {
+            world.say(ANA, &long(n), Some(&asked.ts)).await;
+            world.work().await;
+        }
+        world.say(ANA, &format!("again\n{}", lookups[1]), Some(&asked.ts)).await;
+        world.work().await;
+
+        let runs = world.runs(main).await;
+        assert_eq!(runs.len(), 7, "{name}");
+        assert!(runs.iter().all(|run| run["status"] == "completed"), "{name}: {runs:?}");
+        assert!(runs.iter().all(|run| run["session_id"] == runs[0]["session_id"]));
+        let sent = turns(&world).split_off(before);
+        assert_eq!(sent.len(), 12, "{name}");
+        assert_eq!(breaks(kind, &sent).len(), 1, "{name}: the trim");
+        for (index, turn) in sent.iter().enumerate() {
+            let marked = markers(kind, &turn.body).unwrap();
+            assert!(marked.len() <= MAX_BREAKPOINTS, "{name}: turn {index}: {marked:?}");
+            assert_eq!(
+                marked,
+                expected_markers(kind, model, &turn.body),
+                "{name}: turn {index}"
+            );
+            // Once the model answered, a path that takes them uses all four.
+            if at_breakpoints(kind, model) && index > 0 {
+                assert_eq!(marked.len(), MAX_BREAKPOINTS, "{name}: turn {index}");
+            }
+            assert!(recall(kind, &turn.body).is_some(), "{name}: turn {index}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn reads_and_writes_only_its_own_organization_workspace_agent_and_type() {
+    const THEIRS: [&str; 4] = [
+        "The sibling workspace's note.",
+        "The other agent's note.",
+        "Another organization's note.",
+        "The agent's note in another type.",
+    ];
+    for (kind, model) in PATHS {
+        let (world, _, memory_type) = remembering(kind, model).await;
+        let name = format!("{kind:?} {model}");
+        let setup = &world.setup;
+        let main = &world.main;
+        save_for(setup, own(setup), None, "The agent's own note.").await;
+        // The same type's notes of an agent of a sibling workspace and of
+        // another agent of the workspace; another organization's; and the
+        // agent's own in another type.
+        let neighbour = setup.sibling("neighbour", "tk_neighbour").await;
+        remembers(setup, &neighbour, &memory_type).await;
+        save_for(setup, tenant_of(&neighbour), None, THEIRS[0]).await;
+        let (status, other_agent) = setup
+            .kit
+            .send(
+                call("alice", Method::POST, format!("/v1/workspaces/{}/agents", setup.ws))
+                    .naming(&setup.org)
+                    .body(json!({
+                        "name": "Other", "description": "", "instructions": "",
+                        "memory": "type", "memory_type_id": memory_type,
+                    })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{other_agent}");
+        let other_agent = id(&other_agent["data"]).to_owned();
+        let other = ("alice", setup.org.as_str(), setup.ws.as_str(), other_agent.as_str());
+        save_for(setup, other, None, THEIRS[1]).await;
+        let elsewhere = setup.other_organization("bob", "larkspur", "tk_larkspur").await;
+        let (status, created) = setup
+            .kit
+            .send(
+                call(
+                    "bob",
+                    Method::POST,
+                    format!("/v1/organizations/{}/memory-types", elsewhere.org),
+                )
+                .body(json!({ "name": "Customer notes", "kind": "notes", "settings": {} })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        remembers(setup, &elsewhere, id(&created["data"])).await;
+        save_for(setup, tenant_of(&elsewhere), None, THEIRS[2]).await;
+        let other_type = setup.notes_type("Order notes", "allow").await;
+        save_for(setup, own(setup), Some(&other_type), THEIRS[3]).await;
+
+        // A session begins in the agent's type. While its run waits for
+        // approval, the agent moves to the other type, and what arrives in
+        // the thread meanwhile is collected into the session's next run.
+        world.configure(main, json!({ "mid_run": "collect" })).await;
+        let send = setup.calling("send", r#"{"to":"ops"}"#).await;
+        let before = turns(&world).len();
+        let asked = world
+            .say(
+                ANA,
+                &format!(
+                    "{} tell ops\n{send}\nthen\n{}\n{}",
+                    main.mention(),
+                    save("Saved in the session."),
+                    search("note")
+                ),
+                None,
+            )
+            .await;
+        world.work().await;
+        let waiting = World::run_id(world.runs(main).await.last().unwrap());
+        setup.remember_in(&other_type).await;
+        world
+            .say(
+                BO,
+                &format!("and this\n{}\n{}", save("Saved later in the session."), search("note")),
+                Some(&asked.ts),
+            )
+            .await;
+        world.handle().await;
+        world.approve(waiting).await;
+        world.work().await;
+
+        let runs = world.runs(main).await;
+        assert_eq!(runs.len(), 2, "{name}");
+        assert!(runs.iter().all(|run| run["status"] == "completed"), "{name}: {runs:?}");
+        assert_eq!(runs[0]["session_id"], runs[1]["session_id"], "{name}");
+        let sent = turns(&world).split_off(before);
+        let recalled = recalls(kind, &sent);
+        assert!(recalled.iter().all(|recall| recall == &recalled[0]), "{name}");
+        let recalled = recalled[0].clone().unwrap();
+        assert!(
+            recalled.contains("Prefers answers in Portuguese.") && recalled.contains("The agent's own note."),
+            "{name}: {recalled}"
+        );
+        // Both runs called the session's type, found only its own agent's
+        // notes there, and recalled only those.
+        let session_type = MemoryTypeId::parse(&memory_type).unwrap();
+        for run in &runs {
+            let run = World::run_id(run);
+            let calls = memory_calls(setup, run).await;
+            assert_eq!(calls.len(), 2, "{name}: {calls:?}");
+            for call in &calls {
+                assert_eq!(call.state, CallState::Completed, "{name}: {call:?}");
+                assert_eq!(call.target.as_ref().unwrap().memory(), Some(session_type), "{name}");
+            }
+            let found = found(setup, run).await;
+            assert!(found[0].contains("The agent's own note."), "{name}: {found:?}");
+            for theirs in THEIRS {
+                assert!(!recalled.contains(theirs), "{name}: {recalled}");
+                assert!(!found[0].contains(theirs), "{name}: {found:?}");
+            }
+        }
+        // It saved for its own agent, in its own type, only.
+        let kept = texts(setup, own(setup), Some(&memory_type)).await;
+        for text in ["Saved in the session.", "Saved later in the session."] {
+            assert!(kept.iter().any(|kept| kept == text), "{name}: {kept:?}");
+        }
+        assert_eq!(texts(setup, own(setup), Some(&other_type)).await, [THEIRS[3]], "{name}");
+        assert_eq!(texts(setup, tenant_of(&neighbour), None).await, [THEIRS[0]], "{name}");
+        assert_eq!(texts(setup, other, None).await, [THEIRS[1]], "{name}");
+        assert_eq!(texts(setup, tenant_of(&elsewhere), None).await, [THEIRS[2]], "{name}");
+
+        // A new session takes the agent's memory as it is now.
+        let before = turns(&world).len();
+        world.say(ANA, &format!("{} hello", main.mention()), None).await;
+        world.work().await;
+        let fresh = recall(kind, &turns(&world)[before].body).unwrap();
+        assert!(
+            fresh.contains(THEIRS[3]) && !fresh.contains("The agent's own note."),
+            "{name}: {fresh}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn recalls_nothing_after_a_trim_once_its_type_is_deleted_and_refuses_its_calls() {
+    for (kind, model) in PATHS {
+        let (world, model_id, memory_type) = remembering(kind, model).await;
+        let name = format!("{kind:?} {model}");
+        narrow(&world, &model_id).await;
+        let setup = &world.setup;
+        let main = &world.main;
+        world.configure(main, json!({ "mid_run": "collect" })).await;
+        let send = setup.calling("send", r#"{"to":"ops"}"#).await;
+        let before = turns(&world).len();
+        let asked = world.say(ANA, &format!("{} {}", main.mention(), long(1)), None).await;
+        world.work().await;
+        for n in 2..=3 {
+            world.say(ANA, &long(n), Some(&asked.ts)).await;
+            world.work().await;
+        }
+        // The fourth run waits for approval. Meanwhile the agent moves to
+        // another type, the session's is deleted, and a long message with a
+        // save arrives, for the session's next run: it trims the history.
+        world.say(ANA, &format!("tell ops\n{send}"), Some(&asked.ts)).await;
+        world.work().await;
+        let waiting = World::run_id(world.runs(main).await.last().unwrap());
+        let other_type = setup.notes_type("Other notes", "allow").await;
+        setup.remember_in(&other_type).await;
+        let (status, body) = setup
+            .kit
+            .send(call(
+                "alice",
+                Method::DELETE,
+                format!("/v1/organizations/{}/memory-types/{memory_type}", setup.org),
+            ))
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        world
+            .say(
+                BO,
+                &format!("{}\n{}", long(5), save("Ships on Fridays.")),
+                Some(&asked.ts),
+            )
+            .await;
+        world.handle().await;
+        world.approve(waiting).await;
+        world.work().await;
+
+        let runs = world.runs(main).await;
+        assert_eq!(runs.len(), 5, "{name}");
+        assert!(runs.iter().all(|run| run["status"] == "completed"), "{name}: {runs:?}");
+        assert!(runs.iter().all(|run| run["session_id"] == runs[0]["session_id"]));
+        let sent = turns(&world).split_off(before);
+        assert_eq!(sent.len(), 7, "{name}: a turn a run, two for each with a call");
+        let broken: Vec<usize> = breaks(kind, &sent).into_iter().map(|(index, _)| index).collect();
+        assert_eq!(broken, [5], "{name}: the fifth run is trimmed");
+        // Until the trim, every turn sends the recall the session began
+        // with, the type's deletion meanwhile included; from the trim, the
+        // session's type is gone, and nothing is recalled. Its tools stay.
+        let recalled = recalls(kind, &sent);
+        assert!(recalled[0].is_some(), "{name}");
+        assert!(recalled[..5].iter().all(|recall| recall == &recalled[0]), "{name}");
+        assert_eq!(recalled[5..], [None, None], "{name}");
+        let tools = Prompt::read(kind, &sent[0].body).unwrap().tools;
+        for turn in &sent {
+            assert_eq!(Prompt::read(kind, &turn.body).unwrap().tools, tools, "{name}");
+        }
+        let calls = memory_calls(setup, World::run_id(&runs[4])).await;
+        assert_eq!(calls.len(), 1, "{name}: {calls:?}");
+        assert_eq!(calls[0].state, CallState::Refused, "{name}: {calls:?}");
+        assert_eq!(calls[0].failure.as_ref().unwrap().code, "memory_type_removed");
+        assert!(texts(setup, own(setup), None).await.is_empty(), "{name}: nothing saved");
+        assert_eq!(
+            kept(&world, World::run_id(&runs[4])).await,
+            keeping(&memory_type, None, None),
+            "{name}"
+        );
     }
 }

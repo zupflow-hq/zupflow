@@ -57,6 +57,7 @@ use crate::model_store::RunModel;
 use crate::policy::ToolLevel;
 use crate::runs::QueuedJob;
 use crate::runs::names::Offer;
+use crate::runs::state::SessionMemory;
 use crate::runs::transition::Steer;
 use crate::time::Timestamp;
 use crate::workspaces::Page;
@@ -482,23 +483,29 @@ pub struct NewDispatch {
 }
 
 /// What a session's runs are fixed with: the model, the instructions with
-/// the channel preface, the tools, and the history budget in tokens.
+/// the channel preface, the tools (the memory's among them), the memory,
+/// and the history budget in tokens.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionTemplate {
     pub model: RunModel,
     pub instructions: String,
     pub offer: Offer,
+    /// The agent's memory type and the session's audience: `None` when the
+    /// agent has none, or one of a kind this server doesn't serve.
+    pub memory: Option<SessionMemory>,
     pub history_budget: u64,
 }
 
 impl SessionTemplate {
     /// Whether a session fixed with `other` asks its model the same way:
     /// the same model through the same connection, the same instructions,
-    /// and the same tools as the model reads them (each one's name,
-    /// description and schema, in order). What only the Console shows (a
-    /// connection's or installation's label, a team's name) and the history
-    /// budget never start a new session on their own, so a rename doesn't
-    /// throw the provider's cache away.
+    /// the same tools as the model reads them (each one's name, description
+    /// and schema, in order), and the same memory: a session recalls from
+    /// one type for one audience, and its memory tools act in that type
+    /// only. What only the Console shows (a connection's or installation's
+    /// label, a team's name) and the history budget never start a new
+    /// session on their own, so a rename doesn't throw the provider's cache
+    /// away.
     pub fn same_for_the_model(&self, other: &SessionTemplate) -> bool {
         let specs = |template: &SessionTemplate| {
             template
@@ -508,7 +515,10 @@ impl SessionTemplate {
                 .map(|tool| (tool.name.clone(), tool.description.clone(), tool.input_schema.clone()))
                 .collect::<Vec<_>>()
         };
-        self.model == other.model && self.instructions == other.instructions && specs(self) == specs(other)
+        self.model == other.model
+            && self.instructions == other.instructions
+            && specs(self) == specs(other)
+            && self.memory == other.memory
     }
 }
 
@@ -1205,9 +1215,13 @@ pub trait ChannelStore: Send + Sync {
     ///
     /// `template` is what the session's runs are fixed with, read now: a
     /// session that has none takes it, and an idle one whose own differs
-    /// starts a new run session with it, its history starting over. `None`
-    /// starts a run with the session's own, and leaves the dispatch waiting
-    /// when it has none.
+    /// for the model ([`SessionTemplate::same_for_the_model`]) starts a new
+    /// run session with it, its history and its recall starting over.
+    /// `None` starts a run with the session's own, and leaves the dispatch
+    /// waiting when it has none. Each run's snapshot carries the session's
+    /// memory and the recall it keeps for the run's history start, read by
+    /// the first run from that start; a session whose run read an app's
+    /// tool result keeps that as the run ends.
     async fn dispatch(
         &self,
         organization_id: OrganizationId,
@@ -1389,8 +1403,8 @@ pub trait ChannelStore: Send + Sync {
     /// [`super::INBOUND_EVENT_RETENTION_DAYS`], and the text of channel runs
     /// that finished before the cutoff: their input, output, turns, steered
     /// turns and kept transcripts. A session whose runs lose their text
-    /// starts a new run session, reading its thread anew; one with a run in
-    /// progress keeps its runs until a later sweep.
+    /// starts a new run session, reading its thread and what it recalls
+    /// anew; one with a run in progress keeps its runs until a later sweep.
     async fn sweep_retention(
         &self,
         organization_id: OrganizationId,
@@ -1432,4 +1446,54 @@ pub trait ChannelStore: Send + Sync {
         now: Timestamp,
         audit: &Audit<'_, ChannelSettings>,
     ) -> Result<ChannelSettings, ChannelError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::ids::{ChannelConversationId, MemoryTypeId, ModelConnectionId, ModelId};
+    use crate::memory::Audience;
+
+    fn template(memory: Option<SessionMemory>) -> SessionTemplate {
+        SessionTemplate {
+            model: RunModel {
+                model_id: ModelId::from_uuid(Uuid::from_u128(1)),
+                connection_id: ModelConnectionId::from_uuid(Uuid::from_u128(2)),
+                provider_model_id: "model-a".to_owned(),
+            },
+            instructions: "Be brief.".to_owned(),
+            offer: Offer::default(),
+            memory,
+            history_budget: 1_000,
+        }
+    }
+
+    #[test]
+    fn starts_a_new_session_for_other_memory_only() {
+        let notes = MemoryTypeId::from_uuid(Uuid::from_u128(3));
+        let here = ChannelConversationId::from_uuid(Uuid::from_u128(4));
+        let workspace = Some(SessionMemory {
+            memory_type_id: notes,
+            audience: Audience::Workspace,
+        });
+        let same = template(workspace);
+        let mut budget = template(workspace);
+        budget.history_budget = 2_000;
+        assert!(same.same_for_the_model(&budget), "the budget isn't the model's");
+        for other in [
+            None,
+            Some(SessionMemory {
+                memory_type_id: MemoryTypeId::from_uuid(Uuid::from_u128(5)),
+                audience: Audience::Workspace,
+            }),
+            Some(SessionMemory {
+                memory_type_id: notes,
+                audience: Audience::Direct(here),
+            }),
+        ] {
+            assert!(!same.same_for_the_model(&template(other)), "{other:?}");
+        }
+    }
 }

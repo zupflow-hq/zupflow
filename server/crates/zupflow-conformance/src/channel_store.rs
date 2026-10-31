@@ -7,7 +7,10 @@
 //! app per agent per manager, one live connection per app, an agent channel
 //! only on its own agent's app, a manager's tokens replaced once per version
 //! read, one active run per session, the conversation breaker's count of
-//! the runs that start, and each message read once in a run session.
+//! the runs that start, and each message read once in a run session. A
+//! session keeps the memory it began with, and one recall for each history
+//! start, read by the first run from it; other memory starts a new run
+//! session, and a run whose session went with its memory fails.
 //! A message is read back byte for byte as it was recorded. Every change is
 //! made only by an editor who still may, and an agent's apps go with it.
 //! An app is made at least once: an attempt marks it before the provider is
@@ -52,22 +55,25 @@ use zupflow_core::connect::{ConnectIntent, ConnectSessionStatus, ConnectStore, N
 use zupflow_core::environment::Environment;
 use zupflow_core::ids::{
     AgentChannelId, AgentId, ApiKeyId, ChannelAppId, ChannelAppManagerId, ChannelConnectionId, ChannelConversationId,
-    ChannelMessageId, ConnectSessionId, MemberId, ModelConnectionId, ModelId, OrganizationId, RunId, ToolCallId,
-    UserId, WorkspaceId,
+    ChannelMessageId, ConnectSessionId, MemberId, MemoryTypeId, ModelConnectionId, ModelId, OrganizationId, RunId,
+    ToolCallId, UserId, WorkspaceId,
 };
 use zupflow_core::jobs::{JobOptions, JobQueue};
 use zupflow_core::keys::{Sealed, WrappedKey};
+use zupflow_core::memory::{Audience, MemoryWrites, notes};
 use zupflow_core::model_store::{RouteState, RunModel};
 use zupflow_core::models::Message;
 use zupflow_core::models::{Completion, Reply, TokenUsage};
 use zupflow_core::policy::ToolLevel;
 use zupflow_core::runs::QueuedJob;
-use zupflow_core::runs::RunTrigger;
-use zupflow_core::runs::names::Offer;
-use zupflow_core::runs::reducer::{Facts, ModelAnswer, ModelResult, advance, cancel};
-use zupflow_core::runs::state::{ClaimantId, Continuation, InvocationId, RequestId};
+use zupflow_core::runs::names::{Offer, memory_tool};
+use zupflow_core::runs::reducer::{Facts, Io, ModelAnswer, ModelResult, SESSION_REMOVED, advance, cancel};
+use zupflow_core::runs::state::{
+    ClaimantId, Continuation, FrozenMemory, InvocationId, RequestId, SessionMemory, SessionRecall,
+};
 use zupflow_core::runs::store::{Applied, RunStore};
 use zupflow_core::runs::transition::Operation;
+use zupflow_core::runs::{RunStatus, RunTrigger};
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
 
@@ -122,6 +128,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     records_deliveries_once(&stores, &prepare).await;
     catches_up_only_on_its_own_join(&stores, &prepare).await;
     starts_one_run_per_session(&stores, &prepare).await;
+    keeps_a_sessions_memory_and_one_recall_per_history_start(&stores, &prepare).await;
     counts_the_breaker_under_concurrency(&stores, &prepare).await;
     counts_runs_and_reads_each_message_once(&stores, &prepare).await;
     links_a_team_through_a_connect_session(&stores, &prepare).await;
@@ -1199,6 +1206,7 @@ fn template() -> SessionTemplate {
         },
         instructions: "You are answering in Slack.\n\nBe brief.".to_owned(),
         offer: Offer::default(),
+        memory: None,
         history_budget: 1_000,
     }
 }
@@ -1380,6 +1388,204 @@ async fn starts_one_run_per_session(stores: &Stores<'_>, prepare: &Prepare) {
         Ok(None),
         "an ended run takes nothing in"
     );
+}
+
+/// Drives a run as [`answer_run`] does, its worker reading `read` for its
+/// memory whenever asked: what each model attempt was sent to recall, in
+/// order.
+async fn answer_remembering(
+    stores: &Stores<'_>,
+    org: OrganizationId,
+    ws: WorkspaceId,
+    run: RunId,
+    read: &FrozenMemory,
+) -> Vec<Option<String>> {
+    let mut facts = Facts {
+        claimant: Some(ClaimantId::from_uuid(uuid::Uuid::now_v7())),
+        offer: Some(Offer::default()),
+        memory: Some(read.clone()),
+        model_route: Some(RouteState::Usable { key_version: 1 }),
+        invocation_id: Some(InvocationId::from_uuid(uuid::Uuid::now_v7())),
+        ..Facts::at(now())
+    };
+    let mut recalled = Vec::new();
+    for _ in 0..8 {
+        let snapshot = stores.runs.find_snapshot(org, ws, run).await.unwrap().expect("the run");
+        facts.model = match snapshot.control.continuation {
+            Continuation::Done => return recalled,
+            Continuation::AwaitModel { turn, attempt } => Some(ModelAnswer {
+                turn,
+                attempt,
+                result: ModelResult::Answered(Completion {
+                    reply: Reply::Text("Noted.".to_owned()),
+                    usage: TokenUsage::default(),
+                }),
+            }),
+            _ => None,
+        };
+        let plan = advance(&snapshot, &facts).expect("a plan");
+        if let Io::CallModel(asked) = plan.io() {
+            recalled.push(asked.memory.clone());
+        }
+        let request = plan.request().expect("a transition").clone();
+        if let Operation::Claim(claim) = request.operation() {
+            facts.claim = Some(claim.epoch);
+        }
+        let applied = stores.runs.apply(org, ws, &request).await;
+        assert!(matches!(applied, Ok(Applied::Committed(_))), "{applied:?}");
+    }
+    panic!("the run didn't end");
+}
+
+/// A session keeps the memory it began with, the type and the audience, and
+/// one recall for each history start: the first run from a start reads it
+/// with its first model attempt, and every later run from the same start
+/// sends it again, whatever its worker read; a trim reads it anew. A
+/// template with other memory starts a new run session, its recall unread.
+/// A run whose session was removed with its memory fails.
+async fn keeps_a_sessions_memory_and_one_recall_per_history_start(stores: &Stores<'_>, prepare: &Prepare) {
+    const RECALL: &str = "<memory>\n[k7m2qd] Prefers replies in Portuguese.\n</memory>";
+    const LATER: &str = "<memory>\n[k7m2qd] Prefers replies in Portuguese.\n[p3x9tw] Ships on Fridays.\n</memory>";
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let (_, _, connection) = installed(stores, &t, ws, t.agent).await;
+    let channel = stores.channels.list_agent_channels(org, ws, t.agent).await.unwrap()[0].clone();
+    let base = template();
+    let remembering = |memory_type_id: MemoryTypeId| {
+        let tools = notes::tools(MemoryWrites::Allow)
+            .iter()
+            .map(|tool| memory_tool(memory_type_id, "Customer notes", notes::KIND, notes::NAME, tool))
+            .collect();
+        let (offer, left_out) = Offer::default().with(tools);
+        assert!(left_out.is_empty());
+        SessionTemplate {
+            offer,
+            memory: Some(SessionMemory {
+                memory_type_id,
+                audience: Audience::Workspace,
+            }),
+            ..base.clone()
+        }
+    };
+    let read = |memory_type_id: MemoryTypeId, recall: &str| FrozenMemory {
+        memory_type_id,
+        recall: Some(recall.to_owned()),
+    };
+    let mut sent = 0;
+    let mut start = |template: SessionTemplate| {
+        sent += 1;
+        let external_id = format!("5.{sent}");
+        async move {
+            let asked = recorded(stores, &t, connection, &external_id, "what's due?").await;
+            let outcome = stores
+                .channels
+                .dispatch(
+                    org,
+                    ws,
+                    &dispatch_of(asked.id, channel.id, &external_id),
+                    Some(&template),
+                    now(),
+                )
+                .await
+                .unwrap();
+            let DispatchOutcome::Started { run_id } = outcome else {
+                panic!("a run starts in the idle session: {outcome:?}");
+            };
+            let snapshot = stores.runs.find_snapshot(org, ws, run_id).await.unwrap().unwrap();
+            (run_id, snapshot)
+        }
+    };
+    let customer = MemoryTypeId::generate();
+    let session_memory = remembering(customer).memory;
+
+    // The first run reads the recall with its first attempt; the session
+    // keeps it, and the run only its type.
+    let (first, snapshot) = start(remembering(customer)).await;
+    let session = snapshot.session.expect("a channel run's session");
+    assert_eq!(
+        (session.memory, session.recall, session.app_content_read),
+        (session_memory, SessionRecall::Unread, false)
+    );
+    assert_eq!(
+        answer_remembering(stores, org, ws, first, &read(customer, RECALL)).await,
+        [Some(RECALL.to_owned())]
+    );
+    let ended = stores.runs.find_snapshot(org, ws, first).await.unwrap().unwrap();
+    assert_eq!(
+        ended.frozen_memory,
+        Some(FrozenMemory {
+            memory_type_id: customer,
+            recall: None
+        }),
+        "the session keeps the recall, the run its type"
+    );
+
+    // The next run from the same start sends the same, whatever its worker
+    // read since.
+    let (second, snapshot) = start(remembering(customer)).await;
+    let session = snapshot.session.expect("its session");
+    assert_eq!(session.recall, SessionRecall::Read(Some(RECALL.to_owned())));
+    assert_eq!(session.history.len(), 2, "the first run's input and answer");
+    assert_eq!(
+        answer_remembering(stores, org, ws, second, &read(customer, LATER)).await,
+        [Some(RECALL.to_owned())]
+    );
+    let first_run = stores.runs.find_run(org, ws, first).await.unwrap().unwrap();
+    let second_run = stores.runs.find_run(org, ws, second).await.unwrap().unwrap();
+    assert_eq!(first_run.session_id, second_run.session_id);
+
+    // A trim starts the history anew, and its first run reads again.
+    let (trimmed, snapshot) = start(SessionTemplate {
+        history_budget: 1,
+        ..remembering(customer)
+    })
+    .await;
+    let session = snapshot.session.expect("its session");
+    assert!(session.history.is_empty(), "trimmed: {:?}", session.history);
+    assert_eq!(
+        (session.memory, session.recall),
+        (session_memory, SessionRecall::Unread)
+    );
+    assert_eq!(
+        answer_remembering(stores, org, ws, trimmed, &read(customer, LATER)).await,
+        [Some(LATER.to_owned())]
+    );
+    let trimmed_run = stores.runs.find_run(org, ws, trimmed).await.unwrap().unwrap();
+    assert_eq!(trimmed_run.session_id, first_run.session_id);
+
+    // Other memory starts a new run session, which reads its own.
+    let orders = MemoryTypeId::generate();
+    let (other, snapshot) = start(remembering(orders)).await;
+    let session = snapshot.session.expect("its session");
+    assert_eq!(
+        (session.memory, session.recall, session.history.len()),
+        (remembering(orders).memory, SessionRecall::Unread, 0)
+    );
+    assert_ne!(
+        stores.runs.find_run(org, ws, other).await.unwrap().unwrap().session_id,
+        first_run.session_id
+    );
+    assert_eq!(
+        answer_remembering(stores, org, ws, other, &read(orders, RECALL)).await,
+        [Some(RECALL.to_owned())]
+    );
+    // Another workspace reads none of it.
+    assert_eq!(stores.runs.find_snapshot(org, t.sibling, other).await, Ok(None));
+
+    // A run whose session goes with its agent's channel, under way, fails:
+    // its memory went with the session.
+    let (orphaned, _) = start(remembering(orders)).await;
+    stores
+        .channels
+        .delete_agent_channel(org, ws, t.agent, connection, developer(&t), &|_| by_suite_in(ws))
+        .await
+        .unwrap();
+    let snapshot = stores.runs.find_snapshot(org, ws, orphaned).await.unwrap().unwrap();
+    assert_eq!(snapshot.session.as_ref().map(|session| session.memory), Some(None));
+    answer_remembering(stores, org, ws, orphaned, &read(orders, RECALL)).await;
+    let failed = stores.runs.find_run(org, ws, orphaned).await.unwrap().unwrap();
+    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(failed.error.map(|error| error.code), Some(SESSION_REMOVED.to_owned()));
 }
 
 /// A message in its own thread of C0SUPPORT.

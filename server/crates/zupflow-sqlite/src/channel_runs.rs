@@ -18,6 +18,13 @@
 //! whole runs and a quarter of the budget at least
 //! ([`zupflow_core::runs::history::trimmed_start`]), so the cache misses
 //! once per trim.
+//!
+//! A session's memory (its type and audience) is fixed with its tools, and
+//! the session keeps the recall its history begins with, once for each
+//! start: the first run from a start reads it with its first model attempt
+//! ([`keep_recall`]), and every other run from that start sends it again.
+//! When one of its runs read an app's tool result, the session keeps that
+//! as it ends, for what later runs save.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -35,15 +42,18 @@ use zupflow_core::channels::thread::{
 };
 use zupflow_core::channels::{ChannelProviderKind, ConversationKind, MidRun};
 use zupflow_core::ids::{
-    AgentChannelId, AgentId, ChannelConnectionId, ChannelConversationId, ChannelMessageId, ModelConnectionId, ModelId,
-    OrganizationId, RunId, SessionId, WorkspaceId,
+    AgentChannelId, AgentId, ChannelConnectionId, ChannelConversationId, ChannelMessageId, MemoryTypeId,
+    ModelConnectionId, ModelId, OrganizationId, RunId, SessionId, WorkspaceId,
 };
+use zupflow_core::memory::Audience;
 use zupflow_core::model_store::RunModel;
 use zupflow_core::models::Message;
 use zupflow_core::runs::history::{transcript, trimmed_start, weight as weight_of};
 use zupflow_core::runs::names::Offer;
-use zupflow_core::runs::reducer::admit;
-use zupflow_core::runs::state::{ChannelOrigin, SessionContext, SteeredTurn};
+use zupflow_core::runs::reducer::{TOOL_ERROR, admit};
+use zupflow_core::runs::state::{
+    ChannelOrigin, FrozenMemory, SessionContext, SessionMemory, SessionRecall, SteeredTurn,
+};
 use zupflow_core::runs::store::StoreError;
 use zupflow_core::runs::transition::{SeenMessage, Steer};
 use zupflow_core::runs::{ChannelAdmission, MemoryMode, NewRun, RunStatus, RunTrigger, TakenIn};
@@ -103,11 +113,49 @@ macro_rules! session_select {
     () => {
         "SELECT s.id, s.agent_channel_id, s.conversation_id, s.thread_key, s.session_id, s.active_run_id, \
          s.last_run_id, s.run_count, s.model, s.model_id, s.model_connection_id, s.instructions, s.offer, \
-         s.history_budget, s.seen_message_id, s.seen_at, s.changes_noted_at FROM channel_sessions s"
+         s.history_budget, s.memory_type_id, s.memory_audience, s.seen_message_id, s.seen_at, s.changes_noted_at \
+         FROM channel_sessions s"
     };
 }
 
+/// How a session's audience is stored: `direct` for its own conversation's,
+/// beside the workspace's.
+fn audience_text(audience: &Audience) -> &'static str {
+    match audience {
+        Audience::Workspace => "workspace",
+        Audience::Direct(_) => "direct",
+    }
+}
+
+/// A session's memory as stored, in its conversation.
+fn session_memory(
+    memory_type_id: Option<Uuid>,
+    audience: Option<&str>,
+    conversation_id: ChannelConversationId,
+) -> Result<Option<SessionMemory>, StoreError> {
+    let audience = match audience {
+        None => None,
+        Some("workspace") => Some(Audience::Workspace),
+        Some("direct") => Some(Audience::Direct(conversation_id)),
+        Some(_) => return Err(corrupt("a session's audience")),
+    };
+    match (memory_type_id, audience) {
+        (Some(memory_type_id), Some(audience)) => Ok(Some(SessionMemory {
+            memory_type_id: MemoryTypeId::from_uuid(memory_type_id),
+            audience,
+        })),
+        (None, None) => Ok(None),
+        _ => Err(corrupt("a session's memory")),
+    }
+}
+
 fn session_from(row: &SqliteRow) -> Result<SessionRow, StoreError> {
+    let conversation_id = ChannelConversationId::from_uuid(get(row, "conversation_id")?);
+    let memory = session_memory(
+        get(row, "memory_type_id")?,
+        get::<Option<String>>(row, "memory_audience")?.as_deref(),
+        conversation_id,
+    )?;
     let template = match (
         get::<Option<String>>(row, "model")?,
         get::<Option<Uuid>>(row, "model_id")?,
@@ -125,10 +173,11 @@ fn session_from(row: &SqliteRow) -> Result<SessionRow, StoreError> {
                 },
                 instructions,
                 offer: serde_json::from_str::<Offer>(&offer).map_err(unreadable)?,
+                memory,
                 history_budget: u64::try_from(budget).map_err(unreadable)?,
             })
         }
-        (None, None, None, None, None, None) => None,
+        (None, None, None, None, None, None) if memory.is_none() => None,
         _ => return Err(corrupt("a session's template")),
     };
     let seen = match (
@@ -143,7 +192,7 @@ fn session_from(row: &SqliteRow) -> Result<SessionRow, StoreError> {
         session: ChannelSession {
             key: ChannelSessionKey::from_uuid(get(row, "id")?),
             agent_channel_id: AgentChannelId::from_uuid(get(row, "agent_channel_id")?),
-            conversation_id: ChannelConversationId::from_uuid(get(row, "conversation_id")?),
+            conversation_id,
             thread_key: get(row, "thread_key")?,
             session_id: SessionId::from_uuid(get(row, "session_id")?),
             active_run_id: get::<Option<Uuid>>(row, "active_run_id")?.map(RunId::from_uuid),
@@ -1319,7 +1368,7 @@ async fn start_session_run(
         session_id,
         trigger: RunTrigger::Channel,
         input,
-        // A channel run is `agent`; its session sends it no memory.
+        // A channel run is `agent`: it remembers as its session does.
         memory: MemoryMode::Agent,
         model: template.model.clone(),
         instructions: template.instructions.clone(),
@@ -1351,11 +1400,16 @@ async fn start_session_run(
     )
     .await?;
     let offer = to_json(&template.offer)?;
+    // The memory is fixed with the tools; a new run session reads what it
+    // recalls anew, as does each history start ([`keep_recall`]).
     let started = sqlx::query(
         "UPDATE channel_sessions SET session_id = ?1, active_run_id = ?2, run_count = ?3, seen_message_id = ?4, \
          seen_at = ?5, model = ?6, model_id = ?7, model_connection_id = ?8, instructions = ?9, offer = ?10, \
          history_budget = ?11, updated_at = ?12, changes_noted_at = CASE WHEN ?13 IS NULL THEN changes_noted_at \
-         WHEN changes_noted_at IS NULL OR changes_noted_at < ?13 THEN ?13 ELSE changes_noted_at END \
+         WHEN changes_noted_at IS NULL OR changes_noted_at < ?13 THEN ?13 ELSE changes_noted_at END, \
+         memory_type_id = ?17, memory_audience = ?18, \
+         recall = CASE WHEN session_id = ?1 AND memory_type_id IS ?17 THEN recall END, \
+         recall_start_run_id = CASE WHEN session_id = ?1 AND memory_type_id IS ?17 THEN recall_start_run_id END \
          WHERE organization_id = ?14 AND workspace_id = ?15 AND id = ?16 AND active_run_id IS NULL",
     )
     .bind(session_id.uuid())
@@ -1374,6 +1428,8 @@ async fn start_session_run(
     .bind(organization_id.uuid())
     .bind(workspace_id.uuid())
     .bind(key.uuid())
+    .bind(template.memory.map(|memory| memory.memory_type_id.uuid()))
+    .bind(template.memory.as_ref().map(|memory| audience_text(&memory.audience)))
     .execute(&mut *connection)
     .await
     .map_err(failed("start_session_run"))?;
@@ -1414,8 +1470,13 @@ pub(crate) async fn run_ended(
     };
     let input: String = get(&run, "input")?;
     keep_transcript(connection, organization_id, workspace_id, run_id, &input).await?;
+    // A run that read an app's tool result (its answer, or its own error)
+    // marks the session: what any later run of it saves may come from it.
     let freed = sqlx::query(
-        "UPDATE channel_sessions SET active_run_id = NULL, last_run_id = ?1, updated_at = ?2 \
+        "UPDATE channel_sessions SET active_run_id = NULL, last_run_id = ?1, updated_at = ?2, \
+         app_content_read = CASE WHEN app_content_read = 1 OR EXISTS (SELECT 1 FROM run_tool_calls c \
+         WHERE c.organization_id = ?3 AND c.workspace_id = ?4 AND c.run_id = ?1 AND c.installation_id IS NOT NULL \
+         AND (c.state = 'completed' OR (c.state = 'failed' AND c.failure_code = ?6))) THEN 1 ELSE 0 END \
          WHERE organization_id = ?3 AND workspace_id = ?4 AND id = ?5 AND active_run_id = ?1",
     )
     .bind(run_id.uuid())
@@ -1423,6 +1484,7 @@ pub(crate) async fn run_ended(
     .bind(organization_id.uuid())
     .bind(workspace_id.uuid())
     .bind(key)
+    .bind(TOOL_ERROR)
     .execute(&mut *connection)
     .await
     .map_err(failed("run_ended"))?;
@@ -1645,8 +1707,11 @@ pub(crate) async fn take_steer(
 
 /// A channel run's session context: the transcripts of its session's runs
 /// from its history start, as kept when each ended, the session's tools,
-/// and its own steered turns.
-/// `None` for any other run.
+/// its memory with the recall it keeps for the run's start, whether an
+/// earlier run of it read an app's result, and the run's own steered turns.
+/// The session's memory is read only while the session holds the run's
+/// run session: a session that's gone, or moved on after the run, has
+/// none for it. `None` for any other run.
 pub(crate) async fn session_context(
     connection: &mut SqliteConnection,
     organization_id: OrganizationId,
@@ -1717,14 +1782,97 @@ pub(crate) async fn session_context(
         sequence,
     )
     .await?;
+    let conversation_id = ChannelConversationId::from_uuid(origin_conversation);
+    let held = sqlx::query(
+        "SELECT memory_type_id, memory_audience, recall, recall_start_run_id, app_content_read \
+         FROM channel_sessions WHERE organization_id = ? AND workspace_id = ? AND id = ? AND session_id = ?",
+    )
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(key.uuid())
+    .bind(session_id.uuid())
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(failed("session_context"))?;
+    let (memory, recall, app_content_read) = match &held {
+        None => (None, SessionRecall::Read(None), false),
+        Some(row) => {
+            let memory = session_memory(
+                get(row, "memory_type_id")?,
+                get::<Option<String>>(row, "memory_audience")?.as_deref(),
+                conversation_id,
+            )?;
+            let recall = match (memory, get::<Option<Uuid>>(row, "recall_start_run_id")?) {
+                (Some(_), Some(kept)) if kept == start.uuid() => SessionRecall::Read(get(row, "recall")?),
+                (Some(_), _) => SessionRecall::Unread,
+                (None, _) => SessionRecall::Read(None),
+            };
+            (memory, recall, get::<i64>(row, "app_content_read")? != 0)
+        }
+    };
     Ok(Some(SessionContext {
         origin: ChannelOrigin {
             connection_id: ChannelConnectionId::from_uuid(origin_connection),
-            conversation_id: ChannelConversationId::from_uuid(origin_conversation),
+            conversation_id,
             thread_key,
         },
         history,
         offer: serde_json::from_str::<Offer>(&offer).map_err(unreadable)?,
+        memory,
+        recall,
+        app_content_read,
         steers: steered_turns(connection, organization_id, workspace_id, run_id).await?,
     }))
+}
+
+/// Keeps what a channel run's first model attempt recalls on its session,
+/// for every run from the run's history start: once, by the first run from
+/// that start, and never another recall for it. The run's session must
+/// hold the run, in the run's run session, with `memory`'s type. `false`
+/// when it doesn't, or keeps another recall for that start: nothing is
+/// written.
+pub(crate) async fn keep_recall(
+    connection: &mut SqliteConnection,
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    run_id: RunId,
+    memory: &FrozenMemory,
+    now: Timestamp,
+) -> Result<bool, StoreError> {
+    let run = sqlx::query(
+        "SELECT channel_session_id, session_id, history_start_run_id FROM runs \
+         WHERE organization_id = ? AND workspace_id = ? AND id = ?",
+    )
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(run_id.uuid())
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(failed("keep_recall"))?
+    .ok_or(StoreError::NotFound)?;
+    let (Some(key), Some(start)) = (
+        get::<Option<Uuid>>(&run, "channel_session_id")?,
+        get::<Option<Uuid>>(&run, "history_start_run_id")?,
+    ) else {
+        return Ok(false);
+    };
+    let session_id: Uuid = get(&run, "session_id")?;
+    let kept = sqlx::query(
+        "UPDATE channel_sessions SET recall = ?1, recall_start_run_id = ?2, updated_at = ?3 \
+         WHERE organization_id = ?4 AND workspace_id = ?5 AND id = ?6 AND session_id = ?7 AND active_run_id = ?8 \
+         AND memory_type_id = ?9 AND (recall_start_run_id IS NOT ?2 OR recall IS ?1)",
+    )
+    .bind(memory.recall.as_deref())
+    .bind(start)
+    .bind(now.millis())
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(key)
+    .bind(session_id)
+    .bind(run_id.uuid())
+    .bind(memory.memory_type_id.uuid())
+    .execute(&mut *connection)
+    .await
+    .map_err(failed("keep_recall"))?;
+    Ok(kept.rows_affected() == 1)
 }

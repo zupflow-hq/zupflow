@@ -27,9 +27,10 @@
 //!
 //! A run starts with its memory's **recall**: lines the kind gives, framed
 //! by the server ([`Recall::framed`]), none of which opens or closes the
-//! frame ([`shown_line`]), and fixed for the whole run so the provider's
-//! prompt cache holds. The same memories, settings and audience give the
-//! same bytes, and the same settings give the same tool definitions. A run
+//! frame ([`shown_line`]), and fixed for the whole run (a channel session's,
+//! for every run from one history start) so the provider's prompt cache
+//! holds. The same memories, settings and audience give the same bytes,
+//! and the same settings give the same tool definitions. A run
 //! keeps the tools it started with, so each call carries its type's writes
 //! as they are now ([`CallContext`]): once they're denied, the tools that
 //! write are refused. A run's call that changes a memory commits a record of
@@ -57,6 +58,7 @@ use serde_json::{Map, Value, json};
 
 use crate::apps::ToolEffect;
 use crate::audit::{Audit, AuditEntry};
+use crate::channels::ConversationKind;
 use crate::ids::{
     AgentId, ApiKeyId, ChannelConversationId, MemoryId, MemoryTypeId, OrganizationId, RunId, ToolCallId, UserId,
     WorkspaceId,
@@ -223,6 +225,17 @@ pub enum Audience {
 }
 
 impl Audience {
+    /// Who a channel session in the conversation `conversation_id` of
+    /// `kind` remembers for: a direct message's (a `dm` or a `group_dm`)
+    /// own audience, else the workspace.
+    pub fn in_conversation(kind: ConversationKind, conversation_id: ChannelConversationId) -> Self {
+        if kind.is_direct() {
+            Self::Direct(conversation_id)
+        } else {
+            Self::Workspace
+        }
+    }
+
     /// Whether a memory saved in `saved_in` (`None`: outside any direct
     /// conversation) reaches this audience.
     pub fn reaches(&self, saved_in: Option<ChannelConversationId>) -> bool {
@@ -1086,6 +1099,19 @@ mod tests {
         assert!(!Audience::Direct(here).reaches(Some(there)));
         assert_eq!(Audience::Direct(here).conversation(), Some(here));
         assert_eq!(Audience::Workspace.conversation(), None);
+    }
+
+    #[test]
+    fn remembers_for_a_direct_conversation_only_in_a_dm_or_a_group_dm() {
+        let here = ChannelConversationId::from_uuid(Uuid::from_u128(1));
+        for (kind, audience) in [
+            (ConversationKind::Dm, Audience::Direct(here)),
+            (ConversationKind::GroupDm, Audience::Direct(here)),
+            (ConversationKind::Channel, Audience::Workspace),
+            (ConversationKind::PrivateChannel, Audience::Workspace),
+        ] {
+            assert_eq!(Audience::in_conversation(kind, here), audience, "{kind:?}");
+        }
     }
 
     #[test]
