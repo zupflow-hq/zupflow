@@ -33,8 +33,11 @@
 //! record a mark on the sessions of its agent, workspace and type that may
 //! recall the memory (every one for a workspace's memory, and for a direct
 //! conversation's, only that conversation's), and the next run of each
-//! reads the recall anew. Once the type is deleted, a session recalls
-//! nothing from its next run, and its calls are refused as any run's are.
+//! reads the recall anew. Once the type is deleted, a run the session
+//! starts with its own tools, with what waited for the one before,
+//! recalls nothing, and its calls are refused as any run's are; the next
+//! message to find the session idle starts a new run session, with the
+//! agent's memory as it is then.
 //!
 //! **Decided live.** Each call is decided when the model makes it, and again
 //! just before it's sent, from the run's type as it is then ([`decide`]): a

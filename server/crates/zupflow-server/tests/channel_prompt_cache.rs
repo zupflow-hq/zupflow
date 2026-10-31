@@ -14,17 +14,18 @@
 //! cache; a save in one run doesn't change what a later one recalls, and a
 //! trim reads the recall anew from the session's own type, as a new session
 //! does. A forget reaches the session at its next run instead, whoever
-//! forgets, its history kept, and so does deleting its type (it recalls
-//! nothing then, and its calls are refused); a run under way keeps the
-//! recall it started with, and ends as it would have. Only the sessions of
-//! the forget's agent, workspace and type read their recall anew, and of
-//! those, for a direct conversation's note, only that conversation's; none
-//! keeps the recall's text once no run of it is under way. A person's
-//! change to a note reaches the session as a forget does; a run's own
-//! change, at its next trim. A conversation shared with another
-//! organization has no memory: from the sharing on, no run there has
-//! memory tools or recalls anything, a run under way aside. Nor does a
-//! session whose type's settings its kind refuses: the agent still answers.
+//! forgets, its history kept, and so does deleting its type (the run that
+//! collects what waited for one under way recalls nothing then, and its
+//! calls are refused); a run under way keeps the recall it started with,
+//! and ends as it would have. Only the sessions of the forget's agent,
+//! workspace and type read their recall anew, and of those, for a direct
+//! conversation's note, only that conversation's; none keeps the recall's
+//! text once no run of it is under way. A person's change to a note
+//! reaches the session as a forget does; a run's own change, at its next
+//! trim. A conversation shared with another organization has no memory:
+//! from the sharing on, no run there has memory tools or recalls anything,
+//! a run under way aside. Nor does a session whose type's settings its
+//! kind refuses: the agent still answers.
 //! A `dm`'s or a `group_dm`'s session recalls, finds and saves its own
 //! conversation's notes beside the workspace's, and nothing else sees them;
 //! a channel's saves are the workspace's. Once a run of a session read an

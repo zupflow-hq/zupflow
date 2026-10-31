@@ -973,7 +973,7 @@ export const routes: readonly Route[] = [
     method: "delete",
     path: "/v1/organizations/{org}/memory-types/{memory_type}",
     summary:
-      "Delete a memory type: owners and admins, from the Console. Refused while it is the organization's default or an agent's (`409 memory_type_in_use`, naming them). Its memories, in every workspace, are forgotten with it, without a `memory.forgotten` for each. Every channel session kept on it reads its recall anew at its next run, which recalls nothing; a run under way keeps the recall it started with",
+      "Delete a memory type: owners and admins, from the Console. Refused while it is the organization's default or an agent's (`409 memory_type_in_use`, naming them). Its memories, in every workspace, are forgotten with it, without a `memory.forgotten` for each. A channel session kept on it keeps none of what it recalled: a run under way keeps the recall it started with, a run that then starts with the messages that waited for it recalls nothing, and the next message to find the session idle starts its next run under a new `session_id`, with the agent's memory as it is then",
     callers: consoleOnly,
     params: { ...org, memory_type: idSchema("memory_type") },
     response: noContent,
