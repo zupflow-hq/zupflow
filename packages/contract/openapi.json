@@ -15122,7 +15122,7 @@
       },
       "patch": {
         "operationId": "updateMemory",
-        "summary": "Change a memory's text: owners, admins and developers, from the Console in Sandbox only, and API keys. The memory is found first (`404`), then its kind's `manage` checked, then the text kept as for saving (`422 invalid_memory_text`, `fields.text`). Its origin becomes the caller; sends `memory.updated`, audited as `memory.updated`. The text it holds already changes nothing: not its `updated_at` or origin, and nothing is sent or audited",
+        "summary": "Change a memory's text: owners, admins and developers, from the Console in Sandbox only, and API keys. The memory is found first (`404`), then its kind's `manage` checked, then the text kept as for saving (`422 invalid_memory_text`, `fields.text`). Its origin becomes the caller; sends `memory.updated`, audited as `memory.updated`. Every channel session of the agent in the workspace, on the memory's type, that may recall it (for a memory saved in a direct conversation, that conversation's only) reads its recall anew at its next run, so none recalls the old text again; a run under way keeps the recall it started with. The text it holds already changes nothing: not its `updated_at` or origin, and nothing is sent, audited or read anew",
         "security": [
           {
             "consoleSession": [],

@@ -25,10 +25,11 @@
 //! the session keeps the recall its history begins with, once for each
 //! start: the first run from a start reads it with its first model attempt
 //! ([`keep_recall`]), and every other run from that start sends it again.
-//! A forget marks the sessions that may recall what it forgot, by their
-//! audience ([`refresh_recall`]): the next run of each reads the recall
-//! anew, from the same start, and a marked session keeps no recall text
-//! once no run of it is under way, only its weight for the trim. When one of its runs read
+//! A forget, or a person's change, marks the sessions that may recall the
+//! memory, by their audience ([`refresh_recall`]): the next run of each
+//! reads the recall anew, from the same start, and a marked session keeps
+//! no recall text once no run of it is under way, only its weight for the
+//! trim. When one of its runs read
 //! an app's tool result, the session keeps that as it ends, for what later
 //! runs save.
 

@@ -446,9 +446,10 @@ pub(crate) fn memory_event_in(
 }
 
 /// What one change records with it ([`zupflow_core::memory::Record`]): its
-/// webhook event, and its audit event, by the caller; a forget marks the
-/// agent's channel sessions in the type that may recall the memory, so
-/// none recalls it again.
+/// webhook event, and its audit event, by the caller; a forget or a change
+/// marks the agent's channel sessions in the type that may recall the
+/// memory, so none recalls what it held again
+/// ([`MemoryChange::refreshes_recall`]).
 fn recorded(access: &WorkspaceAccess, agent: &Agent, change: &MemoryChange) -> Recorded {
     let action = match change {
         MemoryChange::Saved(_) => AuditAction::MemorySaved,
@@ -458,7 +459,7 @@ fn recorded(access: &WorkspaceAccess, agent: &Agent, change: &MemoryChange) -> R
     Recorded {
         audit: Some(workspace_audit(access, action, memory_target(agent, change.memory()))),
         events: vec![memory_event(access, change)],
-        refresh_recall: matches!(change, MemoryChange::Forgotten(_)),
+        refresh_recall: change.refreshes_recall(),
         call: None,
     }
 }

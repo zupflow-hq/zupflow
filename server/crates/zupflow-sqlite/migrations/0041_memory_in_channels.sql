@@ -20,17 +20,19 @@
 --   back to 0 when a new run session starts; never more than 0 without
 --   the session's memory, nor 0 beside a recall.
 -- - `refresh_recall`: set when what the session recalls may hold a memory
---   forgotten since: a memory of its agent, in its workspace and type, that
---   its audience is shown (the workspace's, or a `direct` session's own
---   conversation's), forgotten through the API or by a run (one of the
---   session's own included), in the forget's own transaction; and every
---   session kept on a type when the type is deleted. The same transaction clears the recall's
+--   forgotten or changed since: a memory of its agent, in its workspace and
+--   type, that its audience is shown (the workspace's, or a `direct`
+--   session's own conversation's), forgotten through the API or by a run
+--   (one of the session's own included), or changed through the API or the
+--   Console, in the change's own transaction; and every session kept on a
+--   type when the type is deleted. The same transaction clears the recall's
 --   text and start on a session with no run under way, and a marked
---   session's run clears them as it ends, so no forgotten text stays at
---   rest. The session's next run clears the mark and reads the recall anew,
---   from the same history start: a run under way keeps the recall it
---   started with. Saves and changes still reach a session only at a trim or
---   a new run session. Never set on a session without memory.
+--   session's run clears them as it ends, so no forgotten or changed text
+--   stays at rest. The session's next run clears the mark and reads the
+--   recall anew, from the same history start: a run under way keeps the
+--   recall it started with. Saves, and a run's changes, still reach a
+--   session only at a trim or a new run session. Never set on a session
+--   without memory.
 -- - `app_content_read`: whether a run of the session read an app's tool
 --   result, set as such a run ends and kept from then on, so a save in a
 --   later run says it may come from that content.

@@ -19,7 +19,9 @@
 //! recall it started with, and ends as it would have. Only the sessions of
 //! the forget's agent, workspace and type read their recall anew, and of
 //! those, for a direct conversation's note, only that conversation's; none
-//! keeps the recall's text once no run of it is under way.
+//! keeps the recall's text once no run of it is under way. A person's
+//! change to a note reaches the session as a forget does; a run's own
+//! change, at its next trim.
 //! A `dm`'s or a `group_dm`'s session recalls, finds and saves its own
 //! conversation's notes beside the workspace's, and nothing else sees them;
 //! a channel's saves are the workspace's. Once a run of a session read an
@@ -664,6 +666,28 @@ async fn forget(setup: &Setup, memory: &Value) {
         )
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// Changes the agent's `memory`'s text through the API, as alice.
+async fn change_text(setup: &Setup, memory: &Value, text: &str) {
+    let (status, body) = setup
+        .kit
+        .send(
+            call(
+                "alice",
+                Method::PATCH,
+                format!(
+                    "/v1/workspaces/{}/agents/{}/memories/{}",
+                    setup.ws,
+                    setup.agent,
+                    id(memory)
+                ),
+            )
+            .naming(&setup.org)
+            .body(json!({ "text": text })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 /// Whether the session of the channel run `run`, of the setup's
@@ -1469,6 +1493,74 @@ async fn forgets_a_note_at_a_sessions_next_run_whoever_forgets_it_its_history_ke
                 "{name}"
             );
             assert!(!refreshing(&world, run).await, "{name}: each mark taken");
+        }
+    }
+}
+
+#[tokio::test]
+async fn recalls_a_persons_change_at_a_sessions_next_run_and_a_runs_at_its_next_trim() {
+    for (kind, model) in PATHS {
+        let (world, _, _) = remembering(kind, model).await;
+        let name = format!("{kind:?} {model}");
+        let setup = &world.setup;
+        let main = &world.main;
+        let card = setup.save_note("Card on file ends 4242.").await;
+        let before = turns(&world).len();
+        let asked = world.say(ANA, &format!("{} hello", main.mention()), None).await;
+        world.work().await;
+        // A person redacts the note while the session is idle: the session
+        // keeps no recall text from then on, and its next run recalls the
+        // redacted note, its history kept.
+        change_text(setup, &card, "Card on file.").await;
+        let rest = at_rest(&world).await;
+        assert!(rest[0].0.is_none() && rest[0].2, "{name}: {rest:?}");
+        world.say(ANA, "and now?", Some(&asked.ts)).await;
+        world.work().await;
+        // A run changes the note itself: that marks nothing, and the run
+        // after still sends the recall its session keeps.
+        let updating = calling_memory(
+            "update_memory",
+            &json!({ "memory": card["short_id"], "text": "Card on file, expired." }),
+        );
+        world.say(ANA, &format!("update it\n{updating}"), Some(&asked.ts)).await;
+        world.work().await;
+        let rest = at_rest(&world).await;
+        assert!(rest[0].0.is_some() && !rest[0].2, "{name}: {rest:?}");
+        world.say(ANA, "ok", Some(&asked.ts)).await;
+        world.work().await;
+
+        let runs = world.runs(main).await;
+        assert_eq!(runs.len(), 4, "{name}");
+        assert!(runs.iter().all(|run| run["status"] == "completed"), "{name}: {runs:?}");
+        assert!(
+            runs.iter().all(|run| run["session_id"] == runs[0]["session_id"]),
+            "{name}"
+        );
+        let changed = memory_calls(setup, World::run_id(&runs[2])).await;
+        assert_eq!(changed.len(), 1, "{name}: {changed:?}");
+        assert_eq!(changed[0].state, CallState::Completed, "{name}: {changed:?}");
+        let sent = turns(&world).split_off(before);
+        assert_eq!(sent.len(), 5, "{name}: a turn a run, two for the one with a call");
+        let broken: Vec<usize> = breaks(kind, &sent).into_iter().map(|(index, _)| index).collect();
+        assert_eq!(broken, [1], "{name}: only the run after the person's change reads anew");
+        let recalled: Vec<String> = recalls(kind, &sent)
+            .into_iter()
+            .map(|recall| recall.unwrap_or_else(|| panic!("{name}: a turn without a recall")))
+            .collect();
+        assert!(
+            recalled[0].contains("Card on file ends 4242."),
+            "{name}: {}",
+            recalled[0]
+        );
+        for (index, recall) in recalled.iter().enumerate().skip(1) {
+            assert!(
+                recall.contains("Card on file.") && !recall.contains("ends 4242") && !recall.contains("expired"),
+                "{name}: turn {index}: {recall}"
+            );
+        }
+        for (index, turn) in sent.iter().enumerate() {
+            let opening = Prompt::read(kind, &turn.body).unwrap().messages[0].to_string();
+            assert!(opening.contains("hello"), "{name}: turn {index}: {opening}");
         }
     }
 }

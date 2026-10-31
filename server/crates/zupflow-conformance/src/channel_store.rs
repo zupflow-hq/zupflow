@@ -71,7 +71,9 @@ use zupflow_core::jobs::{JobOptions, JobQueue};
 use zupflow_core::keys::{Sealed, WrappedKey};
 use zupflow_core::memory::notes::{self, NewNote, NoteRef, NoteStore, Reach};
 use zupflow_core::memory::type_store::{MemoryTypeStore, NewMemoryType};
-use zupflow_core::memory::{Audience, MemoryError, MemoryKind, MemoryScope, MemoryWrites, Origin, record_nothing};
+use zupflow_core::memory::{
+    Audience, MemoryError, MemoryKind, MemoryScope, MemoryWrites, Origin, Record, record_nothing,
+};
 use zupflow_core::model_store::{RouteState, RunModel};
 use zupflow_core::models::Message;
 use zupflow_core::models::{Completion, Reply, TokenUsage};
@@ -1662,6 +1664,24 @@ const SUPPORT: (&str, ConversationKind) = ("C0SUPPORT", ConversationKind::Channe
 const DM: (&str, ConversationKind) = ("D0DANA", ConversationKind::Dm);
 const GROUP: (&str, ConversationKind) = ("G0SHIFT", ConversationKind::GroupDm);
 
+/// Changes `note`'s text as `origin` would, with what `record` builds:
+/// whether its text changed.
+async fn rewrite(
+    stores: &Stores<'_>,
+    scope: &MemoryScope,
+    note: MemoryId,
+    origin: &Origin,
+    text: &str,
+    record: &Record<'_>,
+) -> bool {
+    stores
+        .notes
+        .update(scope, NoteRef::Id(note), Reach::Everything, origin, text, now(), record)
+        .await
+        .unwrap()
+        .changed
+}
+
 /// Makes `conversation` exist on the connection, by recording a message in
 /// a thread of its own that wakes no one: its ID.
 async fn opened(
@@ -1780,9 +1800,10 @@ impl Thread {
 /// A forget reaches every session that may recall what it forgot at the
 /// session's next run, its history kept: forgetting a note of a session's
 /// agent, in its workspace and type, alone or with its scope's oldest,
-/// marks every such session in the forget's own transaction, and no other;
-/// a save, a change, a forget that doesn't ask it and one that fails mark
-/// none; and deleting a type marks every session kept on it, in every
+/// marks every such session in the forget's own transaction, and no other,
+/// and so does a person's change; a save, a run's change, a person's change
+/// to the text a note holds, a forget that doesn't ask it and one that fails
+/// mark none; and deleting a type marks every session kept on it, in every
 /// workspace. A run under way keeps the recall it started with and ends as
 /// it would have; the next run reads the recall anew, and the one after
 /// sends what it read. No forgotten text stays at rest: a session marked
@@ -1882,8 +1903,9 @@ async fn reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(sto
         );
     }
 
-    // A save and a change mark nothing; nor does a forget that doesn't ask,
-    // nor one whose records can't be written, which forgets nothing.
+    // A save and a run's change mark nothing; nor does a forget that
+    // doesn't ask, nor one whose records can't be written, which forgets
+    // nothing.
     let short_ids = [ShortId::from_bits(4)];
     let saved = NewNote {
         id: MemoryId::generate(),
@@ -1897,13 +1919,18 @@ async fn reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(sto
         .insert(&scope, &saved, 200, now(), &recorded)
         .await
         .unwrap();
+    let run = Origin::Run {
+        run_id: RunId::generate(),
+        tool_call_id: ToolCallId::generate(),
+        after_app_content: false,
+    };
     stores
         .notes
         .update(
             &scope,
             NoteRef::Id(notes[0].id),
             Reach::Everything,
-            &member,
+            &run,
             "Prefers replies in Spanish.",
             now(),
             &recorded,
@@ -1983,6 +2010,31 @@ async fn reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(sto
         );
     }
 
+    // A person's change marks it as a forget does, so a redaction isn't
+    // recalled again; one to the text the note holds changes nothing, and
+    // marks nothing.
+    let spanish = "Prefers replies in Spanish.";
+    assert!(!rewrite(stores, &scope, notes[0].id, &member, spanish, &recorded).await);
+    assert_eq!(
+        session.kept_recall(stores, &t).await,
+        SessionRecall::Read(Some(LATER.to_owned())),
+        "nothing changed"
+    );
+    let french = "Prefers replies in French.";
+    assert!(rewrite(stores, &scope, notes[0].id, &member, french, &recorded).await);
+    assert_eq!(
+        session.kept_recall(stores, &t).await,
+        SessionRecall::Unread,
+        "an idle session marked keeps no recall text"
+    );
+    for other in &others {
+        assert_eq!(other.kept_recall(stores, &t).await, kept, "{}", other.thread);
+    }
+    assert_eq!(
+        session.answered(stores, &t, 5, RECALL).await,
+        (SessionRecall::Unread, Some(RECALL.to_owned()))
+    );
+
     // Forgetting the scope's oldest marks it once, whatever the count.
     let forgotten = stores
         .notes
@@ -1999,7 +2051,7 @@ async fn reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(sto
         assert_eq!(other.kept_recall(stores, &t).await, kept, "{}", other.thread);
     }
     assert_eq!(
-        session.answered(stores, &t, 5, RECALL).await,
+        session.answered(stores, &t, 6, RECALL).await,
         (SessionRecall::Unread, Some(RECALL.to_owned()))
     );
     for other in &others {
@@ -2024,7 +2076,7 @@ async fn reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(sto
         assert_eq!(other.kept_recall(stores, &t).await, expected, "{}", other.thread);
     }
     assert_eq!(
-        session.answered(stores, &t, 6, LATER).await,
+        session.answered(stores, &t, 7, LATER).await,
         (SessionRecall::Unread, Some(LATER.to_owned()))
     );
     for (other, marked) in others.iter().zip([false, true, true]) {
@@ -2131,6 +2183,17 @@ async fn marks_only_the_sessions_whose_audience_may_recall_a_change(stores: &Sto
         .await
         .unwrap();
     assert_eq!(marked().await, [false, true, false], "a dm's note");
+    // A person's change to the group_dm's note: its sessions only. A run's
+    // change to a workspace note: none.
+    assert!(rewrite(stores, &scope, notes[1].id, &member, "Note 1, redacted.", &recorded).await);
+    assert_eq!(marked().await, [false, false, true], "a person's change");
+    let run = Origin::Run {
+        run_id: RunId::generate(),
+        tool_call_id: ToolCallId::generate(),
+        after_app_content: false,
+    };
+    assert!(rewrite(stores, &scope, notes[2].id, &run, "Note 2, changed.", &recorded).await);
+    assert_eq!(marked().await, [false, false, false], "a run's change");
     // A workspace note: every one.
     stores
         .notes

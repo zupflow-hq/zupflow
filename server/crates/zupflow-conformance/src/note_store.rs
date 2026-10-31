@@ -1784,7 +1784,7 @@ pub(crate) fn recorder(environment: Environment) -> impl Fn(&MemoryChange) -> Re
                 ),
                 created_at: now,
             }],
-            refresh_recall: matches!(change, MemoryChange::Forgotten(_)),
+            refresh_recall: change.refreshes_recall(),
             call: None,
         }
     }

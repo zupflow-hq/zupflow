@@ -22,16 +22,16 @@
 //! server records of it: its audit event and its webhook events
 //! ([`Record`]). A change a run's tool call makes commits with its webhook
 //! events, and no audit event: the run's timeline is its record. A forget,
-//! either way, also marks the channel sessions that may recall what it
-//! forgot, so each reads its recall anew at its next run
-//! ([`Recorded::refresh_recall`]). What a deleted agent, workspace or type
+//! either way, and a change people make also mark the channel sessions
+//! that may recall the memory, so each reads its recall anew at its next
+//! run ([`MemoryChange::refreshes_recall`]). What a deleted agent, workspace or type
 //! kept, each kind forgets when a job the deletion queued tells it to
 //! ([`FORGET_JOB`]).
 //!
 //! A run starts with its memory's **recall**: lines the kind gives, framed
 //! by the server ([`Recall::framed`]), none of which opens or closes the
 //! frame ([`shown_line`]), and fixed for the whole run (a channel session's,
-//! for every run from one history start, until a forget marks the session)
+//! for every run from one history start, until a change marks the session)
 //! so the provider's prompt cache holds. A channel run's takes only the room
 //! its session's history budget leaves, and no more than half the budget
 //! ([`MemoryProvider::recall_within`]).
@@ -572,13 +572,28 @@ impl MemoryChange {
             Self::Saved(memory) | Self::Updated(memory) | Self::Forgotten(memory) => memory,
         }
     }
+
+    /// Whether the change marks the channel sessions that may recall the
+    /// memory, so each reads its recall anew at its next run
+    /// ([`Recorded::refresh_recall`]): a forget, and a change people make,
+    /// through the API or the Console, so a redaction isn't recalled again.
+    /// A save, and a run's own change, reach a session's recall at its next
+    /// trim or session.
+    pub fn refreshes_recall(&self) -> bool {
+        match self {
+            Self::Saved(_) => false,
+            Self::Updated(memory) => !matches!(memory.origin, Origin::Run { .. }),
+            Self::Forgotten(_) => true,
+        }
+    }
 }
 
 /// What one change to a memory records with it: its audit event, its
 /// webhook events, each recorded with a delivery for every enabled endpoint
 /// of its organization and environment subscribed to its type, as
 /// [`crate::webhooks::WebhookStore::record_event`] records one, and, for a
-/// forget, the channel sessions it reaches ([`Recorded::refresh_recall`]).
+/// forget or a person's change, the channel sessions it reaches
+/// ([`Recorded::refresh_recall`], [`MemoryChange::refreshes_recall`]).
 /// Built by the server, which knows who acts and what to call things, from
 /// the memory as the change left it; never its text. A run's call adds
 /// itself ([`Recorded::call`]).
@@ -590,9 +605,10 @@ pub struct Recorded {
     /// kept on its type, that may recall the memory, to read their recall
     /// anew at their next run, from the same history start: every one for a
     /// workspace's memory, and for one kept for a direct conversation, only
-    /// those whose audience is that conversation. Set for a forget, so a
-    /// memory forgotten isn't recalled again, though a session otherwise
-    /// keeps its recall until a trim. A run under way keeps the recall it
+    /// those whose audience is that conversation. Set for a forget and a
+    /// change people make ([`MemoryChange::refreshes_recall`]), so a memory
+    /// forgotten or redacted isn't recalled again, though a session
+    /// otherwise keeps its recall until a trim. A run under way keeps the recall it
     /// started with. A marked session keeps no recall text once no run of
     /// it is under way: one with none loses it with the change, one with a
     /// run as the run ends. Marked once for a change that forgets many, for

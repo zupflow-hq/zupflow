@@ -25,11 +25,12 @@
 //! room the session's history budget leaves it, half the budget at most
 //! ([`session_recall`]), and every run from the same start sends those
 //! bytes. A save in one run reaches a later run of the session through the
-//! conversation, and its recall at the next trim or session. A forget, a
-//! run's or a person's, records a mark on the sessions of its agent,
-//! workspace and type that may recall what it forgot (every one for a
-//! workspace's memory, and for a direct conversation's, only that
-//! conversation's), and the next run of each reads the recall anew. Once
+//! conversation, and its recall at the next trim or session; so does a
+//! run's change. A forget, a run's or a person's, and a person's change
+//! record a mark on the sessions of its agent, workspace and type that may
+//! recall the memory (every one for a workspace's memory, and for a direct
+//! conversation's, only that conversation's), and the next run of each
+//! reads the recall anew. Once
 //! the type is deleted, a session recalls nothing from its next run, and its
 //! calls are refused as any run's are.
 //!
@@ -535,13 +536,14 @@ fn answered(result: CallResult) -> SendOutcome {
 /// What a run's change records with it: its webhook events, placed in the
 /// run's workspace, and no audit event; a forget marks the agent's channel
 /// sessions in the type that may recall what it forgot, the run's own
-/// included, which keeps its recall to its end. The kind adds the call
+/// included, which keeps its recall to its end, and a save or a change
+/// marks none ([`MemoryChange::refreshes_recall`]). The kind adds the call
 /// itself.
 fn recorded(organization_id: OrganizationId, workspace: &Workspace, change: &MemoryChange) -> Recorded {
     Recorded {
         audit: None,
         events: vec![memory_event_in(organization_id, workspace, change)],
-        refresh_recall: matches!(change, MemoryChange::Forgotten(_)),
+        refresh_recall: change.refreshes_recall(),
         call: None,
     }
 }
