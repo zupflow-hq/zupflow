@@ -12,16 +12,18 @@
 //! start, read by the first run from it; other memory starts a new run
 //! session, and a run whose session went with its memory fails. Forgetting
 //! a note a session may recall (its agent's, in its workspace and type, and
-//! the workspace's or the session's own direct conversation's), or deleting
-//! its type, marks the session in the same transaction, and no other: its
-//! next run reads the recall anew, its history kept, while a run under way
-//! keeps the recall it started with, and no session keeps recall text once
-//! it's marked and no run of it is under way. The recall a session keeps
-//! counts in its history budget as no more than half of it, and a run
-//! carries the budget. A run whose call to an app's tool completed, or
-//! failed with the tool's own error, marks its session as it ends, for
-//! every later run of its run session, a trim included; a new run session
-//! starts without the mark.
+//! the workspace's or the session's own direct conversation's), a person's
+//! change to one, or deleting its type, marks the session in the same
+//! transaction, and no other: its next run reads the recall anew, its
+//! history kept, while a run under way keeps the recall it started with,
+//! and no session keeps recall text once it's marked and no run of it is
+//! under way. Once its conversation is shared with another organization,
+//! what waited for a session's run starts a new run session without
+//! memory. The recall a session keeps counts in its history budget as no
+//! more than half of it, and a run carries the budget. A run whose call to
+//! an app's tool completed, or failed with the tool's own error, marks its
+//! session as it ends, for every later run of its run session, a trim
+//! included; a new run session starts without the mark.
 //! A message is read back byte for byte as it was recorded. Every change is
 //! made only by an editor who still may, and an agent's apps go with it.
 //! An app is made at least once: an attempt marks it before the provider is

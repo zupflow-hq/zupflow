@@ -149,8 +149,17 @@ Read `README.md` first, then `DEVELOPMENT.md`.
   channel session holds it across its runs: its tools, instructions and
   memory are fixed when it starts, and its recall is read once for each
   history start and kept on the session, never again per run, but for the
-  next run after a forget marked the session, in the forget's own
-  transaction (`tests/channel_prompt_cache.rs`).
+  next run after a forget, a person's change to a memory or a type's
+  deletion marked the session, in the change's own transaction. A change
+  marks only the sessions whose audience may recall the memory, and that
+  next run misses the cache once from the recall on, since the recall comes
+  before the whole history. The same transaction clears the recall text of
+  a marked session with no run under way, and a marked session's run
+  clears it as it ends: no forgotten text stays at rest. The recall counts
+  in the history budget as no more than half of it, and one read anew
+  takes no more than the room left, up to that half. A conversation shared
+  with another organization has no memory, and neither does a session
+  whose type's settings its kind refuses (`tests/channel_prompt_cache.rs`).
 - Secrets are sealed with `keys::seal` under an `EncryptionContext` built from
   the trust context with the constructor for that kind of secret
   (`installation_credential`, `oauth_client_secret`, `webhook_signing_secret`),
