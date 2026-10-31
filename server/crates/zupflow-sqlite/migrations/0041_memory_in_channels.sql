@@ -14,6 +14,15 @@
 --   recall's digest. A new start (a trim, or a new run session) reads it
 --   anew. A recall is never empty, and never without its start or the
 --   session's memory; a start is never without the session's memory.
+-- - `refresh_recall`: set when what the session recalls may hold a memory
+--   forgotten since: a memory of its agent, in its workspace and type,
+--   forgotten through the API or by a run (one of the session's own
+--   included), in the forget's own transaction; and every session kept on a
+--   type when the type is deleted. The session's next run clears it and
+--   reads the recall anew, from the same history start: a run under way
+--   keeps the recall it started with. Saves and changes still reach a
+--   session only at a trim or a new run session. Never set on a session
+--   without memory.
 -- - `app_content_read`: whether a run of the session read an app's tool
 --   result, set as such a run ends and kept from then on, so a save in a
 --   later run says it may come from that content.
@@ -37,6 +46,9 @@ ALTER TABLE channel_sessions ADD COLUMN recall_start_run_id UUID
 
 ALTER TABLE channel_sessions ADD COLUMN recall TEXT
     CHECK (recall IS NULL OR (recall_start_run_id IS NOT NULL AND length(recall) >= 1));
+
+ALTER TABLE channel_sessions ADD COLUMN refresh_recall INTEGER NOT NULL DEFAULT 0
+    CHECK (refresh_recall IN (0, 1) AND (refresh_recall = 0 OR memory_type_id IS NOT NULL));
 
 ALTER TABLE channel_sessions ADD COLUMN app_content_read INTEGER NOT NULL DEFAULT 0
     CHECK (app_content_read IN (0, 1));
