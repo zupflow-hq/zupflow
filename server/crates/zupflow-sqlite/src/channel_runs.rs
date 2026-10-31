@@ -30,8 +30,9 @@
 //! reads the recall anew, from the same start, and a marked session keeps
 //! no recall text once no run of it is under way, only its weight for the
 //! trim. When one of its runs read an app's tool result, the session keeps
-//! that as it ends, for what later runs of the same run session save, a
-//! trim included; a new run session starts without it.
+//! that as it ends, for good: what any later run in its thread saves may
+//! come from it, a trim or a new run session included, since a new run
+//! session reads the thread again, the agent's earlier replies too.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -1423,9 +1424,8 @@ async fn start_session_run(
     // first run after a forget marked the session ([`refresh_recall`]),
     // which takes the mark: its history stays as it is, and so does the
     // weight of the recall its runs sent, for the next trim. A new run
-    // session starts with none, and without the mark that a run of the
-    // last one read an app's result ([`run_ended`]): its history starts
-    // empty. A trim keeps that mark.
+    // session starts with none. The mark that a run read an app's result
+    // ([`run_ended`]) stays, through a trim and a new run session alike.
     let started = sqlx::query(
         "UPDATE channel_sessions SET session_id = ?1, active_run_id = ?2, run_count = ?3, seen_message_id = ?4, \
          seen_at = ?5, model = ?6, model_id = ?7, model_connection_id = ?8, instructions = ?9, offer = ?10, \
@@ -1436,7 +1436,7 @@ async fn start_session_run(
          recall_start_run_id = CASE WHEN session_id = ?1 AND memory_type_id IS ?17 AND refresh_recall = 0 \
          THEN recall_start_run_id END, \
          recall_weight = CASE WHEN session_id = ?1 AND memory_type_id IS ?17 THEN recall_weight ELSE 0 END, \
-         refresh_recall = 0, app_content_read = CASE WHEN session_id = ?1 THEN app_content_read ELSE 0 END \
+         refresh_recall = 0 \
          WHERE organization_id = ?14 AND workspace_id = ?15 AND id = ?16 AND active_run_id IS NULL",
     )
     .bind(session_id.uuid())
@@ -1500,9 +1500,9 @@ pub(crate) async fn run_ended(
     let input: String = get(&run, "input")?;
     keep_transcript(connection, organization_id, workspace_id, run_id, &input).await?;
     // A run that read an app's tool result (its answer, or its own error)
-    // marks the session: what any later run of its run session saves may
-    // come from it, a trim included. A new run session starts without it
-    // ([`start_session_run`]).
+    // marks the session for good: what any later run in its thread saves
+    // may come from it, a trim or a new run session included, since a new
+    // run session reads the thread again, the agent's earlier replies too.
     // A session marked to read its recall anew while the run was under way
     // ([`refresh_recall`]) keeps no recall text once it ends, only its
     // weight.
@@ -1751,7 +1751,7 @@ pub(crate) async fn take_steer(
 /// A channel run's session context: the transcripts of its session's runs
 /// from its history start, as kept when each ended, the session's tools,
 /// its memory with the recall it keeps for the run's start, its history
-/// budget, whether an earlier run of its run session read an app's result,
+/// budget, whether any earlier run in its thread read an app's result,
 /// and the run's own steered turns. The session's memory and budget are
 /// read only while the session holds the run's run session: a session
 /// that's gone, or moved on after the run, has none for it. `None` for any

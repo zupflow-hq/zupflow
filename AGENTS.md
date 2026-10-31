@@ -160,6 +160,10 @@ Read `README.md` first, then `DEVELOPMENT.md`.
   takes no more than the room left, up to that half. A conversation shared
   with another organization has no memory, and neither does a session
   whose type's settings its kind refuses (`tests/channel_prompt_cache.rs`).
+  A save's `after_app_content` counts any earlier run in the same thread,
+  even one before the session started over: the mark a run leaves on its
+  session when it reads an app's result is never cleared, since a new run
+  session reads the thread again, the agent's earlier replies included.
 - Secrets are sealed with `keys::seal` under an `EncryptionContext` built from
   the trust context with the constructor for that kind of secret
   (`installation_credential`, `oauth_client_secret`, `webhook_signing_secret`),

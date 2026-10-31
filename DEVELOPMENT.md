@@ -746,10 +746,14 @@ the recall it started with, and ends as it would have. Once a type is
 deleted, the run that collects what waited for one under way recalls nothing
 (its calls are refused `memory_type_removed`, as any run's are), and its
 tools stay as they were; the next message to find the session idle starts a
-new run session with the agent's memory as it is then. Once a run of a
-session read an app's tool result, every later save in that run session says
-so (`after_app_content`), a trim included; a new run session starts without
-it. A run that uses its session's memory fails `channel_session_removed` if
+new run session with the agent's memory as it is then. Once a run in a
+thread (or among a `dm`'s messages outside threads) read an app's tool
+result, every later save there says so (`after_app_content`): any earlier
+run in the same thread counts, even one before the session started over (a
+trim, a new run session, the retention sweep), since a new run session reads
+the thread again, the agent's earlier replies included, and saying it of a
+save that didn't need it is the safe side. The mark is never cleared. A run
+that uses its session's memory fails `channel_session_removed` if
 the session goes, with its agent's channel, connection or app, while it's
 under way. `tests/channel_runs.rs` drives all of it through the route with a
 fake team chat, and `tests/channel_prompt_cache.rs` checks the prefix turn

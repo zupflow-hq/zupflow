@@ -1143,11 +1143,13 @@ fn sent_recall(snapshot: &Snapshot, memory: &FrozenMemory) -> Option<String> {
 /// Whether the model had read an app's (an installation's) tool result
 /// before it made `call`: a result of a call of an earlier turn, the app's
 /// own answer or its own error. What a memory tool writes then may come
-/// from that content, and its origin says so. A channel run counts the
-/// earlier runs of its run session too, through the session's flag: once
-/// one read an app's result, every later save in that run session says so,
-/// a trim included, since saying it of a save that didn't need it is the
-/// safe side. A new run session, its history empty, starts without it.
+/// from that content, and its origin says so. A channel run counts any
+/// earlier run in the same thread too, even one before the session started
+/// over, through the session's flag: once one read an app's result, every
+/// later save in the thread says so, after a trim or in a new run session
+/// too, since a new run session reads the thread again, the agent's
+/// earlier replies included, and saying it of a save that didn't need it
+/// is the safe side.
 pub fn after_app_content(snapshot: &Snapshot, call: &CallRecord) -> bool {
     if snapshot
         .session

@@ -1305,9 +1305,8 @@ export const MemoryOrigin = named(
       /**
        * The run had read an app's tool result before the call, so what it
        * wrote may come from that content: a product can review it. For a
-       * `channel` run, so had any earlier run with its `session_id`, even
-       * one the model no longer reads; a thread's runs under a new
-       * `session_id` start without it.
+       * `channel` run, so had any earlier run in the same thread, even one
+       * before the session started over (under another `session_id`).
        */
       after_app_content: z.boolean(),
     }),
