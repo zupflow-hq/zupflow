@@ -1304,7 +1304,9 @@ export const MemoryOrigin = named(
       tool_call_id: idSchema("tool_call"),
       /**
        * The run had read an app's tool result before the call, so what it
-       * wrote may come from that content: a product can review it.
+       * wrote may come from that content: a product can review it. For a
+       * `channel` run, so had any earlier run of its session, whatever part
+       * of the conversation the model still reads.
        */
       after_app_content: z.boolean(),
     }),
@@ -2030,7 +2032,9 @@ export type RunUsage = z.infer<typeof RunUsage>;
 
 /**
  * Why a run failed, by stable `code`. Among them: `empty_output`, a channel
- * run that ended with no answer twice and never called `stay_silent`.
+ * run that ended with no answer twice and never called `stay_silent`; and
+ * `channel_session_removed`, a channel run that used its session's memory
+ * when the session went with its agent's channel, connection or app.
  */
 export const RunError = named("RunError", z.object({ code: z.string(), message: z.string() }));
 export type RunError = z.infer<typeof RunError>;
