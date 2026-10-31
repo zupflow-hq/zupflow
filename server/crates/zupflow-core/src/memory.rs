@@ -32,9 +32,11 @@
 //! same bytes, and the same settings give the same tool definitions. A run
 //! keeps the tools it started with, so each call carries its type's writes
 //! as they are now ([`CallContext`]): once they're denied, the tools that
-//! write are refused. A call whose answer was lost is settled by finding
-//! what it did, by the run and the call in its origin, and never makes its
-//! change twice ([`MemoryProvider::settle`]).
+//! write are refused. A run's call that changes a memory commits a record of
+//! itself with the change ([`MadeCall`]), one for each call: a call whose
+//! answer was lost is answered by that record, whatever became of the memory
+//! since, and made then only if it changed nothing ([`settle`]); a sender
+//! that commits after its call was settled changes nothing.
 //!
 //! - [`notes`]: the `notes` kind, and the [`notes::NoteStore`] it keeps its notes in.
 //! - [`registry`]: [`registry::MemoryProviders`], the kinds a server serves, by key.
@@ -541,11 +543,60 @@ impl MemoryChange {
 /// of its organization and environment subscribed to its type, as
 /// [`crate::webhooks::WebhookStore::record_event`] records one. Built by the
 /// server, which knows who acts and what to call things, from the memory as
-/// the change left it; never its text.
+/// the change left it; never its text. A run's call adds itself
+/// ([`Recorded::call`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Recorded {
     pub audit: Option<AuditEntry>,
     pub events: Vec<NewWebhookEvent>,
+    /// The run's call that made the change, kept with it: one for each call,
+    /// ever. Another for the same call, in this transaction or an earlier
+    /// one, fails the change ([`MemoryError::AlreadyMade`]), and it changes
+    /// nothing. Set on a call's first change only.
+    pub call: Option<MadeCall>,
+}
+
+/// A run's call that changed a memory, as its change recorded it
+/// ([`Recorded::call`]): the run, the call, its tool, the memory it changed
+/// and what the model read back, which names the memory by its short ID and
+/// never holds its text. Kept while the run's workspace is, through erasures
+/// of the memories it names: a call settled after an erasure is answered by
+/// it, and never makes its change again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MadeCall {
+    pub run_id: RunId,
+    pub tool_call_id: ToolCallId,
+    pub tool: String,
+    pub memory_id: MemoryId,
+    pub answer: String,
+    pub at: Timestamp,
+}
+
+impl MadeCall {
+    /// The call `context` makes with `tool`, having changed `memory` and
+    /// answered `answer`; `None` for a change that isn't a run's call.
+    pub fn of(context: &CallContext<'_>, tool: &str, memory: &Memory, answer: String) -> Option<Self> {
+        let Origin::Run {
+            run_id, tool_call_id, ..
+        } = *context.origin
+        else {
+            return None;
+        };
+        Some(Self {
+            run_id,
+            tool_call_id,
+            tool: tool.to_owned(),
+            memory_id: memory.id,
+            answer,
+            at: context.now,
+        })
+    }
+
+    /// What the model reads back: the call's answer as it was made, changing
+    /// nothing now.
+    pub fn result(&self) -> CallResult {
+        CallResult::answer(self.answer.clone(), None)
+    }
 }
 
 /// What a change records, from each memory it saves, changes or forgets, as
@@ -760,6 +811,10 @@ pub enum MemoryError {
     NotServed,
     #[error("not a cursor from this list")]
     InvalidCursor,
+    /// The run's call made its change already ([`Recorded::call`]): this
+    /// one changed nothing.
+    #[error("the call made its change already")]
+    AlreadyMade,
 }
 
 /// A memory kind. Every method that reads or changes memories takes their
@@ -807,8 +862,11 @@ pub trait MemoryProvider: Send + Sync {
     /// changed nothing. A tool that writes, called while `context.writes` is
     /// `deny`, is refused that way, even when the run still offers it. A
     /// change records with it what `record` builds from it (its webhook
-    /// events), in its transaction; a refusal records nothing. A save or a
-    /// change of text writes `context.origin` as who wrote it.
+    /// events) and, for a run's call (`context.origin`), the call itself
+    /// with its answer ([`Recorded::call`]), in its transaction; a refusal
+    /// records nothing. A call that made its change already fails,
+    /// `AlreadyMade`, changing nothing. A save or a change of text writes
+    /// `context.origin` as who wrote it.
     async fn call(
         &self,
         scope: &MemoryScope,
@@ -818,24 +876,19 @@ pub trait MemoryProvider: Send + Sync {
         record: &Record<'_>,
     ) -> Result<CallResult, MemoryError>;
 
-    /// Settles a call whose answer was lost, the worker making it having
-    /// stopped before it recorded what came of it: what the call did, found
-    /// by its origin (`context.origin`, the run and the call), answered as
-    /// it did it and recording nothing again; or, when it did nothing, the
-    /// call made now, as [`MemoryProvider::call`] makes it, recording with
-    /// it. Never makes a change twice. `None` when what came of it can't be
-    /// told: the server settles the call as unknown. A kind that can't find
-    /// what its calls did keeps this default.
-    async fn settle(
+    /// What run `run_id`'s call `tool_call_id` changed in `scope`, as its
+    /// change recorded it ([`Recorded::call`]), whatever became of the memory
+    /// since: `None` when it changed nothing there, or wasn't made. A kind
+    /// that keeps no such record answers `Unsupported`, and a call of its
+    /// whose answer was lost is settled unknown.
+    async fn made(
         &self,
         scope: &MemoryScope,
-        context: &CallContext<'_>,
-        tool: &str,
-        arguments: &Map<String, Value>,
-        record: &Record<'_>,
-    ) -> Result<Option<CallResult>, MemoryError> {
-        let _ = (scope, context, tool, arguments, record);
-        Ok(None)
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+    ) -> Result<Option<MadeCall>, MemoryError> {
+        let _ = (scope, run_id, tool_call_id);
+        Err(MemoryError::Unsupported)
     }
 
     /// What a person is told the kind keeps when it refuses text
@@ -914,6 +967,63 @@ pub trait MemoryProvider: Send + Sync {
         let _ = (scope, run);
         Ok(())
     }
+}
+
+/// Makes a run's call through `provider` ([`MemoryProvider::call`]), unless
+/// it made its change already: then it's answered as that change recorded it
+/// ([`MemoryProvider::made`]), and nothing changes again. What a sender that
+/// stalled past its claim finds once its call was settled meanwhile.
+pub async fn make(
+    provider: &dyn MemoryProvider,
+    scope: &MemoryScope,
+    context: &CallContext<'_>,
+    tool: &str,
+    arguments: &Map<String, Value>,
+    record: &Record<'_>,
+) -> Result<CallResult, MemoryError> {
+    match provider.call(scope, context, tool, arguments, record).await {
+        Err(MemoryError::AlreadyMade) => {
+            let Origin::Run {
+                run_id, tool_call_id, ..
+            } = *context.origin
+            else {
+                return Err(MemoryError::AlreadyMade);
+            };
+            provider
+                .made(scope, run_id, tool_call_id)
+                .await?
+                .map(|made| made.result())
+                .ok_or(MemoryError::Unavailable)
+        }
+        made => made,
+    }
+}
+
+/// Settles a run's call whose answer was lost, its sender having stopped
+/// before it recorded what came of it: answered as its change recorded it
+/// when it made one ([`MemoryProvider::made`]), whatever became of the memory
+/// since, and its change never made again; made now, as [`make`] makes it,
+/// when it made none. A call that changed nothing has no record, so it's
+/// made again: a search searches again, and a change of a memory to the text
+/// it held then changes it now if it was edited since.
+pub async fn settle(
+    provider: &dyn MemoryProvider,
+    scope: &MemoryScope,
+    context: &CallContext<'_>,
+    tool: &str,
+    arguments: &Map<String, Value>,
+    record: &Record<'_>,
+) -> Result<CallResult, MemoryError> {
+    let Origin::Run {
+        run_id, tool_call_id, ..
+    } = *context.origin
+    else {
+        return Err(MemoryError::Unsupported);
+    };
+    if let Some(made) = provider.made(scope, run_id, tool_call_id).await? {
+        return Ok(made.result());
+    }
+    make(provider, scope, context, tool, arguments, record).await
 }
 
 #[cfg(test)]

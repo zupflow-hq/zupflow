@@ -105,6 +105,9 @@ const TABLES: &[(&str, Scoping)] = &[
     ("memory_types", Scoping::Organization),
     ("default_memory_types", Scoping::Organization),
     ("memory_notes", Scoping::Workspace),
+    // What each run's memory call changed, one row per call, kept while
+    // its workspace is.
+    ("memory_calls", Scoping::Workspace),
     // A deleted workspace's events stay in the log.
     ("audit_events", Scoping::History),
 ];
@@ -1271,6 +1274,267 @@ async fn keeps_agents_and_their_grants_through_migration_0039() {
         1,
         "never the conversation"
     );
+}
+
+/// Every row of `table`, each value of `columns` quoted, in order: what a
+/// rebuilt table must hold again.
+async fn rows_of(pool: &sqlx::SqlitePool, table: &str, columns: &[String]) -> Vec<String> {
+    let quoted = columns
+        .iter()
+        .map(|column| format!("quote({column})"))
+        .collect::<Vec<_>>()
+        .join(" || ',' || ");
+    // The suite's own table and column names.
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT {quoted} FROM {table} ORDER BY id")))
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+async fn column_names(pool: &sqlx::SqlitePool, table: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn keeps_runs_their_calls_and_attempts_through_migration_0040() {
+    use std::str::FromStr;
+
+    use serde_json::Map;
+    use sqlx::sqlite::SqliteConnectOptions;
+    use uuid::Uuid;
+    use zupflow_core::ids::{OrganizationId, RunId, ToolCallId, WorkspaceId};
+    use zupflow_core::runs::store::RunStore;
+    use zupflow_core::runs::transition::SendOutcome;
+    use zupflow_core::runs::{CallState, MemoryMode, state::Continuation};
+
+    let directory = TemporaryDirectory::new();
+    let earlier = directory.0.join("migrations");
+    std::fs::create_dir(&earlier).unwrap();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.as_str() < "0040" {
+            std::fs::copy(&path, earlier.join(&name)).unwrap();
+        }
+    }
+    let options = SqliteConnectOptions::from_str("sqlite:")
+        .unwrap()
+        .filename(directory.file())
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+    sqlx::migrate::Migrator::new(earlier.as_path())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    let blob = |n: u8| {
+        let mut id = [0u8; 16];
+        id[15] = n;
+        id.to_vec()
+    };
+    let uuid = |n: u8| Uuid::from_slice(&blob(n)).unwrap();
+    let digest = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+    let waiting = Continuation::AwaitApproval {
+        call_id: ToolCallId::from_uuid(uuid(9)),
+    }
+    .to_json();
+    let mut result = Map::new();
+    result.insert("result".to_owned(), "Found.".into());
+    let sent = serde_json::to_string(&SendOutcome::Completed { result }).unwrap();
+    // A run waiting for approval of its second call, its first sent and
+    // answered, with the turn and the model attempt that asked for both.
+    for statement in [
+        "INSERT INTO organizations (id, name, slug, created_at) VALUES (?1, 'Org', 'org', 0)",
+        "INSERT INTO workspaces (id, organization_id, environment, name, slug, created_at) \
+         VALUES (?2, ?1, 'sandbox', 'W', 'w', 0)",
+        "INSERT INTO runs (id, organization_id, workspace_id, agent_id, session_id, trigger, job_id, status, input, \
+         model, instructions, input_tokens, output_tokens, tool_calls, created_at, started_at, execution_version, \
+         revision, continuation, cache_read_input_tokens) \
+         VALUES (?3, ?1, ?2, ?4, ?5, 'api', ?6, 'waiting_for_approval', 'Look it up.', 'gpt-5', 'Be brief.', 40, \
+         7, 2, 1, 2, 1, 9, ?13, 10)",
+        "INSERT INTO run_model_attempts (id, organization_id, workspace_id, run_id, turn, attempt, state, \
+         request_digest, offer, input_tokens, output_tokens, created_at, updated_at) \
+         VALUES (?12, ?1, ?2, ?3, 0, 1, 'answered', ?15, '[]', 40, 7, 2, 3)",
+        "INSERT INTO run_turns (id, organization_id, workspace_id, run_id, turn, model_attempt, text, input_tokens, \
+         output_tokens, created_at) \
+         VALUES (?11, ?1, ?2, ?3, 0, 1, 'Looking.', 40, 7, 3)",
+        "INSERT INTO run_tool_calls (id, organization_id, workspace_id, run_id, turn, position, model_call_id, name, \
+         installation_id, installation_label, app_name, tool, arguments, state, verdict, policy, mode, rule, \
+         outcome, outcome_is_error, started_at, finished_at, installation_short_id, app_key, definition_sha256, \
+         call_digest) \
+         VALUES (?7, ?1, ?2, ?3, 0, 0, 'm1', 'tools_abcdef_lookup', ?8, 'Main', 'Tools', 'lookup', '{\"n\":1}', \
+         'completed', 'allow', 'org', 'default', 'allowed', 'Found.', 0, 3, 4, 'abcdef', 'tools', ?16, ?17)",
+        "INSERT INTO run_tool_calls (id, organization_id, workspace_id, run_id, turn, position, model_call_id, name, \
+         installation_id, installation_label, app_name, tool, arguments, state, verdict, policy, mode, rule, reason, \
+         installation_short_id, app_key, definition_sha256, call_digest) \
+         VALUES (?9, ?1, ?2, ?3, 0, 1, 'm2', 'tools_abcdef_send', ?8, 'Main', 'Tools', 'send', '{}', \
+         'awaiting_approval', 'require_approval', 'org', 'default', 'organization_requires_approval', \
+         'Approve it.', 'abcdef', 'tools', ?18, ?19)",
+        "INSERT INTO run_call_attempts (id, organization_id, workspace_id, run_id, call_id, attempt, dispatch_epoch, \
+         invocation_id, authorized_at, send_lease_until, outcome, outcome_recorded_at, late) \
+         VALUES (?10, ?1, ?2, ?3, ?7, 1, 1, ?14, 3, 63, ?20, 4, 0)",
+    ] {
+        let mut query = sqlx::query(statement);
+        for n in 1..=12 {
+            query = query.bind(blob(n));
+        }
+        query = query.bind(waiting.as_str()).bind(blob(14)).bind(digest('a'));
+        for c in ['b', 'c', 'd', 'e'] {
+            query = query.bind(digest(c));
+        }
+        query
+            .bind(sent.as_str())
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    let tables = [
+        "runs",
+        "run_tool_calls",
+        "run_call_attempts",
+        "run_model_attempts",
+        "run_turns",
+    ];
+    let mut before = Vec::new();
+    for table in tables {
+        let columns = column_names(&pool, table).await;
+        let rows = rows_of(&pool, table, &columns).await;
+        before.push((columns, rows));
+    }
+    pool.close().await;
+
+    let database = Database::open(&directory.file()).await.unwrap();
+    let pool = database.pool();
+    for (table, (columns, rows)) in tables.into_iter().zip(&before) {
+        assert_eq!(
+            &rows_of(pool, table, columns).await,
+            rows,
+            "{table}: every row as it was"
+        );
+        let added: Vec<String> = column_names(pool, table)
+            .await
+            .into_iter()
+            .filter(|column| !columns.contains(column))
+            .collect();
+        let expected: &[&str] = match table {
+            "runs" => &["memory", "memory_type_id", "recall_digest", "recall"],
+            "run_tool_calls" => &["memory_type_id"],
+            _ => &[],
+        };
+        assert_eq!(added, expected, "{table}: the columns 0040 adds");
+    }
+    let memory: (String, Option<Vec<u8>>, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT memory, memory_type_id, recall, recall_digest FROM runs")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        memory,
+        ("agent".to_owned(), None, None, None),
+        "a run under way keeps the prompt it started with, without memory"
+    );
+    let typed: i64 = sqlx::query_scalar("SELECT count(*) FROM run_tool_calls WHERE memory_type_id IS NOT NULL")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(typed, 0, "no call targets a memory type");
+    let violations: i64 = sqlx::query_scalar("SELECT count(*) FROM pragma_foreign_key_check")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(violations, 0);
+    let mut indexes: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_index_list('run_tool_calls') WHERE origin = 'c'")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    indexes.sort();
+    assert_eq!(
+        indexes,
+        [
+            "run_tool_calls_awaiting_approval",
+            "run_tool_calls_awaiting_approval_in_type",
+            "run_tool_calls_in_run"
+        ]
+    );
+    // Every connection enforces foreign keys again: holding as many as the
+    // pool opens reaches each.
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let mut connection = pool.acquire().await.unwrap();
+        let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        assert_eq!(enabled, 1);
+        held.push(connection);
+    }
+    drop(held);
+
+    // The store reads the run as it was, on the agent's memory, recalling
+    // nothing.
+    let (organization_id, workspace_id, run_id) = (
+        OrganizationId::from_uuid(uuid(1)),
+        WorkspaceId::from_uuid(uuid(2)),
+        RunId::from_uuid(uuid(3)),
+    );
+    let snapshot = crate::SqliteRunStore::new(database.clone())
+        .find_snapshot(organization_id, workspace_id, run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((snapshot.memory, snapshot.frozen_memory), (MemoryMode::Agent, None));
+    assert_eq!(
+        snapshot.control.continuation,
+        Continuation::AwaitApproval {
+            call_id: ToolCallId::from_uuid(uuid(9))
+        }
+    );
+    let states: Vec<(CallState, usize)> = snapshot
+        .calls
+        .iter()
+        .map(|call| (call.state, call.attempts.len()))
+        .collect();
+    assert_eq!(states, [(CallState::Completed, 1), (CallState::AwaitingApproval, 0)]);
+
+    // The rebuilt table still references its run, and its attempts it.
+    let orphan = sqlx::query(
+        "INSERT INTO run_call_attempts (id, organization_id, workspace_id, run_id, call_id, attempt, \
+         dispatch_epoch, invocation_id, authorized_at, send_lease_until, late) \
+         VALUES (?, ?, ?, ?, ?, 1, 1, ?, 0, 0, 0)",
+    )
+    .bind(blob(30))
+    .bind(blob(1))
+    .bind(blob(2))
+    .bind(blob(3))
+    .bind(blob(31))
+    .bind(blob(32))
+    .execute(pool)
+    .await;
+    assert!(
+        orphan.is_err_and(|error| error.to_string().contains("FOREIGN KEY")),
+        "an attempt of no call"
+    );
+    sqlx::query("DELETE FROM runs WHERE organization_id = ? AND id = ?")
+        .bind(blob(1))
+        .bind(blob(3))
+        .execute(pool)
+        .await
+        .unwrap();
+    for table in ["run_tool_calls", "run_call_attempts"] {
+        let left: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "{table} go with their run");
+    }
 }
 
 /// Every column a session held before 0035, in order.

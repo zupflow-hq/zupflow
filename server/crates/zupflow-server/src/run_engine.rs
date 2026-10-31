@@ -33,9 +33,11 @@
 //! the first user message. Nothing reads the recall again during a run, and
 //! the cache key never covers it. Each memory call is decided as it's made,
 //! on the type as it is then, made in the run's own scope with a webhook
-//! row committed with its change, and a lapsed one is settled by finding
-//! its change by origin, never made twice. A channel session's runs have no
-//! memory.
+//! row and a record of the call committed with its change, and a lapsed one
+//! is settled by that record: answered as made, whatever became of the
+//! memory since, and its change never made again; one with no record (it
+//! changed nothing, or was never made) is made then. A channel session's
+//! runs have no memory.
 //!
 //! The job queue's lease and the run's claim go together: the job's lease
 //! is extended before every step that keeps the claim, and once a step
@@ -50,7 +52,9 @@
 //! The same worker takes the job an installation's deletion or
 //! disconnection queues ([`REFUSE_WAITING_JOB`], decision 0047): it refuses
 //! each call waiting for approval on that installation, through
-//! [`refuse_waiting`] and the store, so those runs move on.
+//! [`refuse_waiting`] and the store, so those runs move on. A memory type's
+//! deletion queues the same job for the calls waiting in that type, in any
+//! workspace of its organization.
 //!
 //! [`ApprovalPolicy`]: zupflow_core::policy::ApprovalPolicy
 
@@ -61,7 +65,9 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 use zupflow_core::environment::Environment;
-use zupflow_core::ids::{AgentId, InstallationId, ModelId, OrganizationId, RunId, ToolCallId, WorkspaceId};
+use zupflow_core::ids::{
+    AgentId, InstallationId, MemoryTypeId, ModelId, OrganizationId, RunId, ToolCallId, WorkspaceId,
+};
 use zupflow_core::installations::{Installation, InstallationStatus, InstalledApp};
 use zupflow_core::jobs::{Job, JobId, LeaseToken, Retry};
 use zupflow_core::model_store::{ModelStatus, RouteState};
@@ -78,9 +84,9 @@ use zupflow_core::runs::state::{
     CallDecision, CallRecord, CallVerdict, ClaimantId, FrozenMemory, InvocationId, RequestId, Snapshot,
 };
 use zupflow_core::runs::store::{
-    Applied, REFUSE_WAITING_JOB, RUN_JOB, RunStore, StoreError, installation_of_job, run_of_job,
+    Applied, REFUSE_WAITING_JOB, RUN_JOB, RunStore, StoreError, installation_of_job, memory_type_of_job, run_of_job,
 };
-use zupflow_core::runs::transition::{Conflict, Operation, SendOutcome};
+use zupflow_core::runs::transition::{Conflict, Operation, SendOutcome, WentAway};
 use zupflow_core::runs::{CallState, Failure, RunEvent};
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::tools::{RegisteredTool, ToolError};
@@ -1497,7 +1503,8 @@ pub async fn sweep(state: &AppState) -> usize {
 }
 
 /// Claims and works one job, if one is due: a run's, or one refusing the
-/// calls waiting on an installation that went. Whether one was.
+/// calls waiting on an installation that went, or in a memory type
+/// deleted. Whether one was.
 pub async fn work_once(state: &AppState) -> bool {
     let (Ok(run), Ok(refusals)) = (Name::new(RUN_AGENT), Name::new(REFUSE_WAITING_JOB)) else {
         return false;
@@ -1529,12 +1536,22 @@ enum Refusal {
     Retry,
 }
 
+/// What a refusing job's calls wait on: an installation of one workspace,
+/// or a memory type of the organization.
+#[derive(Debug, Clone, Copy)]
+enum Waiting {
+    Installation(OrganizationId, WorkspaceId, InstallationId),
+    MemoryType(OrganizationId, MemoryTypeId),
+}
+
 /// The job an installation's deletion or disconnection queued in its
 /// transaction (decision 0047): every call waiting for approval on it is
 /// refused, `installation_removed` or `installation_disconnected` as the
 /// installation is found now, and its run moves on. A run a worker may be
 /// about to park on such a call is waited for; one reconnected since keeps
-/// its calls waiting.
+/// its calls waiting. A memory type's deletion queues it in the type's
+/// organization: every call waiting for approval in the type, in any of
+/// its workspaces, is refused `memory_type_removed`.
 async fn handle_refusals(state: &AppState, job: Job) {
     let Job {
         id,
@@ -1544,16 +1561,29 @@ async fn handle_refusals(state: &AppState, job: Job) {
         lease,
         ..
     } = job;
-    let (Scope::Workspace(organization_id, workspace_id), Some(installation_id)) =
-        (scope, installation_of_job(&payload))
-    else {
-        tracing::error!(event = "runs.malformed_job", kind = REFUSE_WAITING_JOB);
-        if let Ok(reason) = Name::new("malformed") {
-            let _ = state.jobs.bury(&scope, id, &lease, &reason).await;
+    let waiting = match (scope, installation_of_job(&payload), memory_type_of_job(&payload)) {
+        (Scope::Workspace(organization_id, workspace_id), Some(installation_id), None) => {
+            Waiting::Installation(organization_id, workspace_id, installation_id)
         }
-        return;
+        (Scope::Organization(organization_id), None, Some(memory_type_id)) => {
+            Waiting::MemoryType(organization_id, memory_type_id)
+        }
+        _ => {
+            tracing::error!(event = "runs.malformed_job", kind = REFUSE_WAITING_JOB);
+            if let Ok(reason) = Name::new("malformed") {
+                let _ = state.jobs.bury(&scope, id, &lease, &reason).await;
+            }
+            return;
+        }
     };
-    let outcome = refuse_waiting_calls(state, organization_id, workspace_id, installation_id).await;
+    let outcome = match waiting {
+        Waiting::Installation(organization_id, workspace_id, installation_id) => {
+            refuse_waiting_calls(state, organization_id, workspace_id, installation_id).await
+        }
+        Waiting::MemoryType(organization_id, memory_type_id) => {
+            refuse_waiting_in_type(state, organization_id, memory_type_id).await
+        }
+    };
     let finished = match outcome {
         Outcome::Complete | Outcome::Leave => state.jobs.complete(&scope, id, &lease).await,
         Outcome::Postpone(until) => {
@@ -1568,9 +1598,17 @@ async fn handle_refusals(state: &AppState, job: Job) {
                 if retried == Ok(Retry::Exhausted) {
                     // Nothing refuses those calls at once any more: each stays
                     // waiting for a decision, and is refused when it would be
-                    // sent, since every send checks its installation again.
-                    let environment = environment_of(state, organization_id, workspace_id).await;
-                    tracing::warn!(event = "runs.refusals_job_exhausted", %organization_id, %workspace_id, environment, %installation_id, attempt, why);
+                    // sent, since every send checks its installation or its
+                    // type again.
+                    match waiting {
+                        Waiting::Installation(organization_id, workspace_id, installation_id) => {
+                            let environment = environment_of(state, organization_id, workspace_id).await;
+                            tracing::warn!(event = "runs.refusals_job_exhausted", %organization_id, %workspace_id, environment, %installation_id, attempt, why);
+                        }
+                        Waiting::MemoryType(organization_id, memory_type_id) => {
+                            tracing::warn!(event = "runs.refusals_job_exhausted", %organization_id, %memory_type_id, attempt, why);
+                        }
+                    }
                 }
                 retried.map(|_| ())
             }
@@ -1578,7 +1616,14 @@ async fn handle_refusals(state: &AppState, job: Job) {
         },
     };
     if let Err(error) = finished {
-        tracing::warn!(event = "runs.refusals_finish_failed", %organization_id, %workspace_id, %installation_id, %error);
+        match waiting {
+            Waiting::Installation(organization_id, workspace_id, installation_id) => {
+                tracing::warn!(event = "runs.refusals_finish_failed", %organization_id, %workspace_id, %installation_id, %error);
+            }
+            Waiting::MemoryType(organization_id, memory_type_id) => {
+                tracing::warn!(event = "runs.refusals_finish_failed", %organization_id, %memory_type_id, %error);
+            }
+        }
     }
 }
 
@@ -1620,11 +1665,9 @@ async fn refuse_waiting_calls(
         for run_id in &runs {
             match refuse_one(
                 state,
-                organization_id,
-                workspace_id,
-                environment,
+                (organization_id, workspace_id, environment),
                 *run_id,
-                installation_id,
+                WentAway::Installation(installation_id),
                 gone,
             )
             .await
@@ -1639,6 +1682,12 @@ async fn refuse_waiting_calls(
             _ => break,
         }
     }
+    parked_or_done(state, may_park)
+}
+
+/// Done, or, when a run may be about to park on a call refused, looked at
+/// again shortly.
+fn parked_or_done(state: &AppState, may_park: bool) -> Outcome {
     if may_park {
         let until = state
             .clock
@@ -1650,15 +1699,71 @@ async fn refuse_waiting_calls(
     Outcome::Complete
 }
 
-/// Refuses the call `run_id` waits on for approval on `installation_id`, if
-/// it does.
-async fn refuse_one(
+/// Refuses every call waiting for approval in memory type `memory_type_id`,
+/// deleted, in whichever of its organization's workspaces its run is.
+async fn refuse_waiting_in_type(
     state: &AppState,
     organization_id: OrganizationId,
-    workspace_id: WorkspaceId,
-    environment: Environment,
+    memory_type_id: MemoryTypeId,
+) -> Outcome {
+    match state.memory_types.find_type(organization_id, memory_type_id).await {
+        Ok(None) => {}
+        // Its deletion queued this job, in its own transaction.
+        Ok(Some(_)) => return Outcome::Complete,
+        Err(_) => return Outcome::Retry("store_unavailable"),
+    }
+    let page = zupflow_core::runs::MAX_PAGE;
+    let mut may_park = false;
+    let mut after: Option<RunId> = None;
+    let mut environments: HashMap<WorkspaceId, Environment> = HashMap::new();
+    loop {
+        let runs = match state
+            .runs
+            .runs_waiting_in_type(organization_id, memory_type_id, after, page)
+            .await
+        {
+            Ok(runs) => runs,
+            Err(_) => return Outcome::Retry("store_unavailable"),
+        };
+        for (workspace_id, run_id) in &runs {
+            let environment = match environments.get(workspace_id) {
+                Some(environment) => *environment,
+                None => match state.workspaces.find_workspace(organization_id, *workspace_id).await {
+                    Ok(Some(workspace)) => *environments.entry(*workspace_id).or_insert(workspace.environment),
+                    // Gone, with its runs.
+                    Ok(None) => continue,
+                    Err(_) => return Outcome::Retry("store_unavailable"),
+                },
+            };
+            match refuse_one(
+                state,
+                (organization_id, *workspace_id, environment),
+                *run_id,
+                WentAway::MemoryType(memory_type_id),
+                Gone::Removed,
+            )
+            .await
+            {
+                Refusal::Done => {}
+                Refusal::MayPark => may_park = true,
+                Refusal::Retry => return Outcome::Retry("store_unavailable"),
+            }
+        }
+        match runs.last() {
+            Some((_, last)) if runs.len() >= usize::try_from(page).unwrap_or(usize::MAX) => after = Some(*last),
+            _ => break,
+        }
+    }
+    parked_or_done(state, may_park)
+}
+
+/// Refuses the call `run_id` waits on for approval on what `went`, if it
+/// does.
+async fn refuse_one(
+    state: &AppState,
+    (organization_id, workspace_id, environment): (OrganizationId, WorkspaceId, Environment),
     run_id: RunId,
-    installation_id: InstallationId,
+    went: WentAway,
     gone: Gone,
 ) -> Refusal {
     // A revision conflict means the run moved: read it again.
@@ -1668,7 +1773,7 @@ async fn refuse_one(
             Ok(None) | Err(StoreError::Unsupported) => return Refusal::Done,
             Err(_) => return Refusal::Retry,
         };
-        if may_park_on(&snapshot, installation_id) {
+        if may_park_on(&snapshot, went) {
             return Refusal::MayPark;
         }
         // Not waiting on such a call (yet): one later in its turn is checked
@@ -1678,7 +1783,7 @@ async fn refuse_one(
             workspace_id,
             &snapshot,
             RequestId::from_uuid(Uuid::now_v7()),
-            installation_id,
+            went,
             gone,
         ) else {
             return Refusal::Done;

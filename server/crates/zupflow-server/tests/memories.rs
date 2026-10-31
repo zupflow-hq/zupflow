@@ -25,13 +25,13 @@ use axum::http::{Method, StatusCode};
 use common::{Server, call, code};
 use serde_json::{Map, Value, json};
 use zupflow_core::audit::Audit;
-use zupflow_core::ids::{AgentId, MemoryId, MemoryTypeId, OrganizationId, WorkspaceId};
+use zupflow_core::ids::{AgentId, MemoryId, MemoryTypeId, OrganizationId, RunId, ToolCallId, WorkspaceId};
 use zupflow_core::memory::notes::Notes;
 use zupflow_core::memory::registry::MemoryProviders;
 use zupflow_core::memory::{
-    Audience, CallContext, CallResult, FORGET_JOB, Forget, KindDescription, Manage, Memory, MemoryError, MemoryFilter,
-    MemoryKind, MemoryProvider, MemoryScope, MemoryTool, MemoryWrites, Origin, Recall, Record, Rewritten, Settings,
-    SettingsRefusal,
+    Audience, CallContext, CallResult, FORGET_JOB, Forget, KindDescription, MadeCall, Manage, Memory, MemoryError,
+    MemoryFilter, MemoryKind, MemoryProvider, MemoryScope, MemoryTool, MemoryWrites, Origin, Recall, Record, Rewritten,
+    Settings, SettingsRefusal,
 };
 use zupflow_core::time::Timestamp;
 use zupflow_core::workspaces::Page;
@@ -2017,15 +2017,13 @@ impl MemoryProvider for Limited {
         self.notes.call(scope, context, tool, arguments, record).await
     }
 
-    async fn settle(
+    async fn made(
         &self,
         scope: &MemoryScope,
-        context: &CallContext<'_>,
-        tool: &str,
-        arguments: &Map<String, Value>,
-        record: &Record<'_>,
-    ) -> Result<Option<CallResult>, MemoryError> {
-        self.notes.settle(scope, context, tool, arguments, record).await
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+    ) -> Result<Option<MadeCall>, MemoryError> {
+        self.notes.made(scope, run_id, tool_call_id).await
     }
 
     async fn list(&self, scope: &MemoryScope, filter: &MemoryFilter) -> Result<Page<Memory>, MemoryError> {

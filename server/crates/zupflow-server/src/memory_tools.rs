@@ -7,7 +7,7 @@
 //! (its own, or the organization's default), the kind's tools for the type's
 //! settings and `writes`, and what the run recalls, for the workspace. The
 //! tools join the offer by their own names, and the type and the recall are
-//! kept with the attempt ([`FrozenMemory`]), so every later attempt (a retry,
+//! kept on the run, once ([`FrozenMemory`]), so every later attempt (a retry,
 //! another worker, a turn after an approval) sends the same tools and the
 //! same recall, byte for byte. Nothing reads the recall again during a run:
 //! what a run saves reaches the next one. An agent with no memory, or a type
@@ -22,7 +22,12 @@
 //! (`allow`; `approve`, and the run waits for a person, as on any
 //! approve-level call; `deny`, refused as read-only). The type is the one
 //! the run started with, never another: once it's deleted, a call is refused
-//! (`memory_type_removed`).
+//! (`memory_type_removed`), and so is one already waiting for a person
+//! (the job the type's deletion queues). A call is refused for one reason
+//! with one code, whenever it's refused: decided, checked before it's sent,
+//! or made (`memory_kind_not_served` for a kind this server doesn't serve,
+//! `invalid_memory_settings` for settings its kind refuses now, and a tool
+//! the kind doesn't have as an app's unknown tool is).
 //!
 //! **Made in the run's scope.** A call reaches only the run's organization,
 //! workspace and agent, in its type ([`MemoryScope`]), with the type's
@@ -34,29 +39,37 @@
 //! tool's neither: the run's timeline is the record. No log line holds a
 //! memory's text, a call's arguments or its answer.
 //!
-//! **Once.** A call whose sender stopped before recording what came of it is
-//! settled through its kind ([`MemoryProvider::settle`]) by what it did,
-//! found by the run and the call: answered as made, or made now if it never
-//! was, and never made twice. One the kind can't tell is settled unknown.
+//! **Once.** A call that changes a memory commits a record of itself with
+//! its change, one for each call ([`Recorded::call`]). A call whose sender
+//! stopped before recording what came of it is settled by that record
+//! ([`MemoryProvider::made`]): answered as it was made, whatever became of
+//! the memory or its type since, and its change never made again; with
+//! none (it changed nothing, or was never made), it's made then, as
+//! [`memory::settle`] does. A sender that commits after its call was
+//! settled is refused, changing nothing ([`memory::make`]). A call of a kind
+//! that keeps no record, or that this server doesn't serve, is settled
+//! unknown.
 //!
 //! [`Record`]: zupflow_core::memory::Record
+//! [`Recorded::call`]: zupflow_core::memory::Recorded::call
 
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
-use zupflow_core::ids::{AgentId, MemoryTypeId, OrganizationId, RunId, WorkspaceId};
+use zupflow_core::ids::{AgentId, MemoryTypeId, OrganizationId, RunId, ToolCallId, WorkspaceId};
 use zupflow_core::memory::type_store::MemoryType;
 use zupflow_core::memory::{
-    Audience, CallContext, CallResult, MemoryChange, MemoryError, MemoryProvider, MemoryScope, MemoryTool,
-    MemoryWrites, Origin, Recorded, Settings,
+    self, Audience, CallContext, CallResult, MemoryChange, MemoryError, MemoryKind, MemoryProvider, MemoryScope,
+    MemoryTool, MemoryWrites, Origin, Recorded, Settings,
 };
 use zupflow_core::policy::{Rule, ToolLevel};
 use zupflow_core::runs::MemoryMode;
-use zupflow_core::runs::digest::memory_call_digest;
+use zupflow_core::runs::digest::{Sha256Digest, memory_call_digest};
 use zupflow_core::runs::names::{OfferedTool, memory_tool};
 use zupflow_core::runs::reducer::{
-    InstallationCheck, MEMORY_OFF, MEMORY_OFF_MESSAGE, MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE,
-    MemorySendRequest, SendCheck, after_app_content,
+    InstallationCheck, MEMORY_KIND_NOT_SERVED, MEMORY_KIND_NOT_SERVED_MESSAGE, MEMORY_OFF, MEMORY_OFF_MESSAGE,
+    MEMORY_SETTINGS_INVALID, MEMORY_SETTINGS_INVALID_MESSAGE, MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE,
+    MemorySendRequest, SendCheck, after_app_content, refusal_code,
 };
 use zupflow_core::runs::state::{CallDecision, CallRecord, CallVerdict, FrozenMemory, Snapshot};
 use zupflow_core::runs::transition::SendOutcome;
@@ -71,12 +84,6 @@ pub const POLICY: &str = "memory";
 /// What the model reads back for a call that writes while the type's
 /// `writes` are `deny`.
 pub const READ_ONLY: &str = "This agent's memory is read-only now, so it can't be changed.";
-
-/// The rule, and the refusal's code, for a call to a type whose kind this
-/// server doesn't serve.
-const NOT_SERVED: &str = "memory_not_served";
-
-const NOT_SERVED_MESSAGE: &str = "This run's memory can't be reached on this server, so this call wasn't made.";
 
 /// The code of a call that couldn't be made just now: nothing changed.
 const UNAVAILABLE: &str = "memory_unavailable";
@@ -111,6 +118,9 @@ enum TypeNow {
     Gone,
     /// This server doesn't serve its kind.
     NotServed,
+    /// Its kind refuses the settings it holds, which it kept when the type
+    /// was saved: a server that changed what it accepts.
+    Unusable,
     Served(Served),
 }
 
@@ -161,7 +171,9 @@ async fn type_now(
         return Ok(TypeNow::NotServed);
     }
     let provider = state.memory_providers.provider(&memory_type.kind);
-    let settings = stored_settings(provider.as_ref(), organization_id, &memory_type)?;
+    let Some(settings) = stored_settings(provider.as_ref(), organization_id, &memory_type) else {
+        return Ok(TypeNow::Unusable);
+    };
     Ok(TypeNow::Served(Served {
         memory_type,
         provider,
@@ -170,23 +182,25 @@ async fn type_now(
 }
 
 /// The type's settings as stored, checked again by its kind, which kept them
-/// when the type was saved: a refusal now is the server's to fix, and the
-/// step is tried again. Only the fields' names are logged.
+/// when the type was saved: `None` when it refuses them now, the server's to
+/// fix. Only the fields' names are logged.
 fn stored_settings(
     provider: &dyn MemoryProvider,
     organization_id: OrganizationId,
     memory_type: &MemoryType,
-) -> Result<Settings, &'static str> {
-    provider.check_settings(&memory_type.settings).map_err(|refusal| {
-        tracing::error!(
-            event = "runs.memory_settings_refused",
-            %organization_id,
-            memory_type_id = %memory_type.id,
-            kind = memory_type.kind.as_str(),
-            settings = ?refusal.fields.keys().collect::<Vec<_>>(),
-        );
-        "memory_settings_refused"
-    })
+) -> Option<Settings> {
+    provider
+        .check_settings(&memory_type.settings)
+        .inspect_err(|refusal| {
+            tracing::error!(
+                event = "runs.memory_settings_refused",
+                %organization_id,
+                memory_type_id = %memory_type.id,
+                kind = memory_type.kind.as_str(),
+                settings = ?refusal.fields.keys().collect::<Vec<_>>(),
+            );
+        })
+        .ok()
 }
 
 // --- What a run starts with -------------------------------------------------------
@@ -203,9 +217,10 @@ pub(crate) struct ResolvedMemory {
 /// attempt: `None` when the agent has none (its memory is off, or it's on
 /// the organization's default and there's none) or this server doesn't
 /// serve its type's kind. A run started with memory `off` gets the same
-/// tools and recalls nothing. A type or a recall that can't be read fails
-/// the step, to be tried again, as an offer that can't be read does: a run
-/// never starts without the memory its agent has.
+/// tools and recalls nothing. A type or a recall that can't be read, or
+/// settings its kind refuses now, fail the step, to be tried again, as an
+/// offer that can't be read does: a run never starts without the memory its
+/// agent has.
 pub(crate) async fn resolve(
     state: &AppState,
     (organization_id, workspace_id): (OrganizationId, WorkspaceId),
@@ -225,6 +240,9 @@ pub(crate) async fn resolve(
         TypeNow::NotServed => return Ok(None),
         // Deleted since the agent's memory was read: read it again.
         TypeNow::Gone => return Err("memory_changed"),
+        // The server's to fix: no model was asked yet, so nothing is lost
+        // trying again.
+        TypeNow::Unusable => return Err("memory_settings_refused"),
     };
     let kind_name = served.provider.describe().name;
     let memory_type = &served.memory_type;
@@ -269,9 +287,10 @@ pub(crate) async fn resolve(
 // --- Decisions ---------------------------------------------------------------------
 
 /// The decision on a call to `tool` of the run's memory type, read now:
-/// refused in a run started with memory `off`, once the type is deleted, or
-/// while its kind isn't served; a tool that reads, allowed; one that writes,
-/// at the type's `writes` now.
+/// refused in a run started with memory `off`, once the type is deleted,
+/// while its kind isn't served or refuses its settings, and for a tool its
+/// kind doesn't have; a tool that reads, allowed; one that writes, at the
+/// type's `writes` now. Only a store that can't be read fails the step.
 pub(crate) async fn decide(
     state: &AppState,
     organization_id: OrganizationId,
@@ -292,7 +311,8 @@ fn decision_now(memory: MemoryMode, now: &TypeNow, tool: &str) -> CallDecision {
     }
     let served = match now {
         TypeNow::Gone => return deny(MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE),
-        TypeNow::NotServed => return deny(NOT_SERVED, NOT_SERVED_MESSAGE),
+        TypeNow::NotServed => return deny(MEMORY_KIND_NOT_SERVED, MEMORY_KIND_NOT_SERVED_MESSAGE),
+        TypeNow::Unusable => return deny(MEMORY_SETTINGS_INVALID, MEMORY_SETTINGS_INVALID_MESSAGE),
         TypeNow::Served(served) => served,
     };
     level_decision(
@@ -304,7 +324,9 @@ fn decision_now(memory: MemoryMode, now: &TypeNow, tool: &str) -> CallDecision {
 
 /// A call to `tool` decided by the tools its type offers at its `writes`
 /// now, `offered`, among every tool its kind has, `every`: at the level the
-/// kind gives it, or refused as read-only when it writes and isn't offered.
+/// kind gives it, refused as read-only when it writes and isn't offered,
+/// and refused as an app's tool its installation doesn't have is
+/// (`unknown_tool`) when the kind has no such tool.
 fn level_decision(tool: &str, offered: &[MemoryTool], every: &[MemoryTool]) -> CallDecision {
     let level = match offered.iter().find(|offered| offered.name == tool) {
         Some(offered) => offered.level,
@@ -345,7 +367,8 @@ async fn checked(
     let now = type_now(state, organization_id, memory_type_id).await?;
     let installation = match now {
         TypeNow::Gone => InstallationCheck::Removed,
-        TypeNow::NotServed | TypeNow::Served(_) => InstallationCheck::Usable,
+        // Refused by the decision, with its own code.
+        TypeNow::NotServed | TypeNow::Unusable | TypeNow::Served(_) => InstallationCheck::Usable,
     };
     Ok((now, installation))
 }
@@ -362,7 +385,7 @@ pub(crate) async fn send_check(
     let tool = call.target.as_ref().map_or("", |target| target.tool.as_str());
     let definition_sha256 = match &now {
         TypeNow::Served(served) => served.definition(tool),
-        TypeNow::Gone | TypeNow::NotServed => None,
+        TypeNow::Gone | TypeNow::NotServed | TypeNow::Unusable => None,
     };
     Ok(SendCheck {
         call_id: call.id,
@@ -408,11 +431,45 @@ fn answered(result: CallResult) -> SendOutcome {
 }
 
 /// What a run's change records with it: its webhook events, placed in the
-/// run's workspace, and no audit event.
+/// run's workspace, and no audit event. The kind adds the call itself.
 fn recorded(organization_id: OrganizationId, workspace: &Workspace, change: &MemoryChange) -> Recorded {
     Recorded {
         audit: None,
         events: vec![memory_event_in(organization_id, workspace, change)],
+        call: None,
+    }
+}
+
+/// One memory call to make, in its run's scope, as it was decided.
+struct Call<'a> {
+    organization_id: OrganizationId,
+    workspace_id: WorkspaceId,
+    run_id: RunId,
+    call_id: ToolCallId,
+    memory_type_id: MemoryTypeId,
+    kind: &'a str,
+    tool: &'a str,
+    arguments: &'a Map<String, Value>,
+    call_digest: Sha256Digest,
+    definition_sha256: Sha256Digest,
+    after_app_content: bool,
+}
+
+impl<'a> Call<'a> {
+    fn sent(send: &'a MemorySendRequest) -> Self {
+        Self {
+            organization_id: send.organization_id,
+            workspace_id: send.workspace_id,
+            run_id: send.run_id,
+            call_id: send.call_id,
+            memory_type_id: send.memory_type_id,
+            kind: &send.kind,
+            tool: &send.tool,
+            arguments: &send.arguments,
+            call_digest: send.call_digest,
+            definition_sha256: send.definition_sha256,
+            after_app_content: send.after_app_content,
+        }
     }
 }
 
@@ -420,7 +477,7 @@ fn recorded(organization_id: OrganizationId, workspace: &Workspace, change: &Mem
 /// and digest checked once more, then the kind asked with the type's
 /// `writes` as they are now.
 pub(crate) async fn send(state: &AppState, agent_id: AgentId, send: &MemorySendRequest) -> SendOutcome {
-    match make(state, agent_id, send).await {
+    match make(state, agent_id, &Call::sent(send)).await {
         Ok(outcome) => outcome,
         Err(why) => {
             tracing::warn!(event = "runs.memory_call_not_made", organization_id = %send.organization_id, workspace_id = %send.workspace_id, run_id = %send.run_id, call_id = %send.call_id, memory_type_id = %send.memory_type_id, why);
@@ -429,24 +486,33 @@ pub(crate) async fn send(state: &AppState, agent_id: AgentId, send: &MemorySendR
     }
 }
 
-async fn make(state: &AppState, agent_id: AgentId, send: &MemorySendRequest) -> Result<SendOutcome, &'static str> {
-    let (organization_id, workspace_id) = (send.organization_id, send.workspace_id);
-    let served = match type_now(state, organization_id, send.memory_type_id).await? {
-        TypeNow::Served(served) => served,
-        TypeNow::Gone => return Ok(refused(MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE)),
-        TypeNow::NotServed => return Ok(refused(NOT_SERVED, NOT_SERVED_MESSAGE)),
+/// Makes `call` now: refused as it would be decided now, each reason with
+/// its own code, and as `tool_changed` when it no longer matches what was
+/// decided; else made through its kind, which answers a call that made its
+/// change already as it was made, changing nothing ([`memory::make`]).
+async fn make(state: &AppState, agent_id: AgentId, call: &Call<'_>) -> Result<SendOutcome, &'static str> {
+    let (organization_id, workspace_id) = (call.organization_id, call.workspace_id);
+    let now = type_now(state, organization_id, call.memory_type_id).await?;
+    // Only a run with memory gets this far: one with memory off is refused
+    // as each call is decided.
+    let decided = decision_now(MemoryMode::Agent, &now, call.tool);
+    if let CallVerdict::Deny { reason } = &decided.verdict {
+        return Ok(refused(refusal_code(&decided), reason));
+    }
+    let TypeNow::Served(served) = now else {
+        return Err("run_inconsistent");
     };
     // Only the run's own type and the tool as it was offered and decided.
     let digest = memory_call_digest(
-        send.memory_type_id,
-        &send.kind,
-        &send.tool,
-        &send.definition_sha256,
-        &send.arguments,
+        call.memory_type_id,
+        call.kind,
+        call.tool,
+        &call.definition_sha256,
+        call.arguments,
     );
-    if served.memory_type.kind.as_str() != send.kind
-        || digest != send.call_digest
-        || served.definition(&send.tool) != Some(send.definition_sha256)
+    if served.memory_type.kind.as_str() != call.kind
+        || digest != call.call_digest
+        || served.definition(call.tool) != Some(call.definition_sha256)
     {
         return Ok(refused(
             "tool_changed",
@@ -461,9 +527,9 @@ async fn make(state: &AppState, agent_id: AgentId, send: &MemorySendRequest) -> 
         .ok_or("workspace_gone")?;
     let scope = served.scope(organization_id, workspace_id, agent_id);
     let origin = Origin::Run {
-        run_id: send.run_id,
-        tool_call_id: send.call_id,
-        after_app_content: send.after_app_content,
+        run_id: call.run_id,
+        tool_call_id: call.call_id,
+        after_app_content: call.after_app_content,
     };
     let context = CallContext {
         origin: &origin,
@@ -473,15 +539,20 @@ async fn make(state: &AppState, agent_id: AgentId, send: &MemorySendRequest) -> 
         now: state.clock.now(),
     };
     let record = |change: &MemoryChange| recorded(organization_id, &workspace, change);
-    match served
-        .provider
-        .call(&scope, &context, &send.tool, &send.arguments, &record)
-        .await
+    match memory::make(
+        served.provider.as_ref(),
+        &scope,
+        &context,
+        call.tool,
+        call.arguments,
+        &record,
+    )
+    .await
     {
         Ok(result) => Ok(answered(result)),
         // The run's agent or type went as the call was made.
         Err(MemoryError::NotFound) => Ok(refused(MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE)),
-        Err(MemoryError::NotServed) => Ok(refused(NOT_SERVED, NOT_SERVED_MESSAGE)),
+        Err(MemoryError::NotServed) => Ok(refused(MEMORY_KIND_NOT_SERVED, MEMORY_KIND_NOT_SERVED_MESSAGE)),
         Err(_) => Err("memory_unavailable"),
     }
 }
@@ -489,10 +560,12 @@ async fn make(state: &AppState, agent_id: AgentId, send: &MemorySendRequest) -> 
 // --- A call whose sender stopped ----------------------------------------------------
 
 /// Settles a memory call whose sender stopped before recording what came of
-/// it, through its kind, in the run's scope: found by the run and the call,
-/// it's answered as made; never made, it's made now. `None` when the kind
-/// can't tell, the type is gone or its tool changed: the call is settled
-/// unknown. A store that can't be read fails the step, to be tried again.
+/// it, in the run's scope. A call that made its change is answered as its
+/// change recorded it ([`MemoryProvider::made`]), whatever became of the
+/// memory, or of its type, since; one that made none is made now, as it's
+/// sent. `None` when what came of it can't be told, its kind keeping no
+/// record of its calls or not served here: the call is settled unknown. A
+/// store that can't be read fails the step, to be tried again.
 pub(crate) async fn settle_lapsed(
     state: &AppState,
     (organization_id, workspace_id, run_id): (OrganizationId, WorkspaceId, RunId),
@@ -503,61 +576,62 @@ pub(crate) async fn settle_lapsed(
     let Some(target) = call.target.as_ref() else {
         return Ok(None);
     };
-    let Some(memory_type_id) = target.memory() else {
-        return Ok(None);
-    };
-    let TypeNow::Served(served) = type_now(state, organization_id, memory_type_id).await? else {
-        return Ok(None);
-    };
-    if served.memory_type.kind.as_str() != target.app_key
-        || served.definition(&target.tool) != Some(target.definition_sha256)
-    {
-        return Ok(None);
-    }
-    let Some(workspace) = state
-        .workspaces
-        .find_workspace(organization_id, workspace_id)
-        .await
-        .map_err(|_| "store_unavailable")?
+    let (Some(memory_type_id), Some(kind), Some(call_digest)) =
+        (target.memory(), MemoryKind::parse(&target.app_key), call.call_digest)
     else {
         return Ok(None);
     };
-    let scope = served.scope(organization_id, workspace_id, agent_id);
-    let origin = Origin::Run {
-        run_id,
-        tool_call_id: call.id,
-        after_app_content: after_app_content(snapshot, call),
+    if !state.memory_providers.serves(&kind) {
+        return Ok(None);
+    }
+    // What it made, read first: its type may be gone since.
+    let scope = MemoryScope {
+        organization_id,
+        workspace_id,
+        agent_id,
+        memory_type_id,
     };
-    let context = CallContext {
-        origin: &origin,
-        audience: &Audience::Workspace,
-        settings: &served.settings,
-        writes: served.memory_type.writes,
-        now: state.clock.now(),
-    };
-    let record = |change: &MemoryChange| recorded(organization_id, &workspace, change);
-    match served
-        .provider
-        .settle(&scope, &context, &target.tool, &call.arguments, &record)
+    match state
+        .memory_providers
+        .provider(&kind)
+        .made(&scope, run_id, call.id)
         .await
     {
-        Ok(settled) => Ok(settled.map(answered)),
-        Err(MemoryError::Unavailable) => Err("store_unavailable"),
-        Err(_) => Ok(None),
+        Ok(Some(made)) => return Ok(Some(answered(made.result()))),
+        Ok(None) => {}
+        Err(MemoryError::Unavailable) => return Err("store_unavailable"),
+        Err(_) => return Ok(None),
     }
+    let call = Call {
+        organization_id,
+        workspace_id,
+        run_id,
+        call_id: call.id,
+        memory_type_id,
+        kind: &target.app_key,
+        tool: &target.tool,
+        arguments: &call.arguments,
+        call_digest,
+        definition_sha256: target.definition_sha256,
+        after_app_content: after_app_content(snapshot, call),
+    };
+    make(state, agent_id, &call).await.map(Some)
 }
 
 #[cfg(test)]
 mod tests {
     use zupflow_core::memory::MemoryWrites;
     use zupflow_core::memory::notes::{self, FORGET_MEMORY, SAVE_MEMORY, SEARCH_MEMORY, UPDATE_MEMORY};
+    use zupflow_core::policy::Rule;
     use zupflow_core::runs::MemoryMode;
     use zupflow_core::runs::reducer::{
-        MEMORY_OFF, MEMORY_OFF_MESSAGE, MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE,
+        MEMORY_KIND_NOT_SERVED, MEMORY_KIND_NOT_SERVED_MESSAGE, MEMORY_OFF, MEMORY_OFF_MESSAGE,
+        MEMORY_SETTINGS_INVALID, MEMORY_SETTINGS_INVALID_MESSAGE, MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE,
+        TOOL_REFUSED, refusal_code,
     };
     use zupflow_core::runs::state::CallVerdict;
 
-    use super::{NOT_SERVED, POLICY, READ_ONLY, TypeNow, decision_now, level_decision};
+    use super::{POLICY, READ_ONLY, TypeNow, decision_now, level_decision};
 
     #[test]
     fn decides_a_call_by_the_types_writes_now() {
@@ -589,17 +663,28 @@ mod tests {
                 level_decision(SEARCH_MEMORY, &offered, &every).verdict,
                 CallVerdict::Allow
             );
-            assert!(matches!(
-                level_decision("erase_everything", &offered, &every).verdict,
-                CallVerdict::Deny { .. }
-            ));
+            // A tool the kind doesn't have, as an app's tool its
+            // installation doesn't have.
+            let unknown = level_decision("erase_everything", &offered, &every);
+            assert_eq!(
+                (unknown.rule.as_str(), refusal_code(&unknown), &unknown.verdict),
+                (
+                    Rule::UnknownTool.as_str(),
+                    TOOL_REFUSED,
+                    &CallVerdict::Deny {
+                        reason: "erase_everything isn't one of this memory's tools.".to_owned()
+                    }
+                )
+            );
         }
     }
 
+    /// Each reason a call is refused with its own code, the one the call
+    /// fails with.
     #[test]
     fn refuses_every_call_with_memory_off_or_once_the_type_is_gone() {
         for tool in [SAVE_MEMORY, SEARCH_MEMORY] {
-            for now in [TypeNow::Gone, TypeNow::NotServed] {
+            for now in [TypeNow::Gone, TypeNow::NotServed, TypeNow::Unusable] {
                 let off = decision_now(MemoryMode::Off, &now, tool);
                 assert_eq!(off.rule, MEMORY_OFF);
                 assert_eq!(
@@ -617,9 +702,34 @@ mod tests {
                     reason: MEMORY_TYPE_REMOVED_MESSAGE.to_owned()
                 }
             );
+            for (now, code, message) in [
+                (TypeNow::Gone, MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE),
+                (
+                    TypeNow::NotServed,
+                    MEMORY_KIND_NOT_SERVED,
+                    MEMORY_KIND_NOT_SERVED_MESSAGE,
+                ),
+                (
+                    TypeNow::Unusable,
+                    MEMORY_SETTINGS_INVALID,
+                    MEMORY_SETTINGS_INVALID_MESSAGE,
+                ),
+            ] {
+                let refused = decision_now(MemoryMode::Agent, &now, tool);
+                assert_eq!(
+                    (refusal_code(&refused), &refused.verdict),
+                    (
+                        code,
+                        &CallVerdict::Deny {
+                            reason: message.to_owned()
+                        }
+                    ),
+                    "{tool}"
+                );
+            }
             assert_eq!(
-                decision_now(MemoryMode::Agent, &TypeNow::NotServed, tool).rule,
-                NOT_SERVED
+                refusal_code(&decision_now(MemoryMode::Off, &TypeNow::Gone, tool)),
+                MEMORY_OFF
             );
         }
     }

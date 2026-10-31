@@ -151,6 +151,7 @@ fn fresh() -> Snapshot {
         instructions: "Be brief.".to_owned(),
         input: "Make a task.".to_owned(),
         memory: MemoryMode::Agent,
+        frozen_memory: None,
         turns: Vec::new(),
         calls: Vec::new(),
         model_attempts: Vec::new(),
@@ -183,7 +184,6 @@ fn awaiting_model() -> Snapshot {
         state: ModelAttemptState::Prepared,
         request_digest: digest,
         offer: offer(),
-        memory: None,
         timed_out: false,
     });
     snapshot
@@ -233,7 +233,6 @@ fn with_calls(continuation: Continuation, calls: Vec<CallRecord>) -> Snapshot {
         state: ModelAttemptState::Answered,
         request_digest: digest,
         offer: offer(),
-        memory: None,
         timed_out: false,
     });
     snapshot.calls = calls;
@@ -2114,7 +2113,14 @@ fn refuse_parked(
     installation_id: InstallationId,
     gone: Gone,
 ) -> Result<TransitionRequest, ControlError> {
-    refuse_waiting(organization(), workspace(), snapshot, caller(1), installation_id, gone)
+    refuse_waiting(
+        organization(),
+        workspace(),
+        snapshot,
+        caller(1),
+        WentAway::Installation(installation_id),
+        gone,
+    )
 }
 
 #[test]
@@ -2138,7 +2144,7 @@ fn a_call_waiting_on_an_installation_that_went_is_refused_and_the_run_moves_on()
             &Operation::RefuseWaiting(RefuseWaiting {
                 request_id: caller(1),
                 call_id: call_id(2),
-                installation_id: work(),
+                went: WentAway::Installation(work()),
                 outcome: CallOutcome {
                     content: message.to_owned(),
                     is_error: true,
@@ -2160,7 +2166,15 @@ fn a_call_waiting_on_an_installation_that_went_is_refused_and_the_run_moves_on()
         );
         // Deterministic for one request; two jobs never build the same one.
         assert_eq!(refuse_parked(&snapshot, work(), gone), Ok(request.clone()));
-        let other = refuse_waiting(organization(), workspace(), &snapshot, caller(2), work(), gone).expect("refuses");
+        let other = refuse_waiting(
+            organization(),
+            workspace(),
+            &snapshot,
+            caller(2),
+            WentAway::Installation(work()),
+            gone,
+        )
+        .expect("refuses");
         assert_eq!(other.id(), request.id());
         assert_ne!(other.digest(), request.digest());
     }
@@ -2211,7 +2225,7 @@ fn only_a_call_waiting_on_the_installation_that_went_is_refused() {
                 workspace_id,
                 &snapshot,
                 caller(1),
-                work(),
+                WentAway::Installation(work()),
                 Gone::Removed
             ),
             Err(ControlError::NotFound)
@@ -2235,19 +2249,19 @@ fn a_run_at_a_call_waiting_on_an_installation_may_still_park_on_it() {
             record(3, 2, PERSONAL_CREATE, CallState::AwaitingApproval),
         ],
     );
-    assert!(may_park_on(&at_call, work()));
+    assert!(may_park_on(&at_call, WentAway::Installation(work())));
     // Not the call it's at, or parked already: the job finds it, or the
     // check before parking does.
-    assert!(!may_park_on(&at_call, personal()));
-    assert!(!may_park_on(&parked(), work()));
+    assert!(!may_park_on(&at_call, WentAway::Installation(personal())));
+    assert!(!may_park_on(&parked(), WentAway::Installation(work())));
     let mut allowed = at_call.clone();
     allowed.calls[1].state = CallState::Allowed;
-    assert!(!may_park_on(&allowed, work()));
+    assert!(!may_park_on(&allowed, WentAway::Installation(work())));
     let mut cancelled = at_call;
     cancelled.control.status = RunStatus::Cancelled;
     cancelled.control.continuation = Continuation::Done;
     cancelled.control.cancel_requested_at = Some(at(0));
-    assert!(!may_park_on(&cancelled, work()));
+    assert!(!may_park_on(&cancelled, WentAway::Installation(work())));
 }
 
 #[test]
@@ -2475,7 +2489,7 @@ fn every_operation_says_where_it_leaves_the_run() {
             Operation::RefuseWaiting(RefuseWaiting {
                 request_id: caller(1),
                 call_id: call,
-                installation_id: work(),
+                went: WentAway::Installation(work()),
                 outcome: refused("x".to_owned()),
                 failure: Failure::new("x", "x"),
                 next,
@@ -2664,7 +2678,6 @@ fn commit(snapshot: &mut Snapshot, request: &TransitionRequest, now: Timestamp) 
                 state: ModelAttemptState::Prepared,
                 request_digest: prepare.request_digest,
                 offer: prepare.offer.clone(),
-                memory: None,
                 timed_out: false,
             });
         }
@@ -2720,10 +2733,9 @@ fn commit(snapshot: &mut Snapshot, request: &TransitionRequest, now: Timestamp) 
             let index = call(snapshot, refuse.call_id);
             let record = &mut snapshot.calls[index];
             assert_eq!(record.state, CallState::AwaitingApproval, "only a waiting call");
-            assert_eq!(
-                record.target.as_ref().and_then(|target| target.installation_id),
-                Some(refuse.installation_id),
-                "bound to the installation that went"
+            assert!(
+                record.target.as_ref().is_some_and(|target| refuse.went.binds(target)),
+                "bound to what went"
             );
             record.state = CallState::Refused;
             record.outcome = Some(refuse.outcome.clone());
@@ -3447,7 +3459,6 @@ fn long_floats_in_a_frozen_offer_survive_storage() {
         state: ModelAttemptState::Prepared,
         request_digest: digest,
         offer: read_back,
-        memory: None,
         timed_out: false,
     });
     let facts = Facts {
@@ -3568,7 +3579,6 @@ fn a_steer_joins_only_a_turns_first_attempt_and_is_resent_as_stored() {
         state: ModelAttemptState::Unanswered,
         request_digest: request.digest(),
         offer: offer(),
-        memory: None,
         timed_out: false,
     });
     let retry = planned(
@@ -3645,7 +3655,6 @@ fn channel_awaiting_model() -> Snapshot {
         state: ModelAttemptState::Prepared,
         request_digest: digest,
         offer: channel_offer(),
-        memory: None,
         timed_out: false,
     });
     snapshot
@@ -3812,7 +3821,6 @@ fn an_empty_channel_answer_is_nudged_once_then_fails_the_run() {
         state: ModelAttemptState::Prepared,
         request_digest: request.digest(),
         offer: channel_offer(),
-        memory: None,
         timed_out: false,
     });
     nudged.control.continuation = Continuation::AwaitModel { turn: 1, attempt: 1 };
@@ -3890,7 +3898,6 @@ fn channel_after_reply(state: CallState) -> Snapshot {
         state: ModelAttemptState::Prepared,
         request_digest: request.digest(),
         offer: channel_offer(),
-        memory: None,
         timed_out: false,
     });
     snapshot.control.continuation = Continuation::AwaitModel { turn: 1, attempt: 1 };
@@ -4139,9 +4146,9 @@ fn every_later_attempt_sends_the_memory_its_first_froze() {
         state: ModelAttemptState::Prepared,
         request_digest: digest,
         offer: remembering(),
-        memory: Some(frozen.clone()),
         timed_out: false,
     });
+    snapshot.frozen_memory = Some(frozen.clone());
     // Its worker stopped. The memory changed since, and so did what a
     // worker resolves now: neither reaches this run.
     let facts = Facts {
@@ -4157,7 +4164,7 @@ fn every_later_attempt_sends_the_memory_its_first_froze() {
     assert_eq!(request.digest(), digest, "the same bytes again");
     // An answer to the first attempt is still checked against what it sent.
     let mut answered_snapshot = snapshot.clone();
-    answered_snapshot.model_attempts[0].memory = Some(recalled(Some("<memory>\n- Other.\n</memory>")));
+    answered_snapshot.frozen_memory = Some(recalled(Some("<memory>\n- Other.\n</memory>")));
     let answer = Facts {
         model: Some(answered(0, 1, Reply::Text("Done.".to_owned()))),
         ..claimed()
@@ -4297,5 +4304,92 @@ fn counts_only_an_apps_results_of_earlier_turns_as_read_before_a_memory_call() {
         let mut snapshot = running(Continuation::NeedCall { turn: 1, position: 0 });
         snapshot.calls = vec![earlier, call.clone()];
         assert_eq!(after_app_content(&snapshot, &call), read, "{why}");
+    }
+}
+
+/// A memory call waiting for approval once the run's memory type is
+/// deleted: refused by the job the deletion queued, with the type's own
+/// reason, and the run moves on; never for another type or an
+/// installation.
+#[test]
+fn a_memory_call_waiting_in_a_deleted_type_is_refused_and_the_run_moves_on() {
+    let mut snapshot = with_calls(
+        Continuation::AwaitApproval { call_id: call_id(2) },
+        vec![
+            record(1, 0, WORK_LIST, CallState::Completed),
+            memory_record(2, 0, "save_memory", CallState::AwaitingApproval),
+        ],
+    );
+    snapshot.calls[1].position = 1;
+    snapshot.control.status = RunStatus::WaitingForApproval;
+    snapshot.control.lease_until = None;
+    let deleted = WentAway::MemoryType(memory_type());
+    let request = refuse_waiting(
+        organization(),
+        workspace(),
+        &snapshot,
+        caller(1),
+        deleted,
+        Gone::Removed,
+    )
+    .expect("refuses");
+    assert_eq!(
+        request.operation(),
+        &Operation::RefuseWaiting(RefuseWaiting {
+            request_id: caller(1),
+            call_id: call_id(2),
+            went: deleted,
+            outcome: CallOutcome {
+                content: MEMORY_TYPE_REMOVED_MESSAGE.to_owned(),
+                is_error: true,
+            },
+            failure: Failure::new(MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED_MESSAGE),
+            next: Continuation::NeedModel { turn: 1 },
+        })
+    );
+    assert_eq!(request.guards(), &Guards::default(), "no claim is needed");
+    for other in [
+        WentAway::MemoryType(MemoryTypeId::from_uuid(Uuid::from_u128(41))),
+        WentAway::Installation(work()),
+    ] {
+        assert_eq!(
+            refuse_waiting(organization(), workspace(), &snapshot, caller(1), other, Gone::Removed),
+            Err(ControlError::NotWaiting),
+            "{other:?}"
+        );
+    }
+    // A run at such a call may still park on it: the job waits for it.
+    let mut at_call = snapshot.clone();
+    at_call.control.status = RunStatus::Running;
+    at_call.control.continuation = Continuation::NeedCall { turn: 0, position: 1 };
+    assert!(may_park_on(&at_call, deleted));
+    assert!(!may_park_on(
+        &at_call,
+        WentAway::MemoryType(MemoryTypeId::from_uuid(Uuid::from_u128(41)))
+    ));
+    assert!(!may_park_on(&snapshot, deleted), "parked already");
+}
+
+/// A memory call refused for one reason fails with one code, whenever it's
+/// refused: the code its decision's rule names.
+#[test]
+fn fails_a_refused_memory_call_with_its_reasons_own_code() {
+    for (rule, code) in [
+        (MEMORY_OFF, MEMORY_OFF),
+        (MEMORY_TYPE_REMOVED, MEMORY_TYPE_REMOVED),
+        (MEMORY_KIND_NOT_SERVED, MEMORY_KIND_NOT_SERVED),
+        (MEMORY_SETTINGS_INVALID, MEMORY_SETTINGS_INVALID),
+        ("unknown_tool", TOOL_REFUSED),
+        ("organization_denies", TOOL_REFUSED),
+    ] {
+        let decision = CallDecision {
+            verdict: CallVerdict::Deny {
+                reason: "No.".to_owned(),
+            },
+            policy: "memory".to_owned(),
+            mode: None,
+            rule: rule.to_owned(),
+        };
+        assert_eq!(refusal_code(&decision), code, "{rule}");
     }
 }

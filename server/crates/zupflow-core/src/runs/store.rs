@@ -27,7 +27,8 @@
 //! The reads are the ones the API and the driver need: a run's snapshot
 //! (what [`super::reducer::advance`] reads), the run as the API shows it,
 //! lists, the timeline, activity and usage, and the runs a call waits on
-//! approval to an installation in. The one statement without a scope is
+//! approval to an installation in, or in a memory type, in any workspace of
+//! the type's organization. The one statement without a scope is
 //! [`RunStore::abandoned_runs`], for the sweep.
 //!
 //! The suite every adapter passes is `zupflow-conformance::run_store`.
@@ -38,7 +39,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::environment::Environment;
-use crate::ids::{InstallationId, OrganizationId, RunId, WorkspaceId};
+use crate::ids::{InstallationId, MemoryTypeId, OrganizationId, RunId, WorkspaceId};
 use crate::jobs::JobOptions;
 use crate::runs::state::{Continuation, Snapshot};
 use crate::runs::transition::{Conflict, TransitionId, TransitionRequest};
@@ -80,7 +81,8 @@ pub fn run_of_job(payload: &[u8]) -> Option<RunId> {
 
 /// The kind of the job an installation's deletion or disconnection queues,
 /// in its transaction, to refuse the calls waiting for approval on it
-/// (decision 0047).
+/// (decision 0047); and a memory type's deletion, for the calls waiting in
+/// it.
 pub const REFUSE_WAITING_JOB: &str = "refuse_waiting_calls";
 
 /// How many times that job is tried when the store is unavailable. Waiting
@@ -106,6 +108,27 @@ pub fn refuse_waiting_job(installation_id: InstallationId) -> Option<QueuedJob> 
 pub fn installation_of_job(payload: &[u8]) -> Option<InstallationId> {
     let payload: Value = serde_json::from_slice(payload).ok()?;
     InstallationId::parse(payload.get("installation_id")?.as_str()?).ok()
+}
+
+/// The job that refuses the calls waiting for approval in memory type
+/// `memory_type_id`, queued in its organization as the type is deleted: its
+/// payload names the type only. The runs it finds may be in any of the
+/// organization's workspaces.
+pub fn refuse_waiting_in_type_job(memory_type_id: MemoryTypeId) -> Option<QueuedJob> {
+    Some(QueuedJob {
+        kind: Name::new(REFUSE_WAITING_JOB).ok()?,
+        payload: json!({ "memory_type_id": memory_type_id }).to_string().into_bytes(),
+        options: JobOptions {
+            delay: Duration::ZERO,
+            max_attempts: REFUSE_WAITING_ATTEMPTS,
+        },
+    })
+}
+
+/// The memory type a refusing job's payload names.
+pub fn memory_type_of_job(payload: &[u8]) -> Option<MemoryTypeId> {
+    let payload: Value = serde_json::from_slice(payload).ok()?;
+    MemoryTypeId::parse(payload.get("memory_type_id")?.as_str()?).ok()
 }
 
 /// What a committed transition did. Answered again, the same (but for
@@ -287,6 +310,19 @@ pub trait RunStore: Send + Sync {
         limit: u32,
     ) -> Result<Vec<RunId>, StoreError>;
 
+    /// Up to `limit` of the organization's unfinished runs this engine
+    /// advances with a call waiting for approval in memory type
+    /// `memory_type_id`, in any of its workspaces, whether the run is parked
+    /// on it yet or not, each with its workspace, by run ID, after `after`
+    /// if given; `limit` clamped to 1 to [`crate::runs::MAX_PAGE`].
+    async fn runs_waiting_in_type(
+        &self,
+        organization_id: OrganizationId,
+        memory_type_id: MemoryTypeId,
+        after: Option<RunId>,
+        limit: u32,
+    ) -> Result<Vec<(WorkspaceId, RunId)>, StoreError>;
+
     /// **Cross-tenant**, for the sweep: up to `limit` runs this engine
     /// advances that are queued or running with no job left to take them
     /// forward (their last job died), each with its scope.
@@ -338,5 +374,29 @@ mod tests {
             None
         );
         assert_eq!(run_of_job(br#"{"run_id":"agt_031DCp7XMZ9AHIB2uF6QgS"}"#), None);
+    }
+
+    #[test]
+    fn a_refusing_job_names_its_memory_type_and_nothing_else() {
+        let memory_type_id = MemoryTypeId::from_uuid(Uuid::from_u128(5));
+        let job = refuse_waiting_in_type_job(memory_type_id).expect("a job");
+        assert_eq!(job.kind.as_str(), REFUSE_WAITING_JOB);
+        assert_eq!(job.options.max_attempts, REFUSE_WAITING_ATTEMPTS);
+        assert_eq!(memory_type_of_job(&job.payload), Some(memory_type_id));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&job.payload).expect("JSON"),
+            json!({ "memory_type_id": memory_type_id.to_string() })
+        );
+        assert_eq!(installation_of_job(&job.payload), None, "no installation");
+        assert_eq!(
+            memory_type_of_job(
+                &refuse_waiting_job(InstallationId::from_uuid(Uuid::from_u128(4)))
+                    .expect("a job")
+                    .payload
+            ),
+            None,
+            "an installation's job names no type"
+        );
+        assert_eq!(memory_type_of_job(b"{}"), None);
     }
 }

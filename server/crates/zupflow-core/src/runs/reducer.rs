@@ -11,8 +11,8 @@
 //! The worker's steps come from [`advance`]. The others have their own pure
 //! constructors: [`admit`] (the API), [`resolve_approval`] (an API key),
 //! [`cancel`] (the API or the Console), [`fail_abandoned`] (the sweep) and
-//! [`refuse_waiting`] (the job an installation's deletion or disconnection
-//! queues).
+//! [`refuse_waiting`] (the job an installation's deletion or disconnection,
+//! or a memory type's deletion, queues).
 //!
 //! | Continuation | Plan |
 //! | --- | --- |
@@ -49,7 +49,7 @@ use crate::runs::state::{
 use crate::runs::transition::{
     Admit, Authorization, AuthorizeCall, Cancel, Claim, Closing, CommitTurn, FailAbandoned, Finish, Guards,
     ModelAttemptRef, NewCall, Operation, OwnerGuard, Park, PrepareModel, RecordOutcome, RefuseWaiting, ResolveApproval,
-    RunEnding, SendGuard, SendLease, SendOutcome, SettleUnknown, Settlement, Steer, TransitionRequest, Yield,
+    RunEnding, SendGuard, SendLease, SendOutcome, SettleUnknown, Settlement, Steer, TransitionRequest, WentAway, Yield,
     YieldReason,
 };
 use crate::runs::{ApprovalDecision, CallOutcome, CallState, Failure, MemoryMode, NewRun, RunStatus, RunTrigger};
@@ -136,6 +136,29 @@ pub const MEMORY_OFF: &str = "memory_off";
 /// memory off.
 pub const MEMORY_OFF_MESSAGE: &str = "Memory is off for this run.";
 
+/// The failure code, and the decision's rule, of a memory tool's call whose
+/// run's memory type is of a kind this server doesn't serve: refused with
+/// [`MEMORY_KIND_NOT_SERVED_MESSAGE`], and the run goes on. The code the
+/// memories API answers such a type with.
+pub const MEMORY_KIND_NOT_SERVED: &str = "memory_kind_not_served";
+
+/// What the model reads back for a memory tool's call whose run's memory
+/// type is of a kind this server doesn't serve.
+pub const MEMORY_KIND_NOT_SERVED_MESSAGE: &str =
+    "This run's memory can't be reached on this server, so this call wasn't made.";
+
+/// The failure code, and the decision's rule, of a memory tool's call whose
+/// run's memory type holds settings its kind refuses now (a server that
+/// changed what it accepts): refused with [`MEMORY_SETTINGS_INVALID_MESSAGE`],
+/// and the run goes on. The code a type's settings are refused with when
+/// it's saved.
+pub const MEMORY_SETTINGS_INVALID: &str = "invalid_memory_settings";
+
+/// What the model reads back for a memory tool's call whose run's memory
+/// type holds settings its kind refuses.
+pub const MEMORY_SETTINGS_INVALID_MESSAGE: &str =
+    "This run's memory has settings this server can't use, so this call wasn't made.";
+
 /// The failure code of a run whose model answered with nothing twice, and
 /// never called `stay_silent`.
 pub const EMPTY_OUTPUT: &str = "empty_output";
@@ -183,15 +206,23 @@ pub fn channel_changes(snapshot: &Snapshot) -> u32 {
 
 /// The failure code of a call the floor, the policy, a channel's rules or a
 /// run's memory refused, unless its rule names its own (`outside_audience`,
-/// `rate_limited`, [`MEMORY_OFF`], [`MEMORY_TYPE_REMOVED`]).
+/// `rate_limited`, [`MEMORY_OFF`], [`MEMORY_TYPE_REMOVED`],
+/// [`MEMORY_KIND_NOT_SERVED`], [`MEMORY_SETTINGS_INVALID`]).
 pub const TOOL_REFUSED: &str = "tool_refused";
 
 /// The code a refused call fails with: its rule's own, for the rules a
 /// channel tool's or a memory tool's call is refused by, else
-/// [`TOOL_REFUSED`].
+/// [`TOOL_REFUSED`]. A memory call refused for one reason fails with one
+/// code, whether it's refused when decided, checked before it's sent, or as
+/// it's made.
 pub fn refusal_code(decision: &CallDecision) -> &str {
     match decision.rule.as_str() {
-        rule @ ("outside_audience" | "rate_limited" | MEMORY_OFF | MEMORY_TYPE_REMOVED) => rule,
+        rule @ ("outside_audience"
+        | "rate_limited"
+        | MEMORY_OFF
+        | MEMORY_TYPE_REMOVED
+        | MEMORY_KIND_NOT_SERVED
+        | MEMORY_SETTINGS_INVALID) => rule,
         _ => TOOL_REFUSED,
     }
 }
@@ -369,7 +400,8 @@ pub struct Facts {
     pub offer: Option<Offer>,
     /// The run's memory, resolved with [`Facts::offer`] for its first model
     /// attempt and read only with it: `None` without memory. Every later
-    /// attempt sends the memory frozen with the first ([`frozen_memory`]).
+    /// attempt sends the memory the first kept on the run
+    /// ([`frozen_memory`]).
     pub memory: Option<FrozenMemory>,
     /// Whether the run's model can be called now, read with the offer for a
     /// run that names an organization's model.
@@ -991,20 +1023,15 @@ pub fn frozen_offer(snapshot: &Snapshot) -> Option<&Offer> {
         .or_else(|| snapshot.session.as_ref().map(|session| &session.offer))
 }
 
-/// The run's memory, frozen at its first model attempt with its offer: the
-/// memory its latest attempt recorded, which every attempt since the first
-/// carried on. `None` before the first attempt (the driver resolves it then,
-/// [`Facts::memory`]), and for a run without memory.
+/// The run's memory, frozen at its first model attempt with its offer and
+/// kept on the run. `None` before the first attempt (the driver resolves it
+/// then, [`Facts::memory`]), and for a run without memory.
 ///
 /// Nothing reads the recall again during a run: a memory saved, changed or
 /// forgotten mid-run (by the run itself, too) reaches the next run, and
 /// this one's prompt keeps the bytes it started with.
 pub fn frozen_memory(snapshot: &Snapshot) -> Option<&FrozenMemory> {
-    snapshot
-        .model_attempts
-        .iter()
-        .max_by_key(|attempt| (attempt.turn, attempt.attempt))
-        .and_then(|attempt| attempt.memory.as_ref())
+    snapshot.frozen_memory.as_ref()
 }
 
 fn model_request(
@@ -1528,7 +1555,7 @@ impl Worker<'_> {
             turn,
             attempt,
             None,
-            (&prepared.offer, prepared.memory.as_ref()),
+            (&prepared.offer, frozen_memory(self.snapshot)),
             None,
         )?;
         if request.digest() != prepared.request_digest {
@@ -2219,18 +2246,19 @@ pub fn resolve_approval(
     ))
 }
 
-/// Refuses the call the run waits on for approval because its installation,
-/// `installation_id`, went away (decision 0047): the call is never sent, and
-/// the run goes on without asking anyone. The job the installation's
-/// deletion or disconnection queued builds it; `request_id` is fresh for
-/// each of its requests. [`ControlError::NotWaiting`] unless the run waits
-/// for a decision on a call to that installation.
+/// Refuses the call the run waits on for approval because what it goes to,
+/// `went`, went away: its installation (decision 0047), or the memory type
+/// its run remembers in, only ever deleted. The call is never sent, and the
+/// run goes on without asking anyone. The job the deletion or disconnection
+/// queued builds it; `request_id` is fresh for each of its requests.
+/// [`ControlError::NotWaiting`] unless the run waits for a decision on a
+/// call to it.
 pub fn refuse_waiting(
     organization_id: OrganizationId,
     workspace_id: WorkspaceId,
     snapshot: &Snapshot,
     request_id: RequestId,
-    installation_id: InstallationId,
+    went: WentAway,
     gone: Gone,
 ) -> Result<TransitionRequest, ControlError> {
     let snapshot = in_scope(organization_id, workspace_id, snapshot)?;
@@ -2248,16 +2276,16 @@ pub fn refuse_waiting(
     let target = call
         .target
         .as_ref()
-        .filter(|target| target.installation_id == Some(installation_id))
+        .filter(|target| went.binds(target))
         .ok_or(ControlError::NotWaiting)?;
-    let (code, message) = gone.refusal(&target.installation_label);
+    let (code, message) = gone_refusal(gone, target);
     Ok(request(
         snapshot,
         Guards::default(),
         Operation::RefuseWaiting(RefuseWaiting {
             request_id,
             call_id,
-            installation_id,
+            went,
             outcome: refused(message.clone()),
             failure: Failure::new(code, message),
             next: next_after(snapshot, call)?,
@@ -2266,21 +2294,18 @@ pub fn refuse_waiting(
 }
 
 /// Whether a worker may be about to park the run on a call waiting for
-/// approval on `installation_id`: the run is at that call and hasn't parked.
-/// The worker read the installation before parking, perhaps before it went,
-/// so the job that refuses such calls waits for the park rather than miss it.
-pub fn may_park_on(snapshot: &Snapshot, installation_id: InstallationId) -> bool {
+/// approval on what `went`: the run is at that call and hasn't parked. The
+/// worker read the installation or the type before parking, perhaps before
+/// it went, so the job that refuses such calls waits for the park rather
+/// than miss it.
+pub fn may_park_on(snapshot: &Snapshot, went: WentAway) -> bool {
     let control = &snapshot.control;
     let Continuation::NeedCall { turn, position } = control.continuation else {
         return false;
     };
     control.status == RunStatus::Running
         && snapshot.call_at(turn, position).is_some_and(|call| {
-            call.state == CallState::AwaitingApproval
-                && call
-                    .target
-                    .as_ref()
-                    .is_some_and(|target| target.installation_id == Some(installation_id))
+            call.state == CallState::AwaitingApproval && call.target.as_ref().is_some_and(|target| went.binds(target))
         })
 }
 

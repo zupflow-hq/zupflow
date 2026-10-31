@@ -212,6 +212,8 @@ fn kind_failure(error: MemoryError, memory_type: &MemoryType, provider: &dyn Mem
         MemoryError::NotServed => not_served(memory_type),
         // Only a save finds no room, and that route names it.
         MemoryError::Full => ApiError::new(422, "memory_full", "The memory is full.").into(),
+        // Only a run's call is made once, and none is made here.
+        MemoryError::AlreadyMade => unavailable(),
     }
 }
 
@@ -454,6 +456,7 @@ fn recorded(access: &WorkspaceAccess, agent: &Agent, change: &MemoryChange) -> R
     Recorded {
         audit: Some(workspace_audit(access, action, memory_target(agent, change.memory()))),
         events: vec![memory_event(access, change)],
+        call: None,
     }
 }
 
@@ -831,6 +834,7 @@ async fn delete_memories(
     let record = |change: &MemoryChange| Recorded {
         audit: None,
         events: vec![memory_event(&access, change)],
+        call: None,
     };
     let mut pause = Duration::ZERO;
     for memory_type in served_types(&state, &access).await? {

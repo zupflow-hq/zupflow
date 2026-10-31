@@ -10,7 +10,9 @@
 //! audit event, and none for a refused change; a run's memory resolved
 //! from the agent's own type, else the default, else none; and deleting an
 //! agent, a workspace or a type queuing, with it, the job that has each
-//! memory kind forget what went, and a refused deletion queuing none.
+//! memory kind forget what went, a type's also the job that refuses the
+//! memory calls waiting for approval in it, and a refused deletion queuing
+//! none.
 //!
 //! `prepare` makes a [`Tenant`] exist: its organization, a Sandbox and a
 //! Production workspace (each named), an active owner, admin and developer,
@@ -35,6 +37,7 @@ use zupflow_core::memory::type_store::{
 use zupflow_core::memory::{
     AgentMemory, FORGET_JOB, Forget, MemoryKind, MemoryScope, MemoryWrites, Origin, Settings, record_nothing,
 };
+use zupflow_core::runs::store::{REFUSE_WAITING_JOB, memory_type_of_job};
 use zupflow_core::scope::{Name, Scope};
 use zupflow_core::time::Timestamp;
 use zupflow_core::workspaces::{WorkspaceError, WorkspaceStore};
@@ -959,15 +962,38 @@ async fn forget_jobs(stores: &Stores<'_>, organization_id: OrganizationId) -> Ve
     queued
 }
 
+/// The jobs refusing the memory calls waiting in a deleted type queued for
+/// the organization, each read back as the type it names, every refusing
+/// job claimed finished: the suite's tenants share one queue.
+async fn refusal_jobs(stores: &Stores<'_>, organization_id: OrganizationId) -> Vec<MemoryTypeId> {
+    let kinds = [Name::new(REFUSE_WAITING_JOB).unwrap()];
+    let mut queued = Vec::new();
+    while let Some(job) = stores
+        .jobs
+        .claim_next(&kinds, std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+    {
+        if job.scope == Scope::Organization(organization_id) {
+            queued.push(memory_type_of_job(&job.payload).expect("a type's refusing job names it"));
+        }
+        stores.jobs.complete(&job.scope, job.id, &job.lease).await.unwrap();
+    }
+    queued
+}
+
 /// Deleting an agent, a workspace or a type queues with it, in the
 /// organization's scope, the job that has each memory kind forget what went
 /// ([`FORGET_JOB`]), naming it by its IDs: for an agent or a workspace, one
 /// for each kind of the organization's types at that moment; for a type,
-/// one for its own kind. A deletion refused queues none.
+/// one for its own kind, and the job that refuses the memory calls waiting
+/// for approval in it ([`REFUSE_WAITING_JOB`]). A deletion refused queues
+/// none.
 async fn queues_forgetting_with_each_deletion(stores: &Stores<'_>, prepare: &Prepare) {
     let t = tenant(prepare).await;
     let org = t.organization_id;
     forget_jobs(stores, org).await;
+    refusal_jobs(stores, org).await;
     let delete_agent = |agent: Agent| async move {
         stores
             .agents
@@ -1040,6 +1066,11 @@ async fn queues_forgetting_with_each_deletion(stores: &Stores<'_>, prepare: &Pre
         Err(WorkspaceError::NotFound)
     );
     assert_eq!(forget_jobs(stores, org).await, [], "a refused deletion queues none");
+    assert_eq!(
+        refusal_jobs(stores, org).await,
+        [],
+        "neither an agent's deletion nor a refused one refuses any call"
+    );
 
     delete(stores, &t, elsewhere.id).await.unwrap();
     assert_eq!(
@@ -1052,6 +1083,11 @@ async fn queues_forgetting_with_each_deletion(stores: &Stores<'_>, prepare: &Pre
             }
         )],
         "a type's: its own kind's"
+    );
+    assert_eq!(
+        refusal_jobs(stores, org).await,
+        [elsewhere.id],
+        "and the calls waiting in it refused"
     );
     stores
         .workspaces
@@ -1068,5 +1104,10 @@ async fn queues_forgetting_with_each_deletion(stores: &Stores<'_>, prepare: &Pre
             }
         )],
         "a workspace's: one for each kind left"
+    );
+    assert_eq!(
+        refusal_jobs(stores, org).await,
+        [],
+        "only a type's deletion refuses the calls waiting in it"
     );
 }

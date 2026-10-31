@@ -1,18 +1,31 @@
 -- no-transaction
--- Memory in runs: what a run was started with, what it recalled, and its
--- calls to memory tools.
+-- Memory in runs: what a run was started with, what it recalled, its calls
+-- to memory tools, and what each of those calls changed.
 --
 -- - `runs.memory`: `agent` (the agent's memory as it's set) or `off` (no
 --   recall, and every call to a memory tool refused). A run started before
---   this is `agent`: it ran with the memory it had, none.
--- - `run_model_attempts` keeps the memory type a run's first attempt
---   resolved and the recall it was sent, with every attempt, as the offer
---   is: each later attempt sends the same bytes. A recall is never empty,
---   and never without its type.
+--   this is `agent`: one that hadn't asked its model yet resolves its
+--   agent's memory at its first attempt, as any run does, and one under way
+--   keeps the prompt it started with, without memory.
+-- - `runs.memory_type_id`, `runs.recall` and `runs.recall_digest`: the
+--   memory type a run's first model attempt resolved and the recall it was
+--   sent, kept on the run once, so each later attempt sends the same bytes
+--   and is held to them by the digest. A recall is never empty, and never
+--   without its type or its digest. A finished run never sends again: its
+--   recall goes with its last transition, and its digest stays.
 -- - `run_tool_calls` gains `memory_type_id`: a call targets an
 --   installation, a channel connection or a memory type, at most one. A
 --   memory tool's call names no short ID; its `app_key` is the type's kind,
---   up to 32 characters, and it has a call digest as the others do.
+--   up to 32 characters, and it has a call digest as the others do. The
+--   calls waiting for approval in a type are found across its
+--   organization's workspaces, for the job its deletion queues.
+-- - `memory_calls`: what each run's memory call changed, written with the
+--   change in its own transaction, one row per call and never a second, so
+--   a call whose answer was lost is answered as it was made, and a sender
+--   that commits after its call was settled changes nothing. Its answer
+--   names a memory by its short ID, never by its text. The rows stay while
+--   the run's workspace does, through erasures of the memories they name:
+--   a settle after an erasure never makes the change again.
 --
 -- Changing checks means rebuilding `run_tool_calls`, which
 -- `run_call_attempts` references. So, as SQLite documents for this, foreign
@@ -27,13 +40,35 @@ BEGIN IMMEDIATE;
 
 ALTER TABLE runs ADD COLUMN memory TEXT NOT NULL DEFAULT 'agent' CHECK (memory IN ('agent', 'off'));
 
--- Model attempts -----------------------------------------------------------
-
-ALTER TABLE run_model_attempts ADD COLUMN memory_type_id UUID
+ALTER TABLE runs ADD COLUMN memory_type_id UUID
     CHECK (memory_type_id IS NULL OR (typeof(memory_type_id) = 'blob' AND length(memory_type_id) = 16));
 
-ALTER TABLE run_model_attempts ADD COLUMN recall TEXT
-    CHECK (recall IS NULL OR (memory_type_id IS NOT NULL AND length(recall) >= 1));
+ALTER TABLE runs ADD COLUMN recall_digest TEXT
+    CHECK (recall_digest IS NULL OR (
+        memory_type_id IS NOT NULL AND length(recall_digest) = 71 AND recall_digest GLOB 'sha256:*'
+    ));
+
+ALTER TABLE runs ADD COLUMN recall TEXT
+    CHECK (recall IS NULL OR (memory_type_id IS NOT NULL AND recall_digest IS NOT NULL AND length(recall) >= 1));
+
+-- What each run's memory call changed ------------------------------------------
+
+-- `id` is the run's tool call: one row per call.
+CREATE TABLE memory_calls (
+    id UUID NOT NULL PRIMARY KEY CHECK (typeof(id) = 'blob' AND length(id) = 16),
+    organization_id UUID NOT NULL,
+    workspace_id UUID NOT NULL,
+    run_id UUID NOT NULL CHECK (typeof(run_id) = 'blob' AND length(run_id) = 16),
+    agent_id UUID NOT NULL CHECK (typeof(agent_id) = 'blob' AND length(agent_id) = 16),
+    memory_type_id UUID NOT NULL CHECK (typeof(memory_type_id) = 'blob' AND length(memory_type_id) = 16),
+    tool TEXT NOT NULL CHECK (length(tool) BETWEEN 1 AND 64),
+    memory_id UUID NOT NULL CHECK (typeof(memory_id) = 'blob' AND length(memory_id) = 16),
+    answer TEXT NOT NULL CHECK (length(answer) BETWEEN 1 AND 1000),
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (organization_id, workspace_id) REFERENCES workspaces (organization_id, id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX memory_calls_of_run ON memory_calls (organization_id, workspace_id, run_id, id);
 
 -- Tool calls ---------------------------------------------------------------
 
@@ -128,6 +163,11 @@ CREATE UNIQUE INDEX run_tool_calls_in_run ON run_tool_calls (organization_id, wo
 CREATE INDEX run_tool_calls_awaiting_approval
     ON run_tool_calls (organization_id, workspace_id, installation_id)
     WHERE state = 'awaiting_approval';
+-- The calls a memory type's deletion refuses, in any of its organization's
+-- workspaces.
+CREATE INDEX run_tool_calls_awaiting_approval_in_type
+    ON run_tool_calls (organization_id, memory_type_id)
+    WHERE state = 'awaiting_approval' AND memory_type_id IS NOT NULL;
 
 -- Every reference still holds, or nothing commits: a row here fails its check.
 CREATE TEMP TABLE migration_0040_check (violations INTEGER NOT NULL CHECK (violations = 0));

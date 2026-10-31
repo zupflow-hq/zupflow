@@ -199,6 +199,11 @@ struct RunRow {
     instructions: String,
     input: String,
     memory: MemoryMode,
+    /// What its first model attempt froze of its memory: the type, the
+    /// recall (gone once the run is finished) and the recall's digest.
+    memory_type_id: Option<Uuid>,
+    recall: Option<String>,
+    recall_digest: Option<Sha256Digest>,
     usage: RunUsage,
     silent_reason: Option<String>,
 }
@@ -212,7 +217,8 @@ async fn run_row(
     let row = sqlx::query(
         "SELECT status, continuation, revision, owner_epoch, owner_claimant, lease_until, cancel_requested_at, \
          execution_version, job_id, agent_id, model, model_id, model_connection_id, instructions, input, memory, \
-         input_tokens, output_tokens, cache_read_input_tokens, cache_write_input_tokens, tool_calls, silent_reason \
+         memory_type_id, recall, recall_digest, input_tokens, output_tokens, cache_read_input_tokens, \
+         cache_write_input_tokens, tool_calls, silent_reason \
          FROM runs WHERE organization_id = ? AND workspace_id = ? AND id = ?",
     )
     .bind(organization_id.uuid())
@@ -241,6 +247,9 @@ async fn run_row(
         instructions: row.try_get("instructions").map_err(unreadable)?,
         input: row.try_get("input").map_err(unreadable)?,
         memory: MemoryMode::parse(&memory).ok_or_else(|| corrupt("a run's memory"))?,
+        memory_type_id: row.try_get("memory_type_id").map_err(unreadable)?,
+        recall: row.try_get("recall").map_err(unreadable)?,
+        recall_digest: digest(&row, "recall_digest")?,
         usage: run_usage(&row)?,
         silent_reason: row.try_get("silent_reason").map_err(unreadable)?,
     }))
@@ -252,6 +261,9 @@ struct Loaded {
     job_id: Uuid,
     agent_id: AgentId,
     usage: RunUsage,
+    /// The digest of the recall its first model attempt froze, kept once
+    /// the recall is gone with the run's end.
+    recall_digest: Option<Sha256Digest>,
     /// When each send claim was authorized, by call and attempt.
     authorized: HashMap<(ToolCallId, u32), Timestamp>,
 }
@@ -471,7 +483,7 @@ async fn load(
     }
 
     let model_attempts = sqlx::query(
-        "SELECT turn, attempt, state, request_digest, offer, memory_type_id, recall, timed_out FROM run_model_attempts \
+        "SELECT turn, attempt, state, request_digest, offer, timed_out FROM run_model_attempts \
          WHERE organization_id = ? AND workspace_id = ? AND run_id = ? ORDER BY turn, attempt",
     )
     .bind(scope.0)
@@ -484,29 +496,26 @@ async fn load(
     .map(|row| {
         let state: String = row.try_get("state").map_err(unreadable)?;
         let offer: String = row.try_get("offer").map_err(unreadable)?;
-        let memory_type_id: Option<Uuid> = row.try_get("memory_type_id").map_err(unreadable)?;
-        let recall: Option<String> = row.try_get("recall").map_err(unreadable)?;
-        let memory = match (memory_type_id, recall) {
-            (Some(memory_type_id), recall) => Some(FrozenMemory {
-                memory_type_id: MemoryTypeId::from_uuid(memory_type_id),
-                recall,
-            }),
-            (None, None) => None,
-            (None, Some(_)) => return Err(corrupt("a recall without its memory type")),
-        };
         Ok(ModelAttempt {
             turn: small(row, "turn")?,
             attempt: small(row, "attempt")?,
             state: parse_model_attempt_state(&state).ok_or_else(|| corrupt("a model attempt state"))?,
             request_digest: digest(row, "request_digest")?.ok_or_else(|| corrupt("a request digest"))?,
             offer: serde_json::from_str::<Offer>(&offer).map_err(unreadable)?,
-            memory,
             timed_out: row.try_get::<i64, _>("timed_out").map_err(unreadable)? != 0,
         })
     })
     .collect::<Result<Vec<_>, StoreError>>()?;
 
     let session = crate::channel_runs::session_context(connection, organization_id, workspace_id, run_id).await?;
+    let frozen_memory = match (row.memory_type_id, row.recall) {
+        (Some(memory_type_id), recall) => Some(FrozenMemory {
+            memory_type_id: MemoryTypeId::from_uuid(memory_type_id),
+            recall,
+        }),
+        (None, None) => None,
+        (None, Some(_)) => return Err(corrupt("a recall without its memory type")),
+    };
 
     Ok(Loaded {
         snapshot: Snapshot {
@@ -529,6 +538,7 @@ async fn load(
             instructions: row.instructions,
             input: row.input,
             memory: row.memory,
+            frozen_memory,
             turns,
             calls,
             model_attempts,
@@ -538,6 +548,7 @@ async fn load(
         job_id: row.job_id,
         agent_id: row.agent_id,
         usage: row.usage,
+        recall_digest: row.recall_digest,
         authorized,
     })
 }
@@ -1275,6 +1286,11 @@ async fn audit(
     Ok(())
 }
 
+/// The digest a run's recall is kept and compared by.
+fn recall_digest(recall: &str) -> Sha256Digest {
+    Sha256Digest::of(recall.as_bytes())
+}
+
 /// A call of an answer must be what the attempt's frozen offer makes of it:
 /// the target of the name the model used, or none for a name it wasn't
 /// offered, and the digest of exactly that target and its arguments.
@@ -1289,6 +1305,7 @@ fn bound_by_offer(snapshot: &Snapshot, offer: &Offer, call: &NewCall) -> Result<
         (Some(tool), Some(target)) => {
             target.installation_id == tool.installation_id
                 && target.channel_connection_id == tool.channel_connection_id
+                && target.memory_type_id == tool.memory_type_id
                 && target.host() != ToolHost::Run
                 && target.installation_short_id == tool.installation_short_id
                 && target.installation_label == tool.installation_label
@@ -1410,15 +1427,8 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
             if key_version.is_some() != snapshot.model_id.is_some() {
                 return Err(refused("a model attempt without the key version of the run's model"));
             }
-            // A run's memory is frozen with its first attempt, and a run
-            // started without memory recalls nothing.
-            if snapshot
-                .model_attempts
-                .last()
-                .is_some_and(|frozen| frozen.memory.as_ref() != memory.as_ref())
-            {
-                return Err(refused("a model attempt with memory other than the run's"));
-            }
+            // A run started without memory recalls nothing, and no recall
+            // is empty.
             if snapshot.memory == MemoryMode::Off && memory.as_ref().is_some_and(|memory| memory.recall.is_some()) {
                 return Err(refused("a recall for a run started without memory"));
             }
@@ -1427,6 +1437,19 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
                 .is_some_and(|memory| memory.recall.as_deref() == Some(""))
             {
                 return Err(refused("an empty recall"));
+            }
+            // A run's memory is frozen with its first attempt and kept on the
+            // run; every later attempt carries the same, its recall compared
+            // by digest.
+            let asked = memory
+                .as_ref()
+                .map(|memory| (memory.memory_type_id, memory.recall.as_deref().map(recall_digest)));
+            let kept = snapshot
+                .frozen_memory
+                .as_ref()
+                .map(|kept| (kept.memory_type_id, loaded.recall_digest));
+            if !snapshot.model_attempts.is_empty() && asked != kept {
+                return Err(refused("a model attempt with memory other than the run's"));
             }
             if steer.is_some() && (snapshot.session.is_none() || *attempt != 1 || abandons.is_some()) {
                 return Err(refused("thread messages joining a run outside a turn's first attempt"));
@@ -1461,11 +1484,35 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
                     .await?;
             }
             let (org, ws, run) = writer.scope();
+            if snapshot.model_attempts.is_empty()
+                && let Some(memory) = memory
+            {
+                // Kept once, unless the run holds another already.
+                let kept = sqlx::query(
+                    "UPDATE runs SET memory_type_id = ?, recall = ?, recall_digest = ? \
+                     WHERE organization_id = ? AND workspace_id = ? AND id = ? \
+                     AND (memory_type_id IS NULL OR (memory_type_id = ? AND recall_digest IS ?))",
+                )
+                .bind(memory.memory_type_id.uuid())
+                .bind(memory.recall.as_deref())
+                .bind(memory.recall.as_deref().map(|recall| recall_digest(recall).to_string()))
+                .bind(org)
+                .bind(ws)
+                .bind(run)
+                .bind(memory.memory_type_id.uuid())
+                .bind(memory.recall.as_deref().map(|recall| recall_digest(recall).to_string()))
+                .execute(&mut *writer.connection)
+                .await
+                .map_err(failed("prepare_model"))?;
+                if kept.rows_affected() != 1 {
+                    return Err(refused("a model attempt with memory other than the run's"));
+                }
+            }
             let offer = serde_json::to_string(offer).map_err(|_| refused("an offer that isn't JSON"))?;
             sqlx::query(
                 "INSERT INTO run_model_attempts (id, organization_id, workspace_id, run_id, turn, attempt, state, \
-                 request_digest, offer, memory_type_id, recall, key_version, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, ?)",
+                 request_digest, offer, key_version, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?)",
             )
             .bind(Uuid::now_v7())
             .bind(org)
@@ -1475,8 +1522,6 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
             .bind(i64::from(*attempt))
             .bind(request_digest.to_string())
             .bind(offer)
-            .bind(memory.as_ref().map(|memory| memory.memory_type_id.uuid()))
-            .bind(memory.as_ref().and_then(|memory| memory.recall.as_deref()))
             .bind(key_version.map(i64::from))
             .bind(now.millis())
             .bind(now.millis())
@@ -1726,7 +1771,7 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
         }
         Operation::RefuseWaiting(RefuseWaiting {
             call_id,
-            installation_id,
+            went: what,
             outcome,
             failure,
             next,
@@ -1739,11 +1784,11 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
                 .filter(|call| waiting && call.state == CallState::AwaitingApproval)
                 .ok_or(refused("a refusal of a call the run doesn't wait for"))?;
             let target = target_of(call)?;
-            if target.installation_id != Some(*installation_id) {
-                return Err(refused("a refusal for an installation the call isn't bound to"));
+            if !what.binds(target) {
+                return Err(refused("a refusal for what the call isn't bound to"));
             }
-            if !installation_went(failure) || !outcome.is_error {
-                return Err(refused("a refusal that doesn't say the installation went"));
+            if !went(target, failure) || !outcome.is_error {
+                return Err(refused("a refusal that doesn't say what the call goes to went"));
             }
             expect_next(*next, next_after(snapshot, call))?;
             writer
@@ -2628,7 +2673,8 @@ impl SqliteRunStore {
              finished_at = coalesce(finished_at, ?), output = coalesce(output, ?), \
              error_code = coalesce(error_code, ?), error_message = coalesce(error_message, ?), \
              input_tokens = ?, output_tokens = ?, cache_read_input_tokens = ?, cache_write_input_tokens = ?, \
-             tool_calls = ?, job_id = ?, silent_reason = coalesce(silent_reason, ?) \
+             tool_calls = ?, job_id = ?, silent_reason = coalesce(silent_reason, ?), \
+             recall = CASE WHEN ? THEN NULL ELSE recall END \
              WHERE organization_id = ? AND workspace_id = ? AND id = ? AND revision = ?",
         )
         .bind(status.as_str())
@@ -2650,6 +2696,9 @@ impl SqliteRunStore {
         .bind(int(usage.tool_calls)?)
         .bind(job_id)
         .bind(row.silent.as_deref())
+        // A finished run never sends again: its recall isn't kept past it,
+        // only its digest.
+        .bind(status.is_terminal())
         .bind(org)
         .bind(ws)
         .bind(run)
@@ -2978,6 +3027,38 @@ impl RunStore for SqliteRunStore {
                 })
             })
             .collect()
+    }
+
+    /// Across the organization's workspaces, as its memory types are: each
+    /// run's call is matched within the run's own organization and
+    /// workspace.
+    async fn runs_waiting_in_type(
+        &self,
+        organization_id: OrganizationId,
+        memory_type_id: MemoryTypeId,
+        after: Option<RunId>,
+        limit: u32,
+    ) -> Result<Vec<(WorkspaceId, RunId)>, StoreError> {
+        let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT DISTINCT r.workspace_id, r.id FROM run_tool_calls c JOIN runs r \
+               ON r.organization_id = c.organization_id AND r.workspace_id = c.workspace_id AND r.id = c.run_id \
+             WHERE c.organization_id = ? AND c.memory_type_id = ? AND c.state = 'awaiting_approval' \
+             AND r.status IN ('running', 'waiting_for_approval') AND r.execution_version >= 1 \
+             AND (? IS NULL OR r.id > ?) \
+             ORDER BY r.id LIMIT ?",
+        )
+        .bind(organization_id.uuid())
+        .bind(memory_type_id.uuid())
+        .bind(after.map(|run| run.uuid()))
+        .bind(after.map(|run| run.uuid()))
+        .bind(i64::from(limit.clamp(1, zupflow_core::runs::MAX_PAGE)))
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(failed("runs_waiting_in_type"))?;
+        Ok(rows
+            .into_iter()
+            .map(|(workspace_id, run_id)| (WorkspaceId::from_uuid(workspace_id), RunId::from_uuid(run_id)))
+            .collect())
     }
 
     async fn runs_waiting_on(

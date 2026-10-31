@@ -19,8 +19,8 @@ use crate::audit::AuditActor;
 use crate::channels::store::ChannelDispatchKey;
 use crate::ids::ChannelMessageId;
 use crate::ids::{
-    AgentId, ApiKeyId, InstallationId, ModelConnectionId, ModelId, OrganizationId, RunId, SessionId, ToolCallId,
-    WorkspaceId,
+    AgentId, ApiKeyId, InstallationId, MemoryTypeId, ModelConnectionId, ModelId, OrganizationId, RunId, SessionId,
+    ToolCallId, WorkspaceId,
 };
 use crate::runs::digest::{Sha256Digest, digest_json};
 use crate::runs::names::Offer;
@@ -205,8 +205,9 @@ pub struct PrepareModel {
     pub abandons: Option<u32>,
     pub request_digest: Sha256Digest,
     pub offer: Offer,
-    /// The run's memory, frozen with the offer: resolved for its first
-    /// attempt, the same for every one after; `None` without memory.
+    /// The run's memory: resolved for its first attempt with the offer and
+    /// kept on the run then, and the same for every attempt after, which
+    /// the store holds it to; `None` without memory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<FrozenMemory>,
     /// The version of the connection's key the attempt uses; `None` for a
@@ -320,24 +321,47 @@ pub struct ResolveApproval {
     pub next: Continuation,
 }
 
-/// A call the run waits on for approval, refused because its installation
-/// was deleted or disconnected (decision 0047): never sent, and the run
-/// runnable again. Nobody decided it, so no approval is recorded. The job
-/// the installation's deletion or disconnection queued asks for it.
+/// A call the run waits on for approval, refused because what it goes to
+/// went away: its installation, deleted or disconnected (decision 0047), or
+/// its run's memory type, deleted. Never sent, and the run runnable again.
+/// Nobody decided it, so no approval is recorded. The job the deletion or
+/// disconnection queued asks for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RefuseWaiting {
     /// The job's request: two jobs never build the same request.
     pub request_id: RequestId,
     pub call_id: ToolCallId,
-    /// The installation that went away. The store refuses the request
-    /// unless the call is bound to it.
-    pub installation_id: InstallationId,
+    /// What went away. The store refuses the request unless the call is
+    /// bound to it.
+    pub went: WentAway,
     /// What the model reads back.
     #[serde(serialize_with = "ser::call_outcome")]
     pub outcome: CallOutcome,
-    /// `installation_removed` or `installation_disconnected`.
+    /// `installation_removed` or `installation_disconnected`, or
+    /// `memory_type_removed`: the reason for what went.
     pub failure: Failure,
     pub next: Continuation,
+}
+
+/// What went away under a call waiting for approval
+/// ([`RefuseWaiting::went`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WentAway {
+    /// The call's installation, deleted or disconnected.
+    Installation(InstallationId),
+    /// The memory type the call's run remembers in, deleted.
+    MemoryType(MemoryTypeId),
+}
+
+impl WentAway {
+    /// Whether a call bound to `target` goes to it.
+    pub fn binds(self, target: &BoundTarget) -> bool {
+        match self {
+            Self::Installation(installation_id) => target.installation_id == Some(installation_id),
+            Self::MemoryType(memory_type_id) => target.memory() == Some(memory_type_id),
+        }
+    }
 }
 
 /// What a call's check at send allows.

@@ -11,8 +11,10 @@
 //! with its deliveries and their jobs, as the outbox writes one, and the
 //! audit event, each only in the scope's own workspace.
 //!
-//! A note a run's call wrote is found by the call in its origin, the JSON
-//! it's kept as, within the full scope ([`BY_ORIGIN`]).
+//! A run's call that changes a note is written with its change, in
+//! `memory_calls`, one row for each call ([`INSERT_CALL`]): a second of the
+//! same call fails its change, `AlreadyMade`, and the transaction rolls
+//! back. Its row is read back within the full scope ([`MADE`]).
 //!
 //! A search is FTS5's: the notes holding every word, by word, in any case
 //! and accent, ranked by BM25, then newest first. BM25 weighs a word by how
@@ -36,7 +38,7 @@ use zupflow_core::ids::{
 use zupflow_core::installations::ShortId;
 use zupflow_core::memory::notes::{NewNote, NoteRef, NoteStore, Reach, Recent};
 use zupflow_core::memory::{
-    Audience, Forget, Memory, MemoryChange, MemoryError, MemoryScope, Origin, Record, Recorded, Rewritten,
+    Audience, Forget, MadeCall, Memory, MemoryChange, MemoryError, MemoryScope, Origin, Record, Recorded, Rewritten,
 };
 use zupflow_core::time::Timestamp;
 use zupflow_core::workspaces::Page;
@@ -96,15 +98,34 @@ fn read(error: impl std::fmt::Display) -> MemoryError {
     MemoryError::Unavailable
 }
 
-/// Writes what a change records, in its transaction: each webhook event, with
-/// a delivery and its job for every endpoint subscribed to it, and the audit
-/// event. Either placed anywhere but the scope's workspace fails the change.
+/// Writes what a change records, in its transaction: the run's call that
+/// made it, each webhook event, with a delivery and its job for every
+/// endpoint subscribed to it, and the audit event. An event placed anywhere
+/// but the scope's workspace fails the change, and so does a call that made
+/// its change already (`AlreadyMade`): its transaction rolls back, and it
+/// changes nothing.
 async fn write_records(
     connection: &mut SqliteConnection,
     scope: &MemoryScope,
     recorded: &Recorded,
     operation: &'static str,
 ) -> Result<(), MemoryError> {
+    if let Some(call) = &recorded.call {
+        let written = bind_scope(sqlx::query(INSERT_CALL), scope)
+            .bind(call.tool_call_id.uuid())
+            .bind(call.run_id.uuid())
+            .bind(call.tool.as_str())
+            .bind(call.memory_id.uuid())
+            .bind(call.answer.as_str())
+            .bind(call.at.millis())
+            .execute(&mut *connection)
+            .await
+            .map_err(failed(operation))?;
+        if written.rows_affected() == 0 {
+            tracing::warn!(event = "memory_notes.call_made_already", operation);
+            return Err(MemoryError::AlreadyMade);
+        }
+    }
     for event in &recorded.events {
         if event.workspace_id != Some(scope.workspace_id) {
             tracing::error!(event = "memory_notes.event_misplaced", operation);
@@ -197,15 +218,17 @@ const WRITTEN: &str = concat!(
     written!(),
     " AND (id = ?7 OR short_id = ?8)"
 );
-/// The note whose origin is the run (`?5`) and call (`?6`) that wrote its
-/// text, whatever its audience: at most one, as a call writes one note.
-const BY_ORIGIN: &str = concat!(
-    "SELECT ",
-    columns!(),
-    " FROM memory_notes WHERE ",
+/// A run's call (`?5`) of run `?6` that changed a note, with its tool
+/// (`?7`), the note (`?8`), its answer (`?9`) and when (`?10`): none when
+/// the call made its change already, as a call's row is its only one.
+const INSERT_CALL: &str = "INSERT INTO memory_calls (id, organization_id, workspace_id, agent_id, memory_type_id, \
+     run_id, tool, memory_id, answer, created_at) VALUES (?5, ?1, ?2, ?3, ?4, ?6, ?7, ?8, ?9, ?10) \
+     ON CONFLICT DO NOTHING";
+/// What run `?5`'s call `?6` changed in the scope, as its change wrote it.
+const MADE: &str = concat!(
+    "SELECT tool, memory_id, answer, created_at FROM memory_calls WHERE ",
     in_scope!(),
-    " AND json_extract(origin, '$.type') = 'run' AND json_extract(origin, '$.run_id') = ?5 \
-     AND json_extract(origin, '$.tool_call_id') = ?6 ORDER BY updated_at DESC, id DESC LIMIT 1"
+    " AND run_id = ?5 AND id = ?6"
 );
 /// A note by its ID (`?5`), whatever its audience.
 const FIND: &str = concat!(
@@ -579,19 +602,29 @@ impl NoteStore for SqliteNoteStore {
         row.as_ref().map(note_from).transpose()?.ok_or(MemoryError::NotFound)
     }
 
-    async fn by_origin(
+    async fn made(
         &self,
         scope: &MemoryScope,
         run_id: RunId,
         tool_call_id: ToolCallId,
-    ) -> Result<Option<Memory>, MemoryError> {
-        let row = bind_scope(sqlx::query(BY_ORIGIN), scope)
-            .bind(run_id.to_string())
-            .bind(tool_call_id.to_string())
+    ) -> Result<Option<MadeCall>, MemoryError> {
+        let row = bind_scope(sqlx::query(MADE), scope)
+            .bind(run_id.uuid())
+            .bind(tool_call_id.uuid())
             .fetch_optional(self.database.pool())
             .await
-            .map_err(failed("by_origin"))?;
-        row.as_ref().map(note_from).transpose()
+            .map_err(failed("made"))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(MadeCall {
+            run_id,
+            tool_call_id,
+            tool: row.try_get("tool").map_err(read)?,
+            memory_id: MemoryId::from_uuid(row.try_get("memory_id").map_err(read)?),
+            answer: row.try_get("answer").map_err(read)?,
+            at: Timestamp::from_millis(row.try_get("created_at").map_err(read)?),
+        }))
     }
 
     async fn recent(&self, scope: &MemoryScope, audience: &Audience, limit: u32) -> Result<Recent, MemoryError> {

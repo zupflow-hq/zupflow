@@ -372,20 +372,21 @@ pub enum ModelAttemptState {
     Unanswered,
 }
 
-/// A run's memory, resolved at its first model attempt and frozen with it,
-/// as its offer is: every later attempt reads it from the run, never from
-/// the store, so retries, restarts and approval pauses send the same bytes.
-/// `None` where it's kept: the run has no memory (its agent's is off, on a
-/// default the organization hasn't chosen, or of a kind this server doesn't
-/// serve).
+/// A run's memory, resolved at its first model attempt with its offer and
+/// kept on the run once: every later attempt reads it from the run, never
+/// from the memory, so retries, restarts and approval pauses send the same
+/// bytes. `None` where it's kept: the run has no memory (its agent's is off,
+/// on a default the organization hasn't chosen, or of a kind this server
+/// doesn't serve).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FrozenMemory {
     /// The memory type the run's memory tools are of; their calls are
     /// decided on it as it is when they're made.
     pub memory_type_id: MemoryTypeId,
     /// The recall the run's first user message starts with, framed; `None`
-    /// when there's nothing to recall, and for a run started with memory
-    /// `off`.
+    /// when there's nothing to recall, for a run started with memory `off`,
+    /// and once the run is finished: it never sends again, and its recall
+    /// isn't kept past it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recall: Option<String>,
 }
@@ -400,8 +401,6 @@ pub struct ModelAttempt {
     pub request_digest: Sha256Digest,
     /// The tools offered, frozen.
     pub offer: Offer,
-    /// The run's memory, frozen with the offer.
-    pub memory: Option<FrozenMemory>,
     /// Unanswered because it was sent and no answer came in time.
     pub timed_out: bool,
 }
@@ -465,6 +464,9 @@ pub struct Snapshot {
     pub input: String,
     /// What the run does with its agent's memory, as it was started.
     pub memory: MemoryMode,
+    /// Its memory as its first model attempt froze it, kept on the run:
+    /// `None` before that attempt, and for a run without memory.
+    pub frozen_memory: Option<FrozenMemory>,
     /// In order: `turns[n].turn == n`.
     pub turns: Vec<CommittedTurn>,
     /// Every call, by turn and position.
