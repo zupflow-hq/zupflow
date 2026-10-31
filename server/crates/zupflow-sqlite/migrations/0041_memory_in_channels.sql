@@ -20,10 +20,11 @@
 --   back to 0 when a new run session starts; never more than 0 without
 --   the session's memory, nor 0 beside a recall.
 -- - `refresh_recall`: set when what the session recalls may hold a memory
---   forgotten since: a memory of its agent, in its workspace and type,
---   forgotten through the API or by a run (one of the session's own
---   included), in the forget's own transaction; and every session kept on a
---   type when the type is deleted. The same transaction clears the recall's
+--   forgotten since: a memory of its agent, in its workspace and type, that
+--   its audience is shown (the workspace's, or a `direct` session's own
+--   conversation's), forgotten through the API or by a run (one of the
+--   session's own included), in the forget's own transaction; and every
+--   session kept on a type when the type is deleted. The same transaction clears the recall's
 --   text and start on a session with no run under way, and a marked
 --   session's run clears them as it ends, so no forgotten text stays at
 --   rest. The session's next run clears the mark and reads the recall anew,

@@ -17,7 +17,8 @@
 //! forgets, its history kept, and so does deleting its type (it recalls
 //! nothing then, and its calls are refused); a run under way keeps the
 //! recall it started with, and ends as it would have. Only the sessions of
-//! the forget's agent, workspace and type read their recall anew, and none
+//! the forget's agent, workspace and type read their recall anew, and of
+//! those, for a direct conversation's note, only that conversation's; none
 //! keeps the recall's text once no run of it is under way.
 //! A `dm`'s or a `group_dm`'s session recalls, finds and saves its own
 //! conversation's notes beside the workspace's, and nothing else sees them;
@@ -707,6 +708,27 @@ async fn holds_recall(world: &World, run: &Value) -> bool {
     held == 1
 }
 
+/// Each of the organization's channel sessions with memory, by its
+/// conversation's external ID, and whether it's marked to read its recall
+/// anew.
+async fn session_marks(world: &World) -> Vec<(String, bool)> {
+    let (org, _) = world.setup.scope();
+    let pool = database(world).await;
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT c.external_id, s.refresh_recall FROM channel_sessions s JOIN channel_conversations c \
+         ON c.organization_id = s.organization_id AND c.workspace_id = s.workspace_id AND c.id = s.conversation_id \
+         WHERE s.organization_id = ? AND s.memory_type_id IS NOT NULL ORDER BY c.external_id, s.thread_key",
+    )
+    .bind(org.uuid())
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    rows.into_iter()
+        .map(|(conversation, marked)| (conversation, marked == 1))
+        .collect()
+}
+
 /// What each of the organization's channel sessions keeps of its recall,
 /// oldest first: the text, its weight in tokens, and whether its next run
 /// is marked to read it anew.
@@ -1013,6 +1035,32 @@ async fn keeps_a_direct_conversations_notes_to_it_and_a_channels_to_the_workspac
                 assert_eq!(found[which].contains(text), mine(text), "{name}: {place}: {found:?}");
             }
         }
+
+        // Forgetting Ana's dm's note marks only the sessions in Ana's dm,
+        // the only ones that recall it; forgetting a workspace note marks
+        // every session.
+        let note = |text: &str| {
+            body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|note| note["text"] == text)
+                .unwrap()
+                .clone()
+        };
+        forget(&world.setup, &note(ANAS)).await;
+        // A session for each save and each look: two in Ana's dm.
+        let marks = session_marks(&world).await;
+        assert_eq!(marks.len(), 9, "{name}: {marks:?}");
+        assert!(
+            marks
+                .iter()
+                .all(|(conversation, marked)| *marked == (conversation == "D0ANA")),
+            "{name}: {marks:?}"
+        );
+        forget(&world.setup, &note(WORKSPACES[1])).await;
+        let marks = session_marks(&world).await;
+        assert!(marks.iter().all(|(_, marked)| *marked), "{name}: {marks:?}");
     }
 }
 

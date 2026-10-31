@@ -441,8 +441,9 @@ pub struct Recent {
 /// once in its scope), keeps whatever a store searches with in step, and
 /// writes what `record` builds of the change ([`Record`]): its audit event,
 /// its webhook events with their deliveries, placed in the scope's
-/// workspace, the mark on the channel sessions a forget reaches
-/// ([`Recorded::refresh_recall`]), once however many notes it forgets, and
+/// workspace, the mark on the channel sessions a change reaches, by the
+/// changed notes' audience ([`Recorded::refresh_recall`]), once however many
+/// notes it forgets, and
 /// the run's call that made it ([`Recorded::call`]), once for each call,
 /// alone for an update to the text a note holds. A record that can't be
 /// written fails the change, a second of the same call fails it

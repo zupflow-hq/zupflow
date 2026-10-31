@@ -25,10 +25,10 @@
 //! the session keeps the recall its history begins with, once for each
 //! start: the first run from a start reads it with its first model attempt
 //! ([`keep_recall`]), and every other run from that start sends it again.
-//! A forget marks the sessions that may recall what it forgot
-//! ([`refresh_recall`]): the next run of each reads the recall anew, from
-//! the same start, and a marked session keeps no recall text once no run of
-//! it is under way, only its weight for the trim. When one of its runs read
+//! A forget marks the sessions that may recall what it forgot, by their
+//! audience ([`refresh_recall`]): the next run of each reads the recall
+//! anew, from the same start, and a marked session keeps no recall text
+//! once no run of it is under way, only its weight for the trim. When one of its runs read
 //! an app's tool result, the session keeps that as it ends, for what later
 //! runs save.
 
@@ -1918,21 +1918,29 @@ pub(crate) async fn keep_recall(
     Ok(kept.rows_affected() == 1)
 }
 
-/// Marks every channel session of `scope`'s agent, in its workspace, kept
-/// on its type, to read its recall anew at its next run, in the transaction
-/// of the forget that asks it ([`zupflow_core::memory::Recorded::refresh_recall`]):
-/// a session may recall what was forgotten until then. A session with no
-/// run under way keeps no recall text from then on, only its weight for the
+/// Marks the channel sessions of `scope`'s agent, in its workspace, kept on
+/// its type, that may recall a memory kept for `kept_for`, to read their
+/// recall anew at their next run, in the transaction of the change that
+/// asks it ([`zupflow_core::memory::Recorded::refresh_recall`]): a session
+/// may recall what changed until then. A workspace's memory (`None`) marks
+/// every one of them; a direct conversation's, only those whose audience is
+/// that conversation, the only ones that recall it. A session with no run
+/// under way keeps no recall text from then on, only its weight for the
 /// trim; one whose run is under way loses it as the run ends
 /// ([`run_ended`]). Only a run's start reads the mark
 /// ([`start_session_run`]), so a run under way keeps the recall it started
 /// with.
-pub(crate) async fn refresh_recall(connection: &mut SqliteConnection, scope: &MemoryScope) -> Result<(), sqlx::Error> {
+pub(crate) async fn refresh_recall(
+    connection: &mut SqliteConnection,
+    scope: &MemoryScope,
+    kept_for: Option<ChannelConversationId>,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE channel_sessions SET refresh_recall = 1, \
          recall = CASE WHEN active_run_id IS NULL THEN NULL ELSE recall END, \
          recall_start_run_id = CASE WHEN active_run_id IS NULL THEN NULL ELSE recall_start_run_id END \
          WHERE organization_id = ?1 AND workspace_id = ?2 AND memory_type_id = ?4 AND refresh_recall = 0 \
+         AND (?5 IS NULL OR (memory_audience = 'direct' AND conversation_id = ?5)) \
          AND agent_channel_id IN (SELECT id FROM agent_channels \
          WHERE organization_id = ?1 AND workspace_id = ?2 AND agent_id = ?3)",
     )
@@ -1940,6 +1948,7 @@ pub(crate) async fn refresh_recall(connection: &mut SqliteConnection, scope: &Me
     .bind(scope.workspace_id.uuid())
     .bind(scope.agent_id.uuid())
     .bind(scope.memory_type_id.uuid())
+    .bind(kept_for.map(|conversation| conversation.uuid()))
     .execute(&mut *connection)
     .await?;
     Ok(())

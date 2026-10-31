@@ -447,7 +447,8 @@ pub(crate) fn memory_event_in(
 
 /// What one change records with it ([`zupflow_core::memory::Record`]): its
 /// webhook event, and its audit event, by the caller; a forget marks the
-/// agent's channel sessions in the type, so none recalls the memory again.
+/// agent's channel sessions in the type that may recall the memory, so
+/// none recalls it again.
 fn recorded(access: &WorkspaceAccess, agent: &Agent, change: &MemoryChange) -> Recorded {
     let action = match change {
         MemoryChange::Saved(_) => AuditAction::MemorySaved,
@@ -833,7 +834,7 @@ async fn delete_memories(
     console_may_act(&access, "forget memories")?;
     let agent = find_agent(&state, &access, &agent).await?;
     // Each memory's event, and the mark on the agent's channel sessions in
-    // the type; each call's audit event counts them.
+    // the type that may recall it; each call's audit event counts them.
     let record = |change: &MemoryChange| Recorded {
         audit: None,
         events: vec![memory_event(&access, change)],

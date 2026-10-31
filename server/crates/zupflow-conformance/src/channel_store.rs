@@ -11,10 +11,12 @@
 //! session keeps the memory it began with, and one recall for each history
 //! start, read by the first run from it; other memory starts a new run
 //! session, and a run whose session went with its memory fails. Forgetting
-//! a note a session may recall (its agent's, in its workspace and type), or
-//! deleting its type, marks the session in the same transaction, and no
-//! other: its next run reads the recall anew, its history kept, while a run
-//! under way keeps the recall it started with. The recall a session keeps
+//! a note a session may recall (its agent's, in its workspace and type, and
+//! the workspace's or the session's own direct conversation's), or deleting
+//! its type, marks the session in the same transaction, and no other: its
+//! next run reads the recall anew, its history kept, while a run under way
+//! keeps the recall it started with, and no session keeps recall text once
+//! it's marked and no run of it is under way. The recall a session keeps
 //! counts in its history budget as no more than half of it, and a run
 //! carries the budget.
 //! A message is read back byte for byte as it was recorded. Every change is
@@ -145,6 +147,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     starts_one_run_per_session(&stores, &prepare).await;
     keeps_a_sessions_memory_and_one_recall_per_history_start(&stores, &prepare).await;
     reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(&stores, &prepare).await;
+    marks_only_the_sessions_whose_audience_may_recall_a_change(&stores, &prepare).await;
     counts_a_sessions_recall_in_its_history_budget(&stores, &prepare).await;
     counts_the_breaker_under_concurrency(&stores, &prepare).await;
     counts_runs_and_reads_each_message_once(&stores, &prepare).await;
@@ -1589,6 +1592,11 @@ async fn keeps_a_sessions_memory_and_one_recall_per_history_start(stores: &Store
 /// `base`, remembering in `memory_type_id` for the workspace, with the
 /// `notes` kind's tools.
 fn remembering(base: &SessionTemplate, memory_type_id: MemoryTypeId) -> SessionTemplate {
+    remembering_for(base, memory_type_id, Audience::Workspace)
+}
+
+/// [`remembering`], for `audience`.
+fn remembering_for(base: &SessionTemplate, memory_type_id: MemoryTypeId, audience: Audience) -> SessionTemplate {
     let tools = notes::tools(MemoryWrites::Allow)
         .iter()
         .map(|tool| memory_tool(memory_type_id, "Customer notes", notes::KIND, notes::NAME, tool))
@@ -1599,7 +1607,7 @@ fn remembering(base: &SessionTemplate, memory_type_id: MemoryTypeId) -> SessionT
         offer,
         memory: Some(SessionMemory {
             memory_type_id,
-            audience: Audience::Workspace,
+            audience,
         }),
         ..base.clone()
     }
@@ -1650,6 +1658,31 @@ struct Thread {
 
 /// The channel most threads are in.
 const SUPPORT: (&str, ConversationKind) = ("C0SUPPORT", ConversationKind::Channel);
+/// A `dm` and a `group_dm` with the agent.
+const DM: (&str, ConversationKind) = ("D0DANA", ConversationKind::Dm);
+const GROUP: (&str, ConversationKind) = ("G0SHIFT", ConversationKind::GroupDm);
+
+/// Makes `conversation` exist on the connection, by recording a message in
+/// a thread of its own that wakes no one: its ID.
+async fn opened(
+    stores: &Stores<'_>,
+    t: &Tenant,
+    ws: WorkspaceId,
+    connection: ChannelConnectionId,
+    (external_id, kind): (&str, ConversationKind),
+) -> ChannelConversationId {
+    let thread = format!("{external_id}.opened");
+    let mut new = message(&thread, external_id, "hello", 1_000);
+    new.conversation.kind = kind;
+    new.thread_key = thread;
+    stores
+        .channels
+        .record_message(t.organization_id, ws, connection, &new, now())
+        .await
+        .unwrap()
+        .message
+        .conversation_id
+}
 
 impl Thread {
     fn memory_type_id(&self) -> MemoryTypeId {
@@ -2002,6 +2035,122 @@ async fn reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(sto
         };
         assert_eq!(other.answered(stores, &t, 4, LATER).await, expected, "{}", other.thread);
     }
+}
+
+/// A change marks only the sessions that may recall the note it changed: a
+/// note kept for a direct conversation marks the sessions whose audience is
+/// that conversation, and no other; a workspace note marks every session of
+/// its agent, workspace and type, direct ones included; and an erasure
+/// chunk marks those any of its notes reach.
+async fn marks_only_the_sessions_whose_audience_may_recall_a_change(stores: &Stores<'_>, prepare: &Prepare) {
+    const RECALL: &str = "<memory>\n[k7m2qd] Prefers replies in Portuguese.\n</memory>";
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let customer = notes_type(stores, &t, "Customer notes").await;
+    let base = template();
+    let (_, _, connection) = installed(stores, &t, ws, t.agent).await;
+    let channel = stores.channels.list_agent_channels(org, ws, t.agent).await.unwrap()[0].id;
+    let dm = opened(stores, &t, ws, connection, DM).await;
+    let group = opened(stores, &t, ws, connection, GROUP).await;
+    let thread = |conversation, thread, audience| Thread {
+        ws,
+        connection,
+        channel,
+        conversation,
+        thread,
+        template: remembering_for(&base, customer, audience),
+    };
+    // The agent's sessions in a channel, a dm and a group_dm.
+    let sessions = [
+        thread(SUPPORT, "10.channel", Audience::Workspace),
+        thread(DM, "10.dm", Audience::Direct(dm)),
+        thread(GROUP, "10.group", Audience::Direct(group)),
+    ];
+    let scope = MemoryScope {
+        organization_id: org,
+        workspace_id: ws,
+        agent_id: t.agent,
+        memory_type_id: customer,
+    };
+    let member = Origin::Member { user_id: t.admin_user };
+    // Oldest first: the dm's, the group_dm's, the workspace's, then the
+    // dm's and the workspace's again.
+    let mut notes = Vec::new();
+    for (n, kept_for) in [Some(dm), Some(group), None, Some(dm), None].into_iter().enumerate() {
+        let short_ids = [ShortId::from_bits(u32::try_from(n).unwrap() + 1)];
+        let text = format!("Note {n}.");
+        let note = NewNote {
+            id: MemoryId::generate(),
+            text: &text,
+            channel_conversation_id: kept_for,
+            origin: &member,
+            short_ids: &short_ids,
+        };
+        let at = Timestamp::from_millis(1_700_000_000_000 + i64::try_from(n).unwrap());
+        notes.push(
+            stores
+                .notes
+                .insert(&scope, &note, 200, at, &record_nothing)
+                .await
+                .unwrap(),
+        );
+    }
+    let recorded = note_store::recorder(Environment::Sandbox);
+    for session in &sessions {
+        assert_eq!(
+            session.answered(stores, &t, 1, RECALL).await,
+            (SessionRecall::Unread, Some(RECALL.to_owned())),
+            "{}",
+            session.thread
+        );
+    }
+    let mut runs = 1;
+    // Which sessions the last change marked, by whether each, idle, still
+    // keeps its recall; then each runs once more, taking its mark.
+    let mut marked = async || {
+        runs += 1;
+        let mut marked = Vec::new();
+        for session in &sessions {
+            let kept = session.kept_recall(stores, &t).await;
+            let (recall, sent) = session.answered(stores, &t, runs, RECALL).await;
+            assert_eq!(
+                recall, kept,
+                "{}: the run starts as the session kept it",
+                session.thread
+            );
+            assert_eq!(sent.as_deref(), Some(RECALL), "{}", session.thread);
+            marked.push(kept == SessionRecall::Unread);
+        }
+        marked
+    };
+
+    // A dm's note: its sessions only.
+    stores
+        .notes
+        .delete(&scope, NoteRef::Id(notes[3].id), Reach::Everything, &recorded)
+        .await
+        .unwrap();
+    assert_eq!(marked().await, [false, true, false], "a dm's note");
+    // A workspace note: every one.
+    stores
+        .notes
+        .delete(&scope, NoteRef::Id(notes[4].id), Reach::Everything, &recorded)
+        .await
+        .unwrap();
+    assert_eq!(marked().await, [true, true, true], "a workspace note");
+    // A chunk of the dm's note and the group_dm's: both, not the channel's.
+    let counted = note_store::counter(scope);
+    let forgotten = stores.notes.delete_scope(&scope, 2, &recorded, &counted).await.unwrap();
+    assert_eq!(forgotten, 2);
+    assert_eq!(marked().await, [false, true, true], "a chunk of direct notes");
+    // A chunk with a workspace note: every one.
+    let forgotten = stores
+        .notes
+        .delete_scope(&scope, 10, &recorded, &counted)
+        .await
+        .unwrap();
+    assert_eq!(forgotten, 1);
+    assert_eq!(marked().await, [true, true, true], "a chunk with a workspace note");
 }
 
 /// The recall a session keeps counts in its history budget, beside the

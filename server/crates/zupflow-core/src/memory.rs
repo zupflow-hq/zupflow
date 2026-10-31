@@ -586,14 +586,17 @@ impl MemoryChange {
 pub struct Recorded {
     pub audit: Option<AuditEntry>,
     pub events: Vec<NewWebhookEvent>,
-    /// Marks every channel session of the scope's agent, in its workspace,
-    /// kept on its type, to read its recall anew at its next run, from the
-    /// same history start: set for a forget, so a memory forgotten isn't
-    /// recalled again, though a session otherwise keeps its recall until a
-    /// trim. A run under way keeps the recall it started with. A marked
-    /// session keeps no recall text once no run of it is under way: one
-    /// with none loses it with the change, one with a run as the run ends.
-    /// Marked once for a change that forgets many.
+    /// Marks the channel sessions of the scope's agent, in its workspace,
+    /// kept on its type, that may recall the memory, to read their recall
+    /// anew at their next run, from the same history start: every one for a
+    /// workspace's memory, and for one kept for a direct conversation, only
+    /// those whose audience is that conversation. Set for a forget, so a
+    /// memory forgotten isn't recalled again, though a session otherwise
+    /// keeps its recall until a trim. A run under way keeps the recall it
+    /// started with. A marked session keeps no recall text once no run of
+    /// it is under way: one with none loses it with the change, one with a
+    /// run as the run ends. Marked once for a change that forgets many, for
+    /// the sessions any of its memories reach.
     pub refresh_recall: bool,
     /// The run's call that made the change, kept with it: one for each call,
     /// ever. Another for the same call, in this transaction or an earlier
