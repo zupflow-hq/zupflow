@@ -14,7 +14,7 @@ Zupflow's backend is one deployable process: an HTTP API and its background work
 flowchart TB
     subgraph process["zupflow (one process)"]
         API["HTTP API<br/>axum router"]
-        W["Workers<br/>discovery · runs · webhooks · channels"]
+        W["Workers<br/>discovery · runs · webhooks · channels · memory"]
         S["AppState<br/>Arc&lt;dyn Trait&gt; for every resource"]
         API --> S
         W --> S
@@ -37,7 +37,7 @@ The server is a Cargo workspace under `server/crates`, in three layers.
 
 | Crate | What it holds |
 | --- | --- |
-| `zupflow-core` | The shared types (typed IDs, scopes, errors, environments) and every trait: the stores, `JobQueue`, `KeyService`, `Cache`, `ObjectStore`, `EventBus`, `Metrics`, `Identity`, `OutboundHttp`, `ModelProvider`, `ModelProviderCatalog`, `ApprovalPolicy`, `ChannelProvider`, `AppProvisioner`, `MessageHandler`, `Clock`. Also the pure parts of the domain, such as the run reducer and the approval floor. |
+| `zupflow-core` | The shared types (typed IDs, scopes, errors, environments) and every trait: the stores, `JobQueue`, `KeyService`, `Cache`, `ObjectStore`, `EventBus`, `Metrics`, `Identity`, `OutboundHttp`, `ModelProvider`, `ModelProviderCatalog`, `ApprovalPolicy`, `ChannelProvider`, `AppProvisioner`, `MessageHandler`, `MemoryProvider`, `Clock`. Also the pure parts of the domain, such as the run reducer and the approval floor, and the `notes` memory kind over its `NoteStore`. |
 | `zupflow-sqlite` | The basic database: every store and the job queue, in one SQLite file, with migrations. |
 | `zupflow-basic` | The other basic adapters: local keys, in-memory cache, local files, in-process events and metrics, local sign-in, `ConfiguredPolicy`, and the scripted model, providers and channel provisioner for local work. |
 | `zupflow-outbound` | `SafeHttpClient`, the only way the server calls anything: HTTPS only, public addresses only, no redirects, credentials injected last. |
@@ -67,6 +67,9 @@ let state = AppState {
     events: Arc::new(InProcessEventBus::default()),
     metrics: Arc::new(InProcessMetrics::default()),
     approvals: Arc::new(ConfiguredPolicy::new(policy_store)),
+    memory_providers: bootstrap::memory_providers(
+        Arc::new(SqliteNoteStore::new(database.clone())),
+    ),
     provider,                                    // HttpModelProvider, ScriptedModel or none
     outbound,                                    // SafeHttpClient
     // ...
@@ -88,6 +91,6 @@ bootstrap::serve(&config, state, guard, bootstrap::shutdown_signal()).await
 
 - [The request path](/self-hosting/architecture/request-path/): what happens between a request arriving and a response leaving.
 - [The run engine](/self-hosting/architecture/run-engine/): how runs move, survive crashes and keep the prompt cache stable.
-- [Background work](/self-hosting/architecture/background-work/): the job queue, the outbox, webhooks, discovery and channels.
+- [Background work](/self-hosting/architecture/background-work/): the job queue, the outbox, webhooks, discovery, channels and forgetting memories.
 - [Traits and adapters](/self-hosting/architecture/traits/): every trait, what it does and what implements it.
 - [Extending Zupflow](/self-hosting/architecture/extending/): writing and wiring your own adapter.

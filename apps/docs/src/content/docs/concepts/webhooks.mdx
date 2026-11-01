@@ -1,8 +1,8 @@
 ---
 title: Webhooks
-description: Signed deliveries for runs, approvals and connected accounts.
+description: Signed deliveries for runs, approvals, connected accounts and memory.
 sidebar:
-  order: 5
+  order: 6
 ---
 
 import { Aside } from "@astrojs/starlight/components";
@@ -22,15 +22,16 @@ Webhooks tell your backend when something happens that it should act on. Endpoin
 | `installation.disconnected` | An account was disconnected or deleted. |
 | `connect_session.completed`, `connect_session.failed` | A Connect session finished. |
 | `app.tools_changed` | A connected app changed a tool's definition: review it. |
+| `memory.saved`, `memory.updated`, `memory.forgotten` | An agent's memory was saved, its text changed, or it was forgotten. |
 | `webhook.test` | The Console's test button. Needs no subscription. |
 
-Events are **lean**: type, IDs, environment, the workspace's `external_id` and the object's status. Read the object through the API for the rest.
+Events are **lean**: type, IDs, environment, the workspace's `external_id` and the object's status. Read the object through the API for the rest. A memory's events name its agent, its type and its `origin`, never its text: read it with `getMemory` (see [Memory](/concepts/memory/#origin-and-webhooks)).
 
 ```json
 {
   "id": "evt_034HXHH2LZFzvoaSAhfGVC",
   "type": "run.completed",
-  "created_at": "2026-10-04T21:04:11Z",
+  "created_at": "2026-10-04T21:04:11.000Z",
   "environment": "production",
   "organization_id": "org_034CmCMi0M7gup3a0htwn5",
   "workspace": { "id": "ws_034FpGDIRLk8Of6gikx8DG", "external_id": "cus_1042" },

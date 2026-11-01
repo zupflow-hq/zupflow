@@ -131,6 +131,7 @@ function groupOf(path: string): string {
   const key = (scoped && segments[1]) || segments[0] || "";
   if (key === "apps" && segments.includes("tool-levels")) return "Tool policy";
   if (key === "agents" && segments.at(-1) === "runs") return "Runs";
+  if (key === "agents" && segments.at(-1) === "memories") return "Memory";
   return GROUPS[key] ?? key;
 }
 

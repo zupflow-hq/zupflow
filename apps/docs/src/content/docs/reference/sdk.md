@@ -42,6 +42,7 @@ await zupflow.runs.cancel(workspaceId, run.id);
 | `agents`, `grants` | Agents and what they may use. |
 | `runs`, `organizationRuns` | Runs, their events, approvals and cancelling. |
 | `modelConnections`, `models` | Model providers. |
+| `memoryKinds`, `memoryTypes`, `memories` | Memory kinds and types, the default type (changed from the Console only), and what agents remember. |
 | `apiKeys`, `webhooks`, `connectSettings` | Developer settings. |
 
 ## Idempotency
@@ -51,6 +52,8 @@ Every `POST` sends an `Idempotency-Key`. By default the SDK makes a fresh one pe
 ```ts
 await zupflow.runs.create(workspaceId, agentId, { input }, { idempotencyKey: job.id });
 ```
+
+A memory's save keeps only the memory's ID with its key, never its text: a retry answers the memory as it is now, or `409 idempotency_key_completed` once it's forgotten (or when its kind doesn't let people list memories).
 
 ## Errors
 

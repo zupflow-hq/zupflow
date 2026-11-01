@@ -6,7 +6,7 @@ const SAMPLE = JSON.stringify(
   {
     id: "evt_034HXHH2LZFzvoaSAhfGVC",
     type: "run.completed",
-    created_at: "2026-10-04T21:04:11Z",
+    created_at: "2026-10-04T21:04:11.000Z",
     environment: "sandbox",
     organization_id: "org_034CmCMi0M7gup3a0htwn5",
     workspace: { id: "ws_034FpGDIRLk8Of6gikx8DG", external_id: "acct_1042" },

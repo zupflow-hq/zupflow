@@ -1,6 +1,6 @@
 ---
 title: Background work
-description: The job queue, the outbox, webhook delivery, tool discovery and channels.
+description: The job queue, the outbox, webhook delivery, tool discovery, channels and forgetting memories.
 sidebar:
   order: 4
 ---
@@ -17,6 +17,7 @@ flowchart LR
     Q --> CP["Channel worker<br/>apps, tokens, upkeep"]
     Q --> CI["Inbound worker<br/>who answers a message"]
     Q --> CR["Reply worker<br/>post a run's answer"]
+    Q --> MF["Memory worker<br/>forget what went"]
     R -->|run events| Q
 ```
 
@@ -34,6 +35,8 @@ The basic queue lives in the same SQLite database as the stores, which is what l
 ## The outbox
 
 A change that causes an event never sends it directly. It queues an **announcement** job in its own transaction: the run store when it appends a run event a webhook names, the tool registry when a listing changes a tool. A rolled-back change announces nothing, and a committed one is never lost.
+
+A memory's change goes one step further: it records its `memory.*` event, with a delivery and its job for each subscribed endpoint, in the transaction that makes the change, as the announcer would. A memory is never changed without its events, nor its events written without the change.
 
 ```mermaid
 sequenceDiagram
@@ -104,3 +107,17 @@ sequenceDiagram
 - One run per message. A message in a thread continues the session's run, with its earlier runs as a cached prefix (see [the run engine](/self-hosting/architecture/run-engine/#keeping-the-prompt-cache-warm)).
 - The reply job posts a channel run's answer. A retried reply looks for a post whose answer was lost before posting again, so nothing is posted twice.
 - The channel worker makes each agent's app at the provider through the [`AppProvisioner`](/self-hosting/architecture/traits/#appprovisioner), rotates tokens, and keeps apps in step with their agents.
+
+## Forgetting memories
+
+Deleting an agent, a workspace or a memory type forgets the memories that went with it. A kind keeps its memories in the database that holds the server's records, so what the database drops with the deletion goes in the deletion's own transaction: that's where the `notes` kind's notes go.
+
+The same transaction queues a `forget_memories` job for each kind of the organization's memory types at that moment (only the type's own kind, for a type), naming what went by its IDs. The memory worker asks the kind to forget whatever else it keeps of it ([`MemoryProvider::forget_all`](/self-hosting/architecture/traits/#memoryprovider)) until it has.
+
+- Forgetting what's gone already is no failure, so a kind can be asked again safely.
+- A kind that fails is asked again after half a minute, then twice as long each time, up to an hour apart. After more than three days of failures, the job is given up on, with an error in the log.
+- The job of a kind this server doesn't serve is kept without using an attempt, so the kind forgets once a server serves it again. It's looked at again after five minutes, then twice as long each time, up to six hours apart, with a warning each time.
+
+A deletion sends no `memory.forgotten` for the memories that went with it. `deleteMemories` does: it forgets in the request, a hundred memories at a time, oldest first, each hundred in one transaction with a `memory.forgotten` for each memory and one audit event. Between two batches it waits as long as the last one took, up to half a second, so other writers waiting for the database get it first.
+
+A deleted type's memory calls waiting for approval are refused by a job of their own, on the run worker (see [the run engine](/self-hosting/architecture/run-engine/#when-a-type-is-deleted)).

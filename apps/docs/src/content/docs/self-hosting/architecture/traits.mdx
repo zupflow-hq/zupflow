@@ -5,7 +5,7 @@ sidebar:
   order: 5
 ---
 
-Every resource outside the server's own memory is a trait in `zupflow-core`. The server holds each one as an `Arc<dyn Trait>` in `AppState` and never names a concrete type outside `main.rs`. Each trait has a conformance suite in `zupflow-conformance` that every implementation must pass.
+Every resource outside the server process is a trait in `zupflow-core`. The server holds each one as an `Arc<dyn Trait>` in `AppState` and never names a concrete type outside `main.rs`. Each trait has a conformance suite in `zupflow-conformance` that every implementation must pass.
 
 ```mermaid
 flowchart TB
@@ -28,6 +28,10 @@ flowchart TB
         MC[ModelProviderCatalog]
         AP[ApprovalPolicy]
     end
+    subgraph memory["Memory"]
+        MK[MemoryProvider]
+        NS[NoteStore]
+    end
     subgraph channels["Channels"]
         CP[ChannelProvider]
         PR[AppProvisioner]
@@ -39,7 +43,7 @@ flowchart TB
 
 | Trait | What it does | Built in |
 | --- | --- | --- |
-| [The stores](#the-stores) | Every table: organizations, workspaces, API keys, apps, installations, tools, agents, policies, models, runs, webhooks, Connect, channels, audit, idempotency | SQLite (`zupflow-sqlite`) |
+| [The stores](#the-stores) | Every table: organizations, workspaces, API keys, apps, installations, tools, agents, policies, models, memory types, runs, webhooks, Connect, channels, audit, idempotency | SQLite (`zupflow-sqlite`) |
 | [`JobQueue`](#jobqueue) | Durable background work with leases | SQLite, in the same database |
 | [`KeyService`](#keyservice) | Wraps and unwraps the data keys that seal secrets | `LocalKeyService`, from `ZUPFLOW_SECRET_KEY` |
 | [`Cache`](#cache) | Short-lived values that can be rebuilt | `MemoryCache`, in process |
@@ -52,6 +56,8 @@ flowchart TB
 | [`ModelProvider`](#modelprovider) | Answers one turn of a run | `HttpModelProvider` (`zupflow-providers`), `ScriptedModel`, `NoModelProvider` |
 | [`ModelProviderCatalog`](#modelprovidercatalog) | Checks a provider key and lists its models | `HttpProviderCatalog`, `ScriptedProviders`, `NoProviders` |
 | [`ApprovalPolicy`](#approvalpolicy) | Allows, holds or denies each tool call | `ConfiguredPolicy` |
+| [`MemoryProvider`](#memoryprovider) | One memory kind: its settings, tools, recall and memories | `Notes`, the `notes` kind |
+| [`NoteStore`](#notestore) | Where the `notes` kind keeps and searches its notes | `SqliteNoteStore` (`zupflow-sqlite`) |
 | [`ChannelProvider`](#channelprovider) | Reads a chat provider's events and sends replies | `SlackChannelProvider` (`zupflow-slack`), `FakeChannelProvider` |
 | [`AppProvisioner`](#appprovisioner) | Creates each agent's app at a chat provider | `SlackProvisioner`, `ScriptedChannelProvisioner`, `NoChannelProvisioner` |
 | [`MessageHandler`](#messagehandler) | Decides which agents answer a new message | `MentionHandler` |
@@ -60,7 +66,7 @@ flowchart TB
 
 ### The stores
 
-`OrganizationStore`, `WorkspaceStore`, `ApiKeyStore`, `AppStore`, `InstallationStore`, `ToolRegistry`, `AgentStore`, `ToolPolicyStore`, `ModelStore`, `RunStore`, `WebhookStore`, `ConnectStore`, `ChannelStore`, `AuditStore` and `IdempotencyStore`. Each is a domain-shaped interface (`create_workspace`, `apply` a run transition, `record_event`), not a generic repository, so the rules live next to the data.
+`OrganizationStore`, `WorkspaceStore`, `ApiKeyStore`, `AppStore`, `InstallationStore`, `ToolRegistry`, `AgentStore`, `ToolPolicyStore`, `ModelStore`, `MemoryTypeStore`, `RunStore`, `WebhookStore`, `ConnectStore`, `ChannelStore`, `AuditStore` and `IdempotencyStore`. Each is a domain-shaped interface (`create_workspace`, `apply` a run transition, `record_event`), not a generic repository, so the rules live next to the data.
 
 What every store guarantees:
 
@@ -168,6 +174,52 @@ async fn decide(&self, call: &ToolCall) -> Decision;
 Decides each tool call: `Allow`, `RequireApproval { reason }` or `Deny { reason }`. The `ToolCall` carries the organization, workspace, agent, installation, app, tool, its registry status, how the grant names it, and the organization's level for it.
 
 Every implementation holds to **the floor** (`zupflow_core::policy::floor`): it never allows a tool the grant doesn't name, one the grant requires approval for, or one that changed and wasn't reviewed. A reason is written for the model and the person deciding: plain, and never empty. `ConfiguredPolicy` reads the organization's tool policy and levels from the `ToolPolicyStore`, and waits for approval when they can't be read.
+
+## Memory
+
+### MemoryProvider
+
+```rust
+fn kind(&self) -> &MemoryKind;
+fn describe(&self) -> KindDescription;
+fn check_settings(&self, settings: &Map<String, Value>) -> Result<Settings, SettingsRefusal>;
+fn tools(&self, settings: &Settings, writes: MemoryWrites) -> Vec<MemoryTool>;
+async fn recall(&self, scope: &MemoryScope, audience: &Audience, settings: &Settings) -> Result<Recall, MemoryError>;
+async fn recall_within(&self, scope: &MemoryScope, audience: &Audience, settings: &Settings, room: usize) -> Result<Recall, MemoryError> { … }
+async fn call(
+    &self,
+    scope: &MemoryScope,
+    context: &CallContext<'_>,
+    tool: &str,
+    arguments: &Map<String, Value>,
+    record: &Record<'_>,
+) -> Result<CallResult, MemoryError>;
+async fn made(&self, scope: &MemoryScope, run_id: RunId, tool_call_id: ToolCallId) -> Result<Option<MadeCall>, MemoryError>;
+fn text_rule(&self) -> String;
+fn limit(&self, settings: &Settings) -> u32;
+async fn forget_all(&self, what: &Forget) -> Result<(), MemoryError>;
+```
+
+One memory kind, served by its key (`notes`). It checks a memory type's settings, gives the tools a run offers for the type's `writes`, builds a run's recall, and makes each memory call once the server has decided it; `made` reads back what a run's call did. `recall_within`, a provided method, builds a channel run's recall in no more than `room` bytes, the room its session's history budget leaves it: by default the whole recall when it fits and none when it doesn't, while `notes` leaves its oldest notes out. `text_rule` and `limit` tell a person what the kind keeps when it refuses their text (`invalid_memory_text`), and how many memories it keeps when their save finds no room (`memory_full`). What people do through the API goes through `list`, `get`, `add`, `change`, `forget` and `forget_scope`, an erasure's next batch. `forget_all` forgets everything of an agent, a workspace, a type or an organization once it's deleted, and may be asked again.
+
+`MemoryProviders` holds the kinds a server serves, by key, as `ChannelProviders` holds channel providers: each type is served by its own kind, and nothing picks one kind for the whole server. A stored type whose kind isn't served answers through a stand-in, so its agents run without memory (`served: false`). `bootstrap::memory_providers` serves `notes` over the `NoteStore` it's given, and a deployment may add kinds of its own.
+
+What every kind guarantees, checked by the `memory_provider` suite:
+
+- **One scope.** Every method that reads or changes memories takes a `MemoryScope` (organization, workspace, agent and type) first, built only from the trust context. A memory in another scope, any one of the four changed, answers like one that doesn't exist.
+- **The same bytes.** The same settings give the same tool definitions, whatever the type's `writes`, which only decides which tools are offered. The same memories, settings and audience give the same recall, and a recall within a room takes no more than the room, the same bytes for the same room. Nothing to recall gives no block, and no line opens or closes the `<memory>` frame.
+- **Audiences.** A memory saved in a direct conversation is recalled and found only there, and a run there changes none of the workspace's.
+- **Records with the change.** A kind keeps its memories in the database that holds the server's records, so a change commits in one transaction with what the server records of it, such as its webhook events, and its audit event or the run's call that made it. In the same transaction, a forget or a person's change marks the channel sessions that may recall the memory (`refresh_recall`, checked by the `channel_store` suite). A refused change records nothing.
+- **Once.** A run's call that changed a memory is found again with `made`, and a second of the same call fails `AlreadyMade`, changing nothing. A kind that keeps no such record answers `Unsupported`, and its lapsed calls are settled unknown, as an app's are.
+- **Exact forgetting.** `forget_all` of an agent, a workspace, a type or an organization forgets exactly that.
+
+Like every adapter, a kind never logs a memory's text.
+
+### NoteStore
+
+Where the `notes` kind keeps its notes. What a note is, the settings, the tools, the recall's lines and what a search matches are written once, in `zupflow-core`, over this trait: `insert`, `update`, `delete`, `delete_scope`, `get`, `made`, `recent`, `search` and `list`, each taking the scope first, and `delete_all`, which takes what to forget (`&Forget`), as `forget_all` does. Each change is one transaction that holds what concurrent saves must keep (the note limit, a short ID once in its scope) and writes what the change records with it.
+
+`SqliteNoteStore` keeps notes in `memory_notes`, in the database that holds everything else. A search is FTS5's: every word, in any case and accent, ranked by BM25, then newest first. Each search indexes only the notes it may find, in a temporary table of its own connection, so its order depends on no other scope's notes and no index keeps a note that's gone. Another database implements the same trait and passes the `note_store` suite; how it ranks is its own.
 
 ## Channels
 
