@@ -704,8 +704,10 @@ only; one in a channel or a private channel is the workspace's, and never
 sees a direct conversation's. A conversation shared with another
 organization (`is_external`), of any kind, has no memory: its sessions get no
 memory tools and recall nothing, and once a conversation is shared, its next
-run starts a new run session without memory, a collected one too; only a run
-under way keeps what it started with. A session whose type has settings its
+run starts a new run session without memory, a collected one too, and so
+does one whose job read the conversation before it was shared: the store
+reads it in the transaction that starts each run. Only a run under way
+keeps what it started with. A session whose type has settings its
 kind refuses starts without memory as well, rather than leave the agent
 silent in every conversation; the server logs it
 (`channels.session_without_memory`), and a run of a session begun with

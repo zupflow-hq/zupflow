@@ -527,8 +527,9 @@ impl SessionTemplate {
     }
 
     /// This template with no memory: its memory tools left out of the
-    /// offer, everything else as it is. A session's own template, once its
-    /// conversation is shared with another organization.
+    /// offer, everything else as it is. What a run that starts in a
+    /// conversation shared with another organization is fixed with,
+    /// whatever template it was given ([`ChannelStore::dispatch`]).
     pub fn without_memory(&self) -> SessionTemplate {
         SessionTemplate {
             offer: self.offer.without_memory(),
@@ -1234,7 +1235,11 @@ pub trait ChannelStore: Send + Sync {
     /// for the model ([`SessionTemplate::same_for_the_model`]) starts a new
     /// run session with it, its history and its recall starting over.
     /// `None` starts a run with the session's own, and leaves the dispatch
-    /// waiting when it has none. Each run's snapshot carries the session's
+    /// waiting when it has none. A run that starts in a conversation shared
+    /// with another organization, here or as collected, has no memory
+    /// ([`SessionTemplate::without_memory`]), whatever template it's given:
+    /// whether the conversation is shared is read in the transaction that
+    /// starts the run. Each run's snapshot carries the session's
     /// memory and the recall it keeps for the run's history start, read by
     /// the first run from that start, and again by the first run after a
     /// forget marked the session, which takes the mark as it starts; a

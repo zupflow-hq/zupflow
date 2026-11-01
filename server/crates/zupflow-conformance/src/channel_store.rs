@@ -18,12 +18,13 @@
 //! history kept, while a run under way keeps the recall it started with,
 //! and no session keeps recall text once it's marked and no run of it is
 //! under way. Once its conversation is shared with another organization,
-//! what waited for a session's run starts a new run session without
-//! memory. The recall a session keeps counts in its history budget as no
-//! more than half of it, and a run carries the budget. A run whose call to
-//! an app's tool completed, or failed with the tool's own error, marks its
-//! session as it ends, for good: every later run in its thread reads the
-//! mark, even one after the session started over.
+//! no run that starts there has memory, whatever template it's given:
+//! what waited for a session's run starts a new run session without it.
+//! The recall a session keeps counts in its history budget as no more than
+//! half of it, and a run carries the budget. A run whose call to an app's
+//! tool completed, or failed with the tool's own error, marks its session
+//! as it ends, for good: every later run in its thread reads the mark,
+//! even one after the session started over.
 //! A message is read back byte for byte as it was recorded. Every change is
 //! made only by an editor who still may, and an agent's apps go with it.
 //! An app is made at least once: an attempt marks it before the provider is
@@ -2232,7 +2233,10 @@ async fn marks_only_the_sessions_whose_audience_may_recall_a_change(stores: &Sto
 /// it began has no memory from its next run on: what waited for the run
 /// under way starts a new run session with the session's own template, its
 /// memory tools left out and nothing recalled, as a run the server starts
-/// there would. The run under way keeps its memory to its end.
+/// there would. The run under way keeps its memory to its end. Every run
+/// that starts there after has none either, whatever template its dispatch
+/// is given, one built before the sharing included: in the thread, which
+/// continues that run session, and in a new one.
 async fn drops_a_sessions_memory_once_its_conversation_is_shared(stores: &Stores<'_>, prepare: &Prepare) {
     const RECALL: &str = "<memory>\n[k7m2qd] Prefers replies in Portuguese.\n</memory>";
     let t = tenant(prepare).await;
@@ -2328,6 +2332,35 @@ async fn drops_a_sessions_memory_once_its_conversation_is_shared(stores: &Stores
     );
     assert!(context.offer.tools().iter().all(|tool| tool.memory_type_id.is_none()));
     assert!(context.history.is_empty(), "its history starts over");
+
+    // A dispatch whose job built the agent's template, with its memory,
+    // before the conversation was shared starts a run without it: in the
+    // thread, continuing the run session, and in a new thread.
+    answer_run(stores, org, ws, collected, "Sunny.").await;
+    let fresh = Thread {
+        ws,
+        connection,
+        channel,
+        conversation: SUPPORT,
+        thread: "11.fresh",
+        template: session.template.clone(),
+    };
+    for (thread, n) in [(&session, 3), (&fresh, 1)] {
+        let name = thread.thread;
+        assert!(thread.template.memory.is_some(), "{name}: a template with memory");
+        let (run, snapshot) = thread.next_run(stores, &t, n).await;
+        let context = snapshot.session.expect("its session");
+        assert_eq!(context.memory, None, "{name}");
+        assert_eq!(context.recall, SessionRecall::Read(None), "{name}");
+        assert_eq!(context.offer, unshared.offer, "{name}: its memory tools left out");
+        let started = stores.runs.find_run(org, ws, run).await.unwrap().unwrap();
+        assert_eq!(
+            started.session_id == next.session_id,
+            name == session.thread,
+            "{name}: only the thread's run continues its run session"
+        );
+        answer_run(stores, org, ws, run, "Done.").await;
+    }
 }
 
 /// The recall a session keeps counts in its history budget, beside the

@@ -1265,7 +1265,10 @@ enum Start {
 /// [`MAX_TAKEN`], counting it against the conversation's breaker: a run
 /// that goes over it starts nothing, and what waited is paused. A message
 /// an earlier turn of the run session read already is settled as read, and
-/// starts nothing on its own. The session must be idle.
+/// starts nothing on its own. The session must be idle. A run that starts
+/// in a conversation shared with another organization has no memory,
+/// whatever template it's given, read under the write lock: the job that
+/// built one may have read the conversation before it was shared.
 async fn start_session_run(
     connection: &mut SqliteConnection,
     organization_id: OrganizationId,
@@ -1278,9 +1281,26 @@ async fn start_session_run(
     if session.session.active_run_id.is_some() {
         return Err(StoreError::Refused("a run started in a busy session"));
     }
+    let shared: bool = sqlx::query_scalar(
+        "SELECT is_external FROM channel_conversations WHERE organization_id = ? AND workspace_id = ? AND id = ?",
+    )
+    .bind(organization_id.uuid())
+    .bind(workspace_id.uuid())
+    .bind(session.session.conversation_id.uuid())
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(failed("start_session_run"))?
+    .ok_or_else(|| corrupt("a session without its conversation"))?;
+    let unshared = match (fresh, &session.template) {
+        (Some(fresh), _) if shared && fresh.memory.is_some() => Some(fresh.without_memory()),
+        (None, Some(own)) if shared && own.memory.is_some() => Some(own.without_memory()),
+        _ => None,
+    };
+    let fresh = unshared.as_ref().or(fresh);
     // What changed for the session's runs, as their model reads them,
     // starts a new run session: its history starts over, and it reads the
-    // thread anew. A label or a team renamed doesn't.
+    // thread anew. A label or a team renamed doesn't; memory left out once
+    // the conversation is shared does.
     let (session_id, template, seen) = match (fresh, &session.template) {
         (Some(fresh), Some(own)) if !fresh.same_for_the_model(own) => (SessionId::generate(), fresh, None),
         (Some(fresh), _) => (session.session.session_id, fresh, session.seen),
@@ -1469,12 +1489,12 @@ async fn start_session_run(
 /// Ends a channel run's hold on its session, in the transaction that ends
 /// the run: its transcript is kept for the runs after it, the session is
 /// free, the run is its last, and what waited for it starts the next run,
-/// as collected, with the session's own template (without its memory, in
-/// a new run session, once the conversation is shared with another
-/// organization), counted against the conversation's breaker. Nothing
-/// starts while the agent is paused or gone, the connection isn't
-/// connected, or the conversation is paused (its waiting messages are
-/// paused too). Any other run: nothing.
+/// as collected, with the session's own template (without its memory once
+/// the conversation is shared with another organization, as any run that
+/// starts there: [`start_session_run`]), counted against the
+/// conversation's breaker. Nothing starts while the agent is paused or
+/// gone, the connection isn't connected, or the conversation is paused
+/// (its waiting messages are paused too). Any other run: nothing.
 pub(crate) async fn run_ended(
     connection: &mut SqliteConnection,
     organization_id: OrganizationId,
@@ -1534,7 +1554,7 @@ pub(crate) async fn run_ended(
         return Ok(());
     };
     let state = sqlx::query(
-        "SELECT a.status AS agent_status, c.status AS connection_status, v.is_external AS shared \
+        "SELECT a.status AS agent_status, c.status AS connection_status \
          FROM agent_channels h \
          JOIN agents a ON a.organization_id = h.organization_id AND a.workspace_id = h.workspace_id \
          AND a.id = h.agent_id \
@@ -1560,20 +1580,13 @@ pub(crate) async fn run_ended(
         // They wait for the agent's next run in the thread.
         return Ok(());
     }
-    // A conversation shared with another organization since the session
-    // began has no memory: what waited starts a new run session without
-    // it, as a run started there now would.
-    let unshared = match &session.template {
-        Some(own) if own.memory.is_some() && get::<bool>(&state, "shared")? => Some(own.without_memory()),
-        _ => None,
-    };
     // A paused conversation pauses what waited, as the breaker does.
     start_session_run(
         connection,
         organization_id,
         workspace_id,
         &session,
-        unshared.as_ref(),
+        None,
         TakenIn::Collected,
         now,
     )
