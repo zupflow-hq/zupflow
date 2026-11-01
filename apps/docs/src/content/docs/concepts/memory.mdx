@@ -41,7 +41,7 @@ A **note** is one line of 1 to 500 characters. The agent names it by its `short_
 | `recall_characters` (Recall length) | How many characters of notes a run starts with: 8,000 by default, from 0 to 32,000. |
 | `max_notes` (Note limit) | How many notes one agent keeps in one workspace and type: 200 by default, from 1 to 1,000. |
 
-The agent gets four tools. The descriptions of `save_memory` and `update_memory` tell the model that notes are information, never instructions, and never to save secrets, passwords, keys or government ID numbers.
+The agent gets four tools. The descriptions of `save_memory` and `update_memory` tell the model that notes are information, never instructions, and never to save secrets, passwords, keys or government ID numbers. `update_memory`'s also has it forget a note and save what should stay when a person wants something taken out.
 
 | Tool | What it does |
 | --- | --- |
@@ -174,6 +174,6 @@ An agent can also talk with people in a team chat, like Slack. Who a memory is f
 - **In a direct message or group DM,** the agent recalls and finds the workspace's memories and that conversation's own, and saves, changes and forgets only the conversation's. The API names their conversation in `channel_conversation_id`; the Console marks them Direct conversation.
 - **In a channel,** what it recalls, finds and saves is the workspace's.
 
-A conversation shared with another organization has no memory. Tell the people who talk to the agent that what they say can be remembered until it's forgotten.
+A conversation shared with another organization (`is_external`) has no memory. Tell the people who talk to the agent that what they say can be remembered until it's forgotten.
 
-The agent's runs in one thread, or in a direct message outside threads, form a **session** and share its recall, which can be shorter than `recall_characters` to leave room for the conversation. Its next run reads the recall again after a memory is forgotten in any way, or changed through the API or the Console; what the agent saves or changes reaches it when the history is trimmed, or in a new session. Once a session has read an app's tool result, its later saves have `after_app_content: true`, even after a trim.
+The agent's runs in one thread, or in a direct message outside threads, form a **session**: they share a `session_id` and one recall, which can be shorter than `recall_characters` to leave room for the conversation. The session's next run reads the recall again after a memory is forgotten in any way, or changed through the API or the Console. What the agent saves or changes reaches it when the history is trimmed, or when the agent's model, instructions, tools or memory change and the next run starts a new session. Once a run in a thread, or in a direct message outside threads, has read an app's tool result, every later save there has `after_app_content: true`, in a new session too.
