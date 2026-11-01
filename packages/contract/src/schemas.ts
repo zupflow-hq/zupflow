@@ -1304,7 +1304,9 @@ export const MemoryOrigin = named(
       tool_call_id: idSchema("tool_call"),
       /**
        * The run had read an app's tool result before the call, so what it
-       * wrote may come from that content: a product can review it.
+       * wrote may come from that content: a product can review it. For a
+       * `channel` run, so had any earlier run in the same thread, even one
+       * before the session started over (under another `session_id`).
        */
       after_app_content: z.boolean(),
     }),
@@ -1685,7 +1687,11 @@ export const ChannelConversation = named(
     kind: ChannelConversationKind,
     /** Null for a DM, and when the provider doesn't say. */
     name: z.string().nullable(),
-    /** Shared with another organization (Slack Connect). */
+    /**
+     * Shared with another organization (Slack Connect). An agent's runs that
+     * start here once it's shared have no memory: no memory tools, and
+     * nothing recalled.
+     */
     is_external: z.boolean(),
     /** Whether the connection's identity is in it. */
     identity_is_member: z.boolean(),
@@ -2030,7 +2036,9 @@ export type RunUsage = z.infer<typeof RunUsage>;
 
 /**
  * Why a run failed, by stable `code`. Among them: `empty_output`, a channel
- * run that ended with no answer twice and never called `stay_silent`.
+ * run that ended with no answer twice and never called `stay_silent`; and
+ * `channel_session_removed`, a channel run that used its session's memory
+ * when the session went with its agent's channel, connection or app.
  */
 export const RunError = named("RunError", z.object({ code: z.string(), message: z.string() }));
 export type RunError = z.infer<typeof RunError>;

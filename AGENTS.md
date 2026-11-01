@@ -145,7 +145,30 @@ Read `README.md` first, then `DEVELOPMENT.md`.
   or sent. Memory tools are their kind's fixed definitions in the one list,
   by name; the recall is the first block of the first user message, never the
   system prompt, and never in `prompt_cache_key`; a turn marks at most four
-  breakpoints. `tests/prompt_cache.rs` holds every provider path to it.
+  breakpoints. `tests/prompt_cache.rs` holds every provider path to it. A
+  channel session holds it across its runs: its tools, instructions and
+  memory are fixed when it starts, and its recall is read once for each
+  history start and kept on the session, never again per run, but for the
+  next run after a forget, a person's change to a memory or a type's
+  deletion marked the session, in the change's own transaction. A change
+  marks only the sessions whose audience may recall the memory, and that
+  next run misses the cache once from the recall on, since the recall comes
+  before the whole history. The same transaction clears the recall text of
+  a marked session with no run under way, and a marked session's run
+  clears it as it ends: no forgotten text stays at rest. The recall counts
+  in the history budget as no more than half of it, and one read anew
+  takes no more than the room left, up to that half; a kept one heavier
+  than that half, kept under a larger budget, is read anew by the next run
+  as if marked. A conversation shared with another organization has no
+  memory, read in the transaction that starts each run, whatever template
+  the run was given, and neither does a session whose type's settings its
+  kind refuses; a run that has to read its recall while they're refused
+  recalls nothing, and marks its session so the next run reads it again
+  (`tests/channel_prompt_cache.rs`).
+  A save's `after_app_content` counts any earlier run in the same thread,
+  even one before the session started over: the mark a run leaves on its
+  session when it reads an app's result is never cleared, since a new run
+  session reads the thread again, the agent's earlier replies included.
 - Secrets are sealed with `keys::seal` under an `EncryptionContext` built from
   the trust context with the constructor for that kind of secret
   (`installation_credential`, `oauth_client_secret`, `webhook_signing_secret`),

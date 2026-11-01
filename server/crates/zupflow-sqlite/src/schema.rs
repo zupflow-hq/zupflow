@@ -1537,6 +1537,229 @@ async fn keeps_runs_their_calls_and_attempts_through_migration_0040() {
     }
 }
 
+#[tokio::test]
+async fn keeps_channel_sessions_through_migration_0041_without_memory() {
+    use std::str::FromStr;
+
+    use sqlx::sqlite::SqliteConnectOptions;
+    use uuid::Uuid;
+    use zupflow_core::ids::{OrganizationId, RunId, WorkspaceId};
+    use zupflow_core::runs::state::SessionRecall;
+    use zupflow_core::runs::store::RunStore;
+
+    let directory = TemporaryDirectory::new();
+    let earlier = directory.0.join("migrations");
+    std::fs::create_dir(&earlier).unwrap();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.as_str() < "0041" {
+            std::fs::copy(&path, earlier.join(&name)).unwrap();
+        }
+    }
+    let options = SqliteConnectOptions::from_str("sqlite:")
+        .unwrap()
+        .filename(directory.file())
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+    sqlx::migrate::Migrator::new(earlier.as_path())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    let blob = |n: u8| {
+        let mut id = [0u8; 16];
+        id[15] = n;
+        id.to_vec()
+    };
+    let uuid = |n: u8| Uuid::from_slice(&blob(n)).unwrap();
+    // An agent's channel in a conversation, with a session that never ran
+    // and one whose run ended, fixed with its model, tools and budget.
+    for statement in [
+        "INSERT INTO organizations (id, name, slug, created_at) VALUES (?1, 'Org', 'org', 0)",
+        "INSERT INTO workspaces (id, organization_id, environment, name, slug, created_at) \
+         VALUES (?2, ?1, 'sandbox', 'W', 'w', 0)",
+        "INSERT INTO model_connections (id, organization_id, environment, kind, label, key_version, key_last4, \
+         key_updated_at, status, created_at, updated_at) \
+         VALUES (?3, ?1, 'sandbox', 'openai', 'O', 1, 'abcd', 0, 'active', 0, 0)",
+        "INSERT INTO models (id, organization_id, environment, connection_id, provider_model_id, name, author, \
+         context_window, supports_tools, status, created_at, updated_at) \
+         VALUES (?4, ?1, 'sandbox', ?3, 'gpt-5', 'GPT-5', 'openai', NULL, 1, 'available', 0, 0)",
+        "INSERT INTO agents (id, organization_id, workspace_id, name, description, model_id, instructions, status, \
+         created_at, updated_at) \
+         VALUES (?5, ?1, ?2, 'Helper', 'Helps.', ?4, 'Be brief.', 'active', 0, 0)",
+        "INSERT INTO channel_apps (id, organization_id, workspace_id, manager_id, agent_id, provider, \
+         external_app_id, client_id, inbound_ref, status, provision_job_id, created_at, updated_at) \
+         VALUES (?6, ?1, ?2, randomblob(16), ?5, 'slack', 'A1', 'C1', 'abcdefghijklmnopqrstuvwxyz234567', \
+         'installed', randomblob(16), 0, 0)",
+        "INSERT INTO installation_short_ids (id, organization_id, workspace_id, short_id, created_at) \
+         VALUES (?7, ?1, ?2, 'bcdefg', 0)",
+        "INSERT INTO channel_connections (id, organization_id, workspace_id, provider, app_id, short_id, label, \
+         handler, status, team_id, identity_external_id, handle, granted_scopes, created_at, updated_at) \
+         VALUES (?8, ?1, ?2, 'slack', ?6, 'bcdefg', 'Team', 'mention', 'connected', 'T1', 'U1', 'helper', '[]', \
+         0, 0)",
+        "INSERT INTO agent_channels (id, organization_id, workspace_id, agent_id, connection_id, tools, \
+         approval_required, audience, audience_conversations, answers_dms, answers_mentions, thread_follow_up, \
+         agent_messages, max_agent_hops, mid_run, senders, sender_list, allow_automated, allow_external, \
+         reply_with_output, created_at, updated_at) \
+         VALUES (?9, ?1, ?2, ?5, ?8, '[]', '[]', 'origin', '[]', 1, 1, 'off', 'ignore', 1, 'steer', 'anyone', \
+         '[]', 0, 0, 0, 0, 0)",
+        "INSERT INTO channel_conversations (id, organization_id, workspace_id, connection_id, external_id, kind, \
+         is_external, identity_is_member, created_at, updated_at) \
+         VALUES (?10, ?1, ?2, ?8, 'C1', 'channel', 0, 1, 0, 0)",
+        "INSERT INTO runs (id, organization_id, workspace_id, agent_id, session_id, trigger, job_id, status, input, \
+         output, model, instructions, input_tokens, output_tokens, tool_calls, created_at, started_at, \
+         finished_at, execution_version, revision, continuation, model_id, model_connection_id, \
+         channel_session_id, channel_connection_id, channel_conversation_id, channel_thread_key, channel_reason, \
+         origin_message_id, session_sequence, history_start_run_id, offer, transcript, transcript_weight) \
+         VALUES (?11, ?1, ?2, ?5, ?12, 'channel', ?13, 'completed', '[U1] hi', 'Hello.', 'gpt-5', 'Be brief.', \
+         40, 7, 0, 1, 2, 3, 1, 4, '{\"v\":1,\"step\":\"done\"}', ?4, ?3, ?14, ?8, ?10, '1.0', 'mentioned', ?15, \
+         1, ?11, '[]', '[]', 0)",
+        "INSERT INTO channel_sessions (id, organization_id, workspace_id, agent_channel_id, conversation_id, \
+         thread_key, session_id, created_at, updated_at) \
+         VALUES (?16, ?1, ?2, ?9, ?10, '', ?17, 0, 0)",
+        "INSERT INTO channel_sessions (id, organization_id, workspace_id, agent_channel_id, conversation_id, \
+         thread_key, session_id, last_run_id, created_at, updated_at, model, model_id, model_connection_id, \
+         instructions, offer, history_budget, seen_message_id, seen_at, run_count) \
+         VALUES (?14, ?1, ?2, ?9, ?10, '1.0', ?12, ?11, 0, 3, 'gpt-5', ?4, ?3, 'Be brief.', '[]', 1000, ?15, 1, 1)",
+    ] {
+        let mut query = sqlx::query(statement);
+        for n in 1..=17 {
+            query = query.bind(blob(n));
+        }
+        query
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    let columns = column_names(&pool, "channel_sessions").await;
+    let before = rows_of(&pool, "channel_sessions", &columns).await;
+    pool.close().await;
+
+    let database = Database::open(&directory.file()).await.unwrap();
+    let pool = database.pool();
+    assert_eq!(
+        rows_of(pool, "channel_sessions", &columns).await,
+        before,
+        "every session as it was"
+    );
+    let added: Vec<String> = column_names(pool, "channel_sessions")
+        .await
+        .into_iter()
+        .filter(|column| !columns.contains(column))
+        .collect();
+    assert_eq!(
+        added,
+        [
+            "memory_type_id",
+            "memory_audience",
+            "recall_start_run_id",
+            "recall",
+            "recall_weight",
+            "refresh_recall",
+            "app_content_read"
+        ],
+        "the columns 0041 adds"
+    );
+    type Memory = (
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<Vec<u8>>,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+    );
+    let memory: Vec<Memory> = sqlx::query_as(
+        "SELECT memory_type_id, memory_audience, recall_start_run_id, recall, recall_weight, refresh_recall, \
+         app_content_read FROM channel_sessions ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        memory,
+        [(None, None, None, None, 0, 0, 0), (None, None, None, None, 0, 0, 0)],
+        "without memory, a recall or a mark"
+    );
+    let violations: i64 = sqlx::query_scalar("SELECT count(*) FROM pragma_foreign_key_check")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(violations, 0);
+
+    // The run that ended reads its session as one without memory.
+    let snapshot = crate::SqliteRunStore::new(database.clone())
+        .find_snapshot(
+            OrganizationId::from_uuid(uuid(1)),
+            WorkspaceId::from_uuid(uuid(2)),
+            RunId::from_uuid(uuid(11)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let session = snapshot.session.expect("a channel run's session");
+    assert_eq!(
+        (
+            session.memory,
+            session.recall,
+            session.app_content_read,
+            session.history_budget
+        ),
+        (None, SessionRecall::Read(None), false, 1000)
+    );
+
+    // What the header says holds: a session's memory needs its model and
+    // its audience, a recall its start and the session's memory, a recall
+    // its weight, and a weight or a mark the memory.
+    let change = |statement: &'static str, session: u8| async move {
+        sqlx::query(statement)
+            .bind(blob(18))
+            .bind(blob(11))
+            .bind(blob(session))
+            .execute(pool)
+            .await
+    };
+    for (refused, session) in [
+        (
+            "UPDATE channel_sessions SET memory_type_id = ?1, memory_audience = 'workspace' WHERE id = ?3",
+            16,
+        ),
+        ("UPDATE channel_sessions SET memory_type_id = ?1 WHERE id = ?3", 14),
+        ("UPDATE channel_sessions SET recall_start_run_id = ?2 WHERE id = ?3", 14),
+        ("UPDATE channel_sessions SET recall_weight = 1 WHERE id = ?3", 14),
+        ("UPDATE channel_sessions SET refresh_recall = 1 WHERE id = ?3", 14),
+        (
+            "UPDATE channel_sessions SET memory_type_id = ?1, memory_audience = 'workspace', \
+             recall = '<memory>\n[k7m2qd] Ships on Fridays.\n</memory>', recall_weight = 11 WHERE id = ?3",
+            14,
+        ),
+        (
+            "UPDATE channel_sessions SET memory_type_id = ?1, memory_audience = 'workspace', recall_start_run_id = ?2, \
+             recall = '<memory>\n[k7m2qd] Ships on Fridays.\n</memory>' WHERE id = ?3",
+            14,
+        ),
+        (
+            "UPDATE channel_sessions SET memory_type_id = ?1, memory_audience = 'workspace', recall_start_run_id = ?2, \
+             recall = '', recall_weight = 1 WHERE id = ?3",
+            14,
+        ),
+    ] {
+        assert!(change(refused, session).await.is_err(), "{refused}");
+    }
+    change(
+        "UPDATE channel_sessions SET memory_type_id = ?1, memory_audience = 'workspace', recall_start_run_id = ?2, \
+         recall = '<memory>\n[k7m2qd] Ships on Fridays.\n</memory>', recall_weight = 11, refresh_recall = 1, \
+         app_content_read = 1 WHERE id = ?3",
+        14,
+    )
+    .await
+    .unwrap();
+}
+
 /// Every column a session held before 0035, in order.
 const SESSIONS: &str = "SELECT id, organization_id, workspace_id, environment, catalog_app_id, workspace_app_id, \
      configuration_version, intent, installation_id, label, status, return_url, requested_scopes, reference_hash, \

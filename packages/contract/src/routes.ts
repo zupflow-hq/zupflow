@@ -973,7 +973,7 @@ export const routes: readonly Route[] = [
     method: "delete",
     path: "/v1/organizations/{org}/memory-types/{memory_type}",
     summary:
-      "Delete a memory type: owners and admins, from the Console. Refused while it is the organization's default or an agent's (`409 memory_type_in_use`, naming them). Its memories, in every workspace, are forgotten with it, without a `memory.forgotten` for each",
+      "Delete a memory type: owners and admins, from the Console. Refused while it is the organization's default or an agent's (`409 memory_type_in_use`, naming them). Its memories, in every workspace, are forgotten with it, without a `memory.forgotten` for each. A channel session kept on it keeps none of what it recalled: a run under way keeps the recall it started with, a run that then starts with the messages that waited for it recalls nothing, and the next message to find the session idle starts its next run under a new `session_id`, with the agent's memory as it is then",
     callers: consoleOnly,
     params: { ...org, memory_type: idSchema("memory_type") },
     response: noContent,
@@ -1045,7 +1045,7 @@ export const routes: readonly Route[] = [
     method: "patch",
     path: "/v1/workspaces/{ws}/agents/{agent}/memories/{memory}",
     summary:
-      "Change a memory's text: owners, admins and developers, from the Console in Sandbox only, and API keys. The memory is found first (`404`), then its kind's `manage` checked, then the text kept as for saving (`422 invalid_memory_text`, `fields.text`). Its origin becomes the caller; sends `memory.updated`, audited as `memory.updated`. The text it holds already changes nothing: not its `updated_at` or origin, and nothing is sent or audited",
+      "Change a memory's text: owners, admins and developers, from the Console in Sandbox only, and API keys. The memory is found first (`404`), then its kind's `manage` checked, then the text kept as for saving (`422 invalid_memory_text`, `fields.text`). Its origin becomes the caller; sends `memory.updated`, audited as `memory.updated`. Every channel session of the agent in the workspace, on the memory's type, that may recall it (for a memory saved in a direct conversation, that conversation's only) reads its recall anew at its next run, so none recalls the old text again; a run under way keeps the recall it started with. The text it holds already changes nothing: not its `updated_at` or origin, and nothing is sent, audited or read anew",
     callers: both,
     params: { ...ws, agent: idSchema("agent"), memory: idSchema("memory") },
     body: s.UpdateMemoryInput,
@@ -1056,7 +1056,7 @@ export const routes: readonly Route[] = [
     method: "delete",
     path: "/v1/workspaces/{ws}/agents/{agent}/memories/{memory}",
     summary:
-      "Forget a memory: owners, admins and developers, from the Console in Sandbox only, and API keys. The memory is found first (`404`), then its kind's `manage` checked. Sends `memory.forgotten`; audited as `memory.forgotten`",
+      "Forget a memory: owners, admins and developers, from the Console in Sandbox only, and API keys. The memory is found first (`404`), then its kind's `manage` checked. Sends `memory.forgotten`; audited as `memory.forgotten`. Every channel session of the agent in the workspace, on the memory's type, that may recall it (for a memory saved in a direct conversation, that conversation's only) reads its recall anew at its next run, so none recalls the memory again; a run under way keeps the recall it started with",
     callers: both,
     params: { ...ws, agent: idSchema("agent"), memory: idSchema("memory") },
     response: noContent,
@@ -1066,7 +1066,7 @@ export const routes: readonly Route[] = [
     method: "delete",
     path: "/v1/workspaces/{ws}/agents/{agent}/memories",
     summary:
-      "Forget everything the agent keeps in the workspace, in every memory type of a kind this server serves, whatever the kind's `manage` says: an erasure, for owners, admins and developers, from the Console in Sandbox only, and API keys. Each type's memories go a hundred at a time, oldest first: each hundred sends a `memory.forgotten` for each memory and is audited once, as `agent.memory_forgotten` naming the type and how many. An erasure that fails partway has still forgotten the hundreds before; asking again forgets the rest",
+      "Forget everything the agent keeps in the workspace, in every memory type of a kind this server serves, whatever the kind's `manage` says: an erasure, for owners, admins and developers, from the Console in Sandbox only, and API keys. Each type's memories go a hundred at a time, oldest first: each hundred sends a `memory.forgotten` for each memory and is audited once, as `agent.memory_forgotten` naming the type and how many. An erasure that fails partway has still forgotten the hundreds before; asking again forgets the rest. As each hundred goes, every channel session of the agent in the workspace, on that type, that may recall one of them (for memories saved in a direct conversation, that conversation's only) reads its recall anew at its next run; a run under way keeps the recall it started with",
     callers: both,
     params: { ...ws, agent: idSchema("agent") },
     response: noContent,

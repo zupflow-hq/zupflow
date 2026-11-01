@@ -187,7 +187,9 @@ pub trait MemoryTypeStore: Send + Sync {
     /// it's the default or an agent names it. Its memories kept in the same
     /// database go with it, in the same transaction, which queues the job
     /// that has its kind forget them wherever it keeps them
-    /// ([`super::Forget::job`]).
+    /// ([`super::Forget::job`]), and marks every channel session kept on it,
+    /// in any workspace, to read its recall anew at its next run, as a
+    /// forget does ([`super::Recorded::refresh_recall`]): nothing, now.
     async fn delete_type(
         &self,
         organization_id: OrganizationId,

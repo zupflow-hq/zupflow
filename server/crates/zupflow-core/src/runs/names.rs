@@ -432,6 +432,19 @@ impl Offer {
         let offer = Self::new(tools).unwrap_or_default();
         (offer, left_out)
     }
+
+    /// This offer without its memory tools, the others as they are, in
+    /// their order.
+    pub fn without_memory(&self) -> Self {
+        Self {
+            tools: self
+                .tools
+                .iter()
+                .filter(|tool| tool.memory_type_id.is_none())
+                .cloned()
+                .collect(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -792,5 +805,23 @@ mod tests {
             cache_key: None,
         };
         assert_eq!(crate::models::validate_turn(&turn), Ok(()));
+    }
+
+    #[test]
+    fn leaves_out_only_its_memory_tools() {
+        let built = build_offer([
+            candidate(1, "taskboard", "k7m2qd", "Work", "create_task"),
+            candidate(1, "taskboard", "k7m2qd", "Work", "list_tasks"),
+        ]);
+        let memory_type = crate::ids::MemoryTypeId::from_uuid(Uuid::from_u128(9));
+        let memory_tools = crate::memory::notes::tools(crate::memory::MemoryWrites::Allow)
+            .iter()
+            .map(|tool| memory_tool(memory_type, "Notes", "notes", "Notes", tool))
+            .collect();
+        let (joined, left_out) = built.offer.clone().with(memory_tools);
+        assert!(left_out.is_empty());
+        assert!(joined.tools().len() > built.offer.tools().len());
+        assert_eq!(joined.without_memory(), built.offer);
+        assert_eq!(built.offer.without_memory(), built.offer, "nothing to leave out");
     }
 }

@@ -3488,6 +3488,10 @@ fn in_session() -> Snapshot {
             },
         ],
         offer: offer(),
+        memory: None,
+        recall: crate::runs::state::SessionRecall::Read(None),
+        history_budget: 1_000,
+        app_content_read: false,
         steers: Vec::new(),
     });
     snapshot
@@ -4031,6 +4035,7 @@ fn recalled(recall: Option<&str>) -> FrozenMemory {
     FrozenMemory {
         memory_type_id: memory_type(),
         recall: recall.map(str::to_owned),
+        read_again: false,
     }
 }
 
@@ -4250,6 +4255,7 @@ fn sends_a_memory_call_in_the_runs_type_saying_whether_an_apps_result_came_first
             call_digest: call.call_digest.expect("digested"),
             definition_sha256: save.definition_sha256,
             after_app_content: true,
+            audience: crate::memory::Audience::Workspace,
         }
     );
     assert!(matches!(
@@ -4392,4 +4398,215 @@ fn fails_a_refused_memory_call_with_its_reasons_own_code() {
         };
         assert_eq!(refusal_code(&decision), code, "{rule}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// A channel session's memory
+
+/// A run in a session that remembers in [`memory_type`] for `audience`: its
+/// tools joined to the session's offer, and `recall` as the session keeps
+/// it for the run's history start.
+fn remembering_session(audience: crate::memory::Audience, recall: SessionRecall) -> Snapshot {
+    let mut snapshot = in_session();
+    let session = snapshot.session.as_mut().expect("a session");
+    session.offer = remembering();
+    session.memory = Some(crate::runs::state::SessionMemory {
+        memory_type_id: memory_type(),
+        audience,
+    });
+    session.recall = recall;
+    snapshot
+}
+
+#[test]
+fn a_channel_run_sends_its_sessions_recall_read_once_for_its_history_start() {
+    // The session kept a recall for the run's start: every run from it
+    // sends those bytes, and nothing is read.
+    let kept = remembering_session(
+        crate::memory::Audience::Workspace,
+        SessionRecall::Read(Some(RECALL.to_owned())),
+    );
+    let facts = Facts {
+        offer: None,
+        memory: Some(recalled(Some("<memory>\n- Read again.\n</memory>"))),
+        ..claimed()
+    };
+    let plan = planned(&kept, &facts);
+    let (prepared, request) = prepared_with(&plan);
+    assert_eq!(prepared.offer, remembering(), "the session's tools");
+    assert_eq!(prepared.memory, Some(recalled(Some(RECALL))));
+    assert_eq!(
+        request.memory.as_deref(),
+        Some(RECALL),
+        "the session's recall, not a fresh one"
+    );
+    assert_eq!(
+        request.messages[0],
+        user("[Ana] hello"),
+        "first in the history: the provider puts the recall before it"
+    );
+    assert_eq!(frozen_memory(&kept), Some(recalled(Some(RECALL))));
+
+    // The first run from a new start reads it, from the session's type.
+    let unread = remembering_session(crate::memory::Audience::Workspace, SessionRecall::Unread);
+    assert_eq!(frozen_memory(&unread), None, "read with the first attempt");
+    let without = Facts {
+        offer: None,
+        ..claimed()
+    };
+    assert_eq!(advance(&unread, &without), Err(AdvanceError::MissingFact("memory")));
+    let read = Facts {
+        offer: None,
+        memory: Some(recalled(Some(RECALL))),
+        ..claimed()
+    };
+    let plan = planned(&unread, &read);
+    let (prepared, request) = prepared_with(&plan);
+    assert_eq!(prepared.memory, Some(recalled(Some(RECALL))), "kept with the attempt");
+    assert_eq!(request.memory.as_deref(), Some(RECALL));
+    let elsewhere = Facts {
+        offer: None,
+        memory: Some(FrozenMemory {
+            memory_type_id: MemoryTypeId::from_uuid(Uuid::from_u128(41)),
+            recall: Some(RECALL.to_owned()),
+            read_again: false,
+        }),
+        ..claimed()
+    };
+    assert_eq!(
+        advance(&unread, &elsewhere),
+        Err(AdvanceError::InvalidFact(
+            "a recall read from another type than the session's"
+        ))
+    );
+    // Read while the session's type couldn't give one: none is sent, and
+    // the attempt asks the store to keep that for this run alone.
+    let none = FrozenMemory {
+        read_again: true,
+        ..recalled(None)
+    };
+    let gave_none = Facts {
+        offer: None,
+        memory: Some(none.clone()),
+        ..claimed()
+    };
+    let plan = planned(&unread, &gave_none);
+    let (prepared, request) = prepared_with(&plan);
+    assert_eq!((prepared.memory.clone(), request.memory.clone()), (Some(none), None));
+
+    // Nothing to recall, and an empty recall, send none: the type stays.
+    for recall in [None, Some(String::new())] {
+        let nothing = remembering_session(crate::memory::Audience::Workspace, SessionRecall::Read(recall));
+        let plan = planned(&nothing, &without);
+        let (prepared, request) = prepared_with(&plan);
+        assert_eq!(
+            (prepared.memory.clone(), request.memory.clone()),
+            (Some(recalled(None)), None)
+        );
+    }
+
+    // A session without memory sends none, whatever a driver read.
+    let plan = planned(&in_session(), &read);
+    let (prepared, request) = prepared_with(&plan);
+    assert_eq!((prepared.memory.as_ref(), request.memory.as_ref()), (None, None));
+}
+
+#[test]
+fn fails_a_channel_run_whose_session_went_with_its_memory() {
+    let gone = |frozen: bool, offered: bool, recall: SessionRecall, memory: bool| {
+        let mut snapshot = remembering_session(crate::memory::Audience::Workspace, recall);
+        let session = snapshot.session.as_mut().expect("a session");
+        if !offered {
+            session.offer = offer();
+        }
+        if !memory {
+            session.memory = None;
+        }
+        if frozen {
+            snapshot.frozen_memory = Some(recalled(None));
+        }
+        snapshot
+    };
+    let facts = Facts {
+        offer: None,
+        memory: Some(recalled(Some(RECALL))),
+        ..claimed()
+    };
+    for (snapshot, why) in [
+        (
+            gone(true, true, SessionRecall::Read(None), false),
+            "its first attempt froze the session's memory",
+        ),
+        (
+            gone(false, true, SessionRecall::Read(None), false),
+            "it offers the session's memory tools",
+        ),
+        (
+            gone(true, false, SessionRecall::Read(None), false),
+            "every memory tool left out, the type frozen",
+        ),
+        (
+            gone(true, true, SessionRecall::Unread, true),
+            "the recall it sent isn't the session's any more",
+        ),
+    ] {
+        let plan = planned(&snapshot, &facts);
+        assert_eq!(failure_code(&plan), SESSION_REMOVED, "{why}");
+        assert_eq!(guards(&plan), releases(1), "{why}");
+    }
+    let mut other = gone(true, true, SessionRecall::Read(None), true);
+    other.session.as_mut().expect("a session").memory = Some(crate::runs::state::SessionMemory {
+        memory_type_id: MemoryTypeId::from_uuid(Uuid::from_u128(41)),
+        audience: crate::memory::Audience::Workspace,
+    });
+    assert_eq!(failure_code(&planned(&other, &facts)), SESSION_REMOVED, "another type");
+    // A session without memory goes on without it, gone or not.
+    let plain = gone(false, false, SessionRecall::Read(None), false);
+    assert!(matches!(
+        operation(&planned(&plain, &facts)),
+        Operation::PrepareModel(_)
+    ));
+    // A finished run, or one waiting for a person, has nothing to fail.
+    let mut waiting = gone(true, true, SessionRecall::Read(None), false);
+    waiting.control.status = RunStatus::WaitingForApproval;
+    waiting.control.continuation = Continuation::AwaitApproval { call_id: call_id(1) };
+    assert_eq!(advance(&waiting, &facts), Ok(Plan::Idle(Idle::AwaitingApproval)));
+}
+
+#[test]
+fn sends_a_memory_call_for_its_sessions_audience_after_the_sessions_app_results() {
+    let conversation = origin().conversation_id;
+    let mut call = memory_record(2, 0, "save_memory", CallState::Allowed);
+    call.decision = Some(allow());
+    let direct = crate::memory::Audience::Direct(conversation);
+    for (audience, read_before, expected) in [
+        (direct, false, false),
+        (direct, true, true),
+        (crate::memory::Audience::Workspace, true, true),
+    ] {
+        let mut snapshot = remembering_session(audience, SessionRecall::Read(Some(RECALL.to_owned())));
+        snapshot.control.continuation = Continuation::NeedCall { turn: 0, position: 0 };
+        snapshot.turns.push(CommittedTurn { turn: 0, text: None });
+        snapshot.calls = vec![call.clone()];
+        snapshot.frozen_memory = Some(recalled(None));
+        snapshot.session.as_mut().expect("a session").app_content_read = read_before;
+        assert_eq!(memory_audience(&snapshot), Some(audience));
+        assert_eq!(after_app_content(&snapshot, &call), expected, "{audience:?}");
+        let facts = Facts {
+            send_check: Some(check(&call, allow())),
+            invocation_id: Some(invocation(1)),
+            ..claimed()
+        };
+        let plan = planned(&snapshot, &facts);
+        let Io::SendMemory(send) = plan.io() else {
+            panic!("a memory call, got {plan:?}");
+        };
+        assert_eq!((send.audience, send.after_app_content), (audience, expected));
+    }
+    // An API or Console run's memory is the workspace's.
+    assert_eq!(
+        memory_audience(&running(Continuation::NeedModel { turn: 0 })),
+        Some(crate::memory::Audience::Workspace)
+    );
+    assert_eq!(memory_audience(&in_session()), None, "a session without memory");
 }

@@ -2163,6 +2163,7 @@ fn frozen(memory_type_id: MemoryTypeId, recall: Option<&str>) -> FrozenMemory {
     FrozenMemory {
         memory_type_id,
         recall: recall.map(str::to_owned),
+        read_again: false,
     }
 }
 

@@ -20,6 +20,7 @@ use crate::ids::{
     ApiKeyId, ChannelConnectionId, ChannelConversationId, InstallationId, MemoryTypeId, ModelConnectionId, ModelId,
     OrganizationId, RunId, ToolCallId, WorkspaceId,
 };
+use crate::memory::Audience;
 use crate::models::{Message, TokenUsage};
 use crate::policy::{Decision, Verdict};
 use crate::runs::digest::Sha256Digest;
@@ -378,6 +379,11 @@ pub enum ModelAttemptState {
 /// bytes. `None` where it's kept: the run has no memory (its agent's is off,
 /// on a default the organization hasn't chosen, or of a kind this server
 /// doesn't serve).
+///
+/// A channel run's memory is its session's ([`SessionContext::memory`]):
+/// the session keeps the recall, once for every run from its history's
+/// start, and the run keeps the type and the recall's digest, so here its
+/// `recall` is `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FrozenMemory {
     /// The memory type the run's memory tools are of; their calls are
@@ -389,6 +395,40 @@ pub struct FrozenMemory {
     /// isn't kept past it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recall: Option<String>,
+    /// A channel run's recall, read while its session's type couldn't give
+    /// one (its kind isn't served, or refuses the type's settings now): the
+    /// run recalls nothing, and its session keeps that for the run alone,
+    /// so the session's next run reads the recall again, from the same
+    /// history start, rather than send nothing until its next trim.
+    /// `false` for any other.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub read_again: bool,
+}
+
+/// A channel session's memory, fixed with the session's tools when it
+/// began: the type its memory tools are of, and who its runs recall and
+/// save for (a `dm`'s or a `group_dm`'s conversation, beside the
+/// workspace; else the workspace). Every run of the session uses it, and
+/// only a new session takes another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionMemory {
+    pub memory_type_id: MemoryTypeId,
+    pub audience: Audience,
+}
+
+/// What a channel session's history, from a run's start, begins with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRecall {
+    /// Not read for the run's history start yet, or not since a forget, or
+    /// a run that read it while the session's type couldn't give one
+    /// ([`FrozenMemory::read_again`]), marked the session: the run reads it
+    /// with its first model attempt, from the session's own type for its
+    /// audience ([`super::reducer::Facts::memory`]), and the session keeps
+    /// it for every run from the same start, until the next mark.
+    Unread,
+    /// Read for the run's history start, framed: `None` when there was
+    /// nothing to recall, and for a session without memory.
+    Read(Option<String>),
 }
 
 /// One request to the model, as committed by `PrepareModel`.
@@ -431,8 +471,8 @@ pub struct ChannelOrigin {
 }
 
 /// What a channel run continues and keeps: its session's conversation so
-/// far, the tools fixed for the session, and the thread messages that
-/// joined it.
+/// far, the tools and the memory fixed for the session, what the session
+/// recalls, and the thread messages that joined it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionContext {
     /// Where the run was started.
@@ -442,6 +482,22 @@ pub struct SessionContext {
     pub history: Vec<Message>,
     /// The tools every run in the session offers, in its order.
     pub offer: Offer,
+    /// The session's memory: `None` for a session without memory, and once
+    /// the session is gone (removed with its agent's channel), with its
+    /// memory.
+    pub memory: Option<SessionMemory>,
+    /// What the session's history, from the run's start, begins with.
+    pub recall: SessionRecall,
+    /// The session's history budget in tokens, as its latest run started
+    /// with it: what the history, the run's input and the recall may take
+    /// together, the recall no more than half ([`super::history::recall_room`]).
+    /// `0` once the session is gone, or moved on to another run session.
+    pub history_budget: u64,
+    /// Whether any earlier run in the same thread read an app's tool result,
+    /// even one before the session started over: set as such a run ends,
+    /// and kept from then on, through a trim, a new run session and the
+    /// retention sweep ([`super::reducer::after_app_content`]).
+    pub app_content_read: bool,
     /// In order of turn.
     pub steers: Vec<SteeredTurn>,
 }
@@ -465,7 +521,8 @@ pub struct Snapshot {
     /// What the run does with its agent's memory, as it was started.
     pub memory: MemoryMode,
     /// Its memory as its first model attempt froze it, kept on the run:
-    /// `None` before that attempt, and for a run without memory.
+    /// `None` before that attempt, and for a run without memory. A channel
+    /// run's recall is its session's ([`SessionContext::recall`]).
     pub frozen_memory: Option<FrozenMemory>,
     /// In order: `turns[n].turn == n`.
     pub turns: Vec<CommittedTurn>,

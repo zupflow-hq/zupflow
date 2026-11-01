@@ -21,6 +21,7 @@
 //! | `AwaitApproval` | idle: waiting for a person |
 //! | any other, no claim held | `Claim` under a fresh claimant, or idle while another lease or a send claim is live |
 //! | a call failed for a reconnect | `Finish` failed |
+//! | a channel run whose session's memory is gone with the session | `Finish` failed |
 //! | `NeedModel` | `PrepareModel` (offering the tools frozen at the run's first attempt, [`frozen_offer`]) + call the model; `Finish` past the turn limit; `Yield` past the step budget |
 //! | `AwaitModel` with its answer | `CommitTurn`; `Finish` failed; `Yield` when the model is unavailable, `Finish` failed on the job's last attempt, or on a turn's second timeout |
 //! | `AwaitModel` without one | `PrepareModel` of a new attempt, the old one abandoned |
@@ -37,6 +38,7 @@ use crate::channels::tools::{self, SILENT_WITHOUT_REASON, STAYED_SILENT};
 use crate::ids::{
     ApiKeyId, ChannelConnectionId, InstallationId, MemoryTypeId, OrganizationId, RunId, ToolCallId, WorkspaceId,
 };
+use crate::memory::Audience;
 use crate::model_store::RouteState;
 use crate::models::{Completion, Message, ModelToolCall, Reply, ToolSpec, Turn, validate_completion, validate_turn};
 use crate::runs::digest::{Sha256Digest, call_digest, channel_call_digest, digest_json, memory_call_digest};
@@ -44,7 +46,7 @@ use crate::runs::history::{NUDGE, blank};
 use crate::runs::names::{Offer, OfferedTool, ToolHost};
 use crate::runs::state::{
     BoundTarget, CallAttempt, CallDecision, CallRecord, CallVerdict, ClaimantId, Continuation, EXECUTION_VERSION,
-    FrozenMemory, InvocationId, ModelAttemptState, RequestId, Snapshot, SteeredTurn, Usage, supports,
+    FrozenMemory, InvocationId, ModelAttemptState, RequestId, SessionRecall, Snapshot, SteeredTurn, Usage, supports,
 };
 use crate::runs::transition::{
     Admit, Authorization, AuthorizeCall, Cancel, Claim, Closing, CommitTurn, FailAbandoned, Finish, Guards,
@@ -162,6 +164,17 @@ pub const MEMORY_SETTINGS_INVALID_MESSAGE: &str =
 /// The failure code of a run whose model answered with nothing twice, and
 /// never called `stay_silent`.
 pub const EMPTY_OUTPUT: &str = "empty_output";
+
+/// The failure code of a channel run whose session was removed (with its
+/// agent's channel, connection or app) while the run used the session's
+/// memory: the session kept the recall the run's prompt starts with, and
+/// who its memory is for, so the run can't go on as it began. Nothing it
+/// answered would be posted either.
+pub const SESSION_REMOVED: &str = "channel_session_removed";
+
+/// What a run that failed with [`SESSION_REMOVED`] says.
+pub const SESSION_REMOVED_MESSAGE: &str = "The agent's channel was removed while the run was under way, and the memory its conversation began with went \
+     with it.";
 
 /// What the model reads back for `stay_silent` in a run that posted, or
 /// is about to.
@@ -401,7 +414,11 @@ pub struct Facts {
     /// The run's memory, resolved with [`Facts::offer`] for its first model
     /// attempt and read only with it: `None` without memory. Every later
     /// attempt sends the memory the first kept on the run
-    /// ([`frozen_memory`]).
+    /// ([`frozen_memory`]). A channel run's is its session's: the first run
+    /// from the session's history start, or after a forget marked the
+    /// session, reads its recall, from the session's type for its audience
+    /// ([`SessionRecall::Unread`]), and every other run sends the one the
+    /// session kept.
     pub memory: Option<FrozenMemory>,
     /// Whether the run's model can be called now, read with the offer for a
     /// run that names an organization's model.
@@ -592,6 +609,8 @@ pub struct MemorySendRequest {
     /// Whether the model had read an app's tool result before it made the
     /// call ([`after_app_content`]): kept with what the call writes.
     pub after_app_content: bool,
+    /// Who the call recalls and saves for ([`memory_audience`]).
+    pub audience: Audience,
 }
 
 /// The I/O a plan allows once its transition commits.
@@ -765,6 +784,9 @@ pub fn advance(snapshot: &Snapshot, facts: &Facts) -> Result<Plan, AdvanceError>
     };
     if let Some(failure) = reconnect_failure(snapshot) {
         return Ok(worker.finish(RunEnding::Failed { error: failure }));
+    }
+    if session_memory_gone(snapshot) {
+        return Ok(worker.fail(SESSION_REMOVED, SESSION_REMOVED_MESSAGE));
     }
     match control.continuation {
         Continuation::NeedModel { turn } => worker.need_model(turn),
@@ -1030,8 +1052,57 @@ pub fn frozen_offer(snapshot: &Snapshot) -> Option<&Offer> {
 /// Nothing reads the recall again during a run: a memory saved, changed or
 /// forgotten mid-run (by the run itself, too) reaches the next run, and
 /// this one's prompt keeps the bytes it started with.
-pub fn frozen_memory(snapshot: &Snapshot) -> Option<&FrozenMemory> {
-    snapshot.frozen_memory.as_ref()
+///
+/// A channel run's memory is its session's, fixed when the session began,
+/// with the recall the session keeps for the run's history start: so every
+/// run of the session sends the same tools and the same recall until a
+/// trim moves the start, or a forget marks the session for its next run.
+/// `None` until the first run from that start, or that next run, read it
+/// ([`SessionRecall::Unread`]), and for a session without memory.
+pub fn frozen_memory(snapshot: &Snapshot) -> Option<FrozenMemory> {
+    let Some(session) = &snapshot.session else {
+        return snapshot.frozen_memory.clone();
+    };
+    let memory = session.memory.as_ref()?;
+    match &session.recall {
+        SessionRecall::Read(recall) => Some(FrozenMemory {
+            memory_type_id: memory.memory_type_id,
+            recall: recall.clone(),
+            read_again: false,
+        }),
+        SessionRecall::Unread => None,
+    }
+}
+
+/// Who a run's memory is for: an API or Console run's, the workspace; a
+/// channel run's, its session's audience. `None` for a channel run whose
+/// session has no memory, or lost it with the session.
+pub fn memory_audience(snapshot: &Snapshot) -> Option<Audience> {
+    match &snapshot.session {
+        None => Some(Audience::Workspace),
+        Some(session) => session.memory.map(|memory| memory.audience),
+    }
+}
+
+/// Whether a channel run's memory went with its session: the run froze its
+/// session's memory, or offers its tools, and the session doesn't hold it
+/// any more, removed with its agent's channel. A run in progress holds its
+/// session, so nothing else changes the session's memory under it.
+fn session_memory_gone(snapshot: &Snapshot) -> bool {
+    let Some(session) = &snapshot.session else {
+        return false;
+    };
+    let used = snapshot
+        .frozen_memory
+        .as_ref()
+        .map(|frozen| frozen.memory_type_id)
+        .or_else(|| session.offer.tools().iter().find_map(|tool| tool.memory_type_id));
+    used.is_some_and(|memory_type_id| {
+        session
+            .memory
+            .is_none_or(|memory| memory.memory_type_id != memory_type_id)
+            || (snapshot.frozen_memory.is_some() && session.recall == SessionRecall::Unread)
+    })
 }
 
 fn model_request(
@@ -1073,8 +1144,21 @@ fn sent_recall(snapshot: &Snapshot, memory: &FrozenMemory) -> Option<String> {
 /// Whether the model had read an app's (an installation's) tool result
 /// before it made `call`: a result of a call of an earlier turn, the app's
 /// own answer or its own error. What a memory tool writes then may come
-/// from that content, and its origin says so.
+/// from that content, and its origin says so. A channel run counts any
+/// earlier run in the same thread too, even one before the session started
+/// over, through the session's flag: once one read an app's result, every
+/// later save in the thread says so, after a trim or in a new run session
+/// too, since a new run session reads the thread again, the agent's
+/// earlier replies included, and saying it of a save that didn't need it
+/// is the safe side.
 pub fn after_app_content(snapshot: &Snapshot, call: &CallRecord) -> bool {
+    if snapshot
+        .session
+        .as_ref()
+        .is_some_and(|session| session.app_content_read)
+    {
+        return true;
+    }
     snapshot.calls.iter().any(|earlier| {
         earlier.turn < call.turn
             && earlier
@@ -1440,15 +1524,16 @@ impl Worker<'_> {
         // Frozen at the first attempt: a fresh offer, and the memory read
         // with it, are for that one only. What's frozen is what's sent.
         let (offer, memory) = match frozen_offer(self.snapshot) {
-            Some(frozen) => (frozen, frozen_memory(self.snapshot)),
+            Some(frozen) => (frozen, self.memory_frozen_or_read()?),
             None => (
                 self.facts.offer.as_ref().ok_or(AdvanceError::MissingFact("offer"))?,
-                self.facts.memory.as_ref(),
+                self.facts.memory.clone(),
             ),
         };
         let memory = memory.map(|memory| FrozenMemory {
             memory_type_id: memory.memory_type_id,
-            recall: sent_recall(self.snapshot, memory),
+            recall: sent_recall(self.snapshot, &memory),
+            read_again: memory.read_again,
         });
         // A run of an organization's model calls it only while the model and
         // its connection are there and the provider takes the key.
@@ -1520,6 +1605,28 @@ impl Worker<'_> {
         Ok(self.apply(self.keeps(), operation, Io::CallModel(request)))
     }
 
+    /// The memory a run whose offer is frozen sends: its own, or a channel
+    /// run's session's. A channel run that's the first from its session's
+    /// history start sends the recall the driver read now, from the
+    /// session's type: it's kept on the session with this attempt, for this
+    /// run alone when the type couldn't give one
+    /// ([`FrozenMemory::read_again`]).
+    fn memory_frozen_or_read(&self) -> Result<Option<FrozenMemory>, AdvanceError> {
+        if let Some(frozen) = frozen_memory(self.snapshot) {
+            return Ok(Some(frozen));
+        }
+        let Some(memory) = self.snapshot.session.as_ref().and_then(|session| session.memory) else {
+            return Ok(None);
+        };
+        let read = self.facts.memory.as_ref().ok_or(AdvanceError::MissingFact("memory"))?;
+        if read.memory_type_id != memory.memory_type_id {
+            return Err(AdvanceError::InvalidFact(
+                "a recall read from another type than the session's",
+            ));
+        }
+        Ok(Some(read.clone()))
+    }
+
     /// Whether an earlier attempt of `turn` than `attempt` timed out.
     fn timed_out_before(&self, turn: u32, attempt: u32) -> bool {
         self.snapshot
@@ -1555,7 +1662,7 @@ impl Worker<'_> {
             turn,
             attempt,
             None,
-            (&prepared.offer, frozen_memory(self.snapshot)),
+            (&prepared.offer, frozen_memory(self.snapshot).as_ref()),
             None,
         )?;
         if request.digest() != prepared.request_digest {
@@ -2072,6 +2179,9 @@ impl Worker<'_> {
                     .ok_or(AdvanceError::InvalidSnapshot("a memory call without its digest"))?,
                 definition_sha256: target.definition_sha256,
                 after_app_content: after_app_content(self.snapshot, call),
+                audience: memory_audience(self.snapshot).ok_or(AdvanceError::InvalidSnapshot(
+                    "a memory call without its session's memory",
+                ))?,
             })),
             ToolHost::Run => return Err(AdvanceError::InvalidSnapshot("the run's own tool sent")),
         };

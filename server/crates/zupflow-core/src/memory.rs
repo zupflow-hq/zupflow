@@ -21,23 +21,30 @@
 //! A change people make, from the API or the Console, commits with what the
 //! server records of it: its audit event and its webhook events
 //! ([`Record`]). A change a run's tool call makes commits with its webhook
-//! events, and no audit event: the run's timeline is its record. What a
-//! deleted agent, workspace or type kept, each kind forgets when a job the
-//! deletion queued tells it to ([`FORGET_JOB`]).
+//! events, and no audit event: the run's timeline is its record. A forget,
+//! either way, and a change people make also mark the channel sessions
+//! that may recall the memory, so each reads its recall anew at its next
+//! run ([`MemoryChange::refreshes_recall`]). What a deleted agent, workspace or type
+//! kept, each kind forgets when a job the deletion queued tells it to
+//! ([`FORGET_JOB`]).
 //!
 //! A run starts with its memory's **recall**: lines the kind gives, framed
 //! by the server ([`Recall::framed`]), none of which opens or closes the
-//! frame ([`shown_line`]), and fixed for the whole run so the provider's
-//! prompt cache holds. The same memories, settings and audience give the
-//! same bytes, and the same settings give the same tool definitions. A run
-//! keeps the tools it started with, so each call carries its type's writes
-//! as they are now ([`CallContext`]): once they're denied, the tools that
-//! write are refused. A run's call that changes a memory commits a record of
-//! itself with the change ([`MadeCall`]), one for each call, and one that
-//! gives a memory the text it holds commits the record alone: a call whose
-//! answer was lost is answered by that record, whatever became of the memory
-//! since, and made then only when there's none ([`settle`]); a sender that
-//! commits after its call was settled changes nothing.
+//! frame ([`shown_line`]), and fixed for the whole run (a channel session's,
+//! for every run from one history start, until a change marks the session)
+//! so the provider's prompt cache holds. A channel run's takes only the room
+//! its session's history budget leaves, and no more than half the budget
+//! ([`MemoryProvider::recall_within`]).
+//! The same memories, settings and audience give the same bytes, and the
+//! same settings give the same tool definitions. A run keeps the tools it
+//! started with, so each call carries its type's writes as they are now
+//! ([`CallContext`]): once they're denied, the tools that write are refused.
+//! A run's call that changes a memory commits a record of itself with the
+//! change ([`MadeCall`]), one for each call, and one that gives a memory the
+//! text it holds commits the record alone: a call whose answer was lost is
+//! answered by that record, whatever became of the memory since, and made
+//! then only when there's none ([`settle`]); a sender that commits after its
+//! call was settled changes nothing.
 //!
 //! - [`notes`]: the `notes` kind, and the [`notes::NoteStore`] it keeps its notes in.
 //! - [`registry`]: [`registry::MemoryProviders`], the kinds a server serves, by key.
@@ -57,6 +64,7 @@ use serde_json::{Map, Value, json};
 
 use crate::apps::ToolEffect;
 use crate::audit::{Audit, AuditEntry};
+use crate::channels::ConversationKind;
 use crate::ids::{
     AgentId, ApiKeyId, ChannelConversationId, MemoryId, MemoryTypeId, OrganizationId, RunId, ToolCallId, UserId,
     WorkspaceId,
@@ -223,6 +231,17 @@ pub enum Audience {
 }
 
 impl Audience {
+    /// Who a channel session in the conversation `conversation_id` of
+    /// `kind` remembers for: a direct message's (a `dm` or a `group_dm`)
+    /// own audience, else the workspace.
+    pub fn in_conversation(kind: ConversationKind, conversation_id: ChannelConversationId) -> Self {
+        if kind.is_direct() {
+            Self::Direct(conversation_id)
+        } else {
+            Self::Workspace
+        }
+    }
+
     /// Whether a memory saved in `saved_in` (`None`: outside any direct
     /// conversation) reaches this audience.
     pub fn reaches(&self, saved_in: Option<ChannelConversationId>) -> bool {
@@ -487,6 +506,22 @@ impl Recall {
         block.push_str(RECALL_CLOSE);
         Some(block)
     }
+
+    /// How many bytes the block takes ([`Recall::framed`]): `0` with
+    /// nothing to recall.
+    pub fn framed_len(&self) -> usize {
+        framed_len(self.lines.iter().map(String::len))
+    }
+}
+
+/// How many bytes a block of lines this long takes ([`Recall::framed`]):
+/// `0` for none.
+pub fn framed_len(lines: impl IntoIterator<Item = usize>) -> usize {
+    let mut lines = lines.into_iter().peekable();
+    if lines.peek().is_none() {
+        return 0;
+    }
+    lines.fold(RECALL_OPEN.len() + 1 + RECALL_CLOSE.len(), |len, line| len + 1 + line)
 }
 
 /// A call to one of a kind's tools, as the server makes it: who makes it,
@@ -537,19 +572,48 @@ impl MemoryChange {
             Self::Saved(memory) | Self::Updated(memory) | Self::Forgotten(memory) => memory,
         }
     }
+
+    /// Whether the change marks the channel sessions that may recall the
+    /// memory, so each reads its recall anew at its next run
+    /// ([`Recorded::refresh_recall`]): a forget, and a change people make,
+    /// through the API or the Console, so a redaction isn't recalled again.
+    /// A save, and a run's own change, reach a session's recall at its next
+    /// trim or session.
+    pub fn refreshes_recall(&self) -> bool {
+        match self {
+            Self::Saved(_) => false,
+            Self::Updated(memory) => !matches!(memory.origin, Origin::Run { .. }),
+            Self::Forgotten(_) => true,
+        }
+    }
 }
 
-/// What one change to a memory records with it: its audit event, and its
+/// What one change to a memory records with it: its audit event, its
 /// webhook events, each recorded with a delivery for every enabled endpoint
 /// of its organization and environment subscribed to its type, as
-/// [`crate::webhooks::WebhookStore::record_event`] records one. Built by the
-/// server, which knows who acts and what to call things, from the memory as
-/// the change left it; never its text. A run's call adds itself
-/// ([`Recorded::call`]).
+/// [`crate::webhooks::WebhookStore::record_event`] records one, and, for a
+/// forget or a person's change, the channel sessions it reaches
+/// ([`Recorded::refresh_recall`], [`MemoryChange::refreshes_recall`]).
+/// Built by the server, which knows who acts and what to call things, from
+/// the memory as the change left it; never its text. A run's call adds
+/// itself ([`Recorded::call`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Recorded {
     pub audit: Option<AuditEntry>,
     pub events: Vec<NewWebhookEvent>,
+    /// Marks the channel sessions of the scope's agent, in its workspace,
+    /// kept on its type, that may recall the memory, to read their recall
+    /// anew at their next run, from the same history start: every one for a
+    /// workspace's memory, and for one kept for a direct conversation, only
+    /// those whose audience is that conversation. Set for a forget and a
+    /// change people make ([`MemoryChange::refreshes_recall`]), so a memory
+    /// forgotten or redacted isn't recalled again, though a session
+    /// otherwise keeps its recall until a trim. A run under way keeps the recall it
+    /// started with. A marked session keeps no recall text once no run of
+    /// it is under way: one with none loses it with the change, one with a
+    /// run as the run ends. Marked once for a change that forgets many, for
+    /// the sessions any of its memories reach.
+    pub refresh_recall: bool,
     /// The run's call that made the change, kept with it: one for each call,
     /// ever. Another for the same call, in this transaction or an earlier
     /// one, fails the change ([`MemoryError::AlreadyMade`]), and it changes
@@ -861,6 +925,28 @@ pub trait MemoryProvider: Send + Sync {
         settings: &Settings,
     ) -> Result<Recall, MemoryError>;
 
+    /// What a run in `scope` starts with, for `audience`, when its block
+    /// may take no more than `room` bytes ([`Recall::framed_len`]): a
+    /// channel run's, which keeps within its session's history budget. The
+    /// kind leaves out what doesn't fit, as it chooses, and recalls nothing
+    /// when nothing would. Same memories, settings, audience and room, same
+    /// bytes; with room for [`MemoryProvider::recall`], the same. By
+    /// default, that recall when it fits, and nothing when it doesn't.
+    async fn recall_within(
+        &self,
+        scope: &MemoryScope,
+        audience: &Audience,
+        settings: &Settings,
+        room: usize,
+    ) -> Result<Recall, MemoryError> {
+        let recall = self.recall(scope, audience, settings).await?;
+        Ok(if recall.framed_len() <= room {
+            recall
+        } else {
+            Recall::none()
+        })
+    }
+
     /// One call to one of its tools, after the server decided it. A call
     /// that can't do what it asks is answered as an error for the model to
     /// read; `Err` only when the call couldn't be made at all, and then it
@@ -1086,6 +1172,19 @@ mod tests {
         assert!(!Audience::Direct(here).reaches(Some(there)));
         assert_eq!(Audience::Direct(here).conversation(), Some(here));
         assert_eq!(Audience::Workspace.conversation(), None);
+    }
+
+    #[test]
+    fn remembers_for_a_direct_conversation_only_in_a_dm_or_a_group_dm() {
+        let here = ChannelConversationId::from_uuid(Uuid::from_u128(1));
+        for (kind, audience) in [
+            (ConversationKind::Dm, Audience::Direct(here)),
+            (ConversationKind::GroupDm, Audience::Direct(here)),
+            (ConversationKind::Channel, Audience::Workspace),
+            (ConversationKind::PrivateChannel, Audience::Workspace),
+        ] {
+            assert_eq!(Audience::in_conversation(kind, here), audience, "{kind:?}");
+        }
     }
 
     #[test]

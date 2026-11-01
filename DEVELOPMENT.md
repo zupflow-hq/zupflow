@@ -443,7 +443,8 @@ worker stopped is answered by that record, as it was made, whatever became
 of the memory since, and its change is never made again; one with no record
 (a search, a refusal, or a call never made) is made then. A worker that
 makes its call after another settled it is refused, and changes nothing. A
-channel session's runs have no memory.
+channel run's memory is its session's (below): it's decided, made and settled
+the same way.
 Each call it asks for is decided (floor, then policy) and recorded with its
 policy, mode and rule; allowed calls go only to their own installation's MCP
 server through the safe outbound path, with its credential injected last. A
@@ -683,15 +684,97 @@ the conversation's breaker in the transaction that starts it. Each run of a
 session continues
 the ones before it byte for byte, so the provider's prompt cache holds across
 runs: the session fixes its model, instructions (a fixed channel preface, then
-the agent's own) and tools when it starts, every message reaches the model
+the agent's own), tools and memory when it starts, every message reaches the model
 once (a late job finds its message read), rendered when it's taken in (at most
 8,000 characters a turn), each run's transcript is kept as sent when it ends,
 and the history is trimmed by whole runs, a quarter of its budget (60% of the
 model's context window) at a time, so the cache misses once per trim. Messages that
 arrive mid-run join it at its next turn boundary (`steer`) or wait and start
-one run after it (`collect`). `tests/channel_runs.rs` drives all of it through
-the route with a fake team chat, and `tests/channel_prompt_cache.rs` checks the
-prefix turn by turn on the Anthropic and OpenAI paths.
+one run after it (`collect`). A run whose dispatch finds the agent's model,
+instructions, tools or memory changed starts a new run session, its history
+and recall starting over; a collected run continues the session as it is.
+
+A channel run remembers as its session does (`memory: "agent"`; there's no
+`off` for one). The session's memory is the agent's type when it starts, with
+the kind's tools for the type's `writes` joined to its list by their own
+names, for the session's audience: a session in a `dm` or a `group_dm`
+recalls and finds the workspace's memories and that conversation's own, and
+what it saves is stamped with the conversation, recalled and found there
+only; one in a channel or a private channel is the workspace's, and never
+sees a direct conversation's. A conversation shared with another
+organization (`is_external`), of any kind, has no memory: its sessions get no
+memory tools and recall nothing, and once a conversation is shared, its next
+run starts a new run session without memory, a collected one too, and so
+does one whose job read the conversation before it was shared: the store
+reads it in the transaction that starts each run. Only a run under way
+keeps what it started with. A session whose type has settings its
+kind refuses starts without memory as well, rather than leave the agent
+silent in every conversation; the server logs it
+(`channels.session_without_memory`). A run that continues a session begun
+with memory (one collected, or one started just before) sends the recall
+its history start kept; one that has to read the recall while they're
+refused, or while the type's kind isn't served, recalls nothing, and the
+session's next run reads it again, so the session recalls as soon as the
+server can. An API run still fails its step then: it never starts without
+the memory its agent has.
+
+The session keeps its recall, once for each history start: the first run
+from a start reads it from the session's own type for that audience with its
+first model attempt, and every other run from that start sends the same
+bytes, as the first block of the history's first message, so each run
+continues the one before; a run keeps only the type and the recall's digest.
+The recall counts in the history budget beside the history and the new
+input, as no more than half the budget: one read anew takes no more than the
+room the history and the input leave it, up to that half, and the trim
+counts a kept one as no more than half, so a long recall leaves the history
+room instead of trimming all of it on every run. A kept one heavier than
+half, as one kept under a larger budget may be (a smaller context window
+alone starts no new session), is read anew by the next run, in its room, as
+after a forget, so no run sends more than its budget. A save or a change in
+one run reaches the session's later runs through the conversation, and the
+recall at the next trim or run session; a `dm`'s messages outside threads
+are one session, so they learn of notes saved elsewhere only then. A trim
+reads the recall anew from the session's type.
+
+A forget, or a person's change, reaches a session sooner: forgetting a
+memory (`deleteMemory`, each hundred of `deleteMemories`, or a run's
+`forget_memory`, the session's own included), or changing its text through
+the API or the Console (`updateMemory`), marks the channel sessions of that
+agent, in that workspace, kept on that type, that may recall it, in the
+change's own transaction: every one for a workspace's memory, and only that
+conversation's for a direct conversation's. Deleting a type marks every
+session kept on it. A run's own change marks nothing: like a save, it
+reaches the recall at the next trim or run session. So that what a person
+wants gone leaves the recall at the next run, `notes`' `update_memory`
+tells the model to forget the note (`forget_memory`) and save what should
+stay rather than change it. The next run of a marked
+session reads the recall anew, from the same history start (the mark trims
+nothing); but the recall comes before the whole history, so that run misses
+the cache once from the recall on. No forgotten or changed text stays
+at rest: the change's transaction clears the recall text of a marked session
+with no run under way, and a marked session's run clears it as it ends,
+keeping only the recall's weight for the next trim. A run under way keeps
+the recall it started with, and ends as it would have. Once a type is
+deleted, the run that collects what waited for one under way recalls nothing
+(its calls are refused `memory_type_removed`, as any run's are), and its
+tools stay as they were; the next message to find the session idle starts a
+new run session with the agent's memory as it is then. Once a run in a
+thread (or among a `dm`'s messages outside threads) read an app's tool
+result, every later save there says so (`after_app_content`): any earlier
+run in the same thread counts, even one before the session started over (a
+trim, a new run session, the retention sweep), since a new run session reads
+the thread again, the agent's earlier replies included, and saying it of a
+save that didn't need it is the safe side. The mark is never cleared. A run
+that uses its session's memory fails `channel_session_removed` if
+the session goes, with its agent's channel, connection or app, while it's
+under way. `tests/channel_runs.rs` drives all of it through the route with a
+fake team chat, and `tests/channel_prompt_cache.rs` checks the prefix turn
+by turn on the Anthropic and OpenAI paths, with memory too (the recall's
+bytes and place, its share of the budget, the audiences, shared
+conversations, an unusable type, `after_app_content`, a forget or a person's
+change reaching each session that may recall it at its next run, no recall
+text at rest, a deleted type, isolation, and never more than four
+breakpoints, through OpenRouter to Claude as well).
 
 ### Agents in Slack
 
@@ -760,7 +843,8 @@ from its `message` event (its `app_mention` is recorded and nothing more);
 edits and deletions change nothing a model was sent; a message in a channel
 shared with another organization (Slack Connect) is read with its author's
 own team, so it wakes the agent only when the agent allows people of other
-organizations; and any post with a `bot_id` is an app's. Only for a message
+organizations, and the agent's runs in such a channel have no memory; and
+any post with a `bot_id` is an app's. Only for a message
 the agent may answer does the inbound job ask Slack about people with
 `users.info`: the author's email when a sender list is checked, and once the
 message wakes the agent, its author and the people it mentions (ten at

@@ -512,6 +512,7 @@ async fn load(
         (Some(memory_type_id), recall) => Some(FrozenMemory {
             memory_type_id: MemoryTypeId::from_uuid(memory_type_id),
             recall,
+            read_again: false,
         }),
         (None, None) => None,
         (None, Some(_)) => return Err(corrupt("a recall without its memory type")),
@@ -1483,18 +1484,28 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
                     )
                     .await?;
             }
+            // A channel run's memory is its session's: its type, and the
+            // recall the session keeps for the run's history start.
+            if let Some(session) = &snapshot.session
+                && session.memory.map(|kept| kept.memory_type_id) != memory.as_ref().map(|asked| asked.memory_type_id)
+            {
+                return Err(refused("a model attempt with memory other than its session's"));
+            }
             let (org, ws, run) = writer.scope();
             if snapshot.model_attempts.is_empty()
                 && let Some(memory) = memory
             {
-                // Kept once, unless the run holds another already.
+                // Kept once, unless the run holds another already; a
+                // channel run's recall is kept on its session, once for
+                // every run from its start, and the run keeps its digest.
+                let channel = snapshot.session.is_some();
                 let kept = sqlx::query(
                     "UPDATE runs SET memory_type_id = ?, recall = ?, recall_digest = ? \
                      WHERE organization_id = ? AND workspace_id = ? AND id = ? \
                      AND (memory_type_id IS NULL OR (memory_type_id = ? AND recall_digest IS ?))",
                 )
                 .bind(memory.memory_type_id.uuid())
-                .bind(memory.recall.as_deref())
+                .bind(memory.recall.as_deref().filter(|_| !channel))
                 .bind(memory.recall.as_deref().map(|recall| recall_digest(recall).to_string()))
                 .bind(org)
                 .bind(ws)
@@ -1506,6 +1517,19 @@ async fn operate(writer: &mut Writer<'_>, loaded: &Loaded, request: &TransitionR
                 .map_err(failed("prepare_model"))?;
                 if kept.rows_affected() != 1 {
                     return Err(refused("a model attempt with memory other than the run's"));
+                }
+                if channel
+                    && !crate::channel_runs::keep_recall(
+                        &mut *writer.connection,
+                        writer.organization_id,
+                        writer.workspace_id,
+                        writer.run_id,
+                        memory,
+                        now,
+                    )
+                    .await?
+                {
+                    return Err(refused("a recall other than its session's"));
                 }
             }
             let offer = serde_json::to_string(offer).map_err(|_| refused("an offer that isn't JSON"))?;

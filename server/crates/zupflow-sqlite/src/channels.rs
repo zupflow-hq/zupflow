@@ -3883,6 +3883,8 @@ mod tests {
                 connect: &crate::SqliteConnectStore::new(database.clone()),
                 jobs: &crate::SqliteJobQueue::new(database.clone()),
                 runs: &crate::SqliteRunStore::new(database.clone()),
+                notes: &crate::SqliteNoteStore::new(database.clone()),
+                memory_types: &crate::SqliteMemoryTypeStore::new(database.clone()),
             },
             prepare(database),
         )

@@ -155,6 +155,15 @@ named_values! {
     }
 }
 
+impl ConversationKind {
+    /// A direct message: one person's (`dm`) or a few people's (`group_dm`)
+    /// conversation with the agent. A run reads one only where it began,
+    /// and what a session in one remembers stays in it.
+    pub fn is_direct(self) -> bool {
+        matches!(self, Self::Dm | Self::GroupDm)
+    }
+}
+
 named_values! {
     Direction {
         Inbound => "inbound",

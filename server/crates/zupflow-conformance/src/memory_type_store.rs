@@ -12,7 +12,8 @@
 //! agent, a workspace or a type queuing, with it, the job that has each
 //! memory kind forget what went, a type's also the job that refuses the
 //! memory calls waiting for approval in it, and a refused deletion queuing
-//! none.
+//! none. The mark a deleted type leaves on the channel sessions kept on it
+//! is checked by the `ChannelStore` suite, which holds sessions.
 //!
 //! `prepare` makes a [`Tenant`] exist: its organization, a Sandbox and a
 //! Production workspace (each named), an active owner, admin and developer,

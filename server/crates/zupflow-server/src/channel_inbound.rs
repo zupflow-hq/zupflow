@@ -76,6 +76,7 @@ use zupflow_core::error::ApiError;
 use zupflow_core::ids::{ChannelAppId, ChannelMessageId, OrganizationId, WorkspaceId};
 use zupflow_core::jobs::Job;
 use zupflow_core::keys::{self, EncryptionContext};
+use zupflow_core::memory::Audience;
 use zupflow_core::runs::history::history_budget;
 use zupflow_core::scope::{Name, Scope};
 
@@ -431,9 +432,13 @@ fn candidate(context: &InboundContext, senders: bool) -> Result<Option<Admitted<
 }
 
 /// What the agent's runs in a thread are fixed with, read now: its model,
-/// the channel preface before its instructions, its tools and the history
-/// budget its model's context window allows. `None` when it has no model.
-async fn template(
+/// the channel preface before its instructions, its tools, its memory for
+/// the conversation's audience (a `dm`'s or a `group_dm`'s own, beside the
+/// workspace's; else the workspace's), and the history budget its model's
+/// context window allows. A conversation shared with another organization
+/// has no memory, of any kind: the workspace's memories never reach people
+/// outside it, and nothing said there is kept. `None` when it has no model.
+async fn session_template(
     state: &AppState,
     organization_id: OrganizationId,
     workspace_id: WorkspaceId,
@@ -473,8 +478,9 @@ async fn template(
         .await
         .map_err(|_| "store_unavailable")?
         .and_then(|found| found.context_window);
-    // The agent's app tools, then its channel tools and stay_silent: one
-    // list, sorted, fixed for the session.
+    // The agent's app tools, then its channel tools and stay_silent, then
+    // its memory's tools by their own names: one list, sorted, fixed for
+    // the session with the memory's type and audience.
     let mut tools = AgentReads {
         state,
         organization_id,
@@ -486,7 +492,24 @@ async fn template(
     .tools()
     .to_vec();
     tools.extend(crate::channel_tools::session_tools(state, organization_id, &context.connection, channel).await?);
-    let offer = Offer::new(tools).map_err(|_| "offer_invalid")?;
+    let mut offer = Offer::new(tools).map_err(|_| "offer_invalid")?;
+    let audience = Audience::in_conversation(context.conversation.kind, context.conversation.id);
+    let memory = if context.conversation.is_external {
+        None
+    } else {
+        crate::memory_tools::session_memory(state, (organization_id, workspace_id), agent.id, audience).await?
+    };
+    let memory = match memory {
+        None => None,
+        Some((memory, memory_tools)) => {
+            let (joined, left_out) = offer.with(memory_tools);
+            for name in left_out {
+                tracing::warn!(event = "runs.memory_tool_not_offered", %organization_id, %workspace_id, agent_id = %agent.id, memory_type_id = %memory.memory_type_id, %name);
+            }
+            offer = joined;
+            Some(memory)
+        }
+    };
     let preface = preface(
         context.connection.provider,
         &context.connection.identity.handle,
@@ -496,6 +519,7 @@ async fn template(
         model,
         instructions: instructions(&preface, &agent.instructions),
         offer,
+        memory,
         history_budget: history_budget(context_window),
     }))
 }
@@ -622,7 +646,8 @@ async fn handle_message(
             {
                 continue;
             }
-            let Some(template) = template(state, organization_id, workspace_id, &context, channel).await? else {
+            let Some(template) = session_template(state, organization_id, workspace_id, &context, channel).await?
+            else {
                 tracing::warn!(event = "channels.no_model", %organization_id, %workspace_id, %message_id, agent_channel_id = %channel.id);
                 continue;
             };

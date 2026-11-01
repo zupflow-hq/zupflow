@@ -9,7 +9,12 @@
 //! with the text the note already holds, nothing but a run's call (below).
 //! What a change records ([`Record`]) is written in its transaction: each
 //! webhook event with its deliveries and their jobs, as the outbox writes
-//! one, and the audit event, each only in the scope's own workspace.
+//! one, and the audit event, each only in the scope's own workspace; and,
+//! for a change that asks it, the mark on the channel sessions of the
+//! scope's agent, in its workspace and type, that may recall the note (a
+//! workspace note's, every one; a direct conversation's, only those whose
+//! audience is that conversation), so each reads its recall anew at its
+//! next run, once however many notes the change forgets.
 //!
 //! A run's call that changes a note is written with its change, in
 //! `memory_calls`, one row for each call ([`INSERT_CALL`]), and one that
@@ -24,6 +29,8 @@
 //! notes it may find, and only those, in a temporary FTS5 table of its own
 //! connection, in a read transaction it then rolls back: its order depends
 //! on nothing else, and no index keeps a note that's gone.
+
+use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -101,14 +108,17 @@ fn read(error: impl std::fmt::Display) -> MemoryError {
 
 /// Writes what a change records, in its transaction: the run's call that
 /// made it, each webhook event, with a delivery and its job for every
-/// endpoint subscribed to it, and the audit event. An event placed anywhere
-/// but the scope's workspace fails the change, and so does a call that made
-/// its change already (`AlreadyMade`): its transaction rolls back, and it
+/// endpoint subscribed to it, the audit event, and the mark on the channel
+/// sessions that may recall a note kept for `kept_for` (the changed note's
+/// conversation, `None` for the workspace's). An event placed anywhere but
+/// the scope's workspace fails the change, and so does a call that made its
+/// change already (`AlreadyMade`): its transaction rolls back, and it
 /// changes nothing.
 async fn write_records(
     connection: &mut SqliteConnection,
     scope: &MemoryScope,
     recorded: &Recorded,
+    kept_for: Option<ChannelConversationId>,
     operation: &'static str,
 ) -> Result<(), MemoryError> {
     if let Some(call) = &recorded.call {
@@ -141,6 +151,11 @@ async fn write_records(
     }
     if let Some(entry) = &recorded.audit {
         crate::audit::record_in_workspace(&mut *connection, scope.organization_id, scope.workspace_id, entry)
+            .await
+            .map_err(failed(operation))?;
+    }
+    if recorded.refresh_recall {
+        crate::channel_runs::refresh_recall(&mut *connection, scope, kept_for)
             .await
             .map_err(failed(operation))?;
     }
@@ -486,7 +501,8 @@ impl NoteStore for SqliteNoteStore {
             .await
             .map_err(failed("insert"))?;
         let saved = MemoryChange::Saved(note_from(&row)?);
-        write_records(&mut transaction, scope, &record(&saved), "insert").await?;
+        let kept_for = saved.memory().channel_conversation_id;
+        write_records(&mut transaction, scope, &record(&saved), kept_for, "insert").await?;
         transaction.commit().await.map_err(failed("insert"))?;
         Ok(saved.into_memory())
     }
@@ -513,7 +529,8 @@ impl NoteStore for SqliteNoteStore {
         let rewritten = match row {
             Some(row) => {
                 let updated = MemoryChange::Updated(note_from(&row)?);
-                write_records(&mut transaction, scope, &record(&updated), "update").await?;
+                let kept_for = updated.memory().channel_conversation_id;
+                write_records(&mut transaction, scope, &record(&updated), kept_for, "update").await?;
                 Rewritten {
                     memory: updated.into_memory(),
                     changed: true,
@@ -534,7 +551,8 @@ impl NoteStore for SqliteNoteStore {
                     call: record(&unchanged).call,
                     ..Recorded::default()
                 };
-                write_records(&mut transaction, scope, &call, "update").await?;
+                let kept_for = unchanged.memory().channel_conversation_id;
+                write_records(&mut transaction, scope, &call, kept_for, "update").await?;
                 Rewritten {
                     memory: unchanged.into_memory(),
                     changed: false,
@@ -558,7 +576,8 @@ impl NoteStore for SqliteNoteStore {
             .await
             .map_err(failed("delete"))?;
         let deleted = MemoryChange::Forgotten(row.as_ref().map(note_from).transpose()?.ok_or(MemoryError::NotFound)?);
-        write_records(&mut transaction, scope, &record(&deleted), "delete").await?;
+        let kept_for = deleted.memory().channel_conversation_id;
+        write_records(&mut transaction, scope, &record(&deleted), kept_for, "delete").await?;
         transaction.commit().await.map_err(failed("delete"))?;
         Ok(deleted.into_memory())
     }
@@ -586,9 +605,28 @@ impl NoteStore for SqliteNoteStore {
             tracing::error!(event = "memory_notes.scope_moved", operation = "delete_scope");
             return Err(MemoryError::Unavailable);
         }
+        // The sessions they reach are marked once, after every note's
+        // records: those that may recall any of them, every one of the
+        // scope's once a workspace note goes.
+        let mut reached = BTreeSet::new();
         for row in &rows {
             let forgotten = MemoryChange::Forgotten(note_from(row)?);
-            write_records(&mut transaction, scope, &record(&forgotten), "delete_scope").await?;
+            let kept_for = forgotten.memory().channel_conversation_id;
+            let mut recorded = record(&forgotten);
+            if std::mem::take(&mut recorded.refresh_recall) {
+                reached.insert(kept_for);
+            }
+            write_records(&mut transaction, scope, &recorded, kept_for, "delete_scope").await?;
+        }
+        let reached = if reached.contains(&None) {
+            vec![None]
+        } else {
+            reached.into_iter().collect()
+        };
+        for kept_for in reached {
+            crate::channel_runs::refresh_recall(&mut transaction, scope, kept_for)
+                .await
+                .map_err(failed("delete_scope"))?;
         }
         let count = rows.len() as u64;
         if count > 0 {

@@ -17,7 +17,9 @@
 //! and its webhook events with their deliveries) in its own transaction: a
 //! change refused or changing nothing records nothing, and a record placed
 //! outside the note's workspace fails the change, which then changes
-//! nothing. The suite reads them back through the [`Logs`]. A run's call
+//! nothing. The suite reads them back through the [`Logs`]; the mark a
+//! forget leaves on the channel sessions that may recall it is checked by
+//! the `ChannelStore` suite, which holds sessions. A run's call
 //! that changes a note is kept with its change, once, and one that gives a
 //! note the text it holds is kept alone, recording nothing else: another
 //! change of the same call fails, changing nothing, and the call is read
@@ -1746,7 +1748,8 @@ fn suite_actor() -> AuditActor {
 
 /// What the suites record of a change: its audit event, naming the memory by
 /// its short ID, and its webhook event, each in the memory's own workspace,
-/// whose environment is `environment`.
+/// whose environment is `environment`; and for a forget, as the server does,
+/// the mark on the channel sessions it reaches.
 pub(crate) fn recorder(environment: Environment) -> impl Fn(&MemoryChange) -> Recorded + Send + Sync {
     move |change| {
         let memory = change.memory();
@@ -1781,6 +1784,7 @@ pub(crate) fn recorder(environment: Environment) -> impl Fn(&MemoryChange) -> Re
                 ),
                 created_at: now,
             }],
+            refresh_recall: change.refreshes_recall(),
             call: None,
         }
     }

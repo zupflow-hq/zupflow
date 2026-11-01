@@ -247,7 +247,7 @@ fn audience_refusal(run: &RunChannelContext, conversation: &ChannelConversation)
 /// Whether a read may show `conversation`: a direct message only when the
 /// run began in it.
 fn readable(run: &RunChannelContext, conversation: &ChannelConversation) -> bool {
-    !matches!(conversation.kind, ConversationKind::Dm | ConversationKind::GroupDm) || conversation.id == run.origin.id
+    !conversation.kind.is_direct() || conversation.id == run.origin.id
 }
 
 fn outside(run: &RunChannelContext) -> Refusal {
