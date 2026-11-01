@@ -19,7 +19,8 @@
 //! ([`zupflow_core::runs::history::trimmed_start`]), so the cache misses
 //! once per trim. The recall counts in the budget with the new input, as no
 //! more than half of it: the one the session keeps, or kept last, for one
-//! read anew, which takes no more than that half.
+//! read anew, which takes no more than that half. A kept one heavier than
+//! that half, kept under a larger budget, is read anew by the next run.
 //!
 //! A session's memory (its type and audience) is fixed with its tools, and
 //! the session keeps the recall its history begins with, once for each
@@ -1372,7 +1373,10 @@ async fn start_session_run(
     // same start; one it reads anew, after a trim or a forget, takes no
     // more than the room left, up to that share
     // ([`zupflow_core::runs::history::recall_room`]), so a long recall
-    // leaves the history room rather than trimming it all on every run.
+    // leaves the history room rather than trimming it all on every run. A
+    // kept recall heavier than that share, as one kept under a larger
+    // budget may be, is read anew as after a forget (below), so no run
+    // sends more than its budget.
     let runs = session_runs(connection, organization_id, workspace_id, key, session_id).await?;
     let start = runs
         .last()
@@ -1445,18 +1449,21 @@ async fn start_session_run(
     // recalls anew, as does each history start ([`keep_recall`]), and the
     // first run after a forget marked the session ([`refresh_recall`]),
     // which takes the mark: its history stays as it is, and so does the
-    // weight of the recall its runs sent, for the next trim. A new run
-    // session starts with none. The mark that a run read an app's result
-    // ([`run_ended`]) stays, through a trim and a new run session alike.
+    // weight of the recall its runs sent, for the next trim. So does the
+    // first run whose session keeps a recall heavier than its share of the
+    // budget, as a mark would have it. A new run session starts with none.
+    // The mark that a run read an app's result ([`run_ended`]) stays,
+    // through a trim and a new run session alike.
     let started = sqlx::query(
         "UPDATE channel_sessions SET session_id = ?1, active_run_id = ?2, run_count = ?3, seen_message_id = ?4, \
          seen_at = ?5, model = ?6, model_id = ?7, model_connection_id = ?8, instructions = ?9, offer = ?10, \
          history_budget = ?11, updated_at = ?12, changes_noted_at = CASE WHEN ?13 IS NULL THEN changes_noted_at \
          WHEN changes_noted_at IS NULL OR changes_noted_at < ?13 THEN ?13 ELSE changes_noted_at END, \
          memory_type_id = ?17, memory_audience = ?18, \
-         recall = CASE WHEN session_id = ?1 AND memory_type_id IS ?17 AND refresh_recall = 0 THEN recall END, \
+         recall = CASE WHEN session_id = ?1 AND memory_type_id IS ?17 AND refresh_recall = 0 \
+         AND recall_weight <= ?19 THEN recall END, \
          recall_start_run_id = CASE WHEN session_id = ?1 AND memory_type_id IS ?17 AND refresh_recall = 0 \
-         THEN recall_start_run_id END, \
+         AND recall_weight <= ?19 THEN recall_start_run_id END, \
          recall_weight = CASE WHEN session_id = ?1 AND memory_type_id IS ?17 THEN recall_weight ELSE 0 END, \
          refresh_recall = 0 \
          WHERE organization_id = ?14 AND workspace_id = ?15 AND id = ?16 AND active_run_id IS NULL",
@@ -1479,6 +1486,7 @@ async fn start_session_run(
     .bind(key.uuid())
     .bind(template.memory.map(|memory| memory.memory_type_id.uuid()))
     .bind(template.memory.as_ref().map(|memory| audience_text(&memory.audience)))
+    .bind(i64::try_from(recall_share(template.history_budget)).map_err(unreadable)?)
     .execute(&mut *connection)
     .await
     .map_err(failed("start_session_run"))?;

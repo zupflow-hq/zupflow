@@ -17,7 +17,9 @@
 //! of it ([`recall_share`]): a recall read anew takes the room they leave,
 //! up to that half ([`recall_room`]), and the trim counts the one the
 //! session keeps as no more than that half, so a long recall leaves the
-//! history room instead of trimming it all on every run.
+//! history room instead of trimming it all on every run. A kept recall
+//! heavier than that half, as one kept under a larger budget may be, is
+//! read anew by the next run, so no run sends more than its budget.
 
 use crate::models::{Message, ModelToolCall};
 use crate::runs::state::{CallRecord, CommittedTurn, SteeredTurn};
@@ -192,7 +194,9 @@ pub fn trimmed_start(weights: &[u64], fixed: u64, budget: u64) -> usize {
 /// The most of a session's history `budget` its recall takes, in tokens:
 /// half. A recall read anew takes no more ([`recall_room`]), and the trim
 /// counts the one a session keeps as no more ([`trimmed_start`]'s `fixed`),
-/// so the history always has the other half beside the new input.
+/// so the history always has the other half beside the new input; a kept
+/// one that's heavier, kept under a larger budget, is read anew instead of
+/// sent again.
 pub fn recall_share(budget: u64) -> u64 {
     budget / 2
 }

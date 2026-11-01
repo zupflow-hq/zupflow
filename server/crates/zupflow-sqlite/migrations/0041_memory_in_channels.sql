@@ -16,9 +16,11 @@
 --   session's memory; a start is never without the session's memory.
 -- - `recall_weight`: the tokens the recall the session keeps takes, kept
 --   when a mark clears its text (below), so the next run's trim still
---   counts what the runs from that start sent. Set with the recall, and
---   back to 0 when a new run session starts; never more than 0 without
---   the session's memory, nor 0 beside a recall.
+--   counts what the runs from that start sent. A run that starts with it
+--   over half the run's budget, as a recall kept under a larger budget may
+--   be, reads the recall anew, as a mark would have it. Set with the
+--   recall, and back to 0 when a new run session starts; never more than 0
+--   without the session's memory, nor 0 beside a recall.
 -- - `refresh_recall`: set when what the session recalls may hold a memory
 --   forgotten or changed since: a memory of its agent, in its workspace and
 --   type, that its audience is shown (the workspace's, or a `direct`

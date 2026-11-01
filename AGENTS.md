@@ -157,12 +157,14 @@ Read `README.md` first, then `DEVELOPMENT.md`.
   a marked session with no run under way, and a marked session's run
   clears it as it ends: no forgotten text stays at rest. The recall counts
   in the history budget as no more than half of it, and one read anew
-  takes no more than the room left, up to that half. A conversation shared
-  with another organization has no memory, read in the transaction that
-  starts each run, whatever template the run was given, and neither does a
-  session whose type's settings its kind refuses; a run that has to read
-  its recall while they're refused recalls nothing, and marks its session
-  so the next run reads it again (`tests/channel_prompt_cache.rs`).
+  takes no more than the room left, up to that half; a kept one heavier
+  than that half, kept under a larger budget, is read anew by the next run
+  as if marked. A conversation shared with another organization has no
+  memory, read in the transaction that starts each run, whatever template
+  the run was given, and neither does a session whose type's settings its
+  kind refuses; a run that has to read its recall while they're refused
+  recalls nothing, and marks its session so the next run reads it again
+  (`tests/channel_prompt_cache.rs`).
   A save's `after_app_content` counts any earlier run in the same thread,
   even one before the session started over: the mark a run leaves on its
   session when it reads an app's result is never cleared, since a new run

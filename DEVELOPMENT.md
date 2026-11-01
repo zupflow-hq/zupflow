@@ -727,8 +727,11 @@ The recall counts in the history budget beside the history and the new
 input, as no more than half the budget: one read anew takes no more than the
 room the history and the input leave it, up to that half, and the trim
 counts a kept one as no more than half, so a long recall leaves the history
-room instead of trimming all of it on every run. A save or a change in one
-run reaches the session's later runs through the conversation, and the
+room instead of trimming all of it on every run. A kept one heavier than
+half, as one kept under a larger budget may be (a smaller context window
+alone starts no new session), is read anew by the next run, in its room, as
+after a forget, so no run sends more than its budget. A save or a change in
+one run reaches the session's later runs through the conversation, and the
 recall at the next trim or run session; a `dm`'s messages outside threads
 are one session, so they learn of notes saved elsewhere only then. A trim
 reads the recall anew from the session's type.

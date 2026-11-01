@@ -1242,10 +1242,13 @@ pub trait ChannelStore: Send + Sync {
     /// starts the run. Each run's snapshot carries the session's
     /// memory and the recall it keeps for the run's history start, read by
     /// the first run from that start, and again by the first run after a
-    /// forget marked the session, which takes the mark as it starts; a
-    /// session whose run read an app's tool result keeps that as the run
-    /// ends, for every later run in its thread, even one after the session
-    /// started over.
+    /// forget marked the session, which takes the mark as it starts (as
+    /// after a run whose type gave none:
+    /// [`crate::runs::state::FrozenMemory::read_again`]), or once the recall
+    /// it keeps is heavier than its share of the run's budget
+    /// ([`crate::runs::history::recall_share`]); a session whose run read
+    /// an app's tool result keeps that as the run ends, for every later run
+    /// in its thread, even one after the session started over.
     async fn dispatch(
         &self,
         organization_id: OrganizationId,
