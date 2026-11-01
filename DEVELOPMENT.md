@@ -737,7 +737,10 @@ agent, in that workspace, kept on that type, that may recall it, in the
 change's own transaction: every one for a workspace's memory, and only that
 conversation's for a direct conversation's. Deleting a type marks every
 session kept on it. A run's own change marks nothing: like a save, it
-reaches the recall at the next trim or run session. The next run of a marked
+reaches the recall at the next trim or run session. So that what a person
+wants gone leaves the recall at the next run, `notes`' `update_memory`
+tells the model to forget the note (`forget_memory`) and save what should
+stay rather than change it. The next run of a marked
 session reads the recall anew, from the same history start (the mark trims
 nothing); but the recall comes before the whole history, so that run misses
 the cache once from the recall on. No forgotten or changed text stays
