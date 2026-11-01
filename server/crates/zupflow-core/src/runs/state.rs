@@ -395,6 +395,14 @@ pub struct FrozenMemory {
     /// isn't kept past it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recall: Option<String>,
+    /// A channel run's recall, read while its session's type couldn't give
+    /// one (its kind isn't served, or refuses the type's settings now): the
+    /// run recalls nothing, and its session keeps that for the run alone,
+    /// so the session's next run reads the recall again, from the same
+    /// history start, rather than send nothing until its next trim.
+    /// `false` for any other.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub read_again: bool,
 }
 
 /// A channel session's memory, fixed with the session's tools when it
@@ -411,11 +419,12 @@ pub struct SessionMemory {
 /// What a channel session's history, from a run's start, begins with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionRecall {
-    /// Not read for the run's history start yet, or not since a forget
-    /// marked the session: the run reads it with its first model attempt,
-    /// from the session's own type for its audience
-    /// ([`super::reducer::Facts::memory`]), and the session keeps it for
-    /// every run from the same start, until the next forget.
+    /// Not read for the run's history start yet, or not since a forget, or
+    /// a run that read it while the session's type couldn't give one
+    /// ([`FrozenMemory::read_again`]), marked the session: the run reads it
+    /// with its first model attempt, from the session's own type for its
+    /// audience ([`super::reducer::Facts::memory`]), and the session keeps
+    /// it for every run from the same start, until the next mark.
     Unread,
     /// Read for the run's history start, framed: `None` when there was
     /// nothing to recall, and for a session without memory.

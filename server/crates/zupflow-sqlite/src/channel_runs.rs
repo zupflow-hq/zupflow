@@ -26,13 +26,15 @@
 //! start: the first run from a start reads it with its first model attempt
 //! ([`keep_recall`]), and every other run from that start sends it again.
 //! A forget, or a person's change, marks the sessions that may recall the
-//! memory, by their audience ([`refresh_recall`]): the next run of each
-//! reads the recall anew, from the same start, and a marked session keeps
-//! no recall text once no run of it is under way, only its weight for the
-//! trim. When one of its runs read an app's tool result, the session keeps
-//! that as it ends, for good: what any later run in its thread saves may
-//! come from it, a trim or a new run session included, since a new run
-//! session reads the thread again, the agent's earlier replies too.
+//! memory, by their audience ([`refresh_recall`]), and a run that read its
+//! recall while the session's type couldn't give one marks its own
+//! ([`keep_recall`]): the next run of each reads the recall anew, from the
+//! same start, and a marked session keeps no recall text once no run of it
+//! is under way, only its weight for the trim. When one of its runs read
+//! an app's tool result, the session keeps that as it ends, for good: what
+//! any later run in its thread saves may come from it, a trim or a new run
+//! session included, since a new run session reads the thread again, the
+//! agent's earlier replies too.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -1895,9 +1897,13 @@ pub(crate) async fn session_context(
 /// Keeps what a channel run's first model attempt recalls on its session,
 /// for every run from the run's history start, with its weight for the
 /// trim: once, by the first run from that start, and never another recall
-/// for it. The run's session must hold the run, in the run's run session,
-/// with `memory`'s type. `false` when it doesn't, or keeps another recall
-/// for that start: nothing is written.
+/// for it. One read while the session's type couldn't give one
+/// ([`FrozenMemory::read_again`]) is kept for the run alone: the session
+/// is marked as a forget marks it ([`refresh_recall`]), so its next run
+/// reads the recall again, from the same start. The run's session must
+/// hold the run, in the run's run session, with `memory`'s type. `false`
+/// when it doesn't, or keeps another recall for that start: nothing is
+/// written.
 pub(crate) async fn keep_recall(
     connection: &mut SqliteConnection,
     organization_id: OrganizationId,
@@ -1926,7 +1932,8 @@ pub(crate) async fn keep_recall(
     let session_id: Uuid = get(&run, "session_id")?;
     let weight = memory.recall.as_deref().map_or(0, text_weight);
     let kept = sqlx::query(
-        "UPDATE channel_sessions SET recall = ?1, recall_start_run_id = ?2, recall_weight = ?10, updated_at = ?3 \
+        "UPDATE channel_sessions SET recall = ?1, recall_start_run_id = ?2, recall_weight = ?10, updated_at = ?3, \
+         refresh_recall = CASE WHEN ?11 THEN 1 ELSE refresh_recall END \
          WHERE organization_id = ?4 AND workspace_id = ?5 AND id = ?6 AND session_id = ?7 AND active_run_id = ?8 \
          AND memory_type_id = ?9 AND (recall_start_run_id IS NOT ?2 OR recall IS ?1)",
     )
@@ -1940,6 +1947,7 @@ pub(crate) async fn keep_recall(
     .bind(run_id.uuid())
     .bind(memory.memory_type_id.uuid())
     .bind(i64::try_from(weight).map_err(unreadable)?)
+    .bind(memory.read_again)
     .execute(&mut *connection)
     .await
     .map_err(failed("keep_recall"))?;

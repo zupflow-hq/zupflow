@@ -512,6 +512,7 @@ async fn load(
         (Some(memory_type_id), recall) => Some(FrozenMemory {
             memory_type_id: MemoryTypeId::from_uuid(memory_type_id),
             recall,
+            read_again: false,
         }),
         (None, None) => None,
         (None, Some(_)) => return Err(corrupt("a recall without its memory type")),

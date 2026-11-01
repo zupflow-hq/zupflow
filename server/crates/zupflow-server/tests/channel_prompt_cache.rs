@@ -25,7 +25,10 @@
 //! trim. A conversation shared with another organization has no memory:
 //! from the sharing on, no run there has memory tools or recalls anything,
 //! a run under way aside. Nor does a session whose type's settings its
-//! kind refuses: the agent still answers.
+//! kind refuses: the agent still answers. A run of a session begun with
+//! memory that reads its recall while they're refused recalls nothing,
+//! and the session's next run reads it again, so it recalls once they're
+//! fixed.
 //! A `dm`'s or a `group_dm`'s session recalls, finds and saves its own
 //! conversation's notes beside the workspace's, and nothing else sees them;
 //! a channel's saves are the workspace's. Once a run in a thread read an
@@ -1661,10 +1664,30 @@ async fn has_no_memory_in_a_conversation_shared_with_another_organization() {
 }
 
 /// Stores settings `memory_type`'s kind refuses, as the server's own
-/// mistake would leave them.
-async fn refuse_settings(world: &World, memory_type: &str) {
+/// mistake would leave them: the settings they replace.
+async fn refuse_settings(world: &World, memory_type: &str) -> String {
     let pool = database(world).await;
+    let id = MemoryTypeId::parse(memory_type).unwrap().uuid();
+    let settings: String = sqlx::query_scalar("SELECT settings FROM memory_types WHERE id = ?")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     sqlx::query("UPDATE memory_types SET settings = '{\"max_notes\": 0}' WHERE id = ?")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    settings
+}
+
+/// Stores `settings` for `memory_type` again, as fixing the server's
+/// mistake would.
+async fn restore_settings(world: &World, memory_type: &str, settings: &str) {
+    let pool = database(world).await;
+    sqlx::query("UPDATE memory_types SET settings = ? WHERE id = ?")
+        .bind(settings)
         .bind(MemoryTypeId::parse(memory_type).unwrap().uuid())
         .execute(&pool)
         .await
@@ -1684,9 +1707,9 @@ async fn answers_without_memory_while_its_kind_refuses_its_types_settings() {
         // ones its kind refuses.
         let idle = world.say(ANA, &format!("{} hello", main.mention()), None).await;
         world.work().await;
-        world.say(ANA, &format!("{} hi", main.mention()), None).await;
+        let busy = world.say(ANA, &format!("{} hi", main.mention()), None).await;
         world.handle().await;
-        refuse_settings(&world, &memory_type).await;
+        let settings = refuse_settings(&world, &memory_type).await;
         world.work().await;
         // Then a follow-up in the idle thread, and a new thread.
         world.say(ANA, "and now?", Some(&idle.ts)).await;
@@ -1728,6 +1751,37 @@ async fn answers_without_memory_while_its_kind_refuses_its_types_settings() {
                 "{name}: turn {index}"
             );
         }
+
+        // Once they're fixed, the next run of the session begun with
+        // memory continues it, and recalls: the run that recalled nothing
+        // left the recall to be read again.
+        restore_settings(&world, &memory_type, &settings).await;
+        world.say(ANA, "and the notes?", Some(&busy.ts)).await;
+        world.work().await;
+        let after = world.runs(main).await;
+        assert_eq!(after.len(), 5, "{name}: {after:?}");
+        let fixed = after
+            .iter()
+            .find(|run| run["input"].as_str().unwrap().ends_with("and the notes?"))
+            .unwrap_or_else(|| panic!("{name}: {after:?}"));
+        assert_eq!(fixed["status"], "completed", "{name}: {fixed}");
+        assert_eq!(
+            fixed["session_id"],
+            by_input("@helper hi")["session_id"],
+            "{name}: the same run session"
+        );
+        let last = turns(&world).split_off(before + 4);
+        assert_eq!(last.len(), 1, "{name}: a turn");
+        let recalled = recall(kind, &last[0].body).unwrap_or_else(|| panic!("{name}: no recall"));
+        assert!(
+            recalled.contains("Prefers answers in Portuguese."),
+            "{name}: {recalled}"
+        );
+        assert_eq!(
+            memory_tools(kind, &last[0].body),
+            memory_tools(kind, &sent[0].body),
+            "{name}"
+        );
     }
 }
 

@@ -27,7 +27,9 @@
 //! reads it from the session's type for that audience, within the room the
 //! session's history budget leaves it, half the budget at most
 //! ([`session_recall`]), and every run from the same start sends those
-//! bytes. A save in one run reaches a later run of the session through the
+//! bytes; one that reads it while the type's kind isn't served or refuses
+//! its settings recalls nothing, and the session's next run reads it
+//! again. A save in one run reaches a later run of the session through the
 //! conversation, and its recall at the next trim or session; so does a
 //! run's change. A forget, a run's or a person's, and a person's change
 //! record a mark on the sessions of its agent, workspace and type that may
@@ -351,6 +353,7 @@ pub(crate) async fn resolve(
         frozen: FrozenMemory {
             memory_type_id: served.memory_type.id,
             recall,
+            read_again: false,
         },
     }))
 }
@@ -400,9 +403,12 @@ pub(crate) async fn session_memory(
 /// half the budget at most ([`zupflow_core::runs::history::recall_room`]):
 /// nothing once the type is deleted, while its kind isn't served, or while
 /// it refuses the type's settings ([`stored_settings`] logs it), as a
-/// session begun then would have no memory. The tools stay the session's,
-/// whatever the type became. A recall that can't be read fails the step,
-/// to be tried again.
+/// session begun then would have no memory. While the kind isn't served or
+/// refuses the settings, the session keeps that for the run alone
+/// ([`FrozenMemory::read_again`]): its next run reads the recall again, so
+/// the session recalls as soon as the server can, not only from its next
+/// trim. The tools stay the session's, whatever the type became. A recall
+/// that can't be read fails the step, to be tried again.
 pub(crate) async fn session_recall(
     state: &AppState,
     (organization_id, workspace_id): (OrganizationId, WorkspaceId),
@@ -410,16 +416,18 @@ pub(crate) async fn session_recall(
     memory: &SessionMemory,
     room: usize,
 ) -> Result<FrozenMemory, &'static str> {
-    let recall = match type_now(state, organization_id, memory.memory_type_id).await? {
-        TypeNow::Gone | TypeNow::NotServed | TypeNow::Unusable => None,
+    let (recall, read_again) = match type_now(state, organization_id, memory.memory_type_id).await? {
+        TypeNow::Gone => (None, false),
+        TypeNow::NotServed | TypeNow::Unusable => (None, true),
         TypeNow::Served(served) => {
             let scope = served.scope(organization_id, workspace_id, agent_id);
-            recall_for(&served, &scope, &memory.audience, Some(room)).await?
+            (recall_for(&served, &scope, &memory.audience, Some(room)).await?, false)
         }
     };
     Ok(FrozenMemory {
         memory_type_id: memory.memory_type_id,
         recall,
+        read_again,
     })
 }
 

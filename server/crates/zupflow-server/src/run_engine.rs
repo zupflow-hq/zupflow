@@ -41,9 +41,10 @@
 //! its audience (a `dm`'s or a `group_dm`'s own conversation beside the
 //! workspace, else the workspace), and the session keeps its recall: the
 //! first run from each history start reads it (`memory_tools::session_recall`),
-//! as does the first after a forget marked the session, in the room the
-//! session's history budget leaves it, half the budget at most, and every
-//! other run from that start sends it again.
+//! as does the first after a forget, or a run whose type couldn't give one,
+//! marked the session, in the room the session's history budget leaves it,
+//! half the budget at most, and every other run from that start sends it
+//! again.
 //!
 //! The job queue's lease and the run's claim go together: the job's lease
 //! is extended before every step that keeps the claim, and once a step

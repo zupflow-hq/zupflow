@@ -4035,6 +4035,7 @@ fn recalled(recall: Option<&str>) -> FrozenMemory {
     FrozenMemory {
         memory_type_id: memory_type(),
         recall: recall.map(str::to_owned),
+        read_again: false,
     }
 }
 
@@ -4468,6 +4469,7 @@ fn a_channel_run_sends_its_sessions_recall_read_once_for_its_history_start() {
         memory: Some(FrozenMemory {
             memory_type_id: MemoryTypeId::from_uuid(Uuid::from_u128(41)),
             recall: Some(RECALL.to_owned()),
+            read_again: false,
         }),
         ..claimed()
     };
@@ -4477,6 +4479,20 @@ fn a_channel_run_sends_its_sessions_recall_read_once_for_its_history_start() {
             "a recall read from another type than the session's"
         ))
     );
+    // Read while the session's type couldn't give one: none is sent, and
+    // the attempt asks the store to keep that for this run alone.
+    let none = FrozenMemory {
+        read_again: true,
+        ..recalled(None)
+    };
+    let gave_none = Facts {
+        offer: None,
+        memory: Some(none.clone()),
+        ..claimed()
+    };
+    let plan = planned(&unread, &gave_none);
+    let (prepared, request) = prepared_with(&plan);
+    assert_eq!((prepared.memory.clone(), request.memory.clone()), (Some(none), None));
 
     // Nothing to recall, and an empty recall, send none: the type stays.
     for recall in [None, Some(String::new())] {

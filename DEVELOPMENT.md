@@ -710,9 +710,13 @@ reads it in the transaction that starts each run. Only a run under way
 keeps what it started with. A session whose type has settings its
 kind refuses starts without memory as well, rather than leave the agent
 silent in every conversation; the server logs it
-(`channels.session_without_memory`), and a run of a session begun with
-memory recalls nothing while they're refused. An API run still fails its
-step then: it never starts without the memory its agent has.
+(`channels.session_without_memory`). A run that continues a session begun
+with memory (one collected, or one started just before) sends the recall
+its history start kept; one that has to read the recall while they're
+refused, or while the type's kind isn't served, recalls nothing, and the
+session's next run reads it again, so the session recalls as soon as the
+server can. An API run still fails its step then: it never starts without
+the memory its agent has.
 
 The session keeps its recall, once for each history start: the first run
 from a start reads it from the session's own type for that audience with its

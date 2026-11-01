@@ -28,7 +28,10 @@
 --   type when the type is deleted. The same transaction clears the recall's
 --   text and start on a session with no run under way, and a marked
 --   session's run clears them as it ends, so no forgotten or changed text
---   stays at rest. The session's next run clears the mark and reads the
+--   stays at rest. Set too by the first model attempt of a run that read
+--   the recall while the session's type couldn't give one (its kind not
+--   served, or refusing the type's settings), so that nothing is kept for
+--   the run alone. The session's next run clears the mark and reads the
 --   recall anew, from the same history start: a run under way keeps the
 --   recall it started with. Saves, and a run's changes, still reach a
 --   session only at a trim or a new run session. Never set on a session

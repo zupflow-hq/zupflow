@@ -9,8 +9,9 @@
 //! read, one active run per session, the conversation breaker's count of
 //! the runs that start, and each message read once in a run session. A
 //! session keeps the memory it began with, and one recall for each history
-//! start, read by the first run from it; other memory starts a new run
-//! session, and a run whose session went with its memory fails. Forgetting
+//! start, read by the first run from it, or by the next when that one's
+//! type couldn't give one; other memory starts a new run session, and a
+//! run whose session went with its memory fails. Forgetting
 //! a note a session may recall (its agent's, in its workspace and type, and
 //! the workspace's or the session's own direct conversation's), a person's
 //! change to one, or deleting its type, marks the session in the same
@@ -162,6 +163,7 @@ pub async fn run(stores: Stores<'_>, prepare: Prepare) {
     reads_a_sessions_recall_anew_once_a_note_it_may_recall_is_forgotten(&stores, &prepare).await;
     marks_only_the_sessions_whose_audience_may_recall_a_change(&stores, &prepare).await;
     drops_a_sessions_memory_once_its_conversation_is_shared(&stores, &prepare).await;
+    reads_the_recall_again_after_a_run_whose_type_gave_none(&stores, &prepare).await;
     counts_a_sessions_recall_in_its_history_budget(&stores, &prepare).await;
     marks_a_session_for_good_once_a_run_reads_an_apps_result(&stores, &prepare).await;
     counts_the_breaker_under_concurrency(&stores, &prepare).await;
@@ -1531,7 +1533,8 @@ async fn keeps_a_sessions_memory_and_one_recall_per_history_start(stores: &Store
         ended.frozen_memory,
         Some(FrozenMemory {
             memory_type_id: customer,
-            recall: None
+            recall: None,
+            read_again: false,
         }),
         "the session keeps the recall, the run its type"
     );
@@ -1633,6 +1636,7 @@ fn read(memory_type_id: MemoryTypeId, recall: &str) -> FrozenMemory {
     FrozenMemory {
         memory_type_id,
         recall: Some(recall.to_owned()),
+        read_again: false,
     }
 }
 
@@ -2361,6 +2365,55 @@ async fn drops_a_sessions_memory_once_its_conversation_is_shared(stores: &Stores
         );
         answer_run(stores, org, ws, run, "Done.").await;
     }
+}
+
+/// A run that reads its session's recall while the session's type couldn't
+/// give one (its kind isn't served, or refuses the type's settings now)
+/// recalls nothing, and the session keeps that for the run alone, marked
+/// as a forget marks it: its next run, from the same history start, reads
+/// the recall again, and the session keeps what that one read.
+async fn reads_the_recall_again_after_a_run_whose_type_gave_none(stores: &Stores<'_>, prepare: &Prepare) {
+    const RECALL: &str = "<memory>\n[k7m2qd] Prefers replies in Portuguese.\n</memory>";
+    let t = tenant(prepare).await;
+    let (org, ws) = (t.organization_id, t.sandbox);
+    let (_, _, connection) = installed(stores, &t, ws, t.agent).await;
+    let channel = stores.channels.list_agent_channels(org, ws, t.agent).await.unwrap()[0].id;
+    let customer = MemoryTypeId::generate();
+    let session = Thread {
+        ws,
+        connection,
+        channel,
+        conversation: SUPPORT,
+        thread: "13.unusable",
+        template: remembering(&template(), customer),
+    };
+    let (first, snapshot) = session.next_run(stores, &t, 1).await;
+    assert_eq!(snapshot.session.expect("its session").recall, SessionRecall::Unread);
+    let none = FrozenMemory {
+        memory_type_id: customer,
+        recall: None,
+        read_again: true,
+    };
+    assert_eq!(answer_remembering(stores, org, ws, first, &none).await, [None]);
+    assert_eq!(
+        session.kept_recall(stores, &t).await,
+        SessionRecall::Unread,
+        "nothing kept for the history start"
+    );
+
+    let (second, snapshot) = session.next_run(stores, &t, 2).await;
+    let context = snapshot.session.expect("its session");
+    assert_eq!(context.history.len(), 2, "the first run's input and answer");
+    assert_eq!(context.recall, SessionRecall::Unread, "read again");
+    assert_eq!(
+        answer_remembering(stores, org, ws, second, &read(customer, RECALL)).await,
+        [Some(RECALL.to_owned())]
+    );
+    let (third, snapshot) = session.next_run(stores, &t, 3).await;
+    let context = snapshot.session.expect("its session");
+    assert_eq!(context.history.len(), 4, "the same history start");
+    assert_eq!(context.recall, SessionRecall::Read(Some(RECALL.to_owned())));
+    answer_run(stores, org, ws, third, "Done.").await;
 }
 
 /// The recall a session keeps counts in its history budget, beside the

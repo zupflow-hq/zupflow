@@ -1068,6 +1068,7 @@ pub fn frozen_memory(snapshot: &Snapshot) -> Option<FrozenMemory> {
         SessionRecall::Read(recall) => Some(FrozenMemory {
             memory_type_id: memory.memory_type_id,
             recall: recall.clone(),
+            read_again: false,
         }),
         SessionRecall::Unread => None,
     }
@@ -1532,6 +1533,7 @@ impl Worker<'_> {
         let memory = memory.map(|memory| FrozenMemory {
             memory_type_id: memory.memory_type_id,
             recall: sent_recall(self.snapshot, &memory),
+            read_again: memory.read_again,
         });
         // A run of an organization's model calls it only while the model and
         // its connection are there and the provider takes the key.
@@ -1606,7 +1608,9 @@ impl Worker<'_> {
     /// The memory a run whose offer is frozen sends: its own, or a channel
     /// run's session's. A channel run that's the first from its session's
     /// history start sends the recall the driver read now, from the
-    /// session's type: it's kept on the session with this attempt.
+    /// session's type: it's kept on the session with this attempt, for this
+    /// run alone when the type couldn't give one
+    /// ([`FrozenMemory::read_again`]).
     fn memory_frozen_or_read(&self) -> Result<Option<FrozenMemory>, AdvanceError> {
         if let Some(frozen) = frozen_memory(self.snapshot) {
             return Ok(Some(frozen));

@@ -160,8 +160,9 @@ Read `README.md` first, then `DEVELOPMENT.md`.
   takes no more than the room left, up to that half. A conversation shared
   with another organization has no memory, read in the transaction that
   starts each run, whatever template the run was given, and neither does a
-  session whose type's settings its kind refuses
-  (`tests/channel_prompt_cache.rs`).
+  session whose type's settings its kind refuses; a run that has to read
+  its recall while they're refused recalls nothing, and marks its session
+  so the next run reads it again (`tests/channel_prompt_cache.rs`).
   A save's `after_app_content` counts any earlier run in the same thread,
   even one before the session started over: the mark a run leaves on its
   session when it reads an app's result is never cleared, since a new run
